@@ -30,6 +30,7 @@ const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
 const app_render_runtime = @import("core/app/app_render_runtime.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
+const mux_session_bridge = @import("core/mux/session_bridge.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
@@ -502,6 +503,7 @@ const App = struct {
             generation_usage_provider.unavailable_provider,
     ),
     session_persistence: app_session_runtime.Persistence = .{},
+    mux_bridge: mux_session_bridge.Runtime = .{},
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
     approval_prompt: ApprovalPrompt = .{},
@@ -638,6 +640,15 @@ const App = struct {
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;
         try HostConfigAppRuntime.restore(&app, builtin_modes.registry);
         return app;
+    }
+
+    fn ensureMuxBridge(self: *App) void {
+        if (self.mux_bridge.isStarted()) return;
+        const session_id = SessionAppRuntime.activeSessionId(self) orelse return;
+        const store = if (self.session_persistence.store) |*value| value else return;
+        self.mux_bridge.start(self.alloc, store.sessions_dir, session_id) catch |err| {
+            debug_trace.logf("mux", "session bridge unavailable err={s}", .{@errorName(err)});
+        };
     }
 
     pub fn persistAcceptedModel(self: *App, model: []const u8) !void {
@@ -788,6 +799,7 @@ const App = struct {
         self.file_index.requestStop();
 
         self.terminal_takeover.shutdown(App, self);
+        self.mux_bridge.deinit();
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
         self.terminal_takeover.deinit(self.alloc);
@@ -2436,6 +2448,7 @@ const App = struct {
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+        self.ensureMuxBridge();
 
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
             try self.collectThemeFacts();
@@ -2533,6 +2546,7 @@ const App = struct {
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
         try self.flushRequestedFrame();
+        self.mux_bridge.publish(self.shell.shadow_vt);
     }
 
     pub fn admitPendingApprovalResize(self: *App) bool {
@@ -2690,7 +2704,8 @@ const App = struct {
         if (self.terminal_takeover.blocksFxSurface(&self.terminal)) {
             return self.terminal_input_runtime.takeDeferredThemeMonitorByte();
         }
-        return self.terminal_input_runtime.takeDeferredTerminalInputByte();
+        return self.mux_bridge.takeInputByte() orelse
+            self.terminal_input_runtime.takeDeferredTerminalInputByte();
     }
 };
 
