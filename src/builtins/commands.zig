@@ -64,6 +64,17 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
+        .kind = .mux,
+        .token = "mux",
+        .usage = "mux [session-id]",
+        .summary = "Juggle concurrent fx sessions in a native terminal UI",
+        .details = &.{
+            "Hosts one fx child terminal per session with a minimal sidebar.",
+            "Pass a saved session id to select it on startup.",
+            "Use ctrl+h/l to focus, ctrl+j/k to switch, ctrl+n to create, ctrl+delete to archive, and ctrl+q to quit.",
+        },
+    },
+    .{
         .kind = .pr,
         .token = "pr",
         .usage = "pr [--auto] [--create] [context]",
@@ -284,6 +295,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .background, .usage = "background [last|<id>]" },
     } },
     .{ .entries = &.{
+        .{ .kind = .mux, .usage = "mux [session-id]" },
         .{ .kind = .sessions, .usage = "sessions" },
         .{ .kind = .session, .usage = "session <last|id>" },
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },

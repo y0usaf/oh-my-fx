@@ -8,6 +8,7 @@ const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
+const cli_mux = @import("cli_mux.zig");
 const cli_replay = @import("cli_replay.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
@@ -67,6 +68,7 @@ pub const Command = union(enum) {
     permissions: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
+    mux: []const [:0]const u8,
     doctor: []const [:0]const u8,
     background: []const [:0]const u8,
     teams: []const [:0]const u8,
@@ -473,6 +475,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'm' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .models)) return .{ .models = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .mux)) return .{ .mux = args[1..] };
         },
         'p' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .pr)) return .{ .pr = args[1..] };
@@ -1128,6 +1131,23 @@ fn runNonInteractiveWithDeps(
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
+        },
+        .mux => |rest| {
+            const options = cli_mux.parseArgs(rest) catch {
+                try writeStderr(deps, "usage: fx mux [session-id]\n");
+                return .handled_failure;
+            };
+            const exit_code = cli_mux.run(options) catch |err| {
+                try writeStderr(deps, "fx mux: ");
+                try writeStderr(deps, switch (err) {
+                    error.TmuxUnavailable => "tmux 3.2 or newer is required",
+                    error.TmuxCommandFailed => "tmux command failed",
+                    else => @errorName(err),
+                });
+                try writeStderr(deps, "\n");
+                return .handled_failure;
+            };
+            return if (exit_code == 0) .handled_success else .{ .handled_exit = exit_code };
         },
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -3475,6 +3495,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("models"), @constCast("--json") })) {
         .models => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("mux"), @constCast("session-1") })) {
+        .mux => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{@constCast("doctor")})) {

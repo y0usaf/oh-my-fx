@@ -112,6 +112,14 @@ fx starts in `auto` permission mode. Routine understood development actions run 
 
 JSON and quiet requests stay noninteractive by default. Add `--prompt-permissions` to allow configured approval prompts when stdin is a TTY. Automatic safety review never opens that prompt. Prompt text is written to stderr, so JSON stdout stays parseable and quiet stdout stays empty. Piped or redirected stdin remains noninteractive and fails instead of waiting for approval.
 
+Juggle concurrent sessions for the current workspace in a native terminal UI:
+
+```bash
+fx mux
+```
+
+The minimal sidebar lists saved and newly created sessions while each child fx terminal remains live. Use `ctrl+h` and `ctrl+l` to move focus, `ctrl+j` and `ctrl+k` to switch sessions, `ctrl+n` to create one, `ctrl+delete` to move the selected saved session into `~/.fx/archive/`, and `ctrl+q` to quit. Pass a saved session ID to `fx mux <session-id>` to select it on startup.
+
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
 ## Embed fx
