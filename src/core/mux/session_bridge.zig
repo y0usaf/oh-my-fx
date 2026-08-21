@@ -236,3 +236,43 @@ test "mux session endpoint is scoped to the durable session" {
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/tmp/fx/sessions/session-1/mux.sock", path);
 }
+
+test "mux session bridge exchanges screen checkpoints and input" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "session", .default_dir);
+    const sessions_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(sessions_dir);
+
+    var bridge: Runtime = .{};
+    try bridge.start(alloc, sessions_dir, "session");
+    defer bridge.deinit();
+
+    var grid = try terminal_engine.Grid.init(alloc, 12, 4);
+    defer grid.deinit();
+    try grid.feed("attached");
+    grid.cursor_shape = .bar;
+    bridge.publish(&grid);
+
+    const endpoint = try endpointPath(alloc, sessions_dir, "session");
+    defer alloc.free(endpoint);
+    var restored = try requestScreen(alloc, endpoint);
+    defer restored.deinit();
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    try restored.rowTextTrimmed(1, &row);
+    try std.testing.expectEqualStrings("attached", row.items);
+    try std.testing.expectEqual(@as(@TypeOf(restored.cursor_shape), .bar), restored.cursor_shape);
+
+    try sendInput(endpoint, "xy");
+    const deadline = io_mod.milliTimestamp() + 1000;
+    var first: ?u8 = null;
+    while (first == null and io_mod.milliTimestamp() < deadline) {
+        first = bridge.takeInputByte();
+        if (first == null) io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(?u8, 'x'), first);
+    try std.testing.expectEqual(@as(?u8, 'y'), bridge.takeInputByte());
+    try std.testing.expectEqual(@as(?u8, null), bridge.takeInputByte());
+}
