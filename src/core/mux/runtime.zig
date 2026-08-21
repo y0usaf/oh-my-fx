@@ -209,6 +209,8 @@ pub fn run(resume_id: ?[]const u8) !u8 {
     var input_escape_len: usize = 0;
     var last_rows: u16 = 0;
     var last_cols: u16 = 0;
+    var last_frame: std.ArrayList(u8) = .empty;
+    defer last_frame.deinit(alloc);
 
     while (true) {
         const layout = try ui_terminal.queryLayout(std.posix.STDIN_FILENO, 0);
@@ -309,7 +311,7 @@ pub fn run(resume_id: ?[]const u8) !u8 {
                 }
             }
         }
-        try render(alloc, entries.items, state, layout.cols, layout.rows);
+        try renderIfChanged(alloc, entries.items, state, layout.cols, layout.rows, &last_frame);
     }
 }
 
@@ -377,25 +379,48 @@ fn refreshAttached(alloc: Allocator, attached: *Attached) !void {
     attached.grid = next;
 }
 
-fn render(alloc: Allocator, entries: []const Entry, state: model_mod.Model, cols: u16, rows: u16) !void {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
+fn renderIfChanged(
+    alloc: Allocator,
+    entries: []const Entry,
+    state: model_mod.Model,
+    cols: u16,
+    rows: u16,
+    last_frame: *std.ArrayList(u8),
+) !void {
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(alloc);
+    try buildFrame(alloc, entries, state, cols, rows, &frame);
+    // Keep the hardware cursor hidden for the complete repaint. Otherwise each
+    // row movement is visible before the final cursor position is restored.
+    const wire = try frameWireBytesChanged(alloc, frame.items, last_frame) orelse return;
+    defer alloc.free(wire);
+    try writeStdout(wire);
+}
+
+fn buildFrame(
+    alloc: Allocator,
+    entries: []const Entry,
+    state: model_mod.Model,
+    cols: u16,
+    rows: u16,
+    out: *std.ArrayList(u8),
+) !void {
     try out.appendSlice(alloc, "\x1b[H\x1b[0m");
     var row: u16 = 1;
     while (row <= rows) : (row += 1) {
         if (row == 1) {
-            try appendPadded(alloc, &out, "fx", sidebar_width);
+            try appendPadded(alloc, out, "fx", sidebar_width);
         } else if (row - 2 < entries.len) {
             const index: usize = row - 2;
             const marker = if (index == state.selected) "> " else "  ";
             if (index == state.selected and state.focus == .sidebar) try out.appendSlice(alloc, "\x1b[7m");
             try out.appendSlice(alloc, marker);
-            try appendPadded(alloc, &out, entries[index].title, sidebar_width - 2);
+            try appendPadded(alloc, out, entries[index].title, sidebar_width - 2);
             try out.appendSlice(alloc, "\x1b[0m");
         } else if (row == rows) {
-            try appendPadded(alloc, &out, "^N new  ^J/K sessions  ^H/L focus  ^Q quit", sidebar_width);
+            try appendPadded(alloc, out, "^N new  ^J/K sessions  ^H/L focus  ^Q quit", sidebar_width);
         } else {
-            try appendPadded(alloc, &out, "", sidebar_width);
+            try appendPadded(alloc, out, "", sidebar_width);
         }
         try out.appendSlice(alloc, "\x1b[2m│\x1b[0m");
         if (entries[state.selected].child) |child| {
@@ -421,8 +446,7 @@ fn render(alloc: Allocator, entries: []const Entry, state: model_mod.Model, cols
         try out.appendSlice(alloc, "\x1b[K");
         if (row != rows) try out.appendSlice(alloc, "\r\n");
     }
-    try appendCursor(alloc, &out, entries[state.selected], state, cols, rows);
-    try writeStdout(out.items);
+    try appendCursor(alloc, out, entries[state.selected], state, cols, rows);
 }
 
 fn appendCursor(
@@ -453,6 +477,18 @@ fn appendCursor(
     });
     defer alloc.free(sequence);
     try out.appendSlice(alloc, sequence);
+}
+
+fn frameWireBytesChanged(
+    alloc: Allocator,
+    frame: []const u8,
+    last_frame: *std.ArrayList(u8),
+) !?[]u8 {
+    if (std.mem.eql(u8, frame, last_frame.items)) return null;
+    const wire = try std.mem.concat(alloc, u8, &.{ "\x1b[?2026h\x1b[?25l", frame, "\x1b[?2026l" });
+    last_frame.clearRetainingCapacity();
+    try last_frame.appendSlice(alloc, frame);
+    return wire;
 }
 
 fn cursorShapeCode(shape: terminal_contracts.CursorShape, blinking: bool) u8 {
@@ -541,6 +577,26 @@ fn writeFd(fd: std.posix.fd_t, bytes: []const u8) !usize {
 
 fn closeFd(fd: std.posix.fd_t) void {
     (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(io_mod.getIo());
+}
+
+test "mux frame wire hides cursor during changed repaint and skips unchanged frame" {
+    const alloc = std.testing.allocator;
+    var last: std.ArrayList(u8) = .empty;
+    defer last.deinit(alloc);
+
+    const first = (try frameWireBytesChanged(alloc, "frame\x1b[4;9H\x1b[?25h", &last)).?;
+    defer alloc.free(first);
+    try std.testing.expect(std.mem.startsWith(u8, first, "\x1b[?2026h\x1b[?25l"));
+    try std.testing.expect(std.mem.endsWith(u8, first, "\x1b[?2026l"));
+    try std.testing.expectEqualStrings("frame\x1b[4;9H\x1b[?25h", last.items);
+    try std.testing.expect((try frameWireBytesChanged(alloc, last.items, &last)) == null);
+}
+
+test "mux cursor shape codes preserve shape and blinking" {
+    try std.testing.expectEqual(@as(u8, 1), cursorShapeCode(.block, true));
+    try std.testing.expectEqual(@as(u8, 2), cursorShapeCode(.block, false));
+    try std.testing.expectEqual(@as(u8, 3), cursorShapeCode(.underline, true));
+    try std.testing.expectEqual(@as(u8, 6), cursorShapeCode(.bar, false));
 }
 
 test "mux recognizes ctrl delete encodings" {

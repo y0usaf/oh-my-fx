@@ -66,7 +66,7 @@ Juggle concurrent sessions for the current workspace in a native terminal UI:
 fx mux
 ```
 
-The minimal sidebar lists saved and newly created sessions while each child fx terminal remains live. Use `ctrl+h` and `ctrl+l` to move focus, `ctrl+j` and `ctrl+k` to switch sessions, `ctrl+n` to create one, `ctrl+delete` to move the selected saved session into `~/.fx/archive/`, and `ctrl+q` to quit. Pass a saved session ID to `fx mux <session-id>` to select it on startup.
+The minimal sidebar lists saved and newly created sessions while each child fx terminal remains live. If a saved session is already open in another fx process, the mux attaches to its live screen and forwards input instead of starting a competing resume process. Use `ctrl+h` and `ctrl+l` to move focus, `ctrl+j` and `ctrl+k` to switch sessions, `ctrl+n` to create one, `ctrl+delete` to move an inactive selected saved session into `~/.fx/archive/`, and `ctrl+q` to quit. Pass a saved session ID to `fx mux <session-id>` to select it on startup.
 
 fx starts in `auto` permission mode, which reviews unresolved sensitive actions. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
