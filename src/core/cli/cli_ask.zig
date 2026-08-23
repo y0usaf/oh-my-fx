@@ -15,7 +15,6 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
-const provider_set = @import("../gateway/provider_set.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -46,7 +45,6 @@ const permission_gate = @import("../permissions/permission_gate.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_runtime = @import("../session/session.zig");
-const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_usage = @import("../session/session_usage.zig");
 const usage_report = @import("../session/usage_report.zig");
@@ -67,8 +65,7 @@ const test_builtin_gateway = if (std_builtin.is_test)
 else
     struct {};
 const builtin_tools = @import("../../builtins/tools.zig");
-const model_tool_schema = @import("../tooling/model_tool_schema.zig");
-const tool_projection_mod = @import("../tooling/tool_projection.zig");
+const tool_advertisement = @import("../tooling/tool_advertisement.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
@@ -225,7 +222,16 @@ pub const Config = struct {
     gateway_chat_url: []const u8,
     gateway_models_path: []const u8,
     gateway_provider: gateway_provider.Provider,
-    provider_set: provider_set.Set,
+    codex_agent_stream: ?agent_stream_provider.Provider = null,
+    codex_model_catalog: ?model_catalog.Provider = null,
+    grok_agent_stream: ?agent_stream_provider.Provider = null,
+    grok_model_catalog: ?model_catalog.Provider = null,
+    /// Registry-driven transports and catalogs for every non-fx-native
+    /// provider; gateway/codex/grok keep their dedicated fields above.
+    provider_streams: std.EnumMap(model_provider.ProviderId, agent_stream_provider.Provider) =
+        std.EnumMap(model_provider.ProviderId, agent_stream_provider.Provider).init(.{}),
+    provider_model_catalogs: std.EnumMap(model_provider.ProviderId, model_catalog.Provider) =
+        std.EnumMap(model_provider.ProviderId, model_catalog.Provider).init(.{}),
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
@@ -241,6 +247,9 @@ pub const Config = struct {
     max_history_turns: usize,
     mode_registry: mode_registry.Registry,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
@@ -254,7 +263,7 @@ fn runAskChild(
     cancel: *std.atomic.Value(bool),
 ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
-    var child_projection = ctx.cfg.mode_registry.buildModelToolProjection(
+    var child_projection = ctx.cfg.mode_registry.buildGatewayToolProjection(
         ctx.alloc,
         ctx.deps.tool_set,
         ctx.mode_id,
@@ -269,19 +278,41 @@ fn runAskChild(
     return subagent_agent_adapter.run(.{
         .host = ctx.subagent_host orelse return error.ProviderFailed,
         .tool_context = ctx.toolContext(),
-        .provider_set = ctx.cfg.provider_set,
+        .provider_routes = askProviderRoutes(ctx),
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skills_prompt_section = ctx.subagent_skills_prompt,
         .explicit_skills_prompt_section = ctx.subagent_explicit_skills_prompt,
-        .advertised_tool_names = child_projection.advertised_names,
-        .advertised_functions = child_projection.advertised_functions,
+        .gateway_tools_json = child_projection.tools_json,
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
         .project_context = ctx.modelVisibleProjectContext(),
         .lifecycle_view = ctx.lifecycle_view,
     }, turn, message, admission, cancel);
+}
+
+fn askProviderRoutes(ctx: *AskContext) subagent_agent_adapter.ProviderRoutes {
+    var routes = subagent_agent_adapter.ProviderRoutes{};
+    inline for (std.meta.tags(model_provider.ProviderId)) |id| {
+        const reviewer: ?permission_auto_classifier.Provider = switch (id) {
+            .gateway => ctx.cfg.permission_reviewer_provider,
+            .codex => ctx.cfg.codex_permission_reviewer_provider,
+            .grok => ctx.cfg.grok_permission_reviewer_provider,
+            else => null,
+        };
+        const stream = switch (id) {
+            .gateway => ctx.cfg.gateway_provider.agent_stream,
+            .codex => ctx.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
+            .grok => ctx.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
+            else => ctx.cfg.provider_streams.get(id) orelse agent_stream_provider.unavailable_provider,
+        };
+        routes.put(id, .{
+            .agent_stream_provider = stream,
+            .permission_reviewer_provider = reviewer,
+        });
+    }
+    return routes;
 }
 
 pub const PromptRunResult = struct {
@@ -447,11 +478,11 @@ fn buildAskGatewayToolProjection(
     registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
     mode_id: []const u8,
-    options: tool_projection_mod.Options,
+    options: tool_advertisement.Options,
     has_child_capability: bool,
-) !tool_projection_mod.EffectiveToolProjection {
+) !tool_advertisement.EffectiveToolProjection {
     if (has_child_capability) {
-        return registry.buildModelToolProjection(
+        return registry.buildGatewayToolProjection(
             alloc,
             tool_set,
             mode_id,
@@ -466,7 +497,7 @@ fn buildAskGatewayToolProjection(
             break index;
         }
     } else {
-        return registry.buildModelToolProjection(
+        return registry.buildGatewayToolProjection(
             alloc,
             tool_set,
             mode_id,
@@ -480,7 +511,7 @@ fn buildAskGatewayToolProjection(
     );
     defer alloc.free(projected_tools);
     projected_tools[terminal_index] = builtin_tools.terminalExecOnlySpec();
-    return registry.buildModelToolProjection(
+    return registry.buildGatewayToolProjection(
         alloc,
         .{
             .registry = .{ .tools = projected_tools },
@@ -529,7 +560,6 @@ const AskContext = struct {
     use_process_interrupt_flag: bool = false,
     background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
-    ephemeral_command_replay: command_replay_store.EphemeralStore,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_skills_prompt: []u8 = &.{},
     subagent_explicit_skills_prompt: []u8 = &.{},
@@ -584,12 +614,12 @@ const AskContext = struct {
             .model = cfg.default_model,
             .seed_model = cfg.default_model,
             .mode_id = cfg.mode_registry.default_mode_id,
-            .session = session_runtime.SessionRuntime.initWithProviders(
+            .session = session_runtime.SessionRuntime.init(
                 cfg.max_history_turns,
-                cfg.provider_set.deferredUsageProviders(),
+                cfg.gateway_provider.generation_usage,
             ),
             .web_search_runtime = web_search_runtime.Runtime.init(.{
-                .provider = cfg.provider_set.gateway.fx_search.?,
+                .provider = cfg.gateway_provider.web_search,
             }),
             .background = BackgroundRuntime.init(
                 cfg.background_process_provider,
@@ -597,7 +627,6 @@ const AskContext = struct {
             .terminal_client = terminal_client_runtime.Runtime.init(
                 cfg.background_process_provider,
             ),
-            .ephemeral_command_replay = command_replay_store.EphemeralStore.init(alloc),
             .lifecycle_runtime = lifecycle_runtime,
             .lifecycle_view = hooks.RuntimeView.empty(),
         };
@@ -712,7 +741,6 @@ const AskContext = struct {
         if (self.writable) |*writable| writable.deinit(self.alloc);
         self.writable = null;
         if (self.store) |*store| store.deinit(self.alloc);
-        self.ephemeral_command_replay.deinit();
         self.permission_rules.deinit(self.alloc);
         self.session.deinit(self.alloc);
         if (self.skills_dir.len > 0) self.alloc.free(self.skills_dir);
@@ -931,11 +959,10 @@ const AskContext = struct {
     }
 
     fn toolContext(self: *AskContext) tool_runtime.Context {
-        const provider_capabilities = self.cfg.provider_set.select(self.provider).capabilities;
-        if (provider_capabilities.fx_search) {
+        const gateway_features_allowed = model_provider.usesGatewayAuxiliaries(self.provider);
+        if (gateway_features_allowed) {
             self.web_search_runtime.configure(.{
                 .api_key = self.api_key,
-                .credential_source = self.credential_source,
                 .gateway_team = self.gateway_team,
                 .worker_model = self.model,
                 .gateway_retry_count = self.cfg.gateway_retry_count,
@@ -960,7 +987,6 @@ const AskContext = struct {
             .credential_source = self.credential_source,
             .account_id = self.account_id,
             .provider = self.provider,
-            .provider_capabilities = provider_capabilities,
             .oauth_transport = self.cfg.gateway_provider.oauth_transport,
             .secret_store = self.cfg.secret_store,
             .model = self.model,
@@ -997,10 +1023,6 @@ const AskContext = struct {
                 writable.childCapability() catch null
             else
                 null,
-            .ephemeral_command_replay = if (self.writable == null)
-                &self.ephemeral_command_replay
-            else
-                null,
             .terminal_client = &self.terminal_client,
             .command_timeout_ms = self.command_timeout_ms,
             .web_fetch_runtime = &self.web_fetch_runtime,
@@ -1009,7 +1031,7 @@ const AskContext = struct {
             .web_fetch_progress_ctx = @ptrCast(self),
             .on_web_fetch_progress = onWebFetchProgress,
             .web_search_runtime_ready = false,
-            .web_search_backend = if (provider_capabilities.fx_search) self.web_search_runtime.dispatchBackend() else null,
+            .web_search_backend = if (gateway_features_allowed) self.web_search_runtime.dispatchBackend() else null,
             .web_search_progress_ctx = @ptrCast(self),
             .on_web_search_progress = onWebSearchProgress,
             .model_capability_resolver = .{
@@ -1051,7 +1073,12 @@ const AskContext = struct {
 
     fn admissionAutoClassifier(self: *AskContext) permission_auto_classifier.Classifier {
         if (self.auto_classifier.enabled()) return self.auto_classifier;
-        const provider = self.cfg.provider_set.select(self.provider).permission_reviewer orelse
+        const provider = switch (self.provider) {
+            .gateway => self.cfg.permission_reviewer_provider,
+            .codex => self.cfg.codex_permission_reviewer_provider,
+            .grok => self.cfg.grok_permission_reviewer_provider,
+            else => null,
+        } orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
@@ -1065,7 +1092,12 @@ const AskContext = struct {
     }
 
     fn agentStreamProvider(self: *const AskContext) agent_stream_provider.Provider {
-        return self.cfg.provider_set.select(self.provider).agent_stream_or_unavailable();
+        return switch (self.provider) {
+            .gateway => self.cfg.gateway_provider.agent_stream,
+            .codex => self.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
+            .grok => self.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
+            else => self.cfg.provider_streams.get(self.provider) orelse agent_stream_provider.unavailable_provider,
+        };
     }
 
     fn writeStdout(self: *AskContext, text: []const u8) !void {
@@ -1384,12 +1416,7 @@ fn missingCredentialResult(
     options: RunOptions,
     provider: model_provider.ProviderId,
 ) !PromptRunResult {
-    const message = if (provider == .codex)
-        credentials.missing_chatgpt_credential_message
-    else if (provider == .grok)
-        credentials.missing_grok_credential_message
-    else
-        credentials.missing_credential_message;
+    const message = credentials.missingCredentialMessage(provider, .cli);
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
@@ -1558,17 +1585,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         credential.gatewayTeam(),
         credential.accountId(),
     );
-    if (comptime @import("builtin").os.tag != .wasi) {
-        if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
-            ctx.session.usage.replaceProviderReconciliationCredential(
-                alloc,
-                ctx.provider,
-                credential.source,
-                credential.accountId(),
-                credential.token,
-            );
-        }
-    }
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
@@ -1718,9 +1734,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .explicit_skills_prompt_section = explicit_skills.text,
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
-        .advertised_tool_names = tool_projection.advertised_names,
-        .advertised_functions = tool_projection.advertised_functions,
-        .provider_capabilities = cfg.provider_set.select(ctx.provider).capabilities,
+        .gateway_tools_json = tool_projection.tools_json,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
@@ -1748,10 +1762,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             false,
         .context_limits = ctx.context_limits,
         .session_child_capability = session_child_capability,
-        .ephemeral_command_replay = if (session_child_capability == null)
-            &ctx.ephemeral_command_replay
-        else
-            null,
     }, job) catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
@@ -2003,8 +2013,13 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const catalog = bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model);
+    const catalog = selectModelCatalog(
+        ctx.provider,
+        ctx.cfg.gateway_provider.model_catalog,
+        ctx.cfg.codex_model_catalog,
+        ctx.cfg.grok_model_catalog,
+        ctx.cfg.provider_model_catalogs,
+    ) orelse return model_capabilities.capabilitiesForModel(model);
     return ctx.capability_resolver.resolve(
         ctx.alloc,
         catalog,
@@ -2014,16 +2029,63 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
             .cancel_flag = ctx.cancelFlag(),
         },
         model,
-        bundle.fallbackModelCapabilities(model),
     );
+}
+
+fn selectModelCatalog(
+    provider: model_provider.ProviderId,
+    gateway: model_catalog.Provider,
+    codex: ?model_catalog.Provider,
+    grok: ?model_catalog.Provider,
+    registry: std.EnumMap(model_provider.ProviderId, model_catalog.Provider),
+) ?model_catalog.Provider {
+    return switch (provider) {
+        .gateway => gateway,
+        .codex => codex,
+        .grok => grok,
+        else => registry.get(provider),
+    };
 }
 
 fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    return ctx.capability_resolver.available(
-        model,
-        ctx.cfg.provider_set.select(ctx.provider).fallbackModelCapabilities(model),
-    );
+    return ctx.capability_resolver.available(model);
+}
+
+test "provider catalog selection never falls back across origins" {
+    var gateway_tag: u8 = 0;
+    var codex_tag: u8 = 0;
+    var gateway = test_builtin_gateway.model_catalog_provider;
+    gateway.context = &gateway_tag;
+    var codex = test_builtin_gateway.model_catalog_provider;
+    codex.context = &codex_tag;
+    var grok_tag: u8 = 0;
+    var grok = test_builtin_gateway.model_catalog_provider;
+    grok.context = &grok_tag;
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        codex: ?model_catalog.Provider,
+        grok: ?model_catalog.Provider,
+        expected_context: ?*anyopaque,
+    }{
+        .{ .provider = .gateway, .codex = codex, .grok = grok, .expected_context = &gateway_tag },
+        .{ .provider = .codex, .codex = codex, .grok = grok, .expected_context = &codex_tag },
+        .{ .provider = .codex, .codex = null, .grok = grok, .expected_context = null },
+        .{ .provider = .grok, .codex = codex, .grok = grok, .expected_context = &grok_tag },
+        .{ .provider = .grok, .codex = codex, .grok = null, .expected_context = null },
+    };
+
+    for (cases) |case| {
+        var registry = std.EnumMap(model_provider.ProviderId, model_catalog.Provider).init(.{});
+        registry.put(.openrouter, gateway);
+        const selected = selectModelCatalog(case.provider, gateway, case.codex, case.grok, registry);
+        if (case.expected_context) |expected| {
+            try std.testing.expect(selected != null);
+            try std.testing.expect(selected.?.context.? == expected);
+        } else {
+            try std.testing.expect(selected == null);
+        }
+    }
 }
 
 fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
@@ -3812,7 +3874,6 @@ fn testConfig() Config {
         .gateway_chat_url = "https://example.invalid/chat",
         .gateway_models_path = "/models",
         .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{
             .system_prompt = "system",
@@ -3939,7 +4000,7 @@ fn testProcessQueuedPromptChecksTimeout(deps: *const agent_runtime.AgentRuntimeD
     try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.worker_model);
     try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
     try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gateway_chat_url);
-    try std.testing.expect(ctx.web_search_runtime.provider.?.execute_fn == ctx.cfg.provider_set.gateway.fx_search.?.execute_fn);
+    try std.testing.expect(ctx.web_search_runtime.provider.?.execute_fn == ctx.cfg.gateway_provider.web_search.execute_fn);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try testPushAssistantText(deps, "assistant text");
 }
@@ -3947,23 +4008,15 @@ fn testProcessQueuedPromptChecksTimeout(deps: *const agent_runtime.AgentRuntimeD
 fn testProcessQueuedPromptChecksExecOnlyTerminal(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expect(cfg.session_child_capability == null);
-    try std.testing.expect(cfg.ephemeral_command_replay != null);
     const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
-    try std.testing.expect(ctx.toolContext().ephemeral_command_replay != null);
     try std.testing.expectEqualStrings("inspect", ctx.mode_id);
-    try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "read_file"));
-    try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "terminal"));
-    try std.testing.expect(!tool_projection_mod.containsName(cfg.advertised_tool_names, "run_command"));
-    try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "web_search"));
-    const advertised_terminal = for (cfg.advertised_functions) |function| {
-        if (std.mem.eql(u8, function.name, "terminal")) break function;
-    } else return error.TestExpectedEqual;
-    try std.testing.expect(!model_tool_schema.isSingleRequiredObjectUnionField(
-        advertised_terminal.input_schema,
-        "request",
-    ));
-    try std.testing.expect(std.mem.find(u8, advertised_terminal.description, "required finite timeout_ms") != null);
-    try std.testing.expect(std.mem.find(u8, advertised_terminal.description, "Use start") == null);
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"read_file\"") != null);
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"terminal\"") != null);
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"run_command\"") == null);
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"web_search\"") == null);
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "gateway.perplexity_search") != null);
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "Run one captured command and return its result.") != null);
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "Use start for commands") == null);
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, cfg.custom_tool_guidance);
     try std.testing.expectEqualStrings("test model overlay", cfg.model_prompt_overlay.?);
     const runtime_terminal = deps.tool_registry.lookup("terminal") orelse
@@ -3975,18 +4028,14 @@ fn testProcessQueuedPromptChecksExecOnlyTerminal(deps: *const agent_runtime.Agen
 fn testProcessQueuedPromptChecksFullTerminal(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expect(cfg.session_child_capability != null);
-    try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "terminal"));
-    const advertised_terminal = for (cfg.advertised_functions) |function| {
-        if (std.mem.eql(u8, function.name, "terminal")) break function;
-    } else return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.find(u8, advertised_terminal.description, "Use start") != null);
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "Use start for commands") != null);
     try testPushAssistantText(deps, "assistant text");
 }
 
 fn testProcessQueuedPromptChecksInjectedToolSet(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
-    try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "read_file"));
-    try std.testing.expect(!tool_projection_mod.containsName(cfg.advertised_tool_names, "run_command"));
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"read_file\"") != null);
+    try std.testing.expect(std.mem.find(u8, cfg.gateway_tools_json, "\"name\":\"run_command\"") == null);
     try std.testing.expectEqualStrings("", cfg.custom_tool_guidance);
 
     const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
@@ -5332,7 +5381,7 @@ test "fx ask default user commands require configured authority or review" {
         .arguments_json = "{\"action\":\"exec\",\"command\":\"touch automatic.txt\"}",
     }, .auto, &.{}, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, automatic.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, automatic.denial_reason.?);
 }
 
 test "fx ask automatic review observes worker cancellation" {
@@ -5357,7 +5406,7 @@ test "fx ask automatic review observes worker cancellation" {
     var stderr_capture: TestCapture = .{};
     defer stderr_capture.deinit(alloc);
     var cfg = testConfig();
-    cfg.provider_set.gateway.permission_reviewer = .{ .review_fn = Provider.review };
+    cfg.permission_reviewer_provider = .{ .review_fn = Provider.review };
     var ctx = AskContext.init(
         alloc,
         cfg,
@@ -5836,10 +5885,10 @@ test "disabled headless ask scope leaves the interactive SIGINT handler untouche
     try std.testing.expectEqual(@as(usize, 1), test_previous_sigint_count.load(.seq_cst));
 }
 
-test "fx ask auto mode applies automatic clear and caution without a prompt" {
+test "fx ask auto mode applies automatic allow and ask without a prompt" {
     const FakeClassifier = struct {
         calls: usize = 0,
-        decision: permission_auto_classifier.Decision = .clear,
+        decision: permission_auto_classifier.Decision = .allow,
 
         fn classify(
             raw_ctx: *anyopaque,
@@ -5849,7 +5898,8 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
             return .{ .valid = .{
-                .risk = if (self.decision == .clear) .low else .high,
+                .risk = if (self.decision == .allow) .low else .high,
+                .authorization = .medium,
                 .decision = self.decision,
                 .rationale = try alloc.dupe(u8, "test automatic review"),
             } };
@@ -5866,7 +5916,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
     defer stderr_capture.deinit(alloc);
     var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
     defer ctx.deinit();
-    var fake = FakeClassifier{ .decision = .clear };
+    var fake = FakeClassifier{ .decision = .allow };
     ctx.auto_classifier = permission_auto_classifier.Classifier.withOverride(
         @ptrCast(&fake),
         FakeClassifier.classify,
@@ -5921,7 +5971,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
     }
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
 
-    fake.decision = .caution;
+    fake.decision = .ask;
     const check_call: ToolCall = .{
         .id = "check",
         .name = "terminal",
@@ -5940,7 +5990,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         &.{},
     );
     try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, blocked.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
@@ -6332,7 +6382,8 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
             try std.testing.expectEqualStrings("write_file", file.tool_name);
             return .{ .valid = .{
                 .risk = .medium,
-                .decision = .clear,
+                .authorization = .high,
+                .decision = .allow,
                 .rationale = try alloc.dupe(u8, "test automatic review"),
             } };
         }
@@ -6469,7 +6520,7 @@ test "fx ask preserves CLI headless blocker diagnostics" {
         &.{},
     );
     try std.testing.expectEqual(ToolPermissionDecision.deny, external_outcome.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, external_outcome.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, external_outcome.denial_reason.?);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 
@@ -6513,7 +6564,7 @@ test "fx ask preserves CLI headless blocker diagnostics" {
         &.{},
     );
     try std.testing.expectEqual(ToolPermissionDecision.deny, auto_approval.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, auto_approval.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, auto_approval.denial_reason.?);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 
@@ -6697,7 +6748,7 @@ test "CLI ask auto mode requires review when only one copy or rename target is c
             .arguments_json = case.arguments_json,
         }, .auto, &.{}, &.{});
         try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
-        try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, outcome.denial_reason.?);
+        try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
         stdout_capture.bytes.clearRetainingCapacity();
         stderr_capture.bytes.clearRetainingCapacity();
     }

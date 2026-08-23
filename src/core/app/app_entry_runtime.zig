@@ -9,10 +9,13 @@ const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
 const gateway_provider = @import("../gateway/gateway_provider.zig");
-const provider_set = @import("../gateway/provider_set.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
+const model_provider = @import("../config/model_provider.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -44,7 +47,20 @@ pub const Config = struct {
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_provider: gateway_provider.Provider,
-    provider_set: provider_set.Set,
+    codex_agent_stream: ?agent_stream_provider.Provider = null,
+    codex_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    codex_model_catalog: ?model_catalog.Provider = null,
+    grok_agent_stream: ?agent_stream_provider.Provider = null,
+    grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    grok_model_catalog: ?model_catalog.Provider = null,
+    /// Registry-driven transports and catalogs for every non-fx-native
+    /// provider; gateway/codex/grok keep their dedicated fields above.
+    provider_streams: std.EnumMap(model_provider.ProviderId, agent_stream_provider.Provider) =
+        std.EnumMap(model_provider.ProviderId, agent_stream_provider.Provider).init(.{}),
+    provider_model_catalogs: std.EnumMap(model_provider.ProviderId, model_catalog.Provider) =
+        std.EnumMap(model_provider.ProviderId, model_catalog.Provider).init(.{}),
+    provider_cli_catalogs: std.EnumMap(model_provider.ProviderId, gateway_provider.CliModelCatalogProvider) =
+        std.EnumMap(model_provider.ProviderId, gateway_provider.CliModelCatalogProvider).init(.{}),
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -65,6 +81,9 @@ pub const Config = struct {
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     acp_runner: acp_runner.Runner,
+    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 pub fn run(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config) !void {
@@ -386,7 +405,15 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .gateway_provider = cfg.gateway_provider,
-        .provider_set = cfg.provider_set,
+        .codex_agent_stream = cfg.codex_agent_stream,
+        .codex_cli_model_catalog = cfg.codex_cli_model_catalog,
+        .codex_model_catalog = cfg.codex_model_catalog,
+        .grok_agent_stream = cfg.grok_agent_stream,
+        .grok_cli_model_catalog = cfg.grok_cli_model_catalog,
+        .grok_model_catalog = cfg.grok_model_catalog,
+        .provider_streams = cfg.provider_streams,
+        .provider_cli_catalogs = cfg.provider_cli_catalogs,
+        .provider_model_catalogs = cfg.provider_model_catalogs,
         .background_process_provider = cfg.background_process_provider,
         .url_opener = cfg.url_opener,
         .secret_store = cfg.secret_store,
@@ -406,6 +433,9 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
         .acp_runner = cfg.acp_runner,
+        .permission_reviewer_provider = cfg.permission_reviewer_provider,
+        .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
+        .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
     };
 }
 
@@ -504,7 +534,6 @@ fn testConfig() Config {
         .gateway_retry_count = 2,
         .gateway_chat_url = "https://gateway/chat",
         .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .url_opener = host.unavailable_url_opener,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "system" },
@@ -792,9 +821,9 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expectEqualStrings("entry_test_tool", capture.seen_config.?.tool_set.order[0]);
     try std.testing.expectEqualStrings("skills", capture.seen_config.?.skill_root_policy.workspace_roots[0].path);
     try std.testing.expect(capture.seen_config.?.gateway_provider.chat_url.resolve_fn == test_builtin_gateway.chat_url_provider.resolve_fn);
-    try std.testing.expect(capture.seen_config.?.provider_set.gateway.cli_model_catalog.?.fetch_fn == test_builtin_gateway.cli_model_catalog_provider.fetch_fn);
-    try std.testing.expect(capture.seen_config.?.provider_set.gateway.fx_search.?.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
-    try std.testing.expect(capture.seen_config.?.provider_set.gateway.model_catalog.?.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
+    try std.testing.expect(capture.seen_config.?.gateway_provider.cli_model_catalog.fetch_fn == test_builtin_gateway.cli_model_catalog_provider.fetch_fn);
+    try std.testing.expect(capture.seen_config.?.gateway_provider.web_search.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
+    try std.testing.expect(capture.seen_config.?.gateway_provider.model_catalog.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
     try std.testing.expect(
         capture.seen_config.?.background_process_provider.spawn_prepared_fn ==
             cfg.background_process_provider.spawn_prepared_fn,

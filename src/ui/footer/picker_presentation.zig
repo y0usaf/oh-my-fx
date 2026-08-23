@@ -409,7 +409,7 @@ fn composeSignInPickerRow(
         else
             ui_render.dim_style,
     );
-    if (row_index == 2 and source == .chatgpt_subscription) {
+    if (row_index == 2 and credentials.sourceIs(source, .chatgpt_subscription)) {
         const prefix = "   Open   ";
         try row_text.appendClipped(alloc, &row, prefix, width);
         const used: u16 = @intCast(@min(display_width.visibleWidth(prefix), width));
@@ -450,9 +450,9 @@ fn composeSignInPickerRow(
     }
     var label_buf: [512]u8 = undefined;
     const label = switch (row_index) {
-        0 => if (source == .chatgpt_subscription)
+        0 => if (credentials.sourceIs(source, .chatgpt_subscription))
             "   Sign in with Codex"
-        else if (source == .grok_subscription)
+        else if (credentials.sourceIs(source, .grok_subscription))
             "   Sign in with Grok"
         else
             "   Sign in with Vercel",
@@ -461,9 +461,9 @@ fn composeSignInPickerRow(
             &label_buf,
             "   Open   {s}",
             .{snapshot.verification_uri},
-        ) catch if (source == .chatgpt_subscription)
+        ) catch if (credentials.sourceIs(source, .chatgpt_subscription))
             "   Open the Codex authorization page"
-        else if (source == .grok_subscription)
+        else if (credentials.sourceIs(source, .grok_subscription))
             "   Open the Grok authorization page"
         else
             "   Open the Vercel device authorization page",

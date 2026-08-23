@@ -2,6 +2,7 @@ const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
+const model_provider = @import("../../core/config/model_provider.zig");
 const model_capabilities = @import("../../core/config/model_capabilities.zig");
 const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
@@ -85,7 +86,8 @@ pub fn composeModelMenuRow(
 
     const layout = ModelMenuLayout.build(projection, row_count);
     if (projection.load_state == .ready and row_index == header_rows and row_index < layout.row_count - 1) {
-        const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
+        const text = (try loadedCatalogStatusText(alloc, projection.catalog_state)) orelse return row;
+        defer alloc.free(text);
         return composeDimmedRow(alloc, text, width);
     }
     if (projection.load_state != .ready or layout.match_count == 0) {
@@ -334,11 +336,12 @@ fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16
     return composeDimmedRow(alloc, text, width);
 }
 
-fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]const u8 {
-    if (retryableFailureText(state.failure)) |text| return text;
+fn loadedCatalogStatusText(alloc: Allocator, state: model_cache_runtime.ModelMenuCatalogState) !?[]const u8 {
+    if (retryableFailureText(state.failure)) |text| return try alloc.dupe(u8, text);
     if (state.private_models_hidden) {
-        const reason = state.public_only_reason orelse return "Using the public model catalog.";
-        return switch (reason) {
+        const reason = state.public_only_reason orelse
+            return try alloc.dupe(u8, "Using the public model catalog.");
+        const reason_text = switch (reason) {
             .no_credential => "Using the public model catalog; sign in or use an API key for team-private models.",
             .fx_login_team_required => "Choose a Vercel team to load its private models.",
             .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
@@ -347,17 +350,24 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
             .grok_subscription => "Grok models require an authenticated Grok catalog.",
         };
+        return try alloc.dupe(u8, reason_text);
     }
     if (state.access_level == .authenticated) {
-        const source = state.source orelse return "Using an authenticated AI Gateway catalog.";
-        return switch (source) {
+        const source = state.source orelse return try alloc.dupe(u8, "Using an authenticated AI Gateway catalog.");
+        const text = switch (source) {
             .fx_login => "Gateway catalog: authenticated with fx login.",
             .ai_gateway_api_key => "Gateway catalog: authenticated with an API key.",
             .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
             .grok_subscription => "Grok catalog: authenticated with a subscription.",
+            .provider_api_key => |provider| try std.fmt.allocPrint(
+                alloc,
+                "{s} catalog: authenticated with an API key.",
+                .{model_provider.label(provider)},
+            ),
         };
+        return try alloc.dupe(u8, text);
     }
     return null;
 }
@@ -522,10 +532,12 @@ test "model menu states and navigation budget stay bounded" {
 }
 
 test "model menu status follows provenance and retryable failure precedence" {
-    try std.testing.expectEqualStrings(
-        "Gateway catalog: authenticated with fx login.",
-        loadedCatalogStatusText(.{ .access_level = .authenticated, .source = .fx_login }).?,
-    );
+    const alloc = std.testing.allocator;
+    {
+        const text = (try loadedCatalogStatusText(alloc, .{ .access_level = .authenticated, .source = .fx_login })).?;
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("Gateway catalog: authenticated with fx login.", text);
+    }
 
     const cases = [_]struct {
         state: model_cache_runtime.ModelMenuCatalogState,
@@ -543,7 +555,9 @@ test "model menu status follows provenance and retryable failure precedence" {
     };
 
     for (cases) |case| {
-        try std.testing.expectEqualStrings(case.expected, loadedCatalogStatusText(case.state).?);
+        const text = (try loadedCatalogStatusText(alloc, case.state)).?;
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(case.expected, text);
     }
 }
 

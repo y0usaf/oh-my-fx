@@ -60,6 +60,55 @@ The OpenAI Codex route uses ChatGPT subscription access directly and never sends
 
 The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
 
+To use any API-key provider, export its key and select the provider:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+```
+
+```json
+{
+  "provider": "openrouter",
+  "model": "stealth/ox-alpha"
+}
+```
+
+`model` is an id from the active provider's catalog: `fx models` lists it, `/model` switches between entries, and `FX_MODEL` overrides the model for one run. Each provider talks to its own endpoint directly with your key and never sends that key to Vercel AI Gateway or any other provider.
+
+Supported API-key providers and their environment variables:
+
+| Provider | `provider` value | Environment variables |
+|---|---|---|
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` (`ANTHROPIC_OAUTH_TOKEN` wins when set) |
+| OpenAI | `openai` | `OPENAI_API_KEY` |
+| xAI | `xai` | `XAI_API_KEY` |
+| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` |
+| Google Gemini | `google` | `GEMINI_API_KEY` |
+| Google Vertex AI | `google-vertex` | `GOOGLE_CLOUD_API_KEY` (express mode) |
+| Azure OpenAI | `azure-openai` | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_RESOURCE_NAME`, optional `AZURE_OPENAI_BASE_URL` |
+| Amazon Bedrock | `bedrock` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, region via `AWS_REGION` |
+| GitHub Copilot | `github-copilot` | `COPILOT_GITHUB_TOKEN`, or sign in once with the device flow |
+| NVIDIA NIM | `nvidia` | `NVIDIA_API_KEY` |
+| Groq | `groq` | `GROQ_API_KEY` |
+| Cerebras | `cerebras` | `CEREBRAS_API_KEY` |
+| Mistral | `mistral` | `MISTRAL_API_KEY` |
+| MiniMax | `minimax` / `minimax-cn` | `MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` |
+| Moonshot AI | `moonshotai` / `moonshotai-cn` | `MOONSHOT_API_KEY` |
+| Z.ai | `zai` / `zai-coding-cn` | `ZAI_API_KEY` / `ZAI_CODING_CN_API_KEY` |
+| Hugging Face | `huggingface` | `HF_TOKEN` |
+| Fireworks AI | `fireworks` | `FIREWORKS_API_KEY` |
+| Together AI | `together` | `TOGETHER_API_KEY` |
+| OpenCode Zen | `opencode` / `opencode-go` | `OPENCODE_API_KEY` |
+| Kimi for Coding | `kimi-coding` | `KIMI_API_KEY` |
+| Ant Ling | `ant-ling` | `ANT_LING_API_KEY` |
+| Cloudflare Workers AI | `cloudflare-workers-ai` | `CLOUDFLARE_API_KEY`, `CLOUDFLARE_ACCOUNT_ID` |
+| Cloudflare AI Gateway | `cloudflare-ai-gateway` | `CLOUDFLARE_API_KEY`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_GATEWAY_ID` |
+| Xiaomi MiMo | `xiaomi` | `XIAOMI_API_KEY` |
+| Xiaomi Token Plan | `xiaomi-token-plan-cn` / `-ams` / `-sgp` | matching `XIAOMI_TOKEN_PLAN_*_API_KEY` |
+
+Providers with a public model listing fetch live catalogs and fall back to a bundled snapshot; the rest ship curated catalogs. Credentials never cross providers: each request carries only the active provider's own key.
+
 To use an AI Gateway API key instead:
 
 ```bash

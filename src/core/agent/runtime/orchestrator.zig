@@ -1962,7 +1962,7 @@ fn refreshGatewayCredentialForJob(
     const previous_api_key = active_api_key.*;
     if (comptime !host_target.is_wasm) {
         if (deps.usage) |usage| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) {
+            if (credentials.isSubscription(source)) {
                 usage.clearReconciliationCredential();
             } else {
                 usage.refreshReconciliationCredential(
