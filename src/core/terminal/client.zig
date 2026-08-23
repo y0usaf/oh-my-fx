@@ -39,7 +39,16 @@ pub const Completion = struct {
     kind: CompletionKind,
     correlation_id: ?contracts.CorrelationId = null,
     incompatibility: ?contracts.ProtocolIncompatibility = null,
+    missing_capabilities: u64 = 0,
     frame: ?protocol.DecodedFrame = null,
+
+    pub fn is_missing_capability(
+        self: Completion,
+        capability: u64,
+    ) bool {
+        return self.kind == .unavailable and
+            self.missing_capabilities & capability != 0;
+    }
 
     pub fn deinit(self: *Completion) void {
         if (self.frame) |*frame| frame.deinit();
@@ -305,7 +314,7 @@ pub const Runtime = struct {
         }
         self.mutex.unlock(zio);
         const alloc = self.alloc orelse {
-            self.* = .{};
+            self.resetDrainedState();
             return;
         };
         while (self.queue.take()) |intent_value| {
@@ -319,7 +328,25 @@ pub const Runtime = struct {
             completion.deinit();
         }
         self.projection.deinit(alloc);
-        self.* = .{};
+        self.resetDrainedState();
+    }
+
+    noinline fn resetDrainedState(self: *Runtime) void {
+        // The drain above already nulls every owned slot. Reset only the
+        // observable metadata so teardown does not copy the full runtime.
+        self.process_provider = background_process_provider.unavailable_provider;
+        self.mutex = .init;
+        self.wake = .init;
+        self.queue.len = 0;
+        self.completions.len = 0;
+        self.completions.correlated_len = 0;
+        self.thread = null;
+        self.alloc = null;
+        self.stopping = false;
+        self.stop_requested = .init(false);
+        self.active_count = 0;
+        self.next_correlation_value = 1;
+        self.projection = .{};
     }
 
     fn pushCompletionLocked(self: *Runtime, completion: Completion) void {
@@ -592,12 +619,25 @@ fn exchangeConnected(
     intent: *const Intent,
     connected: Connected,
 ) !Completion {
+    const required_capabilities = contracts.required_capabilities(
+        intent.request.value,
+    );
+    const missing_capabilities = required_capabilities &
+        ~connected.negotiated.capabilities;
+    if (missing_capabilities != 0) {
+        return .{
+            .kind = .unavailable,
+            .correlation_id = intent.correlation_id,
+            .missing_capabilities = missing_capabilities,
+        };
+    }
+
     var write_buffer: [4096]u8 = undefined;
     var writer = connected.stream.writer(io_mod.getIo(), &write_buffer);
     var request_frame = try protocol.encodeFrame(
         alloc,
         connected.negotiated.revision,
-        contracts.protocol_capability_authority_generations,
+        required_capabilities,
         intent.correlation_id,
         .{ .request = intent.request.value },
     );
@@ -1245,8 +1285,22 @@ test "runtime deinit owns queued and retained correlations" {
 
     runtime.deinit();
     try std.testing.expect(runtime.alloc == null);
+    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(!runtime.stopping);
+    try std.testing.expect(!runtime.stop_requested.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), runtime.queue.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.completions.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.completions.correlated_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.active_count);
+    try std.testing.expectEqual(@as(usize, 0), runtime.projection.rows.items.len);
+    for (runtime.queue.values) |entry| try std.testing.expect(entry == null);
+    for (runtime.completions.values) |entry| try std.testing.expect(entry == null);
+    for (runtime.live_correlations.values) |entry| try std.testing.expect(entry == null);
+    for (runtime.active) |entry| try std.testing.expect(entry == null);
+
+    try std.testing.expectEqual(@as(u64, 1), runtime.nextCorrelationId().value);
+    runtime.deinit();
+    try std.testing.expectEqual(@as(u64, 1), runtime.nextCorrelationId().value);
 }
 
 test "lazy runtime has no allocation or worker before first admission" {

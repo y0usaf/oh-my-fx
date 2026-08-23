@@ -20,8 +20,6 @@ pub const Composer = struct {
     pasted_blocks: []const paste_blocks.PastedBlock = &.{},
     image_tokens: []const visual_layout.ImageTokenSpan = &.{},
     skill_tokens: []const visual_layout.SkillTokenSpan = &.{},
-    appearance: render_input.InputAppearance,
-    prefix_style: input_presentation.ComposerPrefixStyle,
 };
 
 pub const PaintInput = struct {
@@ -65,8 +63,6 @@ pub fn paint(alloc: Allocator, input: PaintInput) !Paint {
         alloc,
         source,
         layout.composer_window,
-        input.composer.appearance,
-        input.composer.prefix_style,
     );
     defer composer_rows.deinit(alloc);
 
@@ -146,8 +142,6 @@ test "help screen places composer and grouped directory without transcript chrom
         .composer = .{
             .input = "saved",
             .cursor = "saved".len,
-            .appearance = .lines,
-            .prefix_style = input_presentation.ComposerPrefixStyle.rail,
         },
         .clear_display = true,
     });
@@ -185,8 +179,6 @@ test "help screen keeps a selectable command visible at six rows" {
         .composer = .{
             .input = "",
             .cursor = 0,
-            .appearance = .lines,
-            .prefix_style = input_presentation.ComposerPrefixStyle.rail,
         },
         .clear_display = true,
     });
@@ -201,4 +193,43 @@ test "help screen keeps a selectable command visible at six rows" {
     try grid.rowTextTrimmed(4, &row);
     try std.testing.expect(std.mem.find(u8, row.items, "/help") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "●") == null);
+}
+
+test "help screen keeps command descriptions associated at narrow and wide widths" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        cols: u16,
+        description_col: usize,
+    }{
+        .{ .cols = 60, .description_col = 40 },
+        .{ .cols = 160, .description_col = 48 },
+    };
+
+    for (cases) |case| {
+        var screen = try paint(alloc, .{
+            .rows = 16,
+            .cols = case.cols,
+            .help = .{
+                .active = true,
+                .registry = help_screen_test_registry,
+            },
+            .composer = .{
+                .input = "",
+                .cursor = 0,
+            },
+            .clear_display = true,
+        });
+        defer screen.deinit(alloc);
+
+        var grid = try vt_emulator.Grid.init(alloc, case.cols, 16);
+        defer grid.deinit();
+        try grid.feed(screen.bytes);
+
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(alloc);
+        try grid.rowTextTrimmed(6, &row);
+        try std.testing.expect(std.mem.find(u8, row.items, "/help") != null);
+        const description_start = std.mem.find(u8, row.items, "show available").?;
+        try std.testing.expectEqual(case.description_col, description_start);
+    }
 }

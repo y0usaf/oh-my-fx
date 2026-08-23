@@ -21,9 +21,10 @@ import {
 } from "./tmux-helpers";
 import { expectPermissionModeContext } from "./permission-mode-context";
 
-const WARNING = "YOLO enabled: permissions and sandboxing disabled";
+const WARNING = "YOLO enabled: fx permission checks disabled";
 const COMPACT_WARNING = "YOLO: unrestricted";
 const QUIT_HINT = "press ctrl+c again to exit";
+const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
 const TIMEOUT = 30_000;
 const CONFIGURED_SANDBOX = process.platform === "darwin" ? "os" : "none";
 
@@ -56,6 +57,20 @@ function createFixture(prefix: string) {
     workspace: realpathSync(workspace),
     settingsPath: join(home, ".fx", "settings.json"),
   };
+}
+
+async function waitForGatewayRequestCount(
+  fake: { requestCount(): number },
+  expected: number,
+): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (Date.now() < deadline) {
+    if (fake.requestCount() >= expected) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(
+    `Timed out waiting for ${expected} Gateway request(s); received ${fake.requestCount()}`,
+  );
 }
 
 describe("yolo permission mode", () => {
@@ -135,7 +150,7 @@ describe("yolo permission mode", () => {
   );
 
   test(
-    "status reports the effective sandbox while preserving the configured value",
+    "status omits sandbox while preserving the legacy configured value",
     async () => {
       const fixture = createFixture("fx-yolo-status-");
       writeFileSync(
@@ -158,13 +173,62 @@ describe("yolo permission mode", () => {
       });
 
       expect(result.code).toBe(0);
-      expect(JSON.parse(result.stdout.trim())).toMatchObject({
-        permission_mode: "yolo",
-        sandbox: "none",
-      });
+      const status = JSON.parse(result.stdout.trim());
+      expect(status).toMatchObject({ permission_mode: "yolo" });
+      expect(status).not.toHaveProperty("sandbox");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).sandbox).toBe(
         CONFIGURED_SANDBOX,
       );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "legacy sandbox config is inert and ps executes once",
+    async () => {
+      const fixture = createFixture("fx-legacy-sandbox-ps-");
+      const psPath = join(fixture.workspace, "ps.txt");
+      const attemptsPath = join(fixture.workspace, "attempts.txt");
+      writeFileSync(
+        fixture.settingsPath,
+        JSON.stringify({
+          permission_mode: "yolo",
+          sandbox: "os",
+          yolo_acknowledged: true,
+        }) + "\n",
+      );
+
+      const fake = startFakeGateway([
+        fakeGatewayToolCall("legacy_ps", "terminal", {
+          action: "exec",
+          command: `ps -p $$ -o pid= > ${JSON.stringify(psPath)}; printf x >> ${JSON.stringify(attemptsPath)}`,
+        }),
+        fakeGatewayFinalText("LEGACY_PS_DONE"),
+      ]);
+      gateway = fake;
+
+      const result = await runFx(
+        ["ask", "--yolo", "--json", "--no-save", "Run the ps fixture once."],
+        {
+          cwd: fixture.workspace,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-yolo-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: fake.baseUrl,
+            FX_GATEWAY_CHAT_URL: fake.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(readFileSync(psPath, "utf8").trim()).toMatch(/^\d+$/);
+      expect(readFileSync(attemptsPath, "utf8")).toBe("x");
+      expect(fake.classifierRequests).toHaveLength(0);
+      expect(fake.requests).toHaveLength(2);
     },
     TIMEOUT,
   );
@@ -210,7 +274,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       await session.sendText("/settings");
       const settingsPane = await session.waitForText("←→ Change", TIMEOUT);
       expect(settingsPane).toContain("Permission mode");
-      expect(settingsPane).toContain("Command sandbox");
+      expect(settingsPane).not.toContain("Command sandbox");
       await Bun.sleep(4_300);
       expect(await session.capturePane()).toContain("←→ Change");
 
@@ -218,14 +282,6 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       const resumedWarning = await session.waitForText(WARNING, TIMEOUT);
       expect(resumedWarning).toContain("YOLO ·");
 
-      await session.sendText("/sandbox");
-      const sandboxPane = await session.waitForText("←→ Change", TIMEOUT);
-      expect(sandboxPane).toContain("Command sandbox");
-      expect(sandboxPane).not.toContain(WARNING);
-      await Bun.sleep(4_300);
-
-      await session.sendKeys("Escape");
-      await session.waitForText(WARNING, TIMEOUT);
       await Bun.sleep(1_500);
       expect(await session.capturePane()).toContain(WARNING);
       await session.waitForPane((pane) => !pane.includes(WARNING), 3_500);
@@ -240,11 +296,171 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       await session.sendKeys("BTab");
       await session.waitForText("ask ·", TIMEOUT);
       await session.sendText("/status");
-      const statusPane = await session.waitForText(
-        `sandbox=${CONFIGURED_SANDBOX}`,
+      const statusPane = await session.waitForText("agent_step_limit=", TIMEOUT);
+      expect(statusPane).toContain("permission_mode=ask");
+      expect(statusPane).not.toContain("sandbox=");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    45_000,
+  );
+
+  test(
+    "Shift+Tab applies auto to a later tool call in the active turn",
+    async () => {
+      const fixture = createFixture("fx-live-permission-auto-");
+      const markerPath = join(fixture.workspace, "auto-marker.txt");
+      const stderrPath = join(fixture.root, "stderr.log");
+      const tracePath = join(fixture.root, "trace.log");
+      writeFileSync(
+        fixture.settingsPath,
+        JSON.stringify({
+          permission_mode: "ask",
+          sandbox: CONFIGURED_SANDBOX,
+          yolo_acknowledged: true,
+        }) + "\n",
+      );
+      writeFileSync(stderrPath, "");
+
+      let releaseToolCall: (() => void) | undefined;
+      const toolCallGate = new Promise<void>((resolve) => {
+        releaseToolCall = resolve;
+      });
+      const fake = startFakeGateway([
+        async () => {
+          await toolCallGate;
+          return fakeGatewayToolCall("live_auto_command", "terminal", {
+            action: "exec",
+            command: `printf 'LIVE_AUTO_OK\\n' > ${JSON.stringify(markerPath)}`,
+          });
+        },
+        fakeGatewayFinalText("LIVE_AUTO_DONE"),
+      ]);
+      gateway = fake;
+
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-live-permission-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: fake.baseUrl,
+          FX_GATEWAY_CHAT_URL: fake.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_PERMISSION_MODE: undefined,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "permission",
+        },
+      });
+
+      await session.waitForText("ask ·", TIMEOUT);
+      await session.sendText("Run the requested marker command.");
+      await waitForGatewayRequestCount(fake, 1);
+      await session.sendKeys("BTab");
+      await session.waitForText("auto ·", TIMEOUT);
+      releaseToolCall?.();
+
+      const settledPane = await session.waitForPane(
+        (pane) => pane.includes("LIVE_AUTO_DONE") || pane.includes(COMMAND_APPROVAL_PROMPT),
         TIMEOUT,
       );
-      expect(statusPane).toContain("permission_mode=ask");
+      expect(settledPane).toContain("LIVE_AUTO_DONE");
+      expect(settledPane).not.toContain(COMMAND_APPROVAL_PROMPT);
+      expect(readFileSync(markerPath, "utf8")).toBe("LIVE_AUTO_OK\n");
+      expect(fake.classifierRequests).toHaveLength(1);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "tool_name=terminal permission_mode=auto",
+      );
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8"))).toMatchObject({
+        permission_mode: "auto",
+      });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    45_000,
+  );
+
+  test(
+    "Shift+Tab tightening to ask gates a later tool call in the active turn",
+    async () => {
+      const fixture = createFixture("fx-live-permission-ask-");
+      const markerPath = join(fixture.workspace, "ask-marker.txt");
+      const stderrPath = join(fixture.root, "stderr.log");
+      const tracePath = join(fixture.root, "trace.log");
+      writeFileSync(
+        fixture.settingsPath,
+        JSON.stringify({
+          permission_mode: "auto",
+          sandbox: CONFIGURED_SANDBOX,
+          yolo_acknowledged: true,
+        }) + "\n",
+      );
+      writeFileSync(stderrPath, "");
+
+      let releaseToolCall: (() => void) | undefined;
+      const toolCallGate = new Promise<void>((resolve) => {
+        releaseToolCall = resolve;
+      });
+      const fake = startFakeGateway([
+        async () => {
+          await toolCallGate;
+          return fakeGatewayToolCall("live_ask_command", "terminal", {
+            action: "exec",
+            command: `printf 'LIVE_ASK_WRONG\\n' > ${JSON.stringify(markerPath)}`,
+          });
+        },
+        fakeGatewayFinalText("LIVE_ASK_DONE"),
+      ]);
+      gateway = fake;
+
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-live-permission-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: fake.baseUrl,
+          FX_GATEWAY_CHAT_URL: fake.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_PERMISSION_MODE: undefined,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "permission",
+        },
+      });
+
+      await session.waitForText("auto ·", TIMEOUT);
+      await session.sendText("Run the requested marker command.");
+      await waitForGatewayRequestCount(fake, 1);
+      await session.sendKeys("BTab");
+      await session.waitForText("YOLO ·", TIMEOUT);
+      await session.sendKeys("BTab");
+      await session.waitForText("ask ·", TIMEOUT);
+      releaseToolCall?.();
+
+      const settledPane = await session.waitForPane(
+        (pane) => pane.includes(COMMAND_APPROVAL_PROMPT) || pane.includes("LIVE_ASK_DONE"),
+        TIMEOUT,
+      );
+      expect(settledPane).toContain(COMMAND_APPROVAL_PROMPT);
+      expect(settledPane).not.toContain("LIVE_ASK_DONE");
+      expect(existsSync(markerPath)).toBe(false);
+      expect(fake.classifierRequests).toHaveLength(0);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "tool_name=terminal permission_mode=ask",
+      );
+
+      await session.sendKeys("3");
+      await session.waitForText("LIVE_ASK_DONE", TIMEOUT);
+      expect(existsSync(markerPath)).toBe(false);
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8"))).toMatchObject({
+        permission_mode: "ask",
+      });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     45_000,

@@ -6,7 +6,6 @@ const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const context_contract = @import("../workspace/context_contract.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const notification_contract = @import("../notifications/notification_contract.zig");
@@ -18,6 +17,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 
 pub const AgentTurnSettings = struct {
@@ -60,11 +60,12 @@ pub const QueuedPrompt = struct {
     images: []types.ImageAttachment,
     authorized_image_catalog: []types.ImageAttachment = &.{},
     model: []u8,
+    provider: model_provider.ProviderId = .gateway,
     api_key: []u8,
     gateway_team: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
+    account_id: ?[]u8 = null,
     permission_mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind = .none,
     history: []types.HistoryTurn,
     root_user_intent_context: []u8 = &.{},
     grants: []types.PermissionGrant,
@@ -182,7 +183,6 @@ const SnapshotFileOwnershipState = struct {
 
 pub const PermissionSnapshot = struct {
     mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind,
 };
 
 pub const CommandOutputChunk = struct {
@@ -509,7 +509,6 @@ pub const WorkerRuntime = struct {
     pending_question_response: QuestionResponse = .pending,
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
-    active_permission_snapshot: ?PermissionSnapshot = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
 
@@ -1070,6 +1069,12 @@ pub const WorkerRuntime = struct {
         }
     }
 
+    pub fn isProcessing(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.worker_processing;
+    }
+
     pub fn snapshotState(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
@@ -1167,7 +1172,6 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         for (self.queued_prompts.items) |*prompt| {
             prompt.permission_mode = snapshot.mode;
-            prompt.sandbox_backend = snapshot.sandbox_backend;
         }
     }
 
@@ -1203,24 +1207,6 @@ pub const WorkerRuntime = struct {
         return self.active_agent_turn_settings orelse self.agent_turn_settings;
     }
 
-    pub fn setActivePermissionSnapshot(self: *WorkerRuntime, snapshot: PermissionSnapshot) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        self.active_permission_snapshot = snapshot;
-    }
-
-    pub fn clearActivePermissionSnapshot(self: *WorkerRuntime) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        self.active_permission_snapshot = null;
-    }
-
-    pub fn effectivePermissionSnapshot(self: *WorkerRuntime, fallback: PermissionSnapshot) PermissionSnapshot {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        return self.active_permission_snapshot orelse fallback;
-    }
-
     pub fn syncQueuedPromptPermissionState(self: *WorkerRuntime, alloc: std.mem.Allocator, grants: []const types.PermissionGrant, snapshot: PermissionSnapshot) !void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -1229,7 +1215,6 @@ pub const WorkerRuntime = struct {
             types.freePermissionGrantSlice(alloc, prompt.grants);
             prompt.grants = next_grants;
             prompt.permission_mode = snapshot.mode;
-            prompt.sandbox_backend = snapshot.sandbox_backend;
         }
     }
 
@@ -1951,6 +1936,7 @@ pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
     alloc.free(prompt.model);
     secret.zeroAndFree(alloc, prompt.api_key);
     if (prompt.gateway_team) |team| alloc.free(team);
+    if (prompt.account_id) |account_id| alloc.free(account_id);
     types.freeHistoryTurnSlice(alloc, prompt.history);
     if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);
     types.freePermissionGrantSlice(alloc, prompt.grants);
@@ -2949,11 +2935,9 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
-    var first_prompt = try makePrompt(alloc, "first", "old");
-    first_prompt.sandbox_backend = .macos;
+    const first_prompt = try makePrompt(alloc, "first", "old");
     try runtime.enqueuePrompt(alloc, first_prompt);
-    var second_prompt = try makePrompt(alloc, "second", "old");
-    second_prompt.sandbox_backend = .macos;
+    const second_prompt = try makePrompt(alloc, "second", "old");
     try runtime.enqueuePrompt(alloc, second_prompt);
     try std.testing.expectEqual(@as(usize, 2), runtime.queuePreview().count);
 
@@ -2977,19 +2961,15 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     try std.testing.expectEqualStrings("next", runtime.queued_prompts.items[0].model);
     runtime.syncQueuedPromptPermissionSnapshot(.{
         .mode = .ask,
-        .sandbox_backend = .none,
     });
     try std.testing.expectEqual(types.PermissionMode.ask, runtime.queued_prompts.items[0].permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, runtime.queued_prompts.items[0].sandbox_backend);
     try std.testing.expectEqual(types.PermissionMode.auto, job.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, job.sandbox_backend);
 
     const grant_source = try alloc.alloc(types.PermissionGrant, 1);
     defer types.freePermissionGrantSlice(alloc, grant_source);
     grant_source[0] = try makeGrant(alloc, "read_file", "/tmp/a");
     try runtime.syncQueuedPromptPermissionState(alloc, grant_source, .{
         .mode = .auto,
-        .sandbox_backend = .none,
     });
     grant_source[0].tool_name[0] = 'R';
     grant_source[0].target_path[1] = 'T';
@@ -4082,55 +4062,26 @@ test "effectiveAgentTurnSettings prefers active turn settings until cleared" {
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), fallback.effort);
 }
 
-test "effective permission snapshot keeps a held turn pair until cleared" {
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(std.testing.allocator);
-
-    runtime.setActivePermissionSnapshot(.{
-        .mode = .auto,
-        .sandbox_backend = .macos,
-    });
-    const active = runtime.effectivePermissionSnapshot(.{
-        .mode = .ask,
-        .sandbox_backend = .none,
-    });
-    try std.testing.expectEqual(types.PermissionMode.auto, active.mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, active.sandbox_backend);
-
-    runtime.clearActivePermissionSnapshot();
-    const next = runtime.effectivePermissionSnapshot(.{
-        .mode = .ask,
-        .sandbox_backend = .none,
-    });
-    try std.testing.expectEqual(types.PermissionMode.ask, next.mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, next.sandbox_backend);
-}
-
-test "queued permission pair updates from ask to auto without rewriting held turn" {
+test "queued permission mode updates without mutating dequeued fallback" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
     var held_prompt = try makePrompt(alloc, "held", "model");
     held_prompt.permission_mode = .ask;
-    held_prompt.sandbox_backend = .none;
     try runtime.enqueuePrompt(alloc, held_prompt);
     var queued_prompt = try makePrompt(alloc, "queued", "model");
     queued_prompt.permission_mode = .ask;
-    queued_prompt.sandbox_backend = .none;
     try runtime.enqueuePrompt(alloc, queued_prompt);
 
     const active = (try runtime.waitAndTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, active);
     runtime.syncQueuedPromptPermissionSnapshot(.{
         .mode = .auto,
-        .sandbox_backend = .macos,
     });
 
     try std.testing.expectEqual(types.PermissionMode.ask, active.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, active.sandbox_backend);
     try std.testing.expectEqual(types.PermissionMode.auto, runtime.queued_prompts.items[0].permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, runtime.queued_prompts.items[0].sandbox_backend);
 }
 
 test "submitted text only queues while a prompt is active" {

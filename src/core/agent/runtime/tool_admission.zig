@@ -29,6 +29,247 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 const TerminalValidationDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+pub const PermissionActionId = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+const max_turn_permission_denials: usize = 64;
+const max_consecutive_malformed_argument_batches: usize = 3;
+
+const ApprovedAction = struct {
+    authority: command_admission.ToolExecutionAuthority,
+    human_approval: command_admission.HumanApprovalProvenance,
+    consumed: bool = false,
+};
+
+const DeniedAction = struct {
+    request_id: PermissionActionId,
+    exact_id: PermissionActionId,
+    semantic_id: PermissionActionId,
+    call: ToolCall,
+    approval: ?ApprovedAction = null,
+};
+
+pub const TurnPermissionRecovery = struct {
+    denied: std.ArrayList(DeniedAction) = .empty,
+    next_request_sequence: u64 = 1,
+
+    pub fn deinit(self: *TurnPermissionRecovery, alloc: Allocator) void {
+        for (self.denied.items) |entry| types.freeToolCall(alloc, entry.call);
+        self.denied.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn rememberAutoDenial(
+        self: *TurnPermissionRecovery,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        call: ToolCall,
+        outcome: command_admission.PermissionOutcome,
+    ) Allocator.Error!?PermissionActionId {
+        const reason = outcome.denial_reason orelse
+            outcome.decision.denialReason() orelse return null;
+        if (reason != .auto_denied) return null;
+        const exact_id = permissionActionId(call);
+        if (self.indexForExactId(exact_id)) |index| {
+            return self.denied.items[index].request_id;
+        }
+        if (self.denied.items.len == max_turn_permission_denials) return null;
+        const next_sequence = std.math.add(
+            u64,
+            self.next_request_sequence,
+            1,
+        ) catch return null;
+        const request_id = permissionRequestId(self.next_request_sequence);
+        const owned_call = try types.dupeToolCall(alloc, call);
+        errdefer types.freeToolCall(alloc, owned_call);
+        try self.denied.append(alloc, .{
+            .request_id = request_id,
+            .exact_id = exact_id,
+            .semantic_id = try permissionSemanticActionId(
+                alloc,
+                workspace_root,
+                call,
+            ),
+            .call = owned_call,
+        });
+        self.next_request_sequence = next_sequence;
+        return request_id;
+    }
+
+    pub fn deniedCall(
+        self: *const TurnPermissionRecovery,
+        id: PermissionActionId,
+    ) ?ToolCall {
+        const index = self.indexForRequestId(id) orelse return null;
+        return self.denied.items[index].call;
+    }
+
+    pub fn preservedOutcome(
+        self: *const TurnPermissionRecovery,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        call: ToolCall,
+    ) Allocator.Error!?command_admission.PermissionOutcome {
+        const semantic_id = try permissionSemanticActionId(
+            alloc,
+            workspace_root,
+            call,
+        );
+        for (self.denied.items) |entry| {
+            if (std.mem.eql(u8, &entry.semantic_id, &semantic_id)) {
+                return .{
+                    .decision = .deny,
+                    .denial_reason = .auto_denied,
+                };
+            }
+        }
+        return null;
+    }
+
+    pub fn rememberApproval(
+        self: *TurnPermissionRecovery,
+        id: PermissionActionId,
+        authority: command_admission.ToolExecutionAuthority,
+        human_approval: command_admission.HumanApprovalProvenance,
+    ) bool {
+        if (human_approval == .none) return false;
+        const index = self.indexForRequestId(id) orelse return false;
+        self.denied.items[index].approval = .{
+            .authority = authority,
+            .human_approval = human_approval,
+        };
+        return true;
+    }
+
+    pub fn takeApproval(
+        self: *TurnPermissionRecovery,
+        call: ToolCall,
+    ) ?runtime_tool_contracts.LivePermissionRevalidation {
+        const index = self.indexForExactId(permissionActionId(call)) orelse
+            return null;
+        const approval = if (self.denied.items[index].approval) |*value|
+            value
+        else
+            return null;
+        if (approval.consumed) return null;
+        approval.consumed = true;
+        return .{ .action = .{
+            .authority = approval.authority,
+            .human_approval = approval.human_approval,
+        } };
+    }
+
+    fn indexForRequestId(
+        self: *const TurnPermissionRecovery,
+        id: PermissionActionId,
+    ) ?usize {
+        for (self.denied.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, &entry.request_id, &id)) return index;
+        }
+        return null;
+    }
+
+    fn indexForExactId(
+        self: *const TurnPermissionRecovery,
+        id: PermissionActionId,
+    ) ?usize {
+        for (self.denied.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, &entry.exact_id, &id)) return index;
+        }
+        return null;
+    }
+};
+
+pub fn permissionActionId(call: ToolCall) PermissionActionId {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("fx.permission-action.v1\x00");
+    hash.update(call.name);
+    hash.update("\x00");
+    hash.update(call.arguments_json);
+    return hash.finalResult();
+}
+
+fn permissionRequestId(sequence: u64) PermissionActionId {
+    var buffer: [64]u8 = undefined;
+    const rendered = std.fmt.bufPrint(
+        &buffer,
+        "fx.permission-request.v1:{d}",
+        .{sequence},
+    ) catch unreachable;
+    var id: PermissionActionId = undefined;
+    std.crypto.hash.sha2.Sha256.hash(rendered, &id, .{});
+    return id;
+}
+
+fn permissionSemanticActionId(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    call: ToolCall,
+) Allocator.Error!PermissionActionId {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        call.arguments_json,
+        .{},
+    ) catch null;
+    defer if (parsed) |*value| value.deinit();
+    if (parsed) |value| {
+        if (value.value == .object) {
+            const object = value.value.object;
+            if (object.get("command")) |command_value| {
+                if (command_value == .string) {
+                    const command = normalizeRecoveryCommand(
+                        command_value.string,
+                    );
+                    const cwd = if (object.get("cwd")) |cwd_value|
+                        if (cwd_value == .string and
+                            !std.mem.eql(u8, cwd_value.string, "."))
+                            cwd_value.string
+                        else
+                            workspace_root
+                    else
+                        workspace_root;
+                    hash.update("command\x00");
+                    hash.update(command);
+                    hash.update("\x00cwd\x00");
+                    hash.update(cwd);
+                    return hash.finalResult();
+                }
+            }
+        }
+    }
+    return permissionActionId(call);
+}
+
+fn normalizeRecoveryCommand(command: []const u8) []const u8 {
+    var normalized = std.mem.trim(u8, command, " \t\r\n");
+    if (std.mem.endsWith(u8, normalized, " 2>&1")) {
+        normalized = std.mem.trimEnd(
+            u8,
+            normalized[0 .. normalized.len - " 2>&1".len],
+            " \t",
+        );
+    }
+    for ([_][]const u8{
+        "sh -c '",
+        "bash -c '",
+        "zsh -c '",
+        "/bin/sh -c '",
+        "/bin/bash -c '",
+        "/bin/zsh -c '",
+    }) |prefix| {
+        if (std.mem.startsWith(u8, normalized, prefix) and
+            std.mem.endsWith(u8, normalized, "'") and
+            normalized.len > prefix.len)
+        {
+            return std.mem.trim(
+                u8,
+                normalized[prefix.len .. normalized.len - 1],
+                " \t\r\n",
+            );
+        }
+    }
+    return normalized;
+}
 
 const TerminalValidationDigestDecision = struct {
     append_current: bool,
@@ -105,6 +346,86 @@ pub const TerminalValidationRetryState = struct {
     }
 };
 
+pub const MalformedArgumentsRetryState = struct {
+    consecutive_malformed_batches: usize = 0,
+    current_call_count: usize = 0,
+    current_malformed_count: usize = 0,
+
+    pub fn beginBatch(self: *MalformedArgumentsRetryState) void {
+        self.current_call_count = 0;
+        self.current_malformed_count = 0;
+    }
+
+    pub fn observe(self: *MalformedArgumentsRetryState, call: ToolCall) void {
+        self.current_call_count += 1;
+        if (call.argument_integrity != .malformed_json) return;
+        self.current_malformed_count += 1;
+    }
+
+    pub fn finishBatch(self: *MalformedArgumentsRetryState) bool {
+        const all_malformed = self.current_call_count > 0 and
+            self.current_call_count == self.current_malformed_count;
+        if (!all_malformed) {
+            self.consecutive_malformed_batches = 0;
+            return false;
+        }
+        if (self.consecutive_malformed_batches < max_consecutive_malformed_argument_batches) {
+            self.consecutive_malformed_batches += 1;
+        }
+        return self.consecutive_malformed_batches == max_consecutive_malformed_argument_batches;
+    }
+};
+
+test "malformed arguments retry state stops consecutive all-malformed batches" {
+    const malformed_read: ToolCall = .{
+        .id = "read-1",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    };
+    const malformed_fetch: ToolCall = .{
+        .id = "fetch-1",
+        .name = "web_fetch",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    };
+    const valid_read: ToolCall = .{
+        .id = "read-valid",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    };
+
+    var state: MalformedArgumentsRetryState = .{};
+    state.beginBatch();
+    state.observe(malformed_read);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_fetch);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_fetch);
+    try std.testing.expect(state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_fetch);
+    state.observe(valid_read);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_read);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_read);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    state.observe(malformed_read);
+    try std.testing.expect(state.finishBatch());
+}
+
 test "terminal validation retry state retains independent batch corrections" {
     const alloc = std.testing.allocator;
     const correction_s = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
@@ -144,6 +465,63 @@ test "terminal validation retry state retains independent batch corrections" {
     try state.observe(alloc, call, correction_s);
     try std.testing.expectEqual(@as(usize, 2), state.current.items.len);
     try std.testing.expect(state.finishBatch());
+}
+
+test "turn permission recovery binds approval exactly and deduplicates static wrappers" {
+    const alloc = std.testing.allocator;
+    var state: TurnPermissionRecovery = .{};
+    defer state.deinit(alloc);
+    const direct: ToolCall = .{
+        .id = "direct",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"git push origin HEAD\"}",
+    };
+    const wrapped: ToolCall = .{
+        .id = "wrapped",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"sh -c 'git push origin HEAD'\"}",
+    };
+    const changed: ToolCall = .{
+        .id = "changed",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"git push origin main\"}",
+    };
+    const request_id = (try state.rememberAutoDenial(
+        alloc,
+        "/workspace",
+        direct,
+        .{ .decision = .deny, .denial_reason = .auto_denied },
+    )) orelse return error.TestExpectedPermissionRequest;
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &request_id,
+        &permissionActionId(direct),
+    ));
+    try std.testing.expect(state.deniedCall(request_id) != null);
+    try std.testing.expect((try state.preservedOutcome(
+        alloc,
+        "/workspace",
+        wrapped,
+    )) != null);
+    try std.testing.expect((try state.preservedOutcome(
+        alloc,
+        "/workspace",
+        changed,
+    )) == null);
+
+    try std.testing.expect(state.rememberApproval(
+        request_id,
+        .ordinary,
+        .once,
+    ));
+    const first = state.takeApproval(direct) orelse
+        return error.TestExpectedPermissionApproval;
+    try std.testing.expectEqual(
+        command_admission.HumanApprovalProvenance.once,
+        first.action.human_approval,
+    );
+    try std.testing.expect(state.takeApproval(direct) == null);
+    try std.testing.expect(state.takeApproval(changed) == null);
 }
 
 /// Human denials retained only for the current agent turn. Entries use the
@@ -299,7 +677,7 @@ fn tracePermissionRequest(
     target_class: []const u8,
     ctx: TraceContext,
 ) void {
-    debug_trace.eventf("permission", "before_permission_wait", ctx, "call_id={s} tool_name={s} permission_mode={s} local_grants={d} outside_workspace={s} sandbox_outcome=not_applicable", .{ call.id, call.name, @tagName(mode), local_grant_count, target_class });
+    debug_trace.eventf("permission", "before_permission_wait", ctx, "call_id={s} tool_name={s} permission_mode={s} local_grants={d} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), local_grant_count, target_class });
     debug_trace.eventf("permission", "permission_requested", ctx, "call_id={s} tool_name={s} permission_mode={s} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), target_class });
 }
 
@@ -335,55 +713,6 @@ fn tracePermissionOutcome(
         debug_trace.eventf("permission", "after_permission_decision", ctx, "call_id={s} tool_name={s} permission_mode={s} decision={s} approval_source={s} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), permissionDecisionName(outcome.decision), source, target_class });
         debug_trace.eventf("permission", "permission_decision", ctx, "call_id={s} tool_name={s} permission_mode={s} decision={s} approval_source={s} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), permissionDecisionName(outcome.decision), source, target_class });
     }
-}
-
-pub fn requestSandboxWideningTraced(
-    hooks: *const AgentRuntimeDeps,
-    arena: Allocator,
-    call: ToolCall,
-    review_turn: permission_auto_classifier.ReviewTurnContext,
-    mode: PermissionMode,
-    local_grants: []const PermissionGrant,
-    live_authority: ?runtime_tool_contracts.LiveToolAuthority,
-    advertised_dynamic_tool_names: []const []const u8,
-    required: runtime_tool_contracts.SandboxScopeRequired,
-    cancel_flag: *std.atomic.Value(bool),
-    ctx: TraceContext,
-) !command_admission.PermissionOutcome {
-    debug_trace.eventf(
-        "permission",
-        "sandbox_widening_requested",
-        ctx,
-        "call_id={s} tool_name={s} phase={s}",
-        .{ call.id, call.name, @tagName(required.phase) },
-    );
-    const outcome = try hooks.request_sandbox_widening(
-        hooks.ctx,
-        arena,
-        call,
-        review_turn,
-        mode,
-        local_grants,
-        live_authority,
-        advertised_dynamic_tool_names,
-        required,
-    );
-    debug_trace.eventf(
-        "permission",
-        "sandbox_widening_decision",
-        ctx,
-        "call_id={s} tool_name={s} phase={s} decision={s}",
-        .{
-            call.id,
-            call.name,
-            @tagName(required.phase),
-            permissionDecisionName(outcome.decision),
-        },
-    );
-    if (outcome.decision.isDenied() and cancel_flag.load(.seq_cst)) {
-        return error.Cancelled;
-    }
-    return outcome;
 }
 
 fn classifyPermissionTarget(hooks: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8, workspace_root: []const u8) []const u8 {
@@ -745,9 +1074,6 @@ pub fn applyInitialSessionGrants(
         target_kind,
     );
     for (grants) |grant| {
-        // A broader sandbox retry is a separate scope and must receive its own
-        // decision. Only that widening decision may retain a sandbox grant.
-        if (std.mem.eql(u8, grant.tool_name, "sandbox")) continue;
         try appendLocalGrant(arena, local_grants, grant);
         try propagateGrant(hooks, grant);
     }

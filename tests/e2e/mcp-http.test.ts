@@ -65,7 +65,7 @@ function createRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "minimal" }),
+    JSON.stringify({}),
   );
   writeFileSync(
     join(home, ".fx", "mcp.json"),
@@ -508,9 +508,22 @@ describe("modern MCP Streamable HTTP", () => {
     expect(bodies).toContain('\\"trust\\":\\"untrusted_external\\"');
     expect(bodies).toContain("HTTP_RESOURCE_TEXT");
     expect(bodies).toContain("HTTP_PROMPT_TEXT");
-    expect(fixture.requests.filter((entry) =>
+    const resourceReads = fixture.requests.filter((entry) =>
       entry.message.method === "resources/read"
-    )).toHaveLength(2);
+    );
+    expect(resourceReads).toHaveLength(2);
+    for (const entry of resourceReads) {
+      expect(entry.headers["mcp-name"]).toBe("custom://alpha");
+    }
+    const promptGet = fixture.requests.find((entry) =>
+      entry.message.method === "prompts/get"
+    );
+    expect(promptGet?.headers["mcp-name"]).toBe("review");
+    for (const entry of fixture.requests.filter((request) =>
+      ["resources/list", "prompts/list"].includes(request.message.method)
+    )) {
+      expect(entry.headers["mcp-name"]).toBeUndefined();
+    }
     expect(fixture.requests.filter((entry) =>
       entry.message.method === "completion/complete"
     )).toHaveLength(1);
@@ -1395,7 +1408,7 @@ describe("modern MCP Streamable HTTP", () => {
 
       const reloadStarted = Date.now();
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP profile reloaded (ready, runtime ", 5_000);
+      await tui.waitForText("MCP configuration reloaded successfully.", 5_000);
       const cancelDeadline = Date.now() + 5_000;
       while (fixture.cancelledCalls === 0 && Date.now() < cancelDeadline) {
         await Bun.sleep(25);

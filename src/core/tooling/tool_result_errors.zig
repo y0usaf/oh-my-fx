@@ -117,6 +117,34 @@ const adapter_semantic_failure_prefixes = [_][]const u8{
 };
 
 pub fn toolPermissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason: types.ToolPermissionDenialReason) Allocator.Error![]u8 {
+    return toolPermissionDeniedJsonOptionalRequest(
+        alloc,
+        tool_name,
+        reason,
+        null,
+    );
+}
+
+pub fn toolPermissionDeniedJsonWithRequestId(
+    alloc: Allocator,
+    tool_name: []const u8,
+    reason: types.ToolPermissionDenialReason,
+    approval_request_id: []const u8,
+) Allocator.Error![]u8 {
+    return toolPermissionDeniedJsonOptionalRequest(
+        alloc,
+        tool_name,
+        reason,
+        approval_request_id,
+    );
+}
+
+fn toolPermissionDeniedJsonOptionalRequest(
+    alloc: Allocator,
+    tool_name: []const u8,
+    reason: types.ToolPermissionDenialReason,
+    approval_request_id: ?[]const u8,
+) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
@@ -126,8 +154,17 @@ pub fn toolPermissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason:
     writeMaskedJsonString(alloc, &out.writer, permissionDeniedMessage(tool_name, reason)) catch return error.OutOfMemory;
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
     std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch return error.OutOfMemory;
-    out.writer.writeAll(",\"denied\":true,\"suggestion\":") catch return error.OutOfMemory;
-    writeMaskedJsonString(alloc, &out.writer, permissionDeniedSuggestion(reason)) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"denied\":true") catch return error.OutOfMemory;
+    if (approval_request_id) |request_id| {
+        out.writer.writeAll(",\"approval_request_id\":") catch return error.OutOfMemory;
+        std.json.Stringify.value(request_id, .{}, &out.writer) catch return error.OutOfMemory;
+    }
+    out.writer.writeAll(",\"suggestion\":") catch return error.OutOfMemory;
+    writeMaskedJsonString(
+        alloc,
+        &out.writer,
+        permissionDeniedSuggestion(reason, approval_request_id != null),
+    ) catch return error.OutOfMemory;
     out.writer.writeAll("}}") catch return error.OutOfMemory;
 
     return try out.toOwnedSlice();
@@ -136,7 +173,7 @@ pub fn toolPermissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason:
 fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDenialReason) []const u8 {
     return switch (reason) {
         .user_denied => "Permission denied by user",
-        .auto_denied => "Permission denied by auto mode classifier",
+        .auto_denied => "Blocked by automatic safety policy",
         .policy_denied => if (is_network_tool(tool_name))
             "Network or browser access was denied by configured policy"
         else
@@ -151,10 +188,16 @@ fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDe
     };
 }
 
-fn permissionDeniedSuggestion(reason: types.ToolPermissionDenialReason) []const u8 {
+fn permissionDeniedSuggestion(
+    reason: types.ToolPermissionDenialReason,
+    action_bound_request_available: bool,
+) []const u8 {
     return switch (reason) {
         .user_denied => "The tool did not run. Do not retry unchanged; explain the denial or use a safer allowed alternative.",
-        .auto_denied => "The tool did not run. Do not retry unchanged or ask the user for approval. Replan autonomously with a materially different safe action or an existing deterministic safe tool; fx will use its human approval channel after bounded recovery.",
+        .auto_denied => if (action_bound_request_available)
+            "The tool did not run. Do not retry it unchanged. Use a materially different safe action, or ask the user through ask_user_question with the exact approval_request_id. Generic question text cannot authorize the action."
+        else
+            "The tool did not run. Do not retry unchanged. Replan autonomously with a materially different safe action or explain the blocker and stop.",
         .policy_denied => "The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
         .permission_required => "The tool did not run. Noninteractive mode cannot show an approval prompt. Rerun interactively to approve, or configure a narrow permission rule before retrying.",
     };
@@ -273,9 +316,9 @@ pub fn filesystemAccessDeniedJson(
 
 fn filesystemAccessDeniedSuggestion() []const u8 {
     if (builtin.os.tag == .macos) {
-        return "Do not retry this path unchanged or propose a symlink. Fx permissions and /sandbox none cannot override the operating system. If the path is in a protected folder such as Desktop, Documents, or Downloads, ask the user to grant the terminal app Files and Folders or Full Disk Access. Otherwise, ask the user to correct OS filesystem permissions or move/copy the project to an accessible location.";
+        return "Do not retry this path unchanged or propose a symlink. fx permissions cannot override the operating system. If the path is in a protected folder such as Desktop, Documents, or Downloads, ask the user to grant the terminal app Files and Folders or Full Disk Access. Otherwise, ask the user to correct OS filesystem permissions or move/copy the project to an accessible location.";
     }
-    return "Do not retry this path unchanged or propose a symlink. Fx permissions and /sandbox none cannot override the operating system. Ask the user to correct OS filesystem permissions or move/copy the project to an accessible location.";
+    return "Do not retry this path unchanged or propose a symlink. fx permissions cannot override the operating system. Ask the user to correct OS filesystem permissions or move/copy the project to an accessible location.";
 }
 
 pub fn malformedToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Allocator.Error![]u8 {
@@ -389,6 +432,31 @@ test "tool permission denied JSON carries stable fields only" {
     try std.testing.expect(isToolPermissionDeniedOutput(payload));
 }
 
+test "auto denial can carry an opaque action-bound approval request id" {
+    const alloc = std.testing.allocator;
+    const request_id = "0123456789abcdef" ** 4;
+    const payload = try toolPermissionDeniedJsonWithRequestId(
+        alloc,
+        "terminal",
+        .auto_denied,
+        request_id,
+    );
+    defer alloc.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    const error_obj = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(
+        request_id,
+        error_obj.get("approval_request_id").?.string,
+    );
+    try std.testing.expect(std.mem.find(
+        u8,
+        error_obj.get("suggestion").?.string,
+        "ask_user_question",
+    ) != null);
+}
+
 test "tool permission denied JSON explains policy and headless blockers" {
     const alloc = std.testing.allocator;
     const auto_payload = try toolPermissionDeniedJson(alloc, "write_file", .auto_denied);
@@ -410,10 +478,10 @@ test "tool permission denied JSON explains policy and headless blockers" {
     defer web_search.deinit();
 
     const auto_error = auto_denied.value.object.get("error").?.object;
-    try std.testing.expectEqualStrings("Permission denied by auto mode classifier", auto_error.get("message").?.string);
+    try std.testing.expectEqualStrings("Blocked by automatic safety policy", auto_error.get("message").?.string);
     try std.testing.expectEqualStrings("auto_denied", auto_error.get("reason").?.string);
     try std.testing.expectEqualStrings(
-        "The tool did not run. Do not retry unchanged or ask the user for approval. Replan autonomously with a materially different safe action or an existing deterministic safe tool; fx will use its human approval channel after bounded recovery.",
+        "The tool did not run. Do not retry unchanged. Replan autonomously with a materially different safe action or explain the blocker and stop.",
         auto_error.get("suggestion").?.string,
     );
     try std.testing.expectEqual(
@@ -517,7 +585,7 @@ test "filesystem access denial JSON preserves recovery details" {
         try std.testing.expectEqualStrings(@errorName(err), details.get("error").?.string);
         try std.testing.expect(std.mem.find(u8, suggestion, "Do not retry") != null);
         try std.testing.expect(std.mem.find(u8, suggestion, "symlink") != null);
-        try std.testing.expect(std.mem.find(u8, suggestion, "/sandbox none") != null);
+        try std.testing.expect(std.mem.find(u8, suggestion, "fx permissions") != null);
         if (builtin.os.tag == .macos) {
             try std.testing.expect(std.mem.find(u8, suggestion, "If the path is in a protected folder") != null);
             try std.testing.expect(std.mem.find(u8, suggestion, "Files and Folders") != null);

@@ -137,7 +137,49 @@ function fakeGatewayStreamingText(lines: string[], delayMs: number) {
 }
 
 describe("fx ask presentation", () => {
-  test("fresh binary defaults terminal exec and start to the user profile", async () => {
+  test("redirected command output separates the next tool header", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewaySse([
+        {
+          type: "tool-call",
+          toolCallId: "no-final-newline",
+          toolName: "terminal",
+          input: { action: "exec", command: "printf no-final-newline" },
+        },
+        {
+          type: "tool-call",
+          toolCallId: "next-command",
+          toolName: "terminal",
+          input: { action: "exec", command: "printf 'next-output\\n'" },
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: "tool-calls" },
+        },
+      ]),
+      fakeGatewayFinalText("Commands complete.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "--no-color", "Run both commands."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain(
+      "no-final-newline\nRunning printf 'next-output\\n'\nnext-output\n",
+    );
+    expect(result.stderr).not.toContain("no-final-newlineRunning printf");
+    expect(JSON.parse(result.stdout).output).toBe("Commands complete.\n");
+  }, TIMEOUT);
+
+  test("no-save advertises exec only and preserves terminal exec profiles", async () => {
     const configuredShell = userInfo().shell;
     if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
 
@@ -170,6 +212,7 @@ describe("fx ask presentation", () => {
       "case :\"$PATH\": in *:\"$HOME/profile-bin\":*) printf 'path-user:';; *) printf 'path-clean:';; esac; " +
       "if alias fx_profile_alias >/dev/null 2>&1; then fx_profile_alias; else printf no-alias; fi; printf ':'; " +
       "if command -v fx_profile_function >/dev/null; then fx_profile_function; else printf no-function; fi";
+    const nestedExecMarker = join(root.workspace, "nested-no-save-ran");
     const gateway = startFakeGateway([
       fakeGatewayToolCall("terminal-omitted", "terminal", {
         action: "exec",
@@ -185,27 +228,23 @@ describe("fx ask presentation", () => {
         command: profileCommand,
         profile: "user",
       }),
-      fakeGatewayToolCall("terminal-start-omitted", "terminal", {
+      fakeGatewayToolCall("terminal-stale-start", "terminal", {
         action: "start",
-        command: profileCommand,
+        command: "printf should-not-start",
         return_when: { kind: "exit" },
         wait_ceiling_ms: 8_000,
       }),
-      fakeGatewayToolCall("terminal-start-clean", "terminal", {
-        action: "start",
-        command: profileCommand,
-        profile: "clean",
-        return_when: { kind: "exit" },
-        wait_ceiling_ms: 8_000,
+      fakeGatewayToolCall("terminal-nested-exec", "terminal", {
+        request: {
+          action: "exec",
+          command: `printf nested > ${JSON.stringify(nestedExecMarker)}`,
+        },
       }),
-      fakeGatewayToolCall("terminal-start-user", "terminal", {
-        action: "start",
-        command: profileCommand,
-        profile: "user",
-        return_when: { kind: "exit" },
-        wait_ceiling_ms: 8_000,
+      fakeGatewayToolCall("terminal-neighbor-exec", "terminal", {
+        action: "exec",
+        command: "printf neighbor-exec",
       }),
-      fakeGatewayFinalText("Terminal exec profiles verified.\n"),
+      fakeGatewayFinalText("Terminal no-save profiles verified.\n"),
     ]);
     gateways.push(gateway);
 
@@ -219,31 +258,88 @@ describe("fx ask presentation", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout).output).toBe("Terminal exec profiles verified.\n");
+    const output = JSON.parse(result.stdout) as {
+      output: string;
+      tool_calls: Array<{ name: string; status: string }>;
+    };
+    expect(output.output).toBe("Terminal no-save profiles verified.\n");
+    expect(output.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
+      { name: "terminal", status: "success" },
+      { name: "terminal", status: "success" },
+      { name: "terminal", status: "success" },
+      { name: "terminal", status: "error" },
+      { name: "terminal", status: "error" },
+      { name: "terminal", status: "success" },
+    ]);
     expect(gateway.requests).toHaveLength(7);
-    expect(gateway.requests[0]!.body).toContain(
-      "omitting profile is identical to profile=user",
+
+    const firstRequest = JSON.parse(gateway.requests[0]!.body) as {
+      tools: Array<{
+        name?: string;
+        description?: string;
+        inputSchema?: {
+          properties?: Record<string, {
+            enum?: string[];
+            description?: string;
+          }>;
+          required?: string[];
+          additionalProperties?: boolean;
+        };
+      }>;
+    };
+    const terminalTool = firstRequest.tools.find(({ name }) => name === "terminal");
+    expect(terminalTool?.description).toBe(
+      "Run one captured command and return its result.",
     );
-    expect(gateway.requests[0]!.body).toContain(
-      "omission defaults to user, while clean skips user startup files",
+    const terminalSchema = terminalTool?.inputSchema;
+    expect(terminalSchema?.properties?.action?.enum).toEqual(["exec"]);
+    expect(Object.keys(terminalSchema?.properties ?? {})).toEqual([
+      "action",
+      "command",
+      "cwd",
+      "profile",
+    ]);
+    expect(terminalSchema?.required).toEqual(["action", "command", "cwd", "profile"]);
+    expect(terminalSchema?.additionalProperties).toBe(false);
+    expect(terminalSchema?.properties?.command?.description).toBe(
+      "Command to run. Set null when the selected action does not use this field.",
     );
-    expect(gateway.requests[0]!.body).toContain(
-      "User-profile execution supports the configured Bash or zsh login shell",
+    expect(terminalSchema?.properties?.cwd?.description).toBe(
+      "Working directory; defaults to the workspace. Set null when the selected action does not use this field.",
     );
-    expect(gateway.requests[0]!.body).toContain(
-      ".bashrc is available only when sourced by the login profile",
+    expect(terminalSchema?.properties?.profile?.description).toBe(
+      "Profile for exec; omission defaults to user, while clean skips user initialization files. User execution supports the configured Bash or zsh login shell. Bash login execution reads login initialization files; .bashrc is available only when sourced by the login profile. Set null when the selected action does not use this field.",
     );
-    expect(gateway.requests[0]!.body).not.toContain(
-      "omission preserves legacy command behavior",
-    );
-    for (const requestIndex of [1, 3, 4, 6]) {
+    const serializedTerminalTool = JSON.stringify(terminalTool);
+    expect(serializedTerminalTool).not.toContain("Use start");
+    expect(serializedTerminalTool).not.toContain("Other actions");
+    expect(serializedTerminalTool).not.toContain("durable");
+
+    for (const requestIndex of [1, 3]) {
       expect(gateway.requests[requestIndex]!.body).toContain("mode=login:rc:path-user:");
       expect(gateway.requests[requestIndex]!.body).toContain("alias-user:function-user");
     }
-    for (const requestIndex of [2, 5]) {
-      expect(gateway.requests[requestIndex]!.body).toContain("mode=unset:unset:path-clean:");
-      expect(gateway.requests[requestIndex]!.body).toContain("no-alias:no-function");
-    }
+    expect(gateway.requests[2]!.body).toContain("mode=unset:unset:path-clean:");
+    expect(gateway.requests[2]!.body).toContain("no-alias:no-function");
+    expect(gateway.requests[4]!.body).toContain("tool_execution_failed");
+    expect(gateway.requests[4]!.body).toContain(
+      "Durable terminal actions require a saved fx session.",
+    );
+    expect(gateway.requests[4]!.body).toContain(
+      "Use terminal.exec, or rerun without --no-save.",
+    );
+    expect(gateway.requests[4]!.body).not.toContain("authority_denied");
+    expect(gateway.requests[4]!.body).not.toContain("tool_permission_denied");
+    expect(gateway.requests[5]!.body).toContain(
+      "terminal arguments must match the advertised action schema",
+    );
+    expect(gateway.requests[5]!.body).not.toContain("tool_permission_denied");
+    expect(gateway.requests[5]!.body).toContain('"request"');
+    expect(existsSync(nestedExecMarker)).toBe(false);
+    expect(gateway.requests[6]!.body).toContain("neighbor-exec");
+    expect(
+      existsSync(join(root.home, ".fx", "terminal-host", "host.json")),
+    ).toBe(false);
   }, TIMEOUT);
 
   test.skipIf(!tmuxAvailable())(
@@ -284,7 +380,9 @@ describe("fx ask presentation", () => {
 
       expect(result.code).toBe(0);
       expect(result.stdout).toBe("Ask public terminal complete.\n");
-      expect(result.stderr).toContain("Using terminal start");
+      expect(result.stderr).toContain("Starting printf ASK_PUBLIC_TERMINAL_TMUX");
+      expect(result.stderr).not.toContain("Using terminal");
+      expect(result.stderr).not.toContain("Preparing command");
       expect(result.stderr).not.toContain("failed");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).toContain(toolCallId);
@@ -385,6 +483,45 @@ describe("fx ask presentation", () => {
       expect(pane).not.toContain("# Ask presentation");
       expect(pane).not.toContain("**bold**");
       expect(escaped).toContain("\x1b[");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "memory list is presented as a read-only tool call",
+    async () => {
+      const root = createRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("memory_list", "memory", { action: "list" }),
+        fakeGatewayFinalText("Memory list complete.\n"),
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        cmd: terminalCommand([
+          "ask",
+          "--auto",
+          "--no-save",
+          "List saved memories.",
+        ]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const pane = await session.captureFullScrollback();
+      expect(pane).toContain("● 1 tool call · 1 read");
+      expect(pane).toContain("Listing memories");
+      expect(pane).not.toContain("1 write");
+      expect(pane).not.toContain("Remembered list");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );

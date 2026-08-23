@@ -108,7 +108,7 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
                 "Interactive MCP authentication is unavailable here.",
                 false,
             );
-        var authentication = authenticate(
+        const authentication = authenticate(
             command_request.auth_ctx orelse command_request.list_ctx,
             name,
         ) catch |err| {
@@ -118,17 +118,16 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
                 false,
             );
         };
-        defer authentication.deinit();
         return switch (authentication) {
-            .authenticated => lineParts(
+            .started => lineParts(
                 alloc,
-                &.{ "Authenticated MCP server '", name, "'." },
-                true,
+                &.{ "Waiting for MCP authentication for '", name, "'. You can continue using fx while the browser flow completes." },
+                false,
             ),
-            .issuer_mismatch => |mismatch| issuerMismatchResult(
+            .busy => lineParts(
                 alloc,
-                name,
-                mismatch,
+                &.{ "MCP authentication for '", name, "' is already in progress or MCP configuration is reloading." },
+                false,
             ),
         };
     }
@@ -150,6 +149,13 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
                 false,
             );
         };
+        if (result.busy) {
+            return lineParts(
+                alloc,
+                &.{ "MCP authentication for '", name, "' is still in progress. Wait for it to finish before logging out." },
+                false,
+            );
+        }
         if (!result.removed) {
             return lineParts(
                 alloc,
@@ -173,7 +179,13 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             return lineLiteral(alloc, "Usage: /mcp remove <name>", false);
         }
 
-        const removed = removeServerFromPath(alloc, config_path, name) catch false;
+        const removed = removeServerFromPath(alloc, config_path, name) catch |err| {
+            return lineParts(
+                alloc,
+                &.{ "Failed to remove MCP server '", name, "': ", @errorName(err), "." },
+                false,
+            );
+        };
         if (!removed) {
             return lineParts(alloc, &.{ "MCP server '", name, "' not found." }, false);
         }
@@ -191,8 +203,12 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             return lineLiteral(alloc, "Usage: /mcp add <name> <command> [args...]", false);
         }
 
-        addOrReplaceLocalServer(alloc, config_path, tokens.items[0], tokens.items[1..]) catch {
-            return lineLiteral(alloc, "Failed to save MCP server config.", false);
+        addOrReplaceLocalServer(alloc, config_path, tokens.items[0], tokens.items[1..]) catch |err| {
+            return lineParts(
+                alloc,
+                &.{ "Failed to save MCP server config: ", @errorName(err), "." },
+                false,
+            );
         };
         return lineParts(alloc, &.{ "Saved MCP server '", tokens.items[0], "'." }, true);
     }
@@ -327,28 +343,6 @@ fn lineLiteral(alloc: Allocator, text: []const u8, reload: bool) !CommandResult 
 // string splice.
 fn lineParts(alloc: Allocator, parts: []const []const u8, reload: bool) !CommandResult {
     return .{ .display = .{ .line = try std.mem.concat(alloc, u8, parts) }, .reload = reload };
-}
-
-fn issuerMismatchResult(
-    alloc: Allocator,
-    server_name: []const u8,
-    mismatch: mcp_auth.IssuerMismatch,
-) !CommandResult {
-    var expected = try text_utils.encodeTerminalSafe(alloc, mismatch.expected, 1024);
-    defer expected.deinit(alloc);
-    var returned = try text_utils.encodeTerminalSafe(alloc, mismatch.returned, 1024);
-    defer returned.deinit(alloc);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try out.writer.print("MCP authentication for '{s}' was rejected: expected issuer ", .{server_name});
-    try std.json.Stringify.value(expected.bytes, .{}, &out.writer);
-    try out.writer.writeAll(" but metadata returned ");
-    try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
-    try out.writer.writeAll(". Add \"oauth\":{\"issuer\":");
-    try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
-    try out.writer.writeAll("} to this server's entry in ~/.fx/mcp.json and retry.");
-    return .{ .display = .{ .line = try out.toOwnedSlice() } };
 }
 
 pub fn configPathFromHome(alloc: Allocator, home: []const u8) ![]u8 {
@@ -503,10 +497,16 @@ fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpSer
     const json = try renderConfigJson(alloc, configs);
     defer alloc.free(json);
 
-    if (std.fs.path.dirname(path)) |parent| ensureDir(parent);
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), json);
+    const parent = std.fs.path.dirname(path) orelse return error.McpConfigPathInvalid;
+    const grandparent = std.fs.path.dirname(parent) orelse return error.McpConfigPathInvalid;
+
+    var enclosing = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), grandparent, .{ .iterate = true }),
+    };
+    defer enclosing.close();
+    var dir = try io_mod.openOrCreateVerifiedPrivateDir(&enclosing, std.fs.path.basename(parent));
+    defer dir.close();
+    try io_mod.durableReplaceVerified(alloc, &dir, std.fs.path.basename(path), json);
 }
 
 fn freeConfigs(alloc: Allocator, configs: *std.ArrayList(McpServerConfig)) void {
@@ -1157,18 +1157,6 @@ fn isValidServerName(name: []const u8) bool {
     return true;
 }
 
-fn ensureDir(path: []const u8) void {
-    std.Io.Dir.createDirAbsolute(io_mod.getIo(), path, .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => {
-            if (std.fs.path.dirname(path)) |parent| {
-                ensureDir(parent);
-                std.Io.Dir.createDirAbsolute(io_mod.getIo(), path, .default_dir) catch {};
-            }
-        },
-    };
-}
-
 var stable_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
@@ -1263,6 +1251,58 @@ fn tmpRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
 
 fn tmpPath(alloc: Allocator, root: []const u8, name: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ root, name });
+}
+
+test "saving MCP config replaces the file durably" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const original = "{\"mcp\":{\"stale\":{\"command\":\"echo\"}}}";
+    try writeTempFile(&tmp, "home/.fx/mcp.json", original);
+    const path = try tmpDirPath(alloc, tmp.dir, "home/.fx/mcp.json");
+    defer alloc.free(path);
+
+    var fx_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+    defer fx_dir.close(io_mod.getIo());
+
+    // Seed a group-readable mode so the 0600 assertion below cannot pass just
+    // because the developer's umask already produced it.
+    {
+        var seed = try fx_dir.openFile(io_mod.getIo(), "mcp.json", .{ .mode = .read_write });
+        defer seed.close(io_mod.getIo());
+        try seed.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o644));
+    }
+
+    // Hold the pre-save file open. A rename-over leaves this descriptor on the
+    // old, unlinked inode; an in-place truncate would empty it instead, which
+    // is the failure this save must not have.
+    var held = try fx_dir.openFile(io_mod.getIo(), "mcp.json", .{});
+    defer held.close(io_mod.getIo());
+
+    try saveConfigsToPath(alloc, path, &.{});
+
+    const held_stat = try held.stat(io_mod.getIo());
+    try std.testing.expectEqual(@as(u64, 0), held_stat.nlink);
+    const held_bytes = try io_mod.readFileToEnd(alloc, &held, 4096);
+    defer alloc.free(held_bytes);
+    try std.testing.expectEqualStrings(original, held_bytes);
+
+    const written = try readFileForTest(alloc, path);
+    defer alloc.free(written);
+    try std.testing.expect(std.mem.find(u8, written, "stale") == null);
+
+    const stat = try fx_dir.statFile(io_mod.getIo(), "mcp.json", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+
+    var it = fx_dir.iterate();
+    var entries: usize = 0;
+    while (try it.next(io_mod.getIo())) |entry| {
+        entries += 1;
+        try std.testing.expectEqualStrings("mcp.json", entry.name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries);
 }
 
 fn tmpDirPath(alloc: Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
@@ -1649,6 +1689,74 @@ test "built-in MCP command mutates profile config and requests reload after save
     try expectLine(missing_result, "MCP server 'fs' not found.", false);
 }
 
+test "saving MCP config refuses a symlinked target" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const external = "{\"mcp\":{\"fs\":{\"command\":\"node\"}}}";
+    try writeTempFile(&tmp, "home/external.json", external);
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const external_path = try tmpDirPath(alloc, tmp.dir, "home/external.json");
+    defer alloc.free(external_path);
+    try tmp.dir.symLink(io_mod.getIo(), external_path, "home/.fx/mcp.json", .{ .is_directory = false });
+
+    const path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(external_path).?, ".fx", "mcp.json" });
+    defer alloc.free(path);
+
+    // The durable helper refuses a target that is not a plain private file, so
+    // a symlinked config fails the save rather than writing through the link.
+    try std.testing.expectError(error.DurablePathUnsafe, saveConfigsToPath(alloc, path, &.{}));
+
+    const untouched = try readFileForTest(alloc, external_path);
+    defer alloc.free(untouched);
+    try std.testing.expectEqualStrings(external, untouched);
+}
+
+test "built-in MCP command reports a failed save instead of a missing server" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = ListFixture{ .text = "" };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "home/external.json", "{\"mcp\":{\"fs\":{\"command\":\"node\"}}}");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const external_path = try tmpDirPath(alloc, tmp.dir, "home/external.json");
+    defer alloc.free(external_path);
+    try tmp.dir.symLink(io_mod.getIo(), external_path, "home/.fx/mcp.json", .{ .is_directory = false });
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    // The server loads through the symlink, so this is a real entry whose
+    // removal cannot be persisted. It must not be reported as missing.
+    var result = try handleCommand(alloc, "remove fs", request(home, &fixture));
+    defer result.deinit(alloc);
+    try expectLine(result, "Failed to remove MCP server 'fs': DurablePathUnsafe.", false);
+}
+
+test "adding an MCP server creates the profile directory privately" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = ListFixture{ .text = "" };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var result = try handleCommand(alloc, "add fs node server.js", request(home, &fixture));
+    defer result.deinit(alloc);
+    try expectLine(result, "Saved MCP server 'fs'.", true);
+
+    const dir_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o700), dir_stat.permissions.toMode() & 0o777);
+    const file_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx/mcp.json", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o600), file_stat.permissions.toMode() & 0o777);
+}
+
 test "built-in MCP command preserves usage and missing-home notices" {
     const alloc = std.testing.allocator;
     var fixture = ListFixture{ .text = "" };
@@ -1681,6 +1789,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
         validation_calls: usize = 0,
         auth_calls: usize = 0,
         logout_calls: usize = 0,
+        logout_busy: bool = false,
 
         fn list(_: *anyopaque, alloc: Allocator) ![]u8 {
             return alloc.dupe(u8, "");
@@ -1689,19 +1798,12 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
         fn authenticate(
             raw: *anyopaque,
             name: []const u8,
-        ) !mcp_auth.AuthenticationResult {
+        ) !command_provider_contract.AuthenticationStart {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (std.mem.eql(u8, name, "mismatch")) {
-                self.auth_calls += 1;
-                return .{ .issuer_mismatch = try mcp_auth.IssuerMismatch.init(
-                    std.testing.allocator,
-                    "https://signin.auth.plain.com/",
-                    "https://signin.auth.plain.com",
-                ) };
-            }
-            try std.testing.expectEqualStrings("remote", name);
             self.auth_calls += 1;
-            return .authenticated;
+            if (std.mem.eql(u8, name, "busy")) return .busy;
+            try std.testing.expectEqualStrings("remote", name);
+            return .started;
         }
 
         fn validate(raw: *anyopaque, name: []const u8) !void {
@@ -1710,7 +1812,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
             if (std.mem.eql(u8, name, "local")) {
                 return error.McpAuthenticationNotRemote;
             }
-            if (!std.mem.eql(u8, name, "mismatch")) {
+            if (!std.mem.eql(u8, name, "busy")) {
                 try std.testing.expectEqualStrings("remote", name);
             }
         }
@@ -1722,6 +1824,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqualStrings("remote", name);
             self.logout_calls += 1;
+            if (self.logout_busy) return .{ .busy = true };
             return .{ .removed = true };
         }
     };
@@ -1747,25 +1850,29 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
     try std.testing.expectEqual(@as(usize, 1), fixture.validation_calls);
     try std.testing.expectEqual(@as(usize, 0), fixture.auth_calls);
 
-    var authenticated = try handleCommand(
+    var started = try handleCommand(
         alloc,
         "auth remote --open",
         command_request,
     );
-    defer authenticated.deinit(alloc);
-    try expectLine(authenticated, "Authenticated MCP server 'remote'.", true);
+    defer started.deinit(alloc);
+    try expectLine(
+        started,
+        "Waiting for MCP authentication for 'remote'. You can continue using fx while the browser flow completes.",
+        false,
+    );
     try std.testing.expectEqual(@as(usize, 2), fixture.validation_calls);
     try std.testing.expectEqual(@as(usize, 1), fixture.auth_calls);
 
-    var mismatch = try handleCommand(
+    var busy = try handleCommand(
         alloc,
-        "auth mismatch --open",
+        "auth busy --open",
         command_request,
     );
-    defer mismatch.deinit(alloc);
+    defer busy.deinit(alloc);
     try expectLine(
-        mismatch,
-        "MCP authentication for 'mismatch' was rejected: expected issuer \"https://signin.auth.plain.com/\" but metadata returned \"https://signin.auth.plain.com\". Add \"oauth\":{\"issuer\":\"https://signin.auth.plain.com\"} to this server's entry in ~/.fx/mcp.json and retry.",
+        busy,
+        "MCP authentication for 'busy' is already in progress or MCP configuration is reloading.",
         false,
     );
     try std.testing.expectEqual(@as(usize, 3), fixture.validation_calls);
@@ -1781,10 +1888,20 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
     try std.testing.expectEqual(@as(usize, 4), fixture.validation_calls);
     try std.testing.expectEqual(@as(usize, 2), fixture.auth_calls);
 
+    fixture.logout_busy = true;
+    var logout_busy = try handleCommand(alloc, "logout remote", command_request);
+    defer logout_busy.deinit(alloc);
+    try expectLine(
+        logout_busy,
+        "MCP authentication for 'remote' is still in progress. Wait for it to finish before logging out.",
+        false,
+    );
+    fixture.logout_busy = false;
+
     var logged_out = try handleCommand(alloc, "logout remote", command_request);
     defer logged_out.deinit(alloc);
     try expectLine(logged_out, "Logged out of MCP server 'remote'.", true);
-    try std.testing.expectEqual(@as(usize, 1), fixture.logout_calls);
+    try std.testing.expectEqual(@as(usize, 2), fixture.logout_calls);
 }
 
 test "loadConfigFromJson parses canonical local config with command array" {
