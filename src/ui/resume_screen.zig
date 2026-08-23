@@ -19,6 +19,8 @@ pub const Composer = struct {
     pasted_blocks: []const paste_blocks.PastedBlock = &.{},
     image_tokens: []const visual_layout.ImageTokenSpan = &.{},
     skill_tokens: []const visual_layout.SkillTokenSpan = &.{},
+    appearance: render_input.InputAppearance,
+    prefix_style: input_presentation.ComposerPrefixStyle,
 };
 
 pub const PaintInput = struct {
@@ -61,6 +63,8 @@ pub fn paint(alloc: Allocator, input: PaintInput) !Paint {
         alloc,
         source,
         layout.composer_window,
+        input.composer.appearance,
+        input.composer.prefix_style,
     );
     defer composer_rows.deinit(alloc);
 
@@ -147,6 +151,8 @@ test "resume screen places composer catalog and controls without transcript chro
         .composer = .{
             .input = "resume",
             .cursor = "resume".len,
+            .appearance = .lines,
+            .prefix_style = .rail,
         },
         .clear_display = true,
     });
@@ -189,7 +195,7 @@ test "resume screen stays within tiny terminal dimensions" {
         .rows = 3,
         .cols = 8,
         .sessions = .{ .active = true, .load_state = .loading },
-        .composer = .{ .input = "", .cursor = 0 },
+        .composer = .{ .input = "", .cursor = 0, .appearance = .lines, .prefix_style = .rail },
         .clear_display = true,
     });
     defer screen.deinit(alloc);

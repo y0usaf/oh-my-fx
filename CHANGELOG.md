@@ -1,5 +1,11 @@
 # fx
 
+## Unreleased
+
+### Breaking Changes
+
+- **Fork binary name:** Build and Nix installs expose the executable as `omfx`; `zig build` keeps a `bin/fx` compatibility copy so upstream tooling and docs keep working
+
 ## 0.0.5
 
 <!-- release:start -->

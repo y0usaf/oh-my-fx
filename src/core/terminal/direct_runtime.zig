@@ -164,7 +164,7 @@ pub const Runtime = struct {
         const request = contracts.ActionRequest{ .start = .{
             .cwd = input.workspace_root,
             .command = input.command,
-            .shell = try shell_resolver.profileShell(input.alloc, null, .user),
+            .shell = try shell_resolver.profileShell(input.alloc, null, .user, null),
             .backend = .native,
             .return_when = .started,
             .wait_ceiling_ms = start_wait_ceiling_ms,

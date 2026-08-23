@@ -310,6 +310,12 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.takeUpgradeRelaunchRequest()
     else
         null;
+    const mux_handoff_requested = if (comptime cooperative)
+        false
+    else if (comptime @hasDecl(App, "takeMuxHandoffRequest"))
+        app.takeMuxHandoffRequest()
+    else
+        false;
     const resume_handoff_columns: u16 = if (comptime cooperative)
         0
     else if (comptime @hasDecl(App, "resumeHandoffColumns"))
@@ -343,6 +349,28 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 "fx: upgrade installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
             );
         }
+        return .{ .exit = 1 };
+    }
+    if (mux_handoff_requested) {
+        var handoff = handoff_value;
+        defer if (handoff) |*value| value.deinit(alloc);
+        const executable_path = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch {
+            writeStderr(deps, "fx: mux cockpit requested, but the executable path could not be resolved.\n");
+            return .{ .exit = 1 };
+        };
+        defer alloc.free(executable_path);
+        var argv: [3][]const u8 = .{ executable_path, "mux", "" };
+        var argv_len: usize = 2;
+        if (handoff) |*value| {
+            argv[2] = value.session_id;
+            argv_len = 3;
+        }
+        const replace_err = deps.replace_process(
+            deps.replace_ctx,
+            io_mod.getIo(),
+            .{ .argv = argv[0..argv_len] },
+        );
+        writeMuxHandoffFailure(deps, replace_err, if (handoff) |*value| value.session_id else "");
         return .{ .exit = 1 };
     }
     if (handoff_value) |value| {
@@ -381,6 +409,23 @@ fn writeUpgradeRelaunchFailure(
         "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
         .{ @errorName(err), session_id },
     ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
+    writeStderr(deps, message);
+}
+
+fn writeMuxHandoffFailure(deps: RunDeps, err: std.process.ReplaceError, session_id: []const u8) void {
+    var buffer: [512]u8 = undefined;
+    const message = if (session_id.len == 0)
+        std.fmt.bufPrint(
+            &buffer,
+            "fx: mux cockpit launch failed: {s}\n",
+            .{@errorName(err)},
+        ) catch "fx: mux cockpit launch failed.\n"
+    else
+        std.fmt.bufPrint(
+            &buffer,
+            "fx: mux cockpit launch failed: {s}\nContinue session with: fx --resume {s}\n",
+            .{ @errorName(err), session_id },
+        ) catch "fx: mux cockpit launch failed.\n";
     writeStderr(deps, message);
 }
 

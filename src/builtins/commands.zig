@@ -64,6 +64,17 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
+        .kind = .mux,
+        .token = "mux",
+        .usage = "mux [session-id]",
+        .summary = "Juggle concurrent fx sessions in a native terminal UI",
+        .details = &.{
+            "Hosts one fx child terminal per session with a minimal sidebar.",
+            "Pass a saved session id to select it on startup.",
+            "Use ctrl+g/l to focus, ctrl+j/k to switch, ctrl+n to create, ctrl+delete to archive, and ctrl+q to quit.",
+        },
+    },
+    .{
         .kind = .pr,
         .token = "pr",
         .usage = "pr [--auto] [--create] [context]",
@@ -284,6 +295,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .background, .usage = "background [last|<id>]" },
     } },
     .{ .entries = &.{
+        .{ .kind = .mux, .usage = "mux [session-id]" },
         .{ .kind = .sessions, .usage = "sessions" },
         .{ .kind = .session, .usage = "session <last|id>" },
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
@@ -417,6 +429,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .new_session, .command = "/new", .help_entry = "/new", .completion_description = "start a fresh session", .presentation_category = .session, .show_in_welcome = true },
     .{ .kind = .reset_session, .command = "/reset", .help_entry = "/reset", .completion_description = "reset the current session context", .presentation_category = .session },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
+    .{ .kind = .mux, .command = "/mux", .help_entry = "/mux", .completion_description = "hand the terminal to the mux session cockpit", .presentation_category = .session, .show_in_welcome = true },
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose Vercel or Codex sign-in", .presentation_category = .account },
@@ -447,6 +460,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast", .completion_description = "toggle Fast mode when supported", .presentation_category = .model },
+    .{ .kind = .appearance, .command = "/appearance", .aliases = &.{ "/input", "/maxxing" }, .show_aliases_in_completion = false, .help_entry = "/appearance [input lines|tint|presentation normal|minimal]", .completion_description = "choose input and transcript presentation", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
@@ -507,6 +521,9 @@ pub fn slashCompletionHasArgs(command: []const u8) bool {
 pub const argCompletionAnchor = command_specs.argCompletionAnchor;
 pub const argCompletionIndexForLabel = command_specs.argCompletionIndexForLabel;
 pub const allowlistArgCompletionPrefix = command_specs.allowlistArgCompletionPrefix;
+pub const appearanceArgCompletionPrefix = command_specs.appearanceArgCompletionPrefix;
+pub const inputArgCompletionPrefix = command_specs.inputArgCompletionPrefix;
+pub const maxxingArgCompletionPrefix = command_specs.maxxingArgCompletionPrefix;
 pub const statuslineArgCompletionPrefix = command_specs.statuslineArgCompletionPrefix;
 pub const notificationsArgCompletionPrefix = command_specs.notificationsArgCompletionPrefix;
 pub const permissionsArgCompletionPrefix = command_specs.permissionsArgCompletionPrefix;
@@ -518,6 +535,7 @@ test "built-in slash commands register exact active order" {
         "/new",
         "/reset",
         "/resume",
+        "/mux",
         "/continue",
         "/rename",
         "/login",
@@ -548,6 +566,7 @@ test "built-in slash commands register exact active order" {
         "/credits",
         "/paste",
         "/fast",
+        "/appearance",
         "/statusline",
         "/sound",
         "/workspace",
@@ -586,10 +605,10 @@ test "built-in slash registry resolves primary commands and aliases" {
     try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
 }
 
-test "retired appearance slash commands are not registered" {
-    try std.testing.expect(!isExactSlashCommand("/appearance"));
-    try std.testing.expect(!isExactSlashCommand("/input"));
-    try std.testing.expect(!isExactSlashCommand("/maxxing\t"));
+test "exact slash command matching includes hidden completion aliases" {
+    try std.testing.expect(isExactSlashCommand("/appearance"));
+    try std.testing.expect(isExactSlashCommand("/input"));
+    try std.testing.expect(isExactSlashCommand("/maxxing\t"));
     try std.testing.expect(!isExactSlashCommand("/input lines"));
     try std.testing.expect(!isExactSlashCommand("/unknown"));
 }

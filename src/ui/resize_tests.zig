@@ -94,6 +94,7 @@ pub const Harness = struct {
             .shell = .{
                 .stdout_file = file,
                 .layout = layout,
+                .maxxing_mode = .legacy,
             },
         };
         harness.vt.cursor_row = layout.content_bottom;
@@ -929,22 +930,6 @@ fn setToolActivity(
     } };
 }
 
-fn appendCompletedToolStatus(h: *Harness, label: []const u8) !u32 {
-    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = label };
-    _ = try h.shell.applyToolLifecycle(h.alloc, .{ .authoritative_started = .{
-        .id = id,
-        .reconciles_provisional_call_id = null,
-        .tool_name = "test_tool",
-        .activity_kind = .read,
-        .arguments_json = "{}",
-    } });
-    _ = try h.shell.applyToolLifecycle(h.alloc, .{ .terminal = .{
-        .id = id,
-        .outcome = .{ .kind = .completed, .summary = label },
-    } });
-    return h.shell.toolActivityRecord(id).?.entry_id;
-}
-
 fn renderTestFooterWithContext(
     h: *Harness,
     approval: *const approval_prompt.ApprovalPrompt,
@@ -1084,18 +1069,8 @@ fn expectMarkerBackground(h: *Harness, marker: u21, expected: vt_emulator.Color)
 
 fn findFirstDividerRowAfter(h: *Harness, after_row: u16) !u16 {
     const horizontal = "\xe2\x94\x80";
-    const composer_rail = "┃";
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(h.alloc);
-
-    var committed_footer_row: ?u16 = null;
-    for (h.shell.footer_viewport.rows.items) |row| {
-        if (row.row <= after_row) continue;
-        if (std.mem.find(u8, row.text.items, horizontal) == null and
-            std.mem.find(u8, row.text.items, composer_rail) == null) continue;
-        committed_footer_row = @min(committed_footer_row orelse row.row, row.row);
-    }
-    if (committed_footer_row) |row| return row;
 
     var row: u16 = after_row + 1;
     while (row <= h.vt.rows) : (row += 1) {
@@ -1104,7 +1079,7 @@ fn findFirstDividerRowAfter(h: *Harness, after_row: u16) !u16 {
         if (std.mem.find(u8, buf.items, horizontal) != null) return row;
     }
 
-    std.debug.print("grid did not contain footer chrome after row {d}\n", .{after_row});
+    std.debug.print("grid did not contain a divider row after row {d}\n", .{after_row});
     return error.TestExpectedGridText;
 }
 
@@ -1908,7 +1883,7 @@ test "streamed inline code color survives shrink and grow" {
     }
 }
 
-test "semantic code block colors source and keeps current footer rail styled through resize" {
+test "semantic code block colors source and keeps structural rows default through resize" {
     var h = try Harness.init(std.testing.allocator, 40, 40, 4);
     defer h.deinit();
     var input = InputRuntime{};
@@ -1950,8 +1925,7 @@ test "semantic code block colors source and keeps current footer rail styled thr
     try std.testing.expect(python_cell.style.fg.eql(.{ .indexed = 252 }));
     const initial_footer = try findFirstDividerRowAfter(&h, code_row);
     const initial_footer_cell = h.vt.cellAt(initial_footer, 1) orelse return error.TestMissingFooterCell;
-    try std.testing.expectEqual(@as(u21, '┃'), initial_footer_cell.codepoint);
-    try std.testing.expect(initial_footer_cell.style.fg.eql(.{ .indexed = 255 }));
+    try std.testing.expect(initial_footer_cell.style.fg.eql(.default));
 
     try h.driveResize(20, 40, 4, true);
     frame_redraw = true;
@@ -1970,8 +1944,7 @@ test "semantic code block colors source and keeps current footer rail styled thr
     try std.testing.expect(python_cell.style.fg.eql(.{ .indexed = 252 }));
     const resized_footer = try findFirstDividerRowAfter(&h, code_row);
     const resized_footer_cell = h.vt.cellAt(resized_footer, 1) orelse return error.TestMissingFooterCell;
-    try std.testing.expectEqual(@as(u21, '┃'), resized_footer_cell.codepoint);
-    try std.testing.expect(resized_footer_cell.style.fg.eql(.{ .indexed = 255 }));
+    try std.testing.expect(resized_footer_cell.style.fg.eql(.default));
 }
 
 test "semantic code block keeps readable light theme colors through resize" {
@@ -2057,6 +2030,85 @@ test "streamed paragraphs keep words together through shrink and grow" {
     _ = try findRowContaining(&h, "alpha beta gamma delta epsilon");
 }
 
+test "folded tool status continuation retains command foreground through surface paint" {
+    var h = try Harness.init(std.testing.allocator, 32, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    _ = try h.shell.appendRawTranscriptEntryClassified(
+        h.alloc,
+        "\x1b[38;5;252m●\x1b[0m\x1b[1m Ran\x1b[0m \x1b[38;5;245msleep 3.000000000000000000000000000000000000000000000000000000000000\x1b[0m\n",
+        .tool_status,
+    );
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const first_row = try findRowContaining(&h, "Ran sleep");
+    const marker = h.vt.cellAt(first_row, 1) orelse return error.TestMissingStatusMarker;
+    try std.testing.expectEqual(@as(u21, '●'), marker.codepoint);
+    try std.testing.expect(marker.style.fg.eql(.{ .indexed = 252 }));
+
+    const continuation = h.vt.cellAt(first_row + 1, 3) orelse return error.TestMissingStatusContinuation;
+    try std.testing.expectEqual(@as(u21, '0'), continuation.codepoint);
+    try std.testing.expect(continuation.style.fg.eql(.{ .indexed = 245 }));
+}
+
+test "wrapped command output continuation retains muted foreground through surface paint" {
+    var h = try Harness.init(std.testing.allocator, 32, 14, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    const styles = transcript_runtime.Styles{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "\x1b[0m",
+        .dim_style = "\x1b[38;5;245m",
+        .red_style = "\x1b[31m",
+    };
+    try h.shell.writeCommandOutputChunk(
+        h.alloc,
+        &h.metrics,
+        styles,
+        .stdout,
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij\n",
+        true,
+    );
+    try h.shell.flushCommandOutputSummary(
+        h.alloc,
+        &h.metrics,
+        styles,
+        true,
+    );
+    _ = try h.shell.appendRawTranscriptEntryClassified(
+        h.alloc,
+        "after command output\n",
+        .subagent_status,
+    );
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const first_row = try findRowContaining(&h, "0123456789ABC");
+    const first_gutter = h.vt.cellAt(first_row, 1) orelse return error.TestMissingCommandOutputGutter;
+    try std.testing.expectEqual(@as(u21, '│'), first_gutter.codepoint);
+    try std.testing.expect(first_gutter.style.fg.eql(.{ .indexed = 245 }));
+
+    const continuation_row = try findRowContaining(&h, "UVWXYZabcdefghij");
+    try std.testing.expectEqual(first_row + 1, continuation_row);
+    const continuation_gutter = h.vt.cellAt(continuation_row, 1) orelse
+        return error.TestMissingCommandOutputContinuationGutter;
+    try std.testing.expectEqual(@as(u21, '│'), continuation_gutter.codepoint);
+    try std.testing.expect(continuation_gutter.style.fg.eql(.{ .indexed = 245 }));
+    const continuation_text = h.vt.cellAt(continuation_row, 3) orelse
+        return error.TestMissingCommandOutputContinuationText;
+    try std.testing.expectEqual(@as(u21, 'U'), continuation_text.codepoint);
+    try std.testing.expect(continuation_text.style.fg.eql(.{ .indexed = 245 }));
+
+    const following_row = try findRowContaining(&h, "after command output");
+    const following_cell = h.vt.cellAt(following_row, 1) orelse return error.TestMissingFollowingTranscriptCell;
+    try std.testing.expectEqual(@as(u21, 'a'), following_cell.codepoint);
+    try std.testing.expect(following_cell.style.fg.eql(.default));
+}
+
 test "entry-bound shimmer resolves to the painted status row without moving footer" {
     var h = try Harness.init(std.testing.allocator, 80, 22, 4);
     defer h.deinit();
@@ -2099,7 +2151,7 @@ test "entry-bound shimmer overlays status row without moving footer" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 12);
-    const status_id = try appendCompletedToolStatus(&h, "running tests");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "running tests\n", .tool_status);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -2126,8 +2178,8 @@ test "moving entry-bound shimmer restores the previous transcript row" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 12);
-    const first_id = try appendCompletedToolStatus(&h, "status-one complete");
-    const second_id = try appendCompletedToolStatus(&h, "status-two pending");
+    const first_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "status-one complete\n", .tool_status);
+    const second_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "status-two pending\n", .tool_status);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -2163,7 +2215,7 @@ test "clearing entry-bound shimmer restores the transcript row" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 12);
-    const status_id = try appendCompletedToolStatus(&h, "status survives overlay");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "status survives overlay\n", .tool_status);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -2197,7 +2249,7 @@ test "entry-bound shimmer is suppressed when footer banner covers its row" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, h.shell.layout.content_bottom);
-    const status_id = try appendCompletedToolStatus(&h, "bottom status row");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "bottom status row\n", .tool_status);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -2233,7 +2285,7 @@ test "footer banner keeps a gap after entry-bound activity" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 6);
-    const status_id = try appendCompletedToolStatus(&h, "Opening file");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Opening file\n", .tool_status);
     try h.renderTranscriptFrame();
 
     var ctx = defaultFooterContext(&input);
@@ -2267,7 +2319,7 @@ test "footer banner reserves blank row after bottom entry-bound activity" {
         try filler.appendSlice(h.alloc, "paragraph line\n");
     }
     _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, filler.items, .subagent_status);
-    const status_id = try appendCompletedToolStatus(&h, "Creating project");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Creating project\n", .tool_status);
     try h.renderTranscriptFrame();
     try h.flush();
 
@@ -2313,7 +2365,7 @@ test "banner-suppressed overlay restore keeps reserved footer gap" {
         try filler.appendSlice(h.alloc, "paragraph line\n");
     }
     _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, filler.items, .subagent_status);
-    const status_id = try appendCompletedToolStatus(&h, "Creating project");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Creating project\n", .tool_status);
     try h.renderTranscriptFrame();
     try h.flush();
 
@@ -2438,7 +2490,7 @@ test "thinking shimmer keeps a gap after completed tool status" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 6);
-    _ = try appendCompletedToolStatus(&h, "Listed src");
+    _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Listed src\n", .tool_status);
     try h.renderTranscriptFrame();
 
     var ctx = defaultFooterContext(&input);
@@ -2462,12 +2514,16 @@ test "active tool status stays above the thinking slot" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 6);
-    const status_id = try appendCompletedToolStatus(&h, "Running read_file");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(
+        h.alloc,
+        "● Running read_file\n",
+        .tool_status,
+    );
     try h.renderTranscriptFrame();
 
     var ctx = defaultFooterContext(&input);
     ctx.stream.active = true;
-    setToolActivity(&ctx, status_id, "Running read_file");
+    setToolActivity(&ctx, status_id, "● Running read_file");
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
@@ -2490,7 +2546,7 @@ test "assistant paragraph keeps a gap after completed tool status" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 6);
-    _ = try appendCompletedToolStatus(&h, "Listed project");
+    _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Listed project\n", .tool_status);
     _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, "assistant paragraph");
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
@@ -2511,7 +2567,7 @@ test "assistant paragraph replaces thinking gap after completed tool status" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 6);
-    _ = try appendCompletedToolStatus(&h, "Inspected file");
+    _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Inspected file\n", .tool_status);
     try h.renderTranscriptFrame();
 
     var ctx = defaultFooterContext(&input);
@@ -2548,7 +2604,7 @@ test "assistant paragraph and next tool keep one gap after inspected tool" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 6);
-    _ = try appendCompletedToolStatus(&h, "Inspected file");
+    _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Inspected file\n", .tool_status);
     try h.renderTranscriptFrame();
 
     var ctx = defaultFooterContext(&input);
@@ -2566,7 +2622,7 @@ test "assistant paragraph and next tool keep one gap after inspected tool" {
         &h.metrics,
         "\nassistant paragraph after inspect\nwith more detail\nand a final line",
     );
-    const creating_id = try appendCompletedToolStatus(&h, "Creating project");
+    const creating_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Creating project\n", .tool_status);
     try h.renderTranscriptFrameIfDirty();
 
     ctx.stream.active = false;
@@ -2579,9 +2635,7 @@ test "assistant paragraph and next tool keep one gap after inspected tool" {
     const assistant_row = try findRowContaining(&h, "assistant paragraph after inspect");
     const creating_row = try findRowContaining(&h, "Creating project");
     try expectExactlyOneBlankRowBetween(&h, inspected_after, assistant_row);
-    try expectRowEmpty(&h, assistant_row + 3);
-    try expectRowTrimmedEquals(&h, assistant_row + 4, "● 1 tool call · 1 read");
-    try std.testing.expectEqual(assistant_row + 5, creating_row);
+    try expectExactlyOneBlankRowBetween(&h, assistant_row + 2, creating_row);
     try expectGridNotContains(&h, "Thinking");
 }
 
@@ -2923,7 +2977,11 @@ test "completed subagent tool status keeps one blank row before idle footer" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 4);
-    _ = try appendCompletedToolStatus(&h, "Ran subagent: Verify 3d-world-10 code correctness");
+    _ = try h.shell.appendRawTranscriptEntryClassified(
+        h.alloc,
+        "● Ran subagent: Verify 3d-world-10 code correctness\n",
+        .tool_status,
+    );
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -3236,7 +3294,7 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
     try std.testing.expect(h.last_frame.transcript_history_floor_respected);
 }
 
-test "live command output chunks remain one block outside the compact transcript" {
+test "live command output chunks remain one command-output block before next boundary" {
     var h = try Harness.init(std.testing.allocator, 80, 26, 4);
     defer h.deinit();
 
@@ -3254,12 +3312,12 @@ test "live command output chunks remain one block outside the compact transcript
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    _ = try findRowContaining(&h, "assistant after command");
-    try expectGridNotContains(&h, "│ one");
-    try expectGridNotContains(&h, "│ two");
-    try std.testing.expectEqual(@as(usize, 1), h.shell.command_output_blocks.items.len);
-    try std.testing.expectEqualStrings("one", h.shell.command_output_blocks.items[0].lines.items[0].text);
-    try std.testing.expectEqualStrings("two", h.shell.command_output_blocks.items[0].lines.items[1].text);
+    const one = try findRowContaining(&h, "one");
+    const two = try findRowContaining(&h, "two");
+    const assistant = try findRowContaining(&h, "assistant after command");
+
+    try std.testing.expectEqual(one + 1, two);
+    try expectExactlyOneBlankRowBetween(&h, two, assistant);
 }
 
 test "structured command-output rewrite materializes committed transcript scroll rows" {
@@ -3383,6 +3441,7 @@ test "closed tool group finality flows through fixed point resolution and sealin
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 14, 3);
     defer h.deinit();
+    h.shell.maxxing_mode = .minimal;
 
     var input = InputRuntime{};
     defer input.deinit(alloc);
@@ -3547,7 +3606,13 @@ test "completed replay tool entries fit a constrained terminal" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 4);
-    _ = try appendCompletedToolStatus(&h, "Ran pwd");
+    try h.shell.writeTranscriptClassified(
+        h.alloc,
+        &h.metrics,
+        "● Ran pwd\n",
+        true,
+        .tool_status,
+    );
     try h.shell.writeCommandOutputChunk(
         h.alloc,
         &h.metrics,
@@ -3568,15 +3633,9 @@ test "completed replay tool entries fit a constrained terminal" {
     try h.flush();
 
     try expectGridContains(&h, "Ran pwd");
-    try expectGridNotContains(&h, "/workspace");
+    try expectGridContains(&h, "/workspace");
     try expectGridContains(&h, "TOOL_REPLAY_FINISHED");
     try std.testing.expect(h.shell.last_visible_transcript_last_row <= h.shell.layout.rows);
-
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .review));
-    h.frame_redraw = true;
-    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
-    try h.flush();
-    try expectGridContains(&h, "/workspace");
 }
 
 test "long live command output keeps running tool visible with stable footer" {
@@ -3591,7 +3650,7 @@ test "long live command output keeps running tool visible with stable footer" {
     try h.shell.initViewport(&h.metrics, 1);
     const prompt = try h.alloc.dupe(u8, "run the streaming command");
     _ = try h.shell.appendUserTurnOwned(h.alloc, .{ .text = prompt, .images = &.{} });
-    const status_id = try appendCompletedToolStatus(&h, "Running python stream");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Running python stream\n", .tool_status);
 
     var line_index: usize = 1;
     while (line_index <= 18) : (line_index += 1) {
@@ -3610,8 +3669,9 @@ test "long live command output keeps running tool visible with stable footer" {
 
     try expectGridContains(&h, "Thinking");
     try expectGridOccurrenceCount(&h, "Running python stream", 1);
-    _ = try findRowContaining(&h, "Running python stream");
-    try expectGridNotContains(&h, "line-2");
+    const running_row = try findRowContaining(&h, "Running python stream");
+    const first_output_row = try findRowContaining(&h, "line-2");
+    try std.testing.expect(running_row < first_output_row);
     const footer_after_first_batch = try findFirstDividerRowAfter(&h, 1);
 
     while (line_index <= 30) : (line_index += 1) {
@@ -3642,7 +3702,11 @@ test "resize keeps transcript-owned active command above output and thinking" {
     try h.shell.initViewport(&h.metrics, 1);
     const prompt = try h.alloc.dupe(u8, "resize the active tool");
     _ = try h.shell.appendUserTurnOwned(h.alloc, .{ .text = prompt, .images = &.{} });
-    const status_id = try appendCompletedToolStatus(&h, "Resize activity active");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(
+        h.alloc,
+        "Resize activity active\n",
+        .tool_status,
+    );
     var line_index: usize = 1;
     while (line_index <= 18) : (line_index += 1) {
         const line = try std.fmt.allocPrint(h.alloc, "resize-line-{d}\n", .{line_index});
@@ -3672,9 +3736,10 @@ test "resize keeps transcript-owned active command above output and thinking" {
     try expectGridOccurrenceCount(&h, "Thinking", 1);
     try expectGridOccurrenceCount(&h, "Resize activity active", 1);
     const status_row = try findRowContaining(&h, "Resize activity active");
+    const output_row = try findRowContaining(&h, "resize-line-2");
     const thinking_row = try findRowContaining(&h, "Thinking");
-    try std.testing.expect(status_row < thinking_row);
-    try expectGridNotContains(&h, "resize-line-2");
+    try std.testing.expect(status_row < output_row);
+    try std.testing.expect(output_row < thinking_row);
     try std.testing.expect(h.shell.shimmer_active);
     try std.testing.expect(!h.shell.shimmer_is_overlay);
 
@@ -3684,9 +3749,10 @@ test "resize keeps transcript-owned active command above output and thinking" {
     try h.flush();
 
     const resized_status_row = try findRowContaining(&h, "Resize activity active");
+    const resized_output_row = try findRowContaining(&h, "resize-line-1");
     const resized_thinking_row = try findRowContaining(&h, "Thinking");
-    try std.testing.expect(resized_status_row < resized_thinking_row);
-    try expectGridNotContains(&h, "resize-line-1");
+    try std.testing.expect(resized_status_row < resized_output_row);
+    try std.testing.expect(resized_output_row < resized_thinking_row);
     try expectGridOccurrenceCount(&h, "Thinking", 1);
     try expectGridOccurrenceCount(&h, "Resize activity active", 1);
     try std.testing.expect(h.shell.shimmer_active);
@@ -3703,7 +3769,7 @@ test "resize preserves normalized gaps across mixed block types" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewport(&h.metrics, 8);
-    _ = try appendCompletedToolStatus(&h, "tool done");
+    _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "tool done\n", .tool_status);
     _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, "assistant response with enough words to wrap when the terminal gets narrow");
     _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "system notice\n", .subagent_status);
     h.frame_redraw = true;
@@ -3803,7 +3869,7 @@ test "approval banner frames prompt after completed tool status" {
         try body.appendSlice(h.alloc, line);
     }
     _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, body.items, .subagent_status);
-    _ = try appendCompletedToolStatus(&h, "Listed project");
+    _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "Listed project\n", .tool_status);
     _ = try approval.syncRequest(h.alloc, .{ .label = "open_file" });
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
@@ -3936,9 +4002,9 @@ test "render engine preserves transcript footer activity behavior" {
     defer alloc.free(welcome);
     try h.shell.writeTranscriptClassified(alloc, &h.metrics, welcome, true, .welcome);
 
-    _ = try appendCompletedToolStatus(&h, "Listed src/ui");
+    _ = try h.shell.appendRawTranscriptEntryClassified(alloc, "● Listed src/ui\n", .tool_status);
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "The renderer should preserve exactly one paragraph gap after tools.");
-    _ = try appendCompletedToolStatus(&h, "Ran subagent: Verify render behavior");
+    _ = try h.shell.appendRawTranscriptEntryClassified(alloc, "● Ran subagent: Verify render behavior\n", .tool_status);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4000,7 +4066,7 @@ test "render engine preserves transcript footer activity behavior" {
 
     _ = try h.shell.appendRawTranscriptEntryClassified(alloc, "\x1b[2m  │ subagent done | checked rendering\n\x1b[0m", .subagent_status);
 
-    const status_id = try appendCompletedToolStatus(&h, "Writing render-engine-plan");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(alloc, "● Writing render-engine-plan\n", .tool_status);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4035,12 +4101,14 @@ test "render engine preserves transcript footer activity behavior" {
 
     const subagent_done_row = try findRowContaining(&h, "subagent done");
     const status_row = try findRowContaining(&h, "Writing render-engine-plan");
-    const footer_row = try findFirstDividerRowAfter(&h, status_row);
+    const command_one_row = try findRowContaining(&h, "line one");
+    const command_two_row = try findRowContaining(&h, "line two");
+    const footer_row = try findFirstDividerRowAfter(&h, command_two_row);
 
     try std.testing.expect(subagent_done_row < status_row);
-    try expectGridNotContains(&h, "│ line one");
-    try expectGridNotContains(&h, "│ line two");
-    try std.testing.expect(status_row < footer_row);
+    try std.testing.expectEqual(command_one_row + 1, command_two_row);
+    try std.testing.expect(status_row < command_one_row);
+    try std.testing.expectEqual(command_two_row + 1, footer_row);
     try std.testing.expect(!h.shell.last_visible_transcript_split_active);
 
     ctx = defaultFooterContext(&input);
@@ -4061,9 +4129,10 @@ test "render engine preserves transcript footer activity behavior" {
     try expectGridNotContains(&h, "Overlay writing render-engine-plan");
     try std.testing.expect(!h.shell.shimmer_active);
     const restored_status_row = try findRowContaining(&h, "Writing render-engine-plan");
+    const restored_command_two_row = try findRowContaining(&h, "line two");
     const banner_row = try findRowContaining(&h, "1 queued message");
-    try expectGridNotContains(&h, "│ line two");
-    try std.testing.expect(restored_status_row < banner_row);
+    try std.testing.expect(restored_status_row < restored_command_two_row);
+    try std.testing.expectEqual(restored_command_two_row + 1, banner_row);
     try std.testing.expect(banner_row < h.shell.layout.rows);
 
     try h.driveResize(72, 24, 4, false);
@@ -4081,7 +4150,7 @@ test "render engine preserves transcript footer activity behavior" {
     try std.testing.expect(h.shell.last_visible_transcript_last_row <= h.shell.layout.rows);
 }
 
-test "runtime decomposition preserves command output state and replaceable paint state" {
+test "runtime decomposition preserves command output and replaceable paint state" {
     var h = try Harness.init(std.testing.allocator, 96, 36, 4);
     defer h.deinit();
 
@@ -4095,15 +4164,15 @@ test "runtime decomposition preserves command output state and replaceable paint
     try h.shell.writeCommandOutputChunk(h.alloc, &h.metrics, commandOutputStyles(), .stdout, "visible\n", true);
     try h.shell.writeCommandOutputChunk(h.alloc, &h.metrics, commandOutputStyles(), .stdout, "hidden\n", true);
     try h.shell.flushCommandOutputSummary(h.alloc, &h.metrics, commandOutputStyles(), true);
-    const status_id = try h.shell.appendReplaceableTranscriptLineClassified(h.alloc, &h.metrics, "Running tests\n", .subagent_status);
+    const status_id = try h.shell.appendReplaceableTranscriptLineClassified(h.alloc, &h.metrics, "Running tests\n", .tool_status);
     try std.testing.expect(try h.shell.replaceTrailingTranscriptLine(h.alloc, &h.metrics, "Tests passed\n"));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
     try expectGridContains(&h, "Tests passed");
-    try expectGridNotContains(&h, "│ visible");
-    try expectGridNotContains(&h, "│ hidden");
+    try expectGridContains(&h, "visible");
+    try expectGridContains(&h, "hidden");
     try expectGridNotContains(&h, "ctrl o to view");
     try std.testing.expect(h.shell.replaceable_last_line);
     try std.testing.expectEqual(status_id, h.shell.replaceableEntryId().?);
@@ -4114,8 +4183,8 @@ test "runtime decomposition preserves command output state and replaceable paint
     try h.flush();
 
     try expectGridContains(&h, "Tests passed");
-    try expectGridContains(&h, "│ visible");
-    try expectGridContains(&h, "│ hidden");
+    try expectGridContains(&h, "visible");
+    try expectGridContains(&h, "hidden");
     try expectGridNotContains(&h, "command lines folded");
 
     try h.driveResize(72, 24, 4, false);
@@ -4125,8 +4194,8 @@ test "runtime decomposition preserves command output state and replaceable paint
     try h.flush();
 
     try expectGridContains(&h, "Tests passed");
-    try expectGridContains(&h, "│ visible");
-    try expectGridContains(&h, "│ hidden");
+    try expectGridContains(&h, "visible");
+    try expectGridContains(&h, "hidden");
     try expectGridNotContains(&h, "command lines folded");
 
     try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .inline_mode));
@@ -4135,15 +4204,12 @@ test "runtime decomposition preserves command output state and replaceable paint
     try h.flush();
 
     try expectGridContains(&h, "Tests passed");
-    try expectGridNotContains(&h, "│ visible");
-    try expectGridNotContains(&h, "│ hidden");
+    try expectGridContains(&h, "visible");
+    try expectGridContains(&h, "hidden");
     try expectGridNotContains(&h, "ctrl o to view");
     try std.testing.expect(h.shell.replaceable_last_line);
     try std.testing.expectEqual(status_id, h.shell.replaceableEntryId().?);
     try std.testing.expect(h.shell.replaceable_start <= h.shell.transcript.items.len);
-    try std.testing.expectEqual(@as(usize, 1), h.shell.command_output_blocks.items.len);
-    try std.testing.expectEqualStrings("visible", h.shell.command_output_blocks.items[0].lines.items[0].text);
-    try std.testing.expectEqualStrings("hidden", h.shell.command_output_blocks.items[0].lines.items[1].text);
 }
 
 fn checkQueuedPromptAdmissionPreservesCommittedHistory(resize_before_cancel: bool) !void {
@@ -4526,7 +4592,7 @@ test "entry-bound shimmer resolves inside pinned welcome tail selection" {
         try body.appendSlice(h.alloc, line);
     }
     try h.shell.writeTranscriptClassified(h.alloc, &h.metrics, body.items, true, .subagent_status);
-    const status_id = try appendCompletedToolStatus(&h, "tail status line");
+    const status_id = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "tail status line\n", .tool_status);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -5083,10 +5149,10 @@ test "empty pre-paint defers scrolling until first content frame" {
     const emitted = try readEmittedSince(&h, before_frame);
     defer alloc.free(emitted);
     try std.testing.expect(std.mem.find(u8, emitted, "\x1b[3J") == null);
-    try expectRowPrefix(&h, 1, "PRE11");
-    try expectRowPrefix(&h, 9, "PRE19");
-    try expectRowPrefix(&h, 10, "FX01");
-    try expectRowPrefix(&h, 21, "FX12");
+    try expectRowPrefix(&h, 1, "PRE12");
+    try expectRowPrefix(&h, 8, "PRE19");
+    try expectRowPrefix(&h, 9, "FX01");
+    try expectRowPrefix(&h, 20, "FX12");
 }
 
 test "slash picker dismissal releases reserved picker rows" {
@@ -5123,7 +5189,7 @@ test "slash picker dismissal releases reserved picker rows" {
         h.last_frame.planned_scroll_rows,
         h.last_frame.committed_scroll_rows,
     );
-    try std.testing.expectEqual(@as(u16, 9), h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(@as(u16, 8), h.shell.committed_frame_layout.footer_area.top);
     const picker_anchor = h.shell.stableTranscriptProjectionForFlow(
         h.shell.transcript.items,
     ) orelse return error.TestExpectedStableTranscript;
@@ -5195,6 +5261,7 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 124, 75, 3);
     defer h.deinit();
+    h.shell.maxxing_mode = .minimal;
 
     var input = InputRuntime{};
     defer input.deinit(alloc);
@@ -5223,14 +5290,14 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     h.shell.transcript_release = h.shell.transcript_release.with_assistant_tail_writable(false);
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
-    try std.testing.expectEqual(@as(u16, 71), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(@as(u16, 70), h.shell.last_visible_transcript_last_row);
 
     try input.textReplacementState().replace(alloc, "/");
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
-    try std.testing.expectEqual(@as(u16, 62), h.shell.last_visible_transcript_last_row);
-    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "┃ /"));
+    try std.testing.expectEqual(@as(u16, 61), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "❯ /"));
 
     input.picker.dismissInlinePicker(.slash);
     h.frame_redraw = true;
@@ -5238,9 +5305,9 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     try h.flush();
 
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 62), h.shell.last_visible_transcript_last_row);
-    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "┃ /"));
-    try std.testing.expectEqual(@as(u16, 64), h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(@as(u16, 61), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "❯ /"));
+    try std.testing.expectEqual(@as(u16, 63), h.shell.committed_frame_layout.footer_area.top);
     try std.testing.expectEqual(@as(u16, 66), h.shell.committed_frame_layout.footer_area.bottom);
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -5256,9 +5323,9 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expectEqual(@as(u16, 62), h.shell.last_visible_transcript_last_row);
-    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "┃ /x"));
-    try std.testing.expectEqual(@as(u16, 64), h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(@as(u16, 61), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "❯ /x"));
+    try std.testing.expectEqual(@as(u16, 63), h.shell.committed_frame_layout.footer_area.top);
     try std.testing.expectEqual(@as(u16, 66), h.shell.committed_frame_layout.footer_area.bottom);
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -5560,7 +5627,7 @@ test "long transcript picker filtering keeps footer anchored and close releases 
     try h.shell.writeTranscript(
         alloc,
         &h.metrics,
-        "┃ /login\n\n",
+        "❯ /login\n\n",
         true,
     );
     h.frame_redraw = true;
@@ -5686,7 +5753,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 37 · Type to filter");
+    try expectGridContains(&h, "Commands 39 · Type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -5707,7 +5774,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 37");
+    try expectGridNotContains(&h, "Commands 39");
     try expectGridNotContains(&h, "↑↓ Navigate");
 }
 
@@ -5965,6 +6032,7 @@ test "compact command completion keeps restored history footer stable" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 173, 39, 4);
     defer h.deinit();
+    h.shell.maxxing_mode = .minimal;
 
     var input = InputRuntime{};
     defer input.deinit(alloc);
@@ -6902,7 +6970,7 @@ test "large tabbed user turn keeps frame scroll plan aligned" {
         h.last_frame.shadow_state,
     );
     _ = try findRowContaining(&h, "TAB_START_0085");
-    try std.testing.expectEqual(h.shell.committed_frame_layout.footer_area.top, try findFirstDividerRowAfter(&h, 1));
+    try std.testing.expectEqual(h.shell.layout.divider_top_row, try findFirstDividerRowAfter(&h, 1));
     try expectCommittedFooterContains(&h, "test-model");
 }
 
@@ -7038,7 +7106,7 @@ test "settled resize with rows-only change resets terminal scrollback" {
     try std.testing.expect(std.mem.find(u8, emitted, "\x1b[3J") != null);
 }
 
-test "theme reset retints fx entries and replays the retained transcript once" {
+test "theme reset retints Fx entries and replays the retained transcript once" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 24, 4);
     defer h.deinit();
@@ -7098,10 +7166,10 @@ test "theme reset retints fx entries and replays the retained transcript once" {
         h.shell.lookupAssistantSegments(assistant_id).?.text.items,
     );
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.shell.transcript.items, "FX THEME HEADER"));
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, h.shell.transcript.items, "FX THEME TOOL"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.shell.transcript.items, "FX THEME TOOL"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.shell.transcript.items, "FX THEME INLINE CODE"));
     try expectGridContains(&h, "FX THEME HEADER");
-    try expectGridContains(&h, "tool activity");
+    try expectGridContains(&h, "FX THEME TOOL");
     try expectGridContains(&h, "FX THEME INLINE CODE");
 }
 
@@ -7568,7 +7636,7 @@ fn expectGridOccurrenceCount(h: *Harness, needle: []const u8, expected: usize) !
     }
 }
 
-test "orphan command output does not leak into current compact rows" {
+test "command output repaint and resize do not duplicate visible rows" {
     var h = try Harness.init(std.testing.allocator, 64, 16, 4);
     defer h.deinit();
 
@@ -7576,18 +7644,19 @@ test "orphan command output does not leak into current compact rows" {
     try h.shell.writeCommandOutputChunk(h.alloc, &h.metrics, commandOutputStyles(), .stdout, "dedupe-command-row\n", true);
     try h.renderTranscriptFrameIfDirty();
     try h.flush();
-    try expectGridOccurrenceCount(&h, "dedupe-command-row", 0);
-    try std.testing.expectEqualStrings("dedupe-command-row", h.shell.command_output_blocks.items[0].lines.items[0].text);
+    try expectGridOccurrenceCount(&h, "dedupe-command-row", 1);
+    const live_row = try findRowContaining(&h, "dedupe-command-row");
 
     try h.shell.flushCommandOutputSummary(h.alloc, &h.metrics, commandOutputStyles(), true);
     try h.renderTranscriptFrameIfDirty();
     try h.flush();
-    try expectGridOccurrenceCount(&h, "dedupe-command-row", 0);
+    try expectGridOccurrenceCount(&h, "dedupe-command-row", 1);
+    try std.testing.expectEqual(live_row, try findRowContaining(&h, "dedupe-command-row"));
 
     try shell_runtime.requestRedraw(&h.shell, &h.metrics, .replay_viewport);
     try h.renderTranscriptFrame();
     try h.flush();
     try h.driveResize(58, 16, 4, true);
 
-    try expectGridOccurrenceCount(&h, "dedupe-command-row", 0);
+    try expectGridOccurrenceCount(&h, "dedupe-command-row", 1);
 }

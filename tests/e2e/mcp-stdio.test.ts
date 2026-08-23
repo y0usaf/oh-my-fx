@@ -150,7 +150,7 @@ function createRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({}),
+    JSON.stringify({ maxxing_mode: "minimal" }),
   );
   writeFileSync(
     join(home, ".fx", "mcp.json"),
@@ -403,7 +403,7 @@ describe("modern MCP stdio compatibility", () => {
     const marker = join(root, "project-mcp-launched");
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(join(workspace, ".fx"), { recursive: true });
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ maxxing_mode: "minimal" }));
     writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
 
     let projectRequestCount = 0;
@@ -823,6 +823,7 @@ describe("modern MCP stdio compatibility", () => {
       writeFileSync(
         join(root.home, ".fx", "settings.json"),
         JSON.stringify({
+          maxxing_mode: "minimal",
           permission: { mcp_denied_blocked: "deny" },
         }),
       );
@@ -983,6 +984,7 @@ describe("modern MCP stdio compatibility", () => {
     writeFileSync(
       join(root.home, ".fx", "settings.json"),
       JSON.stringify({
+        maxxing_mode: "minimal",
         permission: { edit: { "**": "deny" } },
       }),
     );

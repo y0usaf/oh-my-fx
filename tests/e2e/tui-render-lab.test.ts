@@ -366,27 +366,26 @@ test("render-lab analyzer enforces active-tool placement and uniqueness", () => 
 test("render-lab analyzer rejects activity marker corruption", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const submitted = "exercise one active command placement";
-  const group = "● 1 tool call · 1 command";
-  const activity = "└ Running sleep 1; i=1";
+  const activity = "● Running sleep 1; i=1";
   const cases = [
     {
       name: "missing",
-      lines: [`┃ ${submitted}`, "", group],
+      lines: [`❯ ${submitted}`, ""],
       invariant: "active-tool-activity-marker-count",
     },
     {
       name: "duplicate",
-      lines: [`┃ ${submitted}`, "", group, activity, activity],
+      lines: [`❯ ${submitted}`, "", activity, activity],
       invariant: "active-tool-activity-marker-count",
     },
     {
       name: "reordered",
-      lines: [group, activity, "", `┃ ${submitted}`],
+      lines: [activity, "", `❯ ${submitted}`],
       invariant: "active-tool-activity-marker-order",
     },
     {
       name: "blank",
-      lines: [`┃ ${submitted}`, "", "", group, activity],
+      lines: [`❯ ${submitted}`, "", "", activity],
       invariant: "active-tool-activity-blank-hole",
     },
   ];
@@ -394,14 +393,11 @@ test("render-lab analyzer rejects activity marker corruption", () => {
     const grid = [
       "Run /help for commands",
       "",
-      group,
       activity,
-      "",
-      "• Thinking",
-      "",
-      "┃",
-      "",
-      "auto · test",
+      "────────────────",
+      "❯",
+      "────────────────",
+      "test",
     ];
     const manifest = writeAnalyzerFixture(
       join(outDir, entry.name),
@@ -731,7 +727,7 @@ describe.skipIf(SKIP)("tui: render lab", () => {
       expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-submitted-prompt-tail-visible")).toBe(true);
       expect(artifacts.finalFrame.grid.some((row) => row.includes(artifacts.manifest.markers.submitted[0]!))).toBe(true);
       expect(artifacts.manifest.markers.history?.every((marker) => artifacts.finalFrame.scrollback.includes(marker))).toBe(true);
-      expect(artifacts.finalFrame.grid.some((row) => /^┃\s*$/.test(row))).toBe(true);
+      expect(artifacts.finalFrame.grid.some((row) => /^❯\s*$/.test(row))).toBe(true);
       expect(artifacts.finalFrame.grid.some((row) => row.includes("HTTP 401"))).toBe(false);
       expect(artifacts.finalFrame.grid.some((row) => row.includes("RENDER_LAB_LOCAL_GATEWAY_OK"))).toBe(false);
       expect(artifacts.gatewayRequests).toEqual(["GET /coding-agent/v1/models", "POST /v3/ai/language-model"]);
@@ -751,7 +747,7 @@ describe.skipIf(SKIP)("tui: render lab", () => {
       expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-submitted-prompt-tail-visible")).toBe(true);
       expect(artifacts.finalFrame.grid.some((row) => row.includes(artifacts.manifest.markers.submitted[0]!))).toBe(true);
       expect(artifacts.manifest.markers.history?.every((marker) => artifacts.finalFrame.scrollback.includes(marker))).toBe(true);
-      expect(artifacts.finalFrame.grid.some((row) => /^┃\s*$/.test(row))).toBe(true);
+      expect(artifacts.finalFrame.grid.some((row) => /^❯\s*$/.test(row))).toBe(true);
       expect(artifacts.finalFrame.grid.some((row) => row.includes("HTTP 401"))).toBe(false);
       expect(artifacts.finalFrame.grid.some((row) => row.includes("RENDER_LAB_LOCAL_GATEWAY_OK"))).toBe(false);
       expect(artifacts.gatewayRequests).toEqual(["GET /coding-agent/v1/models", "POST /v3/ai/language-model"]);

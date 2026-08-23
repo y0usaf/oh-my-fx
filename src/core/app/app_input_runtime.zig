@@ -1021,6 +1021,11 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
+            if (appearanceMenuActive(app)) {
+                try routeAppearanceMenuEscapeAction(app, resolved);
+                return .done;
+            }
+
             if (settingsMenuActive(app) and
                 (resolved == .cursor_left or resolved == .cursor_right))
             {
@@ -1252,6 +1257,32 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
+            if (appearanceMenuActive(app)) {
+                if (byte >= 0x80) {
+                    input_reset.resetPendingTextScalarWithTrace(
+                        &app.input_runtime.text_scalar,
+                        "appearance_menu_active",
+                    );
+                    return true;
+                }
+                switch (byte) {
+                    '\t' => {
+                        _ = app.input_runtime.appearance_menu.cycleSection(1);
+                        app.shell.render_requests.request(.footer);
+                    },
+                    '\r' => try submitAppearanceMenuSelection(app),
+                    10 => {
+                        _ = app.input_runtime.appearance_menu.move(1);
+                        app.shell.render_requests.request(.footer);
+                    },
+                    11 => {
+                        _ = app.input_runtime.appearance_menu.move(-1);
+                        app.shell.render_requests.request(.footer);
+                    },
+                    else => {},
+                }
+                return true;
+            }
             if (comptime runtime_profile.allows(App, .subagents)) {
                 if (app.subagents.isViewActive()) {
                     try subagent_rt.handleSubagentRawInput(app, raw);
@@ -1407,6 +1438,7 @@ pub fn Runtime(comptime App: type) type {
                                 } else {
                                     try app.input_runtime.textReplacementState().replace(app.alloc, completion);
                                 }
+                                completion_rt.syncArgCompletionIndex(app);
                                 app.shell.render_requests.request(.footer);
                             }
                         }
@@ -1424,6 +1456,7 @@ pub fn Runtime(comptime App: type) type {
                     } else {
                         switch (try insertComposerSliceBounded(app, " ", max_input_len, false)) {
                             .inserted => {
+                                completion_rt.syncArgCompletionIndex(app);
                                 syncCatalogMenus(app);
                                 app.shell.render_requests.request(.footer);
                             },
@@ -1728,6 +1761,10 @@ pub fn Runtime(comptime App: type) type {
             return app.input_runtime.settings_menu.active;
         }
 
+        fn appearanceMenuActive(app: *App) bool {
+            return app.input_runtime.appearance_menu.active;
+        }
+
         const CompactCommandMenuKind = enum {
             statusline,
             usage,
@@ -1923,6 +1960,14 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        fn submitAppearanceMenuSelection(app: *App) !void {
+            const change = app.input_runtime.appearance_menu.selectedChange() orelse return;
+            if (comptime @hasDecl(App, "notificationPreferences")) {
+                try app_commands.applySettingsCatalogMenuChange(app, change);
+            }
+            app.shell.render_requests.request(.footer);
+        }
+
         fn submitCompactCommandMenuSelection(
             app: *App,
             menu: CompactCommandMenuKind,
@@ -2046,6 +2091,27 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try app_commands.Handlers(App).refreshUsageMenu(app, scope);
             }
+        }
+
+        fn routeAppearanceMenuEscapeAction(app: *App, resolved: input_action.Action) !void {
+            switch (resolved) {
+                .cursor_up, .cursor_down => {
+                    _ = app.input_runtime.appearance_menu.cycleSection(1);
+                },
+                .cursor_left, .cursor_right => {
+                    const snapshot = app_commands.settingsCatalogSnapshot(app);
+                    const change = app.input_runtime.appearance_menu.changeSelectedOption(
+                        &snapshot,
+                        if (resolved == .cursor_left) -1 else 1,
+                    ) orelse return;
+                    if (comptime @hasDecl(App, "notificationPreferences")) {
+                        try app_commands.applySettingsCatalogMenuChange(app, change);
+                    }
+                },
+                .toggle_permission_mode => _ = app.input_runtime.appearance_menu.cycleSection(-1),
+                else => return,
+            }
+            app.shell.render_requests.request(.footer);
         }
 
         fn submitHelpMenuSelection(app: *App, max_input_len: usize, max_prompt_history: usize) !bool {
@@ -2407,7 +2473,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeClear(app);
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+                if (cancelCompactCommandMenu(app) or cancelAppearanceMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                     _ = disarmEscapeClear(app);
                     app.shell.render_requests.request(.footer);
                     return;
@@ -2446,7 +2512,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 }
             }
-            if (cancelCompactCommandMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+            if (cancelCompactCommandMenu(app) or cancelAppearanceMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2498,6 +2564,12 @@ pub fn Runtime(comptime App: type) type {
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             }
+            return true;
+        }
+
+        fn cancelAppearanceMenu(app: *App) bool {
+            if (!app.input_runtime.appearance_menu.active) return false;
+            app.input_runtime.appearance_menu.close();
             return true;
         }
 
@@ -2640,6 +2712,7 @@ const routing_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose a model", .presentation_category = .model, .has_args = true, .accepts_payload = true, .requires_prompt_credential = true },
     .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .appearance, .command = "/appearance", .aliases = &.{ "/input", "/maxxing" }, .show_aliases_in_completion = false, .help_entry = "/appearance", .completion_description = "choose appearance", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
 };
 const routing_test_slash_registry = command_specs.SlashRegistry{ .commands = routing_test_slash_specs[0..] };
@@ -5960,11 +6033,11 @@ test "app_input_runtime Enter binds a slash skill after multiline whitespace" {
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
-test "app_input_runtime retired slash alias no longer shadows a matching skill" {
+test "app_input_runtime exact hidden slash alias wins over a matching skill" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{.{
         .name = "input-helper",
-        .description = "input helper",
+        .description = "input appearance helper",
         .path = "/tmp/input-helper/SKILL.md",
         .source = .global_fx,
     }};
@@ -5976,9 +6049,9 @@ test "app_input_runtime retired slash alias no longer shadows a matching skill" 
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
-    try std.testing.expect(app.last_command == null);
-    try std.testing.expectEqualStrings("$input-helper ", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.skill_tokens.items.len);
+    try std.testing.expect(app.last_command != null);
+    try std.testing.expectEqualStrings("/input", app.last_command.?);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
 }
 
 test "app_input_runtime file picker replaces only the active query for Tab and Enter" {
@@ -6373,6 +6446,30 @@ test "app_input_runtime does not duplicate the startup file index load" {
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, ' ', 4096, 100);
     try Runtime(RoutingFakeApp).handleTerminalByte(&app, '@', 4096, 100);
     try std.testing.expectEqual(@as(usize, 1), app.file_index_refresh_count);
+}
+
+test "app_input_runtime synchronizes input completion with active settings" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    app.input_runtime.input_appearance = .tint;
+    app.input_runtime.picker.slash_completion_index = 0;
+    try app.input_runtime.textReplacementState().replace(alloc, "/input");
+    try Runtime(RoutingFakeApp).handleByte(&app, ' ', 4096, 100);
+    try std.testing.expectEqual(
+        command_specs.argCompletionIndexForLabel("/input ", "tint").?,
+        app.input_runtime.picker.slash_completion_index,
+    );
+
+    app.input_runtime.input_appearance = .lines;
+    app.input_runtime.picker.slash_completion_index = 1;
+    try app.input_runtime.textReplacementState().replace(alloc, "/input");
+    try Runtime(RoutingFakeApp).handleByte(&app, ' ', 4096, 100);
+    try std.testing.expectEqual(
+        command_specs.argCompletionIndexForLabel("/input ", "lines").?,
+        app.input_runtime.picker.slash_completion_index,
+    );
 }
 
 test "app_input_runtime file picker navigation respects completion cap" {

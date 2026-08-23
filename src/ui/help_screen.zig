@@ -20,6 +20,8 @@ pub const Composer = struct {
     pasted_blocks: []const paste_blocks.PastedBlock = &.{},
     image_tokens: []const visual_layout.ImageTokenSpan = &.{},
     skill_tokens: []const visual_layout.SkillTokenSpan = &.{},
+    appearance: render_input.InputAppearance,
+    prefix_style: input_presentation.ComposerPrefixStyle,
 };
 
 pub const PaintInput = struct {
@@ -63,6 +65,8 @@ pub fn paint(alloc: Allocator, input: PaintInput) !Paint {
         alloc,
         source,
         layout.composer_window,
+        input.composer.appearance,
+        input.composer.prefix_style,
     );
     defer composer_rows.deinit(alloc);
 
@@ -142,6 +146,8 @@ test "help screen places composer and grouped directory without transcript chrom
         .composer = .{
             .input = "saved",
             .cursor = "saved".len,
+            .appearance = .lines,
+            .prefix_style = input_presentation.ComposerPrefixStyle.rail,
         },
         .clear_display = true,
     });
@@ -179,6 +185,8 @@ test "help screen keeps a selectable command visible at six rows" {
         .composer = .{
             .input = "",
             .cursor = 0,
+            .appearance = .lines,
+            .prefix_style = input_presentation.ComposerPrefixStyle.rail,
         },
         .clear_display = true,
     });
@@ -216,6 +224,8 @@ test "help screen keeps command descriptions associated at narrow and wide width
             .composer = .{
                 .input = "",
                 .cursor = 0,
+                .appearance = .lines,
+                .prefix_style = input_presentation.ComposerPrefixStyle.rail,
             },
             .clear_display = true,
         });

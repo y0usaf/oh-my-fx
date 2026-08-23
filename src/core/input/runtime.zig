@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const input_appearance = @import("../config/input_appearance.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
 const usage_menu = @import("../session/usage_menu.zig");
 const workspace_menu = @import("../workspace/workspace_menu.zig");
@@ -30,12 +31,16 @@ const vertical_navigation = @import("vertical_navigation.zig");
 const Allocator = std.mem.Allocator;
 const ImageBlocks = kill_ring.ImageBlocks;
 
+pub const InputAppearance = input_appearance.InputAppearance;
+
 pub const Runtime = struct {
     edit_state: editor_state.State = .{},
+    input_appearance: InputAppearance = .default,
     slash_menu_categories: bool = true,
     picker: picker_state.State = .{},
     help_menu: command_specs.HelpMenu = .{},
     settings_menu: settings_catalog.Menu = .{},
+    appearance_menu: settings_catalog.AppearanceMenu = .{},
     statusline_menu: settings_catalog.StatuslineMenu = .{},
     usage_menu: usage_menu.State = .{},
     workspace_menu: workspace_menu.State = .{},
@@ -184,6 +189,7 @@ test "runtime owns product input state without terminal mechanics" {
 
     try runtime.insertionState().insertSlice(alloc, "draft", .clear);
     try std.testing.expectEqualStrings("draft", runtime.edit_state.input.items);
+    try std.testing.expectEqual(InputAppearance.default, runtime.input_appearance);
     try std.testing.expect(!@hasField(Runtime, "terminal_action_decoder"));
     try std.testing.expect(!@hasField(Runtime, "terminal_cursor_probe"));
 }

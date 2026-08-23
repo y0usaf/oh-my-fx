@@ -9,7 +9,6 @@ import unittest
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
     BENCHMARK_USE_FLAGS,
-    FX_MACHINE_OUTLINER_FLAGS,
     GENERATION_FLAGS,
     PROFILE_SECTION_ALIGNMENTS,
     USE_FLAGS,
@@ -17,7 +16,6 @@ from scripts.pgso.pipeline import (
     CandidateMetadata,
     PipelinePaths,
     apply_profile,
-    candidate_object_argv,
     candidate_link_argv,
     instrumentation_argv,
     instrumented_run_argv,
@@ -120,12 +118,6 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-passes=default<O2>,mergefunc,iroutliner",
             ),
             BENCHMARK_USE_FLAGS,
-        )
-        self.assertEqual(
-            (
-                "-machine-outliner-reruns=1",
-            ),
-            FX_MACHINE_OUTLINER_FLAGS,
         )
         self.assertEqual(
             (
@@ -259,12 +251,6 @@ class PgsoPipelineTests(unittest.TestCase):
             "13.0",
         )
         candidate = candidate_link_argv(self.toolchain, self.paths)
-        candidate_object = candidate_object_argv(self.toolchain, self.paths)
-        benchmark_paths = PipelinePaths.create(
-            self.root / "benchmark-run",
-            selector="file_index",
-        )
-        benchmark_object = candidate_object_argv(self.toolchain, benchmark_paths)
 
         for alignment in PROFILE_SECTION_ALIGNMENTS:
             self.assertIn(alignment, instrumented)
@@ -287,9 +273,6 @@ class PgsoPipelineTests(unittest.TestCase):
             ),
             candidate,
         )
-        for flag in FX_MACHINE_OUTLINER_FLAGS:
-            self.assertIn(flag, candidate_object)
-            self.assertNotIn(flag, benchmark_object)
 
     def test_candidate_object_and_signing_contract(self) -> None:
         actions = self.root / "candidate-actions.txt"
@@ -336,7 +319,6 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_ir}",
                 "artifact -filetype=obj -O=2 "
-                "-machine-outliner-reruns=1 "
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_object}",
                 "artifact cc -target aarch64-macos -O2 -Wl,-dead_strip -s "

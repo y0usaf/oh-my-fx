@@ -4,6 +4,9 @@ const Allocator = std.mem.Allocator;
 
 pub const root_dir_name = ".fx";
 pub const auth_file_name = "auth.json";
+/// Oh My Fx keeps profile-owned settings in their own private root so fork
+/// settings never collide with upstream fx deployments that manage `.fx`.
+pub const settings_root_dir_name = ".omfx";
 pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
 pub const api_key_file_name = "api-key";
@@ -27,8 +30,12 @@ pub fn rootDir(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name });
 }
 
+pub fn settingsRootDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, settings_root_dir_name });
+}
+
 pub fn settingsPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ home, root_dir_name, settings_file_name });
+    return std.fs.path.join(alloc, &.{ home, settings_root_dir_name, settings_file_name });
 }
 
 pub fn mcpConfigPath(alloc: Allocator, home: []const u8) ![]u8 {
@@ -105,7 +112,7 @@ test "profile path helpers preserve current default locations" {
 
     const settings = try settingsPath(alloc, "/tmp/fake-home");
     defer alloc.free(settings);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/settings.json", settings);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.omfx/settings.json", settings);
 
     const mcp = try mcpConfigPath(alloc, "/tmp/fake-home");
     defer alloc.free(mcp);

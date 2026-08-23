@@ -1008,7 +1008,7 @@ const picker_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
     .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove]", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true },
-    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|yolo|reset]", .completion_description = "choose permission behavior", .presentation_category = .security, .has_args = true },
+    .{ .kind = .appearance, .command = "/maxxing", .help_entry = "/maxxing [minimal|normal]", .completion_description = "choose transcript presentation", .presentation_category = .appearance, .has_args = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account },
 };
 const picker_test_slash_registry = command_specs.SlashRegistry{ .commands = picker_test_slash_specs[0..] };
@@ -1114,7 +1114,7 @@ test "slash menu hides metadata for commands and skills" {
     var command = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 0, true, command_widths, 60, false);
     defer command.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, command.items, "/model") != null);
-    try std.testing.expect(std.mem.find(u8, command.items, "choose what model") != null);
+    try std.testing.expect(std.mem.find(u8, command.items, "reasoning effort to use") != null);
     try std.testing.expect(std.mem.find(u8, command.items, "Model") == null);
 
     const skills = [_]skill_runtime.Skill{.{
@@ -1170,12 +1170,12 @@ test "slash completion option row clips styled descriptions safely" {
 
 test "slash completion option row aligns argument labels without command prefix" {
     const alloc = std.testing.allocator;
-    var row = try composeSlashCompletionOptionRow(alloc, picker_test_slash_registry, "/permissions ", 0, false, 12, 8, 40);
+    var row = try composeSlashCompletionOptionRow(alloc, picker_test_slash_registry, "/maxxing ", 0, false, 12, 8, 40);
     defer row.deinit(alloc);
 
     try std.testing.expect(std.mem.startsWith(u8, row.items, "\x1b[12G"));
-    try std.testing.expect(std.mem.find(u8, row.items, "ask") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "/permissions") == null);
+    try std.testing.expect(std.mem.find(u8, row.items, "minimal") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "/maxxing") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 40);
 }
 
@@ -1284,18 +1284,18 @@ test "registry-aware slash presentation preserves aliases" {
 
 test "mixed slash completion keeps skills out of argument completions" {
     const skills = [_]skill_runtime.Skill{.{
-        .name = "permissions-helper",
-        .description = "permissions help",
-        .path = "/tmp/.codex/skills/permissions-helper",
+        .name = "maxxing-helper",
+        .description = "maxxing help",
+        .path = "/tmp/.codex/skills/maxxing-helper",
         .source = .global_codex,
     }};
 
-    const command_count = command_specs.slashCompletionCount(picker_test_slash_registry, "/permissions ");
+    const command_count = command_specs.slashCompletionCount(picker_test_slash_registry, "/maxxing ");
     try std.testing.expect(command_count > 0);
-    try std.testing.expectEqual(command_count, mixedSlashCompletionCount(picker_test_slash_registry, "/permissions ", &skills));
-    try std.testing.expect(!mixedSlashCompletionIsSkill(picker_test_slash_registry, "/permissions ", &skills, command_count));
-    try std.testing.expect(nthMixedSlashCompletionSkill(picker_test_slash_registry, "/permissions ", &skills, command_count) == null);
-    try std.testing.expectEqualStrings("/permissions ask", nthMixedSlashCompletionText(picker_test_slash_registry, "/permissions ", &skills, 0).?);
+    try std.testing.expectEqual(command_count, mixedSlashCompletionCount(picker_test_slash_registry, "/maxxing ", &skills));
+    try std.testing.expect(!mixedSlashCompletionIsSkill(picker_test_slash_registry, "/maxxing ", &skills, command_count));
+    try std.testing.expect(nthMixedSlashCompletionSkill(picker_test_slash_registry, "/maxxing ", &skills, command_count) == null);
+    try std.testing.expectEqualStrings("/maxxing minimal", nthMixedSlashCompletionText(picker_test_slash_registry, "/maxxing ", &skills, 0).?);
 }
 
 test "edge-scroll picker window lets selection reach bottom before scrolling" {

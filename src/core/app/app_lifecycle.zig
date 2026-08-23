@@ -6,6 +6,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
+const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -16,6 +17,7 @@ const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const ui_render = @import("../../ui/render.zig");
+const presentation_mode = @import("../config/presentation_mode.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
@@ -131,7 +133,8 @@ pub const StartupState = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
-    fast_mode_source: config_runtime.ConfigSource = .compiled_default,
+    input_appearance: input_appearance.InputAppearance = .default,
+    maxxing_mode: presentation_mode.MaxxingMode = presentation_mode.MaxxingMode.default,
     slash_menu_categories: bool = true,
     auto_upgrade: bool = true,
     update_channel: update_target.Channel = .stable,
@@ -422,9 +425,9 @@ fn loadStartupStateFromOwnedWorkspace(
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
-    state.fast_mode = settings.fast_mode orelse
-        (state.provider == .gateway and state.model_source == .compiled_default);
-    state.fast_mode_source = detailed.sources.fast_mode;
+    state.fast_mode = settings.fast_mode orelse false;
+    state.input_appearance = initialInputAppearance(settings.input_appearance);
+    state.maxxing_mode = initialMaxxingMode(settings.maxxing_mode);
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
@@ -1159,6 +1162,24 @@ test "startup provider chooses only its provider-scoped model" {
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
     return alloc.dupe(u8, initialModelId(default_model, configured));
+}
+
+fn initialInputAppearance(configured: ?[]const u8) input_appearance.InputAppearance {
+    return input_appearance.InputAppearance.parse(
+        configured orelse input_appearance.InputAppearance.default.label(),
+    ) orelse .default;
+}
+
+fn initialMaxxingMode(configured: ?[]const u8) presentation_mode.MaxxingMode {
+    const value = configured orelse return presentation_mode.MaxxingMode.default;
+    return presentation_mode.MaxxingMode.parse(value) orelse presentation_mode.MaxxingMode.default;
+}
+
+test "maxxing mode defaults to minimal and accepts legacy settings" {
+    try std.testing.expectEqual(presentation_mode.MaxxingMode.default, initialMaxxingMode(null));
+    try std.testing.expectEqual(presentation_mode.MaxxingMode.minimal, initialMaxxingMode("minimal"));
+    try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, initialMaxxingMode("legacy"));
+    try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, initialMaxxingMode("normal"));
 }
 
 fn hasProcessModelOverride() bool {
@@ -2021,15 +2042,15 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
 }
 
-test "loadStartupState defaults fast mode on only for the compiled Gateway default and preserves explicit preferences" {
+test "loadStartupState defaults fast mode off and preserves explicit preferences" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
-    try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
-    try tmp.dir.createDirPath(io_mod.getIo(), "codex");
+    try tmp.dir.createDirPath(io_mod.getIo(), "enabled");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -2037,18 +2058,16 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     defer std.testing.allocator.free(absent_root);
     const configured_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "configured");
     defer std.testing.allocator.free(configured_root);
-    const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
-    defer std.testing.allocator.free(disabled_root);
-    const codex_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "codex");
-    defer std.testing.allocator.free(codex_root);
+    const enabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "enabled");
+    defer std.testing.allocator.free(enabled_root);
 
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
-        .{ configured_root, disabled_root, codex_root },
+        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":true}}}}}}\n",
+        .{ configured_root, enabled_root },
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.omfx/settings.json", fixture);
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2057,7 +2076,7 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     defer absent.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.selected_model);
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.configured_model);
-    try std.testing.expect(absent.fast_mode);
+    try std.testing.expect(!absent.fast_mode);
 
     var configured = try loadStartupStateForWorkspace(std.testing.allocator, configured_root, "zai/glm-5.2", 25);
     defer configured.deinit(std.testing.allocator);
@@ -2065,21 +2084,18 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     try std.testing.expectEqualStrings("openai/gpt-5", configured.configured_model);
     try std.testing.expect(!configured.fast_mode);
 
-    var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "zai/glm-5.2", 25);
-    defer disabled.deinit(std.testing.allocator);
-    try std.testing.expect(!disabled.fast_mode);
-
-    var codex = try loadStartupStateForWorkspace(std.testing.allocator, codex_root, "zai/glm-5.2", 25);
-    defer codex.deinit(std.testing.allocator);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", codex.selected_model);
-    try std.testing.expect(!codex.fast_mode);
+    var enabled = try loadStartupStateForWorkspace(std.testing.allocator, enabled_root, "zai/glm-5.2", 25);
+    defer enabled.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("zai/glm-5.2", enabled.selected_model);
+    try std.testing.expectEqualStrings("zai/glm-5.2", enabled.configured_model);
+    try std.testing.expect(enabled.fast_mode);
 }
 
 test "loadStartupState resolves startup scrollback default and explicit false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
@@ -2097,7 +2113,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
         .{disabled_root},
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.omfx/settings.json", fixture);
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2105,16 +2121,54 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "default-model", 25);
     defer absent.deinit(std.testing.allocator);
     try std.testing.expect(absent.startup_scrollback);
+    try std.testing.expectEqual(input_appearance.InputAppearance.tint, absent.input_appearance);
 
     var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "default-model", 25);
     defer disabled.deinit(std.testing.allocator);
     try std.testing.expect(!disabled.startup_scrollback);
 }
 
+test "loadStartupState resolves input appearance default and explicit lines" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "absent");
+    try tmp.dir.createDirPath(io_mod.getIo(), "lines");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
+    defer std.testing.allocator.free(absent_root);
+    const lines_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "lines");
+    defer std.testing.allocator.free(lines_root);
+
+    const fixture = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"workspaces\":{{\"{s}\":{{\"input_appearance\":\"lines\"}}}}}}\n",
+        .{lines_root},
+    );
+    defer std.testing.allocator.free(fixture);
+    try writeFixtureFile(tmp.dir, "home/.omfx/settings.json", fixture);
+
+    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+
+    var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "default-model", 25);
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expectEqual(input_appearance.InputAppearance.tint, absent.input_appearance);
+
+    var lines = try loadStartupStateForWorkspace(std.testing.allocator, lines_root, "default-model", 25);
+    defer lines.deinit(std.testing.allocator);
+    try std.testing.expectEqual(input_appearance.InputAppearance.lines, lines.input_appearance);
+}
+
 test "loadStartupState resolves slash menu categories default and explicit false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
@@ -2130,7 +2184,7 @@ test "loadStartupState resolves slash menu categories default and explicit false
     defer initial.deinit(std.testing.allocator);
     try std.testing.expect(initial.slash_menu_categories);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"slash_menu_categories\":false}\n");
+    try writeFixtureFile(tmp.dir, "home/.omfx/settings.json", "{\"slash_menu_categories\":false}\n");
     var hidden = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
     defer hidden.deinit(std.testing.allocator);
     try std.testing.expect(!hidden.slash_menu_categories);
@@ -2216,6 +2270,7 @@ test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
 test "loadStartupState diagnoses the retired fuzzy skill setting" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
@@ -2224,7 +2279,7 @@ test "loadStartupState diagnoses the retired fuzzy skill setting" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"skill_match_fuzzy\":true}");
+    try writeFixtureFile(tmp.dir, "home/.omfx/settings.json", "{\"skill_match_fuzzy\":true}");
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();

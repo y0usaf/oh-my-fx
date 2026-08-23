@@ -378,6 +378,7 @@ pub const ExecutorKind = enum {
     create_folder,
     file_info,
     memory,
+    ast_symbols,
     semantic_search,
     open_file,
     web_fetch,

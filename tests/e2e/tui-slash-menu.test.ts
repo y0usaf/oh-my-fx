@@ -181,6 +181,25 @@ async function waitForStatuslineValue(
   );
 }
 
+async function waitForAppearanceMenu(
+  session: TmuxSession,
+  expectedSelection?: string,
+): Promise<string[]> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: string[] = [];
+  while (Date.now() < deadline) {
+    latest = await session.capturePaneGrid();
+    const pane = latest.join("\n");
+    if (
+      pane.includes("Input appearance") &&
+      pane.includes("Maxxing mode") &&
+      (expectedSelection === undefined || pane.includes(expectedSelection))
+    ) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(`Timed out waiting for appearance menu.\nPane:\n${latest.join("\n")}`);
+}
+
 async function waitForStatuslineMenu(
   session: TmuxSession,
   expectedSelection?: string,
@@ -532,7 +551,7 @@ function stripAnsi(text: string): string {
 
 function submittedSkillRows(escapes: string): string[] {
   return escapes.split("\n").filter((line) =>
-    /┃ managed-menu please/.test(stripAnsi(line))
+    /(?:┃|❯) managed-menu please/.test(stripAnsi(line))
   );
 }
 
@@ -937,7 +956,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(71);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 38", 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(62);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1177,7 +1196,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForSettingsMenu(session);
       expect(grid.join("\n")).toContain("Slash menu categories");
 
-      for (let index = 0; index < 3; index += 1) {
+      for (let index = 0; index < 5; index += 1) {
         await session.sendKeys("Down");
       }
       await session.sendKeys("Left");
@@ -1381,16 +1400,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("Sessions"),
         5_000,
       );
-      for (const retired of ["/appearance", "/input", "/maxxing"]) {
-        await session.sendKeys("C-u");
-        await session.sendLiteralText(retired);
-        pane = await session.waitForText("no matching slash commands", 5_000);
-        expect(composerContains(pane, retired)).toBe(true);
-        expect(pane).not.toContain("minimal");
-        expect(pane).not.toContain("legacy");
-        expect(pane).not.toContain("resume-helper");
-        expect(session.isAlive()).toBe(true);
-      }
+      await session.sendLiteralText("/maxxing ");
+      pane = await session.waitForPane(
+        (current) => current.includes("minimal") && current.includes("legacy"),
+        5_000,
+      );
+      expect(pane).not.toContain("resume-helper");
+      expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
       await session.pasteText("\n   ");
@@ -1439,7 +1455,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 37);
+      let grid = await waitForHelpMenu(session, 38);
       let pane = grid.join("\n");
       expect(pane).not.toContain("𝒇x");
       expect(pane).not.toContain("Run /help for commands");
@@ -1459,11 +1475,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 38);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 37"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 38"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1472,7 +1488,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 38);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1489,7 +1505,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 38);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -1518,6 +1534,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(
         settingsPath,
         `${JSON.stringify({
+          input_appearance: "tint",
           statusLine: { workspace: false },
         })}\n`,
       );
@@ -1551,9 +1568,16 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("[All]");
       expect(pane).not.toContain("Enter Change");
 
-      expect(pane).not.toContain("Input appearance");
-      expect(pane).not.toContain("Maxxing mode");
-      for (let index = 0; index < 2; index += 1) await session.sendKeys("Down");
+      expect(pane).toContain("Input appearance");
+      await session.sendKeys("Left");
+      await waitForSettingValue(settingsPath, "input_appearance", "lines");
+
+      await session.sendKeys("Down");
+      await session.waitForText(/Maxxing mode\s+minimal/, 5_000);
+      await session.sendKeys("Left");
+      await waitForSettingValue(settingsPath, "maxxing_mode", "legacy");
+
+      for (let index = 0; index < 3; index += 1) await session.sendKeys("Down");
       await session.waitForText(/Status line workspace\s+off/, 5_000);
       await session.sendKeys("Right");
       await waitForStatuslineValue(settingsPath, "workspace", true);
@@ -1577,14 +1601,93 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "appearance command applies both independent settings from one inline panel",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-appearance-menu-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const settingsPath = join(home, ".fx", "settings.json");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(
+        settingsPath,
+        `${JSON.stringify({
+          input_appearance: "tint",
+          maxxing_mode: "minimal",
+        })}\n`,
+      );
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 100,
+        height: 30,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/appearance");
+      let grid = await waitForAppearanceMenu(session);
+      let pane = grid.join("\n");
+      expect(pane).toContain("𝒇x");
+      expect(pane).toContain("Input appearance");
+      expect(pane).toContain("Maxxing mode");
+      expect(pane).toContain("lines  tint");
+      expect(pane).toContain("minimal  legacy");
+      expect(pane).not.toContain("❯");
+      expect(pane).not.toContain("✓");
+      expect(pane).toContain("Tab Section");
+      expect(pane).toContain("←→ Change");
+
+      await session.sendKeys("Right");
+      await waitForSettingValue(settingsPath, "input_appearance", "lines");
+      grid = await waitForAppearanceMenu(session, "lines  tint");
+      pane = grid.join("\n");
+      expect(pane).not.toContain("✓");
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).input_appearance).toBe("lines");
+
+      await session.sendKeys("Tab");
+      await session.waitForText("minimal  legacy", 5_000);
+      await session.sendKeys("Right");
+      await waitForSettingValue(settingsPath, "maxxing_mode", "legacy");
+      grid = await waitForAppearanceMenu(session, "minimal  legacy");
+      pane = grid.join("\n");
+      expect(pane).not.toContain("✓");
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).maxxing_mode).toBe("legacy");
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) =>
+          hasEmptyComposer(current) &&
+          current.includes("𝒇x") &&
+          !current.includes("Appearance · Choose one"),
+        5_000,
+      );
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "compact catalogs keep their actionable rows visible",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-compact-catalogs-")));
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "workspace");
+      const settingsPath = join(home, ".fx", "settings.json");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
+      writeFileSync(settingsPath, `${JSON.stringify({ input_appearance: "tint" })}\n`);
 
       session = await TmuxSession.create({
         cwd: workspace,
@@ -1600,7 +1703,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let pane = await session.waitForText("Commands 37", 5_000);
+      let pane = await session.waitForText("Commands 38", 5_000);
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       await session.sendKeys("Escape");
@@ -1608,19 +1711,32 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.resizeWindow(60, 7, 500);
       await session.sendText("/settings");
       pane = (await waitForSettingsMenu(session)).join("\n");
-      expect(pane).toContain("Status line context");
-      expect(pane).not.toContain("Input appearance");
-      expect(pane).not.toContain("Maxxing mode");
+      expect(pane).toContain("Input appearance");
 
       await session.resizeWindow(60, 9, 500);
+      await session.sendKeys("Left");
+      await waitForSettingValue(settingsPath, "input_appearance", "lines");
       pane = (await waitForSettingsMenu(session)).join("\n");
-      expect(pane).toContain("Status line context");
+      expect(pane).toContain("Input appearance");
       await session.sendKeys("Escape");
       await session.waitForPane(
         (current) => hasEmptyComposer(current) && !current.includes("←→ Change"),
         5_000,
       );
 
+      await session.resizeWindow(60, 12, 500);
+      await session.sendText("/appearance");
+      pane = await session.waitForText("Appearance", 5_000);
+      expect(pane).toContain("Input appearance");
+      expect(pane).toContain("lines  tint");
+      expect(pane).toContain("Maxxing mode");
+      expect(pane).toContain("minimal  legacy");
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("←→ Change"),
+        5_000,
+      );
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
@@ -2294,7 +2410,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(tail_history).not.toContain("𝒇x v0.3.7");
       const escapes = await session.capturePaneEscapes();
       expect(escapes).not.toContain(`${DIM_SGR}fx-review`);
-      expect(deep_history).not.toMatch(/┃ \/sk/);
+      expect(deep_history).not.toMatch(/(?:┃|❯) \/sk/);
 
       await session.sendLiteralText("work");
       grid = await waitForSkillsMenu(session, 1);
@@ -3033,8 +3149,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         );
 
         let history = capturePaneHistory(session, -200);
-        expect(history).toMatch(/┃ managed-menu please/);
-        expect(history).not.toMatch(/┃ \$managed-menu please/);
+        expect(history).toMatch(/(?:┃|❯) managed-menu please/);
+        expect(history).not.toMatch(/(?:┃|❯) \$managed-menu please/);
         escapes = await session.captureFullScrollbackEscapes();
         let submittedRows = submittedSkillRows(escapes);
         expect(submittedRows).toHaveLength(1);
@@ -3042,8 +3158,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
         await session.resizeWindow(80, 24);
         history = capturePaneHistory(session, -200);
-        expect(history).toMatch(/┃ managed-menu please/);
-        expect(history).not.toMatch(/┃ \$managed-menu please/);
+        expect(history).toMatch(/(?:┃|❯) managed-menu please/);
+        expect(history).not.toMatch(/(?:┃|❯) \$managed-menu please/);
         escapes = await session.captureFullScrollbackEscapes();
         submittedRows = submittedSkillRows(escapes);
         expect(submittedRows).toHaveLength(1);
@@ -3271,7 +3387,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 38", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");

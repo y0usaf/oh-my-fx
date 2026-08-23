@@ -837,7 +837,7 @@ function expectAltExitToPreserveNormalViewport(tapePath: string): void {
 }
 
 test.skipIf(!tmuxAvailable())(
-  "approved-shell command output normalizes controls in Ctrl-O and resume views",
+  "approved-shell command output normalizes controls in compact, Ctrl-O, and resume views",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-output-terminal-safety-")));
     const home = join(root, "home");
@@ -857,7 +857,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(resumedStderrPath, "");
@@ -908,20 +908,19 @@ printf '${trailingMarker}   '
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, doneMarker);
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).toContain("└ Ran ./command-output-controls.sh");
-      expect(compact).not.toContain(`│ ${ansiMarker}`);
-      expect(compact).not.toContain(`│ ${crMarker}`);
-      expect(compact).not.toContain("│ TAB");
-      expect(compact).not.toContain("│ NUL:\\x00:END");
-      expect(compact).not.toContain("│ INVALID:\\xff:END");
+      expect(compact).toContain(`│ ${ansiMarker}`);
+      expect(compact).toContain(`│ ${crMarker}`);
+      expect(compact).toContain("│ TAB");
+      expect(compact).toContain("STOP");
+      expect(compact).toContain("│ NUL:\\x00:END");
+      expect(compact).toContain("│ INVALID:\\xff:END");
       expect(compact).not.toContain("CR_STAGE_01");
       expect(compact).not.toContain("\\x0d");
       expect(compact).not.toContain("\\x1b[31m");
       expect(compact).not.toContain("BOUNDARY_LEADING");
       expect(compact).not.toContain(splitMarker);
       expect(compact).not.toContain(trailingMarker);
-      expect(compact).not.toContain("lines more (ctrl o to view)");
+      expect(compact).toContain("│ … 5 lines more (ctrl o to view)");
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
       expect(readFileSync(tracePath, "utf8")).toContain("route=approved_shell");
 
@@ -931,8 +930,8 @@ printf '${trailingMarker}   '
       );
       const compactGrid = await active.capturePaneGrid();
       await active.resizeWindow(48, 24);
-      const narrow = await active.waitForText(doneMarker, TIMEOUT);
-      expect(narrow).not.toContain(`│ ${ansiMarker}`);
+      const narrow = await active.waitForText("│ … 5 lines more (ctrl o to view)", TIMEOUT);
+      expect(narrow).toContain(`│ ${ansiMarker}`);
       expect(narrow).not.toContain(trailingMarker);
       await active.resizeWindow(72, 24);
       await active.waitForText(doneMarker, TIMEOUT);
@@ -943,7 +942,7 @@ printf '${trailingMarker}   '
       );
 
       const tape = readFileSync(tapePath);
-      expect(tape.includes(Buffer.from(`│ ${ansiMarker}`))).toBe(false);
+      expect(tape.includes(Buffer.from(`│ ${ansiMarker}`))).toBe(true);
       expect(tape.includes(Buffer.from(`\x1b[31m${ansiMarker}`))).toBe(false);
       expect(tape.includes(Buffer.from(`NUL:\x00:END`))).toBe(false);
       expect(tape.includes(Buffer.from([0x49, 0x4e, 0x56, 0x41, 0x4c, 0x49, 0x44, 0x3a, 0xff])))
@@ -1008,7 +1007,7 @@ printf '${trailingMarker}   '
         width: 72,
         height: 24,
       });
-      await active.waitForText(doneMarker, TIMEOUT);
+      await active.waitForText("│ … 5 lines more (ctrl o to view)", TIMEOUT);
       await active.sendKeys("C-o");
       await active.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
       expect(await active.capturePane()).not.toContain(trailingMarker);
@@ -1052,7 +1051,7 @@ printf '${trailingMarker}   '
 );
 
 test.skipIf(!tmuxAvailable())(
-  "Ctrl-O opens retained command output and restores grouped compact output",
+  "Ctrl-O opens retained command output in the alternate buffer and restores compact inline output",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-")));
     const home = join(root, "home");
@@ -1063,7 +1062,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -1088,9 +1087,11 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
+      await waitForScrollback(
+        active,
+        "│ … 2995 lines more (ctrl o to view)",
+      );
       const compact = await waitForScrollback(active, "FULL_CTRL_O_DONE");
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).not.toContain("lines more (ctrl o to view)");
       expect(compact).not.toContain(tailMarker);
       await active.waitForPane(
         (pane) => pane.includes("FULL_CTRL_O_DONE") && !pane.includes("Streaming ("),
@@ -1157,10 +1158,10 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Left");
       await active.waitForText("Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close", TIMEOUT);
       await active.sendKeys("C-o");
-      await active.waitForText("● 1 tool call · 1 command", TIMEOUT);
+      await active.waitForText("│ … 2995 lines more (ctrl o to view)", TIMEOUT);
       const restored = await active.capturePane();
       const restoredScrollback = await active.captureFullScrollback();
-      expect(restored).not.toContain("lines more (ctrl o to view)");
+      expect(restored).toContain("│ … 2995 lines more (ctrl o to view)");
       expect(restored).not.toContain(tailMarker);
       expect(normalizeVolatileStatusRows(await active.capturePaneGrid())).toEqual(
         normalizeVolatileStatusRows(compactGrid),
@@ -1183,7 +1184,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "cap-crossing command output stays durable while grouped compact returns to input",
+  "cap-crossing command output returns to input and accepts slash commands",
   async () => {
     const timeout = 120_000;
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-output-cap-")));
@@ -1196,7 +1197,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -1234,9 +1235,12 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cap-crossing command.");
+      await waitForScrollback(
+        active,
+        `│ … ${lineCount * 2 - 5} lines more (ctrl o to view)`,
+        timeout,
+      );
       const compact = await waitForScrollback(active, finalMarker, timeout);
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).not.toContain("lines more (ctrl o to view)");
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
 
@@ -1318,7 +1322,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(
@@ -1384,16 +1388,16 @@ printf '${tailMarker}\\n'
       );
       const activeCompact = await active.waitForPane(
         (pane) =>
-          pane.includes("Running ./active-overflow.sh") &&
-          !pane.includes(stableMarker),
+          pane.includes(stableMarker) &&
+          /│ … \d+ (?:line|lines) more \(ctrl o to view\)/.test(pane),
         timeout,
       );
       const compactOutputRows = activeCompact.split("\n").filter((line) =>
         line.trimStart().startsWith("│ ") && !line.includes("ctrl o to view")
       );
-      expect(compactOutputRows).toHaveLength(0);
+      expect(compactOutputRows).toHaveLength(5);
       expect(activeCompact).not.toContain(tailMarker);
-      expect(activeCompact.match(/Running \.\/active-overflow\.sh/g)).toHaveLength(1);
+      expect(activeCompact.match(/● Running/g)).toHaveLength(1);
 
       await active.sendKeys("C-o");
       await active.waitForText(futureMarker, timeout);
@@ -1431,8 +1435,8 @@ printf '${tailMarker}\\n'
       await active.sendKeys("Escape");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running ./active-overflow.sh") &&
-          !pane.includes(stableMarker) &&
+          pane.includes(stableMarker) &&
+          pane.includes("lines more (ctrl o") &&
           !pane.includes(futureMarker),
         timeout,
       );
@@ -1445,9 +1449,8 @@ printf '${tailMarker}\\n'
       );
 
       const terminalCompact = await active.capturePane();
-      expect(terminalCompact).toContain("Ran ./active-overflow.sh");
-      expect(terminalCompact).not.toContain(stableMarker);
-      expect(terminalCompact).not.toContain("lines more (ctrl o");
+      expect(terminalCompact).toContain(stableMarker);
+      expect(terminalCompact).toContain("lines more (ctrl o");
       expect(terminalCompact).not.toContain(tailMarker);
       expect(terminalCompact).not.toContain(futureMarker);
       const sessionId = sessionIdFromHome(home);
@@ -1488,7 +1491,7 @@ printf '${tailMarker}\\n'
 );
 
 test.skipIf(!tmuxAvailable())(
-  "cancelled cap-crossing command keeps grouped rows stable and Ctrl-O opens its artifact",
+  "cancelled cap-crossing command keeps inline rows stable and Ctrl-O opens its complete artifact",
   async () => {
     const timeout = 60_000;
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-command-cap-")));
@@ -1511,7 +1514,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(join(workspace, ".cancel-cap-row-prefix"), rowPrefix);
@@ -1571,6 +1574,7 @@ while :; do :; done
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cancellable cap-crossing command.");
+      await waitForScrollback(active, expectedRows[4]!, timeout);
       await waitForCondition(
         () => existsSync(readyPath),
         "the cap-crossing command readiness file",
@@ -1585,6 +1589,7 @@ while :; do :; done
 
       await active.sendKeys("Escape");
       await waitForScrollback(active, "Cancelled", timeout);
+      await waitForScrollback(active, "│ … 619 lines more (ctrl o to view)", timeout);
       await waitForCondition(
         () => readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
         "interrupted command finalization",
@@ -1597,10 +1602,15 @@ while :; do :; done
       writeFileSync(beforePath, before);
       writeFileSync(beforeAnsiPath, beforeAnsi);
       const beforePlain = stripAnsi(before);
-      for (const row of expectedRows) {
+      for (const row of expectedRows.slice(0, 5)) {
+        expect(countOccurrences(beforePlain, row)).toBe(1);
+      }
+      for (const row of expectedRows.slice(5)) {
         expect(countOccurrences(beforePlain, row)).toBe(0);
       }
-      expect(historicalLines(before)).toHaveLength(0);
+      expect(historicalLines(before).map(stripAnsi)).toEqual(
+        expectedRows.slice(0, 5).map((row) => expect.stringContaining(row)),
+      );
       expect(beforePlain).not.toContain(tailMarker);
 
       const sessionId = sessionIdFromHome(home);
@@ -1632,7 +1642,7 @@ while :; do :; done
       await active.sendKeys("C-o");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Cancelled") &&
+          pane.includes("│ … 619 lines more (ctrl o to view)") &&
           !pane.includes(tailMarker),
         timeout,
       );
@@ -1777,7 +1787,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(join(workspace, ".cancel-below-head"), headMarker);
@@ -1822,6 +1832,7 @@ while :; do :; done
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cancellable below-cap command.");
+      await waitForScrollback(active, headMarker, timeout);
       await waitForCondition(
         () => existsSync(readyPath),
         "the below-cap command readiness file",
@@ -1838,7 +1849,7 @@ while :; do :; done
 
       expect(gateway.requests).toHaveLength(1);
       const compact = await active.captureFullScrollback();
-      expect(countOccurrences(compact, headMarker)).toBe(0);
+      expect(countOccurrences(compact, headMarker)).toBe(1);
       expect(compact).not.toContain(tailMarker);
       const sessionId = sessionIdFromHome(home);
       const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
@@ -1857,7 +1868,7 @@ while :; do :; done
       expect(await active.capturePane()).toContain(tailMarker);
       await active.sendKeys("Escape");
       await active.waitForPane(
-        (pane) => pane.includes("Cancelled") && !pane.includes(tailMarker),
+        (pane) => pane.includes(headMarker) && !pane.includes(tailMarker),
         timeout,
       );
       expect(await active.captureFullScrollback()).not.toContain(tailMarker);
@@ -1906,7 +1917,7 @@ while :; do :; done
 );
 
 test.skipIf(!tmuxAvailable())(
-  "grouped command status stays compact while Ctrl-O keeps detail",
+  "inline command output follows completed tool status and Ctrl-O keeps detail",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-output-status-order-")));
     const home = join(root, "home");
@@ -1924,14 +1935,14 @@ test.skipIf(!tmuxAvailable())(
     const workspace = realpathSync(workspaceDir);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
     const finalMarker = "ORDER_REPRO_DONE";
     const prompt =
       "Use the shell tool to run exactly pwd and no other commands. Then reply with the completion marker.";
-    const statusLine = "└ Ran pwd";
+    const statusLine = "● Ran pwd";
     const outputLine = workspace;
     const reviewOutputPrefix = workspace.slice(0, 56);
     const visibleLinearText = (text: string): string =>
@@ -1955,7 +1966,10 @@ test.skipIf(!tmuxAvailable())(
       expect(statusIndex).toBeGreaterThanOrEqual(0);
       expect(doneIndex).toBeGreaterThan(statusIndex);
       const transcriptRegion = scrollback.slice(statusIndex, doneIndex);
-      expect(countOccurrences(transcriptRegion, outputLine)).toBe(0);
+      expect(countOccurrences(transcriptRegion, outputLine)).toBe(1);
+      const outputIndex = scrollback.indexOf(outputLine, statusIndex);
+      expect(outputIndex).toBeGreaterThan(statusIndex);
+      expect(doneIndex).toBeGreaterThan(outputIndex);
     };
     const gateway = startFakeGateway([
       fakeGatewayToolCall("order-repro-pwd", "terminal", { action: "exec", command: "pwd" }),
@@ -2116,6 +2130,69 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "slow shell streaming keeps normal inline scrollback lossless",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-slow-command-output-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
+    );
+    writeFileSync(stderrPath, "");
+
+    const marker = "SLOW_STREAM_DONE";
+    const command =
+      "zsh -lc 'for i in {001..080}; do print -r -- \"SLOW_STREAM $i\"; sleep 0.05; done'";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("slow-command-output", "terminal", { action: "exec", command }),
+      fakeGatewayFinalText(marker),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+        },
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Run the prepared streaming command.");
+      const scrollback = await waitForScrollback(active, marker);
+
+      const duplicateLines: string[] = [];
+      for (let i = 1; i <= 5; i += 1) {
+        const line = `│ SLOW_STREAM ${String(i).padStart(3, "0")}`;
+        const count = countOccurrences(scrollback, line);
+        if (count !== 1) duplicateLines.push(`${line}: ${count}`);
+      }
+      expect(duplicateLines).toEqual([]);
+      expect(scrollback).not.toContain("│ SLOW_STREAM 006");
+      expect(scrollback).not.toContain("│ SLOW_STREAM 080");
+      expect(scrollback).toContain("│ … 75 lines more (ctrl o to view)");
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "Ctrl-C closes the Ctrl-O viewer without clearing the unsent draft",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-draft-")));
@@ -2273,7 +2350,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2356,7 +2433,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2420,7 +2497,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2443,7 +2520,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
-      await active.waitForText("Running sh -c", TIMEOUT);
+      await active.waitForText(firstMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText(tailMarker, TIMEOUT);
@@ -2486,7 +2563,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2517,8 +2594,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
-          !pane.includes(`${lineMarker} 001`),
+          pane.includes(`${lineMarker} 001`) &&
+          /│ … [1-9]\d* lines more \(ctrl o to view\)/.test(pane),
         TIMEOUT,
       );
       const scrollActions = [
@@ -2576,9 +2653,9 @@ test.skipIf(!tmuxAvailable())(
         TIMEOUT,
       );
       const scrollback = await waitForScrollback(active, doneMarker);
-      expect(scrollback).not.toContain(`│ ${lineMarker} 001`);
-      expect(countOccurrences(scrollback, `│ ${lineMarker} 001`)).toBe(0);
-      expect(scrollback).not.toContain("lines more (ctrl o to view)");
+      expect(scrollback).toContain(`│ ${lineMarker} 001`);
+      expect(countOccurrences(scrollback, `│ ${lineMarker} 001`)).toBe(1);
+      expect(scrollback).toContain("│ … 155 lines more (ctrl o to view)");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await active.sendText("/quit");
@@ -2619,7 +2696,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "Ctrl-O navigation during shell streaming preserves grouped compact rows",
+  "Ctrl-O navigation during shell streaming preserves compact scrollback rows",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-navigation-")));
     const home = join(root, "home");
@@ -2629,7 +2706,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2657,8 +2734,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
-          !pane.includes(`${commandMarker} 00005`),
+          pane.includes(`${commandMarker} 00005`) &&
+          /│ … [1-9]\d* lines more \(ctrl o to view\)/.test(pane),
         TIMEOUT,
       );
 
@@ -2672,15 +2749,20 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Escape");
 
       const scrollback = await waitForScrollback(active, doneMarker);
+      const missingOrDuplicate: string[] = [];
       for (let index = 1; index <= 5; index += 1) {
         const line = `│ ${commandMarker} ${String(index).padStart(5, "0")}`;
-        expect(countOccurrences(scrollback, line)).toBe(0);
+        const count = countOccurrences(scrollback, line);
+        if (count !== 1) missingOrDuplicate.push(`${line}: ${count}`);
       }
+      expect(missingOrDuplicate).toEqual([]);
       expect(scrollback).not.toContain(`│ ${commandMarker} 00006`);
       expect(scrollback).not.toContain(
         `│ ${commandMarker} ${String(lineCount).padStart(5, "0")}`,
       );
-      expect(scrollback).not.toContain("lines more (ctrl o to view)");
+      expect(scrollback).toContain(
+        `│ … ${lineCount - 5} lines more (ctrl o to view)`,
+      );
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
     } finally {
       if (active) {
@@ -2708,7 +2790,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2787,7 +2869,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2893,7 +2975,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2959,7 +3041,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(
       join(workspace, "README.md"),
@@ -3021,7 +3103,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(join(workspace, "README.md"), "READ_FULL_DETAIL_MARKER\n");
     writeFileSync(join(workspace, "LIST_FULL_DETAIL_MARKER"), "");
@@ -3091,6 +3173,7 @@ test.skipIf(!tmuxAvailable())(
         sandbox: "none",
         permission_mode: "ask",
         permission: {},
+        maxxing_mode: "legacy",
       }),
     );
     writeFileSync(stderrPath, "");
@@ -3148,10 +3231,10 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const beforeHandoff = await waitForScrollback(active, priorSummary);
-      expect(beforeHandoff).not.toContain("lines more (ctrl o to view)");
+      expect(beforeHandoff).toContain("│ … 645 lines more (ctrl o to view)");
       expect(countOccurrences(beforeHandoff, priorSummary)).toBe(1);
       const compactOutputRows = beforeHandoff.match(/CTRL_O_FILE_FOLD_\d{4}/g) ?? [];
-      expect(compactOutputRows).toHaveLength(0);
+      expect(compactOutputRows).toHaveLength(5);
       expect(beforeHandoff).not.toContain("CTRL_O_FILE_FOLD_0006");
       expect(beforeHandoff).not.toContain("CTRL_O_FILE_FOLD_0650");
       for (const line of compactOutputRows) {
@@ -3216,7 +3299,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -3279,7 +3362,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -3447,7 +3530,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(seedPath, "9767\n");
@@ -3542,7 +3625,11 @@ test.skipIf(!tmuxAvailable())(
     const pressureRows = (scrollback: string): string[] =>
       scrollback.split("\n").filter((line) =>
         line.includes("CTRL_O_PRESSURE_ASSISTANT_") ||
-        line.includes(setupSentinel)
+        line.includes(setupSentinel) ||
+        line.includes("CTRL_O_PRESSURE_SETUP_OUTPUT_") ||
+        line.includes(activeStart) ||
+        line.includes(streamPrefix) ||
+        line.includes(streamGate)
       ).map((line) => line.trimEnd());
 
     let active: TmuxSession | null = null;
@@ -3570,13 +3657,14 @@ test.skipIf(!tmuxAvailable())(
       const setupScrollback = await waitForScrollbackMarkers(active, [
         assistantHead,
         assistantTail,
+        setupCompactLine,
         setupSentinel,
       ]);
       expect(setupScrollback).toContain(assistantHead);
       expect(setupScrollback).toContain(assistantTail);
-      expect(setupScrollback).not.toContain(setupCompactLine);
+      expect(setupScrollback).toContain(setupCompactLine);
       expect(setupScrollback).not.toContain(setupFullLine);
-      expect(setupScrollback).not.toContain("lines more (ctrl o to view)");
+      expect(setupScrollback).toContain("│ … 67 lines more (ctrl o to view)");
 
       await active.sendText("Run the prepared streaming command and file review.");
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
@@ -3584,8 +3672,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Enter");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running sh -c") &&
-          !pane.includes(`${streamPrefix}004`),
+          pane.includes(`${streamPrefix}004`) &&
+          /│ … [1-9]\d* lines more \(ctrl o to view\)/.test(pane),
         TIMEOUT,
       );
       const compactRowsBeforeNavigation = pressureRows(await active.captureFullScrollback());
@@ -3683,7 +3771,8 @@ test.skipIf(!tmuxAvailable())(
       );
       const afterFileRejection = await active.waitForPane(
         (pane) =>
-          pane.includes("Ran sh -c") &&
+          pane.includes(activeStart) &&
+          pane.includes("│ … 16 lines more (ctrl o to view)") &&
           !pane.includes("Apply this change?"),
         TIMEOUT,
       );
@@ -3712,23 +3801,23 @@ test.skipIf(!tmuxAvailable())(
       const finalPane = await active.capturePane();
       expect(finalScrollback).toContain(assistantHead);
       expect(finalScrollback).toContain(assistantTail);
-      expect(finalScrollback).not.toContain(setupCompactLine);
+      expect(finalScrollback).toContain(setupCompactLine);
       expect(finalScrollback).not.toContain(setupFullLine);
       expect(finalScrollback).toContain(`\n  1) ${questionMarker}`);
       expect(countOccurrences(finalScrollback, setupSentinel)).toBe(1);
       expect(countOccurrences(finalScrollback, finalSentinel)).toBe(1);
       for (let index = 1; index <= 4; index += 1) {
         const outputRow = `│ ${streamPrefix}${String(index).padStart(3, "0")}`;
-        expect(countOccurrences(finalScrollback, outputRow)).toBe(0);
+        expect(countOccurrences(finalScrollback, outputRow)).toBe(1);
       }
       for (let index = 5; index <= 18; index += 1) {
         const outputRow = `│ ${streamPrefix}${String(index).padStart(3, "0")}`;
         expect(countOccurrences(finalScrollback, outputRow)).toBe(0);
       }
-      expect(countOccurrences(finalScrollback, `│ ${activeStart}`)).toBe(0);
+      expect(countOccurrences(finalScrollback, `│ ${activeStart}`)).toBe(1);
       expect(countOccurrences(finalScrollback, `│ ${streamGate}`)).toBe(0);
       expect(countOccurrences(finalScrollback, `│ ${activeDone}`)).toBe(0);
-      expect(finalScrollback).not.toContain("lines more (ctrl o to view)");
+      expect(finalScrollback).toContain("│ … 16 lines more (ctrl o to view)");
       expect(finalPane).not.toContain("Apply this change?");
       expect(finalPane).not.toContain(questionAnswerInstruction);
       expect(finalPane).not.toContain(questionCancelInstruction);
@@ -3921,7 +4010,7 @@ test.skipIf(!tmuxAvailable())(
       await retry.sendLiteralText("/");
       await retry.waitForPane(
         (pane) =>
-          pane.split("\n").some((row) => /^┃ \/\/$/.test(row)) &&
+          pane.split("\n").some((row) => /^(?:┃|❯) \/\/$/.test(row)) &&
           !pane.includes("show available slash commands"),
         TIMEOUT,
       );
@@ -4062,7 +4151,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(nested, { recursive: true });
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(join(workspace, "AGENTS.md"), "DEFERRED_TOOL_ROOT_SCOPE\n");
     writeFileSync(join(nested, "AGENTS.md"), "DEFERRED_TOOL_NESTED_SCOPE\n");
@@ -4131,16 +4220,15 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
 
     function expectDeferredPresentation(scrollback: string): void {
-      expect(scrollback).toContain("1 failed");
-      expect(scrollback).toContain("1 deferred");
-      expect(scrollback).not.toContain("Context updated");
+      expect(scrollback).toContain(`↻ Context updated ${command}`);
+      expect(countOccurrences(scrollback, "Context updated")).toBe(1);
       expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
       expect(scrollback).not.toContain(`● Failed ${command}`);
-      expect(scrollback).toContain("Read nested/input.txt");
-      expect(scrollback).toContain(`Ran ${command}`);
-      expect(scrollback).toContain(`Ran ${failureCommand}`);
-      expect(scrollback).not.toContain("│ exit code 7");
+      expect(scrollback).toContain("● Read nested/input.txt");
+      expect(scrollback).toContain(`● Ran ${command}`);
+      expect(scrollback).toContain(`● Ran ${failureCommand}`);
+      expect(scrollback).toContain("│ exit code 7");
     }
 
     try {
@@ -4163,7 +4251,7 @@ test.skipIf(!tmuxAvailable())(
       );
       const liveScrollback = await active.captureFullScrollback();
       expectDeferredPresentation(liveScrollback);
-      expect(liveScrollback).not.toContain("│ ordinary-failure-control");
+      expect(liveScrollback).toContain("│ ordinary-failure-control");
       expect(readFileSync(liveStderrPath, "utf8")).toBe("");
 
       await active.sendText("/quit");
@@ -4738,7 +4826,7 @@ test.skipIf(!tmuxAvailable())(
       mkdirSync(toolWorkspace);
       writeFileSync(
         join(toolHome, ".fx", "settings.json"),
-        JSON.stringify({}),
+        JSON.stringify({ maxxing_mode: "legacy" }),
       );
       const toolWorkspaceRoot = realpathSync(toolWorkspace);
       const toolReply = "TOOL_RESUME_FINAL_REPLY";
@@ -4760,7 +4848,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run pwd once for resume.");
       const liveToolScrollback = await waitForScrollback(active, toolReply);
       expect(liveToolScrollback).toContain("Ran pwd");
-      expect(liveToolScrollback).not.toContain(toolWorkspaceMarker);
+      expect(liveToolScrollback).toContain(toolWorkspaceMarker);
       expectNoRawToolReplay(liveToolScrollback);
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -4790,7 +4878,7 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForComposer(TIMEOUT);
         const resumedToolScrollback = await waitForScrollback(active, toolReply);
         expect(resumedToolScrollback).toContain("Ran pwd");
-        expect(resumedToolScrollback).not.toContain(toolWorkspaceMarker);
+        expect(resumedToolScrollback).toContain(toolWorkspaceMarker);
         expect(resumedToolScrollback).toContain(toolReply);
         expectNoRawToolReplay(resumedToolScrollback);
         if (index === 0) {
@@ -5180,7 +5268,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -5213,8 +5301,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const firstLive = await waitForScrollback(active, firstCompletion);
-      expect(firstLive).toContain("Wrote first-large.md +120");
-      expect(firstLive).not.toContain("RESUMED_FIRST_FILE_LINE_001");
+      expect(firstLive).toContain("Wrote first-large.md");
+      expect(firstLive).toContain("⋯ +");
       expect(readFileSync(join(workspace, "first-large.md"), "utf8")).toBe(
         `${firstLines.join("\n")}\n`,
       );
@@ -5224,9 +5312,9 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const live = await waitForScrollback(active, secondCompletion);
-      expect(live).toContain("Wrote first-large.md +120");
-      expect(live).toContain("Wrote second-large.md +60");
-      expect(live).not.toContain("RESUMED_SECOND_FILE_LINE_001");
+      expect(live).toContain("Wrote first-large.md");
+      expect(live).toContain("Wrote second-large.md");
+      expect(live).toContain("⋯ +");
       expect(readFileSync(join(workspace, "second-large.md"), "utf8")).toBe(
         `${secondLines.join("\n")}\n`,
       );
@@ -5255,9 +5343,9 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       const resumed = await waitForScrollback(active, secondCompletion);
-      expect(resumed).toContain("Wrote first-large.md +120");
-      expect(resumed).toContain("Wrote second-large.md +60");
-      expect(resumed).not.toContain("RESUMED_SECOND_FILE_LINE_001");
+      expect(resumed).toContain("Wrote first-large.md");
+      expect(resumed).toContain("Wrote second-large.md");
+      expect(resumed).toContain("⋯ +");
 
       await active.sendKeys("C-o");
       await active.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
@@ -5288,7 +5376,7 @@ test.skipIf(!tmuxAvailable())(
       expect(firstFull).not.toContain('"content":"RESUMED_FIRST_FILE_LINE');
 
       await active.sendKeys("C-o");
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("⋯ +", TIMEOUT);
 
       await active.sendText("/undo");
       await active.waitForText("Nothing to undo.", TIMEOUT);
@@ -5335,7 +5423,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(join(home, ".fx"), { recursive: true });
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     const lineCount = 40;
     const commandLine = "x".repeat(40);
@@ -5369,14 +5457,18 @@ printf '${stdoutTail2}\\n'
     for (const marker of orderedTailMarkers) expect(fixtureCommand).not.toContain(marker);
     const firstMarker = "RESUME_COMMAND_LINE_000";
     const completion = "RESUME_COMMAND_OUTPUT_COMPLETE";
+    const compactHint = "lines more (ctrl o to view)";
     const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
     let active: TmuxSession | null = null;
 
     function expectCompactCommandOutput(pane: string): void {
-      expect(pane).toContain("● 1 tool call · 1 command");
-      expect(pane).toContain("Ran ./resume-command-output.sh");
-      expect(pane).not.toContain("lines more (ctrl o to view)");
-      expect(pane).not.toContain(firstMarker);
+      const lines = pane.split("\n");
+      const hintIndex = lines.findIndex((line) => line.includes(compactHint));
+      expect(hintIndex).toBeGreaterThanOrEqual(5);
+      const payloadRows = lines.slice(hintIndex - 5, hintIndex);
+      expect(payloadRows).toHaveLength(5);
+      for (const row of payloadRows) expect(row.trimStart().startsWith("│ ")).toBe(true);
+      expect(pane).toContain(firstMarker);
       expect(pane).not.toContain("RESUME_COMMAND_TAIL");
     }
 
@@ -5443,7 +5535,7 @@ printf '${stdoutTail2}\\n'
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("Enter");
       await active.waitForText(completion, TIMEOUT);
-      await active.waitForPane((pane) => pane.includes("Ran ./resume-command-output.sh"), TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(compactHint), TIMEOUT);
       const live = await active.capturePane();
       expectCompactCommandOutput(live);
       await active.sendText("/quit");
@@ -5464,7 +5556,7 @@ printf '${stdoutTail2}\\n'
         height: 32,
       });
       await active.waitForComposer(TIMEOUT);
-      await active.waitForPane((pane) => pane.includes("Ran ./resume-command-output.sh"), TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(compactHint), TIMEOUT);
       const flagResumed = await active.capturePane();
       expectCompactCommandOutput(flagResumed);
       expectNoRawToolReplay(flagResumed);
@@ -5490,7 +5582,7 @@ printf '${stdoutTail2}\\n'
       await active.sendText("/resume");
       await waitForSessionPicker(active);
       await active.sendKeys("Enter");
-      await active.waitForPane((pane) => pane.includes("Ran ./resume-command-output.sh"), TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(compactHint), TIMEOUT);
       const pickerResumed = await active.capturePane();
       expectCompactCommandOutput(pickerResumed);
       expectNoRawToolReplay(pickerResumed);
@@ -6152,7 +6244,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(initialStderrPath, "");
     writeFileSync(resumedStderrPath, "");
@@ -6195,7 +6287,7 @@ while :; do sleep 1; done
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared interrupt command.");
-      await waitForScrollback(active, "Running ./resume-cancel.sh", timeout);
+      await waitForScrollback(active, outputMarker, timeout);
       await waitForCondition(
         () => existsSync(readyPath),
         "the interrupt command readiness file",
@@ -6210,7 +6302,7 @@ while :; do sleep 1; done
         timeout,
       );
       const liveCancelled = stripAnsi(await active.captureFullScrollback());
-      expect(liveCancelled).not.toContain(outputMarker);
+      expect(liveCancelled).toContain(outputMarker);
       expect(liveCancelled).not.toContain(bufferedTailMarker);
       expect(liveCancelled).not.toContain(artifactTailMarker);
 
@@ -6265,9 +6357,13 @@ while :; do sleep 1; done
       const resumed = stripAnsi(await waitForScrollback(active, followUpMarker, timeout));
       const assistantIndex = resumed.indexOf(assistantMarker);
       const cancelledIndex = resumed.indexOf("Cancelled");
+      const outputIndex = resumed.indexOf(outputMarker);
+      const cancellationNoticeIndex = resumed.indexOf("● System: cancelled");
       expect(assistantIndex).toBeGreaterThanOrEqual(0);
       expect(cancelledIndex).toBeGreaterThan(assistantIndex);
-      expect(resumed).not.toContain(outputMarker);
+      expect(outputIndex).toBeGreaterThan(cancelledIndex);
+      expect(cancellationNoticeIndex).toBeGreaterThan(outputIndex);
+      expect(countOccurrences(resumed, "● System: cancelled")).toBe(1);
       expect(resumed).not.toContain("Interrupted by user after completing");
       expect(resumed).not.toContain("<turn_aborted>");
       expect(resumed).not.toContain(bufferedTailMarker);
@@ -6324,7 +6420,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(initialStderrPath, "");
     writeFileSync(resumedStderrPath, "");

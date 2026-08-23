@@ -26,6 +26,8 @@ pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
 pub const PickerKind = enum { model_stage, file, slash, auth };
+pub const ComposerPrefixStyle = enum { arrow, rail };
+
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -494,6 +496,30 @@ pub fn composeSettingsMenuHintRow(
     return row;
 }
 
+pub fn composeAppearanceMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
+    const variants = [_][]const u8{
+        "↑↓ Navigate     ←→ Change     Tab Section     Esc Close",
+        "↑↓ Navigate  ←→ Change  Tab Section  Esc Close",
+        "↑↓ Move  ←→ Change  Tab  Esc",
+        "←→ Change  Esc Close",
+        "←→ Esc",
+    };
+    var hint = variants[variants.len - 1];
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) {
+            hint = candidate;
+            break;
+        }
+    }
+
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendClipped(alloc, &row, hint, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 pub fn composeCompactCommandMenuHintRow(
     alloc: Allocator,
     width: u16,
@@ -630,11 +656,14 @@ pub fn composeVisibleInputRows(
     alloc: Allocator,
     source: visual_layout.Source,
     window: visual_layout.VisibleWindow,
+    appearance: render_input.InputAppearance,
+    prefix_style: ComposerPrefixStyle,
 ) !ComposedInputRows {
     var result = ComposedInputRows{};
     errdefer result.deinit(alloc);
     if (window.row_count == 0) return result;
 
+    const tint = inputRowTint(appearance);
     const end_row = window.first_row + window.row_count;
     var current: std.ArrayList(u8) = .empty;
     errdefer current.deinit(alloc);
@@ -655,8 +684,10 @@ pub fn composeVisibleInputRows(
                 unit.row_index == window.first_row and window.first_row > 0,
                 &row_started,
                 &remaining_cells,
+                tint,
+                prefix_style,
             );
-            try appendLayoutUnit(alloc, &current, source, unit, &remaining_cells, &omitted_positive_unit);
+            try appendLayoutUnit(alloc, &current, source, unit, &remaining_cells, &omitted_positive_unit, tint);
         },
         .row_end => |row| {
             if (row.index < window.first_row) continue;
@@ -669,8 +700,10 @@ pub fn composeVisibleInputRows(
                 row.index == window.first_row and window.first_row > 0,
                 &row_started,
                 &remaining_cells,
+                tint,
+                prefix_style,
             );
-            try finishComposedInputRow(alloc, &current, source.terminal_cols);
+            try finishComposedInputRow(alloc, &current, source.terminal_cols, tint);
             try result.rows.append(alloc, current);
             current = .empty;
             row_started = false;
@@ -688,12 +721,16 @@ pub fn composeVisibleInputRows(
 pub fn composeQueuedPromptCard(
     alloc: Allocator,
     source: visual_layout.Source,
+    appearance: render_input.InputAppearance,
+    prefix_style: ComposerPrefixStyle,
 ) ![]u8 {
     const summary = visual_layout.summarize(source, null);
     var rows = try composeVisibleInputRows(
         alloc,
         source,
         .{ .first_row = 0, .row_count = summary.total_rows },
+        appearance,
+        prefix_style,
     );
     defer rows.deinit(alloc);
 
@@ -711,11 +748,14 @@ pub fn appendInlineCompletionSuffix(
     row: *std.ArrayList(u8),
     width: u16,
     suffix: []const u8,
+    appearance: render_input.InputAppearance,
 ) !void {
     if (suffix.len == 0) return;
     const used_cells = display_width.visibleWidthIgnoringAnsi(row.items);
     if (used_cells >= @as(usize, width)) return;
 
+    const tint = inputRowTint(appearance);
+    if (tint.len != 0) try row.appendSlice(alloc, tint);
     try row.appendSlice(alloc, ui_render.dim_style);
     try row_text.appendClipped(
         alloc,
@@ -734,16 +774,39 @@ fn startComposedInputRow(
     hidden_above: bool,
     started: *bool,
     remaining_cells: *usize,
+    tint: []const u8,
+    prefix_style: ComposerPrefixStyle,
 ) !void {
     if (started.*) return;
     started.* = true;
+    try row.appendSlice(alloc, tint);
     const prefix = visual_layout.inputPrefix(row_index);
-    try row.appendSlice(alloc, ui_render.hint_style);
-    try row_text.appendClipped(alloc, row, if (hidden_above) "┃↑" else "┃", width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    if (!hidden_above and width > 1) try row_text.appendClipped(alloc, row, " ", width - 1);
+    switch (prefix_style) {
+        .arrow => if (hidden_above) {
+            try row.appendSlice(alloc, ui_render.hint_style);
+            try row_text.appendClipped(alloc, row, "↑ ", width);
+            try row.appendSlice(alloc, if (tint.len > 0) tint else ui_render.reset_style);
+        } else {
+            try row_text.appendClipped(alloc, row, prefix.bytes, width);
+        },
+        .rail => {
+            try row.appendSlice(alloc, ui_render.hint_style);
+            try row_text.appendClipped(alloc, row, if (hidden_above) "┃↑" else "┃", width);
+            try row.appendSlice(alloc, if (tint.len > 0) tint else ui_render.reset_style);
+            if (!hidden_above and width > 1) try row_text.appendClipped(alloc, row, " ", width - 1);
+        },
+    }
     const width_usize: usize = width;
     remaining_cells.* = if (width_usize > prefix.cell_width) width_usize - prefix.cell_width else 0;
+}
+
+// Style prepended to each composed input row and re-applied after mid-row
+// resets; empty when the row is untinted.
+fn inputRowTint(appearance: render_input.InputAppearance) []const u8 {
+    return switch (appearance) {
+        .lines => "",
+        .tint => ui_render.input_bar_style,
+    };
 }
 
 fn appendLayoutUnit(
@@ -753,6 +816,7 @@ fn appendLayoutUnit(
     unit: visual_layout.Unit,
     remaining_cells: *usize,
     omitted_positive_unit: *bool,
+    tint: []const u8,
 ) !void {
     if (remaining_cells.* == 0) return;
 
@@ -768,9 +832,11 @@ fn appendLayoutUnit(
         unit,
         remaining_cells,
         omitted_positive_unit,
+        tint,
     );
     if (selected) {
         try row.appendSlice(alloc, ui_render.reset_style);
+        try row.appendSlice(alloc, tint);
     }
 }
 
@@ -781,6 +847,7 @@ fn appendLayoutUnitContent(
     unit: visual_layout.Unit,
     remaining_cells: *usize,
     omitted_positive_unit: *bool,
+    tint: []const u8,
 ) !void {
     switch (unit.kind) {
         .text => {
@@ -852,6 +919,7 @@ fn appendLayoutUnitContent(
                 }
             }
             try row.appendSlice(alloc, ui_render.reset_style);
+            try row.appendSlice(alloc, tint);
             remaining_cells.* -= emit_cells;
             omitted_positive_unit.* = unit.cell_width > emit_cells;
         },
@@ -865,20 +933,23 @@ fn appendLayoutUnitContent(
             const attachment = source.images[badge.attachment_index];
             try image_attachments.writeImageBadgeClipped(&writer.writer, attachment.id, attachment.path, emit_cells);
             row.* = writer.toArrayList();
+            try row.appendSlice(alloc, tint);
             remaining_cells.* -= emit_cells;
             omitted_positive_unit.* = unit.cell_width > emit_cells;
         },
     }
 }
 
-fn finishComposedInputRow(alloc: Allocator, row: *std.ArrayList(u8), width: u16) !void {
+fn finishComposedInputRow(alloc: Allocator, row: *std.ArrayList(u8), width: u16, tint: []const u8) !void {
     if (display_width.visibleWidthIgnoringAnsi(row.items) < @as(usize, width)) try row.appendSlice(alloc, "\x1b[K");
+    if (tint.len != 0) try row.appendSlice(alloc, ui_render.reset_style);
 }
 
 const input_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
     .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a session", .presentation_category = .session },
+    .{ .kind = .appearance, .command = "/maxxing", .help_entry = "/maxxing [minimal|normal]", .completion_description = "choose transcript presentation", .presentation_category = .appearance, .has_args = true },
 };
 const input_test_slash_registry = command_specs.SlashRegistry{ .commands = input_test_slash_specs[0..] };
 
@@ -916,7 +987,7 @@ test "composer badge labels a later-turn image with its own id" {
     };
     const summary = visual_layout.summarize(source, null);
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 4);
-    var composed = try composeVisibleInputRows(alloc, source, window);
+    var composed = try composeVisibleInputRows(alloc, source, window, .lines, .arrow);
     defer composed.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), composed.rows.items.len);
@@ -934,7 +1005,7 @@ test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
     };
     const full_summary = visual_layout.summarize(full_source, null);
     const full_window = visual_layout.visibleWindow(full_summary.cursor.row_index, full_summary.total_rows, 1);
-    var full = try composeVisibleInputRows(alloc, full_source, full_window);
+    var full = try composeVisibleInputRows(alloc, full_source, full_window, .lines, .arrow);
     defer full.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), full.rows.items.len);
     try std.testing.expect(std.mem.indexOf(u8, full.rows.items[0].items, "\x1b[K") == null);
@@ -946,7 +1017,7 @@ test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
     };
     const short_summary = visual_layout.summarize(short_source, null);
     const short_window = visual_layout.visibleWindow(short_summary.cursor.row_index, short_summary.total_rows, 1);
-    var short = try composeVisibleInputRows(alloc, short_source, short_window);
+    var short = try composeVisibleInputRows(alloc, short_source, short_window, .lines, .arrow);
     defer short.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), short.rows.items.len);
     try std.testing.expect(std.mem.indexOf(u8, short.rows.items[0].items, "\x1b[K") != null);
@@ -963,10 +1034,16 @@ test "composeVisibleInputRows paints selected input without changing visible wid
     const summary = visual_layout.summarize(source, null);
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
 
-    var plain_rows = try composeVisibleInputRows(alloc, .{ .input = source.input, .cursor = source.cursor, .terminal_cols = source.terminal_cols }, window);
+    var plain_rows = try composeVisibleInputRows(
+        alloc,
+        .{ .input = source.input, .cursor = source.cursor, .terminal_cols = source.terminal_cols },
+        window,
+        .lines,
+        .arrow,
+    );
     defer plain_rows.deinit(alloc);
 
-    var rows = try composeVisibleInputRows(alloc, source, window);
+    var rows = try composeVisibleInputRows(alloc, source, window, .lines, .arrow);
     defer rows.deinit(alloc);
 
     try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "\x1b[7ma") != null);
@@ -989,6 +1066,7 @@ test "inline completion suffix uses dim style and clips to the current row" {
         &row,
         @intCast(used + 4),
         "aged-menu",
+        .lines,
     );
 
     try std.testing.expect(std.mem.find(u8, row.items, ui_render.dim_style) != null);
@@ -1005,6 +1083,7 @@ test "inline completion suffix uses dim style and clips to the current row" {
         &full_row,
         full_width,
         "aged-menu",
+        .lines,
     );
     try std.testing.expect(std.mem.find(u8, full_row.items, ui_render.dim_style) == null);
     try std.testing.expect(std.mem.find(u8, full_row.items, "aged") == null);
@@ -1020,12 +1099,12 @@ test "clipped composer row marks hidden input above" {
     };
     const summary = visual_layout.summarize(source, null);
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
-    var composed = try composeVisibleInputRows(alloc, source, window);
+    var composed = try composeVisibleInputRows(alloc, source, window, .lines, .arrow);
     defer composed.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), window.first_row);
     try std.testing.expectEqual(@as(usize, 1), composed.rows.items.len);
-    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "┃↑") != null);
+    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "↑ ") != null);
     try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "second line") != null);
     try std.testing.expectEqual(@as(u16, 14), visual_layout.terminalColumn(summary.cursor, source.terminal_cols));
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(composed.rows.items[0].items) <= source.terminal_cols);
@@ -1041,13 +1120,17 @@ test "trailing empty clipped composer row remains visibly nonempty" {
     };
     const summary = visual_layout.summarize(source, null);
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
-    var rows = try composeVisibleInputRows(alloc, source, window);
-    defer rows.deinit(alloc);
+    var arrow = try composeVisibleInputRows(alloc, source, window, .lines, .arrow);
+    defer arrow.deinit(alloc);
+    var rail = try composeVisibleInputRows(alloc, source, window, .lines, .rail);
+    defer rail.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), window.first_row);
     try std.testing.expectEqual(@as(u16, 3), visual_layout.terminalColumn(summary.cursor, source.terminal_cols));
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┃↑") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(rows.rows.items[0].items) <= source.terminal_cols);
+    try std.testing.expect(std.mem.find(u8, arrow.rows.items[0].items, "↑ ") != null);
+    try std.testing.expect(std.mem.find(u8, rail.rows.items[0].items, "┃↑") != null);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(arrow.rows.items[0].items) <= source.terminal_cols);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(rail.rows.items[0].items) <= source.terminal_cols);
 }
 
 test "queued prompt card wears composer chrome without a card background" {
@@ -1058,12 +1141,18 @@ test "queued prompt card wears composer chrome without a card background" {
         .terminal_cols = 40,
     };
 
-    const card = try composeQueuedPromptCard(alloc, source);
-    defer alloc.free(card);
-    try std.testing.expect(std.mem.find(u8, card, "\x1b[48;") == null);
-    try std.testing.expect(std.mem.find(u8, card, "❯") == null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, card, "┃"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, card, "\n"));
+    const rail = try composeQueuedPromptCard(alloc, source, .lines, .rail);
+    defer alloc.free(rail);
+    try std.testing.expect(std.mem.find(u8, rail, "\x1b[48;") == null);
+    try std.testing.expect(std.mem.find(u8, rail, "❯") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rail, "┃"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rail, "\n"));
+
+    const arrow = try composeQueuedPromptCard(alloc, source, .lines, .arrow);
+    defer alloc.free(arrow);
+    try std.testing.expect(std.mem.find(u8, arrow, "\x1b[48;") == null);
+    try std.testing.expect(std.mem.find(u8, arrow, "❯ queued one") != null);
+    try std.testing.expect(std.mem.find(u8, arrow, "  queued two") != null);
 }
 
 test "footer raw input row composition matches hard newlines and soft wraps" {
@@ -1082,6 +1171,32 @@ test "footer raw input row composition matches hard newlines and soft wraps" {
     const soft = measureRawInputGeometry(testRenderContext(&soft_input), 6, 20, true, false, false, false);
     try std.testing.expectEqual(@as(u16, 2), hard.total_lines);
     try std.testing.expectEqual(hard.total_lines, soft.total_lines);
+}
+
+test "footer raw geometry ignores input appearance" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    try input.edit_state.input.appendSlice(alloc, "first line\n/input tint wraps here");
+    input.edit_state.cursor = input.edit_state.input.items.len;
+
+    var lines_ctx = testRenderContext(&input);
+    lines_ctx.input_appearance = .lines;
+    var tint_ctx = testRenderContext(&input);
+    tint_ctx.input_appearance = .tint;
+
+    const lines = measureRawInputGeometry(lines_ctx, 16, 20, true, false, false, false);
+    const tinted = measureRawInputGeometry(tint_ctx, 16, 20, true, false, false, false);
+
+    try std.testing.expectEqual(lines.summary.total_rows, tinted.summary.total_rows);
+    try std.testing.expectEqual(lines.summary.cursor, tinted.summary.cursor);
+    try std.testing.expectEqual(lines.summary.anchor, tinted.summary.anchor);
+    try std.testing.expectEqual(lines.window, tinted.window);
+    try std.testing.expectEqual(lines.total_lines, tinted.total_lines);
+    try std.testing.expectEqual(lines.input_extra, tinted.input_extra);
+    try std.testing.expectEqual(lines.slash_completion_count, tinted.slash_completion_count);
+    try std.testing.expectEqual(lines.show_slash_query, tinted.show_slash_query);
+    try std.testing.expectEqual(lines.picker_start_col, tinted.picker_start_col);
 }
 
 test "footer tabs are modeled spaces and anchors use modeled columns" {
@@ -1223,12 +1338,28 @@ test "footer slash anchor contract handles top level and argument completions" {
 
     var arg = InputRuntime{};
     defer arg.deinit(alloc);
-    try arg.edit_state.input.appendSlice(alloc, "  /permissions ");
+    try arg.edit_state.input.appendSlice(alloc, "  /maxxing ");
     arg.edit_state.cursor = arg.edit_state.input.items.len;
     const arg_geometry = measureRawInputGeometry(testRenderContext(&arg), 80, 20, true, false, false, false);
-    try std.testing.expectEqual(@as(usize, 2 + "/permissions ".len), arg_geometry.summary.anchor.?.raw_offset);
-    try std.testing.expectEqual(@as(usize, 2 + "/permissions ".len), arg_geometry.summary.anchor.?.content_column);
-    try std.testing.expectEqual(@as(u16, 3 + 2 + "/permissions ".len), arg_geometry.picker_start_col);
+    try std.testing.expectEqual(@as(usize, 2 + "/maxxing ".len), arg_geometry.summary.anchor.?.raw_offset);
+    try std.testing.expectEqual(@as(usize, 11), arg_geometry.summary.anchor.?.content_column);
+    try std.testing.expectEqual(@as(u16, 14), arg_geometry.picker_start_col);
+
+    var wrapped = InputRuntime{};
+    defer wrapped.deinit(alloc);
+    try wrapped.edit_state.input.appendSlice(alloc, "       /maxxing ");
+    wrapped.edit_state.cursor = wrapped.edit_state.input.items.len;
+    // Margin spaces hang on their row instead of wrapping, so row 0 holds
+    // all 7 leading spaces, row 1 is "/maxx", and row 2 is "ing " with the
+    // trailing space hanging at column 2.
+    const wrapped_geometry = measureRawInputGeometry(testRenderContext(&wrapped), 8, 4, true, false, false, false);
+    try std.testing.expectEqual(@as(usize, 3), wrapped_geometry.summary.total_rows);
+    try std.testing.expectEqual(@as(usize, 2), wrapped_geometry.summary.cursor.row_index);
+    try std.testing.expectEqual(@as(usize, 3), wrapped_geometry.summary.cursor.content_column);
+    try std.testing.expectEqual(@as(usize, 2), wrapped_geometry.summary.anchor.?.row_index);
+    try std.testing.expectEqual(@as(usize, 3), wrapped_geometry.summary.anchor.?.content_column);
+    try std.testing.expectEqual(@as(u16, 6), wrapped_geometry.picker_start_col);
+    try std.testing.expectEqual(@as(u16, 0), cappedInputRows(3, 4, true).input_extra);
 }
 
 test "footer slash completion remains active across capped input rows" {
@@ -1274,10 +1405,10 @@ test "footer slash completion separates query activity from candidate count" {
     try std.testing.expect(!no_args.show_slash_query);
     try std.testing.expectEqual(@as(usize, 0), no_args.slash_completion_count);
 
-    try input.textReplacementState().replace(alloc, "/permissions ");
+    try input.textReplacementState().replace(alloc, "/maxxing ");
     const arguments = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
     try std.testing.expect(arguments.show_slash_query);
-    try std.testing.expectEqual(@as(usize, 6), arguments.slash_completion_count);
+    try std.testing.expectEqual(@as(usize, 2), arguments.slash_completion_count);
 }
 
 test "footer slash completion opens after multiline whitespace" {

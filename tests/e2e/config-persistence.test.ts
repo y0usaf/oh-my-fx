@@ -64,7 +64,7 @@ async function disablePromptHistory(
 ): Promise<void> {
   await session.sendText("/settings");
   await session.waitForText("←→ Change", TIMEOUT);
-  for (let index = 0; index < 10; index += 1) {
+  for (let index = 0; index < 12; index += 1) {
     await session.sendKeys("Down");
   }
   await session.sendKeys("Left");
@@ -122,6 +122,77 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     session = null;
     secondSession = null;
   });
+
+  serialTest(
+    "appearance settings persist independently across launches",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-input-appearance-persistence-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const stderrAPath = join(root, "stderr-a.log");
+        const stderrBPath = join(root, "stderr-b.log");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+
+        session = await TmuxSession.create({
+          cwd: workspaceRoot,
+          env: { ...NO_AUTH, HOME: home },
+          stderrPath: stderrAPath,
+        });
+        await session.waitForText("Run /help", TIMEOUT);
+        await session.sendText("/appearance");
+        await session.waitForText("Input appearance", TIMEOUT);
+        expect(await session.capturePane()).toContain("lines  tint");
+        expect(await session.capturePane()).toContain("minimal  legacy");
+        await session.sendKeys("Escape");
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("/appearance input lines");
+        await session.waitForText("● Input: switched to lines", TIMEOUT);
+        await session.sendText("/appearance presentation normal");
+        await session.waitForText("● Maxxing: switched to legacy", TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+
+        let stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+        expect(stored.input_appearance).toBe("lines");
+        expect(stored.maxxing_mode).toBe("legacy");
+
+        secondSession = await TmuxSession.create({
+          cwd: workspaceRoot,
+          env: { ...NO_AUTH, HOME: home },
+          stderrPath: stderrBPath,
+        });
+        await secondSession.waitForText("Run /help", TIMEOUT);
+        await secondSession.sendText("/appearance");
+        await secondSession.waitForText("Input appearance", TIMEOUT);
+        expect(await secondSession.capturePane()).toContain("lines  tint");
+        expect(await secondSession.capturePane()).toContain("minimal  legacy");
+        await secondSession.sendKeys("Escape");
+        await secondSession.waitForComposer(TIMEOUT);
+        await secondSession.sendText("/appearance input tint");
+        await secondSession.waitForText("● Input: switched to tint", TIMEOUT);
+        await secondSession.sendText("/appearance presentation minimal");
+        await secondSession.waitForText("● Maxxing: switched to minimal", TIMEOUT);
+        await secondSession.waitForStableComposer(TIMEOUT);
+        await secondSession.sendText("/quit");
+        await secondSession.waitForSessionEnd(TIMEOUT);
+        secondSession = null;
+
+        stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+        expect(stored.input_appearance).toBe("tint");
+        expect(stored.maxxing_mode).toBe("minimal");
+        expect(readFileSync(stderrAPath, "utf8")).toBe("");
+        expect(readFileSync(stderrBPath, "utf8")).toBe("");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
 
   serialTest(
     "user preferences migrate globally and load in another project",

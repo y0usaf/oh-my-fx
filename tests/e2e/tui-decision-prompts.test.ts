@@ -172,6 +172,25 @@ function outerCommandCall() {
   ]);
 }
 
+const PROJECTION_READY = ".projection-change-ready";
+const PROJECTION_RELEASE = ".projection-change-release";
+const PROJECTION_CHANGING_COMMAND =
+  `i=1; while [ "$i" -le 5000 ]; do printf 'PROJECTION_FIXTURE_%04d\\n' "$i"; i=$((i + 1)); done; ` +
+  `: > ${PROJECTION_READY}; while [ ! -e ${PROJECTION_RELEASE} ]; do sleep 0.01; done`;
+
+function outerProjectionChangingCommandCall() {
+  return outerToolCalls([
+    {
+      id: "projection_command_outer_1",
+      name: "terminal",
+      input: {
+        action: "exec",
+        command: PROJECTION_CHANGING_COMMAND,
+      },
+    },
+  ]);
+}
+
 const LONG_COMMAND_START = "LONG_COMMAND_APPROVAL_START";
 const LONG_COMMAND_END = "LONG_COMMAND_APPROVAL_END";
 const COMMAND_SCROLL_LINE_PREFIX = "APPROVAL_SCROLL_DOGFOOD_LINE_";
@@ -384,7 +403,7 @@ function createIsolatedRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ permission_mode: permissionMode, permission }),
+    JSON.stringify({ permission_mode: permissionMode, permission, maxxing_mode: "legacy" }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };
@@ -1452,7 +1471,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
-    "permission prompt growth preserves displaced transcript history",
+    "permission prompt growth preserves displaced transcript history after projection change",
     async () => {
       const markers = Array.from(
         { length: 34 },
@@ -1467,6 +1486,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await launchScenario(
         [
           outerText(markers.join("\n")),
+          outerProjectionChangingCommandCall(),
           outerCommandCall(),
           outerText(finalMarker),
         ],
@@ -1477,6 +1497,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         },
         "ask",
         () => "allow",
+        { bash: { [PROJECTION_CHANGING_COMMAND]: "allow" } },
       );
       await ctx.session.resizeWindow(120, 36);
 
@@ -1494,7 +1515,15 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       }
       expect(ctx.gateway.requests).toHaveLength(1);
 
+      const projectionTraceStart = readTrace(ctx.tracePath).length;
       await ctx.session.sendText("Create the generic approval acceptance fixture.");
+      await waitForPath(join(ctx.root.workspace, PROJECTION_READY));
+      await waitForTraceAfter(
+        ctx.tracePath,
+        projectionTraceStart,
+        "source_compatible=false",
+      );
+      writeFileSync(join(ctx.root.workspace, PROJECTION_RELEASE), "");
       const pane = await ctx.session.waitForText(
         "Would you like to run the following command?",
         TIMEOUT,
@@ -1526,6 +1555,15 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         /planned_rows=[1-9][0-9]*/.test(line)
       );
       expect(promptPlanIndex, transitionDiagnostics).toBeGreaterThanOrEqual(0);
+      const projectionChangePlanIndex = promptTraceLines.findIndex((line, index) =>
+        index <= promptPlanIndex &&
+        line.includes("transcript_transition_plan") &&
+        line.includes("source_compatible=false")
+      );
+      expect(
+        projectionChangePlanIndex,
+        transitionDiagnostics,
+      ).toBeGreaterThanOrEqual(0);
       const promptCommit = promptTraceLines.slice(promptPlanIndex).find((line) =>
         line.includes("[frame_diff] attempt_result") &&
         /planned_scroll_rows=[1-9][0-9]*/.test(line)
@@ -1534,13 +1572,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         /planned_scroll_rows=([1-9][0-9]*) committed_scroll_rows=\1 .*unplanned_scroll_rows=0/,
       );
       expect(ctx.gateway.classifierRequests).toHaveLength(0);
-      expect(ctx.gateway.requests).toHaveLength(2);
+      expect(ctx.gateway.requests).toHaveLength(3);
 
       await ctx.session.sendLiteralText("1");
       await ctx.session.waitForText(finalMarker, TIMEOUT);
       expect(existsSync(join(ctx.root.workspace, "generic-preview-accepted.txt"))).toBe(true);
       expect(await ctx.session.capturePane()).not.toContain(APPROVAL_PROMPT);
-      expect(ctx.gateway.requests).toHaveLength(3);
+      expect(ctx.gateway.requests).toHaveLength(4);
 
       const afterApproval = await waitForVisibleScrollback(
         ctx.session,

@@ -1,5 +1,4 @@
 pub const TranscriptRuntime = @import("ui/transcript/runtime.zig").TranscriptRuntime;
-pub const TranscriptPreparationSource = @import("ui/transcript/runtime.zig").TranscriptPreparationSource;
 pub const approval_prompt = @import("core/permissions/approval_prompt.zig");
 pub const approval_screen = @import("ui/approval_screen.zig");
 pub const diff = @import("core/output/diff.zig");
@@ -16,3 +15,5 @@ pub const MatchSpan = file_index.MatchSpan;
 pub const SearchResult = file_index.SearchResult;
 pub const max_indexed_files = file_index.max_indexed_files;
 pub const max_path_len = file_index.max_path_len;
+pub const MuxBenchmarkHarness = @import("core/mux/runtime.zig").BenchmarkHarness;
+pub const terminal_engine = @import("core/terminal/engine.zig");

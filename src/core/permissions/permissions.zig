@@ -346,7 +346,9 @@ pub fn permissionTargetsForCallInScope(
     call: types.ToolCall,
     target_kind: PermissionTargetKind,
 ) !PermissionCallTargets {
-    if (target_kind != .command_cwd and !std.mem.eql(u8, call.name, "semantic_search")) {
+    if (target_kind != .command_cwd and
+        !std.mem.eql(u8, call.name, "semantic_search"))
+    {
         return permissionTargetsForCall(alloc, scope.primary_directory, call, target_kind);
     }
     const target = try permissionTargetForCallInScope(alloc, scope, call, target_kind);
@@ -1122,6 +1124,7 @@ const external_path_tools = [_][]const u8{
     "grep_files",
     "open_file",
     "file_info",
+    "ast_symbols",
     "write_file",
     "edit_file",
     "delete_file",
@@ -1145,6 +1148,7 @@ test "allowsExternalPath preserves the exact eligible tool set" {
         "grep_files",
         "open_file",
         "file_info",
+        "ast_symbols",
         "write_file",
         "edit_file",
         "delete_file",
@@ -2402,6 +2406,22 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
         .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
     };
     try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, read_call, .path_existing));
+
+    const ast_call: types.ToolCall = .{
+        .id = "ast",
+        .name = "ast_symbols",
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
+    };
+    try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, ast_call, .path_existing));
+    var ast_targets = try permissionTargetsForCallInScope(
+        alloc,
+        workspace_access.AccessScope.primaryOnly(workspace),
+        ast_call,
+        .path_existing,
+    );
+    defer ast_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ast_targets.items.len);
+    try std.testing.expectEqualStrings(external_file, ast_targets.items[0].path);
 
     const write_call: types.ToolCall = .{
         .id = "write",

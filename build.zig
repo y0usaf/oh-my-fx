@@ -65,8 +65,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    const genome_mod = addGenomeModule(b, "native", target, optimize);
+    exe.root_module.addImport("genome", genome_mod);
 
     b.installArtifact(exe);
+    const install_omfx = b.addInstallFile(exe.getEmittedBin(), "bin/omfx");
+    b.getInstallStep().dependOn(&install_omfx.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -89,6 +93,11 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    const genome_tests = b.addTest(.{ .root_module = genome_mod });
+    const run_genome_tests = b.addRunArtifact(genome_tests);
+    const genome_test_step = b.step("test-genome", "Run genome symbol extraction tests");
+    genome_test_step.dependOn(&run_genome_tests.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
@@ -223,6 +232,30 @@ pub fn build(b: *std.Build) void {
     );
     test_ui_activity_bench_step.dependOn(&run_ui_activity_bench_tests.step);
 
+    // --- mux terminal benchmark ---
+    const mux_bench = b.addExecutable(.{
+        .name = "mux-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/mux.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mux_bench.root_module.addImport("benchmark_exports", benchmark_exports_mod);
+    const install_mux_bench = b.addInstallArtifact(mux_bench, .{});
+    const mux_bench_step = b.step("bench-mux", "Build the mux terminal benchmark");
+    mux_bench_step.dependOn(&install_mux_bench.step);
+
+    const run_mux_bench = b.addRunArtifact(mux_bench);
+    run_mux_bench.step.dependOn(&install_mux_bench.step);
+    if (b.args) |args| run_mux_bench.addArgs(args);
+    const run_mux_bench_step = b.step(
+        "run-bench-mux",
+        "Build and run the mux terminal benchmark",
+    );
+    run_mux_bench_step.dependOn(&run_mux_bench.step);
+
     // --- file-diff approval review benchmark ---
     const approval_review_bench = b.addExecutable(.{
         .name = "approval-review-bench",
@@ -308,6 +341,64 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+fn addGenomeModule(
+    b: *std.Build,
+    comptime name_prefix: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const genome_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/genome/symbols.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    genome_mod.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
+    genome_mod.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
+
+    const flags = [_][]const u8{ "-std=gnu11", "-fno-sanitize=undefined" };
+    genome_mod.addCSourceFile(.{
+        .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
+        .flags = &flags,
+    });
+
+    const grammars = [_]struct { dir: []const u8, scanner: bool }{
+        .{ .dir = "typescript", .scanner = true },
+        .{ .dir = "tsx", .scanner = true },
+        .{ .dir = "python", .scanner = true },
+        .{ .dir = "go", .scanner = false },
+        .{ .dir = "rust", .scanner = true },
+        .{ .dir = "nix", .scanner = true },
+    };
+    inline for (grammars) |g| {
+        const lib = b.addLibrary(.{
+            .name = name_prefix ++ "_ts_" ++ g.dir,
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        lib.root_module.addIncludePath(b.path("vendor/grammars/" ++ g.dir ++ "/src"));
+        if (g.scanner) {
+            lib.root_module.addIncludePath(b.path("vendor/grammars/" ++ g.dir));
+        }
+        lib.root_module.addCSourceFile(.{
+            .file = b.path("vendor/grammars/" ++ g.dir ++ "/src/parser.c"),
+            .flags = &(flags ++ .{"-Wno-unused-but-set-variable"}),
+        });
+        if (g.scanner) {
+            lib.root_module.addCSourceFile(.{
+                .file = b.path("vendor/grammars/" ++ g.dir ++ "/src/scanner.c"),
+                .flags = &flags,
+            });
+        }
+        genome_mod.linkLibrary(lib);
+    }
+    return genome_mod;
+}
+
 fn addWasmArtifact(
     b: *std.Build,
     surface: WasmSurface,
@@ -358,6 +449,12 @@ fn addWasmArtifact(
         }),
     });
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
+    const genome_mod = switch (surface) {
+        .core => addGenomeModule(b, "wasm_core", wasm_target, .ReleaseSmall),
+        .term => addGenomeModule(b, "wasm_term", wasm_target, .ReleaseSmall),
+        .none => unreachable,
+    };
+    wasm_exe.root_module.addImport("genome", genome_mod);
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step(name ++ "-wasm", description);
@@ -395,6 +492,7 @@ fn addNapiArtifact(
         }),
     });
     lib.root_module.addImport("build_options", napi_options.createModule());
+    lib.root_module.addImport("genome", addGenomeModule(b, "napi", target, .ReleaseSafe));
     const node_include = b.option(
         []const u8,
         "node-include-dir",

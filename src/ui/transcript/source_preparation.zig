@@ -343,7 +343,24 @@ pub fn renderCompactTranscriptBytes(
     defer command_overrides.deinit(alloc);
     const styles = self.command_output_render.styles;
 
-    var projection = try buildCompactTranscriptProjection(
+    if (self.maxxing_mode == .legacy) {
+        const entry_actions = try buildCommandOutputActions(
+            alloc,
+            &command_overrides,
+            self.entries.items.len,
+        );
+        defer if (entry_actions.len > 0) alloc.free(entry_actions);
+        return transcript_blocks.renderEntriesWithProjectionToBytes(
+            alloc,
+            self.entries.items,
+            self.layout.cols,
+            styles,
+            entry_actions,
+            self.maxxing_mode,
+        );
+    }
+
+    var projection = try buildMinimalTranscriptProjection(
         self,
         alloc,
         &command_overrides,
@@ -356,6 +373,7 @@ pub fn renderCompactTranscriptBytes(
         self.layout.cols,
         styles,
         projection.entry_actions.items,
+        self.maxxing_mode,
     );
 }
 
@@ -434,10 +452,10 @@ fn prepareTranscriptSourceInternal(
 
     var command_overrides = try buildCommandOutputOverridesInterruptible(self, alloc, checkpoint);
     defer command_overrides.deinit(alloc);
-    var compact_projection: ?tool_group_projection.Projection = null;
-    defer if (compact_projection) |*projection| projection.deinit(alloc);
-    if (self.entries.items.len > 0 and self.layout.cols > 0) {
-        compact_projection = try buildCompactTranscriptProjectionInterruptible(
+    var minimal_projection: ?tool_group_projection.Projection = null;
+    defer if (minimal_projection) |*projection| projection.deinit(alloc);
+    if (self.maxxing_mode == .minimal and self.entries.items.len > 0 and self.layout.cols > 0) {
+        minimal_projection = try buildMinimalTranscriptProjectionInterruptible(
             self,
             alloc,
             &command_overrides,
@@ -446,7 +464,7 @@ fn prepareTranscriptSourceInternal(
         );
     }
 
-    const aligned_actions = if (compact_projection == null)
+    const aligned_actions = if (minimal_projection == null)
         try buildCommandOutputActions(
             alloc,
             &command_overrides,
@@ -456,7 +474,7 @@ fn prepareTranscriptSourceInternal(
         &.{};
     defer if (aligned_actions.len > 0) alloc.free(aligned_actions);
 
-    const entry_actions = if (compact_projection) |*projection|
+    const entry_actions = if (minimal_projection) |*projection|
         projection.entry_actions.items
     else
         aligned_actions;
@@ -507,6 +525,7 @@ fn prepareTranscriptSourceInternal(
                 .folded_summary_entry_ids = summary_entry_ids,
                 .capture_provenance = capture_provenance,
                 .entry_actions = entry_actions,
+                .maxxing_mode = self.maxxing_mode,
             },
             checkpoint,
         );
@@ -716,13 +735,13 @@ fn buildCommandOutputActions(
     return entry_actions;
 }
 
-fn buildCompactTranscriptProjection(
+fn buildMinimalTranscriptProjection(
     self: anytype,
     alloc: Allocator,
     command_overrides: *const CommandOutputOverrides,
     focused_entry_id: ?u32,
 ) !tool_group_projection.Projection {
-    return buildCompactTranscriptProjectionInterruptible(
+    return buildMinimalTranscriptProjectionInterruptible(
         self,
         alloc,
         command_overrides,
@@ -734,7 +753,7 @@ fn buildCompactTranscriptProjection(
     };
 }
 
-fn buildCompactTranscriptProjectionInterruptible(
+fn buildMinimalTranscriptProjectionInterruptible(
     self: anytype,
     alloc: Allocator,
     command_overrides: *const CommandOutputOverrides,
@@ -748,7 +767,7 @@ fn buildCompactTranscriptProjectionInterruptible(
         self.layout.cols,
         focused_entry_id,
         .{
-            .marker_style = user_message_card.promptMarkerStyle(),
+            .marker_style = user_message_card.minimalMarkerStyle(),
             .text_style = ui_render.statusline_style,
             .reset_style = "\x1b[0m",
         },
@@ -1055,6 +1074,7 @@ test "minimal projection does not take ownership of command output overrides" {
         command_output_display: transcript_blocks.CommandOutputDisplayState = .{},
         layout: struct { cols: u16 = 80 } = .{},
         command_output_render: command_output_runtime.CommandOutputRenderPolicy = .{},
+        maxxing_mode: @import("../../core/config/presentation_mode.zig").MaxxingMode = .minimal,
 
         fn deinit(self: *@This(), allocator: Allocator) void {
             for (self.command_output_blocks.items) |*block| block.deinit(allocator);

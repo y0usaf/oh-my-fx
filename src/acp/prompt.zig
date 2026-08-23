@@ -2428,6 +2428,7 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
     if (std.mem.eql(u8, tool_name, "read_file")) return .read;
     if (std.mem.eql(u8, tool_name, "file_info")) return .read;
+    if (std.mem.eql(u8, tool_name, "ast_symbols")) return .search;
     if (std.mem.eql(u8, tool_name, "semantic_search")) return .search;
     if (std.mem.eql(u8, tool_name, "web_fetch")) return .read;
     if (std.mem.eql(u8, tool_name, "web_search")) return .search;
@@ -2958,6 +2959,7 @@ test "mapToolKind maps all file tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("list_files"));
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("glob_files"));
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("file_info"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("ast_symbols"));
     try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("semantic_search"));
     try std.testing.expectEqual(acp_types.ToolCallKind.move, mapToolKind("copy_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("create_folder"));

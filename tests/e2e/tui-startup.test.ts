@@ -40,7 +40,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 37", 5_000);
+      const pane = await session.waitForText("Commands 38", 5_000);
       expect(pane).toContain("General");
       expect(pane).toContain("Enter Open");
       expect(pane).not.toContain("Run /help for commands");
@@ -177,7 +177,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(headPath, "ref: refs/heads/initial-branch\n");
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        `${JSON.stringify({ statusLine: { workspace: true }, fast_mode: false })}\n`,
+        `${JSON.stringify({ statusLine: { workspace: true } })}\n`,
       );
       writeFileSync(stderrPath, "");
 

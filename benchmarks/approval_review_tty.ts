@@ -361,6 +361,7 @@ writeFileSync(
     sandbox: "none",
     permission_mode: "ask",
     permission: {},
+    maxxing_mode: "legacy",
     max_agent_steps: cycles * 3 + 20,
     max_tool_result_bytes: 4 * 1024 * 1024,
   }),

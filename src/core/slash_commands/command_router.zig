@@ -10,6 +10,7 @@ pub const ParsedCommand = union(enum) {
     new_session,
     reset_session,
     resume_session,
+    mux,
     continue_recovery,
     rename_session: []const u8,
     help,
@@ -41,6 +42,7 @@ pub const ParsedCommand = union(enum) {
     credits,
     paste,
     fast,
+    appearance: []const u8,
     statusline: []const u8,
     notifications: []const u8,
     workspace: []const u8,
@@ -55,6 +57,7 @@ pub const CommandHandlers = struct {
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
+    mux: *const fn (ctx: *anyopaque) anyerror!void,
     continue_recovery: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
@@ -85,6 +88,7 @@ pub const CommandHandlers = struct {
     show_credits: *const fn (ctx: *anyopaque) anyerror!void,
     paste_clipboard: *const fn (ctx: *anyopaque) anyerror!void,
     toggle_fast: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_appearance: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_statusline: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -100,10 +104,11 @@ fn command_payload(cmd: []const u8, prefix: []const u8) []const u8 {
 fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
     return switch (kind) {
         .quit => .quit,
+        .resume_session => .resume_session,
+        .mux => .mux,
         .clear_screen => .clear_screen,
         .new_session => .new_session,
         .reset_session => .reset_session,
-        .resume_session => .resume_session,
         .continue_recovery => .continue_recovery,
         .rename_session => .{ .rename_session = payload },
         .help => .help,
@@ -135,6 +140,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .credits => .credits,
         .paste => .paste,
         .fast => .fast,
+        .appearance => .{ .appearance = payload },
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
@@ -162,6 +168,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .new_session => try handlers.new_session(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
+        .mux => try handlers.mux(handlers.ctx),
         .continue_recovery => try handlers.continue_recovery(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
@@ -193,6 +200,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .credits => try handlers.show_credits(handlers.ctx),
         .paste => try handlers.paste_clipboard(handlers.ctx),
         .fast => try handlers.toggle_fast(handlers.ctx),
+        .appearance => |rest| try handlers.handle_appearance(handlers.ctx, rest),
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
@@ -354,6 +362,21 @@ test "parse extracts alias payload" {
     }
 }
 
+test "parse extracts appearance and compatibility alias payloads" {
+    switch (parse(testSlashRegistry(), "/appearance input tint")) {
+        .appearance => |rest| try std.testing.expectEqualStrings("input tint", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/input tint")) {
+        .appearance => |rest| try std.testing.expectEqualStrings("tint", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/maxxing minimal")) {
+        .appearance => |rest| try std.testing.expectEqualStrings("minimal", rest),
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "parse treats unknown and malformed command inputs as unknown" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/wat"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/output"));
@@ -392,11 +415,19 @@ test "parse returns empty payload for bare prefix commands" {
         .skills => |rest| try std.testing.expectEqualStrings("", rest),
         else => return error.TestExpectedEqual,
     }
+    switch (parse(testSlashRegistry(), "/appearance")) {
+        .appearance => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "parse trims only spaces and tabs around payload" {
     switch (parse(testSlashRegistry(), "/model \t claude-opus \t")) {
         .model => |query| try std.testing.expectEqualStrings("claude-opus", query),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/input\tlines\t")) {
+        .appearance => |rest| try std.testing.expectEqualStrings("lines", rest),
         else => return error.TestExpectedEqual,
     }
 }
@@ -480,6 +511,12 @@ fn recordSettings(ctx: *anyopaque, value: []const u8) anyerror!void {
     test_context.payload = value;
 }
 
+fn recordAppearance(ctx: *anyopaque, value: []const u8) anyerror!void {
+    const test_context = testContext(ctx);
+    test_context.called = "appearance";
+    test_context.payload = value;
+}
+
 fn recordNotifications(ctx: *anyopaque, value: []const u8) anyerror!void {
     const test_context = testContext(ctx);
     test_context.called = "notifications";
@@ -510,6 +547,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
+        .mux = unexpectedNoPayload,
         .continue_recovery = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
@@ -540,6 +578,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .show_credits = unexpectedNoPayload,
         .paste_clipboard = unexpectedNoPayload,
         .toggle_fast = unexpectedNoPayload,
+        .handle_appearance = unexpectedPayload,
         .handle_statusline = unexpectedPayload,
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
@@ -625,6 +664,27 @@ test "route forwards settings payload" {
 
     try std.testing.expectEqualStrings("settings", ctx.called);
     try std.testing.expectEqualStrings("startup-scrollback off", ctx.payload);
+}
+
+test "route forwards appearance and compatibility alias payloads" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.handle_appearance = recordAppearance;
+    const cmd = "/appearance input tint";
+
+    try route(testSlashRegistry(), &handlers, cmd);
+
+    try std.testing.expectEqualStrings("appearance", ctx.called);
+    try std.testing.expectEqualStrings("input tint", ctx.payload);
+    try std.testing.expect(ctx.payload.ptr == cmd["/appearance ".len..].ptr);
+
+    try route(testSlashRegistry(), &handlers, "/input lines");
+    try std.testing.expectEqualStrings("appearance", ctx.called);
+    try std.testing.expectEqualStrings("lines", ctx.payload);
+
+    try route(testSlashRegistry(), &handlers, "/maxxing minimal");
+    try std.testing.expectEqualStrings("appearance", ctx.called);
+    try std.testing.expectEqualStrings("minimal", ctx.payload);
 }
 
 test "route forwards notifications payload" {

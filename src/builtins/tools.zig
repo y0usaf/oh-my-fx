@@ -28,6 +28,7 @@ const open_file_impl = @import("../tools/filesystem/open_file.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const rename_file_impl = @import("../tools/filesystem/rename_file.zig");
 const copy_file_impl = @import("../tools/filesystem/copy_file.zig");
+const ast_symbols_impl = @import("../tools/filesystem/ast_symbols.zig");
 const semantic_search_impl = @import("../tools/filesystem/semantic_search.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const memory_impl = @import("../tools/memory/memory.zig");
@@ -74,6 +75,8 @@ const file_info_description =
     "Inspect file or directory metadata, including type, size, and modified time. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: check existence or distinguish files from directories before acting. When NOT to use: read contents, list child entries, search code, or infer git status.";
 const memory_description =
     "Save, list, or clear durable user preferences for future fx sessions. When to use: the user explicitly asks to remember, forget, save, or recall a preference. When NOT to use: store task notes, secrets, project facts, temporary context, or anything the user did not ask to persist.";
+const ast_symbols_description =
+    "Parse one source file with Tree-sitter and list its named declarations with kinds and line numbers. Supports TypeScript, TSX, Python, Go, Rust, and Nix. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect a file's structural outline or locate declarations without text matching. When NOT to use: search across files, inspect function bodies, or edit code.";
 const semantic_search_description =
     "Lexically search workspace files for concept keywords when exact symbols are unknown, ranking likely files for follow-up reads. This is not embedding or true semantic search. When to use: explore unfamiliar concepts, features, or responsibilities. When NOT to use: exact symbols, literal text, file names, counts, or narrow known-path inspection.";
 const open_file_description =
@@ -862,6 +865,35 @@ pub const memory = ToolSpec{
     .irreversible_fn = memory_impl.isIrreversible,
 };
 
+pub const ast_symbols = ToolSpec{
+    .name = "ast_symbols",
+    .description = ast_symbols_description,
+    .gateway_schema = .{
+        .name = "ast_symbols",
+        .description = ast_symbols_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "path", .json_type = .string, .description = "Path to a TypeScript, TSX, Python, Go, Rust, or Nix source file." },
+            },
+            .required = &.{"path"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .ast_symbols,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Parsing",
+    .completed_action_label = "Parsed",
+    .label_arg_kind = .path,
+    .label_arg_default = "source file",
+    .permission_target_kind = .path_existing,
+    .decode = ast_symbols_impl.decode,
+    .validate = ast_symbols_impl.validate,
+    .call = ast_symbols_impl.call,
+    .reads_only_fn = ast_symbols_impl.readsOnly,
+    .irreversible_fn = ast_symbols_impl.isIrreversible,
+};
+
 pub const semantic_search = ToolSpec{
     .name = "semantic_search",
     .description = semantic_search_description,
@@ -1362,6 +1394,7 @@ pub const all = [_]tool_dispatch.Tool{
     create_folder,
     file_info,
     memory,
+    ast_symbols,
     semantic_search,
     open_file,
     web_fetch,
@@ -1874,6 +1907,7 @@ pub const advertisement_order = [_][]const u8{
     "grep_files",
     "list_files",
     "file_info",
+    "ast_symbols",
     "semantic_search",
     "edit_file",
     "write_file",
@@ -1900,6 +1934,7 @@ pub const read_only_tool_names = [_][]const u8{
     "glob_files",
     "grep_files",
     "list_files",
+    "ast_symbols",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -1950,6 +1985,7 @@ test "built-in tools register exact active local order" {
         "create_folder",
         "file_info",
         "memory",
+        "ast_symbols",
         "semantic_search",
         "open_file",
         "web_fetch",
@@ -2367,6 +2403,24 @@ test "built-in memory owns product metadata schema and callbacks" {
         types.ToolActivityKind.write,
         tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, clear_call),
     );
+}
+
+test "built-in ast_symbols owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, ast_symbols);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("ast_symbols", ast_symbols.name);
+    try std.testing.expect(std.mem.find(u8, ast_symbols.description, "Tree-sitter") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"additionalProperties\":false") != null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.ast_symbols, ast_symbols.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.read, ast_symbols.activity_kind);
+    try std.testing.expect(!ast_symbols.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, ast_symbols.label_arg_kind);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_existing, ast_symbols.permission_target_kind);
+    try std.testing.expect(ast_symbols.decode == ast_symbols_impl.decode);
+    try std.testing.expect(ast_symbols.validate.? == ast_symbols_impl.validate);
+    try std.testing.expect(ast_symbols.call == ast_symbols_impl.call);
 }
 
 test "built-in semantic_search owns product metadata schema and callbacks" {
@@ -2901,6 +2955,7 @@ test "built-in read-only tool set matches plan inspection tools" {
         "glob_files",
         "grep_files",
         "list_files",
+        "ast_symbols",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);

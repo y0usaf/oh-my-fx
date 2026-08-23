@@ -1985,8 +1985,9 @@ pub fn runCommandContext(
             else
                 null;
             var login_shell_buffer: [4096]u8 = undefined;
+            var fallback_shell_buffer: [4096]u8 = undefined;
             const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-            break :blk try shell_resolver.environment(arena, configured, profile);
+            break :blk try shell_resolver.environment(arena, configured, profile, &fallback_shell_buffer);
         },
     };
     return .{

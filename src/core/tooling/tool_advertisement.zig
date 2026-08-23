@@ -155,6 +155,29 @@ const test_memory = blk: {
     break :blk spec;
 };
 
+const test_ast_symbols = blk: {
+    var spec = test_read_file;
+    spec.name = "ast_symbols";
+    spec.description = "Test AST symbol extraction. When to use: exercise structural tool projection. When NOT to use: assert parser behavior.";
+    spec.gateway_schema = .{
+        .name = "ast_symbols",
+        .description = spec.description,
+        .input_schema = .{
+            .properties = &.{.{ .name = "path", .json_type = .string }},
+            .required = &.{"path"},
+        },
+    };
+    spec.executor_kind = .ast_symbols;
+    spec.activity_kind = .read;
+    spec.requires_approval = false;
+    spec.action_label = "Parsing";
+    spec.completed_action_label = "Parsed";
+    spec.label_arg_kind = .path;
+    spec.label_arg_default = "source file";
+    spec.permission_target_kind = .path_existing;
+    break :blk spec;
+};
+
 const test_semantic_search = blk: {
     var spec = test_read_file;
     spec.name = "semantic_search";
@@ -679,6 +702,7 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_create_folder,
     test_file_info,
     test_memory,
+    test_ast_symbols,
     test_semantic_search,
     test_open_file,
     test_web_fetch,
@@ -700,6 +724,7 @@ const test_order = [_][]const u8{
     "grep_files",
     "list_files",
     "file_info",
+    "ast_symbols",
     "semantic_search",
     "edit_file",
     "write_file",
@@ -725,6 +750,7 @@ const test_read_only_names = [_][]const u8{
     "glob_files",
     "grep_files",
     "list_files",
+    "ast_symbols",
 };
 
 const test_tool_set = tool_set_contract.ToolSet{

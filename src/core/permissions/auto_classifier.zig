@@ -12,7 +12,7 @@ const types = @import("../shared/types.zig");
 pub const tool_name = "permission_decision";
 const max_rationale_bytes: usize = 240;
 const max_review_packet_bytes: usize = 16 * 1024;
-pub const gateway_reviewer_model = "moonshotai/kimi-k3";
+pub const gateway_reviewer_model = "zai/glm-5.2";
 
 pub const Risk = enum {
     low,

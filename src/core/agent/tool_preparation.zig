@@ -482,7 +482,7 @@ fn applicableTargetsFromPermissionTargets(
 fn filesystemTargetKind(kind: tool_dispatch.ExecutorKind) ?context_contract.TargetKind {
     return switch (kind) {
         .list_files, .glob_files, .grep_files, .semantic_search, .create_folder => .directory,
-        .read_file, .copy_file => .file,
+        .read_file, .ast_symbols, .copy_file => .file,
         else => null,
     };
 }

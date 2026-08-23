@@ -116,17 +116,19 @@ Do not scatter help text or argument parsing across multiple files.
 
 ## Configuration and State
 
-Profile configuration and runtime state lives under `~/.fx/`. Project `.fx.json` contains committed project defaults only.
+Profile settings live under `~/.omfx/` (`settings.json`); durable runtime state (sessions, auth, skills, MCP credentials, logs) stays under `~/.fx/`. Project `.fx.json` contains committed project defaults only.
 
 Config precedence (highest wins):
 
 1. Environment variables such as `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
-2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
-3. `~/.fx/settings.json` top-level (profile global settings)
+2. `~/.omfx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
+3. `~/.omfx/settings.json` top-level (profile global settings)
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `permission_mode`, `credential_source`, and `permission` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `startup_mode`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `permission_mode`, `credential_source`, and `permission` are ignored from project config before their values are parsed.
+
+`startup_mode` (`solo` default, or `mux`) selects what a bare interactive `fx` launch opens: the inline single-session UI, or the mux session cockpit (`fx mux`). Hosted mux children ignore `startup_mode`, so cockpit-spawned sessions never recurse. `/mux` inside a session closes it cleanly and hands the terminal to the cockpit with that session preselected.
 
 Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces — each session tracks its `workspace_root` which updates when resumed in a different workspace. A subagent child is an ordinary session with its own directory; `subagent/` holds create-operation identities on a parent and the control record on a child.
 

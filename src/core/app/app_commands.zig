@@ -1,4 +1,5 @@
 const std = @import("std");
+const mux_session_bridge = @import("../mux/session_bridge.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -12,6 +13,7 @@ const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const editor_state = @import("../input/editor_state.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
@@ -38,6 +40,7 @@ const usage_report = @import("../session/usage_report.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const presentation_mode = @import("../config/presentation_mode.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
 const ui_subagents = @import("../../ui/subagent/runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
@@ -316,6 +319,7 @@ pub fn Handlers(comptime App: type) type {
                 .new_session = commandNewSession,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
+                .mux = commandMux,
                 .continue_recovery = commandContinueRecovery,
                 .show_help = commandShowHelp,
                 .login = commandLogin,
@@ -346,6 +350,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
                 .toggle_fast = commandToggleFast,
+                .handle_appearance = commandHandleAppearance,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
@@ -485,6 +490,20 @@ pub fn Handlers(comptime App: type) type {
         fn commandQuit(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             requestResumeExit(app);
+        }
+
+        fn commandMux(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (io_mod.getenv(mux_session_bridge.direct_endpoint_env) != null) {
+                try app.writeDomainNotice(.{
+                    .topic = "mux",
+                    .tone = .warning,
+                    .body = "Already hosted by the mux cockpit.",
+                }, true);
+                return;
+            }
+            requestResumeExit(app);
+            app.mux_handoff_requested = true;
         }
 
         fn commandClearScreen(ctx: *anyopaque) !void {
@@ -1510,6 +1529,7 @@ pub fn Handlers(comptime App: type) type {
         fn closeInlineCommandMenusIfPresent(app: *App) void {
             if (comptime !@hasField(App, "input_runtime")) return;
             const InputRuntime = @TypeOf(app.input_runtime);
+            if (comptime @hasField(InputRuntime, "appearance_menu")) app.input_runtime.appearance_menu.close();
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
             if (comptime @hasField(InputRuntime, "usage_menu")) app.input_runtime.usage_menu.close(app.alloc);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
@@ -1626,6 +1646,31 @@ pub fn Handlers(comptime App: type) type {
         fn commandToggleFast(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).toggleFast(app);
+        }
+
+        fn commandHandleAppearance(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const trimmed = std.mem.trim(u8, rest, " \t");
+            if (trimmed.len == 0) {
+                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+                if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+                closeHelpMenuIfPresent(app);
+                app.input_runtime.settings_menu.close();
+                closeInlineCommandMenusIfPresent(app);
+                app.input_runtime.appearance_menu.open();
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+
+            const change = parseAppearanceChange(trimmed) orelse {
+                try app.writeDomainNotice(.{
+                    .topic = "appearance",
+                    .tone = .@"error",
+                    .body = "Use: /appearance input lines|tint or /appearance presentation normal|minimal",
+                }, true);
+                return;
+            };
+            try applySettingsCatalogChange(app, change);
         }
 
         fn commandHandleStatusline(ctx: *anyopaque, rest: []const u8) !void {
@@ -2905,6 +2950,142 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+noinline fn parseAppearanceChange(rest: []const u8) ?settings_catalog.Change {
+    var tokens = std.mem.tokenizeAny(u8, rest, " \t");
+    const first = tokens.next() orelse return null;
+    const second = tokens.next();
+    if (tokens.next() != null) return null;
+
+    if (second) |value| {
+        if (std.mem.eql(u8, first, "input")) {
+            const appearance = input_appearance.InputAppearance.parse(value) orelse return null;
+            return .{ .setting = .input_appearance, .value = appearance.label() };
+        }
+        if (std.mem.eql(u8, first, "presentation")) {
+            const mode = presentation_mode.MaxxingMode.parse(value) orelse return null;
+            return .{ .setting = .maxxing_mode, .value = mode.label() };
+        }
+        return null;
+    }
+
+    if (input_appearance.InputAppearance.parse(first)) |appearance| {
+        return .{ .setting = .input_appearance, .value = appearance.label() };
+    }
+    if (presentation_mode.MaxxingMode.parse(first)) |mode| {
+        return .{ .setting = .maxxing_mode, .value = mode.label() };
+    }
+    return null;
+}
+
+fn handleInputAppearanceCommand(app: anytype, rest: []const u8) !void {
+    const trimmed = std.mem.trim(u8, rest, " \t");
+
+    if (trimmed.len == 0) {
+        debug_trace.logf("core", "input command show current={s}", .{app.input_runtime.input_appearance.label()});
+        const msg = try std.fmt.allocPrint(
+            app.alloc,
+            "current: {s}\n" ++
+                "available: lines, tint\n" ++
+                "  lines current two-line composer chrome\n" ++
+                "  tint  tinted composer background\n" ++
+                "examples: /input lines, /input tint",
+            .{app.input_runtime.input_appearance.label()},
+        );
+        defer app.alloc.free(msg);
+        try app.writeDomainNotice(.{ .topic = "input", .tone = .neutral, .body = msg }, true);
+        return;
+    }
+
+    const next = input_appearance.InputAppearance.parse(trimmed) orelse {
+        debug_trace.logf("core", "input command rejected arg_bytes={d}", .{trimmed.len});
+        try app.writeDomainNotice(.{ .topic = "input", .tone = .@"error", .body = "Use: lines, tint" }, true);
+        return;
+    };
+
+    const runtime_changed = next != app.input_runtime.input_appearance;
+    if (runtime_changed) {
+        app.input_runtime.input_appearance = next;
+        app.shell.render_requests.request(.footer);
+    }
+    try persistInputAppearanceSetting(app, next, runtime_changed);
+
+    if (!runtime_changed) {
+        debug_trace.logf("core", "input command unchanged mode={s}", .{next.label()});
+        const msg = try std.fmt.allocPrint(app.alloc, "already in {s}", .{next.label()});
+        defer app.alloc.free(msg);
+        try app.writeDomainNotice(.{ .topic = "input", .tone = .neutral, .body = msg }, true);
+        return;
+    }
+
+    debug_trace.logf("core", "input command switched mode={s}", .{next.label()});
+    const msg = try std.fmt.allocPrint(app.alloc, "switched to {s}", .{next.label()});
+    defer app.alloc.free(msg);
+    try app.writeDomainNotice(.{ .topic = "input", .tone = .neutral, .body = msg }, true);
+}
+
+fn persistInputAppearanceSetting(app: anytype, next: input_appearance.InputAppearance, runtime_changed: bool) !void {
+    if (comptime @hasDecl(@TypeOf(app.*), "persistInputAppearance")) {
+        try app.persistInputAppearance(next.label(), runtime_changed);
+        return;
+    }
+
+    const patch = config_runtime.UserSettingsPatch{ .input_appearance = next.label() };
+    try persistUserPreferences(app, "input", patch, runtime_changed);
+}
+
+fn handleMaxxingCommand(app: anytype, rest: []const u8) !void {
+    const trimmed = std.mem.trim(u8, rest, " \t");
+
+    if (trimmed.len == 0) {
+        const msg = try std.fmt.allocPrint(
+            app.alloc,
+            "current: {s}\n" ++
+                "available: minimal, legacy\n" ++
+                "  minimal bare composer and grouped tool activity\n" ++
+                "  legacy  original Fx presentation\n" ++
+                "examples: /maxxing minimal, /maxxing legacy",
+            .{app.shell.maxxing_mode.label()},
+        );
+        defer app.alloc.free(msg);
+        try app.writeDomainNotice(.{ .topic = "maxxing", .tone = .neutral, .body = msg }, true);
+        return;
+    }
+
+    const next = presentation_mode.MaxxingMode.parse(trimmed) orelse {
+        try app.writeDomainNotice(.{ .topic = "maxxing", .tone = .@"error", .body = "Use: minimal, legacy" }, true);
+        return;
+    };
+
+    const runtime_changed = next != app.shell.maxxing_mode;
+    if (runtime_changed) {
+        app.shell.maxxing_mode = next;
+        app.shell.render_requests.request(.transcript);
+        app.shell.render_requests.request(.footer);
+    }
+    try persistMaxxingModeSetting(app, next, runtime_changed);
+
+    const msg = try std.fmt.allocPrint(app.alloc, "{s} {s}", .{
+        if (runtime_changed) "switched to" else "already in",
+        next.label(),
+    });
+    defer app.alloc.free(msg);
+    try app.writeDomainNotice(.{
+        .topic = "maxxing",
+        .tone = .neutral,
+        .body = msg,
+    }, true);
+}
+
+fn persistMaxxingModeSetting(app: anytype, next: presentation_mode.MaxxingMode, runtime_changed: bool) !void {
+    if (comptime @hasDecl(@TypeOf(app.*), "persistMaxxingMode")) {
+        try app.persistMaxxingMode(next.label(), runtime_changed);
+        return;
+    }
+
+    const patch = config_runtime.UserSettingsPatch{ .maxxing_mode = next.label() };
+    try persistUserPreferences(app, "maxxing", patch, runtime_changed);
+}
+
 fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const App = @TypeOf(app.*);
     const SessionRuntime = app_session_runtime.Runtime(App);
@@ -3126,9 +3307,15 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     }
     if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app.permission_engine.mode);
     if (comptime @hasField(App, "input_runtime")) {
+        snapshot.input_appearance = app.input_runtime.input_appearance.label();
         snapshot.startup_scrollback = app.input_runtime.settings_menu.startup_scrollback;
         if (comptime @hasField(@TypeOf(app.input_runtime), "slash_menu_categories")) {
             snapshot.slash_menu_categories = app.input_runtime.slash_menu_categories;
+        }
+    }
+    if (comptime @hasField(App, "shell")) {
+        if (comptime @hasField(@TypeOf(app.shell), "maxxing_mode")) {
+            snapshot.maxxing_mode = app.shell.maxxing_mode.label();
         }
     }
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
@@ -3148,6 +3335,33 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
 
 pub fn applySettingsCatalogMenuChange(app: anytype, change: settings_catalog.Change) !void {
     switch (change.setting) {
+        .input_appearance => {
+            const next = input_appearance.InputAppearance.parse(change.value) orelse
+                return error.InvalidSettingsCatalogValue;
+            const runtime_changed = next != app.input_runtime.input_appearance;
+            if (runtime_changed) app.input_runtime.input_appearance = next;
+            try persistUserPreferencesSilently(
+                app,
+                "input",
+                .{ .input_appearance = next.label() },
+                runtime_changed,
+            );
+        },
+        .maxxing_mode => {
+            const next = presentation_mode.MaxxingMode.parse(change.value) orelse
+                return error.InvalidSettingsCatalogValue;
+            const runtime_changed = next != app.shell.maxxing_mode;
+            if (runtime_changed) {
+                app.shell.maxxing_mode = next;
+                app.shell.render_requests.request(.transcript);
+            }
+            try persistUserPreferencesSilently(
+                app,
+                "maxxing",
+                .{ .maxxing_mode = next.label() },
+                runtime_changed,
+            );
+        },
         .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             try applyStatuslineItem(
@@ -3185,6 +3399,8 @@ fn persistUserPreferencesSilently(
 pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change) !void {
     switch (change.setting) {
         .model => unreachable,
+        .input_appearance => try handleInputAppearanceCommand(app, change.value),
+        .maxxing_mode => try handleMaxxingCommand(app, change.value),
         .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             const item = statuslineItemForSetting(change.setting).?;
@@ -3516,6 +3732,93 @@ const ClipboardCommandFakeApp = struct {
     }
 };
 
+const InputAppearanceCommandFakeApp = struct {
+    const InputAppearance = input_appearance.InputAppearance;
+
+    const FakeRenderRequests = struct {
+        footer_requests: usize = 0,
+
+        fn request(self: *FakeRenderRequests, reason: anytype) void {
+            _ = reason;
+            self.footer_requests += 1;
+        }
+    };
+
+    const FakeShell = struct {
+        render_requests: FakeRenderRequests = .{},
+    };
+
+    const FakeInputRuntime = struct {
+        input_appearance: InputAppearance = .tint,
+    };
+
+    alloc: std.mem.Allocator,
+    input_runtime: FakeInputRuntime = .{},
+    shell: FakeShell = .{},
+    transcript: std.ArrayList(u8) = .empty,
+    last_tone: ?types.NoticeTone = null,
+    persist_calls: usize = 0,
+    persisted_appearance: []const u8 = "",
+    persisted_runtime_changed: bool = false,
+
+    fn deinit(self: *InputAppearanceCommandFakeApp) void {
+        self.transcript.deinit(self.alloc);
+    }
+
+    noinline fn writeDomainNotice(self: *InputAppearanceCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
+        self.last_tone = notice.tone;
+        try self.transcript.appendSlice(self.alloc, notice.body);
+    }
+
+    fn persistInputAppearance(self: *InputAppearanceCommandFakeApp, appearance: []const u8, runtime_changed: bool) !void {
+        self.persist_calls += 1;
+        self.persisted_runtime_changed = runtime_changed;
+        self.persisted_appearance = appearance;
+    }
+};
+
+const MaxxingCommandFakeApp = struct {
+    const FakeRenderRequests = struct {
+        full_requests: usize = 0,
+
+        fn request(self: *FakeRenderRequests, reason: anytype) void {
+            _ = reason;
+            self.full_requests += 1;
+        }
+    };
+
+    const FakeShell = struct {
+        maxxing_mode: presentation_mode.MaxxingMode = presentation_mode.MaxxingMode.default,
+        render_requests: FakeRenderRequests = .{},
+    };
+
+    const FakeInputRuntime = struct {
+        input_appearance: input_appearance.InputAppearance = .default,
+    };
+
+    alloc: std.mem.Allocator,
+    input_runtime: FakeInputRuntime = .{},
+    shell: FakeShell = .{},
+    transcript: std.ArrayList(u8) = .empty,
+    last_tone: ?types.NoticeTone = null,
+    persisted_mode: []const u8 = "",
+    persisted_runtime_changed: bool = false,
+
+    fn deinit(self: *MaxxingCommandFakeApp) void {
+        self.transcript.deinit(self.alloc);
+    }
+
+    noinline fn writeDomainNotice(self: *MaxxingCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
+        self.last_tone = notice.tone;
+        try self.transcript.appendSlice(self.alloc, notice.body);
+    }
+
+    fn persistMaxxingMode(self: *MaxxingCommandFakeApp, mode: []const u8, runtime_changed: bool) !void {
+        self.persisted_mode = mode;
+        self.persisted_runtime_changed = runtime_changed;
+    }
+};
+
 const SkillsInstallReplayApp = struct {
     const FakeInputRuntime = struct {
         const TextReplacementState = struct {
@@ -3608,6 +3911,36 @@ const ChangeCommandFakeApp = struct {
         try self.transcript.appendSlice(self.alloc, notice.body);
     }
 };
+
+fn runInputAppearanceCommandForTest(app: *InputAppearanceCommandFakeApp, rest: []const u8) !void {
+    try handleInputAppearanceCommand(app, rest);
+}
+
+fn runMaxxingCommandForTest(app: *MaxxingCommandFakeApp, rest: []const u8) !void {
+    try handleMaxxingCommand(app, rest);
+}
+
+test "appearance command parses grouped values and compatibility shorthand" {
+    try std.testing.expectEqual(
+        settings_catalog.Change{ .setting = .input_appearance, .value = "lines" },
+        parseAppearanceChange("input lines").?,
+    );
+    try std.testing.expectEqual(
+        settings_catalog.Change{ .setting = .maxxing_mode, .value = "legacy" },
+        parseAppearanceChange("presentation normal").?,
+    );
+    try std.testing.expectEqual(
+        settings_catalog.Change{ .setting = .input_appearance, .value = "tint" },
+        parseAppearanceChange(" tint ").?,
+    );
+    try std.testing.expectEqual(
+        settings_catalog.Change{ .setting = .maxxing_mode, .value = "minimal" },
+        parseAppearanceChange("minimal").?,
+    );
+    try std.testing.expect(parseAppearanceChange("input minimal") == null);
+    try std.testing.expect(parseAppearanceChange("presentation tint") == null);
+    try std.testing.expect(parseAppearanceChange("input lines extra") == null);
+}
 
 fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
     if (std.fs.path.dirname(sub_path)) |parent| {
@@ -4285,4 +4618,105 @@ test "skills show missing name keeps not found notice" {
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Skill 'missing' not found.") != null);
+}
+
+test "input appearance command without arguments reports session-local options" {
+    var app = InputAppearanceCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try runInputAppearanceCommandForTest(&app, "");
+
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "current: tint") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "available: lines, tint") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "/input lines") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "/input tint") != null);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.render_requests.footer_requests);
+}
+
+test "input appearance command switches mode and requests footer redraw" {
+    var app = InputAppearanceCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try runInputAppearanceCommandForTest(&app, "lines");
+
+    try std.testing.expectEqual(InputAppearanceCommandFakeApp.InputAppearance.lines, app.input_runtime.input_appearance);
+    try std.testing.expectEqualStrings("lines", app.persisted_appearance);
+    try std.testing.expect(app.persisted_runtime_changed);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to lines") != null);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.render_requests.footer_requests);
+
+    app.transcript.clearRetainingCapacity();
+    try runInputAppearanceCommandForTest(&app, "lines");
+
+    try std.testing.expectEqual(InputAppearanceCommandFakeApp.InputAppearance.lines, app.input_runtime.input_appearance);
+    try std.testing.expectEqual(@as(usize, 2), app.persist_calls);
+    try std.testing.expectEqualStrings("lines", app.persisted_appearance);
+    try std.testing.expect(!app.persisted_runtime_changed);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "already in lines") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.render_requests.footer_requests);
+}
+
+test "input appearance command rejects unknown mode without changing state" {
+    var app = InputAppearanceCommandFakeApp{ .alloc = std.testing.allocator, .input_runtime = .{ .input_appearance = .tint } };
+    defer app.deinit();
+
+    try runInputAppearanceCommandForTest(&app, "card");
+
+    try std.testing.expectEqual(InputAppearanceCommandFakeApp.InputAppearance.tint, app.input_runtime.input_appearance);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Use: lines, tint") != null);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.render_requests.footer_requests);
+}
+
+test "maxxing command switches presentation without changing input appearance" {
+    var app = MaxxingCommandFakeApp{ .alloc = std.testing.allocator, .shell = .{ .maxxing_mode = .legacy } };
+    defer app.deinit();
+    app.input_runtime.input_appearance = .lines;
+
+    try runMaxxingCommandForTest(&app, "minimal");
+
+    try std.testing.expectEqual(presentation_mode.MaxxingMode.minimal, app.shell.maxxing_mode);
+    try std.testing.expectEqual(input_appearance.InputAppearance.lines, app.input_runtime.input_appearance);
+    try std.testing.expectEqualStrings("minimal", app.persisted_mode);
+    try std.testing.expect(app.shell.render_requests.full_requests > 0);
+}
+
+test "maxxing command reports options and rejects unknown modes" {
+    var app = MaxxingCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try runMaxxingCommandForTest(&app, "");
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "current: minimal") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "/maxxing minimal") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "/maxxing legacy") != null);
+
+    app.transcript.clearRetainingCapacity();
+    try runMaxxingCommandForTest(&app, "bare");
+    try std.testing.expectEqual(presentation_mode.MaxxingMode.minimal, app.shell.maxxing_mode);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Use: minimal, legacy") != null);
+}
+
+test "maxxing command switches to legacy with stored input appearance intact" {
+    var app = MaxxingCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.input_runtime.input_appearance = .lines;
+
+    try runMaxxingCommandForTest(&app, "legacy");
+
+    try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, app.shell.maxxing_mode);
+    try std.testing.expectEqual(input_appearance.InputAppearance.lines, app.input_runtime.input_appearance);
+    try std.testing.expectEqualStrings("legacy", app.persisted_mode);
+}
+
+test "maxxing command accepts normal as a hidden legacy alias" {
+    var app = MaxxingCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try runMaxxingCommandForTest(&app, "normal");
+
+    try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, app.shell.maxxing_mode);
+    try std.testing.expectEqualStrings("legacy", app.persisted_mode);
 }

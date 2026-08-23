@@ -691,8 +691,9 @@ fn commandEnvironment(
         return .workspace_clean;
     }
     var login_shell_buffer: [4096]u8 = undefined;
+    var fallback_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-    return shell_resolver.environment(alloc, configured, profile);
+    return shell_resolver.environment(alloc, configured, profile, &fallback_shell_buffer);
 }
 
 fn durableAction(action: Action) ?contracts.Action {
@@ -992,8 +993,9 @@ fn buildStartShell(arena: Allocator, input: *const Input) !contracts.ShellSpec {
     if (input.shell) |shell| return buildShell(shell);
     const profile = input.profile orelse .user;
     var login_shell_buffer: [4096]u8 = undefined;
+    var fallback_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-    return shell_resolver.profileShell(arena, configured, profile);
+    return shell_resolver.profileShell(arena, configured, profile, &fallback_shell_buffer);
 }
 
 fn buildReturnCondition(input: ReturnInput) !contracts.ReturnCondition {
@@ -1232,6 +1234,10 @@ pub fn mapAuthorizedResult(
         .authority_retired => try alloc.dupe(
             u8,
             "saved terminal authority is from an older fx version; start a new terminal",
+        ),
+        .unsupported_host => try alloc.dupe(
+            u8,
+            "the persistent terminal host predates this fx build and rejected the request; quit older fx sessions or remove ~/.fx/terminal-host/host.sock so a fresh host starts",
         ),
         else => return result,
     };
