@@ -43,6 +43,7 @@ const statusline_identity = @import("core/workspace/statusline_identity.zig");
 const collections = @import("core/shared/collections.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const config_runtime = @import("core/config/config_runtime.zig");
+const cli_mux = @import("core/cli/cli_mux.zig");
 const model_provider = @import("core/config/model_provider.zig");
 const js_host_prompt_history = @import("core/session/js_host_prompt_history.zig");
 const model_capabilities = @import("core/config/model_capabilities.zig");
@@ -531,6 +532,7 @@ const App = struct {
     question_prompt: QuestionPrompt = .{},
 
     should_exit: bool = false,
+    mux_handoff_requested: bool = false,
     input_runtime: InputRuntime = .{},
     terminal_input_runtime: TerminalInputRuntime = .{},
     queued_prompt_review: input_queue_runtime.State = .{},
@@ -609,6 +611,7 @@ const App = struct {
             }
         }
         app.shell.max_transcript_bytes = max_transcript_bytes;
+        app.shell.suppress_frame_output = io_mod.getenv(mux_session_bridge.direct_endpoint_env) != null;
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
             launch.requested_resume = null;
@@ -665,6 +668,12 @@ const App = struct {
 
     fn ensureMuxBridge(self: *App) void {
         if (self.mux_bridge.isStarted()) return;
+        if (io_mod.getenv(mux_session_bridge.direct_endpoint_env)) |endpoint_path| {
+            self.mux_bridge.startAtPath(self.alloc, endpoint_path) catch |err| {
+                debug_trace.logf("mux", "direct session bridge unavailable err={s}", .{@errorName(err)});
+            };
+            return;
+        }
         const session_id = SessionAppRuntime.activeSessionId(self) orelse return;
         const store = if (self.session_persistence.store) |*value| value else return;
         self.mux_bridge.start(self.alloc, store.sessions_dir, session_id) catch |err| {
@@ -795,6 +804,13 @@ const App = struct {
     /// Returns an owned handoff only after all interactive state is torn down.
     pub fn deinitWithResumeHandoff(self: *App) ?app_session_runtime.ResumeHandoff {
         return self.deinitImpl(true);
+    }
+
+    /// Consumed once during teardown; a true result execs into the mux cockpit.
+    pub fn takeMuxHandoffRequest(self: *App) bool {
+        const requested = self.mux_handoff_requested;
+        self.mux_handoff_requested = false;
+        return requested;
     }
 
     pub fn resumeHandoffColumns(self: *const App) u16 {
@@ -2939,6 +2955,31 @@ fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {
     try writeStdoutFast(text);
 }
 
+fn muxStartupConfigured(alloc: Allocator) bool {
+    const home = io_mod.getenv("HOME") orelse return false;
+    const workspace = io_mod.realpathAlloc(alloc, ".") catch return false;
+    defer alloc.free(workspace);
+    var settings = config_runtime.loadStartupStatusSettingsFromHome(alloc, home, workspace) catch return false;
+    defer settings.deinit(alloc);
+    return settings.startup_mode == .mux;
+}
+
+fn shouldEnterMuxCockpit(
+    requested_resume: bool,
+    upgrade_relaunch: bool,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    hosted_by_mux: bool,
+    startup_mode_mux: bool,
+) bool {
+    return !requested_resume and
+        !upgrade_relaunch and
+        stdin_is_tty and
+        stdout_is_tty and
+        !hosted_by_mux and
+        startup_mode_mux;
+}
+
 fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_args: []const [:0]const u8) !void {
     io_mod.setRawEnviron(raw_env);
 
@@ -2978,6 +3019,24 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
             defer owned_launch.deinit(alloc);
             defer debug_trace.shutdown();
 
+            if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+                if (shouldEnterMuxCockpit(
+                    owned_launch.requested_resume != null,
+                    owned_launch.upgrade_relaunch,
+                    std.c.isatty(std.posix.STDIN_FILENO) != 0,
+                    std.c.isatty(std.posix.STDOUT_FILENO) != 0,
+                    io_mod.getenv(mux_session_bridge.direct_endpoint_env) != null,
+                    muxStartupConfigured(alloc),
+                )) {
+                    const exit_code = cli_mux.run(.{}) catch |err| {
+                        writeStderrFast("fx: mux cockpit unavailable: ") catch {};
+                        writeStderrFast(@errorName(err)) catch {};
+                        writeStderrFast("\n") catch {};
+                        std.process.exit(1);
+                    };
+                    std.process.exit(exit_code);
+                }
+            }
             const outcome = try app_entry_runtime.runInteractive(App, alloc, &owned_launch);
             switch (outcome) {
                 .returned => return,
@@ -3446,6 +3505,16 @@ test "raw benchmark preflight matches no-arg FX_BENCH presence" {
     try std.testing.expect(shouldRunBenchmarkNoArgRaw(no_args[0..], @ptrCast(&bench_env)));
     try std.testing.expect(!shouldRunBenchmarkNoArgRaw(help_args[0..], @ptrCast(&bench_env)));
     try std.testing.expect(!shouldRunBenchmarkNoArgRaw(no_args[0..], @ptrCast(&empty_env)));
+}
+
+test "mux-hosted fresh sessions do not recursively enter the cockpit" {
+    try std.testing.expect(shouldEnterMuxCockpit(false, false, true, true, false, true));
+    try std.testing.expect(!shouldEnterMuxCockpit(false, false, true, true, true, true));
+    try std.testing.expect(!shouldEnterMuxCockpit(true, false, true, true, false, true));
+    try std.testing.expect(!shouldEnterMuxCockpit(false, true, true, true, false, true));
+    try std.testing.expect(!shouldEnterMuxCockpit(false, false, false, true, false, true));
+    try std.testing.expect(!shouldEnterMuxCockpit(false, false, true, false, false, true));
+    try std.testing.expect(!shouldEnterMuxCockpit(false, false, true, true, false, false));
 }
 
 test "terminal help styling respects terminal capability and color opt-outs" {

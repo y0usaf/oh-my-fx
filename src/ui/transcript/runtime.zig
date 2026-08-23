@@ -4093,6 +4093,7 @@ fn sameFullDiffResolver(
 
 pub const TranscriptRuntime = struct {
     stdout_file: std.Io.File = std.Io.File.stdout(),
+    suppress_frame_output: bool = false,
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
     layout: Layout = undefined,
@@ -9125,6 +9126,10 @@ pub const TranscriptRuntime = struct {
 
     fn writeFrameSink(ctx: *anyopaque, metrics: *Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
         const self: *TranscriptRuntime = @ptrCast(@alignCast(ctx));
+        if (self.suppress_frame_output) {
+            metrics.ansi_bytes += bytes.len;
+            return .complete;
+        }
         return transcript_io.writeFrameBytes(self, metrics, bytes);
     }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mux_session_bridge = @import("../mux/session_bridge.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -349,6 +350,7 @@ pub fn Handlers(comptime App: type) type {
                 .new_session = commandNewSession,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
+                .mux = commandMux,
                 .continue_recovery = commandContinueRecovery,
                 .show_help = commandShowHelp,
                 .login = commandLogin,
@@ -590,6 +592,20 @@ pub fn Handlers(comptime App: type) type {
         fn commandQuit(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             requestResumeExit(app);
+        }
+
+        fn commandMux(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (io_mod.getenv(mux_session_bridge.direct_endpoint_env) != null) {
+                try app.writeDomainNotice(.{
+                    .topic = "mux",
+                    .tone = .warning,
+                    .body = "Already hosted by the mux cockpit.",
+                }, true);
+                return;
+            }
+            requestResumeExit(app);
+            app.mux_handoff_requested = true;
         }
 
         fn commandClearScreen(ctx: *anyopaque) !void {

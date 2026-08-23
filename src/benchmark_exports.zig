@@ -16,3 +16,5 @@ pub const MatchSpan = file_index.MatchSpan;
 pub const SearchResult = file_index.SearchResult;
 pub const max_indexed_files = file_index.max_indexed_files;
 pub const max_path_len = file_index.max_path_len;
+pub const MuxBenchmarkHarness = @import("core/mux/runtime.zig").BenchmarkHarness;
+pub const terminal_engine = @import("core/terminal/engine.zig");

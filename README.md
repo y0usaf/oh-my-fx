@@ -20,6 +20,8 @@
 
 fx is a coding agent harness and CLI written in Zig, optimized for research and embeddability as part of larger systems.
 
+> **oh-my-fx** is a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) that installs its binary as `omfx`; substitute `omfx` wherever these docs say `fx`.
+
 It focuses on minimalism and performance across the board, from system prompt design to its tools, feature set, and 7.8 MiB binary.
 
 For end users, its CLI output style and form factor aim to be closer to a Unix shell than a heavy "IDE in the terminal" TUI.
@@ -77,7 +79,7 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
-The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
+The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.omfx/settings.json`:
 
 ```json
 {
@@ -118,7 +120,16 @@ Juggle concurrent sessions for the current workspace in a native terminal UI:
 fx mux
 ```
 
-The minimal sidebar lists saved and newly created sessions while each child fx terminal remains live. If a saved session is already open in another fx process, the mux attaches to its live screen and forwards input instead of starting a competing resume process. Use `ctrl+h` and `ctrl+l` to move focus, `ctrl+j` and `ctrl+k` to switch sessions, `ctrl+n` to create one, `ctrl+delete` to move an inactive selected saved session into `~/.fx/archive/`, and `ctrl+q` to quit. Pass a saved session ID to `fx mux <session-id>` to select it on startup.
+The minimal sidebar lists saved and newly created sessions while each child fx terminal remains live. Sessions launched by mux publish the standard fx renderer grid directly, avoiding ANSI re-parsing; the PTY remains only as a startup and failure fallback. If a saved session is already open in another fx process, the mux attaches to its live screen and forwards input instead of starting a competing resume process. Use `ctrl+h` and `ctrl+l` to move focus, `ctrl+j` and `ctrl+k` to switch sessions, `ctrl+n` to create one, `ctrl+delete` to move an inactive selected saved session into `~/.fx/archive/`, and `ctrl+q` to quit. Pass a saved session ID to `fx mux <session-id>` to select it on startup.
+
+Benchmark mux terminal ingestion, session switching, and frame construction locally:
+
+```bash
+nix run .#benchmark
+nix run .#benchmark -- 32 5000  # sessions, iterations
+```
+
+Without Nix, run `zig build run-bench-mux -Doptimize=ReleaseSafe -- 32 5000`.
 
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
@@ -150,7 +161,7 @@ Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
 git clone https://github.com/vercel-labs/fx.git
 cd fx
 zig build -Doptimize=ReleaseSafe
-./zig-out/bin/fx
+./zig-out/bin/omfx
 ```
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.

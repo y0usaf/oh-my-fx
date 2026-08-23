@@ -45,6 +45,8 @@ const Child = struct {
     master_fd: std.posix.fd_t,
     pid: std.posix.pid_t,
     grid: terminal_engine.Grid,
+    direct_endpoint_path: []u8,
+    direct_render: bool = false,
     scrollback: std.ArrayList([]u8) = .empty,
     scroll_offset: usize = 0,
     exited: bool = false,
@@ -54,9 +56,13 @@ const Child = struct {
             std.posix.kill(self.pid, .TERM) catch {};
             _ = waitForChild(self.pid, 1000);
         }
-        closeFd(self.master_fd);
+        if (self.master_fd >= 0) closeFd(self.master_fd);
+        if (self.direct_endpoint_path.len > 0) {
+            std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), self.direct_endpoint_path) catch {};
+        }
         for (self.scrollback.items) |line| alloc.free(line);
         self.scrollback.deinit(alloc);
+        if (self.direct_endpoint_path.len > 0) alloc.free(self.direct_endpoint_path);
         self.grid.deinit();
     }
 
@@ -205,12 +211,18 @@ pub fn run(resume_id: ?[]const u8) !u8 {
     var state = model_mod.Model{ .session_count = entries.items.len };
     const guard = try TerminalGuard.enter();
     defer guard.leave();
+
     var input_escape: [64]u8 = undefined;
     var input_escape_len: usize = 0;
     var last_rows: u16 = 0;
     var last_cols: u16 = 0;
     var last_frame: std.ArrayList(u8) = .empty;
     defer last_frame.deinit(alloc);
+    // Paint chrome before any bridge I/O so a stalled peer cannot blank the UI.
+    {
+        const layout = try ui_terminal.queryLayout(std.posix.STDIN_FILENO, 0);
+        try renderIfChanged(alloc, entries.items, state, layout.cols, layout.rows, &last_frame);
+    }
 
     while (true) {
         const layout = try ui_terminal.queryLayout(std.posix.STDIN_FILENO, 0);
@@ -241,6 +253,9 @@ pub fn run(resume_id: ?[]const u8) !u8 {
         if (entries.items[state.selected].attached) |*attached| {
             refreshAttached(alloc, attached) catch {};
         }
+        if (entries.items[state.selected].child) |*child| {
+            refreshDirectChild(alloc, child) catch {};
+        }
 
         var poll_fds: [max_sessions + 1]std.posix.pollfd = undefined;
         var owners: [max_sessions]?usize = @splat(null);
@@ -266,7 +281,8 @@ pub fn run(resume_id: ?[]const u8) !u8 {
                     else => break,
                 };
                 if (count == 0) break;
-                try entries.items[index].child.?.feed(alloc, buf[0..count]);
+                const child = &entries.items[index].child.?;
+                if (!child.direct_render) try child.feed(alloc, buf[0..count]);
                 if (count < buf.len) break;
             }
         }
@@ -286,7 +302,13 @@ pub fn run(resume_id: ?[]const u8) !u8 {
                     } else if (escapeSequenceComplete(input_escape[0..input_escape_len])) {
                         const sequence = input_escape[0..input_escape_len];
                         if (scrollDeltaForEscape(sequence, layout.rows)) |delta| {
-                            if (entries.items[state.selected].child) |*child| child.scroll(delta);
+                            if (entries.items[state.selected].child) |*child| {
+                                if (child.direct_render) {
+                                    try forwardSelected(entries.items, state.selected, sequence);
+                                } else {
+                                    child.scroll(delta);
+                                }
+                            }
                         } else {
                             if (entries.items[state.selected].child) |*child| child.scroll_offset = 0;
                             try forwardSelected(entries.items, state.selected, sequence);
@@ -320,6 +342,14 @@ fn appendDraft(alloc: Allocator, entries: *std.ArrayList(Entry)) !void {
 }
 
 fn spawnFx(alloc: Allocator, executable: []const u8, workspace: []const u8, session_id: ?[]const u8, cols: u16, rows: u16) !Child {
+    const endpoint_path = try std.fmt.allocPrint(
+        alloc,
+        "/tmp/fx-mux-{d}-{d}.sock",
+        .{ std.c.getpid(), io_mod.nanoTimestamp() },
+    );
+    errdefer alloc.free(endpoint_path);
+    const endpoint_z = try alloc.dupeZ(u8, endpoint_path);
+    defer alloc.free(endpoint_z);
     const flags = std.posix.O{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true, .NONBLOCK = true };
     const master_fd = posix_openpt(@bitCast(flags));
     if (master_fd < 0) return error.PtyUnavailable;
@@ -349,6 +379,7 @@ fn spawnFx(alloc: Allocator, executable: []const u8, workspace: []const u8, sess
         closeFd(master_fd);
         _ = chdir(workspace_z.ptr);
         _ = setenv("FX_AUTO_UPGRADE", "0", 1);
+        _ = setenv(session_bridge.direct_endpoint_env, endpoint_z.ptr, 1);
         var argv: [3:null]?[*:0]const u8 = .{ exe_z.ptr, null, null };
         if (id_z) |id| {
             argv[1] = "resume";
@@ -359,17 +390,26 @@ fn spawnFx(alloc: Allocator, executable: []const u8, workspace: []const u8, sess
     }
     var grid = try terminal_engine.Grid.init(alloc, cols, rows);
     errdefer grid.deinit();
-    var child = Child{ .master_fd = master_fd, .pid = pid, .grid = grid };
+    var child = Child{
+        .master_fd = master_fd,
+        .pid = pid,
+        .grid = grid,
+        .direct_endpoint_path = endpoint_path,
+    };
     try child.resize(cols, rows);
     return child;
 }
 
 fn forwardSelected(entries: []Entry, selected: usize, bytes: []const u8) !void {
     if (entries[selected].child) |child| {
-        var offset: usize = 0;
-        while (offset < bytes.len) offset += try writeFd(child.master_fd, bytes[offset..]);
+        if (child.direct_render) {
+            session_bridge.sendInput(child.direct_endpoint_path, bytes) catch {};
+        } else {
+            var offset: usize = 0;
+            while (offset < bytes.len) offset += try writeFd(child.master_fd, bytes[offset..]);
+        }
     } else if (entries[selected].attached) |attached| {
-        try session_bridge.sendInput(attached.endpoint_path, bytes);
+        session_bridge.sendInput(attached.endpoint_path, bytes) catch {};
     }
 }
 
@@ -377,6 +417,13 @@ fn refreshAttached(alloc: Allocator, attached: *Attached) !void {
     const next = try session_bridge.requestScreen(alloc, attached.endpoint_path);
     attached.grid.deinit();
     attached.grid = next;
+}
+
+fn refreshDirectChild(alloc: Allocator, child: *Child) !void {
+    const next = try session_bridge.requestScreen(alloc, child.direct_endpoint_path);
+    child.grid.deinit();
+    child.grid = next;
+    child.direct_render = true;
 }
 
 fn renderIfChanged(
@@ -418,7 +465,7 @@ fn buildFrame(
             try appendPadded(alloc, out, entries[index].title, sidebar_width - 2);
             try out.appendSlice(alloc, "\x1b[0m");
         } else if (row == rows) {
-            try appendPadded(alloc, out, "^N new  ^J/K sessions  ^H/L focus  ^Q quit", sidebar_width);
+            try appendPadded(alloc, out, "^N new  ^J/K switch  ^G/L focus  ^Q quit", sidebar_width);
         } else {
             try appendPadded(alloc, out, "", sidebar_width);
         }
@@ -579,6 +626,81 @@ fn closeFd(fd: std.posix.fd_t) void {
     (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(io_mod.getIo());
 }
 
+/// Keeps benchmark-only setup outside the measured mux ingestion and rendering paths.
+pub const BenchmarkHarness = struct {
+    entries: std.ArrayList(Entry) = .empty,
+    state: model_mod.Model,
+    cols: u16,
+    rows: u16,
+
+    pub fn init(
+        alloc: Allocator,
+        session_count: usize,
+        cols: u16,
+        rows: u16,
+    ) !BenchmarkHarness {
+        if (session_count == 0 or session_count > max_sessions) return error.InvalidSessionCount;
+        if (cols <= sidebar_width + 1 or rows == 0) return error.InvalidTerminalSize;
+
+        var harness = BenchmarkHarness{
+            .state = .{ .session_count = session_count },
+            .cols = cols,
+            .rows = rows,
+        };
+        errdefer harness.deinit(alloc);
+        for (0..session_count) |index| {
+            const title = try std.fmt.allocPrint(alloc, "Session {d}", .{index + 1});
+            const grid = terminal_engine.Grid.init(alloc, cols - sidebar_width - 1, rows) catch |err| {
+                alloc.free(title);
+                return err;
+            };
+            harness.entries.append(alloc, .{
+                .id = null,
+                .title = title,
+                .child = .{
+                    .master_fd = -1,
+                    .pid = 0,
+                    .grid = grid,
+                    .direct_endpoint_path = &.{},
+                    .exited = true,
+                },
+            }) catch |err| {
+                var owned_grid = grid;
+                owned_grid.deinit();
+                alloc.free(title);
+                return err;
+            };
+        }
+        return harness;
+    }
+
+    pub fn deinit(self: *BenchmarkHarness, alloc: Allocator) void {
+        for (self.entries.items) |*entry| entry.deinit(alloc);
+        self.entries.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn feedSelected(self: *BenchmarkHarness, alloc: Allocator, bytes: []const u8) !void {
+        try self.entries.items[self.state.selected].child.?.feed(alloc, bytes);
+    }
+
+    pub fn adoptSelectedGrid(self: *BenchmarkHarness, grid: terminal_engine.Grid) void {
+        const child = &self.entries.items[self.state.selected].child.?;
+        child.grid.deinit();
+        child.grid = grid;
+        child.direct_render = true;
+    }
+
+    pub fn selectNext(self: *BenchmarkHarness) void {
+        self.state.apply(.next_session);
+    }
+
+    pub fn buildSelectedFrame(self: *BenchmarkHarness, alloc: Allocator, out: *std.ArrayList(u8)) !void {
+        out.clearRetainingCapacity();
+        try buildFrame(alloc, self.entries.items, self.state, self.cols, self.rows, out);
+    }
+};
+
 test "mux frame wire hides cursor during changed repaint and skips unchanged frame" {
     const alloc = std.testing.allocator;
     var last: std.ArrayList(u8) = .empty;
@@ -626,6 +748,7 @@ test "mux child retains rows scrolled out of the full screen" {
         .master_fd = -1,
         .pid = 0,
         .grid = try terminal_engine.Grid.init(std.testing.allocator, 8, 2),
+        .direct_endpoint_path = &.{},
         .exited = true,
     };
     defer {

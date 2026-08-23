@@ -2019,6 +2019,7 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
@@ -2042,7 +2043,7 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
         .{ configured_root, disabled_root, codex_root },
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.omfx/settings.json", fixture);
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2074,6 +2075,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
@@ -2091,7 +2093,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
         .{disabled_root},
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.omfx/settings.json", fixture);
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2105,10 +2107,12 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     try std.testing.expect(!disabled.startup_scrollback);
 }
 
+
 test "loadStartupState resolves slash menu categories default and explicit false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
@@ -2124,7 +2128,7 @@ test "loadStartupState resolves slash menu categories default and explicit false
     defer initial.deinit(std.testing.allocator);
     try std.testing.expect(initial.slash_menu_categories);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"slash_menu_categories\":false}\n");
+    try writeFixtureFile(tmp.dir, "home/.omfx/settings.json", "{\"slash_menu_categories\":false}\n");
     var hidden = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
     defer hidden.deinit(std.testing.allocator);
     try std.testing.expect(!hidden.slash_menu_categories);
@@ -2210,6 +2214,7 @@ test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
 test "loadStartupState diagnoses the retired fuzzy skill setting" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
@@ -2218,7 +2223,7 @@ test "loadStartupState diagnoses the retired fuzzy skill setting" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"skill_match_fuzzy\":true}");
+    try writeFixtureFile(tmp.dir, "home/.omfx/settings.json", "{\"skill_match_fuzzy\":true}");
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();

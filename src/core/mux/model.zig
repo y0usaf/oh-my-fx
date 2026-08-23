@@ -46,7 +46,7 @@ pub const Model = struct {
 
 pub fn actionForByte(byte: u8) Action {
     return switch (byte) {
-        0x08 => .focus_sidebar,
+        0x07 => .focus_sidebar,
         0x0c => .focus_terminal,
         0x0b => .previous_session,
         0x0a => .next_session,
@@ -68,10 +68,14 @@ test "mux model wraps session navigation and reconciles removal" {
 }
 
 test "mux ctrl navigation is decoded without consuming ordinary input" {
-    try std.testing.expectEqual(Action.focus_sidebar, actionForByte(0x08));
+    try std.testing.expectEqual(Action.focus_sidebar, actionForByte(0x07));
     try std.testing.expectEqual(Action.next_session, actionForByte(0x0a));
     try std.testing.expectEqual(Action.previous_session, actionForByte(0x0b));
     try std.testing.expectEqual(Action.focus_terminal, actionForByte(0x0c));
     try std.testing.expectEqual(Action.new_session, actionForByte(0x0e));
+    try std.testing.expectEqual(Action.none, actionForByte('x'));
+}
+test "mux leaves backspace and emacs chords to the hosted child" {
+    try std.testing.expectEqual(Action.none, actionForByte(0x08));
     try std.testing.expectEqual(Action.none, actionForByte('x'));
 }

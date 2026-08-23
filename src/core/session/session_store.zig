@@ -12658,8 +12658,9 @@ test "malformed settings do not block legacy detail or migration" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(alloc, &tmp);
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.omfx");
     defer ctx.deinit(alloc);
-    const settings_path = try std.fs.path.join(alloc, &.{ ctx.home, ".fx", "settings.json" });
+    const settings_path = try std.fs.path.join(alloc, &.{ ctx.home, ".omfx", "settings.json" });
     defer alloc.free(settings_path);
     try writeRawFile(settings_path, "{broken");
     try writeLegacyFixture(alloc, ctx.store, "legacy-with-bad-settings", ctx.workspace, 20);

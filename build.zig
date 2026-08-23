@@ -67,6 +67,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("build_options", build_options.createModule());
 
     b.installArtifact(exe);
+    const install_omfx = b.addInstallFile(exe.getEmittedBin(), "bin/omfx");
+    b.getInstallStep().dependOn(&install_omfx.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -222,6 +224,30 @@ pub fn build(b: *std.Build) void {
         "Run UI activity benchmark policy tests",
     );
     test_ui_activity_bench_step.dependOn(&run_ui_activity_bench_tests.step);
+
+    // --- mux terminal benchmark ---
+    const mux_bench = b.addExecutable(.{
+        .name = "mux-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/mux.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mux_bench.root_module.addImport("benchmark_exports", benchmark_exports_mod);
+    const install_mux_bench = b.addInstallArtifact(mux_bench, .{});
+    const mux_bench_step = b.step("bench-mux", "Build the mux terminal benchmark");
+    mux_bench_step.dependOn(&install_mux_bench.step);
+
+    const run_mux_bench = b.addRunArtifact(mux_bench);
+    run_mux_bench.step.dependOn(&install_mux_bench.step);
+    if (b.args) |args| run_mux_bench.addArgs(args);
+    const run_mux_bench_step = b.step(
+        "run-bench-mux",
+        "Build and run the mux terminal benchmark",
+    );
+    run_mux_bench_step.dependOn(&run_mux_bench.step);
 
     // --- file-diff approval review benchmark ---
     const approval_review_bench = b.addExecutable(.{

@@ -8,6 +8,21 @@ const private_socket_permissions = std.Io.File.Permissions.fromMode(0o600);
 const max_input_bytes: usize = 4096;
 const max_snapshot_bytes: usize = 8 * 1024 * 1024;
 const listener_poll_ms: i32 = 50;
+const io_timeout_ms: u32 = 500;
+
+/// Bounds every bridge read/write so a stalled peer cannot freeze the
+/// single-threaded mux loop or park the serial bridge accept loop.
+fn setIoTimeouts(fd: std.posix.fd_t) void {
+    const tv: std.posix.timeval = .{
+        .sec = @intCast(io_timeout_ms / 1000),
+        .usec = @intCast((io_timeout_ms % 1000) * 1000),
+    };
+    inline for (.{ std.posix.SO.RCVTIMEO, std.posix.SO.SNDTIMEO }) |opt| {
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, opt, std.mem.asBytes(&tv)) catch {};
+    }
+}
+
+pub const direct_endpoint_env = "FX_MUX_DIRECT_ENDPOINT";
 
 extern "c" fn write(fd: c_int, bytes: [*]const u8, len: usize) isize;
 
@@ -33,10 +48,20 @@ pub const Runtime = struct {
         sessions_dir: []const u8,
         session_id: []const u8,
     ) !void {
-        if (self.thread != null) return;
         const session_dir = try std.fs.path.join(alloc, &.{ sessions_dir, session_id });
         defer alloc.free(session_dir);
-        self.endpoint_path = try std.fs.path.join(alloc, &.{ session_dir, endpoint_name });
+        const path = try std.fs.path.join(alloc, &.{ session_dir, endpoint_name });
+        defer alloc.free(path);
+        return self.startAtPath(alloc, path);
+    }
+
+    pub fn startAtPath(
+        self: *Runtime,
+        alloc: Allocator,
+        path: []const u8,
+    ) !void {
+        if (self.thread != null) return;
+        self.endpoint_path = try alloc.dupe(u8, path);
         errdefer {
             alloc.free(self.endpoint_path);
             self.endpoint_path = &.{};
@@ -110,6 +135,7 @@ pub const Runtime = struct {
             const server = &(self.server orelse return);
             if (!listenerReady(server.socket.handle)) continue;
             var stream = server.accept(io_mod.getIo()) catch continue;
+            setIoTimeouts(stream.socket.handle);
             defer stream.close(io_mod.getIo());
             self.handleClient(stream.socket.handle) catch {};
         }
@@ -198,7 +224,9 @@ pub fn sendInput(endpoint_path: []const u8, bytes: []const u8) !void {
 
 fn connect(endpoint_path: []const u8) !std.Io.net.Stream {
     const address = try std.Io.net.UnixAddress.init(endpoint_path);
-    return address.connect(io_mod.getIo());
+    const stream = try address.connect(io_mod.getIo());
+    setIoTimeouts(stream.socket.handle);
+    return stream;
 }
 
 fn listenerReady(handle: std.Io.net.Socket.Handle) bool {
@@ -235,6 +263,22 @@ test "mux session endpoint is scoped to the durable session" {
     const path = try endpointPath(std.testing.allocator, "/tmp/fx/sessions", "session-1");
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/tmp/fx/sessions/session-1/mux.sock", path);
+}
+
+test "mux session bridge accepts an explicit direct endpoint" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const endpoint = try std.fs.path.join(alloc, &.{ root, "direct.sock" });
+    defer alloc.free(endpoint);
+
+    var bridge: Runtime = .{};
+    try bridge.startAtPath(alloc, endpoint);
+    defer bridge.deinit();
+    try std.testing.expect(bridge.isStarted());
+    try std.testing.expectEqualStrings(endpoint, bridge.endpoint_path);
 }
 
 test "mux session bridge exchanges screen checkpoints and input" {

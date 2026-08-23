@@ -71,7 +71,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .details = &.{
             "Hosts one fx child terminal per session with a minimal sidebar.",
             "Pass a saved session id to select it on startup.",
-            "Use ctrl+h/l to focus, ctrl+j/k to switch, ctrl+n to create, ctrl+delete to archive, and ctrl+q to quit.",
+            "Use ctrl+g/l to focus, ctrl+j/k to switch, ctrl+n to create, ctrl+delete to archive, and ctrl+q to quit.",
         },
     },
     .{
@@ -429,6 +429,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .new_session, .command = "/new", .help_entry = "/new", .completion_description = "start a fresh session", .presentation_category = .session, .show_in_welcome = true },
     .{ .kind = .reset_session, .command = "/reset", .help_entry = "/reset", .completion_description = "reset the current session context", .presentation_category = .session },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
+    .{ .kind = .mux, .command = "/mux", .help_entry = "/mux", .completion_description = "hand the terminal to the mux session cockpit", .presentation_category = .session, .show_in_welcome = true },
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose Vercel or Codex sign-in", .presentation_category = .account },
@@ -530,6 +531,7 @@ test "built-in slash commands register exact active order" {
         "/new",
         "/reset",
         "/resume",
+        "/mux",
         "/continue",
         "/rename",
         "/login",
