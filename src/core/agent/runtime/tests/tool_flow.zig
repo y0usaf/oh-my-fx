@@ -1122,6 +1122,63 @@ test "terminal lifecycle resolves one display target before execution" {
     try std.testing.expectEqualStrings("npm run dev", hooks.tool_display_target.?);
 }
 
+test "processQueuedPrompt keeps sampled root mode through permission and execution" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall(
+        "sampled_mode_read",
+        "read_file",
+        "{\"path\":\"README.md\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.root_permission_mode = .auto;
+    const PermissionFixture = struct {
+        hooks: *FakeAgentRuntimeDeps,
+
+        fn request(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            _: ToolCall,
+            _: permission_auto_classifier.ReviewTurnContext,
+            permission_mode: types.PermissionMode,
+            _: []const PermissionGrant,
+            _: ?runtime_tool_contracts.LiveToolAuthority,
+            _: ?runtime_tool_contracts.LivePermissionRevalidation,
+            _: []const []const u8,
+        ) !command_admission.PermissionOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(types.PermissionMode.auto, permission_mode);
+            self.hooks.root_permission_mode = .ask;
+            return .{
+                .decision = .once,
+                .execution_authority = .ordinary,
+            };
+        }
+    };
+    var permission_fixture = PermissionFixture{ .hooks = &hooks };
+    hooks.permission_request_override = .{
+        .context = &permission_fixture,
+        .request_fn = PermissionFixture.request,
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(types.PermissionMode.ask, hooks.root_permission_mode.?);
+    try std.testing.expectEqual(
+        @as(?types.PermissionMode, .auto),
+        hooks.last_execute_permission_mode,
+    );
+}
+
 test "automatic review does not reposition deferred web fetch lifecycle" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "web_fetch", "{\"url\":\"https://example.com\"}")};

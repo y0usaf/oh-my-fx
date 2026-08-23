@@ -177,9 +177,7 @@ pub fn Runtime(comptime App: type) type {
                     .mode = snapshot.mode,
                 }
             else
-                app.worker.effectivePermissionSnapshot(
-                    app_permission_runtime.Runtime(App).livePermissionSnapshot(app),
-                );
+                app_permission_runtime.Runtime(App).livePermissionSnapshot(app);
             const permission_grants = if (authority) |snapshot|
                 snapshot.grants
             else
@@ -777,9 +775,7 @@ pub fn Runtime(comptime App: type) type {
             _ = max_command_output_bytes;
             _ = gateway_retry_count;
             _ = gateway_chat_url;
-            const permission_snapshot = app.worker.effectivePermissionSnapshot(
-                app_permission_runtime.Runtime(App).livePermissionSnapshot(app),
-            );
+            const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app);
             const host_workspace = appHostWorkspaceInfo(app);
             const workspace_root = if (host_workspace) |info|
                 info.root()
@@ -867,10 +863,6 @@ pub fn Runtime(comptime App: type) type {
             defer app.worker.active_context_snapshot = null;
             app.worker.setActiveAgentTurnSettings(job.agent_settings);
             defer app.worker.clearActiveAgentTurnSettings();
-            app.worker.setActivePermissionSnapshot(.{
-                .mode = job.permission_mode,
-            });
-            defer app.worker.clearActivePermissionSnapshot();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
             defer preflight_context_notices.deinit();
             var postflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
@@ -1951,7 +1943,7 @@ test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
     try std.testing.expect(ctx.permission_reviewer_provider == null);
 }
 
-test "app agent runtime tool context prefers active queued turn settings" {
+test "app agent runtime tool context combines active settings with live permission mode" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc);
     defer app.deinit();
@@ -1971,11 +1963,7 @@ test "app agent runtime tool context prefers active queued turn settings" {
         .effort = types.ReasoningEffort.literal("high"),
     });
     defer app.worker.clearActiveAgentTurnSettings();
-    app.permission_engine.mode = .ask;
-    app.worker.setActivePermissionSnapshot(.{
-        .mode = .auto,
-    });
-    defer app.worker.clearActivePermissionSnapshot();
+    app.permission_engine.mode = .auto;
 
     const ctx = testToolContext(&app);
 
@@ -2368,10 +2356,7 @@ test "app agent runtime appends static and transient context through configured 
     const arena = arena_state.allocator();
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
-    app.worker.setActivePermissionSnapshot(.{
-        .mode = .auto,
-    });
-    defer app.worker.clearActivePermissionSnapshot();
+    app.permission_engine.mode = .auto;
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
@@ -2557,10 +2542,6 @@ test "app agent runtime clears active turn settings when queued prompt setup fai
     const effective = app.worker.effectiveAgentTurnSettings();
     try std.testing.expect(!effective.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), effective.effort);
-    const permission_snapshot = app.worker.effectivePermissionSnapshot(.{
-        .mode = .ask,
-    });
-    try std.testing.expectEqual(PermissionMode.ask, permission_snapshot.mode);
 }
 
 test "subagent tool projection uses immutable admission permission rules" {

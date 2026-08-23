@@ -509,7 +509,6 @@ pub const WorkerRuntime = struct {
     pending_question_response: QuestionResponse = .pending,
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
-    active_permission_snapshot: ?PermissionSnapshot = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
 
@@ -1206,24 +1205,6 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         return self.active_agent_turn_settings orelse self.agent_turn_settings;
-    }
-
-    pub fn setActivePermissionSnapshot(self: *WorkerRuntime, snapshot: PermissionSnapshot) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        self.active_permission_snapshot = snapshot;
-    }
-
-    pub fn clearActivePermissionSnapshot(self: *WorkerRuntime) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        self.active_permission_snapshot = null;
-    }
-
-    pub fn effectivePermissionSnapshot(self: *WorkerRuntime, fallback: PermissionSnapshot) PermissionSnapshot {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        return self.active_permission_snapshot orelse fallback;
     }
 
     pub fn syncQueuedPromptPermissionState(self: *WorkerRuntime, alloc: std.mem.Allocator, grants: []const types.PermissionGrant, snapshot: PermissionSnapshot) !void {
@@ -4081,26 +4062,7 @@ test "effectiveAgentTurnSettings prefers active turn settings until cleared" {
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), fallback.effort);
 }
 
-test "effective permission snapshot keeps a held turn mode until cleared" {
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(std.testing.allocator);
-
-    runtime.setActivePermissionSnapshot(.{
-        .mode = .auto,
-    });
-    const active = runtime.effectivePermissionSnapshot(.{
-        .mode = .ask,
-    });
-    try std.testing.expectEqual(types.PermissionMode.auto, active.mode);
-
-    runtime.clearActivePermissionSnapshot();
-    const next = runtime.effectivePermissionSnapshot(.{
-        .mode = .ask,
-    });
-    try std.testing.expectEqual(types.PermissionMode.ask, next.mode);
-}
-
-test "queued permission mode updates from ask to auto without rewriting held turn" {
+test "queued permission mode updates without mutating dequeued fallback" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);

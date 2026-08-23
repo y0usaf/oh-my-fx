@@ -355,6 +355,9 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
+    if (request.permission_mode) |permission_mode| {
+        execution_ctx.permission_mode = permission_mode;
+    }
     if (request.live_authority) |authority| {
         if (!containsName(authority.tools, request.call.name) and
             !containsName(authority.integrations, request.call.name))
