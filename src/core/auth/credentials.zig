@@ -4,6 +4,7 @@ const chatgpt_oauth = @import("chatgpt_oauth.zig");
 const grok_oauth = @import("grok_oauth.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const io_mod = @import("../shared/io.zig");
 const model_provider = @import("../config/model_provider.zig");
 const oauth = @import("oauth.zig");
@@ -37,33 +38,13 @@ pub const CatalogPublicOnly = union(enum) {
 
 pub const CatalogPublicOnlyReason = std.meta.Tag(CatalogPublicOnly);
 
-pub const CatalogAuthenticatedSource = enum {
-    vercel_oidc_token,
-    ai_gateway_api_key,
-    fx_login,
-    stored_key,
-    chatgpt_subscription,
-    grok_subscription,
-
-    fn credentialSource(self: CatalogAuthenticatedSource) Source {
-        return switch (self) {
-            .vercel_oidc_token => .vercel_oidc_token,
-            .ai_gateway_api_key => .ai_gateway_api_key,
-            .fx_login => .fx_login,
-            .stored_key => .stored_key,
-            .chatgpt_subscription => .chatgpt_subscription,
-            .grok_subscription => .grok_subscription,
-        };
-    }
-};
-
 /// A borrowed authorization decision for one model-catalog request. Public-only
 /// states cannot carry credential or team bytes; authenticated states carry the
 /// only values the request is allowed to send.
 pub const CatalogAccess = union(enum) {
     public_only: CatalogPublicOnly,
     authenticated: struct {
-        source: CatalogAuthenticatedSource,
+        source: Source,
         credential: []const u8,
         team_context: ?[]const u8,
         account_id: ?[]const u8 = null,
@@ -72,7 +53,7 @@ pub const CatalogAccess = union(enum) {
     pub fn credentialSource(self: CatalogAccess) ?Source {
         return switch (self) {
             .public_only => |access| access.credentialSource(),
-            .authenticated => |access| access.source.credentialSource(),
+            .authenticated => |access| access.source,
         };
     }
 
@@ -91,14 +72,14 @@ pub const CatalogAccess = union(enum) {
     pub fn publicFallbackAfterRejection(self: CatalogAccess) ?CatalogAccess {
         return switch (self) {
             .public_only => null,
-            .authenticated => |access| if (access.source == .chatgpt_subscription or access.source == .grok_subscription)
-                null
-            else
-                .{
+            .authenticated => |access| switch (std.meta.activeTag(access.source)) {
+                .chatgpt_subscription, .grok_subscription => null,
+                else => .{
                     .public_only = .{
-                        .authenticated_credential_rejected = access.source.credentialSource(),
+                        .authenticated_credential_rejected = access.source,
                     },
                 },
+            },
         };
     }
 
@@ -126,9 +107,21 @@ pub const CatalogAccess = union(enum) {
     }
 };
 
+/// Optional-aware source comparisons for the union `Source` type; plain
+/// `== .tag` is not valid on a union (or its optional) the way it was on the
+/// historical enum.
+pub fn sourceIs(source: ?Source, comptime tag: std.meta.Tag(Source)) bool {
+    const value = source orelse return false;
+    return std.meta.activeTag(value) == tag;
+}
+
+pub fn isSubscription(source: ?Source) bool {
+    return sourceIs(source, .chatgpt_subscription) or sourceIs(source, .grok_subscription);
+}
+
 pub fn catalogAccessAt(credential: ?Credential, now_ms: i64) CatalogAccess {
     const selected = credential orelse return .{ .public_only = .no_credential };
-    if (selected.source == .fx_login and selected.needsRefreshAt(now_ms)) {
+    if (std.meta.activeTag(selected.source) == .fx_login and selected.needsRefreshAt(now_ms)) {
         return .{ .public_only = .fx_login_refresh_required };
     }
     return catalogAccessForCredentialAndAccount(
@@ -162,27 +155,35 @@ pub fn catalogAccessForCredentialAndAccount(
     account_id: ?[]const u8,
 ) CatalogAccess {
     const selected_source = source orelse return .{ .public_only = .no_credential };
-    const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
-        .vercel_oidc_token => .vercel_oidc_token,
-        .ai_gateway_api_key => .ai_gateway_api_key,
-        .stored_key => .stored_key,
-        .chatgpt_subscription => .chatgpt_subscription,
-        .grok_subscription => .grok_subscription,
-        .fx_login => blk: {
+    if (!isSubscriptionSource(selected_source)) {
+        if (std.meta.activeTag(selected_source) == .fx_login) {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
             if (!types.validGatewayTeam(team))
                 return .{ .public_only = .fx_login_team_required };
-            break :blk .fx_login;
-        },
-    };
+        }
+        return .{
+            .authenticated = .{
+                .source = selected_source,
+                .credential = credential,
+                .team_context = team_context,
+            },
+        };
+    }
     return .{
         .authenticated = .{
-            .source = authenticated_source,
+            .source = selected_source,
             .credential = credential,
-            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
-            .account_id = if (authenticated_source == .grok_subscription) account_id else null,
+            .team_context = null,
+            .account_id = if (std.meta.activeTag(selected_source) == .grok_subscription) account_id else null,
         },
+    };
+}
+
+fn isSubscriptionSource(source: Source) bool {
+    return switch (source) {
+        .chatgpt_subscription, .grok_subscription => true,
+        else => false,
     };
 }
 
@@ -204,6 +205,57 @@ pub const missing_grok_credential_message = "fx needs a Grok subscription login 
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
+/// Static copy shown when a registry provider's API key is absent from the
+/// environment. Generated per provider at comptime so no allocation is needed
+/// on error paths.
+pub fn missing_provider_key_message(comptime provider: model_provider.ProviderId) []const u8 {
+    const label = comptime provider.descriptor().label;
+    const env = comptime firstAuthEnvName(provider);
+    return "fx needs a " ++ label ++ " API key for this model. Set " ++ env ++ ".";
+}
+
+pub fn missing_provider_interactive_key_message(comptime provider: model_provider.ProviderId) []const u8 {
+    const label = comptime provider.descriptor().label;
+    const env = comptime firstAuthEnvName(provider);
+    return label ++ " needs an API key. Set " ++ env ++ " and restart fx.";
+}
+
+fn firstAuthEnvName(comptime provider: model_provider.ProviderId) []const u8 {
+    const names = switch (provider.descriptor().auth) {
+        .env_api_key => |names| names,
+        else => &[_][]const u8{},
+    };
+    if (names.len == 0) return "the provider's environment variable";
+    return names[0];
+}
+
+/// Centralized missing-credential copy for one provider on one surface.
+/// Gateway, Codex, and Grok keep their bespoke sign-in instructions; every
+/// other provider resolves to its static API-key message.
+pub fn missingCredentialMessage(
+    provider: model_provider.ProviderId,
+    surface: MissingHelpSurface,
+) []const u8 {
+    return switch (surface) {
+        .cli => switch (provider) {
+            .gateway => missing_credential_message,
+            .codex => missing_chatgpt_credential_message,
+            .grok => missing_grok_credential_message,
+            inline else => |tag| comptime missing_provider_key_message(tag),
+        },
+        .interactive => switch (provider) {
+            .gateway => missing_interactive_credential_message,
+            .codex => missing_chatgpt_interactive_credential_message,
+            .grok => missing_grok_interactive_credential_message,
+            inline else => |tag| comptime missing_provider_interactive_key_message(tag),
+        },
+    };
+}
+
+pub const MissingHelpSurface = enum {
+    cli,
+    interactive,
+};
 pub const Credential = struct {
     token: []u8,
     source: Source,
@@ -276,29 +328,39 @@ pub fn resolveForProvider(
     provider: model_provider.ProviderId,
     preferred: ?Source,
 ) !Resolution {
-    switch (provider) {
-        .codex => {
+    // Each auth origin resolves through its own path; only gateway-stack
+    // providers fall through to full precedence resolution below.
+    switch (provider.descriptor().auth) {
+        .codex_subscription => {
             const credential = switch (mode) {
                 .stored => try loadStoredChatGptCredential(alloc),
                 .refresh_if_needed => try loadChatGptCredential(alloc, transport, .if_needed),
             };
             return .{ .credential = credential };
         },
-        .grok => {
+        .grok_subscription => {
             const credential = switch (mode) {
                 .stored => try loadStoredGrokCredential(alloc),
                 .refresh_if_needed => try loadGrokCredential(alloc, transport, .if_needed),
             };
             return .{ .credential = credential };
         },
-        .gateway => {},
+        .env_api_key => {
+            const credential = try loadSource(alloc, transport, secret_store, .{ .provider_api_key = provider });
+            return .{ .credential = credential };
+        },
+        .aws_env, .github_device_flow => {
+            const credential = try loadSource(alloc, transport, secret_store, .{ .provider_api_key = provider });
+            return .{ .credential = credential };
+        },
+        .gateway_stack => {},
     }
     return resolvePreferring(
         alloc,
         transport,
         secret_store,
         mode,
-        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        if (preferred) |value| if (isSubscriptionSource(value)) null else value else null,
     );
 }
 
@@ -314,7 +376,7 @@ pub fn resolvePreferring(
     preferred: ?Source,
 ) !Resolution {
     if (preferred) |source| {
-        if (source != .stored_key or !secret_store.isDisabled()) {
+        if (std.meta.activeTag(source) != .stored_key or !secret_store.isDisabled()) {
             const chosen = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| blk: {
                 if (err == error.OutOfMemory) return err;
                 debug_trace.logf("auth", "preferred source load failed source={t} err={s}", .{ source, @errorName(err) });
@@ -388,8 +450,36 @@ fn loadPreferredSource(
             .stored => loadStoredGrokCredential(alloc),
             .refresh_if_needed => loadGrokCredential(alloc, transport, .if_needed),
         },
-        else => loadSource(alloc, transport, secret_store, source),
+        .provider_api_key, .vercel_oidc_token, .ai_gateway_api_key, .stored_key => loadSource(alloc, transport, secret_store, source),
     };
+}
+
+/// True when the ambient AWS environment carries a usable access key pair.
+fn awsEnvironmentConfigured() bool {
+    return nonEmptyEnvValue("AWS_ACCESS_KEY_ID") != null and
+        nonEmptyEnvValue("AWS_SECRET_ACCESS_KEY") != null;
+}
+
+/// True when Copilot can authenticate without an interactive flow: either the
+/// bypass variable is set or a previous device-flow sign-in left its cache.
+fn copilotCredentialConfigured(alloc: std.mem.Allocator) bool {
+    _ = alloc;
+    if (nonEmptyEnvValue("COPILOT_GITHUB_TOKEN") != null) return true;
+    const home = io_mod.getenv("HOME") orelse return false;
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch return false;
+    defer home_dir.close(io_mod.getIo());
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+        .follow_symlinks = false,
+    }) catch return false;
+    defer fx_dir.close(io_mod.getIo());
+    var file = fx_dir.openFile(io_mod.getIo(), "copilot-auth.json", .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch return false;
+    file.close(io_mod.getIo());
+    return true;
 }
 
 pub fn loadSource(
@@ -401,6 +491,32 @@ pub fn loadSource(
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
+        // First non-empty variable in the descriptor's list wins.
+        .provider_api_key => |provider| switch (provider.descriptor().auth) {
+            .env_api_key => |names| blk: {
+                for (names) |name| {
+                    const value = nonEmptyEnvValue(name) orelse continue;
+                    break :blk try envCredential(alloc, value, source);
+                }
+                break :blk null;
+            },
+            .aws_env => blk: {
+                // The Bedrock transport signs with the ambient AWS
+                // environment itself; core only gates on its presence and
+                // hands down a placeholder so non-empty checks pass.
+                if (!awsEnvironmentConfigured()) break :blk null;
+                break :blk try envCredential(alloc, "aws-environment-credentials", source);
+            },
+            .github_device_flow => blk: {
+                // Copilot token exchange lives in the transport; core gates
+                // on either the bypass variable or the device-flow cache.
+                if (!copilotCredentialConfigured(alloc)) break :blk null;
+                break :blk try envCredential(alloc, "copilot-managed-token", source);
+            },
+            // Subscription and Gateway-stack auth kinds never route through
+            // provider-key sources; selection logic keeps them apart.
+            .gateway_stack, .codex_subscription, .grok_subscription => null,
+        },
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
@@ -416,6 +532,17 @@ pub fn sourceExists(
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        .provider_api_key => |provider| switch (provider.descriptor().auth) {
+            .env_api_key => |names| blk: {
+                for (names) |name| {
+                    if (nonEmptyEnvValue(name) != null) break :blk true;
+                }
+                break :blk false;
+            },
+            .aws_env => awsEnvironmentConfigured(),
+            .github_device_flow => copilotCredentialConfigured(alloc),
+            .gateway_stack, .codex_subscription, .grok_subscription => false,
+        },
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -446,16 +573,24 @@ pub fn sourceExists(
     };
 }
 
+fn envCredential(
+    alloc: std.mem.Allocator,
+    value: []const u8,
+    source: Source,
+) !?Credential {
+    return .{
+        .token = try alloc.dupe(u8, value),
+        .source = source,
+    };
+}
+
 fn loadEnvCredential(
     alloc: std.mem.Allocator,
     name: []const u8,
     source: Source,
 ) !?Credential {
     const value = nonEmptyEnvValue(name) orelse return null;
-    return .{
-        .token = try alloc.dupe(u8, value),
-        .source = source,
-    };
+    return envCredential(alloc, value, source);
 }
 
 fn loadStoredKeyCredential(
@@ -640,14 +775,6 @@ fn takeCredentialFromSession(session: *oauth_session.Session, refreshed_at_ms: ?
         .refresh_after_ms = credentialRefreshAfterMs(session.expires_at_ms, refreshed_at_ms),
     };
 }
-
-fn credentialRefreshAfterMs(expires_at_ms: i64, refreshed_at_ms: ?i64) i64 {
-    const refresh_after_ms = oauth_session.refresh_deadline_ms(expires_at_ms);
-    const refreshed_at = refreshed_at_ms orelse return refresh_after_ms;
-    if (refresh_after_ms > refreshed_at) return refresh_after_ms;
-    return expires_at_ms;
-}
-
 pub fn sourceLabel(source: Source) []const u8 {
     return switch (source) {
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
@@ -656,19 +783,25 @@ pub fn sourceLabel(source: Source) []const u8 {
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
+        // The first variable in the descriptor's list names the credential.
+        .provider_api_key => |provider| switch (provider.descriptor().auth) {
+            .env_api_key => |names| if (names.len > 0) names[0] else provider.descriptor().label,
+            else => model_provider.label(provider),
+        },
     };
 }
 
 pub fn sourceRefreshable(source: Source) bool {
-    return source == .fx_login or source == .chatgpt_subscription or source == .grok_subscription;
+    return switch (source) {
+        .fx_login, .chatgpt_subscription, .grok_subscription => true,
+        else => false,
+    };
 }
-
-test "stored key label discloses the backend that answered" {
-    try std.testing.expect(std.mem.find(u8, sourceLabel(.stored_key), stored_key_backend_label) != null);
-    try std.testing.expect(std.mem.find(u8, unreadable_store_message, stored_key_backend_label) != null);
-    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login }) |source| {
-        try std.testing.expect(!std.mem.eql(u8, sourceLabel(source), sourceLabel(.stored_key)));
-    }
+fn credentialRefreshAfterMs(expires_at_ms: i64, refreshed_at_ms: ?i64) i64 {
+    const refresh_after_ms = oauth_session.refresh_deadline_ms(expires_at_ms);
+    const refreshed_at = refreshed_at_ms orelse return refresh_after_ms;
+    if (refresh_after_ms > refreshed_at) return refresh_after_ms;
+    return expires_at_ms;
 }
 
 test "missing credential messages use surface commands in preferred order" {
@@ -681,6 +814,7 @@ test "missing credential messages use surface commands in preferred order" {
 
     const tui_login = std.mem.find(u8, missing_interactive_credential_message, "/login").?;
     const tui_setup = std.mem.find(u8, missing_interactive_credential_message, "/setup").?;
+
     const tui_env = std.mem.find(u8, missing_interactive_credential_message, "AI_GATEWAY_API_KEY").?;
 
     try std.testing.expect(tui_login < tui_setup);

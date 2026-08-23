@@ -58,7 +58,7 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
-    if (input.access.credentialSource() != .grok_subscription) {
+    if (!credentials.sourceIs(input.access.credentialSource(), .grok_subscription)) {
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
     }
     const credential = input.access.authorizationCredential() orelse

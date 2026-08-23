@@ -1,5 +1,6 @@
 const std = @import("std");
 const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
+const credentials = @import("../core/auth/credentials.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -58,7 +59,7 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
-    if (input.access.credentialSource() != .chatgpt_subscription) {
+    if (!credentials.sourceIs(input.access.credentialSource(), .chatgpt_subscription)) {
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
     }
     const credential = input.access.authorizationCredential() orelse
