@@ -1122,7 +1122,7 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             var wrote = false;
             if (payload.provider) |provider| {
                 try writer.writeAll("\"provider\":");
-                try writeJsonString(writer, @tagName(provider));
+                try writeJsonString(writer, model_provider.providerSlug(provider));
                 wrote = true;
             }
             if (payload.model) |model| {
@@ -1474,7 +1474,7 @@ fn writePreferences(
     try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
-    try writeJsonString(writer, @tagName(preferences.provider));
+    try writeJsonString(writer, model_provider.providerSlug(preferences.provider));
     try writer.writeByte('}');
 }
 

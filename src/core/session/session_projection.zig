@@ -461,7 +461,7 @@ fn writePreferences(
     try writer.print(",\"fast_mode\":{s},\"provider\":", .{
         if (preferences.fast_mode) "true" else "false",
     });
-    try writeJsonString(writer, @tagName(preferences.provider));
+    try writeJsonString(writer, model_provider.providerSlug(preferences.provider));
     try writer.writeByte('}');
 }
 
