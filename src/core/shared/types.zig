@@ -86,25 +86,68 @@ test "context notice body drops legacy markers from every line" {
 
     try std.testing.expectEqualStrings("first\nsecond\nalready semantic\n\n", body);
 }
-
-pub const CredentialSource = enum {
+pub const CredentialSource = union(enum) {
+    /// API-key origin owned by one registry provider (`openrouter`,
+    /// `deepseek`, ...). The payload is the provider whose endpoint may
+    /// receive the credential.
+    provider_api_key: @import("../config/model_provider.zig").ProviderId,
     vercel_oidc_token,
     ai_gateway_api_key,
     fx_login,
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+
+    /// Stable name used in settings files and session records. Provider keys
+    /// persist as `<provider-slug>_api_key` so pre-union records such as
+    /// `openrouter_api_key` keep parsing forever.
+    ///
+    /// Exact equality including the provider payload.
+    pub fn eql(self: CredentialSource, other: CredentialSource) bool {
+        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
+        return switch (self) {
+            .provider_api_key => |provider| provider == other.provider_api_key,
+            else => true,
+        };
+    }
+    pub fn persistedName(self: CredentialSource) []const u8 {
+        return switch (self) {
+            .provider_api_key => |provider| switch (provider) {
+                inline else => |ptag| comptime @import("../config/model_provider.zig").providerSlug(ptag) ++ "_api_key",
+            },
+            else => @tagName(std.meta.activeTag(self)),
+        };
+    }
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
-    return std.meta.stringToEnum(CredentialSource, text);
+    const provider_mod = @import("../config/model_provider.zig");
+    inline for (@typeInfo(CredentialSource).@"union".fields) |field| {
+        if (field.type == void and std.mem.eql(u8, field.name, text)) {
+            return @unionInit(CredentialSource, field.name, {});
+        }
+    }
+    const suffix = "_api_key";
+    if (!std.mem.endsWith(u8, text, suffix)) return null;
+    const slug = text[0 .. text.len - suffix.len];
+    return .{ .provider_api_key = provider_mod.parse(slug) orelse return null };
 }
 
 test "credential source round trips through its persisted name" {
-    for (std.meta.tags(CredentialSource)) |source| {
-        try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
+    inline for (@typeInfo(CredentialSource).@"union".fields) |field| {
+        if (field.type == void) {
+            const source: CredentialSource = @unionInit(CredentialSource, field.name, {});
+            try std.testing.expectEqualStrings(field.name, source.persistedName());
+            try std.testing.expectEqual(source, parseCredentialSource(field.name).?);
+        }
     }
+    const openrouter: CredentialSource = .{ .provider_api_key = .openrouter };
+    try std.testing.expectEqualStrings("openrouter_api_key", openrouter.persistedName());
+    try std.testing.expectEqual(openrouter, parseCredentialSource("openrouter_api_key").?);
+    const vertex: CredentialSource = .{ .provider_api_key = .google_vertex };
+    try std.testing.expectEqual(vertex, parseCredentialSource("google-vertex_api_key").?);
     try std.testing.expect(parseCredentialSource("keychain") == null);
+    try std.testing.expect(parseCredentialSource("unknown_provider_api_key") == null);
 }
 
 pub const TurnPresentationOutcome = enum {
