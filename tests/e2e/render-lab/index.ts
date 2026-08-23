@@ -105,8 +105,7 @@ function permissionDecisionResponse(): Response {
       toolName: "permission_decision",
       input: {
         risk: "low",
-        authorization: "medium",
-        decision: "allow",
+        decision: "clear",
         rationale: "deterministic render-lab decision",
       },
     },

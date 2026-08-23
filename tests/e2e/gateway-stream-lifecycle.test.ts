@@ -141,7 +141,7 @@ function sse(body: string): Response {
 
 function startGateway(
   response: () => Response,
-  classifierDecision: "allow" | "ask" = "allow",
+  classifierDecision: "clear" | "caution" = "clear",
 ): GatewayFixture {
   return startDynamicFakeGateway(response, {
     classifierDecision,
@@ -3635,7 +3635,7 @@ describe("gateway stream lifecycle", () => {
       requestIndex += 1;
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -3793,7 +3793,7 @@ describe("gateway stream lifecycle", () => {
         },
       });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -3885,7 +3885,7 @@ describe("gateway stream lifecycle", () => {
         },
       });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -4291,7 +4291,7 @@ describe("gateway stream lifecycle", () => {
       }
       return new Response("unexpected matrix request", { status: 500 });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
 
@@ -4392,8 +4392,8 @@ describe("gateway stream lifecycle", () => {
     }
   }, 90_000);
 
-  test("selected dynamic MCP automatic review asks with zero sends and allows exactly once", async () => {
-    for (const decision of ["ask", "allow"] as const) {
+  test("selected dynamic MCP review cautions with zero sends and clears exactly once", async () => {
+    for (const decision of ["caution", "clear"] as const) {
       const root = createFixtureRoot(`mcp-review-${decision}`);
       const tracePath = join(root.root, "trace.log");
       const mcp = writeMcpFixture(root);
@@ -4433,29 +4433,29 @@ describe("gateway stream lifecycle", () => {
         expect(gateway.classifierRequests[0]!.body).toContain(DYNAMIC_MCP_TOOL_NAME);
         expect(gateway.classifierRequests[0]!.body).toContain("exact-");
         expect(gateway.classifierRequests[0]!.body).toContain("inputSchema");
-        if (decision === "ask") {
-          // Headless automatic review returns a recoverable denial to the
+        if (decision === "caution") {
+          // Headless automatic review returns caution advice to the
           // primary model without executing the MCP tool or asking the user.
           expect(result.code).toBe(0);
           expect(gateway.requests).toHaveLength(3);
-          expect(gateway.requests[2]!.body).toContain("tool_permission_denied");
-          expect(gateway.requests[2]!.body).toContain("auto_denied");
+          expect(gateway.requests[2]!.body).toContain("tool_review_held");
+          expect(gateway.requests[2]!.body).toContain("review_caution");
           expect(gateway.requests[2]!.body).not.toContain("user_denied");
           const json = parseAskJson(result.stdout);
-          expect(json.output).toContain("MCP ask handled.");
+          expect(json.output).toContain("MCP caution handled.");
           expect(json.tool_calls).toContainEqual({
             name: DYNAMIC_MCP_TOOL_NAME,
             status: "error",
           });
           expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
           expect(trace).toContain("event=auto_review_result");
-          expect(trace).toContain("decision=ask");
+          expect(trace).toContain("decision=caution");
           expect(trace).not.toContain("err=NonInteractivePermissionRequired");
           expect(existsSync(mcp.callLogPath)).toBe(false);
         } else {
           expect(result.code).toBe(0);
           const json = parseAskJson(result.stdout);
-          expect(trace).toContain("decision=allow");
+          expect(trace).toContain("decision=clear");
           expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);
           expect(json.tool_calls).toContainEqual({
             name: DYNAMIC_MCP_TOOL_NAME,

@@ -114,7 +114,7 @@ type GatewayRequest = {
 };
 
 type GatewayResponse = Response | (() => Response | Promise<Response>);
-type ClassifierDecision = (body: string) => "allow" | "ask";
+type ClassifierDecision = (body: string) => "clear" | "caution";
 
 type IsolatedRoot = {
   root: string;
@@ -336,7 +336,7 @@ function controlledGatewayResponse(response: Response) {
 
 function startFakeGateway(
   responses: GatewayResponse[],
-  classifierDecision: ClassifierDecision = () => "allow",
+  classifierDecision: ClassifierDecision = () => "clear",
 ) {
   const requests: GatewayRequest[] = [];
   const classifierRequests: GatewayRequest[] = [];
@@ -418,7 +418,7 @@ async function launchScenario(
   traceScopes = "input",
   env: Record<string, string | undefined> = {},
   permissionMode: "ask" | "auto" = "ask",
-  classifierDecision: ClassifierDecision = () => "allow",
+  classifierDecision: ClassifierDecision = () => "clear",
   permission: Record<string, unknown> = {},
 ) {
   const root = createIsolatedRoot(permissionMode, permission);
@@ -1476,7 +1476,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           FX_RECORD_INPUT: "1",
         },
         "ask",
-        () => "allow",
+        () => "clear",
       );
       await ctx.session.resizeWindow(120, 36);
 

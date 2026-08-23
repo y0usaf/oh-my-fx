@@ -307,7 +307,7 @@ fn validStream(alloc: Allocator) !gateway_client.StreamResult {
     errdefer alloc.free(name);
     const arguments = try alloc.dupe(
         u8,
-        "{\"risk\":\"low\",\"authorization\":\"medium\",\"decision\":\"allow\",\"rationale\":\"Narrow authorized action.\"}",
+        "{\"risk\":\"low\",\"decision\":\"clear\",\"rationale\":\"Narrow authorized action.\"}",
     );
     errdefer alloc.free(arguments);
     const tool_calls = try alloc.alloc(types.ToolCall, 1);
@@ -347,7 +347,6 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
         }},
     };
     return .{
-        .workspace_root = "/tmp/workspace",
         .review_turn = .{
             .model = "openai/gpt-5",
             .pending_assistant = pending,
@@ -360,7 +359,6 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
             .tool_name = "list_files",
             .arguments_json = "{\"path\":\".\"}",
         } },
-        .escalation_reason = "No deterministic rule settled the call.",
     };
 }
 
@@ -381,7 +379,7 @@ test "gateway automatic reviewer transport is single-attempt" {
     defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
-        .valid => |result| try std.testing.expectEqual(permission_auto_classifier.Decision.allow, result.decision),
+        .valid => |result| try std.testing.expectEqual(permission_auto_classifier.Decision.clear, result.decision),
         .invalid => return error.TestExpectedEqual,
     }
     try std.testing.expectEqual(@as(usize, 1), fake.calls);

@@ -3888,6 +3888,7 @@ test {
     _ = @import("core/config/model_capabilities.zig");
     _ = @import("core/output/output_contracts.zig");
     _ = @import("core/workspace/pathing.zig");
+    _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
     _ = @import("core/background/process_supervisor.zig");
@@ -3951,6 +3952,7 @@ test {
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/modes.zig");
     _ = @import("builtins/tools.zig");
+    _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("builtins/browser_workspace_tools.zig");
     _ = @import("core/tooling/model_request_budget.zig");
     _ = @import("core/tooling/web_fetch_runtime.zig");

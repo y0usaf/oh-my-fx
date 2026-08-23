@@ -3319,9 +3319,8 @@ fn unexpectedTestPrompt(
 
 const TestAutoReview = struct {
     calls: usize = 0,
-    decision: permission_auto_classifier.Decision = .allow,
+    decision: permission_auto_classifier.Decision = .clear,
     risk: permission_auto_classifier.Risk = .low,
-    authorization: permission_auto_classifier.Authorization = .medium,
     rationale: []const u8 = "test automatic review",
     action_tag: ?std.meta.Tag(permission_auto_classifier.Action) = null,
     exact_command: ?[]const u8 = null,
@@ -3330,7 +3329,6 @@ const TestAutoReview = struct {
     file_additions: usize = 0,
     file_deletions: usize = 0,
     file_review_rows: usize = 0,
-    escalation_reason: ?[]const u8 = null,
     target_path: ?[]const u8 = null,
 
     fn review(
@@ -3339,11 +3337,7 @@ const TestAutoReview = struct {
         request: permission_auto_classifier.ReviewRequest,
     ) anyerror!permission_auto_classifier.ParseOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-        if (request.workspace_root.len == 0 or request.escalation_reason.len == 0) {
-            return error.TestExpectedReviewContext;
-        }
         self.calls += 1;
-        self.escalation_reason = request.escalation_reason;
         self.target_path = if (request.targets.len > 0)
             request.targets[0].path
         else
@@ -3363,7 +3357,6 @@ const TestAutoReview = struct {
         }
         return .{ .valid = .{
             .risk = self.risk,
-            .authorization = self.authorization,
             .decision = self.decision,
             .rationale = try alloc.dupe(u8, self.rationale),
         } };
@@ -5557,7 +5550,6 @@ test "request tool permission combines configured external copy target with work
         .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"../external/copied.txt\"}",
     }, .auto, &.{})).decision);
     try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
-    try std.testing.expectEqualStrings("tool_requires_approval", reviewer.escalation_reason.?);
     try std.testing.expect(rt.worker.pending_permission_request_shared == null);
 }
 
@@ -5596,7 +5588,7 @@ test "disabled automatic reviewer returns a recoverable denial without a human p
         .arguments_json = args,
     }, .auto, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, outcome.denial_reason.?);
     try std.testing.expect(outcome.requirement == null);
     try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expect(outcome.auto_review_result == null);
