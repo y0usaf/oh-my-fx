@@ -12,6 +12,9 @@ zig-out/
 zig-pkg/
 sdk/dist/
 
+# Nix build output
+/result
+
 # Workspace-local runtime state
 /skills/
 
