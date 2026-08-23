@@ -1381,7 +1381,7 @@ describe("modern MCP Streamable HTTP", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       tui = await TmuxSession.create({

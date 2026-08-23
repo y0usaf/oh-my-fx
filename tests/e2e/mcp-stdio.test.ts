@@ -598,7 +598,7 @@ describe("modern MCP stdio compatibility", () => {
       }
       return fakeGatewayFinalText("unexpected scoped MCP child request");
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     gateway = activeGateway;
@@ -667,7 +667,7 @@ describe("modern MCP stdio compatibility", () => {
         }
         return fakeGatewayFinalText("unexpected feature-only child request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
@@ -765,7 +765,7 @@ describe("modern MCP stdio compatibility", () => {
         }
         return fakeGatewayFinalText("unexpected disabled MCP child request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
@@ -874,7 +874,7 @@ describe("modern MCP stdio compatibility", () => {
         }
         return fakeGatewayFinalText("unexpected scoped refresh request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
@@ -4311,7 +4311,7 @@ describe("modern MCP stdio compatibility", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;

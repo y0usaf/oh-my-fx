@@ -24,7 +24,6 @@ fn setIoTimeouts(fd: std.posix.fd_t) void {
 
 pub const direct_endpoint_env = "FX_MUX_DIRECT_ENDPOINT";
 
-pub const direct_endpoint_env = "FX_MUX_DIRECT_ENDPOINT";
 
 extern "c" fn write(fd: c_int, bytes: [*]const u8, len: usize) isize;
 

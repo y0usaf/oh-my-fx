@@ -483,6 +483,8 @@ fn expectedPermissionDeniedMessage(reason: types.ToolPermissionDenialReason) ?[]
     return switch (reason) {
         .user_denied => "Permission denied by user",
         .auto_denied => "Blocked by automatic safety policy",
+        .review_caution => "Action held after safety review",
+        .review_unavailable => "Safety reviewer unavailable; action held",
         .policy_denied, .permission_required => null,
     };
 }
@@ -985,8 +987,7 @@ test "accepted automatic review remains internal before ordinary tool execution"
     hooks.permission_decisions = &.{.once};
     hooks.permission_auto_review_results = &.{.{
         .risk = .low,
-        .authorization = .high,
-        .decision = .allow,
+        .decision = .clear,
         .rationale = "bounded safe action",
     }};
     defer hooks.deinit();
@@ -1192,8 +1193,7 @@ test "automatic review does not reposition deferred web fetch lifecycle" {
     hooks.permission_decisions = &.{.once};
     hooks.permission_auto_review_results = &.{.{
         .risk = .low,
-        .authorization = .high,
-        .decision = .allow,
+        .decision = .clear,
         .rationale = "bounded safe action",
     }};
     defer hooks.deinit();
@@ -1249,8 +1249,7 @@ test "automatic ask permission_required does not emit auto-deny notice or ration
     hooks.permission_denial_reasons = &.{.permission_required};
     hooks.permission_auto_review_results = &.{.{
         .risk = .high,
-        .authorization = .unknown,
-        .decision = .ask,
+        .decision = .caution,
         .rationale = "the destination needs review",
     }};
     defer hooks.deinit();
@@ -3958,7 +3957,7 @@ test "processQueuedPrompt denied registered run command compatibility never reac
     try expectPermissionDeniedToolResult(&gateway, 1, "terminal", .user_denied);
 }
 
-test "processQueuedPrompt auto permission denial labels lifecycle source" {
+test "processQueuedPrompt legacy auto denial retains lifecycle source" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -3988,61 +3987,11 @@ test "processQueuedPrompt auto permission denial labels lifecycle source" {
     try expectPermissionDeniedToolResult(&gateway, 1, "write_file", .auto_denied);
 }
 
-test "four automatic permission blocks finish with a normal blocker" {
+test "exact caution is reused while the agent continues to a normal completion" {
     const alloc = std.testing.allocator;
     const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch blocked\"}")};
     const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch blocked\"}")};
     const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch blocked\"}")};
-    const fourth = [_]ToolCall{toolCall("blocked-4", "run_command", "{\"command\":\"touch blocked\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &first },
-        .{ .tool_calls = &second },
-        .{ .tool_calls = &third },
-        .{ .tool_calls = &fourth },
-        .{ .content = "must not be requested" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{.deny};
-    hooks.permission_denial_reasons = &.{.auto_denied};
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.agent_step_limit = 0;
-    config.gateway_tools_json = fixture_tools_json;
-    var job = fixture.job();
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, config, job);
-
-    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try std.testing.expectEqualStrings(
-        "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
-        hooks.history_assistant_text.?,
-    );
-    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
-    try std.testing.expectEqual(@as(usize, 1), hooks.permission_names.items.len);
-    try std.testing.expectEqualSlices(
-        permission_auto_classifier.AutoPermissionPhase,
-        &.{.automatic_review},
-        hooks.permission_review_phases.items,
-    );
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.texts.items.len);
-    try std.testing.expectEqualStrings(
-        "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
-        hooks.texts.items[0],
-    );
-    try std.testing.expectEqualStrings("\n", hooks.texts.items[1]);
-}
-
-test "three automatic permission blocks still allow a normal text completion" {
-    const alloc = std.testing.allocator;
-    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
-    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
-    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first },
         .{ .tool_calls = &second },
@@ -4053,8 +4002,13 @@ test "three automatic permission blocks still allow a normal text completion" {
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
-    hooks.permission_decisions = &.{ .deny, .deny, .deny };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
+    hooks.permission_decisions = &.{.deny};
+    hooks.permission_denial_reasons = &.{.review_caution};
+    hooks.permission_auto_review_results = &.{.{
+        .risk = .high,
+        .decision = .caution,
+        .rationale = "The requested action needs a safer alternative.",
+    }};
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.agent_step_limit = 4;
@@ -4064,70 +4018,19 @@ test "three automatic permission blocks still allow a normal text completion" {
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 3), hooks.permission_names.items.len);
-    try std.testing.expectEqualSlices(
-        permission_auto_classifier.AutoPermissionPhase,
-        &.{ .automatic_review, .automatic_review, .automatic_review },
-        hooks.permission_review_phases.items,
-    );
+    try std.testing.expectEqual(@as(usize, 1), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    for (gateway.request_bodies.items[1..]) |body| {
+        try std.testing.expect(std.mem.find(u8, body, "tool_review_held") != null);
+        try std.testing.expect(std.mem.find(u8, body, "approval_request_id") == null);
+    }
     try std.testing.expectEqualStrings(
         "No further action is needed.",
         hooks.history_assistant_text.?,
     );
 }
 
-test "a parallel fourth blocked group finishes with a normal blocker" {
-    const alloc = std.testing.allocator;
-    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
-    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
-    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
-    const parallel = [_]ToolCall{
-        toolCall("approved-4a", "run_command", "{\"command\":\"touch approved-a\"}"),
-        toolCall("approved-4b", "run_command", "{\"command\":\"touch approved-b\"}"),
-    };
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &first },
-        .{ .tool_calls = &second },
-        .{ .tool_calls = &third },
-        .{ .tool_calls = &parallel },
-        .{ .content = "must not be requested" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{ .deny, .deny, .deny, .deny, .deny };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied, .auto_denied, .auto_denied };
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.agent_step_limit = 0;
-    var job = fixture.job();
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, config, job);
-
-    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 5), hooks.permission_names.items.len);
-    try std.testing.expectEqualSlices(
-        permission_auto_classifier.AutoPermissionPhase,
-        &.{
-            .automatic_review,
-            .automatic_review,
-            .automatic_review,
-            .automatic_review,
-            .automatic_review,
-        },
-        hooks.permission_review_phases.items,
-    );
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqualStrings(
-        "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
-        hooks.history_assistant_text.?,
-    );
-}
-
-test "three automatic permission blocks preserve an exhausted positive step cap" {
+test "three distinct review cautions preserve an exhausted positive step cap" {
     const alloc = std.testing.allocator;
     const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
     const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
@@ -4143,7 +4046,12 @@ test "three automatic permission blocks preserve an exhausted positive step cap"
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     hooks.permission_decisions = &.{ .deny, .deny, .deny };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
+    hooks.permission_denial_reasons = &.{ .review_caution, .review_caution, .review_caution };
+    hooks.permission_auto_review_results = &.{
+        .{ .risk = .high, .decision = .caution, .rationale = "First action needs a safer alternative." },
+        .{ .risk = .high, .decision = .caution, .rationale = "Second action needs a safer alternative." },
+        .{ .risk = .high, .decision = .caution, .rationale = "Third action needs a safer alternative." },
+    };
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.agent_step_limit = 3;
@@ -4158,40 +4066,7 @@ test "three automatic permission blocks preserve an exhausted positive step cap"
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
-test "four automatic permission blocks win over an exhausted positive step cap" {
-    const alloc = std.testing.allocator;
-    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
-    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
-    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
-    const fourth = [_]ToolCall{toolCall("blocked-4", "run_command", "{\"command\":\"touch four\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &first },
-        .{ .tool_calls = &second },
-        .{ .tool_calls = &third },
-        .{ .tool_calls = &fourth },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.permission_decisions = &.{ .deny, .deny, .deny, .deny };
-    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied, .auto_denied };
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.agent_step_limit = 4;
-
-    try runFakePrompt(&gateway, &hooks, config, fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try std.testing.expectEqualStrings(
-        "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
-        hooks.history_assistant_text.?,
-    );
-    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-}
-
-test "permission review receives bounded proven root request context" {
+test "permission review receives only the current proven root request" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -4253,9 +4128,9 @@ test "permission review receives bounded proven root request context" {
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const context = hooks.permission_user_intent_contexts.items[0];
     try std.testing.expect(std.mem.find(u8, context, "Go ahead.") != null);
-    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") != null);
-    try std.testing.expect(std.mem.find(u8, context, "true first root request") != null);
-    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") != null);
+    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") == null);
+    try std.testing.expect(std.mem.find(u8, context, "true first root request") == null);
+    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") == null);
     try std.testing.expect(std.mem.find(u8, context, "surviving recent assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "excluded older assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "Do not make any more file changes.") == null);

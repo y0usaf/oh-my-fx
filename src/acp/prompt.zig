@@ -1622,7 +1622,10 @@ fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
         );
         return "binary or non-utf8 tool output omitted";
     }
-    if (result.status == .failure and tool_result_errors.isToolPermissionDeniedOutput(result.model_output)) {
+    if (result.status == .failure and
+        (tool_result_errors.isToolPermissionDeniedOutput(result.model_output) or
+            tool_result_errors.isToolReviewHeldOutput(result.model_output)))
+    {
         return result.model_output;
     }
     return text_utils.utf8PrefixByBytes(result.model_output, 200);
@@ -3862,14 +3865,14 @@ test "ACP default user commands require configured authority or review" {
         .arguments_json = "{\"action\":\"exec\",\"command\":\"touch automatic.txt\"}",
     }, .auto, &.{}, &.{}));
     try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, automatic.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, automatic.denial_reason.?);
     try std.testing.expect(automatic.execution_authority == null);
 }
 
-test "ACP auto mode uses automatic review allow and ask without prompting" {
+test "ACP auto mode uses automatic review clear and caution without prompting" {
     const FakeClassifier = struct {
         calls: usize = 0,
-        decision: permission_auto_classifier.Decision = .allow,
+        decision: permission_auto_classifier.Decision = .clear,
         root_text: []const u8 = "",
 
         fn classify(
@@ -3881,8 +3884,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
             self.calls += 1;
             self.root_text = request.review_turn.current_root_request;
             return .{ .valid = .{
-                .risk = if (self.decision == .allow) .low else .high,
-                .authorization = if (self.decision == .allow) .medium else .low,
+                .risk = if (self.decision == .clear) .low else .high,
                 .decision = self.decision,
                 .rationale = try alloc.dupe(u8, "test reviewer rationale"),
             } };
@@ -3895,7 +3897,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
     const arena = arena_state.allocator();
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    var fake = FakeClassifier{ .decision = .allow };
+    var fake = FakeClassifier{ .decision = .clear };
     var ctx = AcpContext{
         .alloc = alloc,
         .state = &state,
@@ -3949,7 +3951,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
         fake.root_text,
     );
 
-    fake.decision = .ask;
+    fake.decision = .caution;
     const blocked_call: ToolCall = .{
         .id = "check",
         .name = "terminal",
@@ -3958,18 +3960,18 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
     var blocked_review = TestReviewTurn.init("Check whether this is allowed.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(permission_auto_classifier.Decision.ask, blocked_classifier.decision);
+    try std.testing.expectEqual(permission_auto_classifier.Decision.caution, blocked_classifier.decision);
     try std.testing.expectEqualStrings("test reviewer rationale", blocked_classifier.rationale);
 }
 
-test "ACP auto mode automatic review allows or asks prepared external file mutation" {
+test "ACP auto mode automatic review clears or cautions prepared external file mutation" {
     const FakeClassifier = struct {
         calls: usize = 0,
-        decision: permission_auto_classifier.Decision = .allow,
+        decision: permission_auto_classifier.Decision = .clear,
         root_text: []const u8 = "",
         saw_file_mutation_context: bool = false,
 
@@ -3983,8 +3985,7 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
             self.root_text = request.review_turn.current_root_request;
             self.saw_file_mutation_context = std.meta.activeTag(request.action) == .file_mutation;
             return .{ .valid = .{
-                .risk = if (self.decision == .allow) .low else .high,
-                .authorization = if (self.decision == .allow) .medium else .low,
+                .risk = if (self.decision == .clear) .low else .high,
                 .decision = self.decision,
                 .rationale = try alloc.dupe(u8, "test reviewer rationale"),
             } };
@@ -4006,7 +4007,7 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
     const arena = arena_state.allocator();
     var state = try initTestAcpState(alloc, workspace, .auto);
     defer state.deinit();
-    var fake = FakeClassifier{ .decision = .allow };
+    var fake = FakeClassifier{ .decision = .clear };
     var ctx = AcpContext{
         .alloc = alloc,
         .state = &state,
@@ -4051,7 +4052,7 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
         defer existing.close(io_mod.getIo());
         try existing.writeStreamingAll(io_mod.getIo(), "existing\n");
     }
-    fake.decision = .ask;
+    fake.decision = .caution;
     const blocked_call: ToolCall = .{
         .id = "external-write-check",
         .name = "write_file",
@@ -4061,10 +4062,10 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(permission_auto_classifier.Decision.ask, blocked_classifier.decision);
+    try std.testing.expectEqual(permission_auto_classifier.Decision.caution, blocked_classifier.decision);
     try std.testing.expectEqualStrings("test reviewer rationale", blocked_classifier.rationale);
 }
 

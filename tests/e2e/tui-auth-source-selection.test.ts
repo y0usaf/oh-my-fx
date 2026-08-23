@@ -879,7 +879,7 @@ function startFakeCodexAutoReview() {
       if (model === "gpt-5.4-mini") {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_permission","name":"permission_decision"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"authorization\\":\\"high\\",\\"decision\\":\\"allow\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"decision\\":\\"clear\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_review","status":"completed","usage":{"input_tokens":8,"output_tokens":3}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
@@ -945,7 +945,7 @@ function startFakeGrokAutoReview() {
       if (body.includes('"name":"permission_decision"')) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_permission","name":"permission_decision"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"authorization\\":\\"high\\",\\"decision\\":\\"allow\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"decision\\":\\"clear\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_review","status":"completed","usage":{"input_tokens":8,"output_tokens":3}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
@@ -2833,6 +2833,8 @@ test(
       expect(codex.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
         .toEqual(["gpt-5.6-sol", "gpt-5.4-mini", "gpt-5.6-sol"]);
       expect(codex.bodies[1]).toContain('"name":"permission_decision"');
+      expect(codex.bodies[2]).toContain('"type":"function_call_output"');
+      expect(codex.bodies[2]).toContain("exit_code=0");
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }
@@ -2885,6 +2887,8 @@ test(
       expect(grok.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
         .toEqual(["grok-4.20", "grok-4.20", "grok-4.20"]);
       expect(grok.bodies[1]).toContain('"name":"permission_decision"');
+      expect(grok.bodies[2]).toContain('"type":"function_call_output"');
+      expect(grok.bodies[2]).toContain("exit_code=0");
       expect(grok.headers).toHaveLength(3);
       for (const headers of grok.headers) {
         expect(headers.tokenAuth).toBe("xai-grok-cli");

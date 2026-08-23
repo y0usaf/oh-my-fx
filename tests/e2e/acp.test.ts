@@ -4528,7 +4528,7 @@ describe("acp: model-independent", () => {
         const blockedGateway = startFakeGateway([
           fileToolCall("write_external_blocked", blockedTarget, "FX_ACP_AUTO_BLOCKED"),
           finalText("ACP external write blocked"),
-        ], { classifierDecision: "ask" });
+        ], { classifierDecision: "caution" });
         try {
           client = await AcpClient.create({
             cwd: blockedRoot.workspace,
@@ -4540,7 +4540,7 @@ describe("acp: model-independent", () => {
           expect(
             blocked.messages.some((message: any) => message.method === "session/request_permission"),
           ).toBe(false);
-          expect(serialized).toContain("auto_denied");
+          expect(serialized).toContain("review_caution");
           expect(serialized).not.toContain("user_denied");
           expect(serialized).toContain('"status":"failed"');
           const failedUpdateIndex = blocked.messages.findIndex((message: any) =>
@@ -4550,6 +4550,14 @@ describe("acp: model-independent", () => {
             message.params.update.status === "failed"
           );
           expect(failedUpdateIndex).toBeGreaterThanOrEqual(0);
+          const heldText = blocked.messages[failedUpdateIndex]!.params.update
+            .content[0].content.text as string;
+          const held = JSON.parse(heldText) as {
+            error: { type: string; reason: string; held: boolean };
+          };
+          expect(held.error.type).toBe("tool_review_held");
+          expect(held.error.reason).toBe("review_caution");
+          expect(held.error.held).toBe(true);
           expect(readFileSync(blockedTarget, "utf-8")).toBe("before");
           expect(blockedGateway.classifierRequests).toHaveLength(1);
           expect(blockedGateway.classifierRequests[0]!.body).toContain(
@@ -4568,21 +4576,24 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP completes normally after automatic recovery exhaustion",
+    "ACP keeps the session active after repeated advisory cautions",
     async () => {
       const root = createIsolatedRoot("fx-acp-auto-recovery-");
       const target = join(root.external, "recovery.txt");
       writeFileSync(target, "before");
       const gateway = startFakeGateway(
-        Array.from({ length: 4 }, (_, index) => (body: string) => {
-          if (index > 0) expect(body).toContain("auto_denied");
-          return fileToolCall(
-            `recovery_call_${index + 1}`,
-            target,
-            "ACP_RECOVERY_MUST_NOT_RUN",
-          );
-        }),
-        { classifierDecision: "ask" },
+        [
+          ...Array.from({ length: 4 }, (_, index) => (body: string) => {
+            if (index > 0) expect(body).toContain("review_caution");
+            return fileToolCall(
+              `recovery_call_${index + 1}`,
+              target,
+              "ACP_RECOVERY_MUST_NOT_RUN",
+            );
+          }),
+          finalText("ACP advisory cautions handled normally."),
+        ],
+        { classifierDecision: "caution" },
       );
 
       try {
@@ -4593,7 +4604,7 @@ describe("acp: model-independent", () => {
         await startCodeSession(client);
         const result = await runPrompt(
           client,
-          "Write the ACP automatic recovery fixture.",
+          "Write the ACP advisory caution fixture.",
           TIMEOUT,
         );
 
@@ -4603,10 +4614,10 @@ describe("acp: model-independent", () => {
           ),
         ).toBe(false);
         expect(JSON.stringify(result.messages)).toContain(
-          "I couldn't continue because the required actions were blocked by automatic safety checks.",
+          "ACP advisory cautions handled normally.",
         );
         expect(gateway.classifierRequests).toHaveLength(1);
-        expect(gateway.requests).toHaveLength(4);
+        expect(gateway.requests).toHaveLength(5);
         expect(readFileSync(target, "utf8")).toBe("before");
         expect(client.stderr).toBe("");
       } finally {
@@ -7027,7 +7038,7 @@ describe("acp: model-independent", () => {
         expect(terminalResponses.get(397)?.result).toBeNull();
         expect(terminalResponses.get(396)?.result?.stopReason).toBe("cancelled");
 
-        heldReview.resolve(fakeGatewayPermissionDecision("allow"));
+        heldReview.resolve(fakeGatewayPermissionDecision("clear"));
         await Bun.sleep(100);
         expect(gateway.classifierRequests).toHaveLength(1);
         expect(gateway.requests).toHaveLength(1);
@@ -7047,7 +7058,7 @@ describe("acp: model-independent", () => {
         expect(existsSync(marker)).toBe(false);
         expect(client.stderr).toBe("");
       } finally {
-        heldReview.resolve(fakeGatewayPermissionDecision("allow"));
+        heldReview.resolve(fakeGatewayPermissionDecision("clear"));
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

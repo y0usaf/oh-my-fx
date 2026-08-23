@@ -5363,7 +5363,7 @@ test "fx ask default user commands require configured authority or review" {
         .arguments_json = "{\"action\":\"exec\",\"command\":\"touch automatic.txt\"}",
     }, .auto, &.{}, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, automatic.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, automatic.denial_reason.?);
 }
 
 test "fx ask automatic review observes worker cancellation" {
@@ -5867,10 +5867,10 @@ test "disabled headless ask scope leaves the interactive SIGINT handler untouche
     try std.testing.expectEqual(@as(usize, 1), test_previous_sigint_count.load(.seq_cst));
 }
 
-test "fx ask auto mode applies automatic allow and ask without a prompt" {
+test "fx ask auto mode applies automatic clear and caution without a prompt" {
     const FakeClassifier = struct {
         calls: usize = 0,
-        decision: permission_auto_classifier.Decision = .allow,
+        decision: permission_auto_classifier.Decision = .clear,
 
         fn classify(
             raw_ctx: *anyopaque,
@@ -5880,8 +5880,7 @@ test "fx ask auto mode applies automatic allow and ask without a prompt" {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
             return .{ .valid = .{
-                .risk = if (self.decision == .allow) .low else .high,
-                .authorization = .medium,
+                .risk = if (self.decision == .clear) .low else .high,
                 .decision = self.decision,
                 .rationale = try alloc.dupe(u8, "test automatic review"),
             } };
@@ -5898,7 +5897,7 @@ test "fx ask auto mode applies automatic allow and ask without a prompt" {
     defer stderr_capture.deinit(alloc);
     var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
     defer ctx.deinit();
-    var fake = FakeClassifier{ .decision = .allow };
+    var fake = FakeClassifier{ .decision = .clear };
     ctx.auto_classifier = permission_auto_classifier.Classifier.withOverride(
         @ptrCast(&fake),
         FakeClassifier.classify,
@@ -5953,7 +5952,7 @@ test "fx ask auto mode applies automatic allow and ask without a prompt" {
     }
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
 
-    fake.decision = .ask;
+    fake.decision = .caution;
     const check_call: ToolCall = .{
         .id = "check",
         .name = "terminal",
@@ -5972,7 +5971,7 @@ test "fx ask auto mode applies automatic allow and ask without a prompt" {
         &.{},
     );
     try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, blocked.denial_reason.?);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
@@ -6364,8 +6363,7 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
             try std.testing.expectEqualStrings("write_file", file.tool_name);
             return .{ .valid = .{
                 .risk = .medium,
-                .authorization = .high,
-                .decision = .allow,
+                .decision = .clear,
                 .rationale = try alloc.dupe(u8, "test automatic review"),
             } };
         }
@@ -6502,7 +6500,7 @@ test "fx ask preserves CLI headless blocker diagnostics" {
         &.{},
     );
     try std.testing.expectEqual(ToolPermissionDecision.deny, external_outcome.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, external_outcome.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, external_outcome.denial_reason.?);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 
@@ -6546,7 +6544,7 @@ test "fx ask preserves CLI headless blocker diagnostics" {
         &.{},
     );
     try std.testing.expectEqual(ToolPermissionDecision.deny, auto_approval.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, auto_approval.denial_reason.?);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, auto_approval.denial_reason.?);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 
@@ -6730,7 +6728,7 @@ test "CLI ask auto mode requires review when only one copy or rename target is c
             .arguments_json = case.arguments_json,
         }, .auto, &.{}, &.{});
         try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
-        try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
+        try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, outcome.denial_reason.?);
         stdout_capture.bytes.clearRetainingCapacity();
         stderr_capture.bytes.clearRetainingCapacity();
     }

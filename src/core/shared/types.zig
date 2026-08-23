@@ -1628,6 +1628,8 @@ pub const ReasoningEffort = union(enum) {
 pub const ToolPermissionDenialReason = enum {
     user_denied,
     auto_denied,
+    review_caution,
+    review_unavailable,
     policy_denied,
     permission_required,
 };

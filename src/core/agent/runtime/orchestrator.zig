@@ -27,7 +27,6 @@ const tool_preparation = @import("../tool_preparation.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../../permissions/auto_classifier_context.zig");
-const ask_user_question = @import("../../../tools/agent/ask_user_question.zig");
 
 const runtime_config = @import("config.zig");
 const runtime_finalization = @import("finalization.zig");
@@ -2394,9 +2393,9 @@ fn buildReviewTurnContext(
     model: []const u8,
     current_prompt: []const u8,
     root_user_intent_context: []const u8,
+    current_turn_messages: []const ChatMessage,
     pending_assistant: ChatMessage,
     target_call_id: []const u8,
-    auto_permission_phase: permission_auto_classifier.AutoPermissionPhase,
 ) permission_auto_classifier.ReviewTurnContext {
     const current_root_request = currentRootRequest(
         config,
@@ -2412,7 +2411,7 @@ fn buildReviewTurnContext(
             .subagent => .subagent,
         },
         .current_root_request = current_root_request,
-        .auto_permission_phase = auto_permission_phase,
+        .current_turn_untrusted_messages = current_turn_messages,
     };
 }
 
@@ -2422,14 +2421,9 @@ fn currentRootRequest(
     root_user_intent_context: []const u8,
 ) []const u8 {
     return if (root_user_intent_context.len > 0)
-        if (std.mem.count(u8, root_user_intent_context, "\n") > 1)
-            auto_classifier_context.reviewRootUserContext(
-                root_user_intent_context,
-            ) orelse root_user_intent_context
-        else
-            auto_classifier_context.currentRootUserRequest(
-                root_user_intent_context,
-            ) orelse root_user_intent_context
+        auto_classifier_context.currentRootUserRequest(
+            root_user_intent_context,
+        ) orelse root_user_intent_context
     else if (config.origin == .root)
         current_prompt
     else if (config.current_prompt_is_root_authority)
@@ -2442,256 +2436,6 @@ fn currentRootRequest(
         config.root_user_messages[config.root_user_messages.len - 1]
     else
         "";
-}
-
-const AutomaticRecoveryDisposition = enum {
-    continue_auto_review,
-    finish_with_normal_blocker,
-};
-
-const max_automatic_denial_response_groups: usize = 4;
-const automatic_permission_recovery_fallback =
-    "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.";
-
-fn automatic_recovery_disposition(messages: []const ChatMessage) AutomaticRecoveryDisposition {
-    var blocked_groups: usize = 0;
-    var index: usize = 0;
-    while (index < messages.len) : (index += 1) {
-        const assistant = messages[index];
-        if (assistant.role != .assistant or assistant.tool_calls.len == 0) continue;
-        var group_end = index + 1;
-        while (group_end < messages.len and messages[group_end].role != .assistant) {
-            group_end += 1;
-        }
-        if (!responseGroupComplete(messages[index + 1 .. group_end], assistant.tool_calls)) {
-            index = group_end -| 1;
-            continue;
-        }
-        var has_auto_denial = false;
-        var resets_auto_recovery = false;
-        var has_success = false;
-        for (messages[index + 1 .. group_end]) |message| {
-            if (message.role != .tool) continue;
-            if (message.tool_result_status == .success) has_success = true;
-            const output = message.content orelse continue;
-            const reason = tool_result_errors.toolPermissionDenialReason(output) orelse continue;
-            if (reason == .auto_denied)
-                has_auto_denial = true
-            else
-                resets_auto_recovery = true;
-        }
-        if (has_success or resets_auto_recovery) {
-            blocked_groups = 0;
-        } else if (has_auto_denial) {
-            blocked_groups +|= 1;
-        }
-        index = group_end -| 1;
-    }
-    return if (blocked_groups >= max_automatic_denial_response_groups)
-        .finish_with_normal_blocker
-    else
-        .continue_auto_review;
-}
-
-fn responseGroupComplete(
-    results: []const ChatMessage,
-    calls: []const ToolCall,
-) bool {
-    for (calls) |call| {
-        var found = false;
-        for (results) |result| {
-            if (result.role == .tool and
-                result.tool_call_id != null and
-                std.mem.eql(u8, result.tool_call_id.?, call.id))
-            {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    return true;
-}
-
-test "automatic recovery counts completed response groups and resets after success" {
-    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
-    const blocked_group = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &.{.{ .id = "blocked", .name = "run_command", .arguments_json = "{}" }} },
-        .{ .role = .tool, .content = denied, .tool_call_id = "blocked", .tool_result_status = .failure },
-    };
-    var three_then_current: [7]ChatMessage = undefined;
-    @memcpy(three_then_current[0..2], &blocked_group);
-    @memcpy(three_then_current[2..4], &blocked_group);
-    @memcpy(three_then_current[4..6], &blocked_group);
-    three_then_current[6] = .{ .role = .assistant, .tool_calls = &.{.{ .id = "current", .name = "run_command", .arguments_json = "{}" }} };
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(&three_then_current),
-    );
-
-    var four_blocked: [8]ChatMessage = undefined;
-    @memcpy(four_blocked[0..2], &blocked_group);
-    @memcpy(four_blocked[2..4], &blocked_group);
-    @memcpy(four_blocked[4..6], &blocked_group);
-    @memcpy(four_blocked[6..8], &blocked_group);
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.finish_with_normal_blocker,
-        automatic_recovery_disposition(&four_blocked),
-    );
-
-    const success = ChatMessage{
-        .role = .tool,
-        .content = "ok",
-        .tool_call_id = "safe",
-        .tool_result_status = .success,
-    };
-    var reset: [10]ChatMessage = undefined;
-    @memcpy(reset[0..6], three_then_current[0..6]);
-    reset[6] = .{ .role = .assistant, .tool_calls = &.{.{ .id = "safe", .name = "run_command", .arguments_json = "{}" }} };
-    reset[7] = success;
-    reset[8] = blocked_group[0];
-    reset[9] = blocked_group[1];
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(&reset),
-    );
-}
-
-test "automatic recovery resets after non automatic permission denials" {
-    const auto_denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
-    const user_denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"user_denied\"}}";
-    const policy_denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"policy_denied\"}}";
-    const permission_required = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"permission_required\"}}";
-    for ([_][]const u8{ user_denied, policy_denied, permission_required }) |reset_result| {
-        const messages = [_]ChatMessage{
-            .{ .role = .assistant, .tool_calls = &.{.{ .id = "auto-1", .name = "run_command", .arguments_json = "{}" }} },
-            .{ .role = .tool, .content = auto_denied, .tool_call_id = "auto-1", .tool_result_status = .failure },
-            .{ .role = .assistant, .tool_calls = &.{.{ .id = "auto-2", .name = "run_command", .arguments_json = "{}" }} },
-            .{ .role = .tool, .content = auto_denied, .tool_call_id = "auto-2", .tool_result_status = .failure },
-            .{ .role = .assistant, .tool_calls = &.{.{ .id = "auto-3", .name = "run_command", .arguments_json = "{}" }} },
-            .{ .role = .tool, .content = auto_denied, .tool_call_id = "auto-3", .tool_result_status = .failure },
-            .{ .role = .assistant, .tool_calls = &.{.{ .id = "reset", .name = "run_command", .arguments_json = "{}" }} },
-            .{ .role = .tool, .content = reset_result, .tool_call_id = "reset", .tool_result_status = .failure },
-        };
-
-        try std.testing.expectEqual(
-            AutomaticRecoveryDisposition.continue_auto_review,
-            automatic_recovery_disposition(&messages),
-        );
-    }
-}
-
-test "parallel automatic denials count as one response group" {
-    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
-    const calls = [_]ToolCall{
-        .{ .id = "one", .name = "run_command", .arguments_json = "{}" },
-        .{ .id = "two", .name = "run_command", .arguments_json = "{}" },
-    };
-    const messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &calls },
-        .{ .role = .tool, .content = denied, .tool_call_id = "one", .tool_result_status = .failure },
-        .{ .role = .tool, .content = denied, .tool_call_id = "two", .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &calls },
-    };
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(&messages),
-    );
-}
-
-test "a mixed parallel response group resets recovery regardless result order" {
-    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
-    const calls = [_]ToolCall{
-        .{ .id = "safe", .name = "run_command", .arguments_json = "{}" },
-        .{ .id = "blocked", .name = "run_command", .arguments_json = "{}" },
-    };
-    const current = ChatMessage{
-        .role = .assistant,
-        .tool_calls = &.{.{ .id = "current", .name = "run_command", .arguments_json = "{}" }},
-    };
-    var success_first: [10]ChatMessage = undefined;
-    var denial_first: [10]ChatMessage = undefined;
-    for (0..3) |group_index| {
-        const start = group_index * 3;
-        success_first[start] = .{ .role = .assistant, .tool_calls = &calls };
-        success_first[start + 1] = .{ .role = .tool, .content = "ok", .tool_call_id = "safe", .tool_result_status = .success };
-        success_first[start + 2] = .{ .role = .tool, .content = denied, .tool_call_id = "blocked", .tool_result_status = .failure };
-        denial_first[start] = success_first[start];
-        denial_first[start + 1] = success_first[start + 2];
-        denial_first[start + 2] = success_first[start + 1];
-    }
-    success_first[9] = current;
-    denial_first[9] = current;
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(&success_first),
-    );
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(&denial_first),
-    );
-}
-
-test "automatic recovery disposition depends only on completed response groups" {
-    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
-    const messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &.{.{ .id = "one", .name = "run_command", .arguments_json = "{}" }} },
-        .{ .role = .tool, .content = denied, .tool_call_id = "one", .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &.{.{ .id = "two", .name = "run_command", .arguments_json = "{}" }} },
-        .{ .role = .tool, .content = denied, .tool_call_id = "two", .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &.{.{ .id = "three", .name = "run_command", .arguments_json = "{}" }} },
-        .{ .role = .tool, .content = denied, .tool_call_id = "three", .tool_result_status = .failure },
-    };
-
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(&.{}),
-    );
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(messages[0..2]),
-    );
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(messages[0..4]),
-    );
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(&messages),
-    );
-
-    var with_unrelated_prefix: [10]ChatMessage = undefined;
-    with_unrelated_prefix[0] = .{ .role = .user, .content = "unrelated earlier request" };
-    with_unrelated_prefix[1] = .{ .role = .assistant, .content = "unrelated earlier response" };
-    @memcpy(with_unrelated_prefix[2..8], &messages);
-    with_unrelated_prefix[8] = .{ .role = .assistant, .tool_calls = &.{.{ .id = "four", .name = "run_command", .arguments_json = "{}" }} };
-    with_unrelated_prefix[9] = .{ .role = .tool, .content = denied, .tool_call_id = "four", .tool_result_status = .failure };
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.finish_with_normal_blocker,
-        automatic_recovery_disposition(&with_unrelated_prefix),
-    );
-}
-
-test "incomplete parallel response groups do not advance automatic recovery" {
-    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
-    const parallel_calls = [_]ToolCall{
-        .{ .id = "incomplete-1", .name = "run_command", .arguments_json = "{}" },
-        .{ .id = "incomplete-2", .name = "run_command", .arguments_json = "{}" },
-    };
-    const messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &.{.{ .id = "one", .name = "run_command", .arguments_json = "{}" }} },
-        .{ .role = .tool, .content = denied, .tool_call_id = "one", .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &.{.{ .id = "two", .name = "run_command", .arguments_json = "{}" }} },
-        .{ .role = .tool, .content = denied, .tool_call_id = "two", .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &parallel_calls },
-        .{ .role = .tool, .content = denied, .tool_call_id = "incomplete-1", .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = &.{.{ .id = "current", .name = "run_command", .arguments_json = "{}" }} },
-    };
-
-    try std.testing.expectEqual(
-        AutomaticRecoveryDisposition.continue_auto_review,
-        automatic_recovery_disposition(&messages),
-    );
 }
 
 fn appendTrustedPermissionFeedback(
@@ -2721,159 +2465,6 @@ fn buildToolExecutionRootUserContext(
         root_user_context,
         trusted_permission_feedback.items,
     );
-}
-
-fn actionBoundPermissionResult(
-    alloc: Allocator,
-    request_id: runtime_tool_admission.PermissionActionId,
-    decision: types.ToolPermissionDecision,
-    authorized: bool,
-) ![]u8 {
-    const request_hex = std.fmt.bytesToHex(request_id, .lower);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"permission_request_id\":");
-    try std.json.Stringify.value(&request_hex, .{}, &out.writer);
-    try out.writer.writeAll(",\"authorized\":");
-    try out.writer.writeAll(if (authorized) "true" else "false");
-    try out.writer.writeAll(",\"decision\":");
-    try std.json.Stringify.value(@tagName(decision), .{}, &out.writer);
-    try out.writer.writeAll(",\"message\":");
-    try std.json.Stringify.value(
-        if (authorized)
-            "The exact bound action was approved. Retry only that action unchanged."
-        else
-            "The exact bound action was not approved. Do not retry it unchanged.",
-        .{},
-        &out.writer,
-    );
-    try out.writer.writeByte('}');
-    return try out.toOwnedSlice();
-}
-
-fn invalidActionBoundPermissionResult(
-    alloc: Allocator,
-    message: []const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"error\":{\"type\":\"permission_request_invalid\",\"message\":");
-    try std.json.Stringify.value(message, .{}, &out.writer);
-    try out.writer.writeAll("}}");
-    return try out.toOwnedSlice();
-}
-
-fn executeActionBoundPermissionRequest(
-    deps: *const AgentRuntimeDeps,
-    arena: Allocator,
-    recovery: *runtime_tool_admission.TurnPermissionRecovery,
-    call: ToolCall,
-    review_context: permission_auto_classifier.ReviewTurnContext,
-    local_grants: []const PermissionGrant,
-    advertised_dynamic_tool_names: []const []const u8,
-    workspace_root: []const u8,
-    step_ctx: TraceContext,
-) !?ToolExecutionResult {
-    if (!std.mem.eql(u8, call.name, "ask_user_question")) return null;
-    const reference = try ask_user_question.permissionRequestReference(
-        arena,
-        call.arguments_json,
-    );
-    const request_id = switch (reference) {
-        .none => return null,
-        .invalid => return .{
-            .status = .failure,
-            .model_output = try invalidActionBoundPermissionResult(
-                arena,
-                "permission_request_id must be the exact 64-character ID from an auto_denied result",
-            ),
-        },
-        .id => |value| value,
-    };
-    const denied_call = recovery.deniedCall(request_id) orelse return .{
-        .status = .failure,
-        .model_output = try invalidActionBoundPermissionResult(
-            arena,
-            "permission_request_id is not pending in this agent turn",
-        ),
-    };
-
-    var live_authority: ?runtime_tool_contracts.LiveToolAuthority = null;
-    var permission_grants = local_grants;
-    if (deps.live_tool_authority != null) {
-        const resolved = try resolveLiveToolAuthority(
-            deps,
-            arena,
-            denied_call,
-            workspace_root,
-            advertised_dynamic_tool_names,
-            null,
-        );
-        if (liveAuthorityRejectsExecution(resolved)) return .{
-            .status = .failure,
-            .model_output = try actionBoundPermissionResult(
-                arena,
-                request_id,
-                if (resolved.decision == .deny)
-                    .policy_denied
-                else
-                    .permission_required,
-                false,
-            ),
-        };
-        live_authority = resolved.authority;
-        permission_grants = resolved.authority.grants;
-    }
-    const outcome = runtime_tool_admission.requestToolPermissionTraced(
-        deps,
-        arena,
-        denied_call,
-        review_context,
-        .ask,
-        permission_grants,
-        live_authority,
-        null,
-        advertised_dynamic_tool_names,
-        workspace_root,
-        step_ctx,
-    ) catch |err| switch (err) {
-        error.NonInteractivePermissionRequired,
-        error.PermissionPromptUnavailable,
-        => return .{
-            .status = .failure,
-            .model_output = try actionBoundPermissionResult(
-                arena,
-                request_id,
-                .permission_required,
-                false,
-            ),
-        },
-        else => return err,
-    };
-    if (outcome.tool_failure) |failure| return .{
-        .status = .failure,
-        .model_output = failure,
-    };
-    const authority = outcome.execution_authority;
-    const authorized = !outcome.decision.isDenied() and
-        authority != null and
-        recovery.rememberApproval(
-            request_id,
-            authority.?,
-            outcome.human_approval,
-        );
-    return .{
-        .status = if (authorized or outcome.decision == .deny)
-            .success
-        else
-            .failure,
-        .model_output = try actionBoundPermissionResult(
-            arena,
-            request_id,
-            outcome.decision,
-            authorized,
-        ),
-    };
 }
 
 fn visionFallbackMode(
@@ -2933,8 +2524,8 @@ fn processQueuedPromptLoop(
     defer local_grants_ptr.* = local_grants;
     var turn_file_mutation_denials: runtime_tool_admission.TurnFileMutationDenials = .{};
     defer turn_file_mutation_denials.deinit(arena);
-    var turn_permission_recovery: runtime_tool_admission.TurnPermissionRecovery = .{};
-    defer turn_permission_recovery.deinit(arena);
+    var turn_review_cache: runtime_tool_admission.TurnReviewCache = .{};
+    defer turn_review_cache.deinit(arena);
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
     defer terminal_validation_retry.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
@@ -3043,22 +2634,6 @@ fn processQueuedPromptLoop(
             finish_trace.finish("interrupted");
             return;
         }
-        if (automatic_recovery_disposition(within_turn_suffix.items) == .finish_with_normal_blocker) {
-            try finish_automatic_permission_recovery(
-                deps,
-                finalization,
-                arena,
-                job,
-                within_turn_suffix.items,
-                &summary_accumulator,
-                stop_state,
-                &finish_trace,
-                step_ctx,
-            );
-            return;
-        }
-        const auto_permission_phase: permission_auto_classifier.AutoPermissionPhase =
-            .automatic_review;
         _ = overlay_arena_state.reset(.retain_capacity);
         const overlay_arena = overlay_arena_state.allocator();
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
@@ -5398,9 +4973,9 @@ fn processQueuedPromptLoop(
                         successful_gateway_model,
                         job.prompt,
                         root_user_intent_context,
+                        within_turn_suffix.items,
                         pending_assistant,
                         parallel_call.id,
-                        auto_permission_phase,
                     );
                     const maybe_parallel_permission: ?command_admission.PermissionOutcome = runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, config.workspace_root, step_ctx) catch |err| blk: {
                         if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
@@ -6390,9 +5965,9 @@ fn processQueuedPromptLoop(
                 successful_gateway_model,
                 job.prompt,
                 root_user_intent_context,
+                within_turn_suffix.items,
                 pending_assistant,
                 execution_call.id,
-                auto_permission_phase,
             );
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
                 call_allocator,
@@ -6408,20 +5983,12 @@ fn processQueuedPromptLoop(
                 turn_file_mutation_denials.preservedOutcome(identity)
             else
                 null;
-            const approved_revalidation = turn_permission_recovery.takeApproval(
-                execution_call,
-            );
-            const preserved_automatic_denial = if (approved_revalidation == null and
-                auto_permission_phase == .automatic_review)
-                try turn_permission_recovery.preservedOutcome(
-                    call_allocator,
-                    config.workspace_root,
-                    execution_call,
-                )
+            const preserved_review_caution = if (action_permission_mode == .auto)
+                turn_review_cache.cachedCaution(execution_call)
             else
                 null;
             const effective_preserved_denial = preserved_denial orelse
-                preserved_automatic_denial;
+                preserved_review_caution;
             if (effective_preserved_denial != null) {
                 debug_trace.eventf(
                     "permission",
@@ -6431,21 +5998,7 @@ fn processQueuedPromptLoop(
                     .{ tool_call.id, tool_call.name },
                 );
             }
-            const maybe_permission: ?command_admission.PermissionOutcome = if (approved_revalidation) |revalidation|
-                try runtime_tool_admission.requestToolPermissionTraced(
-                    deps,
-                    call_allocator,
-                    execution_call,
-                    review_context,
-                    action_permission_mode,
-                    action_grants,
-                    if (live_authority) |resolved| resolved.authority else null,
-                    revalidation,
-                    advertised_dynamic_tool_names,
-                    config.workspace_root,
-                    step_ctx,
-                )
-            else if (effective_preserved_denial) |outcome|
+            const maybe_permission: ?command_admission.PermissionOutcome = if (effective_preserved_denial) |outcome|
                 outcome
             else
                 (if (prepared_file_mutation) |*prepared|
@@ -6686,25 +6239,27 @@ fn processQueuedPromptLoop(
                 }
                 const reason = permission_outcome.denial_reason orelse
                     decision.denialReason() orelse .user_denied;
-                const approval_request_id = try turn_permission_recovery.rememberAutoDenial(
+                try turn_review_cache.rememberCaution(
                     arena,
-                    config.workspace_root,
                     tool_call,
                     permission_outcome,
                 );
-                const denied_output = if (approval_request_id) |request_id| blk: {
-                    const request_hex = std.fmt.bytesToHex(request_id, .lower);
-                    break :blk try tool_result_errors.toolPermissionDeniedJsonWithRequestId(
+                const denied_output = switch (reason) {
+                    .review_caution, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
                         arena,
                         tool_call.name,
                         reason,
-                        &request_hex,
-                    );
-                } else try tool_result_errors.toolPermissionDeniedJson(
-                    arena,
-                    tool_call.name,
-                    reason,
-                );
+                        if (permission_outcome.auto_review_result) |result|
+                            result.rationale
+                        else
+                            null,
+                    ),
+                    .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
+                        arena,
+                        tool_call.name,
+                        reason,
+                    ),
+                };
                 if (!status_started and (is_file_mutation or defer_auto_command_lifecycle)) {
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
@@ -6919,17 +6474,7 @@ fn processQueuedPromptLoop(
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
-            var execution = (try executeActionBoundPermissionRequest(
-                deps,
-                arena,
-                &turn_permission_recovery,
-                execution_call,
-                review_context,
-                local_grants.items,
-                advertised_dynamic_tool_names,
-                config.workspace_root,
-                step_ctx,
-            )) orelse deps.execute_tool_call(deps.ctx, .{
+            var execution = deps.execute_tool_call(deps.ctx, .{
                 .call_allocator = call_allocator,
                 .result_allocator = arena,
                 .call = execution_call,
@@ -7413,39 +6958,6 @@ fn processQueuedPromptLoop(
         }
     }
 
-    if (automatic_recovery_disposition(within_turn_suffix.items) == .finish_with_normal_blocker) {
-        if (config.cancel_flag.load(.seq_cst)) {
-            runtime_telemetry.traceCancelObserved(last_step_ctx, false);
-            try runtime_interruption.persistInterruptedTurnOnce(
-                deps,
-                finalization,
-                job,
-                null,
-                null,
-                completed_tool_names.items,
-                &interrupted_persisted,
-                last_step_ctx,
-                within_turn_suffix.items,
-                stop_state.retained_candidate,
-                &stop_state.terminal_materializing,
-            );
-            finish_trace.finish("interrupted");
-            return;
-        }
-        try finish_automatic_permission_recovery(
-            deps,
-            finalization,
-            arena,
-            job,
-            within_turn_suffix.items,
-            &summary_accumulator,
-            stop_state,
-            &finish_trace,
-            last_step_ctx,
-        );
-        return;
-    }
-
     runtime_telemetry.traceStepLimitReached(.{
         .ctx = last_step_ctx,
         .step_index = current_step_index,
@@ -7466,55 +6978,6 @@ fn processQueuedPromptLoop(
         &finish_trace,
         config.step_limit_notice,
         "step_limit",
-    );
-}
-
-fn finish_automatic_permission_recovery(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    arena: Allocator,
-    job: QueuedPrompt,
-    current_turn_messages: []const ChatMessage,
-    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
-    stop_state: *CommonStopState,
-    finish_trace: *PromptFinishTrace,
-    trace_ctx: TraceContext,
-) !void {
-    debug_trace.eventf(
-        "permission",
-        "automatic_recovery_exhausted",
-        trace_ctx,
-        "blocked_response_groups={d}",
-        .{max_automatic_denial_response_groups},
-    );
-    try deps.push_text(
-        deps.ctx,
-        .{ .assistant_source = automatic_permission_recovery_fallback },
-    );
-    try deps.push_text(
-        deps.ctx,
-        .{ .assistant_rendered = automatic_permission_recovery_fallback },
-    );
-    try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
-
-    const assistant_text = try hooks.prompt.joinVisibleSegments(
-        arena,
-        stop_state.retained_candidate,
-        automatic_permission_recovery_fallback,
-    );
-    stop_state.terminal_materializing = stop_state.retained_candidate != null;
-    try finishCommonAssistantTerminal(
-        deps,
-        finalization,
-        arena,
-        job,
-        current_turn_messages,
-        summary_accumulator,
-        assistant_text,
-        .completed,
-        null,
-        finish_trace,
-        "automatic_permission_recovery",
     );
 }
 
