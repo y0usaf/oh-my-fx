@@ -3671,7 +3671,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         queuedGateway.requests[1]!.headers.get("ai-language-model-id"),
       ).toBe(nextModel);
       expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")))
-        .toMatchObject({ model: nextModel, effort: "auto" });
+        .toMatchObject({ models: { gateway: nextModel }, effort: "auto" });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
@@ -6476,7 +6476,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(2);
       expect(pane).toContain("● 1 tool call · 1 read · 1 failed");
-      expect(pane).toContain("└ Connection interrupted before read_file ran");
+      expect(pane).toContain("└ Connection interrupted before tool call ran");
       expect(pane).not.toContain("● Reading");
     },
     TIMEOUT,

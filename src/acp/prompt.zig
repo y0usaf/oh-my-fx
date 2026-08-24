@@ -39,11 +39,13 @@ const skill_invocation = @import("../core/skills/skill_invocation.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
-const tool_advertisement = @import("../core/tooling/tool_advertisement.zig");
+const tool_projection_mod = @import("../core/tooling/tool_projection.zig");
+const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_admission = @import("../core/tooling/tool_admission.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
@@ -202,10 +204,11 @@ const AcpContext = struct {
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
-        const gateway_features_allowed = model_provider.usesGatewayAuxiliaries(session.provider);
-        if (gateway_features_allowed) {
+        const provider_capabilities = self.state.cfg.provider_set.select(session.provider).capabilities;
+        if (provider_capabilities.fx_search) {
             self.state.web_search_runtime.configure(.{
                 .api_key = session.api_key,
+                .credential_source = session.credential_source,
                 .gateway_team = self.state.gateway_team,
                 .worker_model = session.model,
                 .gateway_retry_count = self.state.cfg.gateway_retry_count,
@@ -229,6 +232,7 @@ const AcpContext = struct {
             .credential_source = session.credential_source,
             .account_id = session.account_id,
             .provider = session.provider,
+            .provider_capabilities = provider_capabilities,
             .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
             .secret_store = self.state.cfg.secret_store,
             .gateway_team = self.state.gateway_team,
@@ -244,11 +248,7 @@ const AcpContext = struct {
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
-            .permission_reviewer_provider = switch (session.provider) {
-                .gateway => self.state.cfg.permission_reviewer_provider,
-                .codex => self.state.cfg.codex_permission_reviewer_provider,
-                .grok => self.state.cfg.grok_permission_reviewer_provider,
-            },
+            .permission_reviewer_provider = self.state.cfg.provider_set.select(session.provider).permission_reviewer,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
             .subagent_caller_id = session.session_id,
@@ -281,7 +281,7 @@ const AcpContext = struct {
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
             .web_search_runtime_ready = false,
-            .web_search_backend = if (gateway_features_allowed) self.state.web_search_runtime.dispatchBackend() else null,
+            .web_search_backend = if (provider_capabilities.fx_search) self.state.web_search_runtime.dispatchBackend() else null,
             .model_capability_resolver = .{
                 .ctx = @ptrCast(self),
                 .resolve_fn = resolveModelCapabilities,
@@ -526,7 +526,7 @@ pub fn handlePrompt(
         recovery_checkpoint = try checkpoint.dupe(alloc);
     }
 
-    var tool_projection = try state.cfg.mode_registry.buildGatewayToolProjection(alloc, activeToolSet(state), captured_mode, .{
+    var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
@@ -603,12 +603,26 @@ pub fn handlePrompt(
         else
             null,
     );
+    if (comptime @import("builtin").os.tag != .wasi) {
+        if (state.cfg.provider_set.select(session.provider).deferred_usage != null) {
+            if (session.credential_source) |source| {
+                session.session_rt.usage.replaceProviderReconciliationCredential(
+                    alloc,
+                    session.provider,
+                    source,
+                    session.account_id,
+                    session.api_key,
+                );
+            }
+        }
+    }
     defer session.session_rt.usage.configureCheckpointSink(null);
     const deps = agentRuntimeDeps(&ctx);
     var agent_config = buildAgentConfig(state, session, .{
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
-        .gateway_tools_json = tool_projection.tools_json,
+        .advertised_tool_names = tool_projection.advertised_names,
+        .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
     });
     agent_config.session_child_capability = if (session.writable) |*writable|
@@ -665,7 +679,7 @@ pub fn runSubagentChild(
         .captured_permission_mode = admission.permission_mode,
     };
     defer ctx.deinitPublishedToolCalls();
-    var child_projection = state.cfg.mode_registry.buildGatewayToolProjection(
+    var child_projection = state.cfg.mode_registry.buildModelToolProjection(
         alloc,
         builtin_tools.advertisement_set,
         captured_mode,
@@ -693,25 +707,13 @@ pub fn runSubagentChild(
     return subagent_agent_adapter.run(.{
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
-        .provider_routes = .{
-            .gateway = .{
-                .agent_stream_provider = server.streamProviderFor(state, .gateway),
-                .permission_reviewer_provider = state.cfg.permission_reviewer_provider,
-            },
-            .codex = .{
-                .agent_stream_provider = server.streamProviderFor(state, .codex),
-                .permission_reviewer_provider = state.cfg.codex_permission_reviewer_provider,
-            },
-            .grok = .{
-                .agent_stream_provider = server.streamProviderFor(state, .grok),
-                .permission_reviewer_provider = state.cfg.grok_permission_reviewer_provider,
-            },
-        },
+        .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skills_prompt_section = bounded_skills.text,
         .explicit_skills_prompt_section = explicit_skills.text,
-        .gateway_tools_json = child_projection.tools_json,
+        .advertised_tool_names = child_projection.advertised_names,
+        .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = state.cfg.context_registry,
         .context_enabled = state.context_enabled,
@@ -746,7 +748,8 @@ fn refreshProjectContext(
 const AgentConfigSections = struct {
     skills_prompt_section: []const u8,
     explicit_skills_prompt_section: []const u8,
-    gateway_tools_json: []const u8,
+    advertised_tool_names: []const []const u8 = &.{},
+    advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8,
 };
 
@@ -758,7 +761,9 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .explicit_skills_prompt_section = sections.explicit_skills_prompt_section,
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
-        .gateway_tools_json = sections.gateway_tools_json,
+        .advertised_tool_names = sections.advertised_tool_names,
+        .advertised_functions = sections.advertised_functions,
+        .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
@@ -1097,10 +1102,11 @@ fn resolveModelCapabilities(
     model: []const u8,
 ) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const session = if (ctx.state.active_session) |*active| active else return model_capabilities.capabilitiesForModel(model);
+    const session = if (ctx.state.active_session) |*active| active else return .{};
+    const bundle = ctx.state.cfg.provider_set.select(session.provider);
     return ctx.state.capability_resolver.resolve(
         ctx.state.alloc,
-        ctx.state.cfg.gateway_provider.model_catalog,
+        bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
         .{
             .access = credentials.catalogAccessForCredentialAndAccount(
                 session.credential_source,
@@ -1112,6 +1118,7 @@ fn resolveModelCapabilities(
             .cancel_flag = &session.cancel_flag,
         },
         model,
+        bundle.fallbackModelCapabilities(model),
     );
 }
 
@@ -1120,7 +1127,11 @@ fn availableModelCapabilities(
     model: []const u8,
 ) model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return ctx.state.capability_resolver.available(model);
+    const session = if (ctx.state.active_session) |*active| active else return .{};
+    return ctx.state.capability_resolver.available(
+        model,
+        ctx.state.cfg.provider_set.select(session.provider).fallbackModelCapabilities(model),
+    );
 }
 
 fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
@@ -3326,6 +3337,7 @@ fn testServerConfig() server.Config {
         .gateway_chat_url = "http://127.0.0.1",
         .gateway_models_path = "/models",
         .gateway_provider = test_builtin_gateway.provider,
+        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{
             .system_prompt = "test",
@@ -3363,7 +3375,7 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
         .api_key = api_key,
         .credential_source = .ai_gateway_api_key,
         .web_search_runtime = @import("../core/tooling/web_search_runtime.zig").Runtime.init(.{
-            .provider = cfg.gateway_provider.web_search,
+            .provider = cfg.provider_set.gateway.fx_search.?,
         }),
         .active_session = .{
             .session_id = session_id,
@@ -4209,14 +4221,11 @@ test "ACP full advertisement includes direct provider search with explicit permi
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("web_search"), .pattern = @constCast("*"), .action = .allow },
     };
-    var projection = try tool_advertisement.buildGatewayToolProjectionForSet(std.testing.allocator, builtin_tools.advertisement_set, .{
+    var projection = try tool_projection_mod.buildModelToolProjectionForSet(std.testing.allocator, builtin_tools.advertisement_set, .{
         .permission_rules = .{ .rules = &rules },
     });
     defer projection.deinit(std.testing.allocator);
-    const json = projection.tools_json;
-
-    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"web_search\"") == null);
-    try std.testing.expect(std.mem.find(u8, json, "gateway.perplexity_search") != null);
+    try std.testing.expect(tool_projection_mod.containsName(projection.advertised_names, "web_search"));
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, projection.custom_guidance);
 }
 
@@ -4242,7 +4251,8 @@ test "ACP prompt agent config carries request options from active session" {
     const config = buildAgentConfig(&state, session, .{
         .skills_prompt_section = "",
         .explicit_skills_prompt_section = "",
-        .gateway_tools_json = "[]",
+        .advertised_tool_names = &.{"read_file"},
+        .advertised_functions = &.{builtin_tools.read_file.model_schema},
         .custom_tool_guidance = "acp custom tool guidance",
     });
 
@@ -4250,15 +4260,15 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
     try std.testing.expectEqual(@as(usize, 17), config.context_limits.project_instruction_file_bytes.effectiveBytes());
     try std.testing.expectEqual(config_runtime.context_limits.Source.command_line, config.context_limits.project_instruction_file_bytes.source);
-    try std.testing.expectEqualStrings("[]", config.gateway_tools_json);
+    try std.testing.expect(tool_projection_mod.containsName(config.advertised_tool_names, "read_file"));
     try std.testing.expectEqualStrings("acp custom tool guidance", config.custom_tool_guidance);
     try std.testing.expectEqualStrings("ACP test model overlay", config.model_prompt_overlay.?);
     var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
     const tool_ctx = ctx.toolContext();
     try std.testing.expect(!tool_ctx.web_search_runtime_ready);
     try std.testing.expect(tool_ctx.web_search_backend != null);
-    try std.testing.expect(state.web_search_runtime.provider.?.execute_fn == state.cfg.gateway_provider.web_search.execute_fn);
-    try std.testing.expect(state.web_search_runtime.provider.?.preferred_backends_fn == state.cfg.gateway_provider.web_search.preferred_backends_fn);
+    try std.testing.expect(state.web_search_runtime.provider.?.execute_fn == state.cfg.provider_set.gateway.fx_search.?.execute_fn);
+    try std.testing.expect(state.web_search_runtime.provider.?.preferred_backends_fn == state.cfg.provider_set.gateway.fx_search.?.preferred_backends_fn);
     try std.testing.expect(tool_ctx.web_fetch_runtime.? == &state.web_fetch_runtime);
     try std.testing.expectEqualStrings("team_123", tool_ctx.gateway_team.?);
     try std.testing.expectEqualStrings("team_123", state.web_search_runtime.gateway_team.?);

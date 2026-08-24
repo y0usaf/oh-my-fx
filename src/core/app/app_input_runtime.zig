@@ -942,6 +942,14 @@ pub fn Runtime(comptime App: type) type {
             if (try full_transcript_rt.routeAction(app, resolved)) return .done;
 
             if (resolved == .paste_start) {
+                if (comptime runtime_profile.allows(App, .native_auth) and
+                    @hasDecl(@TypeOf(app.auth), "signInCodeEntryActive"))
+                {
+                    if (app.auth.signInCodeEntryActive()) {
+                        paste_rt.beginPaste(app, max_input_len);
+                        return .done;
+                    }
+                }
                 if (comptime @hasDecl(@TypeOf(app.subagents), "beginManagerPaste")) {
                     if (app.subagents.isViewActive()) {
                         app.subagents.beginManagerPaste();

@@ -609,6 +609,9 @@ pub fn Bindings(comptime App: type) type {
             if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
                 return app.resolvedModelCapabilities(model);
             }
+            if (comptime @hasDecl(App, "providerSet")) {
+                return app.providerSet().select(provider_runtime.provider(app)).fallbackModelCapabilities(model);
+            }
             return model_capabilities.capabilitiesForModel(model);
         }
 
@@ -616,6 +619,9 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
                 return app.resolvedModelCapabilities(model);
+            }
+            if (comptime @hasDecl(App, "providerSet")) {
+                return app.providerSet().select(provider_runtime.provider(app)).fallbackModelCapabilities(model);
             }
             return model_capabilities.capabilitiesForModel(model);
         }

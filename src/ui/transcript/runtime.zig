@@ -27,6 +27,7 @@ const ui_render = @import("../render.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const captured_command = @import("../../core/tooling/captured_command.zig");
+const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
@@ -2479,6 +2480,46 @@ test "historical deferred tool detail keeps the call without result evidence" {
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, failed_detail.outcome.?);
     try std.testing.expectEqualStrings("ordinary failure", failed_detail.result.?);
     try std.testing.expectEqualStrings("ordinary-failure.txt", failed_detail.result_handle.?);
+}
+
+test "historical permission denial keeps denied outcome without internal result detail" {
+    const alloc = std.testing.allocator;
+    const denial_output = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .denied,
+        "Denied by auto agent pwd",
+        true,
+    );
+    try runtime.attachHistoricalToolDetail(
+        alloc,
+        entry_id,
+        .{
+            .id = "denied-command",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+        },
+        .command,
+        .{
+            .tool_call_id = @constCast("denied-command"),
+            .tool_name = @constCast("terminal"),
+            .status = .failure,
+            .output = @constCast(denial_output),
+            .output_bytes = denial_output.len,
+            .stored_output_bytes = denial_output.len,
+        },
+    );
+
+    const detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqual(types.ToolOutcomeKind.denied, detail.outcome.?);
+    try std.testing.expect(detail.result == null);
+    try std.testing.expect(detail.result_handle == null);
+    try std.testing.expect(detail.command_output_entry_id == null);
 }
 
 test "historical command detail keeps artifact handles after command block attaches" {
@@ -5231,7 +5272,8 @@ pub const TranscriptRuntime = struct {
     ) !void {
         const context_deferred = types.isContextDeferredToolResult(result);
         const deferred = types.isDeferredToolResult(result);
-        const command_artifact_handle = if (!deferred and activity_kind == .command)
+        const permission_denied = tool_result_errors.toolPermissionDenialReason(result.output) != null;
+        const command_artifact_handle = if (!deferred and !permission_denied and activity_kind == .command)
             command_output_runtime.commandArtifactHandleFromResult(result.output)
         else
             null;
@@ -5244,7 +5286,7 @@ pub const TranscriptRuntime = struct {
             activity_kind,
             if (context_deferred)
                 .deferred
-            else if (deferred)
+            else if (deferred or permission_denied)
                 .denied
             else if (result.status == .success or
                 (activity_kind == .command and
@@ -5252,8 +5294,8 @@ pub const TranscriptRuntime = struct {
                 .completed
             else
                 .failed,
-            if (deferred) null else result.output,
-            if (deferred) null else .{
+            if (deferred or permission_denied) null else result.output,
+            if (deferred or permission_denied) null else .{
                 .output_handle = result.output_handle,
                 .preview = result.preview,
                 .output_bytes = result.output_bytes,
@@ -5263,7 +5305,7 @@ pub const TranscriptRuntime = struct {
                 .command_process_presentation = result.command_process_presentation,
             },
             command_artifact_handle,
-            if (deferred) null else command_output_entry_id,
+            if (deferred or permission_denied) null else command_output_entry_id,
         );
     }
 

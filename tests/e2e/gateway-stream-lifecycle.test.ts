@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createServer, type Socket } from "node:net";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -2759,6 +2760,133 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  test.skipIf(process.platform !== "linux")(
+    "a second headless terminal exec survives replacing the running fx binary",
+    async () => {
+      const root = createFixtureRoot("headless-reexec-after-rebuild");
+      const tracePath = join(root.root, "trace.log");
+      const liveBin = join(root.root, "fx");
+      const replacementBin = join(root.root, "fx.next");
+      const parentExePath = join(root.root, "parent-exe.txt");
+      const firstHelperPidPath = join(root.root, "first-helper.pid");
+      const secondHelperPidPath = join(root.root, "second-helper.pid");
+      const firstCallId = "headless_reexec_replace_1";
+      const secondCallId = "headless_reexec_after_replace_2";
+
+      copyFileSync(FX_BIN, liveBin);
+      chmodSync(liveBin, 0o755);
+      copyFileSync("/bin/sh", replacementBin);
+      chmodSync(replacementBin, 0o755);
+
+      let fxPid: number | null = null;
+      let responseIndex = 0;
+      const gateway = startGateway(() => {
+        switch (responseIndex++) {
+          case 0:
+            if (fxPid === null) {
+              return new Response("fx pid unavailable", { status: 500 });
+            }
+            return fakeGatewayToolCall(firstCallId, "terminal", {
+              action: "exec",
+              command: [
+                `printf '%s\\n' "$PPID" > ${JSON.stringify(firstHelperPidPath)}`,
+                `mv -f ${JSON.stringify(replacementBin)} ${JSON.stringify(liveBin)}`,
+                `readlink ${JSON.stringify(`/proc/${fxPid}/exe`)} > ${JSON.stringify(parentExePath)}`,
+                "printf 'first-terminal-exec-ok\\n'",
+              ].join("; "),
+            });
+          case 1:
+            return fakeGatewayToolCall(secondCallId, "terminal", {
+              action: "exec",
+              command: [
+                `printf '%s\\n' "$PPID" > ${JSON.stringify(secondHelperPidPath)}`,
+                "printf 'second-terminal-exec-ok\\n'",
+              ].join("; "),
+            });
+          case 2:
+            return fakeGatewayFinalText("Both terminal commands completed.");
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      });
+      const proc = Bun.spawn([
+        liveBin,
+        "ask",
+        "--json",
+        "--yolo",
+        "--no-save",
+        "Run both terminal commands.",
+      ], {
+        cwd: root.workspace,
+        env: {
+          ...process.env,
+          ...fixtureEnv(root, gateway, tracePath),
+          FX_AUTO_UPGRADE: "0",
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      fxPid = proc.pid;
+
+      try {
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        const json = parseAskJson(stdout);
+        const firstOutput = toolResultOutput(
+          gateway.requests[1]!.body,
+          firstCallId,
+        );
+        const secondOutput = toolResultOutput(
+          gateway.requests[2]!.body,
+          secondCallId,
+        );
+
+        expect(exitCode).toBe(0);
+        expect(json.error).toBeUndefined();
+        expect(json.tool_calls).toEqual([
+          expect.objectContaining({ name: "terminal", status: "success" }),
+          expect.objectContaining({ name: "terminal", status: "success" }),
+        ]);
+        expect(gateway.requestCount()).toBe(3);
+        expect(firstOutput).toContain("first-terminal-exec-ok");
+        expect(secondOutput).toContain("second-terminal-exec-ok");
+        expect(readFileSync(parentExePath, "utf8").trim()).toBe(
+          `${liveBin} (deleted)`,
+        );
+        expect(
+          [stdout, stderr, firstOutput, secondOutput, readFileSync(tracePath, "utf8")]
+            .join("\n"),
+        ).not.toContain("FileNotFound");
+
+        const firstHelperPid = Number.parseInt(
+          readFileSync(firstHelperPidPath, "utf8"),
+          10,
+        );
+        const secondHelperPid = Number.parseInt(
+          readFileSync(secondHelperPidPath, "utf8"),
+          10,
+        );
+        expect(Number.isSafeInteger(firstHelperPid) && firstHelperPid > 0).toBe(
+          true,
+        );
+        expect(Number.isSafeInteger(secondHelperPid) && secondHelperPid > 0).toBe(
+          true,
+        );
+        await waitForProcessExit(firstHelperPid, 3_000);
+        await waitForProcessExit(secondHelperPid, 3_000);
+      } finally {
+        proc.kill("SIGKILL");
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 
   test("SIGTERM drains an active headless terminal command without panic or survivors", async () => {
     const root = createFixtureRoot("headless-sigterm");

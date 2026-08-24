@@ -4133,8 +4133,12 @@ test.skipIf(!tmuxAvailable())(
     function expectDeferredPresentation(scrollback: string): void {
       expect(scrollback).toContain("1 failed");
       expect(scrollback).toContain("1 deferred");
-      expect(scrollback).not.toContain("Context updated");
+      expect(scrollback).toContain(`Context updated ${command}`);
       expect(scrollback).not.toContain("Not executed");
+      expect(scrollback).not.toContain("├ terminal");
+      expect(scrollback).not.toContain("└ terminal");
+      expect(scrollback).not.toContain("├ read_file");
+      expect(scrollback).not.toContain("└ read_file");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
       expect(scrollback).not.toContain(`● Failed ${command}`);
       expect(scrollback).toContain("Read nested/input.txt");
@@ -4185,7 +4189,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("C-o");
       const detail = await active.waitForPane(
         (pane) =>
-          pane.includes(`↻ Context updated ${command}`) &&
+          pane.includes(`Context updated ${command}`) &&
           pane.includes("ordinary-failure-control"),
         TIMEOUT,
       );
@@ -4872,7 +4876,7 @@ test.skipIf(!tmuxAvailable())(
       const sessionId = sessionIdFromHome(home);
 
       await active.waitForText(
-        "Update installed: ctrl+g to reload",
+        "update ready: ctrl+g to reload",
         UPGRADE_TIMEOUT,
       );
       expect(readFileSync(installedFx, "utf8")).toContain(argvLogPath);
@@ -4889,7 +4893,7 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(argvLogPath, "utf8").trim().split("\n")).toEqual([
         installedFx,
       ]);
-      expect(await fresh.capturePane()).not.toContain("Update installed: ctrl+g to reload");
+      expect(await fresh.capturePane()).not.toContain("update ready: ctrl+g to reload");
       await fresh.sendText("/quit");
       expect(await fresh.waitForSessionEnd()).toBe(true);
       await fresh.kill();
@@ -4898,7 +4902,7 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      const updatedNotice = `● 𝒇x has been updated to v${version}`;
+      const updatedNotice = `● fx has been updated to v${version}`;
       await active.waitForText(updatedNotice, TIMEOUT);
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
@@ -4984,7 +4988,7 @@ test.skipIf(!tmuxAvailable())(
       await waitForCommittedSessionMarker(home, "UPGRADE_CORRUPT_INITIAL_DONE");
       const sessionId = sessionIdFromHome(home);
       await active.waitForText(
-        "Update installed: ctrl+g to reload",
+        "update ready: ctrl+g to reload",
         UPGRADE_TIMEOUT,
       );
 
@@ -4996,7 +5000,7 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      await active.waitForText(`● 𝒇x has been updated to v${version}`, TIMEOUT);
+      await active.waitForText(`● fx has been updated to v${version}`, TIMEOUT);
       const resumed = await waitForScrollback(
         active,
         "UPGRADE_CORRUPT_INITIAL_DONE",

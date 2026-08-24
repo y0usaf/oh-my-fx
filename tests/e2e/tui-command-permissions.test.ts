@@ -2499,7 +2499,7 @@ describe("effect-aware command permissions", () => {
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-user-check.txt");
-      const command = `printf user-check > ${JSON.stringify(marker)}`;
+      const command = "printf user-check > classifier-user-check.txt";
       const gateway = startFakeGateway(
         [
           toolCall(command),
@@ -2534,6 +2534,9 @@ describe("effect-aware command permissions", () => {
       expect(existsSync(marker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(pane).not.toContain("Auto agent denied");
+      expect(pane).toContain("1 denied");
+      expect(pane).toContain(`Safety caution ${command}`);
+      expect(pane).not.toContain("└ terminal");
       expect(gateway.requests).toHaveLength(2);
       const permissionResultRequest = gateway.requests[1]!.body;
       expect(permissionResultRequest).toContain("tool_review_held");
@@ -2544,12 +2547,41 @@ describe("effect-aware command permissions", () => {
       expect(trace).toContain("decision=deny approval_source=denied");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
+      const sessionId = sessionIdFromHome(root);
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+
+      rmSync(
+        join(root.home, ".fx", "sessions", sessionId, "resume-view.bin"),
+        { force: true },
+      );
+      activeSession = await TmuxSession.create({
+        cmd: `${FX_BIN} resume ${sessionId}`,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, { TMPDIR: root.root }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      const resumedPane = await activeSession.waitForPane(
+        (value) => value.includes(`Safety caution ${command}`),
+        TIMEOUT,
+      );
+      expect(resumedPane).toContain("1 denied");
+      expect(resumedPane).not.toContain("└ terminal");
+      expect(resumedPane).not.toContain("tool_permission_denied");
+      expect(gateway.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd()).toBe(true);
       await activeSession.kill();
       activeSession = null;
     },
-    TIMEOUT,
+    TIMEOUT * 2,
   );
 
   test.skipIf(!tmuxAvailable())(

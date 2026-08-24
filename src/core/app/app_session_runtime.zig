@@ -5,6 +5,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
+const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -32,6 +33,7 @@ const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const captured_command = @import("../tooling/captured_command.zig");
+const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_log = @import("../session/session_log.zig");
 const session_resume_view = @import("../session/session_resume_view.zig");
@@ -348,15 +350,10 @@ pub const SessionPreferencePatch = struct {
             .effort = self.effort,
             .fast_mode = self.fast_mode,
         };
-        if (self.provider) |provider| {
-            switch (provider) {
-                .gateway => patch.model = self.model,
-                .codex => patch.codex_model = self.model,
-                .grok => patch.grok_model = self.model,
-            }
-        } else {
-            patch.model = self.model;
-        }
+        if (self.model) |model| patch.model_preference = .{
+            .provider = self.provider orelse .gateway,
+            .model = model,
+        };
         return patch;
     }
 };
@@ -1826,20 +1823,20 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn startResumedSessionReconciliation(app: *App) void {
-            if (comptime @hasField(App, "auth")) {
-                if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource")) {
-                    if (app.auth.credentialSource() == .chatgpt_subscription or app.auth.credentialSource() == .grok_subscription) {
-                        app.session.usage.clearReconciliationCredential();
-                        return;
-                    }
-                }
-                if (app.auth.apiKey()) |api_key| {
-                    app.session.usage.startReconciliation(
-                        app.alloc,
-                        api_key,
-                    );
-                }
-            }
+            if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
+            if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
+                !@hasDecl(@TypeOf(app.auth), "accountId") or
+                !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
+
+            const source = app.auth.credentialSource() orelse return;
+            const credential = app.auth.apiKey() orelse return;
+            app.session.usage.replaceProviderReconciliationCredential(
+                app.alloc,
+                provider_runtime.provider(app),
+                source,
+                app.auth.accountId(),
+                credential,
+            );
         }
 
         pub fn resumeSelectedSession(app: *App) !bool {
@@ -3688,7 +3685,7 @@ pub fn Runtime(comptime App: type) type {
                 .upgrade => |version| {
                     const body = try std.fmt.allocPrint(
                         app.alloc,
-                        "𝒇x has been updated to v{s}",
+                        "fx has been updated to v{s}",
                         .{version},
                     );
                     defer app.alloc.free(body);
@@ -3946,6 +3943,7 @@ pub fn Runtime(comptime App: type) type {
             );
             const context_deferred = types.isContextDeferredToolResult(result);
             const deferred = types.isDeferredToolResult(result);
+            const permission_denial_reason = tool_result_errors.toolPermissionDenialReason(result.output);
             const process_ran = result.command_process_presentation != null;
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
@@ -3959,6 +3957,14 @@ pub fn Runtime(comptime App: type) type {
                         types.context_deferred_tool_status_label
                     else
                         types.deferred_tool_result_output,
+                    &.{},
+                )
+            else if (permission_denial_reason) |reason|
+                try app.describeToolActionDeniedWithAdvertised(
+                    action_arena.allocator(),
+                    call,
+                    null,
+                    tool_admission.permissionDeniedStatusLabel(reason),
                     &.{},
                 )
             else if (result.status == .success or process_ran)
@@ -3981,7 +3987,7 @@ pub fn Runtime(comptime App: type) type {
 
             const outcome: types.ToolOutcomeKind = if (context_deferred)
                 .deferred
-            else if (deferred)
+            else if (deferred or permission_denial_reason != null)
                 .denied
             else if (result.status == .success or process_ran)
                 .completed
@@ -3992,7 +3998,7 @@ pub fn Runtime(comptime App: type) type {
                 outcome,
                 action,
             );
-            if (!is_command or deferred) {
+            if (!is_command or deferred or permission_denial_reason != null) {
                 try sink.attachHistoricalToolDetail(entry_id, call, result);
                 return;
             }
@@ -6567,6 +6573,83 @@ test "execution replay renders persisted permission feedback after its tool resu
     try std.testing.expect(app.cards.items[0].has_prior_turns);
 }
 
+test "execution replay preserves permission denial reasons" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const reasons = [_]types.ToolPermissionDenialReason{
+        .user_denied,
+        .auto_denied,
+        .policy_denied,
+        .permission_required,
+        .review_caution,
+        .review_unavailable,
+    };
+    const call_ids = [_][]const u8{
+        "call_user_denied",
+        "call_auto_denied",
+        "call_policy_denied",
+        "call_permission_required",
+        "call_review_caution",
+        "call_review_unavailable",
+    };
+    var outputs: [reasons.len][]u8 = undefined;
+    var allocated_outputs: usize = 0;
+    defer for (outputs[0..allocated_outputs]) |output| alloc.free(output);
+    var calls: [reasons.len]types.ToolCall = undefined;
+    var results: [reasons.len]types.PersistedToolResult = undefined;
+    for (reasons, 0..) |reason, index| {
+        outputs[index] = switch (reason) {
+            .review_caution, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
+                alloc,
+                "run_command",
+                reason,
+                null,
+            ),
+            .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
+                alloc,
+                "run_command",
+                reason,
+            ),
+        };
+        allocated_outputs += 1;
+        calls[index] = .{
+            .id = call_ids[index],
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"pwd\"}",
+        };
+        results[index] = .{
+            .tool_call_id = @constCast(call_ids[index]),
+            .tool_name = @constCast("run_command"),
+            .status = .failure,
+            .output = outputs[index],
+            .output_bytes = outputs[index].len,
+            .stored_output_bytes = outputs[index].len,
+        };
+    }
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .denied, .denied, .denied, .denied, .denied, .denied },
+        app.completed_tool_outcomes.items,
+    );
+    try std.testing.expectEqual(@as(usize, 6), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Denied by auto agent run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[2]);
+    try std.testing.expectEqualStrings("● Permission required run_command\n", app.completed_tool_statuses.items[3]);
+    try std.testing.expectEqualStrings("● Safety caution run_command\n", app.completed_tool_statuses.items[4]);
+    try std.testing.expectEqualStrings("● Review unavailable run_command\n", app.completed_tool_statuses.items[5]);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+}
+
 test "execution replay writes completed status before saved command output" {
     const line_alloc = std.testing.allocator;
     var line_app = try TestApp.init(line_alloc, "/workspace");
@@ -7426,7 +7509,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("inspect file", context[1].assistant.user.text);
     try std.testing.expectEqualStrings("run server", context[2].background_command.user.text);
     try std.testing.expectEqual(@as(usize, 3), app.notices.items.len);
-    try std.testing.expectEqualStrings("● 𝒇x has been updated to v9.9.9", app.notices.items[0]);
+    try std.testing.expectEqualStrings("● fx has been updated to v9.9.9", app.notices.items[0]);
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "older context") != null);
     try std.testing.expect(std.mem.find(u8, app.notices.items[2], "Re-check runtime context") != null);
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
@@ -7497,7 +7580,7 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
             .assistant_source = @constCast("Partial output before EOF."),
             .cause = .response_interrupted,
             .action = .continuing_response,
-            .route_model = @constCast("saved/model"),
+            .authority = .{ .provider = .gateway, .model = @constCast("saved/model") },
             .requested_fast_mode = false,
             .fast_mode = false,
             .max_provider_attempts = 10,
@@ -8921,10 +9004,10 @@ test "combined preference patch writes user defaults cleans legacy fields and ap
 
     var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, paths.workspace);
     defer detailed.deinit(alloc);
-    try std.testing.expectEqualStrings("user/model", detailed.settings.model.?);
+    try std.testing.expectEqualStrings("user/model", detailed.settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), detailed.settings.effort.?);
     try std.testing.expectEqual(false, detailed.settings.fast_mode.?);
-    try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.model);
+    try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.models.get(.gateway));
     try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.effort);
     try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.fast_mode);
 }
@@ -9761,15 +9844,19 @@ test "renameActiveSession persists the title to the sidecar and session index" {
 }
 
 const ReconciliationOriginUsage = struct {
-    started: usize = 0,
-    cleared: usize = 0,
+    replaced_provider: ?model_provider.ProviderId = null,
+    replaced_source: ?types.CredentialSource = null,
 
-    fn startReconciliation(self: *@This(), _: Allocator, _: []const u8) void {
-        self.started += 1;
-    }
-
-    fn clearReconciliationCredential(self: *@This()) void {
-        self.cleared += 1;
+    fn replaceProviderReconciliationCredential(
+        self: *@This(),
+        _: Allocator,
+        provider: model_provider.ProviderId,
+        source: types.CredentialSource,
+        _: ?[]const u8,
+        _: []const u8,
+    ) void {
+        self.replaced_provider = provider;
+        self.replaced_source = source;
     }
 };
 
@@ -9783,28 +9870,40 @@ const ReconciliationOriginAuth = struct {
     fn apiKey(_: *const @This()) ?[]const u8 {
         return "origin-bound-token";
     }
+
+    fn accountId(_: *const @This()) ?[]const u8 {
+        return null;
+    }
+
+    fn gatewayTeam(_: *const @This()) ?[]const u8 {
+        return null;
+    }
 };
 
 const ReconciliationOriginApp = struct {
     alloc: Allocator = std.testing.allocator,
     auth: ReconciliationOriginAuth,
     session: struct { usage: ReconciliationOriginUsage = .{} } = .{},
+    selected_provider: model_provider.ProviderId,
+    selected_model: std.ArrayList(u8) = .empty,
 };
 
-test "resumed ChatGPT sessions never start Gateway usage reconciliation" {
+test "resumed sessions install provider-scoped usage reconciliation authority" {
     var chatgpt = ReconciliationOriginApp{
         .auth = .{ .source = .chatgpt_subscription },
+        .selected_provider = .codex,
     };
     Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&chatgpt);
-    try std.testing.expectEqual(@as(usize, 0), chatgpt.session.usage.started);
-    try std.testing.expectEqual(@as(usize, 1), chatgpt.session.usage.cleared);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, chatgpt.session.usage.replaced_provider.?);
+    try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, chatgpt.session.usage.replaced_source.?);
 
     var gateway = ReconciliationOriginApp{
         .auth = .{ .source = .ai_gateway_api_key },
+        .selected_provider = .gateway,
     };
     Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
-    try std.testing.expectEqual(@as(usize, 1), gateway.session.usage.started);
-    try std.testing.expectEqual(@as(usize, 0), gateway.session.usage.cleared);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
+    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
 }
 
 test "ensureCachedSessionTitle derives from the first prompt and then freezes" {

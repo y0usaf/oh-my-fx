@@ -18,7 +18,7 @@ const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
-const gateway_schema = @import("gateway_schema.zig");
+const model_tool_schema = @import("model_tool_schema.zig");
 const host = @import("../hosts/host.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
@@ -335,16 +335,16 @@ pub const ReadsOnlyFn = *const fn (ToolInput) bool;
 /// Function pointer classifying whether an input is irreversible.
 pub const IrreversibleFn = *const fn (ToolInput) bool;
 
-pub const GatewayAdvertisementError = std.mem.Allocator.Error || std.Io.Writer.Error || error{
+pub const ProviderAdvertisementError = std.mem.Allocator.Error || std.Io.Writer.Error || error{
     InvalidWebSearchBackend,
     ConflictingDomainFilters,
     InvalidGatewayAdvertisement,
 };
 
-pub const WriteGatewayAdvertisementFn = *const fn (
+pub const WriteProviderAdvertisementFn = *const fn (
     std.mem.Allocator,
     *std.Io.Writer,
-) GatewayAdvertisementError!void;
+) ProviderAdvertisementError!void;
 
 pub const LabelArgKind = enum {
     none,
@@ -425,8 +425,8 @@ pub const PresentationFn = *const fn (std.json.ObjectMap) ?CallPresentation;
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
-    gateway_schema: gateway_schema.FunctionSchema,
-    write_gateway_advertisement_fn: ?WriteGatewayAdvertisementFn = null,
+    model_schema: model_tool_schema.FunctionSchema,
+    write_provider_advertisement_fn: ?WriteProviderAdvertisementFn = null,
     /// Set when the provider runs the tool instead of fx dispatch. Such a tool
     /// never reaches a call-time permission check, so advertisement is its only
     /// enforcement point and requires an already-settled allow.
@@ -1076,7 +1076,7 @@ fn countWebSearchExecution(ctx: DispatchContext, _: ToolInput) DispatchError!Too
 const mock_tool = Tool{
     .name = "mock_tool",
     .description = "Mock tool used by dispatch tests.",
-    .gateway_schema = .{
+    .model_schema = .{
         .name = "mock_tool",
         .description = "Mock tool used by dispatch tests.",
     },
@@ -1159,7 +1159,7 @@ test "toolLabelValue reads the label field named by registered metadata" {
     const labeled_tool = Tool{
         .name = "labeled_tool",
         .description = "Labeled mock tool.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = "labeled_tool",
             .description = "Labeled mock tool.",
         },
@@ -1180,7 +1180,7 @@ test "validateRegisteredToolCall distinguishes unregistered valid and rejected c
     const rejecting_tool = Tool{
         .name = "rejecting_tool",
         .description = "Rejecting mock tool.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = "rejecting_tool",
             .description = "Rejecting mock tool.",
         },
@@ -1253,7 +1253,7 @@ test "dispatchToolCall materializes validate failure" {
     const rejecting_tool = Tool{
         .name = "rejecting_tool",
         .description = "Rejecting mock tool.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = "rejecting_tool",
             .description = "Rejecting mock tool.",
         },
@@ -1351,7 +1351,7 @@ test "dispatchToolCall rejects unavailable web_search before permission or execu
     const web_search = Tool{
         .name = "web_search",
         .description = "Web search dispatch fixture.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = "web_search",
             .description = "Web search dispatch fixture.",
         },
@@ -1397,7 +1397,7 @@ test "dispatchToolCall traces denied web_search query without secrets or executi
     const web_search = Tool{
         .name = "web_search",
         .description = "Web search dispatch fixture.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = "web_search",
             .description = "Web search dispatch fixture.",
         },

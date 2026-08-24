@@ -9,7 +9,7 @@ const mcp_contract = @import("mcp_contract.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_auth_store = @import("mcp_auth_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const gateway_schema = @import("../tooling/gateway_schema.zig");
+const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
@@ -11264,7 +11264,7 @@ fn buildToolSchemaJsonWithLimitMarker(
     else
         try alloc.dupe(u8, encoded_description);
     defer alloc.free(merged_description);
-    return gateway_schema.dynamicFunctionSchemaJsonAlloc(
+    return model_tool_schema.dynamicFunctionSchemaJsonAlloc(
         alloc,
         tool.prefixed_name,
         merged_description,
@@ -18301,7 +18301,7 @@ test "MCP exact selection returns one executable schema by prefixed name" {
     try std.testing.expect(std.mem.find(u8, schema, "\"name\":\"mcp_fs_read\"") != null);
     try std.testing.expect(std.mem.find(u8, schema, "\"inputSchema\"") != null);
     try std.testing.expect(std.mem.find(u8, schema, "instruction tail") != null);
-    try std.testing.expect(std.mem.find(u8, schema, gateway_schema.truncation_marker) == null);
+    try std.testing.expect(std.mem.find(u8, schema, model_tool_schema.truncation_marker) == null);
     try std.testing.expect((try runtime.toolSchemaJsonByName(alloc, "mcp_missing", .{}, .{})) == null);
 }
 

@@ -4550,12 +4550,19 @@ const CoordinatorTestApp = struct {
     }
 
     pub fn resolvedModelCapabilities(self: *CoordinatorTestApp, model: []const u8) model_capabilities.Capabilities {
+        const fallback = model_capabilities.Capabilities{
+            .prompt_caching = true,
+            .context_window = 1_000_000,
+        };
         if (self.gateway_metadata_model) |metadata_model| {
             if (std.mem.eql(u8, metadata_model, model)) {
-                return model_capabilities.resolveCapabilities(model, self.gateway_metadata);
+                return model_capabilities.mergeCapabilities(
+                    fallback,
+                    self.gateway_metadata,
+                );
             }
         }
-        return model_capabilities.capabilitiesForModel(model);
+        return fallback;
     }
 
     fn isFileIndexLoading(_: *CoordinatorTestApp) bool {

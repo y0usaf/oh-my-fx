@@ -12,12 +12,16 @@ const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const gateway_client = @import("../gateway/client.zig");
-const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
-const gateway_json = @import("../core/gateway/gateway_json.zig");
+const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
+const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
+const provider_catalog = @import("../core/auth/provider_catalog.zig");
+const credential_authority = @import("../core/auth/credential_authority.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const vercel_model_policy = @import("../gateway/vercel_model_policy.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
 const shared_types = @import("../core/shared/types.zig");
@@ -25,8 +29,7 @@ const session_usage = @import("../core/session/session_usage.zig");
 const web_search_contract = @import("../core/tooling/web_search_contract.zig");
 const web_search_policy = @import("../core/tooling/web_search_policy.zig");
 const web_search_provider = @import("../core/tooling/web_search_provider.zig");
-const gateway_schema = @import("../core/tooling/gateway_schema.zig");
-const tool_advertisement = @import("../core/tooling/tool_advertisement.zig");
+const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
 
@@ -105,6 +108,10 @@ pub const chat_url_provider = gateway_provider.ChatUrlProvider{
     .resolve_fn = resolveChatUrlForProvider,
 };
 
+pub fn agentChatUrl() []const u8 {
+    return resolveChatUrl(default_chat_url, io_mod.getenv(chat_url_env));
+}
+
 pub const cli_model_catalog_provider = gateway_provider.CliModelCatalogProvider{
     .fetch_fn = fetchCliModelCatalog,
 };
@@ -124,38 +131,47 @@ pub const oauth_transport_provider = oauth_transport.Provider{
 pub const generation_usage_provider = gateway_generation_usage.provider;
 
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
-    .build_fn = buildAgentRequest,
     .stream_fn = streamAgentCompletion,
 };
 
-pub const provider = gateway_provider.Provider{
+pub const provider_bundle = provider_set.Bundle{
+    .capabilities = .{ .fx_search = true, .vision_fallback = true, .deferred_usage = true },
+    .presentation = provider_catalog.find(.gateway),
+    .auth_strategy = .vercel,
+    .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
     .agent_stream = agent_stream_provider,
+    .cli_model_catalog = cli_model_catalog_provider,
+    .model_catalog = model_catalog_provider,
+    .permission_reviewer = permission_reviewer.provider,
+    .deferred_usage = generation_usage_provider,
+    .credits = credits_provider,
+    .fx_search = default_web_search_provider,
+};
+
+pub const provider = gateway_provider.Provider{
     .oauth_transport = oauth_transport_provider,
     .chat_url = chat_url_provider,
-    .cli_model_catalog = cli_model_catalog_provider,
-    .credits = credits_provider,
-    .generation_usage = generation_usage_provider,
-    .web_search = default_web_search_provider,
-    .model_catalog = model_catalog_provider,
 };
 
 pub fn buildAgentRequest(
-    _: ?*anyopaque,
     alloc: Allocator,
-    request: agent_stream_provider_contract.BuildRequest,
+    request: agent_stream_provider_contract.RequestData,
 ) anyerror![]u8 {
-    const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
+    const budget: ?vercel_protocol.BuildBudget = if (request.budget) |value|
         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
     else
         null;
     if (budget) |active| try active.check();
 
+    const tools_json = try buildAgentToolsJson(alloc, request);
+    defer alloc.free(tools_json);
+
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
             return error.MissingStructuredResponseFormat;
-        const body = try gateway_json.buildGatewayRequestBodyWithVerifiedImagesAndBudget(
+        const body = try vercel_protocol.buildGatewayRequestBodyWithVerifiedImagesAndBudget(
             alloc,
-            request.serialized_tools,
+            tools_json,
             request.messages,
             images,
             request.provider_options,
@@ -163,7 +179,7 @@ pub fn buildAgentRequest(
             .{
                 .name = response_format.name,
                 .description = response_format.description,
-                .schema_json = response_format.schema_json,
+                .schema = response_format.schema,
             },
             budget orelse .{},
         );
@@ -171,11 +187,11 @@ pub fn buildAgentRequest(
     }
     if (request.response_format != null) return error.StructuredResponseRequiresVerifiedImages;
 
-    if (request.vision_mode == .unavailable and request.selected_dynamic_tool_schemas.len == 0) {
+    if (request.vision_mode != .required) {
         const body = if (budget) |active|
-            gateway_json.buildGatewayRequestBodyWithOptionsAndBudget(
+            vercel_protocol.buildGatewayRequestBodyWithOptionsAndBudget(
                 alloc,
-                request.serialized_tools,
+                tools_json,
                 request.messages,
                 request.provider_options,
                 request.tool_choice,
@@ -183,9 +199,9 @@ pub fn buildAgentRequest(
                 active,
             )
         else
-            gateway_json.buildGatewayRequestBodyWithOptionsAndOutputLimit(
+            vercel_protocol.buildGatewayRequestBodyWithOptionsAndOutputLimit(
                 alloc,
-                request.serialized_tools,
+                tools_json,
                 request.messages,
                 request.provider_options,
                 request.tool_choice,
@@ -193,18 +209,10 @@ pub fn buildAgentRequest(
             );
         return finalizeAgentRequestBody(alloc, request.model, try body);
     }
-
-    const vision_schema = if (request.vision_mode != .unavailable)
-        try writeVisionGatewaySchema(alloc, request.tool_registry)
-    else
-        null;
-    defer if (vision_schema) |schema| alloc.free(schema);
 
     if (request.vision_mode == .required) {
-        const tools_json = try std.fmt.allocPrint(alloc, "[{s}]", .{vision_schema.?});
-        defer alloc.free(tools_json);
         const body = if (budget) |active|
-            gateway_json.buildGatewayRequiredToolRequestBodyWithOptionsAndBudget(
+            vercel_protocol.buildGatewayRequiredToolRequestBodyWithOptionsAndBudget(
                 alloc,
                 tools_json,
                 request.messages,
@@ -213,7 +221,7 @@ pub fn buildAgentRequest(
                 active,
             )
         else
-            gateway_json.buildGatewayRequiredToolRequestBodyWithOptionsAndOutputLimit(
+            vercel_protocol.buildGatewayRequiredToolRequestBodyWithOptionsAndOutputLimit(
                 alloc,
                 tools_json,
                 request.messages,
@@ -223,36 +231,90 @@ pub fn buildAgentRequest(
         return finalizeAgentRequestBody(alloc, request.model, try body);
     }
 
-    var schemas: std.ArrayList([]const u8) = .empty;
-    defer schemas.deinit(alloc);
-    try schemas.appendSlice(alloc, request.selected_dynamic_tool_schemas);
-    if (vision_schema) |schema| try schemas.append(alloc, schema);
-    const tools_json = try tool_advertisement.buildGatewayToolsJsonWithSelectedDynamicSchemas(
-        alloc,
-        request.serialized_tools,
-        schemas.items,
+    unreachable;
+}
+
+fn resolveGatewayProviderOptions(
+    model: []const u8,
+    effort: shared_types.ReasoningEffort,
+    fast_mode: bool,
+) model_capabilities.ResolvedProviderOptions {
+    return model_capabilities.resolveProviderOptionsForCapabilities(
+        vercel_model_policy.capabilitiesForModel(model),
+        effort,
+        fast_mode,
     );
-    defer alloc.free(tools_json);
-    const body = if (budget) |active|
-        gateway_json.buildGatewayRequestBodyWithOptionsAndBudget(
-            alloc,
-            tools_json,
-            request.messages,
-            request.provider_options,
-            request.tool_choice,
-            request.max_output_tokens,
-            active,
-        )
-    else
-        gateway_json.buildGatewayRequestBodyWithOptionsAndOutputLimit(
-            alloc,
-            tools_json,
-            request.messages,
-            request.provider_options,
-            request.tool_choice,
-            request.max_output_tokens,
-        );
-    return finalizeAgentRequestBody(alloc, request.model, try body);
+}
+
+fn buildAgentToolsJson(
+    alloc: Allocator,
+    request: agent_stream_provider_contract.RequestData,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeByte('[');
+    var first = true;
+
+    if (request.vision_mode == .required) {
+        const vision = request.tools.registry.lookup("vision") orelse
+            return error.VisionToolNotRegistered;
+        try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, vision.model_schema);
+        try out.writer.writeByte(']');
+        return out.toOwnedSlice();
+    }
+
+    for (request.tools.advertised_names) |name| {
+        if (!first) try out.writer.writeByte(',');
+        first = false;
+        if (request.tools.advertisedFunction(name)) |function| {
+            try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, function);
+        } else {
+            const tool = request.tools.registry.lookup(name) orelse return error.AdvertisedToolNotRegistered;
+            const write_advertisement = tool.write_provider_advertisement_fn orelse
+                return error.AdvertisedToolSchemaMissing;
+            try write_advertisement(alloc, &out.writer);
+        }
+    }
+    for (request.tools.additional_functions) |tool| {
+        if (toolNameSelected(request.tools.advertised_names, tool.name)) continue;
+        if (!first) try out.writer.writeByte(',');
+        first = false;
+        try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, tool);
+    }
+    for (request.tools.selected_dynamic) |tool| {
+        if (toolNameSelected(request.tools.advertised_names, tool.name)) continue;
+        if (!first) try out.writer.writeByte(',');
+        first = false;
+        try writeDynamicFunctionTool(&out.writer, tool);
+    }
+    if (request.vision_mode == .optional and
+        !toolNameSelected(request.tools.advertised_names, "vision"))
+    {
+        const vision = request.tools.registry.lookup("vision") orelse
+            return error.VisionToolNotRegistered;
+        if (!first) try out.writer.writeByte(',');
+        try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, vision.model_schema);
+    }
+    try out.writer.writeByte(']');
+    return out.toOwnedSlice();
+}
+
+fn toolNameSelected(names: []const []const u8, expected: []const u8) bool {
+    for (names) |name| if (std.mem.eql(u8, name, expected)) return true;
+    return false;
+}
+
+fn writeDynamicFunctionTool(
+    writer: *std.Io.Writer,
+    tool: agent_stream_provider_contract.DynamicFunctionTool,
+) !void {
+    try writer.writeAll("{\"type\":\"function\",\"name\":");
+    try std.json.Stringify.value(tool.name, .{}, writer);
+    try writer.writeAll(",\"description\":");
+    try std.json.Stringify.value(tool.description, .{}, writer);
+    try writer.writeAll(",\"inputSchema\":");
+    try std.json.Stringify.value(tool.input_schema, .{}, writer);
+    try writer.writeByte('}');
 }
 
 fn finalizeAgentRequestBody(
@@ -263,7 +325,7 @@ fn finalizeAgentRequestBody(
     if (!std.mem.eql(u8, model, "zai/glm-5.2")) return body;
 
     errdefer alloc.free(body);
-    const identified = try gateway_json.withRequestUserAgent(
+    const identified = try vercel_protocol.withRequestUserAgent(
         alloc,
         body,
         gateway_client.user_agent,
@@ -272,25 +334,13 @@ fn finalizeAgentRequestBody(
     return identified;
 }
 
-fn writeVisionGatewaySchema(
-    alloc: Allocator,
-    registry: tool_dispatch.Registry,
-) ![]u8 {
-    const vision_tool = registry.lookup("vision") orelse return error.VisionToolNotRegistered;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try gateway_schema.writeBuiltinFunctionSchema(alloc, &out.writer, vision_tool.gateway_schema);
-    return out.toOwnedSlice();
-}
-
 test "agent request builder keeps default reasoning silent and emits output limit" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildAgentRequest(std.testing.allocator, .{
         .model = "anthropic/claude-opus-4.8",
-        .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .auto,
-        .provider_options = model_capabilities.resolveProviderOptions(
+        .provider_options = resolveGatewayProviderOptions(
             "anthropic/claude-opus-4.8",
             .auto,
             false,
@@ -316,12 +366,11 @@ test "agent request builder scopes the product user agent to GLM 5.2" {
     };
 
     for (cases) |case| {
-        const body = try agent_stream_provider.build(alloc, .{
+        const body = try buildAgentRequest(alloc, .{
             .model = case.model,
-            .serialized_tools = "[]",
             .messages = &messages,
             .tool_choice = .auto,
-            .provider_options = model_capabilities.resolveProviderOptions(case.model, .auto, false),
+            .provider_options = resolveGatewayProviderOptions(case.model, .auto, false),
         });
         defer alloc.free(body);
 
@@ -342,14 +391,23 @@ test "agent request builder scopes the product user agent to GLM 5.2" {
 
 test "agent request builder overlays selected dynamic schemas" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    const selected_schema = "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}";
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    var selected_schema = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"type\":\"object\",\"properties\":{}}",
+        .{},
+    );
+    defer selected_schema.deinit();
+    const body = try buildAgentRequest(std.testing.allocator, .{
         .model = "anthropic/claude",
-        .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .auto,
-        .selected_dynamic_tool_schemas = &.{selected_schema},
-        .provider_options = model_capabilities.resolveProviderOptions(
+        .tools = .{ .selected_dynamic = &.{.{
+            .name = "mcp_fs_read",
+            .description = "Read",
+            .input_schema = selected_schema.value,
+        }} },
+        .provider_options = resolveGatewayProviderOptions(
             "anthropic/claude",
             .auto,
             false,
@@ -384,7 +442,7 @@ test "required vision request contains only the registered vision schema" {
     const vision_tool = tool_dispatch.Tool{
         .name = "vision",
         .description = "registry-owned vision schema sentinel",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = "vision",
             .description = "registry-owned vision schema sentinel",
         },
@@ -395,15 +453,33 @@ test "required vision request contains only the registered vision schema" {
         .irreversible_fn = Callbacks.isIrreversible,
     };
     const registered_tools = [_]tool_dispatch.Tool{vision_tool};
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const read_file_schema = model_tool_schema.FunctionSchema{
+        .name = "read_file",
+        .description = "Read",
+        .input_schema = .{},
+    };
+    var dynamic_schema = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"type\":\"object\",\"properties\":{}}",
+        .{},
+    );
+    defer dynamic_schema.deinit();
+    const body = try buildAgentRequest(std.testing.allocator, .{
         .model = "zai/glm-5.2",
-        .tool_registry = .{ .tools = registered_tools[0..] },
-        .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]",
+        .tools = .{
+            .registry = .{ .tools = registered_tools[0..] },
+            .additional_functions = &.{read_file_schema},
+            .selected_dynamic = &.{.{
+                .name = "mcp_fs_read",
+                .description = "Read",
+                .input_schema = dynamic_schema.value,
+            }},
+        },
         .messages = &messages,
         .tool_choice = .none,
-        .selected_dynamic_tool_schemas = &.{"{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"},
         .vision_mode = .required,
-        .provider_options = model_capabilities.resolveProviderOptions(
+        .provider_options = resolveGatewayProviderOptions(
             "zai/glm-5.2",
             .auto,
             false,
@@ -423,34 +499,38 @@ test "required vision request contains only the registered vision schema" {
 fn streamAgentCompletion(
     _: ?*anyopaque,
     alloc: Allocator,
-    request: agent_stream_provider_contract.Request,
+    request: agent_stream_provider_contract.ModelRequest,
 ) anyerror!agent_stream_provider_contract.Result {
-    if (request.credential_source == .chatgpt_subscription or request.credential_source == .grok_subscription) {
+    if (request.credential.source == .chatgpt_subscription or request.credential.source == .grok_subscription) {
         return error.SubscriptionCredentialCannotAuthorizeGateway;
     }
+    const payload = try buildAgentRequest(alloc, request.data());
+    defer alloc.free(payload);
+    var events = request.events;
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
-            .api_key = request.api_key,
-            .team = request.team,
+            .api_key = request.credential.secret,
+            .team = request.credential.tenant,
             .session_id = request.session_id,
             .model = request.model,
             .retry_count = request.retry_count,
-            .chat_url = request.chat_url,
-            .payload = request.payload,
+            .chat_url = agentChatUrl(),
+            .payload = payload,
             .trace_ctx = request.trace_ctx,
             .content_capture_limit = request.content_capture_limit,
             .delivery = request.delivery,
-            .on_reasoning_chunk = request.on_reasoning_chunk,
-            .on_tool_input_chunk = request.on_tool_input_chunk,
+            .admission = request.admission,
+            .on_reasoning_chunk = EventBridge.reasoning,
+            .on_tool_input_chunk = EventBridge.toolInput,
             .provider_attempt_owner = switch (request.provider_attempt_owner) {
                 .transport => .transport,
                 .agent => .agent,
             },
         },
-        request.callback_ctx,
-        request.on_content_chunk,
-        request.on_tool_start,
+        &events,
+        EventBridge.content,
+        EventBridge.toolStart,
         request.cancel_flag,
     ) catch |err| {
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
@@ -460,19 +540,92 @@ fn streamAgentCompletion(
         return err;
     };
     const diagnostics = if (result.status == .ok)
-        gateway_failure_diagnostics.FailureDiagnostics{}
+        vercel_failure_diagnostics.FailureDiagnostics{}
     else
-        gateway_failure_diagnostics.collect(alloc, request.payload, result.err_body);
-    return .{
-        .status = result.status,
-        .completion = result.completion,
-        .err_body = result.err_body,
-        .generation_origin = gateway_client.generationBaseUrl(),
-        .reconcile_generation_usage = true,
-        .failure_schema = diagnostics.schema,
-        .failure_request_shape = diagnostics.request_shape,
+        vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
+    if (result.status != .ok) return .{ .failed = .{
+        .kind = failureKind(result.status),
+        .detail = result.err_body,
+        .diagnostics = .{
+            .schema = diagnostics.schema,
+            .request_shape = diagnostics.request_shape,
+        },
         .retry_after_seconds = result.retry_after_seconds,
         .ownership = .owned,
+    } };
+    return .{ .completed = .{
+        .completion = result.completion,
+        .usage = gatewayUsageOutcome(request, result.completion),
+        .ownership = .owned,
+    } };
+}
+
+fn gatewayUsageOutcome(
+    request: agent_stream_provider_contract.ModelRequest,
+    completion: shared_types.ModelCompletion,
+) agent_stream_provider_contract.UsageOutcome {
+    const reference = gatewayUsageReference(request, completion) orelse
+        return .{ .unavailable = .possibly_billed };
+    return if (completion.billing != null)
+        .{ .immediate = reference }
+    else
+        .{ .deferred = reference };
+}
+
+fn gatewayUsageReference(
+    request: agent_stream_provider_contract.ModelRequest,
+    completion: shared_types.ModelCompletion,
+) ?agent_stream_provider_contract.DeferredUsageReference {
+    const generation_id = completion.generation_id orelse return null;
+    const source = request.credential.source orelse return null;
+    return .{
+        .provider = .gateway,
+        .generation_id = generation_id,
+        .scope = gateway_client.generationBaseUrl(),
+        .tenant = request.credential.tenant,
+        .account_id = request.credential.account_id,
+        .credential_source = source,
+        .credential_identity = credential_authority.derive(
+            source,
+            request.credential.account_id,
+        ),
+    };
+}
+
+const EventBridge = struct {
+    fn sink(raw: *anyopaque) *agent_stream_provider_contract.EventSink {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn content(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .content_delta = chunk });
+    }
+
+    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .reasoning_delta = chunk });
+    }
+
+    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .tool_input_delta = chunk });
+    }
+
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    }
+};
+
+fn failureKind(status: std.http.Status) agent_stream_provider_contract.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
     };
 }
 
@@ -714,6 +867,7 @@ fn executeWebSearchProvider(
 ) !Response {
     return executeGatewayWorker(alloc, .{
         .api_key = inputs.api_key,
+        .credential_source = inputs.credential_source,
         .team = inputs.gateway_team,
         .model = inputs.worker_model,
         .retry_count = inputs.gateway_retry_count,
@@ -791,6 +945,7 @@ var default_stream_ctx: u8 = 0;
 
 pub const GatewayWorkerConfig = struct {
     api_key: []const u8,
+    credential_source: ?shared_types.CredentialSource = null,
     team: ?[]const u8 = null,
     model: []const u8,
     retry_count: usize,
@@ -838,10 +993,10 @@ pub fn executeGatewayWorker(
         .{ .role = .system, .content = web_search_system_prompt },
         .{ .role = .user, .content = request.query },
     };
-    const payload = try gateway_json.buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(alloc, tools_json, &messages, request.max_output_tokens);
+    const payload = try vercel_protocol.buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(alloc, tools_json, &messages, request.max_output_tokens);
     defer alloc.free(payload);
 
-    const usage_observation = try session_usage.GatewayObservation.begin(config.usage);
+    const usage_observation = try session_usage.InvocationObservation.begin(config.usage);
     var delivery = gateway_client.DeliveryCertainty.init();
     const provider_tool_name = try selectedToolName(request.backend);
     var stream = config.stream_fn(
@@ -865,20 +1020,51 @@ pub fn executeGatewayWorker(
         return err;
     };
     defer stream.deinit(alloc);
-    try usage_observation.complete(
-        config.usage_allocator,
-        stream.status,
-        stream.completion,
-        gateway_client.generationBaseUrl(),
-        config.team,
-    );
-    if (!builtin.is_test) {
+    const usage_outcome = gatewayWorkerUsageOutcome(config, stream.completion);
+    if (stream.status == .ok) {
+        try usage_observation.complete(
+            config.usage_allocator,
+            stream.completion,
+            usage_outcome,
+        );
+    } else {
+        try usage_observation.fail(.unbilled);
+    }
+    if (!builtin.is_test and stream.status == .ok and std.meta.activeTag(usage_outcome) == .deferred) {
         if (config.usage) |ledger| {
-            ledger.startReconciliation(config.usage_allocator, config.api_key);
+            ledger.startDeferredReconciliation(
+                config.usage_allocator,
+                usage_outcome.deferred,
+                config.api_key,
+            );
         }
     }
     if (stream.status != .ok) return error.GatewayRequestFailed;
     return normalizeGatewayCompletion(alloc, request, stream.completion, on_progress, progress_ctx);
+}
+
+fn gatewayWorkerUsageOutcome(
+    config: GatewayWorkerConfig,
+    completion: shared_types.ModelCompletion,
+) agent_stream_provider_contract.UsageOutcome {
+    const generation_id = completion.generation_id orelse
+        return .{ .unavailable = .possibly_billed };
+    const source = config.credential_source orelse .ai_gateway_api_key;
+    const reference = agent_stream_provider_contract.DeferredUsageReference{
+        .provider = .gateway,
+        .generation_id = generation_id,
+        .scope = gateway_client.generationBaseUrl(),
+        .tenant = config.team,
+        .credential_source = source,
+        .credential_identity = credential_authority.derive(
+            source,
+            null,
+        ),
+    };
+    return if (completion.billing != null)
+        .{ .immediate = reference }
+    else
+        .{ .deferred = reference };
 }
 
 fn deadlineAfterMs(timeout_ms: u32) std.Io.Clock.Timestamp {
@@ -957,7 +1143,7 @@ fn streamGatewayWorker(
 fn normalizeGatewayCompletion(
     alloc: Allocator,
     request: Request,
-    completion: shared_types.GatewayCompletion,
+    completion: shared_types.ModelCompletion,
     on_progress: ?ProgressFn,
     progress_ctx: ?*anyopaque,
 ) !Response {
