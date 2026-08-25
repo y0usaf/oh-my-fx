@@ -12,14 +12,14 @@ const c = @cImport({
 });
 
 // Grammar entry points; not declared in any header, so declare here.
-extern fn tree_sitter_typescript() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_tsx() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_python() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_go() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_rust() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_nix() callconv(.c) *const c.TSLanguage;
+extern fn tree_sitter_zig() callconv(.c) *const c.TSLanguage;
 
-pub const Language = enum { typescript, tsx, python, go, rust, nix };
+pub const Language = enum { typescript, tsx, python, go, rust, nix, zig };
 
 pub const SymbolKind = enum {
     function,
@@ -33,7 +33,7 @@ pub const SymbolKind = enum {
 };
 
 pub const Symbol = struct {
-    /// Copied into `alloc`; NUL-free UTF-8 slice of the identifier.
+    /// Borrows `source`; do not outlive the parsed source buffer.
     name: []const u8,
     kind: SymbolKind,
     start_byte: u32,
@@ -55,6 +55,8 @@ pub fn detectLanguage(path: []const u8) ?Language {
         .{ ".go", .go },
         .{ ".rs", .rust },
         .{ ".nix", .nix },
+        .{ ".zig", .zig },
+        .{ ".zon", .zig },
     });
     return map.get(ext);
 }
@@ -106,16 +108,33 @@ const queries = std.enums.EnumMap(Language, QuerySpec).init(.{
     \\(binding attrpath: (attrpath) @function_name expression: (function_expression))
     \\
     },
+    .zig = .{ .query =
+    \\(function_declaration name: (identifier) @function_name)
+    \\((struct_declaration (function_declaration name: (identifier) @method_name)))
+    \\((enum_declaration (function_declaration name: (identifier) @method_name)))
+    \\((union_declaration (function_declaration name: (identifier) @method_name)))
+    \\((source_file (variable_declaration (identifier) @binding_name)))
+    \\((struct_declaration (variable_declaration (identifier) @binding_name)))
+    \\((enum_declaration (variable_declaration (identifier) @binding_name)))
+    \\((union_declaration (variable_declaration (identifier) @binding_name)))
+    \\(variable_declaration (identifier) @struct_name (struct_declaration))
+    \\(variable_declaration (identifier) @struct_name (enum_declaration))
+    \\(variable_declaration (identifier) @struct_name (union_declaration))
+    \\
+    },
 });
 
 fn tsLanguage(lang: Language) *const c.TSLanguage {
     return switch (lang) {
-        .typescript => tree_sitter_typescript(),
+        // The TSX grammar is a superset of TypeScript; it parses plain .ts
+        // declarations correctly, so both map to the same parser.
+        .typescript => tree_sitter_tsx(),
         .tsx => tree_sitter_tsx(),
         .python => tree_sitter_python(),
         .go => tree_sitter_go(),
         .rust => tree_sitter_rust(),
         .nix => tree_sitter_nix(),
+        .zig => tree_sitter_zig(),
     };
 }
 
@@ -147,8 +166,9 @@ fn kindPriority(kind: SymbolKind) u8 {
     };
 }
 
-/// Extracts symbols from `source`. Returned slice and all names live in
-/// `alloc`. On query/parse failure returns an error rather than partial data.
+/// Extracts symbols from `source`. The returned slice lives in `alloc`;
+/// `Symbol.name` borrows from `source`, which must outlive the result.
+/// On query/parse failure returns an error rather than partial data.
 pub fn extract(
     alloc: std.mem.Allocator,
     lang: Language,
@@ -191,10 +211,13 @@ pub fn extract(
     }
 
     var out: std.ArrayListUnmanaged(Symbol) = .empty;
-    errdefer {
-        for (out.items) |symbol| alloc.free(@constCast(symbol.name));
-        out.deinit(alloc);
-    }
+    errdefer out.deinit(alloc);
+
+    // Deduplicate on (start, end) byte range without a quadratic rescan:
+    // map key packs the two u32 endpoints and stores the `out` index.
+    const RangeKey = u64;
+    var seen: std.AutoHashMapUnmanaged(RangeKey, usize) = .empty;
+    defer seen.deinit(alloc);
 
     const cursor = c.ts_query_cursor_new() orelse return error.OutOfMemory;
     defer c.ts_query_cursor_delete(cursor);
@@ -213,20 +236,15 @@ pub fn extract(
             // A node can be captured by several patterns (a rust impl method
             // = function + method; a nix lambda binding = binding + function);
             // retain one entry and prefer the more specific kind.
-            var duplicate = false;
-            for (out.items) |*existing| {
-                if (existing.start_byte == start and existing.end_byte == end) {
-                    if (kindPriority(kind) > kindPriority(existing.kind)) existing.kind = kind;
-                    duplicate = true;
-                    break;
-                }
+            const key: RangeKey = (@as(u64, start) << 32) | end;
+            if (seen.get(key)) |existing_index| {
+                const existing = &out.items[existing_index];
+                if (kindPriority(kind) > kindPriority(existing.kind)) existing.kind = kind;
+                continue;
             }
-            if (duplicate) continue;
-
-            const name = try alloc.dupe(u8, source[start..end]);
-            errdefer alloc.free(name);
+            try seen.put(alloc, key, out.items.len);
             try out.append(alloc, .{
-                .name = name,
+                .name = source[start..end],
                 .kind = kind,
                 .start_byte = start,
                 .end_byte = end,
@@ -340,9 +358,41 @@ test "extract nix symbols" {
     try std.testing.expectEqual(SymbolKind.binding, syms[2].kind);
 }
 
+test "extract zig symbols" {
+    const src =
+        \\const std = @import("std");
+        \\pub const Wallet = struct {
+        \\    balance: u64,
+        \\    pub fn deposit(self: *Wallet, amount: u64) void {
+        \\        self.balance += amount;
+        \\    }
+        \\};
+        \\const Mode = enum { fast, safe };
+        \\pub fn main() !void {}
+        \\
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const syms = try extract(arena.allocator(), .zig, src);
+
+    try std.testing.expectEqual(@as(usize, 5), syms.len);
+    try std.testing.expectEqualStrings("std", syms[0].name);
+    try std.testing.expectEqual(SymbolKind.binding, syms[0].kind);
+    try std.testing.expectEqualStrings("Wallet", syms[1].name);
+    try std.testing.expectEqual(SymbolKind.struct_, syms[1].kind);
+    try std.testing.expectEqualStrings("deposit", syms[2].name);
+    try std.testing.expectEqual(SymbolKind.method, syms[2].kind);
+    try std.testing.expectEqualStrings("Mode", syms[3].name);
+    try std.testing.expectEqual(SymbolKind.struct_, syms[3].kind);
+    try std.testing.expectEqualStrings("main", syms[4].name);
+    try std.testing.expectEqual(SymbolKind.function, syms[4].kind);
+}
+
 test "detectLanguage" {
     try std.testing.expectEqual(Language.rust, detectLanguage("a/b/c.rs").?);
     try std.testing.expectEqual(Language.tsx, detectLanguage("App.tsx").?);
     try std.testing.expectEqual(Language.nix, detectLanguage("flake.nix").?);
+    try std.testing.expectEqual(Language.zig, detectLanguage("src/main.zig").?);
+    try std.testing.expectEqual(Language.zig, detectLanguage("build.zig.zon").?);
     try std.testing.expect(detectLanguage("makefile") == null);
 }

@@ -363,12 +363,12 @@ fn addGenomeModule(
     });
 
     const grammars = [_]struct { dir: []const u8, scanner: bool }{
-        .{ .dir = "typescript", .scanner = true },
         .{ .dir = "tsx", .scanner = true },
         .{ .dir = "python", .scanner = true },
         .{ .dir = "go", .scanner = false },
         .{ .dir = "rust", .scanner = true },
         .{ .dir = "nix", .scanner = true },
+        .{ .dir = "zig", .scanner = false },
     };
     inline for (grammars) |g| {
         const lib = b.addLibrary(.{

@@ -60,7 +60,7 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
         return try ctx.allocator.dupe(u8, "ast_symbols field \"path\" must not be empty");
     }
     if (genome.detectLanguage(input.path) == null) {
-        return try ctx.allocator.dupe(u8, "ast_symbols supports .ts, .mts, .cts, .tsx, .py, .pyi, .go, .rs, and .nix files");
+        return try ctx.allocator.dupe(u8, "ast_symbols supports .ts, .mts, .cts, .tsx, .py, .pyi, .go, .rs, .nix, .zig, and .zon files");
     }
     return null;
 }

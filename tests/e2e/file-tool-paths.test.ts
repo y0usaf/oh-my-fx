@@ -1161,22 +1161,22 @@ describe("filesystem path handling", () => {
     async () => {
       const root = createIsolatedRoot();
       try {
-        const source = join(root.workspace, "wallet.ts");
+        const source = join(root.workspace, "wallet.zig");
         writeFileSync(
           source,
-          "export class Wallet {\n  deposit(): void {}\n}\nfunction main(): void {}\n",
+          "pub const Wallet = struct {\n  pub fn deposit(self: *Wallet) void { _ = self; }\n};\npub fn main() void {}\n",
         );
 
         await runFirstCallToolScenario({
           root,
           id: "ast_symbols_1",
           name: "ast_symbols",
-          input: { path: "wallet.ts" },
-          expectedResultRequest: ["[ast] 3 symbols in wallet.ts"],
+          input: { path: "wallet.zig" },
+          expectedResultRequest: ["[ast] 3 symbols in wallet.zig"],
           expectedResultOutput: [
-            "wallet.ts:1: class Wallet",
-            "wallet.ts:2: method deposit",
-            "wallet.ts:4: function main",
+            "wallet.zig:1: struct Wallet",
+            "wallet.zig:2: method deposit",
+            "wallet.zig:4: function main",
           ],
         });
       } finally {

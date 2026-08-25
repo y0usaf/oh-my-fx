@@ -138,7 +138,7 @@ The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) an
 
 ## Code-aware tools
 
-fx can parse TypeScript, TSX, Python, Go, Rust, and Nix files with the built-in `ast_symbols` tool. It returns named declarations, their kinds, and source line numbers so agents can inspect a file's structural outline without relying on text matching.
+fx can parse TypeScript, TSX, Python, Go, Rust, Nix, and Zig files with the built-in `ast_symbols` tool. It returns named declarations, their kinds, and source line numbers so agents can inspect a file's structural outline without relying on text matching.
 
 ## Extend fx
 
