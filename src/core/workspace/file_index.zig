@@ -1149,7 +1149,9 @@ fn rankTopN(generation: *const Generation, query: PreparedQuery, out: []u32) usi
         const score = if ((path_mask & non_ascii_mask) == 0) ascii_path: {
             const ascii = query_ascii orelse continue;
             if ((path_mask & query_mask) != query_mask) continue;
-            if ((generation.punct_masks[candidate_index] & query_punct_mask) != query_punct_mask) continue;
+            if (query_punct_mask != 0) {
+                if ((generation.punct_masks[candidate_index] & query_punct_mask) != query_punct_mask) continue;
+            }
             break :ascii_path scoreAsciiMatch(
                 generation.pathAt(candidate_index),
                 generation.lowerPathAt(candidate_index),
