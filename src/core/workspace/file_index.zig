@@ -226,9 +226,9 @@ const Generation = struct {
         const basename_starts = try alloc.alloc(u32, totals.n);
         errdefer alloc.free(basename_starts);
         const char_masks = try alloc.alloc(u32, totals.n);
+        errdefer alloc.free(char_masks);
         const punct_masks = try alloc.alloc(u32, totals.n);
         errdefer alloc.free(punct_masks);
-        errdefer alloc.free(char_masks);
         const kinds = try alloc.alloc(CandidateKind, totals.n);
         errdefer alloc.free(kinds);
 
