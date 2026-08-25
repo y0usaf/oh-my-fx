@@ -1759,7 +1759,7 @@ test "surface footer places the cursor after the Vercel team query" {
     defer frame.deinit(alloc);
 
     try std.testing.expectEqual(frame.paint.footer.picker_start, frame.composed.cursor.row);
-    try std.testing.expectEqual(@as(u16, 39), frame.composed.cursor.col);
+    try std.testing.expectEqual(@as(u16, 27), frame.composed.cursor.col);
     try std.testing.expect(frame.composed.cursor_visible);
 }
 
@@ -1819,7 +1819,7 @@ test "surface footer keeps the Vercel team query and cursor visible at minimum h
     }
     try std.testing.expect(query_visible);
     try std.testing.expectEqual(frame.paint.footer.picker_start, frame.composed.cursor.row);
-    try std.testing.expectEqual(@as(u16, 39), frame.composed.cursor.col);
+    try std.testing.expectEqual(@as(u16, 27), frame.composed.cursor.col);
     try std.testing.expect(frame.composed.cursor_visible);
 }
 
@@ -1837,6 +1837,7 @@ test "surface footer keeps the selected auth source visible at minimum height" {
         .selected_choice = .{ .source = .fx_login },
         .active_source = .ai_gateway_api_key,
         .include_skip = false,
+        .stage = .switch_credential,
     };
 
     var shell = surfaceTestShell(5, 80);

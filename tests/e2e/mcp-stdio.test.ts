@@ -47,6 +47,7 @@ type FixtureRoot = {
   launchLogPath: string;
   traceLogPath: string;
   invalidationReleasePath: string;
+  environmentCapturePath: string;
 };
 
 type WireEntry = {
@@ -125,6 +126,7 @@ type RootOptions = {
   required?: boolean;
   resourcesSubscribe?: boolean;
   resourceTtlMs?: number;
+  captureEnvironment?: boolean;
 };
 
 function createRoot(
@@ -139,6 +141,7 @@ function createRoot(
   const wireLogPath = join(root, "mcp-wire.jsonl");
   const launchLogPath = join(root, "mcp-launches.txt");
   const invalidationReleasePath = join(root, "mcp-invalidation-release");
+  const environmentCapturePath = join(root, "mcp-environment.json");
   const command = options.recordLaunchAttempts
     ? [
       "/bin/sh",
@@ -195,6 +198,12 @@ function createRoot(
               options.legacyRejectNewerInitialize ? "1" : undefined,
             FX_MCP_DRAFT7_PATTERN: options.draft7Pattern,
             FX_MCP_URL_REQUIRED_OPERATION: options.urlRequiredOperation,
+            FX_MCP_ENV_CAPTURE: options.captureEnvironment
+              ? environmentCapturePath
+              : undefined,
+            FX_MCP_ENV_SENTINEL: options.captureEnvironment
+              ? "configured"
+              : undefined,
           },
           startup_timeout_ms: options.startupTimeoutMs,
           operation_timeout_ms: options.operationTimeoutMs,
@@ -211,6 +220,7 @@ function createRoot(
     launchLogPath,
     traceLogPath: join(root, "fx-trace.log"),
     invalidationReleasePath,
+    environmentCapturePath,
   };
 }
 
@@ -1891,6 +1901,49 @@ describe("modern MCP stdio compatibility", () => {
       await expectFixtureProcessesExited(wire);
     });
   }
+
+  test("configured MCP stdio environment overlays inherited process values", async () => {
+    const root = createRoot("ask-environment-overlay", MODERN_FIXTURE, {
+      captureEnvironment: true,
+    });
+    const activeGateway = startToolGateway("Environment overlay complete.");
+    gateway = activeGateway;
+    const inheritedSentinel = "inherited-parent-value";
+    const proxySentinel = "http://proxy.example.test:8080";
+    const parentPath = process.env.PATH ?? "/usr/bin:/bin";
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the environment MCP fixture."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...fixtureEnv(root, activeGateway),
+          PATH: parentPath,
+          FX_MCP_INHERITED_SENTINEL: inheritedSentinel,
+          HTTPS_PROXY: proxySentinel,
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Environment overlay complete.");
+    const captured = JSON.parse(readFileSync(root.environmentCapturePath, "utf8")) as {
+      configured?: string;
+      inherited?: string;
+      path?: string;
+      home?: string;
+      httpsProxy?: string;
+    };
+    expect(captured).toEqual({
+      configured: "configured",
+      inherited: inheritedSentinel,
+      path: parentPath,
+      home: root.home,
+      httpsProxy: proxySentinel,
+    });
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 30_000);
 
   test("fx ask does not start an unused optional MCP server", async () => {
     const root = createRoot("ask-unused-optional", MODERN_FIXTURE, {

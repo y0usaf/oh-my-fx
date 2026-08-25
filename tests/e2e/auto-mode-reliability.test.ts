@@ -83,12 +83,13 @@ function gatewayEnv(
 }
 
 function commandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", { action: "exec", command });
+  return fakeGatewayToolCall(id, "terminal", { action: "exec", timeout_ms: 600_000, command });
 }
 
 function userCommandCall(command: string, id: string) {
   return fakeGatewayToolCall(id, "terminal", {
     action: "exec",
+    timeout_ms: 600_000,
     command,
     profile: "user",
   });
@@ -97,6 +98,7 @@ function userCommandCall(command: string, id: string) {
 function cleanCommandCall(command: string, id: string) {
   return fakeGatewayToolCall(id, "terminal", {
     action: "exec",
+    timeout_ms: 600_000,
     command,
     profile: "clean",
   });
@@ -319,7 +321,7 @@ describe("lean auto mode reliability", () => {
               type: "tool-call",
               toolCallId: "clean_direct_pwd",
               toolName: "terminal",
-              input: { action: "exec", command: "pwd", profile: "clean" },
+              input: { action: "exec", timeout_ms: 600_000, command: "pwd", profile: "clean" },
             },
             {
               type: "tool-call",
@@ -327,6 +329,7 @@ describe("lean auto mode reliability", () => {
               toolName: "terminal",
               input: {
                 action: "exec",
+                timeout_ms: 600_000,
                 command: "git status --short",
                 profile: "clean",
               },
@@ -337,6 +340,7 @@ describe("lean auto mode reliability", () => {
               toolName: "terminal",
               input: {
                 action: "exec",
+                timeout_ms: 600_000,
                 command: "git reset --hard",
                 profile: "clean",
               },
@@ -1189,13 +1193,13 @@ describe("lean auto mode reliability", () => {
               type: "tool-call",
               toolCallId: "mixed_block_3",
               toolName: "terminal",
-              input: { action: "exec", command: `touch ${JSON.stringify(markers[2]!)}` },
+              input: { action: "exec", timeout_ms: 600_000, command: `touch ${JSON.stringify(markers[2]!)}` },
             },
             {
               type: "tool-call",
               toolCallId: "mixed_safe_pwd",
               toolName: "terminal",
-              input: { action: "exec", command: "pwd" },
+              input: { action: "exec", timeout_ms: 600_000, command: "pwd" },
             },
             {
               type: "finish",
@@ -1322,7 +1326,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize the saved allow session.");
       await activeSession.waitForText("allow session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember allow terminal ${JSON.stringify({ action: "exec", command: allowedCommand })}`,
+        `/permissions remember allow terminal ${JSON.stringify({ action: "exec", timeout_ms: 600_000, command: allowedCommand })}`,
       );
       await activeSession.waitForText("Remember allow for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");
@@ -1444,7 +1448,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize this saved session.");
       await activeSession.waitForText("session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember deny terminal ${JSON.stringify({ action: "exec", command: blockedCommand })}`,
+        `/permissions remember deny terminal ${JSON.stringify({ action: "exec", timeout_ms: 600_000, command: blockedCommand })}`,
       );
       await activeSession.waitForText("Remember deny for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");

@@ -46,6 +46,7 @@ const permission_gate = @import("../permissions/permission_gate.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_runtime = @import("../session/session.zig");
+const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_usage = @import("../session/session_usage.zig");
 const usage_report = @import("../session/usage_report.zig");
@@ -528,6 +529,7 @@ const AskContext = struct {
     use_process_interrupt_flag: bool = false,
     background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
+    ephemeral_command_replay: command_replay_store.EphemeralStore,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_skills_prompt: []u8 = &.{},
     subagent_explicit_skills_prompt: []u8 = &.{},
@@ -595,6 +597,7 @@ const AskContext = struct {
             .terminal_client = terminal_client_runtime.Runtime.init(
                 cfg.background_process_provider,
             ),
+            .ephemeral_command_replay = command_replay_store.EphemeralStore.init(alloc),
             .lifecycle_runtime = lifecycle_runtime,
             .lifecycle_view = hooks.RuntimeView.empty(),
         };
@@ -709,6 +712,7 @@ const AskContext = struct {
         if (self.writable) |*writable| writable.deinit(self.alloc);
         self.writable = null;
         if (self.store) |*store| store.deinit(self.alloc);
+        self.ephemeral_command_replay.deinit();
         self.permission_rules.deinit(self.alloc);
         self.session.deinit(self.alloc);
         if (self.skills_dir.len > 0) self.alloc.free(self.skills_dir);
@@ -991,6 +995,10 @@ const AskContext = struct {
             .on_background_url_ready = onBackgroundUrlReady,
             .session_child_capability = if (self.writable) |*writable|
                 writable.childCapability() catch null
+            else
+                null,
+            .ephemeral_command_replay = if (self.writable == null)
+                &self.ephemeral_command_replay
             else
                 null,
             .terminal_client = &self.terminal_client,
@@ -1740,6 +1748,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             false,
         .context_limits = ctx.context_limits,
         .session_child_capability = session_child_capability,
+        .ephemeral_command_replay = if (session_child_capability == null)
+            &ctx.ephemeral_command_replay
+        else
+            null,
     }, job) catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
@@ -3935,7 +3947,9 @@ fn testProcessQueuedPromptChecksTimeout(deps: *const agent_runtime.AgentRuntimeD
 fn testProcessQueuedPromptChecksExecOnlyTerminal(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expect(cfg.session_child_capability == null);
+    try std.testing.expect(cfg.ephemeral_command_replay != null);
     const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+    try std.testing.expect(ctx.toolContext().ephemeral_command_replay != null);
     try std.testing.expectEqualStrings("inspect", ctx.mode_id);
     try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "read_file"));
     try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "terminal"));
@@ -3948,6 +3962,8 @@ fn testProcessQueuedPromptChecksExecOnlyTerminal(deps: *const agent_runtime.Agen
         advertised_terminal.input_schema,
         "request",
     ));
+    try std.testing.expect(std.mem.find(u8, advertised_terminal.description, "required finite timeout_ms") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_terminal.description, "Use start") == null);
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, cfg.custom_tool_guidance);
     try std.testing.expectEqualStrings("test model overlay", cfg.model_prompt_overlay.?);
     const runtime_terminal = deps.tool_registry.lookup("terminal") orelse
@@ -3960,6 +3976,10 @@ fn testProcessQueuedPromptChecksFullTerminal(deps: *const agent_runtime.AgentRun
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expect(cfg.session_child_capability != null);
     try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "terminal"));
+    const advertised_terminal = for (cfg.advertised_functions) |function| {
+        if (std.mem.eql(u8, function.name, "terminal")) break function;
+    } else return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.find(u8, advertised_terminal.description, "Use start") != null);
     try testPushAssistantText(deps, "assistant text");
 }
 

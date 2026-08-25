@@ -342,6 +342,7 @@ while :; do sleep 1; done
       gateway = startFakeGateway([
         fakeGatewayToolCall("workspace-cancel-hold", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: "./hold-workspace-cancel.sh",
         }),
       ]);

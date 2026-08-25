@@ -2587,7 +2587,7 @@ test "interactive command approval keeps activity projection out of permission r
     try std.testing.expect(std.mem.endsWith(u8, approval_command, "\n" ++ raw_command));
 }
 
-test "terminal exec omission shares user grants while clean stays isolated" {
+test "terminal exec timeout and profile omission share user grants while clean stays isolated" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2604,12 +2604,12 @@ test "terminal exec omission shares user grants while clean stays isolated" {
     const omitted = try permissionTargetForCall(input, arena, .{
         .id = "omitted",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"timeout_ms\":1}",
     });
     const clean = permissionTargetForCall(input, arena, .{
         .id = "clean",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"clean\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"clean\",\"timeout_ms\":5000}",
     }) catch |err| switch (err) {
         error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
         else => return err,
@@ -2617,7 +2617,7 @@ test "terminal exec omission shares user grants while clean stays isolated" {
     const user = try permissionTargetForCall(input, arena, .{
         .id = "user",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqualStrings(omitted, user);

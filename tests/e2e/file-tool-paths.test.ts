@@ -242,13 +242,10 @@ type SubagentControlRecord = {
 type SubagentToolResult = { tool_name: string; status: string; output: string };
 
 type SubagentTurn = {
-  kind: string;
-  completed_tool_names?: string[];
   execution?: { tool_steps?: Array<{ tool_results?: SubagentToolResult[] }> };
 };
 
-// Interrupted and completed child turns persist tool outcomes in different fields.
-function readSubagentChild(home: string) {
+function readSubagentChildIfPresent(home: string) {
   const sessionsDir = join(home, ".fx", "sessions");
   const children = readdirSync(sessionsDir)
     .map((entry) => join(sessionsDir, entry))
@@ -260,10 +257,11 @@ function readSubagentChild(home: string) {
       history: readFileSync(join(dir, "events.jsonl"), "utf8"),
     }))
     .filter(({ control }) => !!control.parent_id);
-  if (children.length !== 1) {
+  if (children.length > 1) {
     throw new Error(`expected one persisted child record, found ${children.length}`);
   }
-  const child = children[0]!;
+  const child = children[0];
+  if (!child) return null;
   const turns = child.history
     .split("\n")
     .filter((line) => line.length > 0)
@@ -281,10 +279,20 @@ function readSubagentChild(home: string) {
   );
   return {
     ...child,
-    interrupted: turns.some((turn) => turn.kind === "interrupted"),
-    completedToolNames: turns.flatMap((turn) => turn.completed_tool_names ?? []),
     readResult: toolResults.find((result) => result.tool_name === "read_file"),
   };
+}
+
+async function waitForCompletedSubagentChild(home: string, deadlineMs: number) {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    const child = readSubagentChildIfPresent(home);
+    if (child?.control.state === "completed" && child.readResult) {
+      return child;
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error("timed out waiting for completed persisted child record");
 }
 
 // Hold the parent open until the child read completes; the deadline prevents hangs.
@@ -427,7 +435,7 @@ describe("filesystem path handling", () => {
           {
             id: "added_cwd_1",
             name: "terminal",
-            input: { action: "exec", command: "pwd", cwd: root.external },
+            input: { action: "exec", timeout_ms: 600_000, command: "pwd", cwd: root.external },
             expected: root.external,
           },
         ];
@@ -493,6 +501,9 @@ describe("filesystem path handling", () => {
       writeFileSync(target, fileSentinel + "\n");
 
       const childPrompt = `Read exactly ${target}.`;
+      const childSnapshot = Promise.withResolvers<
+        Awaited<ReturnType<typeof waitForCompletedSubagentChild>>
+      >();
       const isChildTurn = (body: string) =>
         body.includes(childPrompt) && !body.includes("parent_create_1");
       const gate = createChildReadGate(8_000);
@@ -508,6 +519,9 @@ describe("filesystem path handling", () => {
           });
         }
         await gate.opened;
+        childSnapshot.resolve(
+          await waitForCompletedSubagentChild(root.home, TIMEOUT),
+        );
         return finalText("Parent received the admitted child handle.");
       };
       const gateway = startFakeGateway([
@@ -572,7 +586,7 @@ describe("filesystem path handling", () => {
           expect(request.body).toContain('"name":"read_file"');
         }
 
-        const child = readSubagentChild(root.home);
+        const child = await childSnapshot.promise;
         expect(child.control.configuration.name).toBe("added-root-reader");
         expect(child.control.mode).toBe("one_off");
         expect(child.control.queue.some((item) => item.content.includes(target))).toBe(
@@ -581,15 +595,12 @@ describe("filesystem path handling", () => {
         expect(child.control.events.some((event) => event.current === "running")).toBe(
           true,
         );
-        expect(["interrupted", "completed"]).toContain(child.control.state);
+        expect(child.control.state).toBe("completed");
         expect(child.history).not.toContain(instructionSentinel);
 
         expect(child.readResult).toBeDefined();
         expect(child.readResult!.status).toBe("success");
         expect(child.readResult!.output).toContain(fileSentinel);
-        if (child.interrupted) {
-          expect(child.completedToolNames).toContain("read_file");
-        }
       } finally {
         gate.dispose();
         gateway.stop();
@@ -607,6 +618,7 @@ describe("filesystem path handling", () => {
       const gateway = startFakeGateway([
         toolCall("added_command_write_1", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: "printf COMMAND_ADDED_WRITE > command-proof.txt",
           cwd: root.external,
         }),
@@ -763,6 +775,7 @@ describe("filesystem path handling", () => {
           const gateway = startFakeGateway([
             toolCall(scenario.id, "terminal", {
               action: "exec",
+              timeout_ms: 600_000,
               command: `pwd; printf ${scenario.id} > ${scenario.id}.txt`,
               cwd: scenario.cwd,
             }),

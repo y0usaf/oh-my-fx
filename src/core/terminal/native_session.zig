@@ -3136,6 +3136,20 @@ const SignalTarget = struct {
     token: process_supervisor.ProcessInstanceToken,
 };
 
+const ProcessGroupDelivery = enum {
+    delivered,
+    missing,
+    failed,
+};
+
+fn shouldPauseRecoveredTmuxProcess(
+    lifecycle: contracts.Lifecycle,
+    terminal_present: bool,
+    child_pid_present: bool,
+) bool {
+    return lifecycle == .starting and !terminal_present and child_pid_present;
+}
+
 const Session = struct {
     alloc: Allocator,
     tracker: WorkTracker,
@@ -3545,7 +3559,11 @@ const Session = struct {
             }
         }
         if (tmuxRecoveryFailure(self.id, "identity")) return error.InjectedFailure;
-        const process_paused = !terminal_present and self.child_pid != null;
+        const process_paused = shouldPauseRecoveredTmuxProcess(
+            self.lifecycle,
+            terminal_present,
+            self.child_pid != null,
+        );
         if (process_paused and !self.signalNative(std.c.SIG.STOP)) {
             return error.TmuxChildIdentityUnavailable;
         }
@@ -4151,8 +4169,30 @@ const Session = struct {
         );
         return terminalSignalCompleted(
             descendants_delivery,
-            !failSignalStageForTest("shell_group") and self.signalProcess(signal),
+            if (failSignalStageForTest("shell_group"))
+                .failed
+            else
+                self.signalVerifiedProcessGroup(target, signal),
         );
+    }
+
+    fn signalVerifiedProcessGroup(
+        self: *Session,
+        target: SignalTarget,
+        signal: contracts.Signal,
+    ) ProcessGroupDelivery {
+        if (!self.matchesSignalTarget(target)) {
+            return if (processGroupMissing(target.pid)) .missing else .failed;
+        }
+        while (true) switch (std.c.errno(std.c.kill(
+            -target.pid,
+            signalValue(signal),
+        ))) {
+            .SUCCESS => return .delivered,
+            .INTR => continue,
+            .SRCH => return .missing,
+            else => return .failed,
+        };
     }
 
     fn signalNative(self: *Session, signal: std.c.SIG) bool {
@@ -5506,9 +5546,45 @@ fn signalAction(
 
 fn terminalSignalCompleted(
     descendants: process_tree.DeliverySummary,
-    shell_group_delivered: bool,
+    shell_group: ProcessGroupDelivery,
 ) bool {
-    return !descendants.incomplete and shell_group_delivered;
+    return !descendants.incomplete and shell_group != .failed;
+}
+
+fn processGroupMissing(pid: std.posix.pid_t) bool {
+    while (true) switch (std.c.errno(std.c.kill(
+        -pid,
+        @enumFromInt(0),
+    ))) {
+        .SUCCESS, .PERM => return false,
+        .INTR => continue,
+        .SRCH => return true,
+        else => return false,
+    };
+}
+
+test "running tmux recovery does not pause the published process group" {
+    try std.testing.expect(!shouldPauseRecoveredTmuxProcess(
+        .running,
+        false,
+        true,
+    ));
+    try std.testing.expect(shouldPauseRecoveredTmuxProcess(
+        .starting,
+        false,
+        true,
+    ));
+}
+
+test "terminal signaling accepts a process group that exited during descendant delivery" {
+    try std.testing.expect(terminalSignalCompleted(
+        .{ .delivered = 1 },
+        .missing,
+    ));
+    try std.testing.expect(!terminalSignalCompleted(
+        .{ .delivered = 1, .incomplete = true },
+        .missing,
+    ));
 }
 
 fn failSignalStageForTest(stage: []const u8) bool {
@@ -6258,12 +6334,12 @@ test "terminal outcomes preserve exact exit and signal status" {
 }
 
 test "terminal signal completion requires checked descendants and shell group" {
-    try std.testing.expect(terminalSignalCompleted(.{}, true));
+    try std.testing.expect(terminalSignalCompleted(.{}, .delivered));
     try std.testing.expect(!terminalSignalCompleted(.{
         .delivered = 1,
         .incomplete = true,
-    }, true));
-    try std.testing.expect(!terminalSignalCompleted(.{}, false));
+    }, .delivered));
+    try std.testing.expect(!terminalSignalCompleted(.{}, .failed));
 }
 
 test "force close fallback does not erase an incomplete tree operation" {

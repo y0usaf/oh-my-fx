@@ -167,7 +167,7 @@ function outerCommandCall() {
     {
       id: "command_outer_1",
       name: "terminal",
-      input: { action: "exec", command: "touch generic-preview-accepted.txt" },
+      input: { action: "exec", timeout_ms: 600_000, command: "touch generic-preview-accepted.txt" },
     },
   ]);
 }
@@ -186,7 +186,7 @@ function outerLongCommandCall() {
     {
       id: "long_command_outer_1",
       name: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     },
   ]);
 }
@@ -203,7 +203,7 @@ function outerScrollableLongCommandCall() {
     {
       id: "scrollable_long_command_outer_1",
       name: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     },
   ]);
 }
@@ -216,7 +216,7 @@ function outerFittingCommandCall() {
     {
       id: "fitting_command_outer_1",
       name: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     },
   ]);
 }

@@ -20,6 +20,7 @@ const credentials = @import("../../auth/credentials.zig");
 const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
+const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const hooks = @import("../../hooks/hooks.zig");
@@ -6639,7 +6640,20 @@ fn processQueuedPromptLoop(
 
             if (execution.cancelled and config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
-                defer if (execution.command_replay_capture) |capture| capture.discard(arena);
+                var replay_handed_off = execution.command_replay_capture == null;
+                defer if (!replay_handed_off) {
+                    execution.command_replay_capture.?.discard(arena);
+                };
+                const cancelled_command = if (execution_is_command and
+                    (config.session_child_capability != null or
+                        config.ephemeral_command_replay != null))
+                    runtime_execution_memory.retainCancelledCommandReplay(
+                        arena,
+                        execution.tool_result_memory,
+                        execution.command_replay_capture,
+                    )
+                else
+                    null;
                 _ = try stream_ctx.provisional_statuses.finishCancelledCall(
                     deps,
                     stream_ctx.alloc,
@@ -6665,7 +6679,40 @@ fn processQueuedPromptLoop(
                     try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
                 }
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                const persist_error = if (execution_is_command)
+                    runtime_interruption.persistInterruptedCommandTurnOnce(
+                        deps,
+                        finalization,
+                        job,
+                        partial_assistant,
+                        tool_call,
+                        completed_tool_names.items,
+                        &interrupted_persisted,
+                        step_ctx,
+                        within_turn_suffix.items,
+                        stop_state.retained_candidate,
+                        &stop_state.terminal_materializing,
+                        cancelled_command,
+                    )
+                else
+                    runtime_interruption.persistInterruptedTurnOnce(
+                        deps,
+                        finalization,
+                        job,
+                        partial_assistant,
+                        tool_call,
+                        completed_tool_names.items,
+                        &interrupted_persisted,
+                        step_ctx,
+                        within_turn_suffix.items,
+                        stop_state.retained_candidate,
+                        &stop_state.terminal_materializing,
+                    );
+                persist_error catch |err| {
+                    replay_handed_off = interrupted_persisted;
+                    return err;
+                };
+                replay_handed_off = true;
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -6745,7 +6792,13 @@ fn processQueuedPromptLoop(
             defer if (!replay_handed_off) {
                 execution.command_replay_capture.?.discard(arena);
             };
-            var prepared = try runtime_execution_memory.prepareToolModelOutput(arena, config, tool_call, execution.model_output);
+            var prepared = try runtime_execution_memory.prepareCapturedToolModelOutput(
+                arena,
+                config,
+                tool_call,
+                execution.model_output,
+                execution.command_replay_capture,
+            );
             runtime_execution_memory.applyToolResultMemory(
                 &prepared.memory,
                 execution.tool_result_memory,
@@ -6756,7 +6809,21 @@ fn processQueuedPromptLoop(
                 &prepared,
                 config.session_child_capability,
                 execution.command_replay_capture,
-            );
+            ) catch |err| switch (err) {
+                error.CommandOutputCaptureFailed => {
+                    const capture_failure = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+                    execution.status = .failure;
+                    execution.model_output = capture_failure.model_output;
+                    prepared.model_output = capture_failure.model_output;
+                    prepared.memory.command_output_replay = .unavailable;
+                    if (execution.command_replay_capture) |capture| {
+                        capture.discard(arena);
+                        execution.command_replay_capture = null;
+                    }
+                    replay_handed_off = true;
+                },
+                else => return err,
+            };
             const safe_tool_output = prepared.model_output;
             try runtime_tool_presentation.finishExecutedToolStatus(
                 deps,

@@ -144,7 +144,7 @@ function lengthLimitedCommandCall(command: string) {
       type: "tool-call",
       toolCallId: "command_1",
       toolName: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     },
     {
       type: "finish",
@@ -6224,6 +6224,7 @@ describe("acp: model-independent", () => {
       const gateway = startFakeGateway([
         fakeGatewayToolCall("approved_command_1", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: `printf approved > '${marker}'`,
         }),
         finalText("command approval complete"),
@@ -7007,6 +7008,7 @@ describe("acp: model-independent", () => {
         [
           fakeGatewayToolCall("cancelled_review_command", "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `printf cancelled > ${JSON.stringify(marker)}`,
           }),
           finalText("follow-up after ACP review cancellation"),
