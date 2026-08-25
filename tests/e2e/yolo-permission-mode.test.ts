@@ -93,6 +93,7 @@ describe("yolo permission mode", () => {
       const fake = startFakeGateway([
         fakeGatewayToolCall("yolo_command", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: `printf 'YOLO_COMMAND_OK\\n' > ${JSON.stringify(markerPath)}`,
         }),
         fakeGatewayFinalText("YOLO_HEADLESS_DONE"),
@@ -201,6 +202,7 @@ describe("yolo permission mode", () => {
       const fake = startFakeGateway([
         fakeGatewayToolCall("legacy_ps", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: `ps -p $$ -o pid= > ${JSON.stringify(psPath)}; printf x >> ${JSON.stringify(attemptsPath)}`,
         }),
         fakeGatewayFinalText("LEGACY_PS_DONE"),
@@ -330,6 +332,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
           await toolCallGate;
           return fakeGatewayToolCall("live_auto_command", "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `printf 'LIVE_AUTO_OK\\n' > ${JSON.stringify(markerPath)}`,
           });
         },
@@ -408,6 +411,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
           await toolCallGate;
           return fakeGatewayToolCall("live_ask_command", "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `printf 'LIVE_ASK_WRONG\\n' > ${JSON.stringify(markerPath)}`,
           });
         },

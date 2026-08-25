@@ -144,7 +144,7 @@ function lengthLimitedCommandCall(command: string) {
       type: "tool-call",
       toolCallId: "command_1",
       toolName: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     },
     {
       type: "finish",
@@ -6224,6 +6224,7 @@ describe("acp: model-independent", () => {
       const gateway = startFakeGateway([
         fakeGatewayToolCall("approved_command_1", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: `printf approved > '${marker}'`,
         }),
         finalText("command approval complete"),
@@ -6462,6 +6463,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-one-off-load-");
       const childName = "acp-readonly-child";
       const childPrompt = "ACP_ONE_OFF_LOAD_CHILD";
+      const childCompletion = heldFakeGatewayFinalText();
       const gateway = startDynamicFakeGateway((body) => {
         if (body.includes("Acknowledge the completed one-off result.")) {
           return finalText("ACP_ONE_OFF_RETIREMENT_ACK_DONE");
@@ -6470,7 +6472,7 @@ describe("acp: model-independent", () => {
           return finalText("ACP_ONE_OFF_LOAD_PARENT_DONE");
         }
         if (body.includes(childPrompt)) {
-          return finalText("ACP_ONE_OFF_LOAD_CHILD_DONE");
+          return childCompletion.response;
         }
         return fakeGatewayToolCall("acp_one_off_load_create", "subagent", {
           command: { create: {
@@ -6492,6 +6494,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
         expect(result.promptResult.result.stopReason).toBe("end_turn");
+        childCompletion.release("ACP_ONE_OFF_LOAD_CHILD_DONE");
         const sessionsDir = join(root.home, ".fx", "sessions");
         let control: { id: string; path: string } | undefined;
         await waitForCondition(
@@ -6516,9 +6519,14 @@ describe("acp: model-independent", () => {
           },
           TIMEOUT,
         );
+        if (!control) throw new Error("ACP one-off control was not persisted");
+        await waitForPersistedAcpDeliveryId(
+          root,
+          control.id,
+          "ACP_ONE_OFF_LOAD_CHILD_DONE",
+        );
         await client.close();
 
-        if (!control) throw new Error("ACP one-off control was not persisted");
         const controlBefore = readFileSync(control.path, "utf8");
 
         client = await AcpClient.create({
@@ -6587,6 +6595,7 @@ describe("acp: model-independent", () => {
         expect(gateway.requests).toHaveLength(4);
         expect(client.stderr).toBe("");
       } finally {
+        childCompletion.dispose();
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -6999,6 +7008,7 @@ describe("acp: model-independent", () => {
         [
           fakeGatewayToolCall("cancelled_review_command", "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `printf cancelled > ${JSON.stringify(marker)}`,
           }),
           finalText("follow-up after ACP review cancellation"),

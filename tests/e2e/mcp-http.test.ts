@@ -85,6 +85,18 @@ function createRoot(
   return { root, home, workspace, traceLogPath: join(root, "fx-trace.log") };
 }
 
+function createEmptyRoot(label: string) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-mcp-http-${label}-`)));
+  cleanupRoot = root;
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+  writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
+  return { root, home, workspace, traceLogPath: join(root, "fx-trace.log") };
+}
+
 function fixtureEnv(
   root: ReturnType<typeof createRoot>,
   activeGateway: ReturnType<typeof startFakeGateway>,
@@ -185,6 +197,52 @@ function assertModernWire(
 }
 
 describe("modern MCP Streamable HTTP", () => {
+  test.skipIf(!tmuxAvailable())(
+    "/mcp add --transport http persists and reloads a remote server",
+    async () => {
+      fixture = startModernMcpHttpFixture("json");
+      const root = createEmptyRoot("add-command");
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 150,
+        height: 36,
+        stderrPath,
+        env: fixtureEnv(root, gateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText(
+        `/mcp add --transport http prisma ${fixture.url}`,
+      );
+      const saved = await tui.waitForText("Saved MCP server 'prisma'.", 10_000);
+      expect(saved).toContain("MCP reconnection started");
+      await tui.waitForText("MCP configuration reloaded successfully.", 15_000);
+      await tui.sendText("/mcp list");
+      const health = await tui.waitForText("MCP health (1 server):", 10_000);
+      expect(health).toMatch(/prisma[\s\S]{0,240}transport=http state=ready/);
+
+      const profile = JSON.parse(
+        readFileSync(join(root.home, ".fx", "mcp.json"), "utf8"),
+      );
+      expect(profile.mcp.prisma).toMatchObject({
+        type: "http",
+        url: fixture.url,
+        enabled: true,
+      });
+      expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+        "server/discover",
+        "tools/list",
+      ]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    30_000,
+  );
+
   test("resource list-change storms coalesce to one complete refresh", async () => {
     fixture = startModernMcpHttpFixture("features");
     const root = createRoot("feature-update-storm", fixture);

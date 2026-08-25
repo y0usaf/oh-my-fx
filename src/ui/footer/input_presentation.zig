@@ -1,5 +1,6 @@
 const std = @import("std");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
+const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -295,6 +296,46 @@ pub fn measureRawInputGeometry(
     };
 }
 
+fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const u8 {
+    if (!view.active or view.include_skip) return null;
+
+    const root_variants = [_][]const u8{
+        "↑↓ Navigate     Enter Open     Esc Close",
+        "↑↓ Move  Enter Open  Esc",
+        "Enter Open  Esc Close",
+        "Enter Esc",
+    };
+    const connections_variants = [_][]const u8{
+        "↑↓ Navigate     Enter Open     Esc Back",
+        "↑↓ Move  Enter Open  Esc",
+        "Enter Open  Esc Back",
+        "Enter Esc",
+    };
+    const selection_variants = [_][]const u8{
+        "↑↓ Navigate     Enter Use     Esc Back",
+        "↑↓ Move  Enter Use  Esc",
+        "Enter Use  Esc Back",
+        "Enter Esc",
+    };
+    const team_variants = [_][]const u8{
+        "Type to search     ↑↓ Navigate     Enter Use     Esc Back",
+        "Type  ↑↓ Move  Enter  Esc",
+        "↑↓ Move  Enter  Esc",
+        "Enter Esc",
+    };
+    const variants = switch (view.stage) {
+        .root => root_variants,
+        .connections => connections_variants,
+        .provider, .switch_credential => selection_variants,
+        .change_team => team_variants,
+        .sign_in, .api_key => return null,
+    };
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) return candidate;
+    }
+    return variants[variants.len - 1];
+}
+
 pub fn composeHintRow(
     alloc: Allocator,
     approval_active: bool,
@@ -305,6 +346,10 @@ pub fn composeHintRow(
     var question_hint_buf: [512]u8 = undefined;
     const question_hint = if (ctx.question) |projection|
         questionInteractionHint(projection, width, &question_hint_buf)
+    else
+        null;
+    const auth_hint = if (!approval_active and question_hint == null and !ctx.ctrl_c_pending)
+        authPickerInteractionHint(ctx.auth_picker, width)
     else
         null;
     var hint_buf: [max_status_line_len]u8 = undefined;
@@ -329,6 +374,8 @@ pub fn composeHintRow(
         hint
     else if (ctx.ctrl_c_pending)
         "press ctrl+c again to exit"
+    else if (auth_hint) |hint|
+        hint
     else if (ctx.selected_subagent_label) |label|
         if (ctx.selected_subagent_status) |status|
             std.fmt.bufPrint(
@@ -1516,6 +1563,32 @@ test "compose hint row keeps model in left hint text" {
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b[14G") == null);
 }
 
+test "compose hint row replaces model status with setup navigation" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var ctx = testRenderContext(&input);
+    ctx.auth_picker = .{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = .{ .action = .connections },
+        .active_source = null,
+        .include_skip = false,
+    };
+
+    var root = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
+    defer root.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, root.items, "↑↓ Navigate") != null);
+    try std.testing.expect(std.mem.find(u8, root.items, "Enter Open") != null);
+    try std.testing.expect(std.mem.find(u8, root.items, "Esc Close") != null);
+    try std.testing.expect(std.mem.find(u8, root.items, "gpt-5.1") == null);
+
+    ctx.auth_picker.stage = .connections;
+    ctx.auth_picker.selected_choice = .{ .action = .login };
+    var child = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
+    defer child.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, child.items, "Esc Back") != null);
+}
+
 test "compose hint row uses dots in subagent view" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
@@ -1609,7 +1682,7 @@ test "compose hint row right-aligns upgrade status" {
         .selected_subagent_id = null,
         .selected_subagent_label = null,
         .selected_subagent_status = null,
-        .upgrade_status = "Update installed: ctrl+g to reload",
+        .upgrade_status = "update ready: ctrl+g to reload",
         .statusline = .{
             .workspace_label = "/a/long/workspace/path/that/uses/the/statusline-tail",
         },
@@ -1620,8 +1693,8 @@ test "compose hint row right-aligns upgrade status" {
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Update installed: ctrl+g to reload") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "\x1b[15G") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "\x1b[19G") != null);
 }
 
 test "compose hint row right-aligns upgrade status after styled auto mode" {
@@ -1639,7 +1712,7 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
         .selected_subagent_id = null,
         .selected_subagent_label = null,
         .selected_subagent_status = null,
-        .upgrade_status = "Update installed: ctrl+g to reload",
+        .upgrade_status = "update ready: ctrl+g to reload",
         .input = &input,
     };
 
@@ -1649,8 +1722,8 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
 
     try std.testing.expect(std.mem.find(u8, row.items, "auto") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-4o") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Update installed: ctrl+g to reload") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "\x1b[23G") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "\x1b[27G") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 56);
 }
 
@@ -1742,13 +1815,13 @@ test "question hint row excludes model and upgrade status at supported widths" {
         var ctx = testRenderContext(&input);
         ctx.question = prompt.projection();
         ctx.model = "model-x";
-        ctx.upgrade_status = "Update installed: ctrl+g to reload";
+        ctx.upgrade_status = "update ready: ctrl+g to reload";
         var row = try composeHintRow(std.testing.allocator, false, null, ctx, case.width);
         defer row.deinit(std.testing.allocator);
 
         try std.testing.expect(std.mem.find(u8, row.items, case.hint) != null);
         try std.testing.expect(std.mem.find(u8, row.items, "model-x") == null);
-        try std.testing.expect(std.mem.find(u8, row.items, "Update installed: ctrl+g to reload") == null);
+        try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") == null);
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= case.width);
     }
 }

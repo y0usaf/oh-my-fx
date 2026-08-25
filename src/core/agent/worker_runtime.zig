@@ -1701,7 +1701,7 @@ test "terminal recovery pause admits continuation before worker cleanup" {
                 .assistant_source = @constCast("partial response"),
                 .cause = .network_interrupted,
                 .action = .paused,
-                .route_model = @constCast("model"),
+                .authority = .{ .provider = .gateway, .model = @constCast("model") },
                 .requested_fast_mode = false,
                 .fast_mode = false,
                 .max_provider_attempts = 10,

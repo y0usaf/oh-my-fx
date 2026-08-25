@@ -1503,6 +1503,7 @@ test.skipIf(!tmuxAvailable())(
     const gateway = startFakeGateway([
       fakeGatewayToolCall("terminal_null_placeholder_exec", "terminal", {
         action: "exec",
+        timeout_ms: 600_000,
         command: `printf NULL_PLACEHOLDER_OK > ${JSON.stringify(marker)}`,
         cwd: "null",
         profile: "null",

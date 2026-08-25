@@ -15,6 +15,7 @@ const diff = @import("../../../output/diff.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const command_result_mapping = @import("../../../tooling/command_result_mapping.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
+const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const tool_specs = @import("../../../tooling/tool_specs.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
@@ -63,10 +64,10 @@ const toolCall = test_support.toolCall;
 const vision_agent_test_tools = test_support.vision_agent_test_tools;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
-const fixture_tools_json =
-    "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
-const terminal_nested_tools_json =
-    "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"oneOf\":[{\"type\":\"object\"}]}},\"required\":[\"request\"],\"additionalProperties\":false}}]";
+const read_file_advertised_names = [_][]const u8{"read_file"};
+const terminal_advertised_names = [_][]const u8{"terminal"};
+const read_file_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.read_file.model_schema};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.terminal.model_schema};
 
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
@@ -1027,7 +1028,8 @@ test "borrowed nested terminal completion is flat before authority execution and
     hooks.permission_decisions = &.{.once};
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.gateway_tools_json = terminal_nested_tools_json;
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -1092,7 +1094,8 @@ test "terminal lifecycle resolves one display target before execution" {
     };
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.gateway_tools_json = terminal_nested_tools_json;
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -4342,7 +4345,7 @@ test "initial session grants follow active registry metadata" {
 
     var provider_list = builtin_tools.list_files;
     provider_list.name = "provider_list";
-    provider_list.gateway_schema.name = "provider_list";
+    provider_list.model_schema.name = "provider_list";
     const tools = [_]tool_dispatch.Tool{provider_list};
 
     var hooks = FakeAgentRuntimeDeps.init(alloc);

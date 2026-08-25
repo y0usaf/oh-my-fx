@@ -26,6 +26,8 @@ const freeHttpHeaders = mcp_contract.freeHttpHeaders;
 const freeHttpHeaderEnv = mcp_contract.freeHttpHeaderEnv;
 const freeOwnedStrings = mcp_contract.freeOwnedStrings;
 
+const add_usage = "Usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>";
+
 pub const command_provider = command_provider_contract.Provider{ .handle_fn = handleCommand };
 
 fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandRequest) !CommandResult {
@@ -163,6 +165,29 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
                 false,
             );
         }
+        if (result.repaired_entries > 0) {
+            const text = if (result.revocation_failed)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "Logged out of MCP server '{s}' locally; remote revocation failed. Removed {d} unreadable MCP credential {s}.",
+                    .{
+                        name,
+                        result.repaired_entries,
+                        if (result.repaired_entries == 1) "entry" else "entries",
+                    },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "Logged out of MCP server '{s}'. Removed {d} unreadable MCP credential {s}.",
+                    .{
+                        name,
+                        result.repaired_entries,
+                        if (result.repaired_entries == 1) "entry" else "entries",
+                    },
+                );
+            return .{ .display = .{ .line = text }, .reload = true };
+        }
         if (result.revocation_failed) {
             return lineParts(
                 alloc,
@@ -199,18 +224,43 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
         var it = std.mem.tokenizeAny(u8, trimmed[4..], " \t");
         while (it.next()) |token| try tokens.append(alloc, token);
 
-        if (tokens.items.len < 2) {
-            return lineLiteral(alloc, "Usage: /mcp add <name> <command> [args...]", false);
-        }
+        if (tokens.items.len < 2) return lineLiteral(alloc, add_usage, false);
 
-        addOrReplaceLocalServer(alloc, config_path, tokens.items[0], tokens.items[1..]) catch |err| {
-            return lineParts(
+        const name = if (std.mem.eql(u8, tokens.items[0], "--transport")) remote: {
+            if (tokens.items.len != 4 or
+                !std.mem.eql(u8, tokens.items[1], "http"))
+            {
+                return lineLiteral(alloc, add_usage, false);
+            }
+            addOrReplaceHttpServer(
                 alloc,
-                &.{ "Failed to save MCP server config: ", @errorName(err), "." },
-                false,
-            );
+                config_path,
+                tokens.items[2],
+                tokens.items[3],
+            ) catch |err| {
+                return lineParts(
+                    alloc,
+                    &.{ "Failed to save MCP server config: ", @errorName(err), "." },
+                    false,
+                );
+            };
+            break :remote tokens.items[2];
+        } else local: {
+            addOrReplaceLocalServer(
+                alloc,
+                config_path,
+                tokens.items[0],
+                tokens.items[1..],
+            ) catch |err| {
+                return lineParts(
+                    alloc,
+                    &.{ "Failed to save MCP server config: ", @errorName(err), "." },
+                    false,
+                );
+            };
+            break :local tokens.items[0];
         };
-        return lineParts(alloc, &.{ "Saved MCP server '", tokens.items[0], "'." }, true);
+        return lineParts(alloc, &.{ "Saved MCP server '", name, "'." }, true);
     }
 
     return lineLiteral(
@@ -424,15 +474,47 @@ fn addOrReplaceLocalServer(alloc: Allocator, path: []const u8, name: []const u8,
     if (command.len == 0) return error.McpMissingCommand;
     if (!isValidServerName(name)) return error.McpInvalidServerName;
 
-    var configs = try loadConfigFromPath(alloc, path);
-    defer freeConfigs(alloc, &configs);
+    return addOrReplaceServer(
+        alloc,
+        path,
+        try configFromCommandVector(alloc, name, command),
+    );
+}
 
-    var next = try configFromCommandVector(alloc, name, command);
+fn addOrReplaceHttpServer(
+    alloc: Allocator,
+    path: []const u8,
+    name: []const u8,
+    url: []const u8,
+) !void {
+    if (!isValidServerName(name)) return error.McpInvalidServerName;
+    streamable_http.validateEndpoint(url) catch return error.McpConfigInvalidUrl;
+
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_url = try alloc.dupe(u8, url);
+    return addOrReplaceServer(alloc, path, .{
+        .name = owned_name,
+        .transport = .http,
+        .url = owned_url,
+        .allow_stored_credentials = true,
+    });
+}
+
+fn addOrReplaceServer(
+    alloc: Allocator,
+    path: []const u8,
+    next_value: McpServerConfig,
+) !void {
+    var next = next_value;
     var moved = false;
     errdefer if (!moved) next.deinit(alloc);
 
+    var configs = try loadConfigFromPath(alloc, path);
+    defer freeConfigs(alloc, &configs);
+
     for (configs.items) |*existing| {
-        if (!std.mem.eql(u8, existing.name, name)) continue;
+        if (!std.mem.eql(u8, existing.name, next.name)) continue;
         existing.deinit(alloc);
         existing.* = next;
         moved = true;
@@ -1689,6 +1771,78 @@ test "built-in MCP command mutates profile config and requests reload after save
     try expectLine(missing_result, "MCP server 'fs' not found.", false);
 }
 
+test "built-in MCP command adds a remote HTTP server and preserves local add" {
+    const alloc = std.testing.allocator;
+    var fixture = ListFixture{ .text = "" };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const config_path = try configPathFromHome(alloc, home);
+    defer alloc.free(config_path);
+
+    var remote = try handleCommand(
+        alloc,
+        "add --transport http prisma https://mcp.prisma.io/mcp",
+        request(home, &fixture),
+    );
+    defer remote.deinit(alloc);
+    try expectLine(remote, "Saved MCP server 'prisma'.", true);
+
+    var local = try handleCommand(
+        alloc,
+        "add files node server.js",
+        request(home, &fixture),
+    );
+    defer local.deinit(alloc);
+    try expectLine(local, "Saved MCP server 'files'.", true);
+
+    var configs = try loadConfigFromPath(alloc, config_path);
+    defer freeConfigs(alloc, &configs);
+    try std.testing.expectEqual(@as(usize, 2), configs.items.len);
+    try std.testing.expectEqualStrings("prisma", configs.items[0].name);
+    try std.testing.expectEqual(McpTransport.http, configs.items[0].transport);
+    try std.testing.expectEqualStrings(
+        "https://mcp.prisma.io/mcp",
+        try configs.items[0].remoteUrl(),
+    );
+    try std.testing.expectEqualStrings("files", configs.items[1].name);
+    try std.testing.expectEqual(McpTransport.stdio, configs.items[1].transport);
+    try std.testing.expectEqualStrings("node", try configs.items[1].stdioCommand());
+    try std.testing.expectEqualStrings("server.js", configs.items[1].args[0]);
+}
+
+test "built-in MCP command rejects invalid remote add forms without mutation" {
+    const alloc = std.testing.allocator;
+    var fixture = ListFixture{ .text = "" };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const config_path = try configPathFromHome(alloc, home);
+    defer alloc.free(config_path);
+
+    for ([_][]const u8{
+        "add --transport http prisma",
+        "add --transport sse prisma https://mcp.prisma.io/mcp",
+        "add --transport http prisma https://mcp.prisma.io/mcp extra",
+    }) |command| {
+        var result = try handleCommand(alloc, command, request(home, &fixture));
+        defer result.deinit(alloc);
+        try expectLine(
+            result,
+            "Usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>",
+            false,
+        );
+    }
+
+    var configs = try loadConfigFromPath(alloc, config_path);
+    defer freeConfigs(alloc, &configs);
+    try std.testing.expectEqual(@as(usize, 0), configs.items.len);
+}
+
 test "saving MCP config refuses a symlinked target" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -1771,9 +1925,9 @@ test "built-in MCP command preserves usage and missing-home notices" {
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
 
-    var add_usage = try handleCommand(alloc, "add server", request(home, &fixture));
-    defer add_usage.deinit(alloc);
-    try expectLine(add_usage, "Usage: /mcp add <name> <command> [args...]", false);
+    var add_usage_result = try handleCommand(alloc, "add server", request(home, &fixture));
+    defer add_usage_result.deinit(alloc);
+    try expectLine(add_usage_result, add_usage, false);
 
     var generic_usage = try handleCommand(alloc, "wat", request(home, &fixture));
     defer generic_usage.deinit(alloc);
@@ -1790,6 +1944,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
         auth_calls: usize = 0,
         logout_calls: usize = 0,
         logout_busy: bool = false,
+        logout_repaired_entries: usize = 0,
 
         fn list(_: *anyopaque, alloc: Allocator) ![]u8 {
             return alloc.dupe(u8, "");
@@ -1825,7 +1980,10 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
             try std.testing.expectEqualStrings("remote", name);
             self.logout_calls += 1;
             if (self.logout_busy) return .{ .busy = true };
-            return .{ .removed = true };
+            return .{
+                .removed = true,
+                .repaired_entries = self.logout_repaired_entries,
+            };
         }
     };
     const alloc = std.testing.allocator;
@@ -1902,6 +2060,15 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
     defer logged_out.deinit(alloc);
     try expectLine(logged_out, "Logged out of MCP server 'remote'.", true);
     try std.testing.expectEqual(@as(usize, 2), fixture.logout_calls);
+
+    fixture.logout_repaired_entries = 2;
+    var repaired = try handleCommand(alloc, "logout remote", command_request);
+    defer repaired.deinit(alloc);
+    try expectLine(
+        repaired,
+        "Logged out of MCP server 'remote'. Removed 2 unreadable MCP credential entries.",
+        true,
+    );
 }
 
 test "loadConfigFromJson parses canonical local config with command array" {

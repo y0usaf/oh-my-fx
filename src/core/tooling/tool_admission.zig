@@ -2588,7 +2588,7 @@ test "interactive command approval keeps activity projection out of permission r
     try std.testing.expect(std.mem.endsWith(u8, approval_command, "\n" ++ raw_command));
 }
 
-test "terminal exec omission shares user grants while clean stays isolated" {
+test "terminal exec timeout and profile omission share user grants while clean stays isolated" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2605,12 +2605,12 @@ test "terminal exec omission shares user grants while clean stays isolated" {
     const omitted = try permissionTargetForCall(input, arena, .{
         .id = "omitted",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"timeout_ms\":1}",
     });
     const clean = permissionTargetForCall(input, arena, .{
         .id = "clean",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"clean\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"clean\",\"timeout_ms\":5000}",
     }) catch |err| switch (err) {
         error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
         else => return err,
@@ -2618,7 +2618,7 @@ test "terminal exec omission shares user grants while clean stays isolated" {
     const user = try permissionTargetForCall(input, arena, .{
         .id = "user",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqualStrings(omitted, user);
@@ -3798,7 +3798,7 @@ test "automatic non-allow is recoverable regardless tool approval policy" {
     );
     var auto_deny_tool = test_builtin_tools.read_file;
     auto_deny_tool.name = "test_auto_deny_on_ask";
-    auto_deny_tool.gateway_schema.name = auto_deny_tool.name;
+    auto_deny_tool.model_schema.name = auto_deny_tool.name;
     auto_deny_tool.requires_approval = true;
     auto_deny_tool.approval_policy = .auto_deny_on_ask;
     auto_deny_tool.label_arg_kind = .none;
@@ -3972,6 +3972,19 @@ test "incomplete review authority maps to unavailable without reviewer transport
             return .permanent_failure;
         }
 
+        fn build(
+            _: *anyopaque,
+            alloc: Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const types.ChatMessage,
+            _: []const u8,
+            _: std.Io.Clock.Timestamp,
+            _: *std.atomic.Value(bool),
+        ) ![]u8 {
+            return alloc.dupe(u8, "{}");
+        }
+
         fn review(
             raw_ctx: *anyopaque,
             alloc: Allocator,
@@ -3982,6 +3995,7 @@ test "incomplete review authority maps to unavailable without reviewer transport
             return permission_auto_classifier.Reviewer.withTransport(.{
                 .context = raw_ctx,
                 .send_fn = send,
+                .build_fn = build,
             }, null, 1000).review(alloc, request);
         }
     };
@@ -4043,7 +4057,7 @@ test "ask-only policy bypasses prompt and reviewer in auto and uses the ordinary
     );
     var ask_only_tool = test_builtin_tools.read_file;
     ask_only_tool.name = "test_ask_only";
-    ask_only_tool.gateway_schema.name = ask_only_tool.name;
+    ask_only_tool.model_schema.name = ask_only_tool.name;
     ask_only_tool.requires_approval = true;
     ask_only_tool.approval_policy = .ask_only;
     ask_only_tool.label_arg_kind = .none;
@@ -4376,7 +4390,7 @@ test "registered subagent commands do not require generic tool approval" {
     );
     var subagent = test_builtin_tools.read_file;
     subagent.name = "subagent";
-    subagent.gateway_schema.name = "subagent";
+    subagent.model_schema.name = "subagent";
     subagent.executor_kind = .subagent;
     subagent.activity_kind = .subagent;
     subagent.label_arg_kind = .none;
@@ -4407,7 +4421,7 @@ test "web search permission target follows registered tool metadata" {
 
     var provider_search = test_builtin_tools.read_file;
     provider_search.name = "provider_search";
-    provider_search.gateway_schema.name = "provider_search";
+    provider_search.model_schema.name = "provider_search";
     provider_search.executor_kind = .web_search;
     provider_search.permission_target_kind = .none;
     const tools = [_]tool_dispatch.Tool{provider_search};
@@ -4574,7 +4588,7 @@ test "permission rule display follows supplied registry metadata" {
 
     var provider_list = test_builtin_tools.list_files;
     provider_list.name = "provider_list";
-    provider_list.gateway_schema.name = "provider_list";
+    provider_list.model_schema.name = "provider_list";
     const tools = [_]tool_dispatch.Tool{provider_list};
     input.tool_registry = .{ .tools = tools[0..] };
     var rules = [_]types.PermissionRule{.{

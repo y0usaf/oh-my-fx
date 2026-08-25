@@ -4575,12 +4575,19 @@ const CoordinatorTestApp = struct {
     }
 
     pub fn resolvedModelCapabilities(self: *CoordinatorTestApp, model: []const u8) model_capabilities.Capabilities {
+        const fallback = model_capabilities.Capabilities{
+            .prompt_caching = true,
+            .context_window = 1_000_000,
+        };
         if (self.gateway_metadata_model) |metadata_model| {
             if (std.mem.eql(u8, metadata_model, model)) {
-                return model_capabilities.resolveCapabilities(model, self.gateway_metadata);
+                return model_capabilities.mergeCapabilities(
+                    fallback,
+                    self.gateway_metadata,
+                );
             }
         }
-        return model_capabilities.capabilitiesForModel(model);
+        return fallback;
     }
 
     fn isFileIndexLoading(_: *CoordinatorTestApp) bool {
@@ -5326,6 +5333,57 @@ test "core.app_render_runtime active skills menu owns a transcript-free alternat
     defer alloc.free(terminal_bytes);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
+}
+
+test "core.app_render_runtime active setup hub stays on the inline transcript surface" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "setup-inline.log", .{ .read = true });
+    defer file.close(io_mod.getIo());
+
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{
+            .stdout_file = file,
+            .layout = .{
+                .rows = 18,
+                .cols = 90,
+                .content_bottom = 14,
+                .divider_top_row = 15,
+                .input_row = 16,
+                .divider_bottom_row = 17,
+                .hint_row = 18,
+            },
+            .owned_top_row = 1,
+            .viewport_top_row = 1,
+        },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    app.auth.openPicker(alloc);
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    try app.shell.writeTranscript(alloc, &app.metrics, "setup transcript stays behind\n", true);
+
+    app.shell.render_requests.request(.footer);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Setup"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Connections"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Credential source"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Enter Open"));
+    try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "test-model")));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "setup transcript stays behind"));
+
+    app.auth.closePicker(alloc);
+    app.shell.render_requests.request(.footer);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "setup transcript stays behind"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "test-model"));
 }
 
 test "core.app_render_runtime model catalog survives modal preemption and restores the transcript on close" {

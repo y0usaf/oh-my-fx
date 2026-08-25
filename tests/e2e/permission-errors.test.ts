@@ -120,6 +120,7 @@ async function runTtyPromptPermissionsCase(
   const gateway = startFakeGateway([
     fakeGatewayToolCall(`${decision}_${outputMode}_call`, "terminal", {
       action: "exec",
+      timeout_ms: 600_000,
       command: `touch ${JSON.stringify(marker)}`,
     }),
     fakeGatewayFinalText(`${decision} ${outputMode} complete`),
@@ -171,6 +172,7 @@ describe("generic permission typed errors", () => {
       const gateway = startFakeGateway([
         fakeGatewayToolCall(toolCallId, "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: `touch ${JSON.stringify(marker)}`,
         }),
         fakeGatewayFinalText("permission error observed"),
@@ -257,6 +259,7 @@ describe("generic permission typed errors", () => {
             if (index > 0) expect(body).toContain("review_caution");
             return fakeGatewayToolCall(`auto_call_${index + 1}`, "terminal", {
               action: "exec",
+              timeout_ms: 600_000,
               command: `touch ${JSON.stringify(marker)}`,
             });
           }),
@@ -335,6 +338,7 @@ describe("generic permission typed errors", () => {
         const gateway = startFakeGateway([
           fakeGatewayToolCall("non_tty_call", "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `touch ${JSON.stringify(marker)}`,
           }),
         ]);

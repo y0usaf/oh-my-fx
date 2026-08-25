@@ -12,7 +12,7 @@ const mcp_health = @import("../mcp/health.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const context_limits = @import("../config/context_limits.zig");
-const tool_advertisement = @import("../tooling/tool_advertisement.zig");
+const tool_projection = @import("../tooling/tool_projection.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const tool_set = @import("../tooling/tool_set.zig");
@@ -681,17 +681,17 @@ fn cancelAndDeinitAuthentication(
     pending.deinit();
 }
 
-pub fn buildGatewayToolProjection(
+pub fn buildModelToolProjection(
     state: *State,
     alloc: Allocator,
     advertisement_set: tool_set.ToolSet,
-    options: tool_advertisement.Options,
-) !tool_advertisement.EffectiveToolProjection {
+    options: tool_projection.Options,
+) !tool_projection.EffectiveToolProjection {
     var lease = state.acquire();
     defer if (lease) |*active| active.deinit();
     var effective = options;
     effective.mcp_runtime = if (lease) |active| active.runtime else null;
-    return tool_advertisement.buildGatewayToolProjectionForSet(
+    return tool_projection.buildModelToolProjectionForSet(
         alloc,
         advertisement_set,
         effective,

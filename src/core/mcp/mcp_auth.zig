@@ -154,13 +154,20 @@ pub const Credentials = struct {
     }
 };
 
+pub const IssuerMismatchSource = enum {
+    authorization_metadata,
+    authorization_response,
+};
+
 pub const IssuerMismatch = struct {
     owner_alloc: Allocator,
+    source: IssuerMismatchSource,
     expected: []u8,
     returned: []u8,
 
     pub fn init(
         alloc: Allocator,
+        source: IssuerMismatchSource,
         expected: []const u8,
         returned: []const u8,
     ) !IssuerMismatch {
@@ -168,6 +175,7 @@ pub const IssuerMismatch = struct {
         errdefer alloc.free(owned_expected);
         return .{
             .owner_alloc = alloc,
+            .source = source,
             .expected = owned_expected,
             .returned = try alloc.dupe(u8, returned),
         };
@@ -186,7 +194,9 @@ pub const AuthorizationResult = union(enum) {
 };
 
 pub const AuthenticationResult = union(enum) {
-    authenticated,
+    authenticated: struct {
+        repaired_entries: usize = 0,
+    },
     issuer_mismatch: IssuerMismatch,
 
     pub fn deinit(self: *AuthenticationResult) void {
@@ -584,6 +594,7 @@ fn parseAuthorizationMetadataOutcome(
     if (!std.mem.eql(u8, issuer, expected_issuer)) {
         return .{ .issuer_mismatch = try IssuerMismatch.init(
             alloc,
+            .authorization_metadata,
             expected_issuer,
             issuer,
         ) };
@@ -1159,6 +1170,7 @@ fn authorizeWithRedirect(
         error.AuthorizationResponseIssuerMismatch => return .{
             .issuer_mismatch = try IssuerMismatch.init(
                 alloc,
+                .authorization_response,
                 metadata.issuer,
                 callback.issuer.?,
             ),
@@ -2338,6 +2350,10 @@ test "authorization metadata mismatch retains exact issuer values and fails clos
     switch (outcome) {
         .metadata => return error.TestUnexpectedResult,
         .issuer_mismatch => |mismatch| {
+            try std.testing.expectEqual(
+                IssuerMismatchSource.authorization_metadata,
+                mismatch.source,
+            );
             try std.testing.expectEqualStrings(
                 "https://login.example.com/",
                 mismatch.expected,

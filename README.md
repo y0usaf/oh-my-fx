@@ -1,3 +1,10 @@
+<p align="center">
+<img src="assets/omfx.svg" alt="oh-my-fx — Why should Pi have all the fun?" width="560">
+</p>
+
+<details>
+<summary>Original vercel-labs/fx README</summary>
+
 ```
  ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
  ⠀⠀⠀⠀⠀⢰⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -13,8 +20,6 @@
 
 fx is a coding agent harness and CLI written in Zig, optimized for research and embeddability as part of larger systems.
 
-> **oh-my-fx** is a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) that installs its binary as `omfx`; substitute `omfx` wherever these docs say `fx`.
-
 It focuses on minimalism and performance across the board, from system prompt design to its tools, feature set, and 7.8 MiB binary.
 
 For end users, its CLI output style and form factor aim to be closer to a Unix shell than a heavy "IDE in the terminal" TUI.
@@ -26,8 +31,6 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 ```bash
 curl -fsSL https://fx.sh/setup.sh | bash
 ```
-
-With Nix: `nix profile add github:vercel-labs/fx`
 
 ## Run fx
 
@@ -51,7 +54,7 @@ fx login grok
 fx
 ```
 
-`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Switch provider** starts sign-in.
+`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Model provider** to move between Gateway, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Model provider** starts sign-in.
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
@@ -72,7 +75,7 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
-The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.omfx/settings.json`:
+The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json
 {
@@ -101,22 +104,7 @@ Use `fx ask` for a single request:
 fx ask "explain the changes in this repository"
 ```
 
-Juggle concurrent sessions for the current workspace in a native terminal UI:
-
-```bash
-fx mux
-```
-
-The minimal sidebar lists saved and newly created sessions while each child fx terminal remains live. Sessions launched by mux publish the standard fx renderer grid directly, avoiding ANSI re-parsing; the PTY remains only as a startup and failure fallback. If a saved session is already open in another fx process, the mux attaches to its live screen and forwards input instead of starting a competing resume process. Use `ctrl+h` and `ctrl+l` to move focus, `ctrl+j` and `ctrl+k` to switch sessions, `ctrl+n` to create one, `ctrl+delete` to move an inactive selected saved session into `~/.fx/archive/`, and `ctrl+q` to quit. Pass a saved session ID to `fx mux <session-id>` to select it on startup.
-
-Benchmark mux terminal ingestion, session switching, and frame construction locally:
-
-```bash
-nix run .#benchmark
-nix run .#benchmark -- 32 5000  # sessions, iterations
-```
-
-Without Nix, run `zig build run-bench-mux -Doptimize=ReleaseSafe -- 32 5000`.
+Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
 
 fx starts in `auto` permission mode. Routine understood development actions run directly. Each unresolved action receives one narrow safety review based on the current user request and the exact pending action. A clear result authorizes only that action. A caution or unavailable review holds the action and returns advice to the agent without opening a permission prompt or ending the turn. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
@@ -136,13 +124,9 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
 
-## Code-aware tools
-
-fx can parse TypeScript, TSX, Python, Go, Rust, Nix, and Zig files with the built-in `ast_symbols` tool. It returns named declarations, their kinds, and source line numbers so agents can inspect a file's structural outline without relying on text matching.
-
 ## Extend fx
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
+Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Inside fx, `/mcp add <name> <command> [args...]` saves a local server and `/mcp add --transport http <name> <url>` saves a remote Streamable HTTP server. Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
 
 ## Documentation
 
@@ -156,7 +140,7 @@ Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
 git clone https://github.com/vercel-labs/fx.git
 cd fx
 zig build -Doptimize=ReleaseSafe
-./zig-out/bin/omfx
+./zig-out/bin/fx
 ```
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
@@ -171,3 +155,5 @@ Third-party licenses and attributions are listed in
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+</details>
