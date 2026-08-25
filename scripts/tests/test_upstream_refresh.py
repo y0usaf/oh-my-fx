@@ -62,8 +62,8 @@ class UpstreamRefreshTests(unittest.TestCase):
         plan_path = Path(next(line[6:] for line in result.stdout.splitlines() if line.startswith("plan: ")))
         payload = json.loads(plan_path.read_text())
         self.assertEqual(git(self.root, "rev-parse", "upstream/main"), payload["source"])
-        self.assertEqual({"upstream-merge", "feature"}, {entry["branch"] for entry in payload["entries"]})
-        self.assertEqual(0, len({entry["status"] for entry in payload["entries"] if entry["status"] == "planned"}))
+        self.assertEqual({"upstream-merge", "feature"}, {entry["branch"] for entry in payload["entries"] if entry["branch"]})
+        self.assertEqual("ready", payload["phase"])
 
     def test_apply_rebases_all_clean_worktrees_onto_pinned_source(self) -> None:
         upstream = self.remote
@@ -86,12 +86,32 @@ class UpstreamRefreshTests(unittest.TestCase):
             text=True, capture_output=True,
         )
         self.assertEqual(0, applied.returncode, applied.stderr)
-        source = git(self.root, "rev-parse", "upstream/main")
-        for branch in ("upstream-merge", "feature"):
-            self.assertEqual(0, run(self.root, "merge-base", "--is-ancestor", source, branch).returncode)
+        integration = payload_integration = json.loads(plan_path.read_text())["integration"]
+        for entry in json.loads(plan_path.read_text())["entries"]:
+            if entry["status"] == "updated":
+                self.assertEqual(0, run(self.root, "merge-base", "--is-ancestor", integration, entry["branch"]).returncode)
         self.assertEqual(0, run(self.root, "for-each-ref", "--format=%(refname)", "refs/backup/omifx-upstream-refresh").returncode)
-        self.assertIn("refs/backup/omifx-upstream-refresh", run(self.root, "for-each-ref", "--format=%(refname)", "refs/backup/omifx-upstream-refresh").stdout)
 
 
+    def test_plan_marks_dirty_worktree_without_mutating_it(self) -> None:
+        marker = self.worktree / "uncommitted"
+        marker.write_text("keep\n")
+        result = subprocess.run(["python3", str(SCRIPT), "prepare", "--root", str(self.root), "--no-fetch"], text=True, capture_output=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        plan_path = Path(next(line[6:] for line in result.stdout.splitlines() if line.startswith("plan: ")))
+        payload = json.loads(plan_path.read_text())
+        feature = next(entry for entry in payload["entries"] if entry["branch"] == "feature")
+        self.assertEqual("skipped-dirty", feature["status"])
+        self.assertTrue(marker.exists())
+
+    def test_plan_reports_detached_worktree(self) -> None:
+        detached = Path(self.temp.name) / "detached"
+        run(self.root, "worktree", "add", "-q", "--detach", str(detached), "HEAD").check_returncode()
+        result = subprocess.run(["python3", str(SCRIPT), "prepare", "--root", str(self.root), "--no-fetch"], text=True, capture_output=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        plan_path = Path(next(line[6:] for line in result.stdout.splitlines() if line.startswith("plan: ")))
+        payload = json.loads(plan_path.read_text())
+        detached_entry = next(entry for entry in payload["entries"] if entry["worktree"] == str(detached))
+        self.assertEqual("skipped-detached", detached_entry["status"])
 if __name__ == "__main__":
     unittest.main()

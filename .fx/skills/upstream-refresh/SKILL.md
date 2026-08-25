@@ -1,41 +1,55 @@
 # Upstream refresh
 
-Use this skill when updating every attached OMIFX worktree from `upstream/main`.
+Use this skill when updating attached OMIFX worktrees from `upstream/main`.
 
-## Contract
+## Deterministic lifecycle
 
-Run the deterministic planner from the repository root:
-
-```bash
-python3 scripts/upstream_refresh.py plan
-```
-
-The command fetches `upstream/main` once, pins its commit, discovers attached
-worktrees, and writes an immutable plan under the common Git directory.
-
-Review the JSON plan before applying it. Dirty worktrees, detached worktrees,
-and worktrees with an existing merge, cherry-pick, revert, or rebase are never
-mutated. Apply a plan only after those entries are intentionally handled:
+Prepare one pinned session:
 
 ```bash
-python3 scripts/upstream_refresh.py apply --plan /path/from-plan.json
+python3 scripts/upstream_refresh.py prepare
 ```
 
-The apply operation rebases each clean OMIFX branch onto the same pinned
-upstream commit and creates a backup ref before changing it. It processes
-branches independently and stops on the first conflict without guessing. The
-agent resolves that conflict in the reported worktree, then runs the normal
-`git rebase --continue` there. Never use `git reset --hard`, blanket
-`checkout --ours`, or blanket `checkout --theirs` during resolution.
+The command records the exact upstream SHA, `origin/main` base SHA, and a
+session-owned integration worktree under the common Git directory. It includes
+the repository root, attached branches, detached worktrees, dirty worktrees,
+and worktrees with active Git operation markers in the JSON plan. It never
+mutates an entry marked skipped.
 
-## Invariants
+The integration phase is authoritative upstream plus the current OMIFX base.
+When it conflicts, resolve that one integration worktree first. Do not resolve
+the same upstream conflict independently in every feature worktree. Record the
+decision and verify the integration result before applying branches.
 
-- The source commit is fetched and recorded once per plan.
-- Each branch keeps its own commits; only its old shared base is replaced.
-- A dirty or already-active worktree is skipped, never stashed or reset.
-- Every mutation has a backup under `refs/backup/omifx-upstream-refresh/`.
-- Re-running a plan is safe: completed or skipped entries are not replayed.
-- Conflicts are semantic work for the agent, not automatic policy decisions.
+When the plan phase is `ready`, apply it:
 
-After resolution, verify the affected branch with its focused tests and build,
-then exercise `./zig-out/bin/fx` as required by the repository instructions.
+```bash
+python3 scripts/upstream_refresh.py apply --plan /path/to/plan.json
+```
+
+Each clean branch is rebased from its recorded fork point onto the same
+integration commit. A backup ref is created before mutation. The command
+rechecks branch tip, worktree cleanliness, and Git operation markers so a stale
+plan refuses drift rather than rebasing newer work.
+
+## Agent conflict policy
+
+Prefer upstream architecture, APIs, and behavior by default. Preserve an OMIFX
+change only when it is an intentional feature not replaced upstream; adapt that
+feature to the current upstream implementation instead of retaining obsolete
+local structure. Never use blanket `git checkout --ours` or `--theirs`, reset a
+worktree, or discard uncommitted work.
+
+For every semantic conflict, write down the file, upstream choice, preserved
+OMIFX behavior, and verification command in the agent report. Resolve conflicts
+in the session-owned worktree only, then run the focused build/test and
+`./zig-out/bin/fx` smoke check required by `AGENTS.md`.
+
+Inspect or hand off a session without changing it:
+
+```bash
+python3 scripts/upstream_refresh.py status --plan /path/to/plan.json
+```
+
+Dirty, detached, missing, and active-operation worktrees are intentionally
+left for explicit agent/user handling. Do not stash or reset them implicitly.
