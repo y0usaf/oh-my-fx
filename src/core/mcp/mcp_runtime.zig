@@ -2458,7 +2458,6 @@ pub const McpServerConfig = mcp_contract.McpServerConfig;
 const freeOwnedStrings = mcp_contract.freeOwnedStrings;
 
 pub const McpTool = struct {
-    server_name: []const u8,
     original_name: []const u8,
     prefixed_name: []u8,
     title: ?[]u8 = null,
@@ -2469,8 +2468,6 @@ pub const McpTool = struct {
     annotations_json: ?[]u8 = null,
     metadata_json: ?[]u8 = null,
     tags: []const []u8,
-    search_text: []u8,
-    server_instructions: ?[]const u8 = null,
 };
 
 pub const ToolCatalogSnapshot = struct {
@@ -3575,7 +3572,6 @@ fn freeTools(alloc: Allocator, tools: []const McpTool) void {
         if (tool.annotations_json) |value| alloc.free(value);
         if (tool.metadata_json) |value| alloc.free(value);
         freeOwnedStrings(alloc, tool.tags);
-        alloc.free(tool.search_text);
     }
 }
 
@@ -5309,6 +5305,7 @@ pub const McpRuntime = struct {
             .issuer_mismatch => |mismatch| return .{ .issuer_mismatch = mismatch },
         };
         var transferred = false;
+        var repaired_entries: usize = 0;
         defer if (!transferred) credentials.deinit(self.alloc);
         {
             server.auth_lock.lockUncancelable(io_mod.getIo());
@@ -5318,7 +5315,12 @@ pub const McpRuntime = struct {
                 source.generation,
                 cancellation,
             );
-            try mcp_auth_store.save(self.alloc, server.config.name, credentials);
+            const save_result = try mcp_auth_store.save(
+                self.alloc,
+                server.config.name,
+                credentials,
+            );
+            repaired_entries = save_result.repaired_entries;
             installAuthCredentials(self.alloc, server, &credentials);
             transferred = true;
             if (server.pending_auth_challenge) |*pending| pending.deinit(self.alloc);
@@ -5340,7 +5342,9 @@ pub const McpRuntime = struct {
         server.connection_lock.unlockShared(io_mod.getIo());
         connection_locked = false;
         try resumeToolSubscriptionAfterAuthentication(self, server, deadline);
-        return .authenticated;
+        return .{ .authenticated = .{
+            .repaired_entries = repaired_entries,
+        } };
     }
 
     pub fn validateAuthenticationServer(self: *McpRuntime, name: []const u8) !void {
@@ -5370,6 +5374,7 @@ pub const McpRuntime = struct {
     pub const LogoutResult = struct {
         removed: bool = false,
         revocation_failed: bool = false,
+        repaired_entries: usize = 0,
     };
 
     const DetachedLogoutAuth = struct {
@@ -5461,7 +5466,10 @@ pub const McpRuntime = struct {
             self.restoreAuthAfterLogout(server, &auth);
             return err;
         };
-        if (deleted.removed == 0 and auth.credentials == null) {
+        if (deleted.removed == 0 and
+            deleted.repaired_entries == 0 and
+            auth.credentials == null)
+        {
             self.restoreAuthAfterLogout(server, &auth);
             return .{};
         }
@@ -5501,6 +5509,7 @@ pub const McpRuntime = struct {
         return .{
             .removed = true,
             .revocation_failed = revocation_failed,
+            .repaired_entries = deleted.repaired_entries,
         };
     }
 
@@ -5817,11 +5826,16 @@ pub const McpRuntime = struct {
                 const auth_witness = catalogAuthWitness(match.server);
                 if (permissions.rulesDenyAllTargetsForPermission(permission_rules, match.tool.prefixed_name)) break :result null;
                 const instruction_limit = limits.mcp_server_instructions_bytes;
-                const instructions = if (match.tool.server_instructions) |value|
+                const server_instructions = match.server.instructions;
+                const instruction_observed_bytes = if (server_instructions) |value|
+                    value.len
+                else
+                    0;
+                const instructions = if (server_instructions) |value|
                     value[0..context_limits.lineSafePrefixLength(value, instruction_limit.effectiveBytes())]
                 else
                     null;
-                const instructions_truncated = if (match.tool.server_instructions) |value|
+                const instructions_truncated = if (server_instructions) |value|
                     instructions.?.len < value.len
                 else
                     false;
@@ -5830,6 +5844,7 @@ pub const McpRuntime = struct {
                     match.tool,
                     instructions,
                     instructions_truncated,
+                    instruction_observed_bytes,
                     instruction_limit,
                 );
                 var schema_owned = true;
@@ -5868,7 +5883,7 @@ pub const McpRuntime = struct {
                         alloc,
                         match.tool.prefixed_name,
                         "instructions truncated",
-                        match.tool.server_instructions.?.len,
+                        instruction_observed_bytes,
                         instruction_limit,
                         "mcp_server_instructions_bytes",
                     )
@@ -5914,8 +5929,8 @@ pub const McpRuntime = struct {
             self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
             defer self.catalog_mutex.unlockShared(io_mod.getIo());
             const capped_limit = @min(if (limit == 0) default_mcp_search_limit else limit, max_mcp_search_limit);
-            var matches: std.ArrayList(McpTool) = .empty;
-            defer matches.deinit(alloc);
+            var match_storage: [max_mcp_search_limit]ToolSearchMatch = undefined;
+            var match_count: usize = 0;
             var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
             defer auth_witnesses.deinit(alloc);
             var more_available = false;
@@ -5928,18 +5943,28 @@ pub const McpRuntime = struct {
                 else
                     "";
                 var server_matched = false;
-                for (server.tool_catalog.tools.items) |tool| {
+                for (server.tool_catalog.tools.items) |*tool| {
                     if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
                     const exact_identity = queryContainsCompleteIdentity(query, tool.original_name) or
                         queryContainsCompleteIdentity(query, tool.prefixed_name);
-                    if (!exact_identity and !toolMatchesQuery(tool, searchable_instructions, query)) continue;
+                    if (!exact_identity and
+                        !toolMatchesQuery(
+                            tool,
+                            server.config.name,
+                            searchable_instructions,
+                            query,
+                        )) continue;
                     server_matched = true;
-                    if (matches.items.len >= capped_limit) {
+                    if (match_count >= capped_limit) {
                         more_available = true;
                         break;
                     }
-                    try matches.append(alloc, tool);
+                    match_storage[match_count] = .{
+                        .server = server,
+                        .tool = tool,
+                    };
+                    match_count += 1;
                 }
                 if (server_matched) {
                     if (catalogAuthWitness(server)) |generation| {
@@ -5951,7 +5976,8 @@ pub const McpRuntime = struct {
                 }
                 if (more_available) break :server_loop;
             }
-            if (matches.items.len == 0) {
+            const matches = match_storage[0..match_count];
+            if (matches.len == 0) {
                 if (try renderAuthenticationRequired(
                     alloc,
                     self.servers.items,
@@ -5964,8 +5990,8 @@ pub const McpRuntime = struct {
 
             const full = try renderSearchResult(
                 alloc,
-                matches.items,
-                matches.items.len,
+                matches,
+                matches.len,
                 limits.mcp_description_bytes,
                 limits.mcp_search_result_bytes,
                 0,
@@ -5976,19 +6002,19 @@ pub const McpRuntime = struct {
             const effective_bytes = limits.mcp_search_result_bytes.effectiveBytes();
             if (full.len <= effective_bytes) {
                 errdefer alloc.free(full);
-                const notice = try renderSearchNotice(alloc, matches.items, matches.items.len, limits, observed_bytes, false);
+                const notice = try renderSearchNotice(alloc, matches, matches.len, limits, observed_bytes, false);
                 errdefer if (notice) |value| alloc.free(value);
                 try validateCatalogAuthWitnesses(auth_witnesses.items);
                 break :result tool_mcp_runtime.SearchResult{ .model_output = full, .notice = notice };
             }
             alloc.free(full);
 
-            var selected_count = matches.items.len;
+            var selected_count = matches.len;
             var model_output: ?[]u8 = null;
             while (true) {
                 const candidate = try renderSearchResult(
                     alloc,
-                    matches.items,
+                    matches,
                     selected_count,
                     limits.mcp_description_bytes,
                     limits.mcp_search_result_bytes,
@@ -6009,7 +6035,7 @@ pub const McpRuntime = struct {
             }
             const output = model_output.?;
             errdefer alloc.free(output);
-            const notice = try renderSearchNotice(alloc, matches.items, selected_count, limits, observed_bytes, true);
+            const notice = try renderSearchNotice(alloc, matches, selected_count, limits, observed_bytes, true);
             errdefer if (notice) |value| alloc.free(value);
             try validateCatalogAuthWitnesses(auth_witnesses.items);
             break :result tool_mcp_runtime.SearchResult{ .model_output = output, .notice = notice };
@@ -8669,13 +8695,11 @@ test "MRTR tool snapshots bind server schemas and both generations" {
         .content_digest = feature_cache.authIdentity(&.{}),
     };
     try server.tool_catalog.tools.append(alloc, .{
-        .server_name = "fixture",
         .original_name = @constCast("echo"),
         .prefixed_name = @constCast("mcp_fixture_echo"),
         .description = @constCast("Echo"),
         .input_schema_json = @constCast("{\"type\":\"object\"}"),
         .tags = &.{},
-        .search_text = @constCast("echo"),
     });
     try runtime.servers.append(alloc, server);
     defer runtime.servers.items[0].tool_catalog.tools.deinit(alloc);
@@ -9793,8 +9817,12 @@ fn connectServer(
         existing.deinit();
         server.env_map = null;
     }
+    defer {
+        if (server.env_map) |*environment| environment.deinit();
+        server.env_map = null;
+    }
     if (server.config.env.len > 0) {
-        server.env_map = EnvMap.init(alloc);
+        server.env_map = try io_mod.cloneEnvironMap(alloc);
         for (server.config.env) |entry| {
             try server.env_map.?.put(entry.key, entry.value);
         }
@@ -10479,9 +10507,6 @@ fn buildProtocolTools(
         const tags = try buildToolTags(alloc, server.config.name, name);
         errdefer freeOwnedStrings(alloc, tags);
 
-        const search_text = try buildSearchText(alloc, server.config.name, name, description, input_schema_json, tags);
-        errdefer alloc.free(search_text);
-
         const title = if (protocol_tool.title) |value| try alloc.dupe(u8, value) else null;
         errdefer if (title) |value| alloc.free(value);
         const output_schema_json = if (protocol_tool.output_schema_json) |value| try alloc.dupe(u8, value) else null;
@@ -10496,7 +10521,6 @@ fn buildProtocolTools(
         try result.tools.ensureUnusedCapacity(alloc, 1);
         try used_tool_names.put(prefixed_name, {});
         result.tools.appendAssumeCapacity(.{
-            .server_name = server.config.name,
             .original_name = original_name,
             .prefixed_name = prefixed_name,
             .title = title,
@@ -10507,8 +10531,6 @@ fn buildProtocolTools(
             .annotations_json = annotations_json,
             .metadata_json = metadata_json,
             .tags = tags,
-            .search_text = search_text,
-            .server_instructions = server.instructions,
         });
     }
     return result;
@@ -11165,9 +11187,9 @@ fn serverHasSnapshotTool(
     server: *const McpServer,
     snapshot: *const ToolCallSnapshot,
 ) bool {
+    if (!std.mem.eql(u8, server.config.name, snapshot.server_name)) return false;
     for (server.tool_catalog.tools.items) |tool| {
-        if (std.mem.eql(u8, tool.server_name, snapshot.server_name) and
-            std.mem.eql(u8, tool.original_name, snapshot.original_name) and
+        if (std.mem.eql(u8, tool.original_name, snapshot.original_name) and
             std.mem.eql(u8, tool.prefixed_name, snapshot.prefixed_name) and
             std.mem.eql(u8, tool.input_schema_json, snapshot.input_schema_json) and
             optionalBytesEqual(tool.output_schema_json, snapshot.output_schema_json))
@@ -11246,6 +11268,7 @@ fn buildToolSchemaJsonWithLimitMarker(
     tool: McpTool,
     instructions: ?[]const u8,
     instructions_truncated: bool,
+    instruction_observed_bytes: usize,
     limit: context_limits.Resolved,
 ) ![]u8 {
     const encoded_description = try encodeScalarAlloc(alloc, tool.description);
@@ -11257,7 +11280,7 @@ fn buildToolSchemaJsonWithLimitMarker(
             try std.fmt.allocPrint(
                 alloc,
                 "{s}\n\nServer instructions: {s}\n<context_limit name=\"mcp_server_instructions_bytes\" action=\"truncated\" observed_bytes=\"{d}\" effective_bytes=\"{d}\" source=\"{s}\" override=\"--context-limit mcp_server_instructions_bytes=BYTES|off\" />",
-                .{ encoded_description, encoded_instructions.?, tool.server_instructions.?.len, limit.effectiveBytes(), limit.source.label() },
+                .{ encoded_description, encoded_instructions.?, instruction_observed_bytes, limit.effectiveBytes(), limit.source.label() },
             )
         else
             try std.fmt.allocPrint(alloc, "{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
@@ -11272,9 +11295,14 @@ fn buildToolSchemaJsonWithLimitMarker(
     );
 }
 
+const ToolSearchMatch = struct {
+    server: *const McpServer,
+    tool: *const McpTool,
+};
+
 fn renderSearchResult(
     alloc: Allocator,
-    matches: []const McpTool,
+    matches: []const ToolSearchMatch,
     selected_count: usize,
     description_limit: context_limits.Resolved,
     result_limit: context_limits.Resolved,
@@ -11285,9 +11313,9 @@ fn renderSearchResult(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"tools\":[");
-    for (matches[0..selected_count], 0..) |tool, index| {
+    for (matches[0..selected_count], 0..) |match, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try writeToolMetadataJson(alloc, &out.writer, tool, description_limit);
+        try writeToolMetadataJson(alloc, &out.writer, match, description_limit);
     }
     try out.writer.print("],\"count\":{d}", .{selected_count});
     if (more_available) try out.writer.writeAll(",\"more_available\":true");
@@ -11305,7 +11333,7 @@ fn renderSearchResult(
 
 fn renderSearchNotice(
     alloc: Allocator,
-    matches: []const McpTool,
+    matches: []const ToolSearchMatch,
     selected_count: usize,
     limits: context_limits.Values,
     observed_bytes: usize,
@@ -11313,7 +11341,8 @@ fn renderSearchNotice(
 ) !?[]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    for (matches[0..selected_count]) |tool| {
+    for (matches[0..selected_count]) |match| {
+        const tool = match.tool;
         const encoded_description = try encodeScalarAlloc(alloc, tool.description);
         defer alloc.free(encoded_description);
         if (encoded_description.len <= limits.mcp_description_bytes.effectiveBytes()) continue;
@@ -11326,9 +11355,9 @@ fn renderSearchNotice(
     }
     if (result_limit_triggered) {
         try out.writer.print("[context] MCP search omitted {d} tool(s) (", .{matches.len - selected_count});
-        for (matches[selected_count..], 0..) |tool, index| {
+        for (matches[selected_count..], 0..) |match, index| {
             if (index > 0) try out.writer.writeAll(", ");
-            try model_context_encoding.writeScalar(&out.writer, tool.prefixed_name);
+            try model_context_encoding.writeScalar(&out.writer, match.tool.prefixed_name);
         }
         try out.writer.print(
             "): observed={d} bytes effective={d} bytes source={s}; override with --context-limit mcp_search_result_bytes=BYTES|off",
@@ -11360,9 +11389,10 @@ fn renderSchemaNotice(
 fn writeToolMetadataJson(
     alloc: Allocator,
     writer: *std.Io.Writer,
-    tool: McpTool,
+    match: ToolSearchMatch,
     description_limit: context_limits.Resolved,
 ) !void {
+    const tool = match.tool;
     const bounded = try boundedEncodedScalar(
         alloc,
         tool.description,
@@ -11372,7 +11402,7 @@ fn writeToolMetadataJson(
     try writer.writeAll("{\"name\":");
     try writeEncodedJsonScalar(alloc, writer, tool.prefixed_name);
     try writer.writeAll(",\"server\":");
-    try writeEncodedJsonScalar(alloc, writer, tool.server_name);
+    try writeEncodedJsonScalar(alloc, writer, match.server.config.name);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(bounded.text, .{}, writer);
     try writer.writeAll(",\"purpose\":");
@@ -11425,7 +11455,29 @@ fn writeEncodedJsonScalar(alloc: Allocator, writer: *std.Io.Writer, value: []con
     try std.json.Stringify.value(encoded, .{}, writer);
 }
 
-fn toolMatchesQuery(tool: McpTool, server_instructions: []const u8, query: []const u8) bool {
+fn toolContainsToken(
+    tool: *const McpTool,
+    server_name: []const u8,
+    token: []const u8,
+) bool {
+    for ([_][]const u8{
+        server_name,
+        tool.original_name,
+        tool.description,
+        tool.input_schema_json,
+        "mcp",
+    }) |field| {
+        if (text_utils.containsIgnoreCase(field, token)) return true;
+    }
+    return false;
+}
+
+fn toolMatchesQuery(
+    tool: *const McpTool,
+    server_name: []const u8,
+    server_instructions: []const u8,
+    query: []const u8,
+) bool {
     var found_token = false;
     var start: ?usize = null;
     for (query, 0..) |byte, index| {
@@ -11436,7 +11488,7 @@ fn toolMatchesQuery(tool: McpTool, server_instructions: []const u8, query: []con
         if (start) |s| {
             found_token = true;
             const token = query[s..index];
-            if (!text_utils.containsIgnoreCase(tool.search_text, token) and
+            if (!toolContainsToken(tool, server_name, token) and
                 !text_utils.containsIgnoreCase(server_instructions, token)) return false;
             start = null;
         }
@@ -11444,7 +11496,7 @@ fn toolMatchesQuery(tool: McpTool, server_instructions: []const u8, query: []con
     if (start) |s| {
         found_token = true;
         const token = query[s..];
-        if (!text_utils.containsIgnoreCase(tool.search_text, token) and
+        if (!toolContainsToken(tool, server_name, token) and
             !text_utils.containsIgnoreCase(server_instructions, token)) return false;
     }
     return found_token or query.len == 0;
@@ -11506,24 +11558,6 @@ fn appendTag(alloc: Allocator, tags: *std.ArrayList([]u8), raw: []const u8) !voi
 
 fn isSearchByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
-}
-
-fn buildSearchText(
-    alloc: Allocator,
-    server_name: []const u8,
-    tool_name: []const u8,
-    description: []const u8,
-    input_schema_json: []const u8,
-    tags: []const []u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.print("{s} {s} {s} {s}", .{ server_name, tool_name, description, input_schema_json });
-    for (tags) |tag| try out.writer.print(" {s}", .{tag});
-    const text = try out.toOwnedSlice();
-    defer alloc.free(text);
-    return try std.ascii.allocLowerString(alloc, text);
 }
 
 fn retainFeatureProtocolDiagnostic(
@@ -11930,7 +11964,16 @@ fn refreshSharedCredentials(
     {
         return false;
     }
-    try mcp_auth_store.save(alloc, server.config.name, refreshed);
+    const save_result = try mcp_auth_store.save(
+        alloc,
+        server.config.name,
+        refreshed,
+    );
+    traceCredentialStoreRepair(
+        "refresh",
+        server.config.name,
+        save_result.repaired_entries,
+    );
     installAuthCredentials(alloc, server, &refreshed);
     transferred = true;
     return true;
@@ -12023,8 +12066,12 @@ fn authorizeForChallenge(
         .credentials => |credentials| credentials,
         .issuer_mismatch => |owned_mismatch| {
             var mismatch = owned_mismatch;
+            const err = switch (mismatch.source) {
+                .authorization_metadata => error.AuthorizationMetadataIssuerMismatch,
+                .authorization_response => error.AuthorizationResponseIssuerMismatch,
+            };
             mismatch.deinit();
-            return error.AuthorizationMetadataIssuerMismatch;
+            return err;
         },
     };
     var credentials_transferred = false;
@@ -12037,9 +12084,31 @@ fn authorizeForChallenge(
         credentials.deinit(alloc);
         return;
     }
-    try mcp_auth_store.save(alloc, server.config.name, credentials);
+    const save_result = try mcp_auth_store.save(
+        alloc,
+        server.config.name,
+        credentials,
+    );
+    traceCredentialStoreRepair(
+        "automated_auth",
+        server.config.name,
+        save_result.repaired_entries,
+    );
     installAuthCredentials(alloc, server, &credentials);
     credentials_transferred = true;
+}
+
+fn traceCredentialStoreRepair(
+    actor: []const u8,
+    server_name: []const u8,
+    repaired_entries: usize,
+) void {
+    if (repaired_entries == 0) return;
+    debug_trace.logf(
+        "mcp",
+        "removed unreadable MCP credential entries actor={s} server={s} count={d}",
+        .{ actor, server_name, repaired_entries },
+    );
 }
 
 fn installAuthCredentials(
@@ -17633,6 +17702,121 @@ test "parseAndStoreTools duplicates original_name for owned cleanup" {
     try std.testing.expectEqualStrings("read", server.tool_catalog.tools.items[0].original_name);
 }
 
+test "MCP tool catalog retains only tool-owned search data" {
+    try std.testing.expect(!@hasField(McpTool, "server_name"));
+    try std.testing.expect(!@hasField(McpTool, "server_instructions"));
+    try std.testing.expect(!@hasField(McpTool, "search_text"));
+    try std.testing.expectEqual(@as(usize, 160), @sizeOf(McpTool));
+}
+
+test "MCP search matches each retained source field" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "git-hub"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.servers.items[0].state = .ready;
+    runtime.servers.items[0].instructions = try alloc.dupe(u8, "workflow guide");
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create ticket","inputSchema":{"type":"object","properties":{"repository_slug":{"type":"string"}}}}]}}
+    ,
+        &used,
+    );
+
+    const cases = [_][]const u8{
+        "mcp",
+        "GIT-HUB",
+        "create_issue",
+        "TICKET",
+        "repository_slug",
+        "workflow",
+        "git-hub repository_slug",
+    };
+    const expected_output =
+        "{\"tools\":[{\"name\":\"mcp_git-hub_create_issue\",\"server\":\"git-hub\",\"description\":\"Create ticket\",\"purpose\":\"Create ticket\",\"usage\":[\"mcp\",\"git-hub\",\"create_issue\"]}],\"count\":1}";
+    for (cases) |query| {
+        var result = try runtime.searchTools(alloc, query, 5, .{}, .{}, .unrestricted);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings(expected_output, result.model_output);
+        try std.testing.expect(result.notice == null);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+        defer parsed.deinit();
+        const tools = parsed.value.object.get("tools").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), tools.len);
+        const usage = tools[0].object.get("usage").?.array.items;
+        try std.testing.expectEqual(@as(usize, 3), usage.len);
+        try std.testing.expectEqualStrings("mcp", usage[0].string);
+        try std.testing.expectEqualStrings("git-hub", usage[1].string);
+        try std.testing.expectEqualStrings("create_issue", usage[2].string);
+    }
+
+    var missing = try runtime.searchTools(
+        alloc,
+        "missing-token",
+        5,
+        .{},
+        .{},
+        .unrestricted,
+    );
+    defer missing.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[],\"count\":0}",
+        missing.model_output,
+    );
+    try std.testing.expect(missing.notice == null);
+}
+
+test "MCP search keeps bounded matches off the allocator" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "github"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create issue","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+
+    var counting = std.testing.FailingAllocator.init(alloc, .{});
+    const search_alloc = counting.allocator();
+    var result = try runtime.searchTools(
+        search_alloc,
+        "github issue",
+        max_mcp_search_limit,
+        .{},
+        .{},
+        .unrestricted,
+    );
+    defer result.deinit(search_alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[{\"name\":\"mcp_github_create_issue\",\"server\":\"github\",\"description\":\"Create issue\",\"purpose\":\"Create issue\",\"usage\":[\"mcp\",\"github\",\"create_issue\"]}],\"count\":1}",
+        result.model_output,
+    );
+    try std.testing.expectEqual(@as(usize, 18), counting.allocations);
+}
+
 test "MCP search preserves exact identities and scopes authentication guidance" {
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
@@ -18246,9 +18430,6 @@ test "MCP server instructions are captured from initialize and exposed only when
     ;
     try parseAndStoreTools(alloc, &server, .{}, tools_response, &used);
     try std.testing.expectEqual(@as(usize, 2), server.tool_catalog.tools.items.len);
-    for (server.tool_catalog.tools.items) |tool| {
-        try std.testing.expect(std.mem.find(u8, tool.search_text, "github issue workflows") == null);
-    }
     server.state = .ready;
 
     var runtime = McpRuntime.init(alloc);
@@ -18427,6 +18608,7 @@ test "tool schema uses prefixed name and call request uses raw name" {
         tool,
         null,
         false,
+        0,
         (context_limits.Values{}).mcp_server_instructions_bytes,
     );
     defer alloc.free(schema);

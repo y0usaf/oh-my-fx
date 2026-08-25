@@ -3790,7 +3790,7 @@ test "app_input_runtime routes auth picker navigation before composer history" {
 
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
 
-    try std.testing.expect((auth_runtime.Choice{ .action = .chatgpt_login }).eql(app.auth.pickerView().selected_choice.?));
+    try std.testing.expect((auth_runtime.Choice{ .action = .switch_provider }).eql(app.auth.pickerView().selected_choice.?));
     try std.testing.expectEqual(@as(?usize, null), app.input_runtime.composer_history.activeIndex());
 }
 
@@ -3803,7 +3803,7 @@ test "app_input_runtime Tab cycles the active auth picker" {
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
-    try std.testing.expect((auth_runtime.Choice{ .action = .chatgpt_login }).eql(app.auth.pickerView().selected_choice.?));
+    try std.testing.expect((auth_runtime.Choice{ .action = .switch_provider }).eql(app.auth.pickerView().selected_choice.?));
 }
 
 test "app_input_runtime Tab leaves a dismissed slash query unchanged" {
@@ -3896,12 +3896,15 @@ test "app_input_runtime auth picker enter closes before selecting a switched sou
     try std.testing.expectEqual(types.CredentialSource.fx_login, app.selected_credential_source.?);
 }
 
-test "app_input_runtime auth picker delegates typed acquisition actions" {
+test "app_input_runtime connections picker delegates typed acquisition actions" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.auth.source_inventory = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
     app.auth.openPicker(alloc);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try std.testing.expectEqual(auth_runtime.PickerStage.connections, app.auth.pickerView().stage);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
@@ -3942,7 +3945,7 @@ test "app_input_runtime auth stage Escape pops before closing the picker" {
     app.auth.source_inventory = auth_runtime.SourceSet.initOne(.stored_key);
     app.auth.openPicker(alloc);
 
-    for (0..6) |_| _ = app.auth.movePicker(1);
+    _ = app.auth.movePicker(-1);
     try std.testing.expect((auth_runtime.Choice{ .action = .switch_credential }).eql(
         app.auth.pickerView().selected_choice.?,
     ));
@@ -3963,7 +3966,7 @@ test "app_input_runtime auth stage Escape pops before closing the picker" {
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
-test "app_input_runtime disabled change team action stays silent" {
+test "app_input_runtime navigation bypasses disabled change team action" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -3971,14 +3974,14 @@ test "app_input_runtime disabled change team action stays silent" {
     app.auth.openPicker(alloc);
 
     for (0..5) |_| _ = app.auth.movePicker(1);
-    try std.testing.expect((auth_runtime.Choice{ .action = .change_team }).eql(
+    try std.testing.expect((auth_runtime.Choice{ .action = .switch_credential }).eql(
         app.auth.pickerView().selected_choice.?,
     ));
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expect(app.auth.pickerView().active);
-    try std.testing.expectEqual(auth_runtime.PickerStage.root, app.auth.pickerView().stage);
+    try std.testing.expectEqual(auth_runtime.PickerStage.switch_credential, app.auth.pickerView().stage);
     try std.testing.expect(app.selected_auth_action == null);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
@@ -7603,7 +7606,7 @@ fn openRoutingAuthPicker(app: *RoutingFakeApp) !void {
     app.auth.source_inventory.insert(.ai_gateway_api_key);
     app.auth.openPicker(app.alloc);
     try std.testing.expect(app.auth.movePicker(1));
-    try std.testing.expectEqual(@as(usize, 7), app.auth.pickerView().choiceCount());
+    try std.testing.expectEqual(@as(usize, 4), app.auth.pickerView().choiceCount());
     try std.testing.expectEqual(@as(usize, 1), app.auth.pickerView().selectedIndex());
 }
 
@@ -7774,9 +7777,9 @@ test "app_input_runtime ctrl+j and ctrl+k navigate visible composer pickers" {
         bytes: []const u8,
         expected_index: usize,
     }{
-        .{ .bytes = "\x0a", .expected_index = 2 },
+        .{ .bytes = "\x0a", .expected_index = 3 },
         .{ .bytes = "\x0b", .expected_index = 0 },
-        .{ .bytes = "\x1b[106;5u", .expected_index = 2 },
+        .{ .bytes = "\x1b[106;5u", .expected_index = 3 },
         .{ .bytes = "\x1b[107;5u", .expected_index = 0 },
     };
 

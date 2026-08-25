@@ -22,6 +22,7 @@ pub const LogoutResult = struct {
     busy: bool = false,
     removed: bool = false,
     revocation_failed: bool = false,
+    repaired_entries: usize = 0,
 };
 
 pub const LogoutServerFn = *const fn (

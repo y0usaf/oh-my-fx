@@ -1746,7 +1746,7 @@ function startActiveToolGatewayFixture(): LocalGatewayFixture {
           ? [
               `data: ${JSON.stringify({ type: "tool-input-start", id: "active_tool_1", toolName: "terminal" })}`,
               "",
-              `data: ${JSON.stringify({ type: "tool-call", toolCallId: "active_tool_1", toolName: "terminal", input: { action: "exec", command: "sleep 1; i=1; while [ \"$i\" -le 32 ]; do printf 'ACTIVE_TOOL_LINE_%02d\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; while [ ! -f .active-tool-release ]; do sleep 0.05; done" } })}`,
+              `data: ${JSON.stringify({ type: "tool-call", toolCallId: "active_tool_1", toolName: "terminal", input: { action: "exec", command: "sleep 1; i=1; while [ \"$i\" -le 32 ]; do printf 'ACTIVE_TOOL_LINE_%02d\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; while [ ! -f .active-tool-release ]; do sleep 0.05; done", timeout_ms: 600_000 } })}`,
               "",
               `data: ${JSON.stringify({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } } })}`,
               "",
@@ -1844,7 +1844,7 @@ function startObservabilityGatewayFixture(
                 type: "tool-call",
                 toolCallId: "observability-tool-1",
                 toolName: "terminal",
-                input: { action: "exec", command },
+                input: { action: "exec", command, timeout_ms: 600_000 },
               },
               {
                 type: "finish",

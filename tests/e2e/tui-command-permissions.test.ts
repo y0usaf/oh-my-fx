@@ -121,7 +121,7 @@ function toolCall(
   options: Record<string, unknown> = {},
   toolCallId = "command_1",
 ) {
-  return gatewayToolCall("terminal", { action: "exec", command, ...options }, toolCallId);
+  return gatewayToolCall("terminal", { action: "exec", timeout_ms: 600_000, command, ...options }, toolCallId);
 }
 
 function permissionDecision(
@@ -174,7 +174,7 @@ function toolCalls(command: string, callIds: string[]) {
       type: "tool-call",
       toolCallId,
       toolName: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     })),
     {
       type: "finish",
@@ -189,13 +189,13 @@ function twoEffectfulCommandBatch(first: string, second: string) {
       type: "tool-call",
       toolCallId: "history_feedback_first",
       toolName: "terminal",
-      input: { action: "exec", command: first },
+      input: { action: "exec", timeout_ms: 600_000, command: first },
     },
     {
       type: "tool-call",
       toolCallId: "history_feedback_second",
       toolName: "terminal",
-      input: { action: "exec", command: second },
+      input: { action: "exec", timeout_ms: 600_000, command: second },
     },
     {
       type: "finish",
@@ -1109,6 +1109,7 @@ async function expectSavedTerminalExec(
   expect(JSON.parse(call.arguments_json)).toEqual(
     expect.objectContaining({
       action: "exec",
+      timeout_ms: 600_000,
       command,
       ...(background ? { background: true } : {}),
     }),
@@ -1368,7 +1369,7 @@ describe("effect-aware command permissions", () => {
             type: "tool-call",
             toolCallId: "command_1",
             toolName: "terminal",
-            input: { action: "exec", command: "pwd" },
+            input: { action: "exec", timeout_ms: 600_000, command: "pwd" },
           },
           {
             type: "finish",
@@ -1476,7 +1477,7 @@ describe("effect-aware command permissions", () => {
             type: "tool-call",
             toolCallId: call.id,
             toolName: "terminal",
-            input: { action: "exec", command: call.command },
+            input: { action: "exec", timeout_ms: 600_000, command: call.command },
           })),
           {
             type: "finish",
@@ -1652,7 +1653,7 @@ describe("effect-aware command permissions", () => {
       expect(losslessCompactOutput).toBe("");
       expect(losslessCompact).toContain("Ran printf");
       for (const row of losslessRows) expect(losslessCompact).not.toContain(`│ ${row}`);
-      expect(commandReplayFiles(root)).toEqual([]);
+      expect(commandReplayFiles(root)).toHaveLength(1);
       const losslessGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
@@ -1682,7 +1683,7 @@ describe("effect-aware command permissions", () => {
       expect(lossyCompactOutput).toBe("");
       expect(lossyCompact).toContain("Ran printf");
       for (const row of lossyRows) expect(lossyCompact).not.toContain(`│ ${row}`);
-      expect(commandReplayFiles(root)).toHaveLength(1);
+      expect(commandReplayFiles(root)).toHaveLength(2);
       const lossyGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
@@ -1733,7 +1734,7 @@ describe("effect-aware command permissions", () => {
       expect(publicSession.stdout).not.toContain("command_replay");
       expect(publicSession.stdout).not.toContain("command_process_presentation");
       expect(publicSession.stdout).not.toContain("process_presentation");
-      expect(publicSession.stdout).not.toContain("fx-command-replay-");
+      expect(publicSession.stdout).toContain("<command_output_handle>fx-command-replay-");
 
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -2195,7 +2196,7 @@ describe("effect-aware command permissions", () => {
               type: "tool-call",
               toolCallId: "scrollback_command",
               toolName: "terminal",
-              input: { action: "exec", command: "seq 1 1" },
+              input: { action: "exec", timeout_ms: 600_000, command: "seq 1 1" },
             },
             {
               type: "finish",
@@ -2404,7 +2405,7 @@ describe("effect-aware command permissions", () => {
           gateway.requests[1]!.body,
           "terminal_session_command",
         );
-        expect(commandResult).toBe(
+        expect(commandResult).toContain(
           "exit_code=0\n" +
             "<stdout>\n" +
             "TTY_SESSION_STDOUT_BEGIN\n" +
@@ -2413,6 +2414,9 @@ describe("effect-aware command permissions", () => {
             "<stderr>\n" +
             "TTY_SESSION_STDERR\n" +
             "</stderr>\n",
+        );
+        expect(commandResult).toMatch(
+          /<command_output_handle>fx-command-replay-[^<]+<\/command_output_handle>/,
         );
         expect(gateway.requests[1]!.body).not.toContain("\\u001e");
         expect(gateway.requests[1]!.body).not.toContain("\\u0006");
@@ -4716,6 +4720,7 @@ describe("effect-aware command permissions", () => {
         if (userText.includes(childPrompt)) {
           return gatewayToolCall("terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `/usr/bin/touch ${shellQuote(markerPath)}`,
           }, childCommandCallId);
         }
@@ -4863,6 +4868,7 @@ describe("effect-aware command permissions", () => {
             if (childRequestCount > 1) expect(body).toContain("review_caution");
             return gatewayToolCall("terminal", {
               action: "exec",
+              timeout_ms: 600_000,
               command: `/usr/bin/touch ${shellQuote(markerPath)}`,
             }, `child_auto_command_${childRequestCount}`);
           }

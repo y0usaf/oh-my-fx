@@ -1194,10 +1194,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Down");
       await session.sendKeys("Down");
-      await session.waitForText("manage MCP servers, resources, and prompts", 5_000);
+      await session.waitForText(
+        "manage local and remote MCP servers, resources, and prompts",
+        5_000,
+      );
       const scrolledGrid = await session.capturePaneGrid();
       const mcpRow = scrolledGrid.find((line) =>
-        line.includes("/mcp") && line.includes("manage MCP servers, resources, and prompts")
+        line.includes("/mcp") &&
+        line.includes("manage local and remote MCP servers, resources, and prompts")
       );
       expect(mcpRow).toBeDefined();
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
@@ -1262,7 +1266,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const mcpRow = grid.find((line) => line.includes("/mcp"));
       expect(modelRow).toContain("choose what model and reasoning effort to use");
       expect(modelRow).not.toContain("Model");
-      expect(mcpRow).toContain("manage MCP servers, resources, and prompts");
+      expect(mcpRow).toContain(
+        "manage local and remote MCP servers, resources, and prompts",
+      );
       expect(mcpRow).not.toContain("Extensions");
 
       await session.sendKeys("C-u");

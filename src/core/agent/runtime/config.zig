@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("../../shared/types.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
 const session_child_store = @import("../../session/session_child_store.zig");
+const command_replay_store = @import("../../session/command_replay_store.zig");
 const context_limits = @import("../../config/context_limits.zig");
 const workspace_access = @import("../../workspace/workspace_access.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
@@ -62,6 +63,7 @@ pub const Config = struct {
     current_prompt_is_root_authority: bool = false,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
+    ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     subagent_id: u64 = 0,
     context_limits: context_limits.Values = .{},
 };

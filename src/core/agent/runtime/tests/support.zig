@@ -1400,6 +1400,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 1,
                 self.command_replay_capability,
             );
+            capture.setPolicyBeforeCapture(.required);
             capture.appendAccepted(request.result_allocator, .stdout, output);
             capture.seal(request.result_allocator);
             result.command_replay_capture = capture;

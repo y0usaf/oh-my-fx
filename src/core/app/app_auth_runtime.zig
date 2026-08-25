@@ -113,7 +113,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPicker(app.alloc);
+            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
             app.shell.render_requests.request(.footer);
         }
 
@@ -224,7 +224,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPicker(app.alloc);
+            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
             app.shell.render_requests.request(.footer);
         }
 
@@ -276,6 +276,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider => |provider| try switchProvider(app, provider, true, .manual),
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
+                    .connections => unreachable,
                     .login => try beginSignIn(app, true),
                     .chatgpt_login => try beginChatGptSignIn(app),
                     .grok_login => try beginGrokSignIn(app),
@@ -1116,7 +1117,7 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
             if (app.auth.credentialSource() == source) app.auth.recordCredentialRefreshFailure(source);
             try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPicker(app.alloc);
+            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
             const failure = auth_runtime.FailureSnapshot{
                 .source = source,
                 .reason = .credential_refresh_failed,
@@ -1442,6 +1443,7 @@ const TestAuth = struct {
     source_inventory_refresh_count: usize = 0,
     refresh_failure_source: ?credentials.Source = null,
     picker_opened: bool = false,
+    picker_provider: model_provider.ProviderId = .gateway,
     picker_closed: bool = false,
     gateway_ready: bool = true,
     catalog_ready: bool = true,
@@ -1507,8 +1509,13 @@ const TestAuth = struct {
         self.refresh_failure_source = source;
     }
 
-    fn openPicker(self: *TestAuth, _: std.mem.Allocator) void {
+    fn openPickerForProvider(
+        self: *TestAuth,
+        _: std.mem.Allocator,
+        provider: model_provider.ProviderId,
+    ) void {
         self.picker_opened = true;
+        self.picker_provider = provider;
     }
 
     fn teamSelection(self: *TestAuth) ?*TestTeamSelection {
@@ -1597,6 +1604,7 @@ const TestUrlOpener = struct {
 
 const TestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
+    selected_provider: model_provider.ProviderId = .gateway,
     auth: TestAuth = .{},
     model_cache: TestModelCache = .{},
     session: struct {
@@ -1642,6 +1650,16 @@ const TestApp = struct {
         if (self.preference_write_succeeds) self.last_preference_source = source;
     }
 };
+
+test "setup hub projects the selected provider into the auth picker" {
+    var app: TestApp = .{ .selected_provider = .codex };
+    defer app.deinit();
+
+    try Runtime(TestApp).openSetupHub(&app);
+
+    try std.testing.expect(app.auth.picker_opened);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.auth.picker_provider);
+}
 
 test "OAuth app gating accepts native auth or JS-host auth and rejects neither" {
     const NativeApp = struct {

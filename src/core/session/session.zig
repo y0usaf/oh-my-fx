@@ -9,6 +9,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const image_attachments = @import("../images/image_attachments.zig");
 const generation_usage_provider = @import("generation_usage_provider.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
+const command_replay_store = @import("command_replay_store.zig");
 pub const session_usage = @import("session_usage.zig");
 pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
 const command_contract = @import("../execution/command_contract.zig");
@@ -77,6 +78,36 @@ pub const CancelledCommandPresentation = core_types.CancelledCommandPresentation
 /// Stored interrupted turn marker, optionally paired with the active tool call.
 pub const InterruptedHistoryTurn = core_types.InterruptedHistoryTurn;
 pub const InterruptedTerminalReason = core_types.InterruptedTerminalReason;
+
+fn formatInterruptedToolOutput(
+    alloc: Allocator,
+    entry: InterruptedHistoryTurn,
+) ![]u8 {
+    const presentation = entry.cancelled_command orelse
+        return alloc.dupe(u8, aborted_tool_output);
+    const replay = presentation.output_replay orelse
+        return alloc.dupe(u8, aborted_tool_output);
+    const descriptor = switch (replay) {
+        .available => |value| value,
+        .unavailable => return alloc.dupe(u8, aborted_tool_output),
+    };
+    return command_replay_store.appendModelHandleNotice(
+        alloc,
+        aborted_tool_output,
+        descriptor.handle,
+    ) catch |err| switch (err) {
+        error.InvalidReplayHandle => {
+            debug_trace.logf(
+                "session",
+                "cancelled command replay handle omitted from model context handle_bytes={d}",
+                .{descriptor.handle.len},
+            );
+            return alloc.dupe(u8, aborted_tool_output);
+        },
+        else => return err,
+    };
+}
+
 /// Stored compacted context summary produced by core history compaction.
 pub const CompactedSummaryHistoryTurn = core_types.CompactedSummaryHistoryTurn;
 /// One persisted session history record.
@@ -2647,13 +2678,18 @@ fn appendHistoryMessagesImpl(
                     });
                     owns_assistant_content = false;
                     owns_calls = false;
+                    const tool_output = try formatInterruptedToolOutput(alloc, entry);
+                    var owns_tool_output = true;
+                    errdefer if (owns_tool_output) alloc.free(tool_output);
                     try messages.append(alloc, .{
                         .role = .tool,
-                        .content = .{ .text = aborted_tool_output },
+                        .content = .{ .text = tool_output },
                         .tool_call_id = tool_call.id,
                         .tool_name = tool_call.name,
                         .tool_result_status = .failure,
+                        .owns_content = true,
                     });
+                    owns_tool_output = false;
                 } else {
                     const assistant_content = try formatInterruptedAssistantClosedContent(alloc, entry);
                     var owns_assistant_content = true;
@@ -2784,9 +2820,10 @@ fn appendHistoryChatMessagesImpl(
                     const calls = try alloc.alloc(core_types.ToolCall, 1);
                     calls[0] = try core_types.dupeToolCall(alloc, tool_call);
                     try messages.append(alloc, .{ .role = .assistant, .content = assistant_content, .tool_calls = calls });
+                    const tool_output = try formatInterruptedToolOutput(alloc, entry);
                     try messages.append(alloc, .{
                         .role = .tool,
-                        .content = aborted_tool_output,
+                        .content = tool_output,
                         .tool_call_id = tool_call.id,
                         .tool_name = tool_call.name,
                         .tool_result_status = .failure,
@@ -4543,14 +4580,19 @@ test "interrupted history projects marker and aborted tool result" {
     try std.testing.expectEqualStrings("call-command", messages.items[1].tool_calls[0].id);
     try std.testing.expectEqualStrings("run_command", messages.items[1].tool_calls[0].name);
     try std.testing.expectEqual(.tool, messages.items[2].role);
-    try std.testing.expectEqualStrings(aborted_tool_output, messages.items[2].content.?.asText());
+    try std.testing.expect(
+        std.mem.find(u8, messages.items[2].content.?.asText(), aborted_tool_output) != null,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, messages.items[2].content.?.asText(), replay_sentinel),
+    );
     try std.testing.expectEqualStrings("call-command", messages.items[2].tool_call_id.?);
     try std.testing.expectEqual(.user, messages.items[3].role);
     try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "<turn_aborted>") != null);
     try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "Do not continue") != null);
     for (messages.items) |entry| {
         if (entry.content) |content| {
-            try std.testing.expect(std.mem.find(u8, content.asText(), replay_sentinel) == null);
             try std.testing.expect(std.mem.find(u8, content.asText(), artifact_sentinel) == null);
         }
     }
@@ -4567,12 +4609,17 @@ test "interrupted history projects marker and aborted tool result" {
     try std.testing.expect(chat_messages.items[1].content == null);
     try std.testing.expectEqualStrings("run_command", chat_messages.items[1].tool_calls[0].name);
     try std.testing.expectEqual(core_types.ChatRole.tool, chat_messages.items[2].role);
-    try std.testing.expectEqualStrings(aborted_tool_output, chat_messages.items[2].content.?);
+    try std.testing.expect(
+        std.mem.find(u8, chat_messages.items[2].content.?, aborted_tool_output) != null,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, chat_messages.items[2].content.?, replay_sentinel),
+    );
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[3].role);
     try std.testing.expect(std.mem.find(u8, chat_messages.items[3].content.?, "<turn_aborted>") != null);
     for (chat_messages.items) |entry| {
         if (entry.content) |content| {
-            try std.testing.expect(std.mem.find(u8, content, replay_sentinel) == null);
             try std.testing.expect(std.mem.find(u8, content, artifact_sentinel) == null);
         }
     }

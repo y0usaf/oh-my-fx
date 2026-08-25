@@ -197,6 +197,8 @@ The interactive surface supports:
 
 * `/mcp add <name> <command> [args...]`
 
+* `/mcp add --transport http <name> <url>`
+
 * `/mcp remove <name>`
 
 * `/mcp reload`
@@ -206,6 +208,10 @@ The interactive surface supports:
 * `/mcp logout <name>`
 
 * `/mcp path`
+
+The local form saves a stdio command. The HTTP form saves a remote Streamable
+HTTP endpoint. Both update `~/.fx/mcp.json` and evaluate the replacement MCP
+runtime immediately.
 
 Remote authentication supports configured bearer tokens and OAuth credential
 discovery, persistence, refresh, scope challenges, and logout. Credential and
