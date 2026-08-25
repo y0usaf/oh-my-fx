@@ -1206,6 +1206,11 @@ noinline fn scoreAsciiRange(
     var previous_position: usize = 0;
     var run_length: usize = 0;
     var position = range_start;
+    if (query.len != 0) {
+        if (std.mem.indexOfScalarPos(u8, path_lower, range_start, query[0])) |first_hit| {
+            position = first_hit;
+        } else return null;
+    }
     while (position < path_lower.len and query_index < query.len) : (position += 1) {
         if (path_lower[position] != query[query_index]) continue;
 
