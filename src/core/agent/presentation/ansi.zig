@@ -1,5 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const io_mod = @import("../../shared/io.zig");
 
 pub const bold_open = "\x1b[1m";
 pub const bold_close = "\x1b[22m";
@@ -35,7 +37,35 @@ pub const task_pending_marker = "\xe2\x98\x90";
 pub const task_completed_marker = "\xe2\x9c\x93";
 
 pub const max_pipe_buffer_bytes: usize = 32 * 1024;
-pub const horizontal_rule_width: usize = 60;
+/// Default rule length when no terminal width is discoverable.
+pub const horizontal_rule_default_width: usize = 60;
+/// Test hook: when set, writeHorizontalRule uses this width verbatim.
+pub var horizontal_rule_width_override: ?usize = null;
+
+fn resolveTerminalColumns() ?usize {
+    if (comptime builtin.os.tag == .windows) return null;
+    if (comptime !builtin.link_libc) return null;
+    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
+    if (std.c.ioctl(std.posix.STDOUT_FILENO, req, &ws) == -1) return null;
+    if (ws.col == 0) return null;
+    return @as(usize, @intCast(ws.col));
+}
+
+/// Rule width: explicit override, then terminal size, then COLUMNS, then default.
+pub fn horizontalRuleWidth() usize {
+    if (horizontal_rule_width_override) |w| return w;
+    if (resolveTerminalColumns()) |cols| return cols;
+    if (io_mod.getenv("COLUMNS")) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t");
+        if (trimmed.len > 0) {
+            if (std.fmt.parseInt(usize, trimmed, 10) catch null) |cols| {
+                if (cols >= 20 and cols <= 500) return cols;
+            }
+        }
+    }
+    return horizontal_rule_default_width;
+}
 /// OSC 8 links longer than this fall back to literal rendering.
 pub const max_link_url_bytes: usize = 2083;
 
@@ -48,6 +78,7 @@ pub fn writeDim(alloc: Allocator, out: *std.ArrayList(u8), bytes: []const u8) !v
 pub fn writeHorizontalRule(alloc: Allocator, out: *std.ArrayList(u8)) !void {
     try out.appendSlice(alloc, dim_open);
     var i: usize = 0;
-    while (i < horizontal_rule_width) : (i += 1) try out.appendSlice(alloc, table_horiz);
+    const width = horizontalRuleWidth();
+    while (i < width) : (i += 1) try out.appendSlice(alloc, table_horiz);
     try out.appendSlice(alloc, dim_close);
 }

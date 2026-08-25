@@ -116,7 +116,6 @@ test "assistant presentation event clone owns nested payloads" {
 
 const isPipeLine = bp.isPipeLine;
 const max_link_url_bytes = ansi.max_link_url_bytes;
-const horizontal_rule_width = ansi.horizontal_rule_width;
 const dim_open = ansi.dim_open;
 const dim_close = ansi.dim_close;
 const table_horiz = ansi.table_horiz;
@@ -3256,8 +3255,10 @@ test "horizontal rule with dashes renders dim line" {
     try processor.push(alloc, "---\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, out.items, dim_open));
     try std.testing.expect(std.mem.endsWith(u8, out.items, dim_close ++ "\n"));
+    ansi.horizontal_rule_width_override = 60;
+    defer ansi.horizontal_rule_width_override = null;
     const glyphs = std.mem.count(u8, out.items, table_horiz);
-    try std.testing.expectEqual(@as(usize, horizontal_rule_width), glyphs);
+    try std.testing.expectEqual(@as(usize, 60), glyphs);
 }
 
 test "thematic rule completion handles newline and EOF without matching H6 content" {
@@ -3294,7 +3295,9 @@ test "thematic rule completion handles newline and EOF without matching H6 conte
     defer h6.deinit(alloc);
     try h6.appendSlice(alloc, "###### ");
     var i: usize = 0;
-    while (i < horizontal_rule_width) : (i += 1) try h6.appendSlice(alloc, table_horiz);
+    ansi.horizontal_rule_width_override = 60;
+    defer ansi.horizontal_rule_width_override = null;
+    while (i < ansi.horizontalRuleWidth()) : (i += 1) try h6.appendSlice(alloc, table_horiz);
     try h6.append(alloc, '\n');
     try processor.pushWithCompletions(alloc, h6.items, &out, .{ .thematic_rule = &completion });
     try std.testing.expectEqual(@as(usize, 2), capture.calls);
