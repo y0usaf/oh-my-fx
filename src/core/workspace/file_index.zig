@@ -1212,7 +1212,9 @@ noinline fn scoreAsciiRange(
         } else return null;
     }
     while (position < path_lower.len and query_index < query.len) : (position += 1) {
-        if (path_lower[position] != query[query_index]) continue;
+        if (path_lower[position] != query[query_index]) {
+            position = std.mem.indexOfScalarPos(u8, path_lower, position + 1, query[query_index]) orelse return null;
+        }
 
         if (query_index == 0) {
             facts.first_position = position - range_start;
