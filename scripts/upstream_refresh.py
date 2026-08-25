@@ -71,7 +71,7 @@ def in_progress(path: Path) -> bool:
     )
 
 
-def entry(root: Path, source: str, item: dict[str, str], excluded: set[str]) -> dict[str, Any]:
+def entry(root: Path, source: str, base: str, item: dict[str, str], excluded: set[str]) -> dict[str, Any]:
     path = Path(item["path"])
     branch = item["branch"]
     data: dict[str, Any] = {"branch": branch, "worktree": str(path), "old": git(path, "rev-parse", branch)}
@@ -84,11 +84,9 @@ def entry(root: Path, source: str, item: dict[str, str], excluded: set[str]) -> 
     elif in_progress(path):
         data["status"] = "skipped-operation-in-progress"
     else:
-        fork = git(root, "merge-base", branch, source)
+        fork = git(root, "merge-base", branch, base)
         data["fork"] = fork
-        probe = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", source, branch], cwd=root
-        )
+        probe = subprocess.run(["git", "merge-base", "--is-ancestor", source, branch], cwd=root)
         data["status"] = "noop" if probe.returncode == 0 else "planned"
     return data
 
@@ -98,21 +96,32 @@ def command_plan(args: argparse.Namespace) -> int:
     states = state_root(root)
     lock_path = states / "lock"
     acquire_lock(lock_path)
+    integration_worktree: Path | None = None
     try:
         if not args.no_fetch:
             git(root, "fetch", "--prune", args.remote, args.upstream_branch)
+            if subprocess.run(["git", "rev-parse", "origin/main"], cwd=root, capture_output=True).returncode == 0:
+                git(root, "fetch", "--prune", "origin", "main")
         source = git(root, "rev-parse", f"{args.remote}/{args.upstream_branch}")
+        base_ref = "origin/main" if subprocess.run(["git", "rev-parse", "origin/main"], cwd=root, capture_output=True).returncode == 0 else "main"
+        base = git(root, "rev-parse", base_ref)
+        integration_worktree = states / f"integration-{source[:12]}"
+        if integration_worktree.exists():
+            run_result = subprocess.run(["git", "worktree", "remove", "--force", str(integration_worktree)], cwd=root, text=True, capture_output=True)
+            if run_result.returncode:
+                raise RefreshError(run_result.stderr.strip())
+        git(root, "worktree", "add", "--detach", str(integration_worktree), base)
+        merge = subprocess.run(["git", "merge", "--no-ff", "--no-edit", source], cwd=integration_worktree, text=True, capture_output=True)
+        if merge.returncode:
+            raise RefreshError(merge.stderr.strip() or "upstream integration merge conflicted")
+        integration = git(integration_worktree, "rev-parse", "HEAD")
         session = f"{time.time_ns()}-{source[:12]}"
         excluded = set(args.exclude)
-        entries = [entry(root, source, item, excluded) for item in worktrees(root)]
+        entries = [entry(root, integration, base, item, excluded) for item in worktrees(root)]
         payload = {
-            "version": 1,
-            "session": session,
-            "root": str(root),
-            "remote": args.remote,
-            "upstream_branch": args.upstream_branch,
-            "source": source,
-            "entries": entries,
+            "version": 2, "session": session, "root": str(root), "remote": args.remote,
+            "upstream_branch": args.upstream_branch, "source": source, "base": base,
+            "integration": integration, "entries": entries,
         }
         path = states / f"{session}.json"
         write_json(path, payload)
@@ -120,6 +129,8 @@ def command_plan(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     finally:
+        if integration_worktree and integration_worktree.exists():
+            subprocess.run(["git", "worktree", "remove", "--force", str(integration_worktree)], cwd=root, check=False)
         (lock_path / "pid").unlink()
         lock_path.rmdir()
 def command_apply(args: argparse.Namespace) -> int:
@@ -129,7 +140,7 @@ def command_apply(args: argparse.Namespace) -> int:
     lock_path = state_root(root) / "lock"
     acquire_lock(lock_path)
     try:
-        source = str(payload["source"])
+        target = str(payload["integration"])
         backup_prefix = f"refs/backup/omifx-upstream-refresh/{payload['session']}"
         for data in payload["entries"]:
             if data["status"] != "planned":
@@ -140,7 +151,7 @@ def command_apply(args: argparse.Namespace) -> int:
             git(root, "update-ref", backup, old)
             path = Path(str(data["worktree"]))
             result = subprocess.run(
-                ["git", "rebase", "--rebase-merges", "--onto", source, str(data["fork"]), branch],
+                ["git", "rebase", "--rebase-merges", "--onto", target, str(data["fork"]), branch],
                 cwd=path, text=True, capture_output=True,
             )
             data["backup"] = backup
