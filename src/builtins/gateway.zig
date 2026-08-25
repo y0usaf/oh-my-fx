@@ -921,8 +921,10 @@ fn fetchCliModelCatalog(
 pub fn resolveChatUrl(fallback: []const u8, override: ?[]const u8) []const u8 {
     const candidate = override orelse return fallback;
     // The chat URL carries the bearer token and full request payload; only a
-    // loopback HTTP override is trusted for local testing.
-    if (!gateway_client.isLoopbackHttpUrl(candidate)) return fallback;
+    // loopback HTTP override is trusted for the CLI. In wasm the env is
+    // supplied by the embedding page itself (the host), so it may route the
+    // gateway through its own proxy (e.g. a Cloudflare Worker).
+    if (builtin.target.cpu.arch != .wasm32 and !gateway_client.isLoopbackHttpUrl(candidate)) return fallback;
     return candidate;
 }
 
