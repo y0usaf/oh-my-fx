@@ -1149,7 +1149,9 @@ fn rankTopN(generation: *const Generation, query: PreparedQuery, out: []u32) usi
         const score = if ((path_mask & non_ascii_mask) == 0) ascii_path: {
             const ascii = query_ascii orelse continue;
             if ((path_mask & query_mask) != query_mask) continue;
-            if ((generation.punct_masks[candidate_index] & query_punct_mask) != query_punct_mask) continue;
+            if (query_punct_mask != 0) {
+                if ((generation.punct_masks[candidate_index] & query_punct_mask) != query_punct_mask) continue;
+            }
             break :ascii_path scoreAsciiMatch(
                 generation.pathAt(candidate_index),
                 generation.lowerPathAt(candidate_index),
@@ -1206,8 +1208,15 @@ noinline fn scoreAsciiRange(
     var previous_position: usize = 0;
     var run_length: usize = 0;
     var position = range_start;
+    if (query.len != 0) {
+        if (std.mem.indexOfScalarPos(u8, path_lower, range_start, query[0])) |first_hit| {
+            position = first_hit;
+        } else return null;
+    }
     while (position < path_lower.len and query_index < query.len) : (position += 1) {
-        if (path_lower[position] != query[query_index]) continue;
+        if (path_lower[position] != query[query_index]) {
+            position = std.mem.indexOfScalarPos(u8, path_lower, position + 1, query[query_index]) orelse return null;
+        }
 
         if (query_index == 0) {
             facts.first_position = position - range_start;
