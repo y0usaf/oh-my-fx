@@ -35,6 +35,7 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_commands = @import("../session/session_commands.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
+const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -364,7 +365,6 @@ pub fn Handlers(comptime App: type) type {
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
-                .show_models = commandShowModels,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -439,6 +439,17 @@ pub fn Handlers(comptime App: type) type {
                 },
                 .failed => |err| failed: {
                     warning = true;
+                    if (err == error.McpAuthorityReducedReloadFailed) {
+                        debug_trace.logf(
+                            "mcp",
+                            "authority-reducing reload left MCP unavailable",
+                            .{},
+                        );
+                        break :failed try app.alloc.dupe(
+                            u8,
+                            "MCP configuration could not be reloaded after project authority was reduced. MCP is unavailable; check the configuration and run /mcp reload.",
+                        );
+                    }
                     debug_trace.logf(
                         "mcp",
                         "profile reload retained current runtime err={s}",
@@ -456,6 +467,9 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (warning) .warning else .neutral,
                 .body = body,
             }, true);
+            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                try app.presentProjectMcpPrompt();
+            }
         }
 
         pub fn collectMcpAuthenticationFacts(app: *App) !void {
@@ -749,15 +763,6 @@ pub fn Handlers(comptime App: type) type {
             try session_commands.Commands(App).handleModel(app, query);
         }
 
-        fn commandShowModels(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            app.ensureModelCache();
-            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            closeHelpMenuIfPresent(app);
-            try app.model_cache.openMenu();
-            app.shell.render_requests.request(.footer);
-        }
-
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (try handlePermissionRuleManagement(app, rest)) return;
@@ -1031,6 +1036,10 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
+            if (comptime @hasField(App, "usage_dashboard")) {
+                try openUsageDashboard(app, .days_30);
+                return;
+            }
             var usage = loadUsageSnapshot(app, .days_30) catch |err| {
                 debug_trace.logf(
                     "usage",
@@ -1054,26 +1063,142 @@ pub fn Handlers(comptime App: type) type {
             app: *App,
             scope: usage_report.Scope,
         ) !void {
-            var usage = loadUsageSnapshot(app, scope) catch |err| {
-                debug_trace.logf(
-                    "usage",
-                    "usage dashboard refresh failed scope={s} reason={s}",
-                    .{ @tagName(scope), @errorName(err) },
-                );
-                try app.input_runtime.usage_menu.recordRefreshFailure(
-                    app.alloc,
-                    scope,
-                    "Local usage data is unavailable",
-                );
+            if (comptime @hasField(App, "usage_dashboard")) {
+                if (scope == .session) {
+                    var usage = loadUsageSnapshot(app, scope) catch |err| {
+                        try recordUsageRefreshFailure(app, scope, err);
+                        return;
+                    };
+                    errdefer usage.deinit(app.alloc);
+                    installUsageSnapshot(app, usage);
+                    return;
+                }
+                if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
+                    installUsageSnapshot(app, usage);
+                    return;
+                }
+                app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
+                try requestUsageDashboardRefresh(app);
                 app.shell.render_requests.request(.footer);
+                return;
+            }
+            var usage = loadUsageSnapshot(app, scope) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
                 return;
             };
             errdefer usage.deinit(app.alloc);
+            installUsageSnapshot(app, usage);
+        }
+
+        pub fn reloadUsageMenu(
+            app: *App,
+            scope: usage_report.Scope,
+        ) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) {
+                try refreshUsageMenu(app, scope);
+                return;
+            }
+            if (scope == .session) {
+                try refreshUsageMenu(app, scope);
+                return;
+            }
+            app.input_runtime.usage_menu.requested_scope = scope;
+            requestUsageDashboardRefresh(app) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
+                return;
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        pub fn collectUsageDashboardFacts(app: *App) !bool {
+            if (comptime !@hasField(App, "usage_dashboard")) return false;
+            const transition = app.usage_dashboard.pollTransition();
+            if (transition == .none) return false;
+            if (!app.input_runtime.usage_menu.active or
+                app.input_runtime.usage_menu.navigationScope() == .session)
+            {
+                return false;
+            }
+            const scope = app.input_runtime.usage_menu.navigationScope();
+            if (transition == .failed) {
+                const err = app.usage_dashboard.lastError() orelse
+                    error.ProfileUsageUnavailable;
+                try recordUsageRefreshFailure(app, scope, err);
+                return true;
+            }
+            if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
+                installUsageSnapshot(app, usage);
+                return true;
+            }
+            const err = app.usage_dashboard.lastError() orelse
+                error.ProfileUsageUnavailable;
+            try recordUsageRefreshFailure(app, scope, err);
+            return true;
+        }
+
+        fn openUsageDashboard(
+            app: *App,
+            scope: usage_report.Scope,
+        ) !void {
+            const cached = try app.usage_dashboard.snapshot(app.alloc, scope);
+            if (cached) |usage| {
+                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
+            } else {
+                app.input_runtime.usage_menu.openLoading(app.alloc, scope);
+            }
+            requestUsageDashboardRefresh(app) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
+                return;
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn requestUsageDashboardRefresh(app: *App) !void {
+            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const availability = try app.session.ensureProfileUsageReadable(
+                app.alloc,
+                home,
+            );
+            if (availability == .unavailable) {
+                return app.session.profile_usage.lastError() orelse
+                    error.ProfileUsageUnavailable;
+            }
+            _ = try app.usage_dashboard.requestRefresh(
+                usage_dashboard_runtime.profileProvider(
+                    &app.session.profile_usage,
+                ),
+                home,
+                @max(io_mod.milliTimestamp(), 0),
+            );
+        }
+
+        fn installUsageSnapshot(
+            app: *App,
+            usage: usage_report.Snapshot,
+        ) void {
             if (app.input_runtime.usage_menu.active) {
                 app.input_runtime.usage_menu.replaceOwned(app.alloc, usage);
             } else {
                 app.input_runtime.usage_menu.openOwned(app.alloc, usage);
             }
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn recordUsageRefreshFailure(
+            app: *App,
+            scope: usage_report.Scope,
+            err: anyerror,
+        ) !void {
+            debug_trace.logf(
+                "usage",
+                "usage dashboard refresh failed scope={s} reason={s}",
+                .{ @tagName(scope), @errorName(err) },
+            );
+            try app.input_runtime.usage_menu.recordRefreshFailure(
+                app.alloc,
+                scope,
+                "Local usage data is unavailable",
+            );
             app.shell.render_requests.request(.footer);
         }
 
@@ -1191,6 +1316,10 @@ pub fn Handlers(comptime App: type) type {
             var reload_notice: ?[]u8 = null;
             defer if (reload_notice) |notice| app.alloc.free(notice);
             var reload_warning = false;
+            if (result.project_action) |action| {
+                try applyProjectMcpAction(app, action, command_body);
+                return;
+            }
             if (result.reload) {
                 app.beginMcpReload() catch |err| {
                     reload_warning = true;
@@ -1226,6 +1355,70 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (reload_warning) .warning else .neutral,
                 .body = body,
             }, true);
+        }
+
+        pub fn applyProjectMcpAction(
+            app: *App,
+            action: @import("../mcp/project_config.zig").ProjectMcpAction,
+            success_body: []const u8,
+        ) !void {
+            if (comptime !@hasField(App, "workspace_root") or
+                !@hasDecl(App, "beginMcpAuthorityReduction"))
+            {
+                return error.McpProjectChoicesUnavailable;
+            } else {
+                const reducing_requested = switch (action) {
+                    .reject, .reset => true,
+                    .approve, .approve_all => false,
+                };
+                var attempt = config_runtime.attemptProjectMcpMutation(
+                    app.alloc,
+                    app.workspace_root,
+                    action,
+                );
+                defer attempt.deinit(app.alloc);
+                var warning = false;
+                var owned_notice: ?[]u8 = null;
+                defer if (owned_notice) |notice| app.alloc.free(notice);
+                switch (attempt) {
+                    .outcome => |outcome| switch (outcome) {
+                        .unchanged => {},
+                        .committed => |committed| {
+                            if (committed.authority_reduced) {
+                                try app.beginMcpAuthorityReduction(true);
+                            } else {
+                                try app.beginMcpReload();
+                            }
+                        },
+                    },
+                    .failure => |failure| {
+                        warning = true;
+                        if (failure.err == error.SettingsCommitIndeterminate and reducing_requested) {
+                            try app.beginMcpAuthorityReduction(false);
+                            owned_notice = try app.alloc.dupe(
+                                u8,
+                                "Project MCP choices may have been saved, so live MCP authority was retired. Run /mcp reload after checking settings.json.",
+                            );
+                        } else {
+                            owned_notice = try std.fmt.allocPrint(
+                                app.alloc,
+                                "Project MCP choices were not applied: {s}.",
+                                .{@errorName(failure.err)},
+                            );
+                        }
+                    },
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "mcp",
+                    .tone = if (warning) .warning else .neutral,
+                    .body = owned_notice orelse success_body,
+                }, true);
+                if (warning and owned_notice != null and
+                    comptime @hasDecl(App, "presentProjectMcpPrompt"))
+                {
+                    try app.presentProjectMcpPrompt();
+                }
+            }
         }
 
         fn listMcpServersAndTools(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
@@ -1486,6 +1679,7 @@ pub fn Handlers(comptime App: type) type {
                 .removed = result.removed,
                 .revocation_failed = result.revocation_failed,
                 .repaired_entries = result.repaired_entries,
+                .local_only = result.local_only,
             };
         }
 
@@ -3256,6 +3450,9 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
             snapshot.slash_menu_categories = app.input_runtime.slash_menu_categories;
         }
     }
+    if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "collapse_tool_calls")) {
+        snapshot.collapse_tool_calls = app.shell.collapse_tool_calls;
+    }
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
@@ -3316,6 +3513,21 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
             if (enabled != statuslineItemEnabled(app, item)) {
                 try applyStatuslineItem(app, item, enabled, .announce);
             }
+        },
+        .collapse_tool_calls => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const runtime_changed = enabled != app.shell.collapse_tool_calls;
+            if (runtime_changed) {
+                app.shell.collapse_tool_calls = enabled;
+                app.shell.markTranscriptStructureDirty();
+                app.shell.render_requests.request(.transcript);
+            }
+            try persistUserPreferences(
+                app,
+                "collapse tool calls",
+                .{ .collapse_tool_calls = enabled },
+                runtime_changed,
+            );
         },
         .slash_menu_categories => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
@@ -3703,30 +3915,6 @@ const SkillsInstallReplayApp = struct {
         self.write_count += 1;
         self.last_tone = notice.tone;
         _ = try self.shell.appendSemanticNotice(self.alloc, notice);
-    }
-};
-
-const ModelCatalogCommandFakeApp = struct {
-    alloc: std.mem.Allocator,
-    model_cache: model_cache_runtime.Runtime,
-    skills: skill_runtime.Runtime = .{},
-    shell: transcript_runtime.TranscriptRuntime = .{},
-    ensure_count: usize = 0,
-
-    fn init(alloc: std.mem.Allocator) !ModelCatalogCommandFakeApp {
-        return ModelCatalogCommandFakeApp{
-            .alloc = alloc,
-            .model_cache = model_cache_runtime.Runtime.init(alloc, "/v1/models"),
-        };
-    }
-
-    fn deinit(self: *ModelCatalogCommandFakeApp) void {
-        self.model_cache.deinit();
-        self.shell.deinit(self.alloc);
-    }
-
-    fn ensureModelCache(self: *ModelCatalogCommandFakeApp) void {
-        self.ensure_count += 1;
     }
 };
 
@@ -4212,22 +4400,6 @@ test "skills install groups command notice fragments for entry replay" {
     try std.testing.expect(std.mem.startsWith(u8, rendered, "● Skills: Installing from "));
     try std.testing.expect(std.mem.find(u8, rendered, "\n\n● Skills: Installed: root-skill") != null);
     try std.testing.expect(std.mem.endsWith(u8, rendered, "  Installed: nested-skill"));
-}
-
-test "models command opens the catalog without writing transcript output" {
-    const alloc = std.testing.allocator;
-    var app = try ModelCatalogCommandFakeApp.init(alloc);
-    defer app.deinit();
-    app.skills.openMenu();
-
-    try Handlers(ModelCatalogCommandFakeApp).commandShowModels(@ptrCast(&app));
-
-    try std.testing.expectEqual(@as(usize, 1), app.ensure_count);
-    try std.testing.expect(!app.skills.menu.active);
-    try std.testing.expect(app.model_cache.menu.active);
-    try std.testing.expectEqual(model_cache_runtime.ModelMenuLoadState.loading, app.model_cache.menu.load_state);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.entries.items.len);
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "help command opens the catalog without writing transcript output" {

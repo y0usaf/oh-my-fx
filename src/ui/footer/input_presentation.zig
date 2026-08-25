@@ -1,6 +1,7 @@
 const std = @import("std");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
+const credentials = @import("../../core/auth/credentials.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -26,7 +27,7 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, file, slash, auth };
+pub const PickerKind = enum { model_stage, models, file, slash, skills, help, settings, sessions, auth };
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -57,6 +58,7 @@ pub const ComposedInputRows = struct {
 pub fn composeQueuedSummaryRow(
     alloc: Allocator,
     queued_count: usize,
+    steering_count: usize,
     queued_paused: bool,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -66,8 +68,15 @@ pub fn composeQueuedSummaryRow(
     // The paused hint row already owns the controls, so it drops the affordance.
     const affordance = if (queued_paused) "" else " · ↑ to edit";
     var row_buf: [max_top_row_len]u8 = undefined;
+    const ordinary_count = queued_count -| steering_count;
     const label = if (queued_count == 0)
         "queued"
+    else if (ordinary_count == 0 and steering_count == 1)
+        std.fmt.bufPrint(&row_buf, "1 steering message{s}", .{affordance}) catch "1 steering message"
+    else if (ordinary_count == 0)
+        std.fmt.bufPrint(&row_buf, "{d} steering messages{s}", .{ steering_count, affordance }) catch "steering messages"
+    else if (steering_count > 0)
+        std.fmt.bufPrint(&row_buf, "{d} pending messages · {d} steering{s}", .{ queued_count, steering_count, affordance }) catch "pending messages"
     else if (queued_count == 1)
         std.fmt.bufPrint(&row_buf, "1 queued message{s}", .{affordance}) catch "1 queued message"
     else
@@ -83,10 +92,13 @@ pub fn composeQueueReviewHintRow(
     width: u16,
     empty_draft: bool,
     cancel_all_available: bool,
+    steering: bool,
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     try row.appendSlice(alloc, ui_render.dim_style);
-    const hint = if (cancel_all_available)
+    const hint = if (steering)
+        "steering paused · enter to apply"
+    else if (cancel_all_available)
         "paused · enter to send · press esc to cancel all queued"
     else if (empty_draft)
         "paused · delete again to remove queued prompt · enter to send unchanged"
@@ -98,17 +110,24 @@ pub fn composeQueueReviewHintRow(
 }
 
 test "collapsed queue banner counts the waiting prompts and offers the review" {
-    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, false, 80);
+    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, 0, false, 80);
     defer single.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, single.items, "1 queued message · ↑ to edit") != null);
 
-    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, false, 80);
+    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, 0, false, 80);
     defer many.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, many.items, "3 queued messages · ↑ to edit") != null);
 }
 
+test "collapsed queue banner identifies pending steering" {
+    var row = try composeQueuedSummaryRow(std.testing.allocator, 1, 1, false, 80);
+    defer row.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.find(u8, row.items, "1 steering message · ↑ to edit") != null);
+}
+
 test "collapsed queue banner drops the affordance while the review is paused" {
-    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, true, 80);
+    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, 0, true, 80);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "2 queued messages") != null);
@@ -116,7 +135,7 @@ test "collapsed queue banner drops the affordance while the review is paused" {
 }
 
 test "queue review hint explains empty draft deletion" {
-    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, true, false);
+    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, true, false, false);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "delete again to remove queued prompt") != null);
@@ -124,10 +143,17 @@ test "queue review hint explains empty draft deletion" {
 }
 
 test "post-cancel queue review hint offers cancelling every queued prompt" {
-    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, true);
+    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, true, false);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "press esc to cancel all queued") != null);
+}
+
+test "steering review hint says enter applies steering" {
+    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, false, true);
+    defer row.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.find(u8, row.items, "steering paused · enter to apply") != null);
 }
 
 // Ordered widest-first; every fallback keeps the enter/esc controls so narrow
@@ -321,12 +347,38 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
         "↑↓ Move  Enter  Esc",
         "Enter Esc",
     };
+    const codex_sign_in_variants = [_][]const u8{
+        "Enter reopens browser · Esc cancels",
+        "Enter reopens  Esc cancels",
+        "Enter  Esc",
+        "Enter Esc",
+    };
+    const grok_browser_variants = [_][]const u8{
+        "Enter reopens browser · Tab enters code · Esc cancels",
+        "Enter reopens  Tab code  Esc cancels",
+        "Enter  Tab  Esc",
+        "Enter Tab Esc",
+    };
+    const grok_manual_variants = [_][]const u8{
+        "Enter submits code · Tab returns to browser · Esc cancels",
+        "Enter submits  Tab browser  Esc cancels",
+        "Enter  Tab  Esc",
+        "Enter Tab Esc",
+    };
     const variants = switch (view.stage) {
         .root => root_variants,
         .connections => connections_variants,
         .provider, .switch_credential => selection_variants,
         .change_team => team_variants,
-        .sign_in, .api_key => return null,
+        .sign_in => switch (view.sign_in_source) {
+            .chatgpt_subscription => codex_sign_in_variants,
+            .grok_subscription => if (view.sign_in_code_visible)
+                grok_manual_variants
+            else
+                grok_browser_variants,
+            else => return null,
+        },
+        .api_key => return null,
     };
     for (variants) |candidate| {
         if (display_width.visibleWidth(candidate) <= width) return candidate;
@@ -482,11 +534,11 @@ pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool
     }
 
     const variants = [_][]const u8{
-        "↑↓ Navigate     Enter Open     Esc Close",
-        "↑↓ Navigate  Enter Open  Esc Close",
-        "↑↓ Move  Enter Open  Esc",
-        "Enter Open  Esc Close",
-        "Enter Esc",
+        "↑↓ Navigate     Tab Category     Enter Open     Esc Close",
+        "↑↓ Navigate  Tab Category  Enter Open  Esc Close",
+        "↑↓ Move  Tab Category  Enter  Esc",
+        "Tab Category  Enter Open  Esc",
+        "Tab Enter Esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
@@ -519,11 +571,11 @@ pub fn composeSettingsMenuHintRow(
     }
 
     const variants = [_][]const u8{
-        "↑↓ Navigate     ←→ Change     Esc Close",
-        "↑↓ Navigate  ←→ Change  Esc Close",
-        "↑↓ Move  ←→ Change  Esc",
-        "←→ Change  Esc Close",
-        "←→ Esc",
+        "↑↓ Navigate     Tab Category     ←→ Change     Esc Close",
+        "↑↓ Navigate  Tab Category  ←→ Change  Esc Close",
+        "↑↓ Move  Tab Category  ←→ Change  Esc",
+        "Tab Category  ←→ Change  Esc",
+        "Tab ←→ Esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
@@ -553,9 +605,9 @@ pub fn composeCompactCommandMenuHintRow(
             "←→ Esc",
         },
         .usage => [_][]const u8{
-            "←→ Scope     ↑↓ Model     Enter Expand     R Refresh     Esc Close",
-            "←→ Scope  ↑↓ Model  Enter Expand  R Refresh  Esc",
-            "←→ ↑↓  Enter  R  Esc",
+            "Tab Scope     ↑↓ Model     Enter Expand     R Refresh     Esc Close",
+            "Tab Scope  ↑↓ Model  Enter Expand  R Refresh  Esc",
+            "Tab ↑↓  Enter  R  Esc",
         },
         .workspace => [_][]const u8{
             "↑↓ Navigate     Enter Use     Esc Close",
@@ -924,7 +976,6 @@ fn finishComposedInputRow(alloc: Allocator, row: *std.ArrayList(u8), width: u16)
 
 const input_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
-    .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a session", .presentation_category = .session },
 };
 const input_test_slash_registry = command_specs.SlashRegistry{ .commands = input_test_slash_specs[0..] };
@@ -1456,6 +1507,53 @@ test "compose hint row replaces model status with setup navigation" {
     var child = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
     defer child.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, child.items, "Esc Back") != null);
+}
+
+test "compose hint row replaces model status with subscription sign-in controls" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        source: credentials.Source,
+        manual_code_visible: bool,
+        expected: []const u8,
+    }{
+        .{
+            .source = .chatgpt_subscription,
+            .manual_code_visible = false,
+            .expected = "Enter reopens browser · Esc cancels",
+        },
+        .{
+            .source = .grok_subscription,
+            .manual_code_visible = false,
+            .expected = "Enter reopens browser · Tab enters code · Esc cancels",
+        },
+        .{
+            .source = .grok_subscription,
+            .manual_code_visible = true,
+            .expected = "Enter submits code · Tab returns to browser · Esc cancels",
+        },
+    };
+
+    for (cases) |case| {
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var ctx = testRenderContext(&input);
+        ctx.model = "model-status-sentinel";
+        ctx.auth_picker = .{
+            .active = true,
+            .available_sources = .empty,
+            .selected_choice = null,
+            .active_source = null,
+            .include_skip = false,
+            .stage = .sign_in,
+            .sign_in_source = case.source,
+            .sign_in_code_visible = case.manual_code_visible,
+        };
+
+        var row = try composeHintRow(alloc, false, null, ctx, 80);
+        defer row.deinit(alloc);
+        try std.testing.expect(std.mem.find(u8, row.items, case.expected) != null);
+        try std.testing.expect(std.mem.find(u8, row.items, "model-status-sentinel") == null);
+    }
 }
 
 test "compose hint row uses dots in subagent view" {

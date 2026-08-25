@@ -1,0 +1,131 @@
+name: Upstream Merge
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [upstream-push]
+
+concurrency:
+  group: upstream-merge
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: vercel-labs/fx
+  UPSTREAM_BRANCH: main
+  MERGE_BRANCH: upstream-merge
+  BASE_BRANCH: main
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure remotes and identity
+        env:
+          GH_TOKEN: ${{ secrets.CODE_GH_PAT || github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch --no-tags --prune origin "${BASE_BRANCH}"
+          git fetch --no-tags --prune upstream "${UPSTREAM_BRANCH}"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
+          git config user.name "oh-my-fx-upstream-bot"
+          git config user.email "upstream@oh-my-fx.invalid"
+
+      - name: Carry forward merge branch
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "${MERGE_BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${MERGE_BRANCH}"
+            git switch --create "${MERGE_BRANCH}" --track "origin/${MERGE_BRANCH}"
+            git merge --no-ff --no-edit "origin/${BASE_BRANCH}"
+          else
+            git switch --create "${MERGE_BRANCH}" "origin/${BASE_BRANCH}"
+          fi
+
+      - name: Merge upstream without committing
+        id: merge
+        continue-on-error: true
+        run: |
+          set -u
+          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
+
+      - name: Run upstream-first merge agent
+        if: steps.merge.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.CODE_GH_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          cat > .github/auto-goal.md <<'EOF'
+          Resolve the current upstream merge. Prefer upstream architecture and behavior by default. Preserve only intentional oh-my-fx fork behavior and adapt it to upstream. Read .github/merge-policy.json. Do not use blanket ours/theirs. Resolve all conflicts, run focused verification, write MERGE_REPORT.md, stage all files, and commit the merge.
+          EOF
+          npx -y @just-every/code@latest exec --cd "$GITHUB_WORKSPACE" --skip-git-repo-check -s workspace-write --goal-file .github/auto-goal.md
+
+      - name: Preserve fork workflow files
+        run: |
+          set -euo pipefail
+          git restore --source="origin/${BASE_BRANCH}" --staged --worktree -- .github/workflows
+
+      - name: Ensure merge is resolved
+        run: |
+          set -euo pipefail
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check
+
+      - name: Commit resolved merge
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            git commit --no-edit
+          elif ! git diff --cached --quiet; then
+            git commit -m "Merge upstream/main into oh-my-fx"
+          fi
+
+      - name: Push merge branch
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "HEAD:${MERGE_BRANCH}"
+
+      - name: Open or update merge PR
+        env:
+          GH_TOKEN: ${{ secrets.CODE_GH_PAT || github.token }}
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY%%/*}"
+          head="${owner}:${MERGE_BRANCH}"
+          title="Merge upstream/main into oh-my-fx"
+          body="Upstream-first refresh from ${UPSTREAM_REPO}/${UPSTREAM_BRANCH}. Review and merge this PR with a merge commit. Do not squash-merge."
+
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${MERGE_BRANCH}" >/dev/null
+          number="$(
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f state=open \
+              -f base="${BASE_BRANCH}" \
+              -f head="${head}" \
+              --jq '.[0].number // empty'
+          )"
+
+          if [ -n "${number}" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${number}" \
+              -f title="${title}" \
+              -f body="${body}" >/dev/null
+            echo "Updated PR #${number}"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f title="${title}" \
+              -f head="${MERGE_BRANCH}" \
+              -f base="${BASE_BRANCH}" \
+              -f body="${body}"
+          fi
