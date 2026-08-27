@@ -373,6 +373,15 @@ pub const ExecutorKind = enum {
     read_tool_result,
     write_file,
     edit_file,
+<<<<<<< HEAD
+=======
+    delete_file,
+    rename_file,
+    copy_file,
+    create_folder,
+    file_info,
+    ast_symbols,
+>>>>>>> 75200ea9 (Fix ast_symbols tool registration)
     memory,
     web_fetch,
     web_search,
