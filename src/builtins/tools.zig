@@ -79,7 +79,7 @@ const file_info_description =
 const memory_description =
     "Save, list, or clear durable user preferences for future fx sessions. When to use: the user explicitly asks to remember, forget, save, or recall a preference. When NOT to use: store task notes, secrets, project facts, temporary context, or anything the user did not ask to persist.";
 const ast_symbols_description =
-    "Parse one source file with Tree-sitter and list its named declarations with kinds and line numbers. Supports TypeScript, TSX, Python, Go, Rust, and Nix. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect a file's structural outline or locate declarations without text matching. When NOT to use: search across files, inspect function bodies, or edit code.";
+    "Parse one source file with Tree-sitter and list its named declarations with kinds and line numbers. Supports TypeScript, TSX, Python, Go, Rust, Nix, and Zig. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect a file's structural outline or locate declarations without text matching. When NOT to use: search across files, inspect function bodies, or edit code.";
 const semantic_search_description =
     "Lexically search workspace files for concept keywords when exact symbols are unknown, ranking likely files for follow-up reads. This is not embedding or true semantic search. When to use: explore unfamiliar concepts, features, or responsibilities. When NOT to use: exact symbols, literal text, file names, counts, or narrow known-path inspection.";
 const open_file_description =
@@ -959,7 +959,7 @@ pub const memory = ToolSpec{
 pub const ast_symbols = ToolSpec{
     .name = "ast_symbols",
     .description = ast_symbols_description,
-    .gateway_schema = .{
+    .model_schema = .{
         .name = "ast_symbols",
         .description = ast_symbols_description,
         .input_schema = .{
