@@ -74,7 +74,7 @@ tmuxTest("direct native-clear recovery resets the view and replays the held draf
   await session.waitForPane((pane) => composerContains(pane, "abc"), 10_000);
   const history = await session.captureFullScrollback();
   expect(history).not.toContain(old_marker);
-  expect(history).toContain("𝒇x v");
+  expect(history).toContain("oh-my-𝒇x v");
   expect(readFileSync(stderr_path, "utf8")).toBe("");
 }, 30_000);
 

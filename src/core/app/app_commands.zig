@@ -15,6 +15,8 @@ const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const editor_state = @import("../input/editor_state.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
+const syntax_theme = @import("../config/syntax_theme.zig");
+const code_highlight = @import("../../ui/render_engine/code_highlight.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const feedback_runtime = @import("../feedback/runtime.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -3441,6 +3443,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
     if (comptime @hasField(App, "prompt_history")) snapshot.prompt_history = app.prompt_history.enabled;
+    snapshot.syntax_theme = syntax_theme.label(code_highlight.activeSyntaxTheme());
     if (comptime @hasDecl(App, "notificationPreferences")) {
         const notifications = app.notificationPreferences();
         snapshot.sound_level = settings_catalog.notificationLevel(
@@ -3526,6 +3529,18 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 .{ .slash_menu_categories = enabled },
                 runtime_changed,
             );
+        },
+        .syntax_theme => {
+            const name = syntax_theme.parse(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const runtime_changed = code_highlight.activeSyntaxTheme() != name;
+            code_highlight.setSyntaxTheme(name);
+            try persistUserPreferences(
+                app,
+                "syntax theme",
+                .{ .syntax_theme = name },
+                runtime_changed,
+            );
+            if (runtime_changed) app.shell.render_requests.request(.transcript);
         },
         .effort => {
             const effort = types.ReasoningEffort.parseDisplayLabel(change.value) orelse

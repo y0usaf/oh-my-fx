@@ -10,6 +10,7 @@ const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const syntax_theme = @import("syntax_theme.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -106,6 +107,7 @@ pub const UserSettingsPatch = struct {
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
+    syntax_theme: ?syntax_theme.Name = null,
     statusline_item: ?StatuslineItemPatch = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
@@ -125,6 +127,7 @@ pub const UserSettingsPatch = struct {
             self.update_channel == null and
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
+            self.syntax_theme == null and
             self.statusline_item == null and
             self.notification_turn_end == null and
             self.notification_attention_required == null and
@@ -999,6 +1002,7 @@ fn applyUserPatchToRoot(
     if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
+    if (patch.syntax_theme) |value| application.changed = try putString(arena, &root.object, "syntax_theme", syntax_theme.label(value)) or application.changed;
 
     if (patch.prompt_history_enabled) |enabled| {
         var prompt_history = if (root.object.getPtr("prompt_history")) |value| blk: {
@@ -1828,6 +1832,11 @@ fn validateKnownSettingsObject(
             return error.InvalidSettingsFormat;
         }
     }
+    if (object.get("syntax_theme")) |value| {
+        if (value != .string or syntax_theme.parse(value.string) == null) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (object.get("max_agent_steps")) |value| {
         if (value != .integer or value.integer < 0) return error.InvalidSettingsFormat;
     }
@@ -2486,6 +2495,7 @@ test "nested user cleanup preserves siblings and skips non-object containers" {
     var outcome = try store.applyUserPatch(alloc, .{
         .prompt_history_enabled = false,
         .statusline_item = .{ .item = .context, .enabled = true },
+        .syntax_theme = .ocean,
     });
     defer outcome.deinit(alloc);
 
@@ -2507,6 +2517,9 @@ test "nested user cleanup preserves siblings and skips non-object containers" {
         return error.TestMissingRootStatusline;
     try std.testing.expectEqual(true, (root_statusline.object.get("context") orelse
         return error.TestMissingRootStatuslineContext).bool);
+    const root_syntax_theme = parsed.value.object.get("syntax_theme") orelse
+        return error.TestMissingRootSyntaxTheme;
+    try std.testing.expectEqualStrings("ocean", root_syntax_theme.string);
     try std.testing.expectEqual(@as(i64, 2), (root_statusline.object.get("future") orelse
         return error.TestMissingRootStatuslineFuture).integer);
 

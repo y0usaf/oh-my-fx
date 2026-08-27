@@ -26,6 +26,7 @@ const update_target = @import("../upgrade/update_target.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
+const code_highlight = @import("../../ui/render_engine/code_highlight.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
@@ -296,6 +297,7 @@ pub fn Runtime(comptime App: type) type {
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;
+            code_highlight.setSyntaxTheme(startup.syntax_theme);
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),
             );

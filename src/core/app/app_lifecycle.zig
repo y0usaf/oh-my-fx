@@ -12,6 +12,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const syntax_theme = @import("../config/syntax_theme.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
@@ -145,6 +146,7 @@ pub const StartupState = struct {
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
+    syntax_theme: syntax_theme.Name = .default,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
@@ -404,6 +406,7 @@ fn loadStartupStateFromOwnedWorkspace(
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
+    state.syntax_theme = settings.syntax_theme orelse .default;
     if (credential_mode) |mode| {
         const resolution = try credentials.resolveForProvider(
             alloc,

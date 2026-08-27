@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_capabilities = @import("model_capabilities.zig");
+const syntax_theme = @import("syntax_theme.zig");
 const types = @import("../shared/types.zig");
 
 pub const Category = enum {
@@ -26,6 +27,7 @@ pub const SettingId = enum {
     statusline_context,
     statusline_session,
     statusline_workspace,
+    syntax_theme,
     slash_menu_categories,
     collapse_tool_calls,
     model,
@@ -54,6 +56,7 @@ pub const Snapshot = struct {
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
+    syntax_theme: []const u8 = "default",
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
     startup_scrollback: bool = true,
@@ -69,6 +72,7 @@ pub const Snapshot = struct {
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
             .statusline_workspace => onOff(self.statusline_workspace),
+            .syntax_theme => self.syntax_theme,
             .slash_menu_categories => onOff(self.slash_menu_categories),
             .collapse_tool_calls => onOff(self.collapse_tool_calls),
             .startup_scrollback => onOff(self.startup_scrollback),
@@ -255,6 +259,7 @@ const specs = [_]Spec{
     .{ .id = .statusline_context, .category = .interface, .label = "Status line context", .description = "Show context usage in the status line" },
     .{ .id = .statusline_session, .category = .interface, .label = "Status line session", .description = "Show the session title in the status line" },
     .{ .id = .statusline_workspace, .category = .interface, .label = "Status line workspace", .description = "Show the workspace path and Git branch in the status line" },
+    .{ .id = .syntax_theme, .category = .interface, .label = "Syntax theme", .description = "Code highlighting palette" },
     .{ .id = .slash_menu_categories, .category = .interface, .label = "Slash menu categories", .description = "Show categories and skill sources in slash-command results" },
     .{ .id = .collapse_tool_calls, .category = .interface, .label = "Collapse tool calls", .description = "Show only a summary for each group of tool calls" },
     .{ .id = .model, .category = .agent, .label = "Model", .description = "Choose the model used for new turns" },
@@ -377,6 +382,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         => &on_off_options,
         .sound_level => &sound_level_options,
         .permission_mode => &permission_options,
+        .syntax_theme => &syntax_theme.names,
     };
 }
 
@@ -575,4 +581,21 @@ test "status line menu describes toggle changes without performing effects" {
 
     menu.close();
     try std.testing.expect(menu.selectedChange(enabled) == null);
+}
+
+test "settings catalog cycles the syntax theme through the palette presets" {
+    const snapshot: Snapshot = .{};
+    const item = itemAt(snapshot, .interface, "syntax theme", 0).?;
+
+    try std.testing.expectEqual(SettingId.syntax_theme, item.id);
+    try std.testing.expectEqualStrings("Syntax theme", item.label);
+    try std.testing.expectEqualStrings("default", item.value);
+    try std.testing.expectEqual(@as(usize, 4), optionCount(&snapshot, .syntax_theme));
+    try std.testing.expectEqualStrings("mono", optionAt(&snapshot, .syntax_theme, 1).?);
+    try std.testing.expectEqualStrings("ocean", optionAt(&snapshot, .syntax_theme, 2).?);
+    try std.testing.expectEqualStrings("ember", optionAt(&snapshot, .syntax_theme, 3).?);
+
+    const change = changeAt(&snapshot, .syntax_theme, 3).?;
+    try std.testing.expectEqual(SettingId.syntax_theme, change.setting);
+    try std.testing.expectEqualStrings("ember", change.value);
 }

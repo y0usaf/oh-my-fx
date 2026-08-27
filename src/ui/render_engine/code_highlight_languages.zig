@@ -34,6 +34,24 @@ pub const Profile = struct {
     literals: []const []const u8 = &.{},
     keyword_case: KeywordCase = .sensitive,
     detection: Detection = .none,
+    /// Builtin type names (lowercase-first languages keep them explicit).
+    types: []const []const u8 = &.{},
+    /// Keywords that announce a declaration whose name token is styled as a
+    /// function (`fn`, `def`, `func`, ...). Call sites are picked up
+    /// independently via the identifier-followed-by-paren rule.
+    function_keywords: []const []const u8 = &.{},
+    /// Treat `Capitalized` identifiers as type names (the TS/Java/Go family
+    /// convention and the Rust/Zig PascalCase type convention).
+    capitalized_types: bool = false,
+    /// Understand `/regex/` literals (JS/TS family).
+    regex_literal: bool = false,
+    /// Bytes that open an attribute/decorator token (`@`, `#` in rust).
+    attribute_prefixes: []const u8 = "",
+    /// A quote that opens a span to the same unescaped quote, multiline
+    /// allowed (template literals).
+    template_quote: ?u8 = null,
+    /// Allow `"""..."` / `'''...'` multiline strings.
+    triple_quotes: bool = false,
 };
 
 const double_quote = &[_]u8{'"'};
@@ -47,6 +65,10 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .quotes = double_quote,
         .keywords = &.{ "const", "var", "fn", "pub", "return", "if", "else", "while", "for", "struct", "enum", "union", "try", "catch", "comptime", "defer", "errdefer", "async", "await", "anytype", "void" },
+        .types = &.{ "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "isize", "usize", "f16", "f32", "f64", "f128", "bool", "noreturn", "type", "anyerror", "c_char", "c_int", "c_long", "c_short", "c_uint", "c_longlong" },
+        .function_keywords = &.{"fn"},
+        .capitalized_types = true,
+        .attribute_prefixes = "@",
     },
     .{
         .label = "ts",
@@ -56,6 +78,12 @@ const profiles = [_]Profile{
         .quotes = shell_quotes,
         .keywords = &.{ "const", "let", "var", "function", "class", "interface", "type", "export", "import", "from", "return", "if", "else", "for", "while", "async", "await", "new", "extends", "implements", "public", "private", "readonly" },
         .literals = &.{ "true", "false", "null", "undefined" },
+        .types = &.{ "string", "number", "boolean", "any", "unknown", "void", "never", "bigint", "symbol", "object" },
+        .function_keywords = &.{"function"},
+        .capitalized_types = true,
+        .regex_literal = true,
+        .attribute_prefixes = "@",
+        .template_quote = '`',
         .detection = .typescript_assertion,
     },
     .{
@@ -72,6 +100,7 @@ const profiles = [_]Profile{
         .quotes = shell_quotes,
         .keywords = &.{ "if", "then", "fi", "for", "do", "done", "in", "case", "esac", "function", "local", "export", "readonly", "return" },
         .literals = &.{ "true", "false", "null" },
+        .function_keywords = &.{"function"},
         .detection = .shell_shebang,
     },
     .{
@@ -81,6 +110,11 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "def", "class", "return", "if", "elif", "else", "for", "while", "in", "import", "from", "as", "try", "except", "with", "lambda", "async", "await", "pass", "raise", "yield", "match", "case" },
         .literals = &.{ "True", "False", "None" },
+        .types = &.{ "int", "float", "complex", "str", "bytes", "bool", "list", "tuple", "dict", "set", "frozenset", "object", "type", "Exception", "Any" },
+        .function_keywords = &.{"def"},
+        .capitalized_types = true,
+        .attribute_prefixes = "@",
+        .triple_quotes = true,
         .detection = .python_header,
     },
     .{
@@ -105,6 +139,7 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "select", "from", "where", "join", "left", "right", "inner", "outer", "on", "insert", "into", "values", "update", "set", "delete", "create", "alter", "drop", "table", "index", "group", "by", "order", "having", "limit", "as", "and", "or", "not", "distinct", "union" },
         .literals = &.{ "true", "false", "null" },
+        .types = &.{ "int", "integer", "smallint", "bigint", "serial", "decimal", "numeric", "float", "real", "double", "char", "varchar", "text", "boolean", "date", "time", "timestamp" },
         .keyword_case = .ascii_insensitive,
         .detection = .sql_select,
     },
@@ -125,6 +160,10 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "fn", "let", "mut", "pub", "struct", "enum", "impl", "trait", "use", "mod", "crate", "return", "if", "else", "match", "for", "while", "loop", "async", "await", "move", "where", "self", "super" },
         .literals = &.{ "true", "false", "None", "Some" },
+        .types = &.{ "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64", "bool", "char", "str" },
+        .function_keywords = &.{"fn"},
+        .capitalized_types = true,
+        .attribute_prefixes = "#",
         .detection = .rust_function,
     },
     .{
@@ -135,6 +174,9 @@ const profiles = [_]Profile{
         .quotes = &[_]u8{ '"', '`' },
         .keywords = &.{ "package", "import", "func", "var", "const", "type", "struct", "interface", "return", "if", "else", "for", "range", "switch", "case", "go", "defer", "select", "chan", "map" },
         .literals = &.{ "true", "false", "nil" },
+        .types = &.{ "bool", "string", "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "byte", "rune", "float32", "float64", "complex64", "complex128", "error", "any" },
+        .function_keywords = &.{"func"},
+        .capitalized_types = true,
         .detection = .go_package,
     },
     .{
@@ -145,6 +187,8 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum", "extern", "float", "for", "goto", "if", "int", "long", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "volatile", "while" },
         .literals = &.{ "true", "false", "NULL" },
+        .types = &.{ "size_t", "ssize_t", "ptrdiff_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "uintptr_t", "intptr_t", "FILE", "bool", "va_list" },
+        .capitalized_types = true,
     },
     .{
         .label = "cpp",
@@ -154,6 +198,8 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "auto", "bool", "class", "const", "constexpr", "decltype", "delete", "enum", "explicit", "friend", "inline", "namespace", "new", "nullptr", "private", "protected", "public", "template", "this", "typename", "using", "virtual", "void" },
         .literals = &.{ "true", "false", "nullptr", "NULL" },
+        .types = &.{ "size_t", "ssize_t", "ptrdiff_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "uintptr_t", "intptr_t", "string", "wstring", "vector", "map", "set", "unordered_map", "unique_ptr", "shared_ptr", "weak_ptr", "optional", "variant", "span", "string_view", "FILE" },
+        .capitalized_types = true,
     },
     .{
         .label = "csharp",
@@ -163,6 +209,8 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "class", "namespace", "using", "public", "private", "protected", "internal", "static", "void", "string", "int", "var", "new", "return", "if", "else", "for", "foreach", "while", "async", "await", "interface", "record", "get", "set" },
         .literals = &.{ "true", "false", "null" },
+        .types = &.{ "object", "byte", "sbyte", "short", "ushort", "int", "uint", "long", "ulong", "float", "double", "decimal", "char", "bool", "string", "dynamic", "Task", "Task<T>" },
+        .capitalized_types = true,
     },
     .{
         .label = "java",
@@ -172,6 +220,8 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "class", "interface", "package", "import", "public", "private", "protected", "static", "final", "void", "new", "return", "if", "else", "for", "while", "try", "catch", "throws", "extends", "implements", "record", "var" },
         .literals = &.{ "true", "false", "null" },
+        .types = &.{ "byte", "short", "int", "long", "float", "double", "char", "boolean" },
+        .capitalized_types = true,
     },
     .{
         .label = "kotlin",
@@ -181,6 +231,9 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "fun", "val", "var", "class", "object", "interface", "package", "import", "public", "private", "return", "if", "else", "when", "for", "while", "try", "catch", "data", "sealed", "suspend" },
         .literals = &.{ "true", "false", "null" },
+        .types = &.{ "Int", "Long", "Short", "Byte", "UInt", "ULong", "Float", "Double", "Char", "Boolean", "String", "Unit", "Any", "Nothing" },
+        .function_keywords = &.{"fun"},
+        .capitalized_types = true,
     },
     .{
         .label = "php",
@@ -190,6 +243,9 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "function", "class", "public", "private", "protected", "namespace", "use", "return", "if", "else", "foreach", "for", "while", "try", "catch", "new", "static", "const", "echo", "yield" },
         .literals = &.{ "true", "false", "null" },
+        .types = &.{ "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed", "void", "null" },
+        .function_keywords = &.{"function"},
+        .attribute_prefixes = "@",
     },
     .{
         .label = "ruby",
@@ -198,6 +254,7 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "def", "class", "module", "end", "return", "if", "elsif", "else", "unless", "case", "when", "do", "while", "for", "in", "begin", "rescue", "require", "attr_reader" },
         .literals = &.{ "true", "false", "nil" },
+        .function_keywords = &.{"def"},
     },
     .{
         .label = "swift",
@@ -207,6 +264,8 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "func", "let", "var", "class", "struct", "enum", "protocol", "extension", "import", "public", "private", "return", "if", "else", "guard", "for", "while", "switch", "case", "async", "await", "throws", "try" },
         .literals = &.{ "true", "false", "nil" },
+        .function_keywords = &.{"func"},
+        .capitalized_types = true,
     },
     .{
         .label = "powershell",
@@ -216,6 +275,7 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "function", "param", "if", "else", "elseif", "foreach", "for", "while", "switch", "return", "throw", "try", "catch", "finally", "begin", "process", "end", "filter", "class", "enum" },
         .literals = &.{ "true", "false", "null" },
+        .function_keywords = &.{"function"},
         .keyword_case = .ascii_insensitive,
     },
     .{
@@ -226,6 +286,7 @@ const profiles = [_]Profile{
         .quotes = double_single_quotes,
         .keywords = &.{ "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while" },
         .literals = &.{ "true", "false", "nil" },
+        .function_keywords = &.{"function"},
     },
     .{
         .label = "html",

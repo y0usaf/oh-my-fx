@@ -8,6 +8,7 @@ const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
 const project_config = @import("../mcp/project_config.zig");
+const syntax_theme = @import("syntax_theme.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -58,6 +59,7 @@ pub const Settings = struct {
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
+    syntax_theme: ?syntax_theme.Name = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
@@ -121,6 +123,7 @@ pub const ConfigSources = struct {
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
+    syntax_theme: ConfigSource = .compiled_default,
     notification_turn_end: ConfigSource = .compiled_default,
     notification_attention_required: ConfigSource = .compiled_default,
     notification_max: ConfigSource = .compiled_default,
@@ -608,6 +611,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "collapse_tool_calls",
         "startup_scrollback",
         "prompt_history",
+        "syntax_theme",
         "statusLine",
         "notifications",
         "context_limits",
@@ -657,6 +661,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
     if (settings.statusline_session != null) sources.statusline_session = source;
+    if (settings.syntax_theme != null) sources.syntax_theme = source;
     if (settings.notification_turn_end != null) sources.notification_turn_end = source;
     if (settings.notification_attention_required != null) sources.notification_attention_required = source;
     if (settings.notification_max != null) sources.notification_max = source;
@@ -1386,6 +1391,11 @@ fn parseProfileOnlyFields(
         settings.permission_mode = parsePermissionMode(value.string) orelse return error.InvalidPermissionMode;
     }
 
+    if (root.object.get("syntax_theme")) |syntax_theme_value| {
+        if (syntax_theme_value != .string) return error.InvalidSyntaxThemeType;
+        settings.syntax_theme = syntax_theme.parse(syntax_theme_value.string) orelse return error.InvalidSyntaxTheme;
+    }
+
     if (root.object.get("credential_source")) |credential_source_value| {
         if (credential_source_value != .string) return error.InvalidCredentialSourceType;
         settings.credential_source = types.parseCredentialSource(credential_source_value.string) orelse
@@ -1538,6 +1548,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     target.models.mergeOwnedFrom(alloc, &incoming.models);
     if (incoming.provider) |value| target.provider = value;
     if (incoming.permission_mode) |value| target.permission_mode = value;
+    if (incoming.syntax_theme) |value| target.syntax_theme = value;
     if (incoming.credential_source) |value| target.credential_source = value;
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;

@@ -193,7 +193,7 @@ function rowHasBackgroundSgr(row: string): boolean {
 }
 
 test("selected slash row ignores the welcome header help hint", () => {
-  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
+  const header = `${SELECTED_COMPLETION_SGR}oh-my-𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
   const composer = `${SELECTED_COMPLETION_SGR}┃ /\x1b[39m`;
   const selected = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m Clear the conversation`;
 

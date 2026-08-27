@@ -3060,7 +3060,7 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
         .code = zig_code,
     }, 80);
     defer alloc.free(highlighted);
-    try std.testing.expect(std.mem.indexOf(u8, highlighted, "\x1b[38;5;252mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, highlighted, "\x1b[38;5;214mconst\x1b[39m") != null);
 
     const python_language = try alloc.dupe(u8, "python");
     defer alloc.free(python_language);
@@ -3071,8 +3071,8 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
         .code = python_code,
     }, 80);
     defer alloc.free(python);
-    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[2m─ python ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[38;5;252mdef\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, python, "┌ \x1b[2mpython\x1b[22m ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[38;5;214mdef\x1b[39m") != null);
 
     const unknown_language = try alloc.dupe(u8, "brainfuck");
     defer alloc.free(unknown_language);
@@ -3106,9 +3106,9 @@ test "semantic code blocks use the light syntax palette when requested" {
     });
     defer rendered.deinit(alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;238mconst\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;243m// comment\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;130mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;71m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;244m// comment\x1b[39m") != null);
 }
 
 test "renderCodeBlockForTranscript infers registered high-confidence code blocks" {
@@ -3123,9 +3123,9 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = code,
     }, 100);
     defer alloc.free(unlabeled);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[2m─ ts ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mconst\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mawait\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "┌ \x1b[2mts\x1b[22m ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;214mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;214mawait\x1b[39m") != null);
 
     const json_language = try alloc.dupe(u8, "");
     defer alloc.free(json_language);
@@ -3136,8 +3136,8 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = json_code,
     }, 100);
     defer alloc.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[2m─ json ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[38;5;250m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "┌ \x1b[2mjson\x1b[22m ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[38;5;114m\"ready\"\x1b[39m") != null);
 
     const ambiguous_language = try alloc.dupe(u8, "");
     defer alloc.free(ambiguous_language);
@@ -3195,8 +3195,8 @@ test "renderCodeBlockForTranscript contains CJK fallback color in ruled and unbo
             if (cell.codepoint == 'z') try std.testing.expect(cell.style.fg.eql(.default));
         }
     }
-    try std.testing.expect(ruled_wide_rune != null);
-    try std.testing.expect(ruled_wide_rune.?.style.fg.eql(.{ .indexed = 245 }));
+    try std.testing.expect(boxed_fallback != null);
+    try std.testing.expect(boxed_fallback.?.style.fg.eql(.{ .indexed = 241 }));
 
     const unboxed = try renderCodeBlockForTranscript(alloc, block, 1);
     defer alloc.free(unboxed);
@@ -3213,7 +3213,7 @@ test "renderCodeBlockForTranscript contains CJK fallback color in ruled and unbo
         if (cell.codepoint == 'z') try std.testing.expect(cell.style.fg.eql(.default));
     }
     try std.testing.expect(unboxed_fallback != null);
-    try std.testing.expect(unboxed_fallback.?.style.fg.eql(.{ .indexed = 245 }));
+    try std.testing.expect(unboxed_fallback.?.style.fg.eql(.{ .indexed = 241 }));
 }
 
 fn appendUserTestEntry(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator, id: u32, text: []const u8) !void {

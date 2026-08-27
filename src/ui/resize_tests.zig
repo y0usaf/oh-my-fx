@@ -2055,11 +2055,13 @@ test "semantic code block colors source and keeps current footer rail styled thr
     var code_row = try findRowContaining(&h, "const hook");
     var code_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), code_cell.codepoint);
-    try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 252 }));
+    try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 214 }));
+    const code_border = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeBorder;
+    try std.testing.expect(code_border.style.fg.eql(.default));
     var python_row = try findRowContaining(&h, "def ready");
     var python_cell = h.vt.cellAt(python_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'd'), python_cell.codepoint);
-    try std.testing.expect(python_cell.style.fg.eql(.{ .indexed = 252 }));
+    try std.testing.expect(python_cell.style.fg.eql(.{ .indexed = 214 }));
     const initial_footer = try findFirstDividerRowAfter(&h, code_row);
     const initial_footer_cell = h.vt.cellAt(initial_footer, 1) orelse return error.TestMissingFooterCell;
     try std.testing.expectEqual(@as(u21, '┃'), initial_footer_cell.codepoint);
@@ -2073,11 +2075,13 @@ test "semantic code block colors source and keeps current footer rail styled thr
     code_row = try findRowContaining(&h, "const hook");
     code_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), code_cell.codepoint);
-    try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 252 }));
+    try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 214 }));
+    const resized_border = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeBorder;
+    try std.testing.expect(resized_border.style.fg.eql(.default));
     python_row = try findRowContaining(&h, "def ready");
     python_cell = h.vt.cellAt(python_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'd'), python_cell.codepoint);
-    try std.testing.expect(python_cell.style.fg.eql(.{ .indexed = 252 }));
+    try std.testing.expect(python_cell.style.fg.eql(.{ .indexed = 214 }));
     const resized_footer = try findFirstDividerRowAfter(&h, code_row);
     const resized_footer_cell = h.vt.cellAt(resized_footer, 1) orelse return error.TestMissingFooterCell;
     try std.testing.expectEqual(@as(u21, '┃'), resized_footer_cell.codepoint);
@@ -2104,13 +2108,13 @@ test "semantic code block keeps readable light theme colors through resize" {
     var code_row = try findRowContaining(&h, "const value");
     var keyword_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
-    try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
+    try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 130 }));
 
     try h.driveResize(20, 40, 4, true);
     code_row = try findRowContaining(&h, "const value");
     keyword_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
-    try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
+    try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 130 }));
 }
 
 test "semantic code block keeps solid rules while source reflows" {
@@ -4045,7 +4049,7 @@ test "welcome logo stays pinned while middle transcript rows overflow" {
     try h.flush();
 
     try expectGridContains(&h, "Run /help for commands");
-    try expectGridContains(&h, "𝒇x v");
+    try expectGridContains(&h, "oh-my-𝒇x v");
     try expectGridNotContains(&h, "content line 0");
     try expectGridContains(&h, "content line 44");
 }
@@ -4074,7 +4078,7 @@ test "welcome logo stays pinned during footer-reserved overflow" {
 
     try std.testing.expect(h.shell.last_visible_transcript_split_active);
     try std.testing.expect(h.shell.last_visible_transcript_split_suffix_start_line > h.shell.last_visible_transcript_split_prefix_lines);
-    try expectGridContains(&h, "𝒇x v");
+    try expectGridContains(&h, "oh-my-𝒇x v");
     try expectGridContains(&h, "Run /help for commands");
     try expectGridNotContains(&h, "content line 0");
     try expectGridContains(&h, "content line 44");
@@ -4726,7 +4730,7 @@ test "entry-bound shimmer resolves inside pinned welcome tail selection" {
     try h.flush();
 
     const status_row = try findRowContaining(&h, "tail status line");
-    try expectGridContains(&h, "𝒇x v");
+    try expectGridContains(&h, "oh-my-𝒇x v");
 
     var ctx = defaultFooterContext(&input);
     setToolActivity(&ctx, status_id, "Reading pinned tail");

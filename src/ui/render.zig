@@ -54,6 +54,22 @@ pub var approval_button_inactive_style: []const u8 = "\x1b[48;5;239m\x1b[38;5;25
 pub var selected_completion_style: []const u8 = "\x1b[1;38;5;255m";
 // Statusbar permissions "auto": a step brighter than the statusline gray.
 pub var permission_auto_style: []const u8 = "\x1b[38;5;252m";
+// Startup wordmark colors, taken from the oh-my-fx logomark (omfx.svg):
+// `oh-my-𝒇x` with o tangerine, h amber, m green, y blue, the hyphens dim,
+// and 𝒇x the bright neutral foreground. Truecolor when the terminal
+// supports it, 256-color fallback otherwise.
+const wordmark_o_truecolor = "\x1b[38;2;228;87;46m";
+const wordmark_h_truecolor = "\x1b[38;2;243;167;18m";
+const wordmark_m_truecolor = "\x1b[38;2;87;167;115m";
+const wordmark_y_truecolor = "\x1b[38;2;61;125;216m";
+const wordmark_o_fallback = "\x1b[38;5;166m";
+const wordmark_h_fallback = "\x1b[38;5;214m";
+const wordmark_m_fallback = "\x1b[38;5;71m";
+const wordmark_y_fallback = "\x1b[38;5;68m";
+pub var wordmark_o_style: []const u8 = wordmark_o_fallback;
+pub var wordmark_h_style: []const u8 = wordmark_h_fallback;
+pub var wordmark_m_style: []const u8 = wordmark_m_fallback;
+pub var wordmark_y_style: []const u8 = wordmark_y_fallback;
 var active_terminal_background: ?TerminalRgb = null;
 
 var truecolor_enabled: bool = true;
@@ -112,6 +128,19 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
     } else {
         diff_added_marker_style = diff_added_marker_fallback;
         diff_removed_marker_style = diff_removed_marker_fallback;
+    }
+
+    // The wordmark letters hold the same brand colors on both themes.
+    if (truecolor_enabled) {
+        wordmark_o_style = wordmark_o_truecolor;
+        wordmark_h_style = wordmark_h_truecolor;
+        wordmark_m_style = wordmark_m_truecolor;
+        wordmark_y_style = wordmark_y_truecolor;
+    } else {
+        wordmark_o_style = wordmark_o_fallback;
+        wordmark_h_style = wordmark_h_fallback;
+        wordmark_m_style = wordmark_m_fallback;
+        wordmark_y_style = wordmark_y_fallback;
     }
 
     user_message_card.setStyle(light, terminal_bg);
@@ -199,8 +228,17 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
     );
     return std.fmt.allocPrint(
         alloc,
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
-        .{ subtitle_style, reset_style, dim_style, build_label },
+        "{s}o{s}{s}h{s}{s}-{s}{s}m{s}{s}y{s}{s}-{s}{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        .{
+            wordmark_o_style, reset_style,
+            wordmark_h_style, reset_style,
+            dim_style,        reset_style,
+            wordmark_m_style, reset_style,
+            wordmark_y_style, reset_style,
+            dim_style,        reset_style,
+            hint_style,       reset_style,
+            dim_style,        build_label,
+        },
     );
 }
 
@@ -877,16 +915,35 @@ test "initTheme selects the light inline code foreground" {
     try std.testing.expectEqualStrings("run \x1b[38;5;247mzig build\x1b[39m now\n", out.items);
 }
 
-test "welcomeMessage shows version and help hint" {
+test "welcomeMessage shows the wordmark, version, and help hint" {
+    initTheme(false, null);
     const message = try welcomeMessage(std.testing.allocator);
     defer std.testing.allocator.free(message);
 
-    try std.testing.expect(std.mem.find(u8, message, "𝒇x") != null);
+    // Each wordmark letter carries its own color run, so the plain string is
+    // never contiguous on the wire; assert the styled letters instead. Each
+    // needle needs its own buffer: bufPrint slices alias the written buffer.
+    var o_needle: [64]u8 = undefined;
+    var h_needle: [64]u8 = undefined;
+    var m_needle: [64]u8 = undefined;
+    var y_needle: [64]u8 = undefined;
+    var f_needle: [64]u8 = undefined;
+    const needles = [_][]const u8{
+        std.fmt.bufPrint(&o_needle, "{s}o", .{wordmark_o_style}) catch unreachable,
+        std.fmt.bufPrint(&h_needle, "{s}h", .{wordmark_h_style}) catch unreachable,
+        std.fmt.bufPrint(&m_needle, "{s}m", .{wordmark_m_style}) catch unreachable,
+        std.fmt.bufPrint(&y_needle, "{s}y", .{wordmark_y_style}) catch unreachable,
+        std.fmt.bufPrint(&f_needle, "{s}𝒇x", .{hint_style}) catch unreachable,
+    };
+    for (needles) |needle| {
+        try std.testing.expect(std.mem.find(u8, message, needle) != null);
+    }
     try std.testing.expect(std.mem.find(u8, message, main.version) != null);
     try std.testing.expect(std.mem.find(u8, message, "/help") != null);
 }
 
-test "welcomeMessage keeps only the app name bright" {
+test "welcomeMessage paints oh-my-𝒇x with the brand wordmark colors" {
+    setTruecolorSupport(true);
     initTheme(false, null);
     const message = try welcomeMessage(std.testing.allocator);
     defer std.testing.allocator.free(message);
@@ -900,8 +957,17 @@ test "welcomeMessage keeps only the app name bright" {
     );
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
-        .{ subtitle_style, reset_style, dim_style, build_label },
+        "{s}o{s}{s}h{s}{s}-{s}{s}m{s}{s}y{s}{s}-{s}{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        .{
+            wordmark_o_truecolor, reset_style,
+            wordmark_h_truecolor, reset_style,
+            dim_style,            reset_style,
+            wordmark_m_truecolor, reset_style,
+            wordmark_y_truecolor, reset_style,
+            dim_style,            reset_style,
+            hint_style,           reset_style,
+            dim_style,            build_label,
+        },
     );
     defer std.testing.allocator.free(expected);
 
