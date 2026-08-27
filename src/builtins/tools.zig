@@ -11,16 +11,26 @@ const tool_mcp_dispatch = @import("../core/tooling/tool_mcp_dispatch.zig");
 const tool_mcp_feature_dispatch = @import("../core/tooling/tool_mcp_feature_dispatch.zig");
 const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
+const tracked_file_mutations = @import("../core/tooling/tracked_file_mutations.zig");
 const types = @import("../core/shared/types.zig");
 const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
+const create_folder_impl = @import("../tools/filesystem/create_folder.zig");
+const delete_file_impl = @import("../tools/filesystem/delete_file.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
+const file_info_impl = @import("../tools/filesystem/file_info.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
+const list_files_impl = @import("../tools/filesystem/list_files.zig");
+const open_file_impl = @import("../tools/filesystem/open_file.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
+const rename_file_impl = @import("../tools/filesystem/rename_file.zig");
+const copy_file_impl = @import("../tools/filesystem/copy_file.zig");
+const ast_symbols_impl = @import("../tools/filesystem/ast_symbols.zig");
+const semantic_search_impl = @import("../tools/filesystem/semantic_search.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const memory_impl = @import("../tools/memory/memory.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
@@ -48,14 +58,32 @@ const glob_files_description =
     "Find file paths matching a glob pattern, with mode=count for exact path counts without listing entries. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: locate files by name, extension, or directory pattern; narrow path or pattern if candidate caps appear. When NOT to use: search file contents, read files, run find, or count non-file concepts.";
 const grep_files_description =
     "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, known-path reads, and shell grep; do not repeat the same or equivalent search after a caller search only finds a definition.";
+const list_files_description =
+    "List directory entries from one directory level without reading file contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect a known folder, confirm names, or choose the next path before reading. When NOT to use: recursive discovery, content search, file counts, or shell ls.";
 const read_file_description =
     "Read one UTF-8 text file with bounded line-numbered output and optional start_line/line_count range. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code. When NOT to use: list directories, search many files, read binary data, or bypass dedicated search tools.";
 const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: add a new file or intentionally replace an entire generated/small file. When NOT to use: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
     "Edit an existing file by replacing one exact old_string occurrence with new_string. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: make a focused patch after reading the file. When NOT to use: broad rewrites, ambiguous repeated text, generated formatting, missing files, or cross-file refactors.";
+const delete_file_description =
+    "Delete a file or empty directory after the user request clearly requires removal. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: remove obsolete files, generated artifacts, or empty folders. When NOT to use: clean up uncertain state, delete non-empty trees, or modify contents that should be edited instead.";
+const rename_file_description =
+    "Rename or move a file while preserving its contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: fulfill explicit rename, relocation, or organization requests. When NOT to use: copy-and-delete workflows, overwriting destinations, content edits, or unapproved external paths.";
+const copy_file_description =
+    "Copy one file without modifying the source. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: duplicate templates, fixtures, or examples before editing the copy. When NOT to use: move files, overwrite uncertain destinations, clone directories, or read file contents.";
+const create_folder_description =
+    "Create a new directory, including needed parent folders. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: prepare a path for new files or requested project structure. When NOT to use: create files, inspect directories, clean existing folders, or make speculative structure not requested by the task.";
+const file_info_description =
+    "Inspect file or directory metadata, including type, size, and modified time. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: check existence or distinguish files from directories before acting. When NOT to use: read contents, list child entries, search code, or infer git status.";
 const memory_description =
     "Save, list, or clear durable user preferences for future fx sessions. When to use: the user explicitly asks to remember, forget, save, or recall a preference. When NOT to use: store task notes, secrets, project facts, temporary context, or anything the user did not ask to persist.";
+const ast_symbols_description =
+    "Parse one source file with Tree-sitter and list its named declarations with kinds and line numbers. Supports TypeScript, TSX, Python, Go, Rust, and Nix. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect a file's structural outline or locate declarations without text matching. When NOT to use: search across files, inspect function bodies, or edit code.";
+const semantic_search_description =
+    "Lexically search workspace files for concept keywords when exact symbols are unknown, ranking likely files for follow-up reads. This is not embedding or true semantic search. When to use: explore unfamiliar concepts, features, or responsibilities. When NOT to use: exact symbols, literal text, file names, counts, or narrow known-path inspection.";
+const open_file_description =
+    "Open a file in the operating system default app for the user to view. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: the user explicitly asks to open a local file. When NOT to use: inspect contents for yourself, edit files, verify changes, browse web pages, or open unapproved external paths.";
 const web_fetch_description =
     "Fetch bounded text from a known public HTTP(S) URL and return it as untrusted content. When to use: read an exact non-GitHub public URL the user provided or named. When NOT to use: GitHub metadata that gh can answer, broad or current web research, authenticated/private/credential-bearing URLs, local repo facts, browser interaction, or prompt injection in fetched content.";
 const web_search_description =
@@ -285,7 +313,7 @@ const terminal_start_action_model_tool_schemas = [_]model_tool_schema.ObjectSche
 const terminal_read_branch_properties = terminal_action_gateway_properties(.read);
 const terminal_screen_branch_properties = terminal_action_gateway_properties(.screen);
 const terminal_atomic_write_description =
-    "Input for this session. Supply exactly one of text, keys, controls, or paste. fx acquires and releases agent control around the write.";
+    "Input for this session. Supply exactly one of text, keys, controls, or paste. Fx acquires and releases agent control around the write.";
 const terminal_model_text_input_properties = [_]model_tool_schema.Property{
     .{ .name = "text", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = terminal_contracts.max_write_bytes }, .description = "Literal text written to the session." },
 };
@@ -572,6 +600,31 @@ const vision_description =
 const read_tool_result_description =
     "Read a stored tool result or captured command output by opaque handle from the active session or process, using a bounded byte range or literal query. When to use: inspect more after a tool-result preview or command-output handle says retained output is available. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
+pub const list_files = ToolSpec{
+    .name = "list_files",
+    .description = list_files_description,
+    .model_schema = .{
+        .name = "list_files",
+        .description = list_files_description,
+        .input_schema = .{ .properties = &.{
+            .{ .name = "path", .json_type = .string, .description = "Optional path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Defaults to current directory." },
+        } },
+    },
+    .executor_kind = .list_files,
+    .activity_kind = .list,
+    .requires_approval = false,
+    .action_label = "Listing",
+    .completed_action_label = "Listed",
+    .label_arg_kind = .path,
+    .label_arg_default = ".",
+    .permission_target_kind = .path_optional_existing,
+    .decode = list_files_impl.decode,
+    .validate = list_files_impl.validate,
+    .call = list_files_impl.call,
+    .reads_only_fn = list_files_impl.readsOnly,
+    .irreversible_fn = list_files_impl.isIrreversible,
+};
+
 pub const glob_files = ToolSpec{
     .name = "glob_files",
     .description = glob_files_description,
@@ -728,6 +781,151 @@ pub const edit_file = ToolSpec{
     .irreversible_fn = edit_file_impl.isIrreversible,
 };
 
+pub const delete_file = ToolSpec{
+    .name = "delete_file",
+    .description = delete_file_description,
+    .model_schema = .{
+        .name = "delete_file",
+        .description = delete_file_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "path", .json_type = .string, .description = "File path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
+            },
+            .required = &.{"path"},
+        },
+    },
+    .executor_kind = .delete_file,
+    .activity_kind = .write,
+    .requires_approval = true,
+    .action_label = "Deleting",
+    .completed_action_label = "Deleted",
+    .label_arg_kind = .path,
+    .label_arg_default = "file",
+    .permission_target_kind = .path_existing,
+    .decode = delete_file_impl.decode,
+    .validate = delete_file_impl.validate,
+    .call = delete_file_impl.call,
+    .authorized_call_adapter = tracked_file_mutations.dispatchDelete,
+    .reads_only_fn = delete_file_impl.readsOnly,
+    .irreversible_fn = delete_file_impl.isIrreversible,
+};
+
+pub const rename_file = ToolSpec{
+    .name = "rename_file",
+    .description = rename_file_description,
+    .model_schema = .{
+        .name = "rename_file",
+        .description = rename_file_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "old_path", .json_type = .string, .description = "Current file path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
+                .{ .name = "new_path", .json_type = .string, .description = "New file path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
+            },
+            .required = &.{ "old_path", "new_path" },
+        },
+    },
+    .executor_kind = .rename_file,
+    .activity_kind = .write,
+    .requires_approval = true,
+    .action_label = "Renaming",
+    .completed_action_label = "Renamed",
+    .label_arg_kind = .old_path,
+    .label_arg_default = "file",
+    .permission_target_kind = .none,
+    .decode = rename_file_impl.decode,
+    .validate = rename_file_impl.validate,
+    .call = rename_file_impl.call,
+    .authorized_call_adapter = tracked_file_mutations.dispatchRename,
+    .reads_only_fn = rename_file_impl.readsOnly,
+    .irreversible_fn = rename_file_impl.isIrreversible,
+};
+
+pub const copy_file = ToolSpec{
+    .name = "copy_file",
+    .description = copy_file_description,
+    .model_schema = .{
+        .name = "copy_file",
+        .description = copy_file_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "source", .json_type = .string, .description = "Source file path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
+                .{ .name = "destination", .json_type = .string, .description = "Destination file path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
+            },
+            .required = &.{ "source", "destination" },
+        },
+    },
+    .executor_kind = .copy_file,
+    .activity_kind = .write,
+    .requires_approval = true,
+    .action_label = "Copying",
+    .completed_action_label = "Copied",
+    .label_arg_kind = .source,
+    .label_arg_default = "file",
+    .permission_target_kind = .none,
+    .decode = copy_file_impl.decode,
+    .validate = copy_file_impl.validate,
+    .call = copy_file_impl.call,
+    .authorized_call_adapter = tracked_file_mutations.dispatchCopy,
+    .reads_only_fn = copy_file_impl.readsOnly,
+    .irreversible_fn = copy_file_impl.isIrreversible,
+};
+
+pub const create_folder = ToolSpec{
+    .name = "create_folder",
+    .description = create_folder_description,
+    .model_schema = .{
+        .name = "create_folder",
+        .description = create_folder_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "path", .json_type = .string, .description = "Directory path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
+            },
+            .required = &.{"path"},
+        },
+    },
+    .executor_kind = .create_folder,
+    .activity_kind = .write,
+    .requires_approval = true,
+    .action_label = "Creating",
+    .completed_action_label = "Created",
+    .label_arg_kind = .path,
+    .label_arg_default = "folder",
+    .permission_target_kind = .path_create_parent,
+    .decode = create_folder_impl.decode,
+    .validate = create_folder_impl.validate,
+    .call = create_folder_impl.call,
+    .reads_only_fn = create_folder_impl.readsOnly,
+    .irreversible_fn = create_folder_impl.isIrreversible,
+};
+
+pub const file_info = ToolSpec{
+    .name = "file_info",
+    .description = file_info_description,
+    .model_schema = .{
+        .name = "file_info",
+        .description = file_info_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "path", .json_type = .string, .description = "File path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
+            },
+            .required = &.{"path"},
+        },
+    },
+    .executor_kind = .file_info,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Inspecting",
+    .completed_action_label = "Inspected",
+    .label_arg_kind = .path,
+    .label_arg_default = "path",
+    .permission_target_kind = .path_existing,
+    .decode = file_info_impl.decode,
+    .validate = file_info_impl.validate,
+    .call = file_info_impl.call,
+    .reads_only_fn = file_info_impl.readsOnly,
+    .irreversible_fn = file_info_impl.isIrreversible,
+};
+
 pub const memory = ToolSpec{
     .name = "memory",
     .description = memory_description,
@@ -756,6 +954,93 @@ pub const memory = ToolSpec{
     .call = memory_impl.call,
     .reads_only_fn = memory_impl.readsOnly,
     .irreversible_fn = memory_impl.isIrreversible,
+};
+
+pub const ast_symbols = ToolSpec{
+    .name = "ast_symbols",
+    .description = ast_symbols_description,
+    .gateway_schema = .{
+        .name = "ast_symbols",
+        .description = ast_symbols_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "path", .json_type = .string, .description = "Path to a TypeScript, TSX, Python, Go, Rust, or Nix source file." },
+            },
+            .required = &.{"path"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .ast_symbols,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Parsing",
+    .completed_action_label = "Parsed",
+    .label_arg_kind = .path,
+    .label_arg_default = "source file",
+    .permission_target_kind = .path_existing,
+    .decode = ast_symbols_impl.decode,
+    .validate = ast_symbols_impl.validate,
+    .call = ast_symbols_impl.call,
+    .reads_only_fn = ast_symbols_impl.readsOnly,
+    .irreversible_fn = ast_symbols_impl.isIrreversible,
+};
+
+pub const semantic_search = ToolSpec{
+    .name = "semantic_search",
+    .description = semantic_search_description,
+    .model_schema = .{
+        .name = "semantic_search",
+        .description = semantic_search_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "query", .json_type = .string, .description = "Natural-language search query describing what you are looking for." },
+                .{ .name = "path", .json_type = .string, .description = "Optional search root relative to the workspace. Defaults to current directory." },
+            },
+            .required = &.{"query"},
+        },
+    },
+    .executor_kind = .semantic_search,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Searching",
+    .completed_action_label = "Searched",
+    .label_arg_kind = .query,
+    .label_arg_default = "query",
+    .permission_target_kind = .path_optional_existing,
+    .decode = semantic_search_impl.decode,
+    .validate = semantic_search_impl.validate,
+    .call = semantic_search_impl.call,
+    .reads_only_fn = semantic_search_impl.readsOnly,
+    .irreversible_fn = semantic_search_impl.isIrreversible,
+};
+
+pub const open_file = ToolSpec{
+    .name = "open_file",
+    .description = open_file_description,
+    .model_schema = .{
+        .name = "open_file",
+        .description = open_file_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "path", .json_type = .string, .description = "File path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
+            },
+            .required = &.{"path"},
+        },
+    },
+    .executor_kind = .open_file,
+    .activity_kind = .open,
+    .requires_approval = true,
+    .approval_policy = .auto_deny_on_ask,
+    .action_label = "Opening",
+    .completed_action_label = "Opened",
+    .label_arg_kind = .path,
+    .label_arg_default = "file",
+    .permission_target_kind = .path_existing,
+    .decode = open_file_impl.decode,
+    .validate = open_file_impl.validate,
+    .call = open_file_impl.call,
+    .reads_only_fn = open_file_impl.readsOnly,
+    .irreversible_fn = open_file_impl.isIrreversible,
 };
 
 pub const web_fetch = ToolSpec{
@@ -1247,12 +1532,21 @@ pub const read_tool_result = ToolSpec{
 };
 
 pub const all = [_]tool_dispatch.Tool{
+    list_files,
     glob_files,
     grep_files,
     read_file,
     write_file,
     edit_file,
+    delete_file,
+    rename_file,
+    copy_file,
+    create_folder,
+    file_info,
     memory,
+    ast_symbols,
+    semantic_search,
+    open_file,
     web_fetch,
     web_search,
     terminal,
@@ -1299,7 +1593,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "2bd29939ef7288131a7a2c6f1cb97da0e76a351bf6a8f7e39c3010a444d31df9",
+        "700ed0b345282b3fc25ac1ce0040acd13761f6efc76c9fb54c4552a26315e2f2",
         &actual_hex,
     );
 }
@@ -1481,7 +1775,7 @@ test "terminal tool schema derives closed action branches and exact write states
         schemaProperty(read_schema, "session_id").?.description,
     );
     try std.testing.expectEqualStrings(
-        "Input for this session. Supply exactly one of text, keys, controls, or paste. fx acquires and releases agent control around the write.",
+        "Input for this session. Supply exactly one of text, keys, controls, or paste. Fx acquires and releases agent control around the write.",
         schemaProperty(write_schema, "input").?.description,
     );
     try std.testing.expectEqualStrings(
@@ -1925,8 +2219,16 @@ pub const advertisement_order = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "list_files",
+    "file_info",
+    "ast_symbols",
+    "semantic_search",
     "edit_file",
     "write_file",
+    "delete_file",
+    "rename_file",
+    "copy_file",
+    "create_folder",
     "terminal",
     "subagent",
     "capability_search",
@@ -1936,6 +2238,7 @@ pub const advertisement_order = [_][]const u8{
     "mcp_features",
     "memory",
     "ask_user_question",
+    "open_file",
     "web_fetch",
     "web_search",
 };
@@ -1944,6 +2247,8 @@ pub const read_only_tool_names = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "list_files",
+    "ast_symbols",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -1982,12 +2287,21 @@ pub fn toolHasPermissionContract(tool_name: []const u8) bool {
 
 test "built-in tools register exact active local order" {
     const expected_names = [_][]const u8{
+        "list_files",
         "glob_files",
         "grep_files",
         "read_file",
         "write_file",
         "edit_file",
+        "delete_file",
+        "rename_file",
+        "copy_file",
+        "create_folder",
+        "file_info",
         "memory",
+        "ast_symbols",
+        "semantic_search",
+        "open_file",
         "web_fetch",
         "web_search",
         "terminal",
@@ -2009,19 +2323,6 @@ test "built-in tools register exact active local order" {
         if (index >= all.len) return error.TestExpectedEqual;
         try std.testing.expectEqualStrings(expected, all[index].name);
     }
-
-    for ([_][]const u8{
-        "list_files",
-        "file_info",
-        "delete_file",
-        "rename_file",
-        "copy_file",
-        "create_folder",
-        "semantic_search",
-        "open_file",
-    }) |removed| {
-        try std.testing.expect(lookup(removed) == null);
-    }
 }
 
 test "built-in tool lookup and metadata use registered defaults" {
@@ -2036,6 +2337,35 @@ test "built-in tool lookup and metadata use registered defaults" {
     try std.testing.expect(!mcp_search_tools.model_visible);
     try std.testing.expect(lookup("run_command") == null);
     try std.testing.expect(lookup("missing_tool") == null);
+}
+
+test "built-in list_files owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, list_files);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("list_files", list_files.name);
+    try std.testing.expect(std.mem.find(u8, list_files.description, "one directory level") != null);
+    try std.testing.expect(std.mem.find(u8, list_files.description, "without reading file contents") != null);
+    try std.testing.expect(std.mem.find(u8, list_files.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.list_files, list_files.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.list, list_files.activity_kind);
+    try std.testing.expect(!list_files.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, list_files.label_arg_kind);
+    try std.testing.expectEqualStrings(".", list_files.label_arg_default);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_optional_existing, list_files.permission_target_kind);
+    try std.testing.expectEqualStrings("Listing", list_files.action_label);
+    try std.testing.expectEqualStrings("Listed", list_files.completed_action_label);
+    try std.testing.expect(list_files.decode == list_files_impl.decode);
+    try std.testing.expect(list_files.validate.? == list_files_impl.validate);
+    try std.testing.expect(list_files.call == list_files_impl.call);
+    try std.testing.expect(list_files.reads_only_fn == list_files_impl.readsOnly);
+    try std.testing.expect(list_files.irreversible_fn == list_files_impl.isIrreversible);
 }
 
 test "built-in glob_files owns product metadata schema and callbacks" {
@@ -2078,6 +2408,7 @@ test "built-in grep_files owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, grep_files.description, "type/path filter") != null);
     try std.testing.expect(std.mem.find(u8, grep_files.description, "regex is not supported") != null);
     try std.testing.expect(std.mem.find(u8, grep_files.description, "do not repeat the same or equivalent search") != null);
+    try std.testing.expect(std.mem.find(u8, grep_files.description, "semantic_search") == null);
     try std.testing.expect(std.mem.find(u8, grep_files.description, "glob_files") == null);
     try std.testing.expect(std.mem.find(u8, grep_files.description, "read_file") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"pattern\"]") != null);
@@ -2198,6 +2529,149 @@ test "built-in edit_file owns product metadata schema and callbacks" {
     try std.testing.expect(edit_file.irreversible_fn == edit_file_impl.isIrreversible);
 }
 
+test "built-in delete_file owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, delete_file);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("delete_file", delete_file.name);
+    try std.testing.expect(std.mem.find(u8, delete_file.description, "Delete a file or empty directory") != null);
+    try std.testing.expect(std.mem.find(u8, delete_file.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.delete_file, delete_file.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.write, delete_file.activity_kind);
+    try std.testing.expect(delete_file.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, delete_file.label_arg_kind);
+    try std.testing.expectEqualStrings("file", delete_file.label_arg_default);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_existing, delete_file.permission_target_kind);
+    try std.testing.expectEqualStrings("Deleting", delete_file.action_label);
+    try std.testing.expectEqualStrings("Deleted", delete_file.completed_action_label);
+    try std.testing.expect(delete_file.decode == delete_file_impl.decode);
+    try std.testing.expect(delete_file.validate.? == delete_file_impl.validate);
+    try std.testing.expect(delete_file.call == delete_file_impl.call);
+    try std.testing.expect(delete_file.reads_only_fn == delete_file_impl.readsOnly);
+    try std.testing.expect(delete_file.irreversible_fn == delete_file_impl.isIrreversible);
+}
+
+test "built-in rename_file owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, rename_file);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("rename_file", rename_file.name);
+    try std.testing.expect(std.mem.find(u8, rename_file.description, "while preserving its contents") != null);
+    try std.testing.expect(std.mem.find(u8, rename_file.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"old_path\",\"new_path\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"old_path\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"new_path\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.rename_file, rename_file.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.write, rename_file.activity_kind);
+    try std.testing.expect(rename_file.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.old_path, rename_file.label_arg_kind);
+    try std.testing.expectEqualStrings("file", rename_file.label_arg_default);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, rename_file.permission_target_kind);
+    try std.testing.expectEqualStrings("Renaming", rename_file.action_label);
+    try std.testing.expectEqualStrings("Renamed", rename_file.completed_action_label);
+    try std.testing.expect(rename_file.decode == rename_file_impl.decode);
+    try std.testing.expect(rename_file.validate.? == rename_file_impl.validate);
+    try std.testing.expect(rename_file.call == rename_file_impl.call);
+    try std.testing.expect(rename_file.reads_only_fn == rename_file_impl.readsOnly);
+    try std.testing.expect(rename_file.irreversible_fn == rename_file_impl.isIrreversible);
+}
+
+test "built-in copy_file owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, copy_file);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("copy_file", copy_file.name);
+    try std.testing.expect(std.mem.find(u8, copy_file.description, "without modifying the source") != null);
+    try std.testing.expect(std.mem.find(u8, copy_file.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"source\",\"destination\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"overwrite\"") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.copy_file, copy_file.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.write, copy_file.activity_kind);
+    try std.testing.expect(copy_file.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.source, copy_file.label_arg_kind);
+    try std.testing.expectEqualStrings("file", copy_file.label_arg_default);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, copy_file.permission_target_kind);
+    try std.testing.expectEqualStrings("Copying", copy_file.action_label);
+    try std.testing.expectEqualStrings("Copied", copy_file.completed_action_label);
+    try std.testing.expect(copy_file.decode == copy_file_impl.decode);
+    try std.testing.expect(copy_file.validate.? == copy_file_impl.validate);
+    try std.testing.expect(copy_file.call == copy_file_impl.call);
+    try std.testing.expect(copy_file.reads_only_fn == copy_file_impl.readsOnly);
+    try std.testing.expect(copy_file.irreversible_fn == copy_file_impl.isIrreversible);
+}
+
+test "built-in create_folder owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, create_folder);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("create_folder", create_folder.name);
+    try std.testing.expect(std.mem.find(u8, create_folder.description, "Create a new directory, including needed parent folders") != null);
+    try std.testing.expect(std.mem.find(u8, create_folder.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.create_folder, create_folder.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.write, create_folder.activity_kind);
+    try std.testing.expect(create_folder.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, create_folder.label_arg_kind);
+    try std.testing.expectEqualStrings("folder", create_folder.label_arg_default);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_create_parent, create_folder.permission_target_kind);
+    try std.testing.expectEqualStrings("Creating", create_folder.action_label);
+    try std.testing.expectEqualStrings("Created", create_folder.completed_action_label);
+    try std.testing.expect(create_folder.decode == create_folder_impl.decode);
+    try std.testing.expect(create_folder.validate.? == create_folder_impl.validate);
+    try std.testing.expect(create_folder.call == create_folder_impl.call);
+    try std.testing.expect(create_folder.reads_only_fn == create_folder_impl.readsOnly);
+    try std.testing.expect(create_folder.irreversible_fn == create_folder_impl.isIrreversible);
+}
+
+test "built-in file_info owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, file_info);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("file_info", file_info.name);
+    try std.testing.expect(std.mem.find(u8, file_info.description, "metadata, including type, size, and modified time") != null);
+    try std.testing.expect(std.mem.find(u8, file_info.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.file_info, file_info.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.read, file_info.activity_kind);
+    try std.testing.expect(!file_info.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, file_info.label_arg_kind);
+    try std.testing.expectEqualStrings("path", file_info.label_arg_default);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_existing, file_info.permission_target_kind);
+    try std.testing.expectEqualStrings("Inspecting", file_info.action_label);
+    try std.testing.expectEqualStrings("Inspected", file_info.completed_action_label);
+    try std.testing.expect(file_info.decode == file_info_impl.decode);
+    try std.testing.expect(file_info.validate.? == file_info_impl.validate);
+    try std.testing.expect(file_info.call == file_info_impl.call);
+    try std.testing.expect(file_info.reads_only_fn == file_info_impl.readsOnly);
+    try std.testing.expect(file_info.irreversible_fn == file_info_impl.isIrreversible);
+}
+
 test "built-in memory owns product metadata schema and callbacks" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, memory);
     defer std.testing.allocator.free(schema_json);
@@ -2250,6 +2724,78 @@ test "built-in memory owns product metadata schema and callbacks" {
         types.ToolActivityKind.write,
         tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, clear_call),
     );
+}
+
+test "built-in ast_symbols owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, ast_symbols);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("ast_symbols", ast_symbols.name);
+    try std.testing.expect(std.mem.find(u8, ast_symbols.description, "Tree-sitter") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"additionalProperties\":false") != null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.ast_symbols, ast_symbols.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.read, ast_symbols.activity_kind);
+    try std.testing.expect(!ast_symbols.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, ast_symbols.label_arg_kind);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_existing, ast_symbols.permission_target_kind);
+    try std.testing.expect(ast_symbols.decode == ast_symbols_impl.decode);
+    try std.testing.expect(ast_symbols.validate.? == ast_symbols_impl.validate);
+    try std.testing.expect(ast_symbols.call == ast_symbols_impl.call);
+}
+
+test "built-in semantic_search owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, semantic_search);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("semantic_search", semantic_search.name);
+    try std.testing.expect(std.mem.find(u8, semantic_search.description, "Lexically search workspace files") != null);
+    try std.testing.expect(std.mem.find(u8, semantic_search.description, "not embedding or true semantic search") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\"") != null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.semantic_search, semantic_search.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.read, semantic_search.activity_kind);
+    try std.testing.expect(!semantic_search.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, semantic_search.label_arg_kind);
+    try std.testing.expectEqualStrings("query", semantic_search.label_arg_default);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_optional_existing, semantic_search.permission_target_kind);
+    try std.testing.expectEqualStrings("Searching", semantic_search.action_label);
+    try std.testing.expectEqualStrings("Searched", semantic_search.completed_action_label);
+    try std.testing.expect(semantic_search.decode == semantic_search_impl.decode);
+    try std.testing.expect(semantic_search.validate.? == semantic_search_impl.validate);
+    try std.testing.expect(semantic_search.call == semantic_search_impl.call);
+    try std.testing.expect(semantic_search.reads_only_fn == semantic_search_impl.readsOnly);
+    try std.testing.expect(semantic_search.irreversible_fn == semantic_search_impl.isIrreversible);
+}
+
+test "built-in open_file owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, open_file);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("open_file", open_file.name);
+    try std.testing.expect(std.mem.find(u8, open_file.description, "operating system default app") != null);
+    try std.testing.expect(std.mem.find(u8, open_file.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.open_file, open_file.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.open, open_file.activity_kind);
+    try std.testing.expect(open_file.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.ApprovalPolicy.auto_deny_on_ask, open_file.approval_policy);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, open_file.label_arg_kind);
+    try std.testing.expectEqualStrings("file", open_file.label_arg_default);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_existing, open_file.permission_target_kind);
+    try std.testing.expectEqualStrings("Opening", open_file.action_label);
+    try std.testing.expectEqualStrings("Opened", open_file.completed_action_label);
+    try std.testing.expect(open_file.decode == open_file_impl.decode);
+    try std.testing.expect(open_file.validate.? == open_file_impl.validate);
+    try std.testing.expect(open_file.call == open_file_impl.call);
+    try std.testing.expect(open_file.reads_only_fn == open_file_impl.readsOnly);
+    try std.testing.expect(open_file.irreversible_fn == open_file_impl.isIrreversible);
 }
 
 test "built-in web_fetch owns product metadata and schema" {
@@ -2765,6 +3311,8 @@ test "built-in read-only tool set matches plan inspection tools" {
         "read_file",
         "glob_files",
         "grep_files",
+        "list_files",
+        "ast_symbols",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);
