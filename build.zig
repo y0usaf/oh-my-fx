@@ -314,8 +314,6 @@ pub fn build(b: *std.Build) void {
         pgso_ir_step.dependOn(&missing_artifact.step);
     }
 }
-
-
 fn addGenomeModule(
     b: *std.Build,
     comptime name_prefix: []const u8,
@@ -344,6 +342,7 @@ fn addGenomeModule(
         .{ .dir = "go", .scanner = false },
         .{ .dir = "rust", .scanner = true },
         .{ .dir = "nix", .scanner = true },
+        .{ .dir = "zig", .scanner = false },
     };
     inline for (grammars) |g| {
         const lib = b.addLibrary(.{
@@ -359,7 +358,10 @@ fn addGenomeModule(
         if (g.scanner) lib.root_module.addIncludePath(b.path("vendor/grammars/" ++ g.dir));
         lib.root_module.addCSourceFile(.{
             .file = b.path("vendor/grammars/" ++ g.dir ++ "/src/parser.c"),
-            .flags = &(flags ++ .{"-Wno-unused-but-set-variable"}),
+            .flags = if (std.mem.eql(u8, g.dir, "zig"))
+                &(flags ++ .{ "-Wno-unused-but-set-variable", "-Wno-override-init" })
+            else
+                &(flags ++ .{"-Wno-unused-but-set-variable"}),
         });
         if (g.scanner) lib.root_module.addCSourceFile(.{
             .file = b.path("vendor/grammars/" ++ g.dir ++ "/src/scanner.c"),

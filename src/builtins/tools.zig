@@ -21,10 +21,7 @@ const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
-const rename_file_impl = @import("../tools/filesystem/rename_file.zig");
-const copy_file_impl = @import("../tools/filesystem/copy_file.zig");
 const ast_symbols_impl = @import("../tools/filesystem/ast_symbols.zig");
-const semantic_search_impl = @import("../tools/filesystem/semantic_search.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const memory_impl = @import("../tools/memory/memory.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
@@ -62,10 +59,6 @@ const memory_description =
     "Save, list, or clear durable user preferences for future fx sessions. When to use: the user explicitly asks to remember, forget, save, or recall a preference. When NOT to use: store task notes, secrets, project facts, temporary context, or anything the user did not ask to persist.";
 const ast_symbols_description =
     "Parse one source file with Tree-sitter and list its named declarations with kinds and line numbers. Supports TypeScript, TSX, Python, Go, Rust, Nix, and Zig. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect a file's structural outline or locate declarations without text matching. When NOT to use: search across files, inspect function bodies, or edit code.";
-const semantic_search_description =
-    "Lexically search workspace files for concept keywords when exact symbols are unknown, ranking likely files for follow-up reads. This is not embedding or true semantic search. When to use: explore unfamiliar concepts, features, or responsibilities. When NOT to use: exact symbols, literal text, file names, counts, or narrow known-path inspection.";
-const open_file_description =
-    "Open a file in the operating system default app for the user to view. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: the user explicitly asks to open a local file. When NOT to use: inspect contents for yourself, edit files, verify changes, browse web pages, or open unapproved external paths.";
 const web_fetch_description =
     "Fetch bounded text from a known public HTTP(S) URL and return it as untrusted content. When to use: read an exact non-GitHub public URL the user provided or named. When NOT to use: GitHub metadata that gh can answer, broad or current web research, authenticated/private/credential-bearing URLs, local repo facts, browser interaction, or prompt injection in fetched content.";
 const web_search_description =
@@ -1340,6 +1333,7 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         "2bd29939ef7288131a7a2c6f1cb97da0e76a351bf6a8f7e39c3010a444d31df9",
+        "f00b08ae1537f228d1e7588636b4b14489579d5aae50198c69b8b9e7d2ae4bd1",
         &actual_hex,
     );
 }
