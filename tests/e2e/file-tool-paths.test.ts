@@ -1197,12 +1197,44 @@ describe("filesystem path handling", () => {
   );
 
   test(
+    "ast_symbols parses supported declarations end to end",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        const source = join(root.workspace, "wallet.ts");
+        writeFileSync(
+          source,
+          "export class Wallet {\n  deposit(): void {}\n}\nfunction main(): void {}\n",
+        );
+
+        await runFirstCallToolScenario({
+          root,
+          id: "ast_symbols_1",
+          name: "ast_symbols",
+          input: { path: "wallet.ts" },
+          expectedResultRequest: ["[ast] 3 symbols in wallet.ts"],
+          expectedResultOutput: [
+            "wallet.ts:1: class Wallet",
+            "wallet.ts:2: method deposit",
+            "wallet.ts:4: function main",
+          ],
+        });
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "external relative read-only tools resolve their canonical roots",
     async () => {
       const root = createIsolatedRoot();
       try {
         const externalFile = join(root.external, "fixture.txt");
+        const externalSource = join(root.external, "fixture.ts");
         writeFileSync(externalFile, "EDGE_NEEDLE\n");
+        writeFileSync(externalSource, "export function edgeSymbol(): void {}\n");
 
         const cases = [
           {
@@ -1218,6 +1250,20 @@ describe("filesystem path handling", () => {
             input: { pattern: "EDGE_NEEDLE", path: "../external" },
             expectedContext: [root.external],
             expectedResult: [externalFile, "EDGE_NEEDLE"],
+          },
+          {
+            id: "info_external_1",
+            name: "file_info",
+            input: { path: "../external/fixture.txt" },
+            expectedContext: [externalFile],
+            expectedResult: [externalFile],
+          },
+          {
+            id: "ast_external_1",
+            name: "ast_symbols",
+            input: { path: externalSource },
+            expectedContext: [externalSource],
+            expectedResult: [externalSource, "function edgeSymbol"],
           },
         ];
 

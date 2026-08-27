@@ -21,6 +21,10 @@ const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
+const rename_file_impl = @import("../tools/filesystem/rename_file.zig");
+const copy_file_impl = @import("../tools/filesystem/copy_file.zig");
+const ast_symbols_impl = @import("../tools/filesystem/ast_symbols.zig");
+const semantic_search_impl = @import("../tools/filesystem/semantic_search.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const memory_impl = @import("../tools/memory/memory.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
@@ -56,6 +60,12 @@ const edit_file_description =
     "Edit an existing file by replacing one exact old_string occurrence with new_string. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: make a focused patch after reading the file. When NOT to use: broad rewrites, ambiguous repeated text, generated formatting, missing files, or cross-file refactors.";
 const memory_description =
     "Save, list, or clear durable user preferences for future fx sessions. When to use: the user explicitly asks to remember, forget, save, or recall a preference. When NOT to use: store task notes, secrets, project facts, temporary context, or anything the user did not ask to persist.";
+const ast_symbols_description =
+    "Parse one source file with Tree-sitter and list its named declarations with kinds and line numbers. Supports TypeScript, TSX, Python, Go, Rust, and Nix. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect a file's structural outline or locate declarations without text matching. When NOT to use: search across files, inspect function bodies, or edit code.";
+const semantic_search_description =
+    "Lexically search workspace files for concept keywords when exact symbols are unknown, ranking likely files for follow-up reads. This is not embedding or true semantic search. When to use: explore unfamiliar concepts, features, or responsibilities. When NOT to use: exact symbols, literal text, file names, counts, or narrow known-path inspection.";
+const open_file_description =
+    "Open a file in the operating system default app for the user to view. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: the user explicitly asks to open a local file. When NOT to use: inspect contents for yourself, edit files, verify changes, browse web pages, or open unapproved external paths.";
 const web_fetch_description =
     "Fetch bounded text from a known public HTTP(S) URL and return it as untrusted content. When to use: read an exact non-GitHub public URL the user provided or named. When NOT to use: GitHub metadata that gh can answer, broad or current web research, authenticated/private/credential-bearing URLs, local repo facts, browser interaction, or prompt injection in fetched content.";
 const web_search_description =
@@ -758,6 +768,35 @@ pub const memory = ToolSpec{
     .irreversible_fn = memory_impl.isIrreversible,
 };
 
+pub const ast_symbols = ToolSpec{
+    .name = "ast_symbols",
+    .description = ast_symbols_description,
+    .gateway_schema = .{
+        .name = "ast_symbols",
+        .description = ast_symbols_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "path", .json_type = .string, .description = "Path to a TypeScript, TSX, Python, Go, Rust, or Nix source file." },
+            },
+            .required = &.{"path"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .ast_symbols,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Parsing",
+    .completed_action_label = "Parsed",
+    .label_arg_kind = .path,
+    .label_arg_default = "source file",
+    .permission_target_kind = .path_existing,
+    .decode = ast_symbols_impl.decode,
+    .validate = ast_symbols_impl.validate,
+    .call = ast_symbols_impl.call,
+    .reads_only_fn = ast_symbols_impl.readsOnly,
+    .irreversible_fn = ast_symbols_impl.isIrreversible,
+};
+
 pub const web_fetch = ToolSpec{
     .name = "web_fetch",
     .description = web_fetch_description,
@@ -1253,6 +1292,7 @@ pub const all = [_]tool_dispatch.Tool{
     write_file,
     edit_file,
     memory,
+    ast_symbols,
     web_fetch,
     web_search,
     terminal,
@@ -1925,6 +1965,7 @@ pub const advertisement_order = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "ast_symbols",
     "edit_file",
     "write_file",
     "terminal",
@@ -1944,6 +1985,7 @@ pub const read_only_tool_names = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "ast_symbols",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -1988,6 +2030,7 @@ test "built-in tools register exact active local order" {
         "write_file",
         "edit_file",
         "memory",
+        "ast_symbols",
         "web_fetch",
         "web_search",
         "terminal",
@@ -2250,6 +2293,24 @@ test "built-in memory owns product metadata schema and callbacks" {
         types.ToolActivityKind.write,
         tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, clear_call),
     );
+}
+
+test "built-in ast_symbols owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, ast_symbols);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("ast_symbols", ast_symbols.name);
+    try std.testing.expect(std.mem.find(u8, ast_symbols.description, "Tree-sitter") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"additionalProperties\":false") != null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.ast_symbols, ast_symbols.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.read, ast_symbols.activity_kind);
+    try std.testing.expect(!ast_symbols.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, ast_symbols.label_arg_kind);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_existing, ast_symbols.permission_target_kind);
+    try std.testing.expect(ast_symbols.decode == ast_symbols_impl.decode);
+    try std.testing.expect(ast_symbols.validate.? == ast_symbols_impl.validate);
+    try std.testing.expect(ast_symbols.call == ast_symbols_impl.call);
 }
 
 test "built-in web_fetch owns product metadata and schema" {
@@ -2765,6 +2826,7 @@ test "built-in read-only tool set matches plan inspection tools" {
         "read_file",
         "glob_files",
         "grep_files",
+        "ast_symbols",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);

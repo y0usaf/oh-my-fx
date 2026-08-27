@@ -2,6 +2,10 @@ export const CANONICAL_BUILTIN_NAMES = [
   "read_file",
   "glob_files",
   "grep_files",
+  "list_files",
+  "file_info",
+  "ast_symbols",
+  "semantic_search",
   "edit_file",
   "write_file",
   "terminal",
@@ -23,6 +27,8 @@ export const READ_ONLY_SERIALIZED_TOOL_NAMES = [
   "read_file",
   "glob_files",
   "grep_files",
+  "list_files",
+  "ast_symbols",
 ] as const;
 
 export const VERIFY_SERIALIZED_TOOL_NAMES = [
