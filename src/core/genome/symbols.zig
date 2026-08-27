@@ -18,8 +18,9 @@ extern fn tree_sitter_python() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_go() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_rust() callconv(.c) *const c.TSLanguage;
 extern fn tree_sitter_nix() callconv(.c) *const c.TSLanguage;
+extern fn tree_sitter_zig() callconv(.c) *const c.TSLanguage;
 
-pub const Language = enum { typescript, tsx, python, go, rust, nix };
+pub const Language = enum { typescript, tsx, python, go, rust, nix, zig };
 
 pub const SymbolKind = enum {
     function,
@@ -55,6 +56,7 @@ pub fn detectLanguage(path: []const u8) ?Language {
         .{ ".go", .go },
         .{ ".rs", .rust },
         .{ ".nix", .nix },
+        .{ ".zig", .zig },
     });
     return map.get(ext);
 }
@@ -106,6 +108,11 @@ const queries = std.enums.EnumMap(Language, QuerySpec).init(.{
     \\(binding attrpath: (attrpath) @function_name expression: (function_expression))
     \\
     },
+    .zig = .{ .query =
+    \\(function_declaration name: (identifier) @function_name)
+    \\(variable_declaration (identifier) @binding_name)
+    \\
+    },
 });
 
 fn tsLanguage(lang: Language) *const c.TSLanguage {
@@ -116,6 +123,7 @@ fn tsLanguage(lang: Language) *const c.TSLanguage {
         .go => tree_sitter_go(),
         .rust => tree_sitter_rust(),
         .nix => tree_sitter_nix(),
+        .zig => tree_sitter_zig(),
     };
 }
 
@@ -317,6 +325,24 @@ test "extract python and go symbols" {
     try std.testing.expectEqualStrings("Config", go_syms[2].name);
 }
 
+test "extract zig symbols" {
+    const src =
+        \\const Balance = struct { value: u64 };
+        \\const Mode = enum { idle, active };
+        \\const Error = error { failed };
+        \\fn deposit(amount: u64) void {}
+        \\test "deposit works" {}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const syms = try extract(arena.allocator(), .zig, src);
+    try std.testing.expectEqual(@as(usize, 4), syms.len);
+    try std.testing.expectEqualStrings("Balance", syms[0].name);
+    try std.testing.expectEqual(SymbolKind.binding, syms[0].kind);
+    try std.testing.expectEqualStrings("deposit", syms[3].name);
+    try std.testing.expectEqual(SymbolKind.function, syms[3].kind);
+}
+
 test "extract nix symbols" {
     const src =
         \\{
@@ -344,5 +370,6 @@ test "detectLanguage" {
     try std.testing.expectEqual(Language.rust, detectLanguage("a/b/c.rs").?);
     try std.testing.expectEqual(Language.tsx, detectLanguage("App.tsx").?);
     try std.testing.expectEqual(Language.nix, detectLanguage("flake.nix").?);
+    try std.testing.expectEqual(Language.zig, detectLanguage("main.zig").?);
     try std.testing.expect(detectLanguage("makefile") == null);
 }
