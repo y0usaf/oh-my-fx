@@ -171,6 +171,8 @@ pub const TurnSummaryAccumulator = struct {
         const now_ms = io_mod.milliTimestamp();
         const elapsed = if (now_ms > self.turn_started_at_ms) now_ms - self.turn_started_at_ms else 0;
         return .{
+            .started_at_ms = self.turn_started_at_ms,
+            .completed_at_ms = now_ms,
             .thinking_duration_ms = self.thinking_duration_ms,
             .turn_duration_ms = @intCast(elapsed),
             .token_progress = self.tokenProgress(),

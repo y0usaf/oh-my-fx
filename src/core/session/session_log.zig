@@ -984,6 +984,23 @@ pub const LoadedWritableSession = struct {
     }
 };
 
+/// Preserves each call's exact error set while sharing one dynamic return ABI.
+pub inline fn failLoadedWritableSession(err: anytype) @TypeOf(err)!LoadedWritableSession {
+    return @errorCast(failLoadedWritableSessionDynamic(err));
+}
+
+noinline fn failLoadedWritableSessionDynamic(err: anyerror) anyerror!LoadedWritableSession {
+    return err;
+}
+
+test "large session errors preserve their exact error type and identity" {
+    const result = failLoadedWritableSession(error.NoSavedSessions);
+    try std.testing.expect(
+        @TypeOf(result) == error{NoSavedSessions}!LoadedWritableSession,
+    );
+    try std.testing.expectError(error.NoSavedSessions, result);
+}
+
 pub const Root = struct {
     sessions: ?io_mod.VerifiedDir,
     display_root: []u8,
@@ -1123,21 +1140,24 @@ pub const Root = struct {
         var lifecycle_value = lifecycle;
         errdefer if (lifecycle_value) |*value| value.deinit(alloc);
         if (self.mode != .writable or self.sessions == null) {
-            return error.SessionStoreUnavailable;
+            return failLoadedWritableSession(error.SessionStoreUnavailable);
         }
         try session_codec.validateState(initial_state);
         const sessions = &self.sessions.?;
-        if (try entryExists(sessions, initial_state.id)) return error.SessionAlreadyExists;
+        if (try entryExists(sessions, initial_state.id)) {
+            return failLoadedWritableSession(error.SessionAlreadyExists);
+        }
 
         sessions.dir.createDir(
             io_mod.getIo(),
             initial_state.id,
             private_dir_permissions,
         ) catch |err| switch (err) {
-            error.PathAlreadyExists => return error.SessionAlreadyExists,
-            else => return error.SessionStartFailed,
+            error.PathAlreadyExists => return failLoadedWritableSession(error.SessionAlreadyExists),
+            else => return failLoadedWritableSession(error.SessionStartFailed),
         };
-        io_mod.syncVerifiedDir(sessions.dir) catch return error.SessionStartFailed;
+        io_mod.syncVerifiedDir(sessions.dir) catch
+            return failLoadedWritableSession(error.SessionStartFailed);
 
         var session_dir = try openSessionDir(sessions, initial_state.id, .writable);
         options.test_controls.lock(.session);
@@ -2337,7 +2357,9 @@ fn openWritableSession(
     var event_log = try openManagedFile(&writable.dir, events_file, .read_write);
     defer event_log.close(io_mod.getIo());
     const length = try event_log.length(io_mod.getIo());
-    if (length < position.through_event_log_bytes) return error.InvalidSessionFormat;
+    if (length < position.through_event_log_bytes) {
+        return failLoadedWritableSession(error.InvalidSessionFormat);
+    }
     const replay_started_ns = io_mod.nanoTimestamp();
     var open_state = loadOpenState(
         alloc,
@@ -2347,7 +2369,7 @@ fn openWritableSession(
         event_log,
         position,
     ) catch |err| switch (err) {
-        error.OutOfMemory => return error.SessionReplayResourceExhausted,
+        error.OutOfMemory => return failLoadedWritableSession(error.SessionReplayResourceExhausted),
         else => return err,
     };
     errdefer open_state.state.deinit(alloc);

@@ -2,15 +2,8 @@ export const CANONICAL_BUILTIN_NAMES = [
   "read_file",
   "glob_files",
   "grep_files",
-  "list_files",
-  "file_info",
-  "semantic_search",
   "edit_file",
   "write_file",
-  "delete_file",
-  "rename_file",
-  "copy_file",
-  "create_folder",
   "terminal",
   "subagent",
   "capability_search",
@@ -20,7 +13,6 @@ export const CANONICAL_BUILTIN_NAMES = [
   "mcp_features",
   "memory",
   "ask_user_question",
-  "open_file",
   "web_fetch",
   "web_search",
   "read_tool_result",
@@ -31,7 +23,6 @@ export const READ_ONLY_SERIALIZED_TOOL_NAMES = [
   "read_file",
   "glob_files",
   "grep_files",
-  "list_files",
 ] as const;
 
 export const VERIFY_SERIALIZED_TOOL_NAMES = [

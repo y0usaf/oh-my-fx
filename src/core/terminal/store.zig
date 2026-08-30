@@ -2469,7 +2469,7 @@ pub fn reloadAuthorityClaim(
     ) or !std.mem.eql(u8, record.cwd, input.principal.cwd) or
         record.backend != input.principal.backend)
     {
-        return error.PrincipalMismatch;
+        return failReloadedAuthorityClaim(error.PrincipalMismatch);
     }
     const authority = try load_authority(
         alloc,
@@ -2482,21 +2482,21 @@ pub fn reloadAuthorityClaim(
         &authority.value,
     );
     if (record.authority_revoked or authority.value.revoked) {
-        return error.AuthorityRevoked;
+        return failReloadedAuthorityClaim(error.AuthorityRevoked);
     }
     const grant = authority.value.grant;
     if (!grant.principal.eql(input.principal)) {
-        return error.PrincipalMismatch;
+        return failReloadedAuthorityClaim(error.PrincipalMismatch);
     }
     if (record.authority_generation.value != input.generation.value or
         grant.generation.value != input.generation.value)
     {
-        return error.StaleAuthorityGeneration;
+        return failReloadedAuthorityClaim(error.StaleAuthorityGeneration);
     }
     const direct_model_observer = observer_policy and
         grant.actor == .human and input.actor == .agent;
     if (!direct_model_observer and grant.actor != input.actor) {
-        return error.ActorRoleMismatch;
+        return failReloadedAuthorityClaim(error.ActorRoleMismatch);
     }
     const controls = if (direct_model_observer)
         contracts.AllowedControls.observer()
@@ -2507,7 +2507,7 @@ pub fn reloadAuthorityClaim(
     defer std.crypto.secureZero(u8, @volatileCast(proof.bytes[0..]));
     const actual = proof_verifier(proof, grant, observer_policy);
     if (!std.mem.eql(u8, &actual, &authority.value.verifier)) {
-        return error.InvalidHolderProof;
+        return failReloadedAuthorityClaim(error.InvalidHolderProof);
     }
     return operation.ownAuthorityClaim(alloc, .{
         .principal = input.principal,
@@ -2515,6 +2515,26 @@ pub fn reloadAuthorityClaim(
         .generation = input.generation,
         .proof = proof,
     }, controls);
+}
+
+inline fn failReloadedAuthorityClaim(err: anytype) @TypeOf(err)!operation.OwnedAuthorityClaim {
+    return @errorCast(failReloadedAuthorityClaimDynamic(err));
+}
+
+noinline fn failReloadedAuthorityClaimDynamic(err: anyerror) anyerror!operation.OwnedAuthorityClaim {
+    return err;
+}
+
+test "reloaded authority failures preserve exact error types and identities" {
+    const revoked = failReloadedAuthorityClaim(error.AuthorityRevoked);
+    try std.testing.expect(
+        @TypeOf(revoked) == error{AuthorityRevoked}!operation.OwnedAuthorityClaim,
+    );
+    try std.testing.expectError(error.AuthorityRevoked, revoked);
+    try std.testing.expectError(
+        error.InvalidHolderProof,
+        failReloadedAuthorityClaim(error.InvalidHolderProof),
+    );
 }
 
 pub const RecoveredExecutionScope = struct {
@@ -6013,28 +6033,46 @@ fn save_record(
     entry.deinit(alloc);
 }
 
+inline fn failRecord(err: anytype) @TypeOf(err)!Record {
+    return @errorCast(failRecordDynamic(err));
+}
+
+noinline fn failRecordDynamic(err: anyerror) anyerror!Record {
+    return err;
+}
+
+test "terminal record failures preserve exact error types and identities" {
+    const missing = failRecord(error.TerminalRecordNotFound);
+    try std.testing.expect(
+        @TypeOf(missing) == error{TerminalRecordNotFound}!Record,
+    );
+    try std.testing.expectError(error.TerminalRecordNotFound, missing);
+    try std.testing.expectError(error.OutOfMemory, failRecord(error.OutOfMemory));
+}
+
 fn load_record(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
     session_id: []const u8,
 ) !Record {
-    const name = try record_name(alloc, session_id);
+    const name = record_name(alloc, session_id) catch |err|
+        return failRecord(err);
     defer alloc.free(name);
     var file = capability.openFileReadOnly(
         alloc,
         .terminal_state,
         name,
     ) catch |err| switch (err) {
-        error.FileNotFound => return error.TerminalRecordNotFound,
-        else => return err,
+        error.FileNotFound => return failRecord(error.TerminalRecordNotFound),
+        else => return failRecord(err),
     };
     defer file.deinit();
     const bytes = file.readToEnd(alloc, max_record_bytes) catch |err| switch (err) {
-        error.StreamTooLong => return error.TerminalRecordTooLarge,
-        else => return err,
+        error.StreamTooLong => return failRecord(error.TerminalRecordTooLarge),
+        else => return failRecord(err),
     };
     defer alloc.free(bytes);
-    return parse_record(alloc, bytes);
+    return parse_record(alloc, bytes) catch |err| return failRecord(err);
 }
 
 fn write_owner_catalog_proof(
@@ -8872,7 +8910,7 @@ test "human owner takeover proof is narrow and excludes agent writes" {
     );
 }
 
-test "human takeover lease is reclaimable only after its Fx process owner is gone" {
+test "human takeover lease is reclaimable only after its fx process owner is gone" {
     const Match = struct {
         var result: process_supervisor.TokenMatch = .matched;
 

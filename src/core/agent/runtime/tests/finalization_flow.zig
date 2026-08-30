@@ -94,6 +94,30 @@ test "processQueuedPrompt normal final completion propagates normalized history 
     try expectBodyNotContains(&gateway, 0, "<turn_aborted>");
 }
 
+test "processQueuedPrompt propagates completed summary with durable history" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{
+        .content = "complete",
+        .usage = .{ .input_tokens = 12, .output_tokens = 34 },
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const propagated_summary = types.historyTurnSummary(
+        hooks.history_turns.items[0],
+    ) orelse return error.TestExpectedTurnSummary;
+    try std.testing.expectEqual(
+        hooks.finish_summary.?,
+        propagated_summary,
+    );
+}
+
 test "processQueuedPrompt pauses missing finish without synthesizing output" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .omit_finish = true }};
@@ -231,6 +255,10 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
                 @as(usize, 0),
                 hooks.history_turns.items[0].assistant.execution.tool_steps.len,
             );
+            const propagated_summary = types.historyTurnSummary(
+                hooks.history_turns.items[0],
+            ) orelse return error.TestExpectedTurnSummary;
+            try std.testing.expectEqual(hooks.finish_summary.?, propagated_summary);
         } else {
             try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
         }
@@ -382,6 +410,10 @@ test "processQueuedPrompt step limit pushes configured notice and finish event" 
     try std.testing.expect(textContains(&hooks, "custom limit"));
     try std.testing.expectEqualStrings("custom limit", hooks.history_assistant_text.?);
     try std.testing.expectEqualStrings("custom limit", hooks.finish_assistant_text.?);
+    const propagated_summary = types.historyTurnSummary(
+        hooks.history_turns.items[0],
+    ) orelse return error.TestExpectedTurnSummary;
+    try std.testing.expectEqual(hooks.finish_summary.?, propagated_summary);
     try std.testing.expect(hooks.finalized_disposition == null);
 }
 
@@ -689,7 +721,7 @@ test "common Stop continues once with exact synthetic context and joined history
     try expectBodyContains(
         &gateway,
         1,
-        "Continue the turn. Fx hook context:\\nverify the answer",
+        "Continue the turn. fx hook context:\\nverify the answer",
     );
     try std.testing.expectEqualStrings(
         "candidate\nfinal",
@@ -716,7 +748,7 @@ test "common Stop continues once with exact synthetic context and joined history
     try expectBodyNotContains(
         &follow_gateway,
         0,
-        "Continue the turn. Fx hook context",
+        "Continue the turn. fx hook context",
     );
 }
 
@@ -1345,7 +1377,7 @@ test "common Stop parallel cancellation preserves ordinary cancelled peer as com
     const calls = [_]ToolCall{
         toolCall("call_ordinary_cancel", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("call_owner_signal", "grep_files", "{\"pattern\":\"Hooks\"}"),
-        toolCall("call_completed_peer", "file_info", "{\"path\":\"src/main.zig\"}"),
+        toolCall("call_completed_peer", "glob_files", "{\"pattern\":\"src/main.zig\"}"),
     };
     var gateway = FakeGateway.init(alloc, &.{
         .{ .content = "candidate" },
@@ -1719,7 +1751,7 @@ test "TurnFinalizationGuard runs PostTurnEnd once for every terminal outcome and
     }
 }
 
-test "TurnFinalizationGuard attempts every tracked lease and returns the first cleanup error" {
+test "TurnFinalizationGuard attempts every tracked lease without replacing accepted completion" {
     const alloc = std.testing.allocator;
     const cleanup_errors = [_]?anyerror{
         error.TestFirstCleanupFailed,
@@ -1739,16 +1771,23 @@ test "TurnFinalizationGuard attempts every tracked lease and returns the first c
     try finalization.track_agent_terminal_lease("terminal-one");
     try finalization.track_agent_terminal_lease("terminal-two");
     finalization.remove_agent_terminal_lease("terminal-missing");
+    const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast("accepted answer"),
+        } },
+    });
 
-    try std.testing.expectError(
-        error.TestFirstCleanupFailed,
-        finalization.finish(.failed, null, null),
-    );
-    try std.testing.expectEqual(TurnFinalizationGuard.State.fatal, finalization.state);
+    try finalization.finish(.completed, .completed, finished);
+    try finalization.finish(.failed, null, null);
+    try std.testing.expectEqual(TurnFinalizationGuard.State.emitted, finalization.state);
     try std.testing.expectEqual(@as(usize, 2), deps.terminal_lease_cleanup_ids.items.len);
     try std.testing.expectEqualStrings("terminal-one", deps.terminal_lease_cleanup_ids.items[0]);
     try std.testing.expectEqualStrings("terminal-two", deps.terminal_lease_cleanup_ids.items[1]);
-    try std.testing.expectEqual(@as(usize, 0), deps.finalization_count);
+    try std.testing.expectEqual(@as(usize, 1), deps.finalization_count);
+    try std.testing.expectEqual(@as(usize, 1), deps.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), deps.finish_event_attempt_count);
+    try std.testing.expectEqualStrings("accepted answer", deps.finish_assistant_text.?);
 }
 
 test "TurnFinalizationGuard removes explicit release without cleanup" {

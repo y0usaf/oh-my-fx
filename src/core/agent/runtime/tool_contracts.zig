@@ -96,6 +96,22 @@ pub const ToolExecutionResult = struct {
     command_replay_capture: ?*command_replay_store.Capture = null,
 };
 
+pub inline fn failToolExecutionResult(err: anytype) @TypeOf(err)!ToolExecutionResult {
+    return @errorCast(failToolExecutionResultDynamic(err));
+}
+
+noinline fn failToolExecutionResultDynamic(err: anyerror) anyerror!ToolExecutionResult {
+    return err;
+}
+
+test "tool result failure writer preserves exact error type and identity" {
+    const failure = failToolExecutionResult(error.LiveToolAuthorityUnavailable);
+    try std.testing.expect(
+        @TypeOf(failure) == error{LiveToolAuthorityUnavailable}!ToolExecutionResult,
+    );
+    try std.testing.expectError(error.LiveToolAuthorityUnavailable, failure);
+}
+
 pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecutionResult {
     return .{
         .status = .failure,
@@ -124,6 +140,7 @@ pub const ToolExecutionRequest = struct {
     current_turn_messages: []const ChatMessage = &.{},
     session_grants: []const PermissionGrant,
     live_authority: ?LiveToolAuthority = null,
+    expected_mcp_runtime_generation: ?u64 = null,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     /// The owning agent loop already ran its policy-neutral idempotency and
@@ -141,8 +158,12 @@ pub const ToolExecutionRequest = struct {
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;
 
+pub const ToolCallValidationWitness = struct {
+    mcp_runtime_generation: ?u64 = null,
+};
+
 pub const ToolCallValidationResult = union(enum) {
     not_registered,
-    valid,
+    valid: ToolCallValidationWitness,
     failure: []const u8,
 };

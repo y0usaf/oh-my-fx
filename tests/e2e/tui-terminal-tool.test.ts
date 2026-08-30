@@ -1061,7 +1061,7 @@ test.skipIf(!tmuxAvailable())(
 
 for (const backend of ["native", "tmux"] as const) {
   test.skipIf(!tmuxAvailable())(
-    `abrupt Fx death leaves a live ${backend} takeover discoverable and reclaimable on exact task resume`,
+    `abrupt fx death leaves a live ${backend} takeover discoverable and reclaimable on exact task resume`,
     async () => {
       const fixture = createFixture(`fx-tui-terminal-reclaim-${backend}-`);
       const scriptPath = writeTakeoverFixture(fixture);
@@ -2291,6 +2291,95 @@ test.skipIf(!tmuxAvailable())(
     expect(pane).toContain("Condition met for");
     expect(pane).toContain("Killed printf 'ATOMIC_WRITE_READY");
     expect(gateway.requests).toHaveLength(6);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "successful terminal close preserves the accepted turn after a lost atomic write response",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-close-finalization-");
+    const effectPath = join(
+      fixture.workspace,
+      "close-finalization-effect.txt",
+    );
+    let terminalSessionId = "";
+    let writeFailure = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("close_finalization_start", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command:
+          "printf 'CLOSE_FINALIZATION_READY\\n'; " +
+          "while IFS= read -r line; do " +
+          "printf 'CLOSE_FINALIZATION_ECHO:%s\\n' \"$line\"; " +
+          "printf '%s\\n' \"$line\" >> close-finalization-effect.txt; done",
+        shell: {
+          kind: "executable",
+          path: TERMINAL_FIXTURE_SHELL,
+          clean_start: true,
+        },
+        backend: "native",
+        return_when: { kind: "match", pattern: "CLOSE_FINALIZATION_READY" },
+        wait_ceiling_ms: 20_000,
+        dimensions: { rows: 24, columns: 80 },
+      }),
+      (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "close_finalization_start"),
+        ) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        return fakeGatewayToolCall("close_finalization_write", "terminal", {
+          request: {
+            action: "write",
+            session_id: terminalSessionId,
+            input: { text: "one effect only\n" },
+          },
+        });
+      },
+      (body) => {
+        writeFailure = toolResultText(body, "close_finalization_write");
+        return fakeGatewayToolCall("close_finalization_close", "terminal", {
+          action: "close",
+          session_id: terminalSessionId,
+          close_policy: "force",
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "close_finalization_close"))
+          .toContain('"lifecycle":"closed"');
+        return fakeGatewayFinalText("CLOSE_FINALIZATION_RESULT_PRESERVED");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, {
+      FX_TERMINAL_TEST_HOST_FAILURE_POINT: "response_write",
+      FX_TERMINAL_TEST_HOST_FAILURE_CORRELATION: "4",
+    });
+
+    await active.sendText("Write once, close the session, and report completion.");
+    const pane = await active.waitForText(
+      "CLOSE_FINALIZATION_RESULT_PRESERVED",
+      TIMEOUT,
+    );
+    const trace = readFileSync(fixture.tracePath, "utf8");
+
+    expect(writeFailure).toContain('"code":"session_lost"');
+    expect(pane).toContain("CLOSE_FINALIZATION_RESULT_PRESERVED");
+    expect(gateway.requests).toHaveLength(4);
+    expect(readFileSync(effectPath, "utf8")).toBe("one effect only\n");
+    expect(trace).toContain("response failed correlation=4");
+    expect(trace).not.toContain("turn lease cleanup failed");
+    expect(terminalRecords(fixture.home)).toEqual([
+      expect.objectContaining({
+        session_id: terminalSessionId,
+        lifecycle: "closed",
+        attention: expect.objectContaining({ write_lease: "none" }),
+      }),
+    ]);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,

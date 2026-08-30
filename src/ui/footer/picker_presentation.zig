@@ -1440,7 +1440,7 @@ test "slash menu hides metadata for commands and skills" {
 test "slash menu keeps matching skill source labels" {
     const skills = [_]skill_runtime.Skill{.{
         .name = "fx-test-strategy",
-        .description = "choose focused regression coverage for the affected Fx behavior",
+        .description = "choose focused regression coverage for the affected fx behavior",
         .path = "/tmp/.codex/skills/fx-test-strategy",
         .source = .global_codex,
     }};

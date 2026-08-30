@@ -41,8 +41,8 @@ const ui_input = @import("../../ui/input/runtime.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
-const skills_screen = @import("../../ui/skills_screen.zig");
 const full_transcript_screen = @import("../../ui/full_transcript_screen.zig");
+const session_child_store = @import("../session/session_child_store.zig");
 const render_engine = @import("../../ui/render_engine.zig");
 const build_checkpoint = @import("../../ui/render_engine/build_checkpoint.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
@@ -641,6 +641,10 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .ask,
                 .queued_count = if (queued_cards.cards.len > 0) queued_cards.cards.len else queue_preview.count,
+                .steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
+                    queue_preview.steering_count
+                else
+                    0,
                 .queued_paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
                     queue_preview.paused
                 else
@@ -1134,7 +1138,7 @@ pub fn Runtime(comptime App: type) type {
                 .question_requested,
                 .open_model_picker,
                 .turn_token_update,
-                .tool_payload_started,
+                .turn_phase_update,
                 .finish_prompt,
                 .session_grant,
                 => {},
@@ -1260,15 +1264,18 @@ pub fn Runtime(comptime App: type) type {
             ctx.file_completions = &.{};
             ctx.inline_completion_suffix = "";
             ctx.auth_picker.active = false;
-            ctx.skills_menu = .{};
+            ctx.skills_menu = if (comptime @hasField(App, "skills"))
+                render_input.skillsMenuProjection(&app.skills)
+            else
+                .{};
             ctx.help_menu = .{};
-            ctx.settings_menu = .{};
+            ctx.settings_menu.active = false;
             ctx.model_menu = if (comptime @hasField(App, "model_cache"))
                 render_input.modelMenuProjection(&app.model_cache)
             else
                 .{};
             ctx.session_menu = .{};
-            ctx.statusline_menu = .{};
+            ctx.statusline_menu.active = false;
             ctx.usage_menu = .{};
             ctx.workspace_menu = .{};
             ctx.upgrade_status = "";
@@ -1773,7 +1780,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false;
                 if (surface_changed) {
-                    if (!modelMenuActive(app)) {
+                    if (!modelMenuActive(app) and !skillsMenuActive(app)) {
                         presentation_shell.invalidateTranscriptAnchor(
                             "subagent child surface activated",
                         );
@@ -1820,9 +1827,6 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 main_footer_ctx;
-            if (child_view != null and skillsMenuActive(app)) {
-                return renderChildSkillsScreen(app, footer_ctx);
-            }
             const render_reconciliation = if (child_view != null)
                 InlineRenderReconciliation{ .alternate_screen_owns_rendering = true }
             else switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx))) {
@@ -1855,6 +1859,13 @@ pub fn Runtime(comptime App: type) type {
             defer if (owned_transcript_source) |*source| source.deinit(app.alloc);
             var transcript_source: ?*transcript_runtime.TranscriptPreparationSource = null;
             var full_transcript_projection: ?*full_transcript_screen.Projection = null;
+            var full_transcript_capability: ?*session_child_store.SessionChildCapability = if (comptime @hasDecl(
+                App,
+                "fullTranscriptSidecarCapability",
+            ))
+                app.fullTranscriptSidecarCapability()
+            else
+                null;
             var transcript_transition: ?transcript_runtime.TranscriptTransition = null;
             defer if (transcript_transition) |*transition| transition.deinit(app.alloc);
             var footer_measurement: ?surface_frame.SurfaceFooterMeasurement = null;
@@ -1885,11 +1896,15 @@ pub fn Runtime(comptime App: type) type {
                             app.fullTranscriptDiffResolver()
                         else
                             null;
-                    full_transcript_projection = try presentation_shell.cachedFullTranscriptProjectionInterruptible(
+                    full_transcript_projection = try presentation_shell.preparedFullTranscriptPageProjectionInterruptible(
                         app.alloc,
                         full_diff_resolver,
+                        full_transcript_capability,
                         checkpoint,
                     );
+                    if (presentation_shell.preparedFullTranscriptPageCapability()) |capability| {
+                        full_transcript_capability = capability;
+                    }
                 }
                 footer_measurement = try surface_frame.measureSurfaceFooter(
                     app.alloc,
@@ -2143,15 +2158,11 @@ pub fn Runtime(comptime App: type) type {
                 if (full_transcript_projection) |projection| {
                     const area = footer_frame.paint.transcript_band;
                     if (!area.isEmpty()) {
-                        const capability = if (comptime @hasDecl(App, "fullTranscriptSidecarCapability"))
-                            app.fullTranscriptSidecarCapability()
-                        else
-                            null;
                         const staged = try presentation_shell.prepareFullTranscriptSurfacePaintInterruptible(
                             app.alloc,
                             &app.metrics,
                             projection,
-                            capability,
+                            full_transcript_capability,
                             .{ .top = area.top, .bottom = area.bottom },
                             checkpoint,
                         );
@@ -2501,46 +2512,6 @@ pub fn Runtime(comptime App: type) type {
             if (screen.needs_full_file_projection) {
                 app.shell.render_requests.request(.modal);
             }
-            return .{
-                .shadow_state = .committed,
-                .animation_visible = false,
-            };
-        }
-
-        fn renderChildSkillsScreen(
-            app: *App,
-            ctx: render_input.RenderContext,
-        ) !FrameAttemptResult {
-            if (comptime !@hasField(App, "terminal") or !@hasField(App, "skills")) {
-                return error.MissingSkillsScreenRuntime;
-            }
-            if (app.shell.shadow_vt) |grid| {
-                if (grid.cols != app.shell.layout.cols or grid.rows != app.shell.layout.rows) {
-                    try grid.resize(app.shell.layout.cols, app.shell.layout.rows);
-                }
-            }
-
-            var screen = try skills_screen.paint(app.alloc, .{
-                .rows = app.shell.layout.rows,
-                .cols = app.shell.layout.cols,
-                .skills = render_input.skillsMenuProjection(&app.skills),
-                .composer = .{
-                    .input = ctx.input.edit_state.input.items,
-                    .cursor = ctx.input.edit_state.cursor,
-                    .images = &.{},
-                    .pasted_blocks = ctx.input.entities.pasted_blocks.items,
-                    .image_tokens = ctx.input.entities.image_tokens.items,
-                    .skill_tokens = ctx.input.entities.skill_tokens.items,
-                },
-                .ctrl_c_pending = ctx.ctrl_c_pending,
-                .clear_display = true,
-            });
-            defer screen.deinit(app.alloc);
-            try app_lifecycle.writeLifecycleTerminalBytes(
-                &app.shell,
-                &app.metrics,
-                screen.bytes,
-            );
             return .{
                 .shadow_state = .committed,
                 .animation_visible = false,
@@ -6572,6 +6543,60 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "stream completed"));
 }
 
+test "core.app_render_runtime full transcript opens with a bounded loading frame" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(
+        std.testing.io,
+        "full-transcript-loading-frame.log",
+        .{ .read = true },
+    );
+    defer file.close(io_mod.getIo());
+
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{
+            .stdout_file = file,
+            .layout = .{
+                .rows = 24,
+                .cols = 96,
+                .content_bottom = 20,
+                .divider_top_row = 21,
+                .input_row = 22,
+                .divider_bottom_row = 23,
+                .hint_row = 24,
+            },
+            .owned_top_row = 1,
+            .viewport_top_row = 1,
+        },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    try app.shell.writeTranscript(
+        alloc,
+        &app.metrics,
+        ("historical transcript row\n" ** 512) ++ "FULL_ASYNC_SENTINEL\n",
+        true,
+    );
+    app.shell.render_requests.request(.first_frame);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+
+    try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+
+    try std.testing.expect(try coordinatorGridContains(
+        app.shell.shadow_vt.?.*,
+        "Preparing full detail",
+    ));
+    try std.testing.expect(!try coordinatorGridContains(
+        app.shell.shadow_vt.?.*,
+        "FULL_ASYNC_SENTINEL",
+    ));
+}
+
 test "core.app_render_runtime changed resized full transcript close preserves primary history without full replay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6936,7 +6961,7 @@ const ChildApprovalReconcileApp = struct {
     }
 };
 
-test "child approval arrival closes review and full transcript depths before rendering" {
+test "child approval arrival closes full transcript depth before rendering" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6948,42 +6973,32 @@ test "child approval arrival closes review and full transcript depths before ren
     defer debug_trace.resetForTest();
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "full_transcript");
 
-    inline for (.{
-        transcript_presentation.Depth.review,
-        transcript_presentation.Depth.full,
-    }) |depth| {
-        var app = ChildApprovalReconcileApp{
-            .alloc = alloc,
-            .subagents = .{ .depth = depth },
-        };
-        defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .id = 91,
-            .label = "terminal.exec npm test",
-        }));
+    var app = ChildApprovalReconcileApp{
+        .alloc = alloc,
+        .subagents = .{ .depth = .full },
+    };
+    defer app.deinit();
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
+        .id = 91,
+        .label = "terminal.exec npm test",
+    }));
 
-        try std.testing.expect(try Runtime(ChildApprovalReconcileApp)
-            .reconcileChildTranscriptForPresentedApproval(
-            &app,
-            "selected-child",
-        ));
+    try std.testing.expect(try Runtime(ChildApprovalReconcileApp)
+        .reconcileChildTranscriptForPresentedApproval(
+        &app,
+        "selected-child",
+    ));
 
-        try std.testing.expectEqual(
-            transcript_presentation.Depth.inline_mode,
-            app.subagents.depth,
-        );
-        try std.testing.expectEqual(@as(usize, 1), app.subagents.close_calls);
-    }
+    try std.testing.expectEqual(
+        transcript_presentation.Depth.inline_mode,
+        app.subagents.depth,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.subagents.close_calls);
 
     var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
     defer trace_file.close(std.testing.io);
     const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
     defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(
-        u8,
-        trace,
-        "depth_transition from=review to=inline route=child trigger=approval_handoff",
-    ) != null);
     try std.testing.expect(std.mem.find(
         u8,
         trace,

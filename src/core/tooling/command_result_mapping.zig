@@ -41,6 +41,23 @@ pub const Foreground = struct {
             .foreground => |foreground| foreground,
             .background => return null,
         };
+        if (foreground.termination_indeterminate) {
+            const details = [_]tool_result_errors.Detail{
+                .{ .name = "command", .value = .{ .string = foreground.command } },
+                .{ .name = "cwd", .value = .{ .string = foreground.cwd } },
+                .{ .name = "termination_indeterminate", .value = .{ .boolean = true } },
+            };
+            return .{
+                .status = .failure,
+                .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
+                    .tool_name = "terminal",
+                    .message = "Command started, but its final process status could not be confirmed",
+                    .details = &details,
+                    .suggestion = "Do not retry the command unchanged because its side effects may already exist. Inspect the resulting state first.",
+                }),
+                .command_result_json = try command_result.toJson(arena),
+            };
+        }
         if ((foreground.exit_code == null or foreground.exit_code.? == 0) and
             foreground.signal == null and
             !foreground.timed_out) return null;
@@ -375,6 +392,25 @@ test "command result mapping preserves non-zero stderr envelope and JSON" {
     try expectContains(result.model_output, "\"stderr\":\"bad [redacted]\"");
     try expectContains(result.command_result_json.?, "\"kind\":\"foreground\"");
     try expectContains(result.command_result_json.?, "\"exit_code\":7");
+}
+
+test "command result mapping reports indeterminate termination with structured evidence" {
+    const alloc = std.testing.allocator;
+    const result = try Foreground.nonZeroFailure(alloc, .{
+        .output = "termination_indeterminate=true\n",
+        .command_result = .{ .foreground = .{
+            .command = "printf effect > marker",
+            .cwd = "/tmp/workspace",
+            .termination_indeterminate = true,
+        } },
+    }) orelse return error.TestExpectedEqual;
+    defer alloc.free(result.model_output);
+    defer alloc.free(result.command_result_json.?);
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectContains(result.model_output, "could not be confirmed");
+    try expectContains(result.model_output, "Do not retry");
+    try expectContains(result.command_result_json.?, "\"termination_indeterminate\":true");
 }
 
 test "cancelled command mapping survives metadata serialization failure" {

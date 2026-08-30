@@ -187,7 +187,7 @@ pub fn Runtime(comptime App: type) type {
                 .semantic_notice,
                 .command_output,
                 .turn_token_update,
-                .tool_payload_started,
+                .turn_phase_update,
                 .diff_block,
                 => .drop,
                 .route_recovery_status => |status| if (status.action == .paused)
@@ -596,17 +596,9 @@ pub fn Runtime(comptime App: type) type {
             if (!app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
                 return status_changed;
             }
-            const native_history_active = if (comptime @hasDecl(
-                @TypeOf(app.shell),
-                "nativeHistoryActive",
-            ))
-                app.shell.nativeHistoryActive()
-            else
-                false;
             if (app.approval_prompt.isActive() or
                 app.question_prompt.isActive() or
-                !app.shell.shimmer_active or
-                native_history_active)
+                !app.shell.shimmer_active)
             {
                 return status_changed;
             }
@@ -630,9 +622,9 @@ pub fn Runtime(comptime App: type) type {
         ) ?[]const u8 {
             // Existence guard only: pass no clock so the label skips the counter.
             if (!app.stream.active and app.pacer.hasCompletedAssistantPresentationTail()) {
-                return activity_status.buildThinkingLabel(buf, .{ .active = true }, 0);
+                return activity_status.buildTurnLabel(buf, .{ .active = true }, 0);
             }
-            if (activity_status.buildThinkingLabel(buf, app.stream, 0)) |label| return label;
+            if (activity_status.buildTurnLabel(buf, app.stream, 0)) |label| return label;
             if (app.stream.last_activity_kind == .ask) return ui_render.ask_activity_label;
             switch (presenter.snapshot().activity) {
                 .tool_slot => |slot| return slot.fallback_label,
@@ -762,7 +754,6 @@ pub fn Runtime(comptime App: type) type {
                         }
                         switch (presentation) {
                             .text => |text| {
-                                app.stream = nextStreamAfterAssistantText(app.stream, text);
                                 try handlers.append_text(handlers.ctx, text);
                                 debug_trace.eventf(
                                     "worker",
@@ -773,17 +764,14 @@ pub fn Runtime(comptime App: type) type {
                                 );
                             },
                             .table => |table| {
-                                markAssistantText(app);
                                 drain_owns_current = false;
                                 try handlers.append_table(handlers.ctx, table);
                             },
                             .code_block => |block| {
-                                markAssistantText(app);
                                 drain_owns_current = false;
                                 try handlers.append_code_block(handlers.ctx, block);
                             },
                             .thematic_rule => {
-                                markAssistantText(app);
                                 drain_owns_current = false;
                                 try handlers.append_thematic_rule(handlers.ctx);
                             },
@@ -872,9 +860,8 @@ pub fn Runtime(comptime App: type) type {
                     .turn_token_update => |update| {
                         applyTurnTokenProgress(app, update);
                     },
-                    .tool_payload_started => {
-                        app.stream.composing_tool_payload = true;
-                        app.shell.render_requests.request(.footer);
+                    .turn_phase_update => |update| {
+                        applyTurnPhase(app, update);
                     },
                     .diff_block => |payload| {
                         drain_owns_current = false;
@@ -961,9 +948,9 @@ pub fn Runtime(comptime App: type) type {
             presenter: activity_runtime.LifecyclePresenter,
             lifecycle: types.ToolLifecycleEvent,
         ) !void {
-            const starts_tool_stretch = switch (lifecycle) {
-                .provisional, .authoritative_started => true,
-                .progress, .terminal, .turn_finished => false,
+            const tool_work_active = switch (lifecycle) {
+                .provisional, .authoritative_started, .progress => true,
+                .terminal, .turn_finished => false,
             };
             const transition = try presenter.apply(
                 app.alloc,
@@ -988,23 +975,12 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const focused_activity_kind = transition.snapshot.focused_activity_kind;
-            if (starts_tool_stretch) {
-                // The payload landed, or another tool took the row.
-                app.stream.composing_tool_payload = false;
-                if (focused_activity_kind != null) {
-                    app.stream.assistant_text_started = false;
-                }
-            }
+            if (tool_work_active) app.stream.phase = .running;
             app.stream.last_activity_kind = focused_activity_kind;
             if (transition.focus_changed()) {
                 app.shell.render_requests.requestAnimationReset();
             }
             app.shell.render_requests.request(.footer);
-        }
-
-        fn markAssistantText(app: *App) void {
-            app.stream.assistant_text_started = true;
-            app.stream.composing_tool_payload = false;
         }
 
         fn resetStream(app: *App, clear_route_recovery: bool) void {
@@ -1041,24 +1017,17 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.animation_next_deadline_ms != 0;
             if (changed and !animation_armed) app.shell.render_requests.request(.footer);
         }
+
+        fn applyTurnPhase(app: *App, update: types.TurnPhaseUpdate) void {
+            if (!app.stream.active or update.turn_id != app.worker.activeTurnId()) return;
+            if (update.step_id < app.stream.phase_step_id) return;
+
+            const changed = app.stream.phase != update.phase;
+            app.stream.phase = update.phase;
+            app.stream.phase_step_id = update.step_id;
+            if (changed) app.shell.render_requests.request(.footer);
+        }
     };
-}
-
-fn nextStreamAfterAssistantText(
-    current: types.StreamState,
-    text: []const u8,
-) types.StreamState {
-    var next = current;
-    if (current.composing_tool_payload and
-        std.mem.trim(u8, text, " \t\r\n").len == 0)
-    {
-        next.assistant_text_started = false;
-        return next;
-    }
-
-    next.assistant_text_started = true;
-    next.composing_tool_payload = false;
-    return next;
 }
 
 fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchProgress) ![]u8 {
@@ -2143,6 +2112,55 @@ test "core.app_worker_runtime applies turn token output as an absolute snapshot"
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
+test "core.app_worker_runtime applies only current monotonic turn phase updates" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.worker.processing = true;
+    app.worker.active_turn_id = 7;
+    app.stream.active = true;
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+        .turn_id = 7,
+        .step_id = 12,
+        .phase = .generating,
+    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+        .turn_id = 7,
+        .step_id = 11,
+        .phase = .running,
+    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+        .turn_id = 6,
+        .step_id = 13,
+        .phase = .running,
+    } });
+
+    try tickNoop(&app);
+
+    try std.testing.expectEqual(types.TurnPhase.generating, app.stream.phase);
+    try std.testing.expectEqual(@as(u64, 12), app.stream.phase_step_id);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "core.app_worker_runtime next admitted model step returns running to thinking" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.worker.processing = true;
+    app.worker.active_turn_id = 7;
+    app.stream = .{ .active = true, .phase = .running, .phase_step_id = 12 };
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+        .turn_id = 7,
+        .step_id = 13,
+        .phase = .thinking,
+    } });
+
+    try tickNoop(&app);
+
+    try std.testing.expectEqual(types.TurnPhase.thinking, app.stream.phase);
+    try std.testing.expectEqual(@as(u64, 13), app.stream.phase_step_id);
+}
+
 test "core.app_worker_runtime advances visible animation exactly at its deadline" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
@@ -2168,7 +2186,7 @@ test "core.app_worker_runtime advances visible animation exactly at its deadline
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
 }
 
-test "core.app_worker_runtime pauses visible animation after native history starts" {
+test "core.app_worker_runtime keeps visible animation alive after native history starts" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
@@ -2181,13 +2199,13 @@ test "core.app_worker_runtime pauses visible animation after native history star
     app.shell.render_requests.animation_visible = true;
     app.shell.render_requests.animation_next_deadline_ms = 1;
 
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(
         &app,
         NoopBridge.lifecyclePresenter(&app),
         1,
         test_awake_timestamp(1),
     ));
-    try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
+    try std.testing.expect(app.shell.render_requests.hasReason(.animation));
 }
 
 test "core.app_worker_runtime refreshes root and selected child retry countdowns" {
@@ -2867,7 +2885,7 @@ test "core.app_worker_runtime syncState clears a completed approval" {
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 }
 
-test "core.app_worker_runtime syncState freezes the thinking clock while an approval waits" {
+test "core.app_worker_runtime syncState freezes the turn clock while an approval waits" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
@@ -3144,7 +3162,7 @@ test "core.app_worker_runtime cancellation snapshot stays coupled to detached ev
     try std.testing.expectEqual(@as(usize, 0), capture.text_count);
 }
 
-test "core.app_worker_runtime lifecycle starts drain real paced text into one assistant entry first" {
+test "core.app_worker_runtime publishes rendered block before opening tool entries" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
     app.worker.processing = true;
@@ -3165,6 +3183,8 @@ test "core.app_worker_runtime lifecycle starts drain real paced text into one as
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 2), bridge.drain_count);
+    try std.testing.expect(!bridge.pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
     try std.testing.expectEqual(@as(usize, 3), app.shell.lifecycle.entries.items.len);
     try std.testing.expect(app.shell.lifecycle.entries.items[0] == .assistant_turn);
     try std.testing.expect(app.shell.lifecycle.entries.items[1] == .raw_bytes);
@@ -3192,14 +3212,13 @@ test "core.app_worker_runtime lifecycle starts drain real paced text into one as
     try std.testing.expectEqual(@as(usize, 2), app.shell.lifecyclePinCount());
 }
 
-test "core.app_worker_runtime structural separator opens thinking stretch during tool composition" {
+test "core.app_worker_runtime structural separator preserves running phase during tool composition" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
     app.worker.processing = true;
     app.stream = .{
         .active = true,
-        .assistant_text_started = true,
-        .composing_tool_payload = true,
+        .phase = .running,
     };
 
     try app.worker.pushEvent(std.heap.c_allocator, .{
@@ -3208,17 +3227,16 @@ test "core.app_worker_runtime structural separator opens thinking stretch during
 
     try tickNoop(&app);
 
-    try std.testing.expect(!app.stream.assistant_text_started);
-    try std.testing.expect(app.stream.composing_tool_payload);
+    try std.testing.expectEqual(types.TurnPhase.running, app.stream.phase);
 }
 
-test "core.app_worker_runtime provisional tool start opens the next thinking stretch" {
+test "core.app_worker_runtime provisional tool start switches generating to running" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
     app.worker.processing = true;
     app.stream = .{
         .active = true,
-        .assistant_text_started = true,
+        .phase = .generating,
     };
 
     try queueLifecycle(&app, .{ .provisional = .{
@@ -3229,7 +3247,7 @@ test "core.app_worker_runtime provisional tool start opens the next thinking str
 
     try tickNoop(&app);
 
-    try std.testing.expect(!app.stream.assistant_text_started);
+    try std.testing.expectEqual(types.TurnPhase.running, app.stream.phase);
     try std.testing.expectEqual(
         @as(?types.ToolActivityKind, .read),
         app.stream.last_activity_kind,
@@ -3249,7 +3267,6 @@ test "core.app_worker_runtime lifecycle boundary survives an incomplete assistan
     });
     try queueToolStart(&app, 1, "read_a", "read_file");
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
@@ -3275,10 +3292,10 @@ test "app worker drains prior paced batch without splitting assistant turn" {
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
     try bridge.tickPacer(0);
 
-    try std.testing.expect(bridge.pacer.hasPending());
+    try std.testing.expect(!bridge.pacer.hasPending());
     try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
     try std.testing.expectEqualStrings(
-        "p",
+        "paced before start",
         app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
     );
 
@@ -3311,7 +3328,7 @@ test "core.app_worker_runtime question boundary drains paced text before opening
     });
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
     try bridge.tickPacer(0);
-    try std.testing.expect(bridge.pacer.hasPending());
+    try std.testing.expect(!bridge.pacer.hasPending());
 
     app.worker.pending_question = true;
     try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
@@ -3341,7 +3358,7 @@ test "core.app_worker_runtime prompt boundary drains paced text before writing t
     });
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
     try bridge.tickPacer(0);
-    try std.testing.expect(bridge.pacer.hasPending());
+    try std.testing.expect(!bridge.pacer.hasPending());
 
     app.stream = .{
         .active = true,
@@ -3662,7 +3679,7 @@ test "core.app_worker_runtime semantic notice handler failure returns through dr
     try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }
 
-test "core.app_worker_runtime text turn finish remains deferred through the pacer" {
+test "core.app_worker_runtime text turn finishes after its rendered block" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
     app.worker.processing = true;
@@ -3693,11 +3710,12 @@ test "core.app_worker_runtime text turn finish remains deferred through the pace
 
     try bridge.tickPacer(0);
     try std.testing.expectEqualStrings(
-        "s",
+        "slow",
         app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
     );
-    try std.testing.expectEqual(@as(usize, 0), bridge.finish_count);
-    try std.testing.expect(bridge.pacer.deferred_turn != null);
+    try std.testing.expectEqual(@as(usize, 1), bridge.finish_count);
+    try std.testing.expect(bridge.pacer.deferred_turn == null);
+    try std.testing.expect(!bridge.pacer.hasPending());
 }
 
 test "core.app_worker_runtime queued begin waits for deferred completed turn summary" {
@@ -3934,7 +3952,7 @@ test "core.app_worker_runtime error text resets active stream and requests foote
     app.worker.processing = true;
     app.stream = .{
         .active = true,
-        .assistant_text_started = true,
+        .phase = .generating,
         .last_activity_kind = .ask,
     };
     try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
@@ -3990,7 +4008,7 @@ test "core.app_worker_runtime blocked error drain retains the error and suffix i
     app.worker.processing = true;
     app.stream = .{
         .active = true,
-        .assistant_text_started = true,
+        .phase = .generating,
         .last_activity_kind = .ask,
     };
     try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{

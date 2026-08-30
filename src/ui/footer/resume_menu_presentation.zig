@@ -461,7 +461,7 @@ fn composeSelectionFailureRow(
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
     try row.appendSlice(alloc, ui_render.red_style);
     const message = switch (failure) {
-        .open_elsewhere => "This session is open in another Fx. Close it there, then press Enter to retry.",
+        .open_elsewhere => "This session is open in another fx. Close it there, then press Enter to retry.",
         .being_updated => "This session is being updated. Wait a moment, then press Enter to retry.",
         .unavailable => "Unable to resume this session.",
     };
@@ -617,7 +617,7 @@ test "resume menu explains retryable selected session contention" {
     }{
         .{
             .failure = .open_elsewhere,
-            .message = "This session is open in another Fx. Close it there, then press Enter to retry.",
+            .message = "This session is open in another fx. Close it there, then press Enter to retry.",
         },
         .{
             .failure = .being_updated,

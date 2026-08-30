@@ -68,7 +68,7 @@ while IFS= read -r branch; do
   target="$(path_for "$branch")"
   declared="$declared $target "
 
-  if git merge-base --is-ancestor "$branch" "$MAIN" && ! has_upstream_pr "$b"; then
+  if [[ "$b" == main || "$b" == master ]]; then :; elif git merge-base --is-ancestor "$branch" "$MAIN" && ! has_upstream_pr "$b"; then
     if [[ -d "$target/.git" || -f "$target/.git" ]] \
        && [[ -z "$(git -C "$target" status --porcelain)" ]]; then
       echo "DELETE (merged, no upstream PR): $target [$b]"
