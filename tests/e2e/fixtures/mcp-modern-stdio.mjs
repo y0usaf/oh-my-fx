@@ -168,6 +168,11 @@ function handle(message) {
       result: {
         resultType: "complete",
         supportedVersions: [protocolVersion],
+        _meta: {
+          "io.modelcontextprotocol/serverInfo": {
+            name: "modern-stdio-fixture",
+          },
+        },
         capabilities: {
           tools: mode === "subscription_cache" || mode === "crash_once_new_tool" || mode === "features"
             ? { listChanged: true }
@@ -248,6 +253,15 @@ function handle(message) {
                 properties: { text: { type: "string" } },
                 required: ["text"],
               },
+              ...(mode === "tool_failure"
+                ? {
+                    outputSchema: {
+                      type: "object",
+                      properties: { result: { type: "string" } },
+                      required: ["result"],
+                    },
+                  }
+                : {}),
             }],
         ttlMs: 60_000,
         cacheScope: "public",

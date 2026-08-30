@@ -27,6 +27,7 @@ const operation_control = @import("operation_control.zig");
 const controlled_lock = @import("controlled_lock.zig");
 const mcp_json = @import("mcp_json.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
+const docker_run = @import("docker_run.zig");
 const stdio_dispatcher = @import("stdio_dispatcher.zig");
 const streamable_http = @import("streamable_http.zig");
 const feature_cache = @import("feature_cache.zig");
@@ -34,6 +35,7 @@ const access_policy = @import("access_policy.zig");
 const health = @import("health.zig");
 const model_catalog = @import("model_catalog.zig");
 const startup_admission = @import("startup_admission.zig");
+const project_config = @import("project_config.zig");
 const tool_subscription = @import("tool_subscription.zig");
 const completion_feature = @import("features/completion.zig");
 const prompts_feature = @import("features/prompts.zig");
@@ -92,7 +94,16 @@ fn allocateRuntimeGeneration() u64 {
     return generation;
 }
 
-pub const LoadRuntimeFn = *const fn (Allocator, elicitation.Capabilities) anyerror!?*McpRuntime;
+pub const LoadRuntimeFn = *const fn (
+    Allocator,
+    []const u8,
+    elicitation.Capabilities,
+) anyerror!?*McpRuntime;
+
+pub const PreviewNativeWorkspaceAuthorityFn = *const fn (
+    Allocator,
+    []const u8,
+) anyerror![][]u8;
 
 const ConnectionControl = struct {
     deadline: ?std.Io.Clock.Timestamp = null,
@@ -2371,6 +2382,14 @@ fn respondToLegacyUrlRequired(
     };
 }
 
+fn requireWorkspaceOperationApproval(server: *const McpServer) !void {
+    if (server.config.source == .workspace and
+        server.config.workspace_admission != .approved)
+    {
+        return error.McpWorkspaceApprovalRequired;
+    }
+}
+
 fn completeFeatureArgument(
     self: *McpRuntime,
     alloc: Allocator,
@@ -2390,6 +2409,7 @@ fn completeFeatureArgument(
     defer operation_access.deinit();
     try operation_access.authorize(.{ .feature_server = server_name });
     const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+    try requireWorkspaceOperationApproval(server);
     if (!server.capabilities.completion) return error.McpCompletionUnsupported;
     switch (reference) {
         .prompt => if (!server.capabilities.prompts) return error.McpPromptsUnsupported,
@@ -3122,7 +3142,7 @@ fn snapshotServerHealthBeforeDiscoveryPublication(
         .connecting
     else
         .disconnected;
-    const authentication = configuredAuthenticationState(server);
+    const authentication = serverAuthenticationState(server);
     const failure = try healthFailureForState(
         alloc,
         server.config.required,
@@ -3135,6 +3155,7 @@ fn snapshotServerHealthBeforeDiscoveryPublication(
         .negotiated_version = null,
         .source = server.config.source,
         .scope = server.config.scope,
+        .workspace_admission = server.config.workspace_admission,
         .required = server.config.required,
         .transport = server.config.transport,
         .protocol_version = null,
@@ -3203,6 +3224,7 @@ fn snapshotServerHealth(
         .negotiated_version = negotiated_version,
         .source = server.config.source,
         .scope = server.config.scope,
+        .workspace_admission = server.config.workspace_admission,
         .required = server.config.required,
         .transport = server.config.transport,
         .protocol_version = protocol_version,
@@ -3254,8 +3276,8 @@ fn configuredAuthenticationState(server: *const McpServer) health.Authentication
 }
 
 fn serverAuthenticationState(server: *const McpServer) health.AuthenticationState {
-    if (server.auth_credentials_present.load(.acquire)) return .authenticated;
     if (server.auth_challenge_present.load(.acquire)) return .required;
+    if (server.auth_credentials_present.load(.acquire)) return .authenticated;
     return configuredAuthenticationState(server);
 }
 
@@ -3282,6 +3304,7 @@ fn snapshotServerModelSummary(
         startup_admission.decide(
             server.config.enabled,
             server.config.required,
+            server.config.workspace_admission,
             .ask_startup,
         ) == .deferred;
     var tool_count: ?usize = null;
@@ -3322,7 +3345,10 @@ fn healthFailureForState(
         return @as(?[]u8, try alloc.dupe(u8, "Enable this required server or mark it optional."));
     }
     if (authentication == .required) {
-        return @as(?[]u8, try alloc.dupe(u8, "Authentication is required; run /mcp auth <name> --open."));
+        return @as(?[]u8, try alloc.dupe(
+            u8,
+            "Authentication is required or the saved credentials lack access; run /mcp auth <name> --open and check server permissions.",
+        ));
     }
     if (connection == .failed) {
         return @as(?[]u8, try alloc.dupe(u8, "Connection or discovery failed; check the trusted profile configuration and trace logs."));
@@ -3801,6 +3827,7 @@ pub const McpRuntime = struct {
     generation: u64,
     legacy_url_runtime_generation: u64 = 0,
     servers: std.ArrayList(McpServer) = .empty,
+    workspace_diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty,
     catalog_mutex: std.Io.RwLock = .init,
     recovery_mutex: std.Io.Mutex = .init,
     catalog_update_mutex: std.Io.Mutex = .init,
@@ -3866,6 +3893,10 @@ pub const McpRuntime = struct {
             server.subscription_lifecycle_lock.unlock(io_mod.getIo());
         }
         self.servers.deinit(self.alloc);
+        for (self.workspace_diagnostics.items) |*diagnostic| {
+            diagnostic.deinit(self.alloc);
+        }
+        self.workspace_diagnostics.deinit(self.alloc);
         std.debug.assert(self.legacy_url_waiters.items.len == 0);
         self.legacy_url_waiters.deinit(self.alloc);
         for (self.early_legacy_url_completions.items) |*completion| {
@@ -4816,11 +4847,141 @@ pub const McpRuntime = struct {
     pub fn addServer(
         self: *McpRuntime,
         config: McpServerConfig,
-    ) (Allocator.Error || error{McpConfigScopeMismatch})!void {
+    ) (Allocator.Error || error{ McpConfigScopeMismatch, McpConfigAdmissionMismatch })!void {
         if (!mcp_contract.sourceAllowsScope(config.source, config.scope)) {
             return error.McpConfigScopeMismatch;
         }
+        if (!mcp_contract.sourceAllowsWorkspaceAdmission(
+            config.source,
+            config.workspace_admission,
+        )) {
+            return error.McpConfigAdmissionMismatch;
+        }
         try self.servers.append(self.alloc, .{ .config = config, .runtime = self, .owner_alloc = self.alloc });
+    }
+
+    pub fn workspaceAuthorityReducedAgainst(
+        self: *const McpRuntime,
+        next: *const McpRuntime,
+        phase: startup_admission.Phase,
+    ) bool {
+        for (self.servers.items) |current| {
+            if (current.config.source != .workspace or
+                startup_admission.decide(
+                    current.config.enabled,
+                    current.config.required,
+                    current.config.workspace_admission,
+                    phase,
+                ) != .connect) continue;
+            var retained = false;
+            for (next.servers.items) |candidate| {
+                if (candidate.config.source != .workspace or
+                    !std.mem.eql(u8, current.config.name, candidate.config.name)) continue;
+                retained = startup_admission.decide(
+                    candidate.config.enabled,
+                    candidate.config.required,
+                    candidate.config.workspace_admission,
+                    phase,
+                ) == .connect;
+                if (retained) break;
+            }
+            if (!retained) return true;
+        }
+        return false;
+    }
+
+    pub fn workspaceAuthorityReducedAgainstConfigs(
+        self: *const McpRuntime,
+        next: []const McpServerConfig,
+        phase: startup_admission.Phase,
+    ) bool {
+        for (self.servers.items) |current| {
+            if (!project_config.configRetainsWorkspaceAuthority(
+                current.config,
+                next,
+                phase,
+            )) return true;
+        }
+        return false;
+    }
+
+    pub fn workspaceAuthorityReducedAgainstNames(
+        self: *const McpRuntime,
+        next_names: []const []const u8,
+        phase: startup_admission.Phase,
+    ) bool {
+        for (self.servers.items) |current| {
+            if (current.config.source != .workspace or
+                startup_admission.decide(
+                    current.config.enabled,
+                    current.config.required,
+                    current.config.workspace_admission,
+                    phase,
+                ) != .connect) continue;
+            var retained = false;
+            for (next_names) |name| {
+                if (std.mem.eql(u8, current.config.name, name)) {
+                    retained = true;
+                    break;
+                }
+            }
+            if (!retained) return true;
+        }
+        return false;
+    }
+
+    pub fn pendingWorkspaceNames(
+        self: *const McpRuntime,
+        alloc: Allocator,
+    ) ![][]u8 {
+        var names: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+        for (self.servers.items) |server| {
+            if (!server.config.enabled or
+                server.config.source != .workspace or
+                server.config.workspace_admission != .pending) continue;
+            const owned_name = try terminalSafeOwned(alloc, server.config.name, 256);
+            errdefer alloc.free(owned_name);
+            try names.append(alloc, owned_name);
+        }
+        return names.toOwnedSlice(alloc);
+    }
+
+    pub fn firstPendingWorkspaceName(
+        self: *const McpRuntime,
+        alloc: Allocator,
+    ) !?[]u8 {
+        for (self.servers.items) |server| {
+            if (!server.config.enabled or
+                server.config.source != .workspace or
+                server.config.workspace_admission != .pending) continue;
+            return @as(?[]u8, try alloc.dupe(u8, server.config.name));
+        }
+        return null;
+    }
+
+    pub fn hasPendingWorkspace(self: *const McpRuntime) bool {
+        for (self.servers.items) |server| {
+            if (server.config.enabled and
+                server.config.source == .workspace and
+                server.config.workspace_admission == .pending) return true;
+        }
+        return false;
+    }
+
+    pub fn takeWorkspaceDiagnostics(
+        self: *McpRuntime,
+        diagnostics: *std.ArrayList(project_config.WorkspaceDiagnostic),
+    ) !void {
+        try self.workspace_diagnostics.ensureUnusedCapacity(
+            self.alloc,
+            diagnostics.items.len,
+        );
+        self.workspace_diagnostics.appendSliceAssumeCapacity(diagnostics.items);
+        diagnostics.clearRetainingCapacity();
     }
 
     pub fn waitForDiscovery(
@@ -4878,7 +5039,29 @@ pub const McpRuntime = struct {
             server.connection_lock.unlockShared(io_mod.getIo());
             initialized += 1;
         }
-        return .{ .captured_at_ms = captured_at_ms, .servers = items };
+        const configuration_issues = try alloc.alloc(
+            health.ConfigurationIssue,
+            self.workspace_diagnostics.items.len,
+        );
+        var issues_initialized: usize = 0;
+        errdefer {
+            for (configuration_issues[0..issues_initialized]) |*issue| issue.deinit(alloc);
+            alloc.free(configuration_issues);
+        }
+        for (self.workspace_diagnostics.items, 0..) |diagnostic, index| {
+            configuration_issues[index] = .{
+                .message = try project_config.renderWorkspaceDiagnostic(
+                    alloc,
+                    diagnostic,
+                ),
+            };
+            issues_initialized += 1;
+        }
+        return .{
+            .captured_at_ms = captured_at_ms,
+            .servers = items,
+            .configuration_issues = configuration_issues,
+        };
     }
 
     /// Returns an owned model-safe catalog snapshot. The caller releases it with `deinit`.
@@ -5048,6 +5231,19 @@ pub const McpRuntime = struct {
         self.connectAllCancellable(tool_registry, &self.discovery_cancel_requested);
     }
 
+    pub fn connectAllForAcp(self: *McpRuntime, tool_registry: tool_dispatch.Registry) void {
+        if (self.discovery_state.cmpxchgStrong(.idle, .loading, .seq_cst, .seq_cst) != null) return;
+        self.discovery_cancel_requested.store(false, .seq_cst);
+        self.connectAllControlled(
+            tool_registry,
+            &self.discovery_cancel_requested,
+            null,
+            .acp_startup,
+        );
+        self.finishDeferredDiscovery();
+        self.discovery_state.store(.complete, .seq_cst);
+    }
+
     pub fn connectAllCancellable(
         self: *McpRuntime,
         tool_registry: tool_dispatch.Registry,
@@ -5179,6 +5375,7 @@ pub const McpRuntime = struct {
             const decision = startup_admission.decide(
                 server.config.enabled,
                 server.config.required,
+                server.config.workspace_admission,
                 phase,
             );
             if (decision != .deferred) continue;
@@ -5201,11 +5398,17 @@ pub const McpRuntime = struct {
             switch (startup_admission.decide(
                 server.config.enabled,
                 server.config.required,
+                server.config.workspace_admission,
                 phase,
             )) {
                 .disabled => {
                     server.state = .disabled;
-                    debug_trace.logf("mcp", "skipped disabled server {s}", .{server.config.name});
+                    var name_buf: [256]u8 = undefined;
+                    debug_trace.logf(
+                        "mcp",
+                        "skipped disabled server {s}",
+                        .{debug_trace.terminalPreview(name_buf[0..], server.config.name)},
+                    );
                     continue;
                 },
                 .deferred => continue,
@@ -5219,7 +5422,15 @@ pub const McpRuntime = struct {
                 server_timeout,
             ) catch |err| {
                 if (cancel_requested.load(.acquire)) return;
-                debug_trace.logf("mcp", "connection failed for server {s}: {s}", .{ server.config.name, @errorName(err) });
+                var name_buf: [256]u8 = undefined;
+                debug_trace.logf(
+                    "mcp",
+                    "connection failed for server {s}: {s}",
+                    .{
+                        debug_trace.terminalPreview(name_buf[0..], server.config.name),
+                        @errorName(err),
+                    },
+                );
                 if (server.last_error == null) {
                     server.setFailed(self.alloc, @errorName(err));
                 } else {
@@ -5256,6 +5467,9 @@ pub const McpRuntime = struct {
         };
         if (cancellation.cancelled()) return error.Cancelled;
         const server = try self.authenticationServer(name);
+        try loadStoredCredentials(self.alloc, server, .{
+            .lifecycle_cancel_flag = &self.retiring,
+        });
         server.connection_lock.lockSharedUncancelable(io_mod.getIo());
         var connection_locked = true;
         defer if (connection_locked) server.connection_lock.unlockShared(io_mod.getIo());
@@ -5358,6 +5572,11 @@ pub const McpRuntime = struct {
         if (self.isDiscovering()) return error.McpDiscoveryInProgress;
         const server = self.findServer(name) orelse return error.McpServerNotFound;
         if (server.config.transport == .stdio) return error.McpAuthenticationNotRemote;
+        if (server.config.source == .workspace and
+            server.config.workspace_admission != .approved)
+        {
+            return error.McpWorkspaceApprovalRequired;
+        }
         return server;
     }
 
@@ -5378,6 +5597,7 @@ pub const McpRuntime = struct {
         removed: bool = false,
         revocation_failed: bool = false,
         repaired_entries: usize = 0,
+        local_only: bool = false,
     };
 
     const DetachedLogoutAuth = struct {
@@ -5453,6 +5673,30 @@ pub const McpRuntime = struct {
         if (self.isDiscovering()) return error.McpDiscoveryInProgress;
         const server = self.findServer(name) orelse return error.McpServerNotFound;
         if (server.config.transport == .stdio) return error.McpAuthenticationNotRemote;
+        if (server.config.source == .workspace and
+            server.config.workspace_admission != .approved)
+        {
+            const deleted = try mcp_auth_store.delete(
+                self.alloc,
+                server.config.name,
+                try server.config.remoteUrl(),
+            );
+            return .{
+                .removed = deleted.removed > 0,
+                .repaired_entries = deleted.repaired_entries,
+                .local_only = true,
+            };
+        }
+        loadStoredCredentials(self.alloc, server, .{
+            .lifecycle_cancel_flag = &self.retiring,
+        }) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            debug_trace.logf(
+                "mcp",
+                "stored credential load skipped during logout server={s} err={s}",
+                .{ server.config.name, @errorName(err) },
+            );
+        };
         server.auth_lock.lockUncancelable(io_mod.getIo());
         if (server.auth_logout_in_progress.load(.acquire)) {
             server.auth_lock.unlock(io_mod.getIo());
@@ -6199,7 +6443,9 @@ pub const McpRuntime = struct {
                 });
             };
             break :result switch (validation) {
-                .valid, .server_authoritative => tool_mcp_runtime.ValidationResult.valid,
+                .valid, .server_authoritative => @as(tool_mcp_runtime.ValidationResult, .{
+                    .valid = self.generation,
+                }),
                 .invalid => |violation| @as(tool_mcp_runtime.ValidationResult, .{
                     .invalid = try std.fmt.allocPrint(
                         arena,
@@ -6221,6 +6467,9 @@ pub const McpRuntime = struct {
         max_tool_result_bytes: usize,
         options: tool_mcp_runtime.CallOptions,
     ) !?tool_mcp_runtime.CallResult {
+        if (options.expected_runtime_generation) |expected| {
+            if (expected != self.generation) return error.McpAuthorityChanged;
+        }
         if (self.isDiscovering()) return null;
         var operation_access = try OperationAccessGuard.init(
             self.alloc,
@@ -6938,6 +7187,17 @@ pub const McpRuntime = struct {
         retired.deinit(self.alloc);
     }
 
+    pub fn loadStoredCredentialsForHealthSnapshot(self: *McpRuntime) !void {
+        if (self.discovery_state.load(.acquire) != .idle) {
+            return error.McpDiscoveryInProgress;
+        }
+        for (self.servers.items) |*server| {
+            try loadStoredCredentials(self.alloc, server, .{
+                .lifecycle_cancel_flag = &self.retiring,
+            });
+        }
+    }
+
     pub fn listServersAndTools(self: *McpRuntime, alloc: Allocator) ![]u8 {
         var snapshot = try self.snapshotHealth(alloc, clockMillis());
         defer snapshot.deinit(alloc);
@@ -6961,6 +7221,7 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.resources) return error.McpResourcesUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -7035,6 +7296,7 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.prompts) return error.McpPromptsUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -7083,6 +7345,7 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.resources) return error.McpResourcesUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -7199,6 +7462,7 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.prompts) return error.McpPromptsUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -8653,7 +8917,7 @@ fn renderAuthenticationRequired(
         try writeEncodedJsonScalar(alloc, &out.writer, server.config.name);
         switch (mode) {
             .oauth => try out.writer.writeAll(
-                ",\"interactive\":true,\"message\":\"Run /mcp auth for this server in an interactive Fx session.\"",
+                ",\"interactive\":true,\"message\":\"Run /mcp auth for this server in an interactive fx session.\"",
             ),
             .bearer_environment => {
                 try out.writer.writeAll(
@@ -8665,7 +8929,7 @@ fn renderAuthenticationRequired(
                     server.config.bearer_token_env.?,
                 );
                 try out.writer.writeAll(
-                    ",\"message\":\"Set this environment variable before starting Fx.\"",
+                    ",\"message\":\"Set this environment variable before starting fx.\"",
                 );
             },
         }
@@ -8920,6 +9184,18 @@ test "a newer pending challenge invalidates interactive authentication publicati
     try std.testing.expectEqualStrings(
         "files:write",
         server.pending_auth_challenge.?.scope.?,
+    );
+}
+
+test "pending authentication challenge overrides stored credential health" {
+    const server = McpServer{
+        .config = .{ .name = "fixture" },
+        .auth_credentials_present = .init(true),
+        .auth_challenge_present = .init(true),
+    };
+    try std.testing.expectEqual(
+        health.AuthenticationState.required,
+        serverAuthenticationState(&server),
     );
 }
 
@@ -10076,8 +10352,17 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
     const generation = server.next_generation;
     server.next_generation = std.math.add(u64, generation, 1) catch
         return error.McpGenerationExhausted;
+    var prepared = try docker_run.prepare(alloc, argv);
+    defer prepared.deinit(alloc);
+    var docker_cleanup = prepared.takeCleanup();
+    defer if (docker_cleanup) |*cleanup| cleanup.deinit(alloc);
+    if (docker_cleanup) |*cleanup| {
+        if (server.env_map) |*environment| {
+            try cleanup.cloneEnvironment(alloc, environment);
+        }
+    }
     const child = try std.process.spawn(io_mod.getIo(), .{
-        .argv = argv,
+        .argv = prepared.argv,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -10085,13 +10370,20 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
         .pgid = if (builtin.os.tag == .windows) null else 0,
     });
 
-    server.dispatcher = try stdio_dispatcher.StdioDispatcher.create(
+    server.dispatcher = stdio_dispatcher.StdioDispatcher.create(
         alloc,
         std.heap.c_allocator,
         child,
         generation,
         mcp_discovery_response_frame_cap_bytes,
-    );
+    ) catch |err| {
+        if (docker_cleanup) |*cleanup| cleanup.run(alloc);
+        return err;
+    };
+    if (docker_cleanup) |cleanup| {
+        server.dispatcher.?.installDockerCleanup(cleanup);
+        docker_cleanup = null;
+    }
 }
 
 fn connectServerLegacy(
@@ -10318,23 +10610,44 @@ fn parseAndStoreServerIdentity(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, response, .{}) catch
         return error.McpInvalidJson;
     defer parsed.deinit();
-    try mcp_contract.validateJsonRpcResponseEnvelope(parsed.value);
-    const result = parsed.value.object.get("result") orelse return error.McpInvalidResult;
-    if (result != .object) return error.McpInvalidResult;
-    const info = result.object.get("serverInfo") orelse return;
-    if (info != .object) return error.McpInvalidResult;
-    const name_value = info.object.get("name") orelse return;
-    const version_value = info.object.get("version") orelse return;
-    if (name_value != .string or version_value != .string) {
-        return error.McpInvalidResult;
-    }
-    const name = try alloc.dupe(u8, name_value.string);
-    errdefer alloc.free(name);
-    const version = try alloc.dupe(u8, version_value.string);
+    const identity = try parseServerIdentity(parsed.value);
+    const name = if (identity.name) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (name) |value| alloc.free(value);
+    const version = if (identity.version) |value| try alloc.dupe(u8, value) else null;
     if (server.negotiated_server_name) |old| alloc.free(old);
     if (server.negotiated_server_version) |old| alloc.free(old);
     server.negotiated_server_name = name;
     server.negotiated_server_version = version;
+}
+
+const ParsedServerIdentity = struct {
+    name: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+};
+
+fn parseServerIdentity(value: std.json.Value) !ParsedServerIdentity {
+    try mcp_contract.validateJsonRpcResponseEnvelope(value);
+    const result = value.object.get("result") orelse return error.McpInvalidResult;
+    if (result != .object) return error.McpInvalidResult;
+    const info = blk: {
+        if (result.object.get("_meta")) |meta| {
+            if (meta != .object) return error.McpInvalidResult;
+            if (meta.object.get("io.modelcontextprotocol/serverInfo")) |modern| {
+                break :blk modern;
+            }
+        }
+        break :blk result.object.get("serverInfo") orelse return .{};
+    };
+    if (info != .object) return error.McpInvalidResult;
+    const name = if (info.object.get("name")) |field| blk: {
+        if (field != .string) return error.McpInvalidResult;
+        break :blk if (field.string.len > 0) field.string else null;
+    } else null;
+    const version = if (info.object.get("version")) |field| blk: {
+        if (field != .string) return error.McpInvalidResult;
+        break :blk if (field.string.len > 0) field.string else null;
+    } else null;
+    return .{ .name = name, .version = version };
 }
 
 fn parseToolsListChangedCapability(value: std.json.Value) !bool {
@@ -12114,6 +12427,9 @@ fn authorizeForChallenge(
         save_result.repaired_entries,
     );
     installAuthCredentials(alloc, server, &credentials);
+    if (server.pending_auth_challenge) |*pending| pending.deinit(alloc);
+    server.pending_auth_challenge = null;
+    server.auth_challenge_present.store(false, .release);
     credentials_transferred = true;
 }
 
@@ -15702,11 +16018,14 @@ test "legacy stdio initialization transitions are bounded and monotonic" {
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2024_11_05 }, .expected = .{ .accept = .v2024_11_05 } },
         .{ .offered = .v2025_06_18, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .accepted = .v2025_03_26 }, .expected = .{ .accept = .v2025_03_26 } },
         .{ .offered = .v2025_11_25, .observation = .connection_closed, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .connection_closed, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .{ .unsupported = null }, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2024_11_05 }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2025_11_25 }, .expected = .fail },
@@ -16201,7 +16520,7 @@ test "connectServer discovers and calls a modern NDJSON tool" {
         \\      exit 2
         \\      ;;
         \\    *'"method":"server/discover"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*'"io.modelcontextprotocol/clientCapabilities":{}'*)
-        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"Use echo."}}'
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"Use echo.","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-identity"}}}}'
         \\      ;;
         \\    *'"method":"tools/list"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*)
         \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","ttlMs":60000,"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
@@ -16225,6 +16544,15 @@ test "connectServer discovers and calls a modern NDJSON tool" {
     try std.testing.expectEqual(ServerState.ready, server.state);
     try std.testing.expectEqual(StdioProtocol.modern, server.stdio_protocol);
     try std.testing.expectEqualStrings("Use echo.", server.instructions.?);
+    try std.testing.expectEqualStrings("modern-identity", server.negotiated_server_name.?);
+    try std.testing.expectEqual(@as(?[]u8, null), server.negotiated_server_version);
+    const listing = try runtime.listServersAndTools(alloc);
+    defer alloc.free(listing);
+    try std.testing.expect(std.mem.find(
+        u8,
+        listing,
+        "negotiated_name=modern-identity negotiated_version=unavailable protocol=2026-07-28",
+    ) != null);
 
     const result = (try runtime.callToolByName(
         alloc,
@@ -16236,6 +16564,68 @@ test "connectServer discovers and calls a modern NDJSON tool" {
     try std.testing.expect(std.mem.find(u8, result.model_output, "modern echo") != null);
 
     server.disconnect();
+}
+
+test "server identity projection preserves independently optional modern fields" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        json: []const u8,
+        name: ?[]const u8,
+        version: ?[]const u8,
+    }{
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"modern-meta\",\"version\":\"2.0.0\"}}}}",
+            .name = "modern-meta",
+            .version = "2.0.0",
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"AWSKnowledgeMCP\",\"version\":\"\"}}}}",
+            .name = "AWSKnowledgeMCP",
+            .version = null,
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"name-only\"}}}",
+            .name = "name-only",
+            .version = null,
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"version\":\"1.2.3\"}}}",
+            .name = null,
+            .version = "1.2.3",
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            .name = null,
+            .version = null,
+        },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        const identity = try parseServerIdentity(parsed.value);
+        if (case.name) |expected| {
+            try std.testing.expectEqualStrings(expected, identity.name.?);
+        } else {
+            try std.testing.expect(identity.name == null);
+        }
+        if (case.version) |expected| {
+            try std.testing.expectEqualStrings(expected, identity.version.?);
+        } else {
+            try std.testing.expect(identity.version == null);
+        }
+    }
+
+    var invalid = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":1}}}",
+        .{},
+    );
+    defer invalid.deinit();
+    try std.testing.expectError(
+        error.McpInvalidResult,
+        parseServerIdentity(invalid.value),
+    );
 }
 
 test "modern MCP calls delegate unsupported schema assertions to the server" {
@@ -16267,15 +16657,16 @@ test "modern MCP calls delegate unsupported schema assertions to the server" {
     const server = &runtime.servers.items[0];
     try std.testing.expectEqual(ServerState.ready, server.state);
     try std.testing.expectEqual(@as(usize, 2), server.tool_catalog.tools.items.len);
-    try std.testing.expectEqual(
-        tool_mcp_runtime.ValidationResult.valid,
-        try runtime.validateToolArgumentsByName(
-            alloc,
-            "mcp_provider_provider_pattern",
-            \\{"email":"person@example.com"}
-            ,
-        ),
+    const valid = try runtime.validateToolArgumentsByName(
+        alloc,
+        "mcp_provider_provider_pattern",
+        \\{"email":"person@example.com"}
+        ,
     );
+    switch (valid) {
+        .valid => |generation| try std.testing.expectEqual(runtime.generation, generation),
+        .invalid, .not_available => return error.TestUnexpectedResult,
+    }
     try std.testing.expectError(
         error.McpInvalidToolArguments,
         runtime.callToolByName(
@@ -17296,7 +17687,7 @@ fn checkHealthSnapshotAllocationFailures(alloc: Allocator) !void {
     defer snapshot.deinit(alloc);
 }
 
-test "MCP health reads only immutable configuration during discovery" {
+test "MCP health reads only lock-free state during discovery" {
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
     defer runtime.deinit();
@@ -17334,7 +17725,7 @@ test "MCP health reads only immutable configuration during discovery" {
     try std.testing.expectEqual(@as(usize, 2), loading.servers.len);
     const loading_active = loading.servers[0];
     try std.testing.expectEqual(health.ConnectionState.connecting, loading_active.connection);
-    try std.testing.expectEqual(health.AuthenticationState.none, loading_active.authentication);
+    try std.testing.expectEqual(health.AuthenticationState.authenticated, loading_active.authentication);
     try std.testing.expectEqual(@as(?[]u8, null), loading_active.negotiated_name);
     try std.testing.expectEqual(@as(?[]u8, null), loading_active.negotiated_version);
     try std.testing.expectEqual(@as(?[]u8, null), loading_active.protocol_version);
@@ -18222,6 +18613,22 @@ test "scoped MCP cached tool and feature operations reject authority revoked aft
     );
 }
 
+test "MCP tool call rejects mismatched expected runtime generation before lookup" {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.callToolByNameWithOptions(
+            std.testing.allocator,
+            "mcp_fixture_echo",
+            "{}",
+            1024,
+            .{ .expected_runtime_generation = runtime.generation + 1 },
+        ),
+    );
+}
+
 test "MCP access snapshot excludes servers whose tools are denied" {
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
@@ -18703,6 +19110,78 @@ test "MCP metadata caps encoded descriptions and preserves ready-server tool ord
     try std.testing.expect(tiny.model_output.len > limits.mcp_search_result_bytes.effectiveBytes());
     try std.testing.expectEqual(@as(i64, expected.len), tiny_parsed.value.object.get("context_limit").?.object.get("omitted_count").?.integer);
     try std.testing.expect(tiny.notice != null);
+}
+
+test "runtime rejects source and workspace admission mismatches before installation" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    var missing: McpServerConfig = .{
+        .name = try alloc.dupe(u8, "missing"),
+        .source = .workspace,
+        .scope = .workspace,
+        .command = try alloc.dupe(u8, "cmd"),
+    };
+    try std.testing.expectError(error.McpConfigAdmissionMismatch, runtime.addServer(missing));
+    missing.deinit(alloc);
+
+    var synthetic: McpServerConfig = .{
+        .name = try alloc.dupe(u8, "synthetic"),
+        .source = .profile,
+        .scope = .profile,
+        .command = try alloc.dupe(u8, "cmd"),
+        .workspace_admission = .approved,
+    };
+    try std.testing.expectError(error.McpConfigAdmissionMismatch, runtime.addServer(synthetic));
+    synthetic.deinit(alloc);
+}
+
+test "interactive authentication requires approved workspace admission" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    for ([_]mcp_contract.WorkspaceAdmission{ .pending, .rejected, .approved }) |admission| {
+        const name = @tagName(admission);
+        try runtime.addServer(.{
+            .name = try alloc.dupe(u8, name),
+            .source = .workspace,
+            .scope = .workspace,
+            .transport = .http,
+            .url = try alloc.dupe(u8, "https://example.test/mcp"),
+            .workspace_admission = admission,
+        });
+    }
+
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.validateAuthenticationServer("pending"),
+    );
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.validateAuthenticationServer("rejected"),
+    );
+    try runtime.validateAuthenticationServer("approved");
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.listResources(
+            alloc,
+            "pending",
+            false,
+            null,
+            .unrestricted,
+        ),
+    );
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.listPrompts(
+            alloc,
+            "rejected",
+            null,
+            .unrestricted,
+        ),
+    );
 }
 
 test "tool schema uses prefixed name and call request uses raw name" {

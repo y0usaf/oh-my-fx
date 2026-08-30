@@ -299,6 +299,20 @@ pub const Result = union(enum) {
     }
 };
 
+pub inline fn failResult(err: anytype) @TypeOf(err)!Result {
+    return @errorCast(failResultDynamic(err));
+}
+
+noinline fn failResultDynamic(err: anyerror) anyerror!Result {
+    return err;
+}
+
+test "result failure writer preserves exact error type and identity" {
+    const failure = failResult(error.Cancelled);
+    try std.testing.expect(@TypeOf(failure) == error{Cancelled}!Result);
+    try std.testing.expectError(error.Cancelled, failure);
+}
+
 pub const StreamFn = *const fn (
     context: ?*anyopaque,
     alloc: Allocator,
@@ -316,7 +330,7 @@ pub const Provider = struct {
 };
 
 fn unavailableStream(_: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Result {
-    return error.AgentStreamProviderUnavailable;
+    return failResult(error.AgentStreamProviderUnavailable);
 }
 
 pub const unavailable_provider = Provider{

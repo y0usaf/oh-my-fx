@@ -33,6 +33,7 @@ const FakeGateway = test_support.FakeGateway;
 const FakeAgentRuntimeDeps = test_support.FakeAgentRuntimeDeps;
 const ModelCapabilityOverride = test_support.ModelCapabilityOverride;
 const PromptFixture = test_support.PromptFixture;
+const ToolExecutionOverride = test_support.ToolExecutionOverride;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 const ExecuteDelegate = test_support.ExecuteDelegate;
 const ToolExecutionRequest = runtime_tool_contracts.ToolExecutionRequest;
@@ -6205,4 +6206,95 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     try std.testing.expect(std.mem.find(u8, trace, "super secret file contents") == null);
     try std.testing.expect(std.mem.find(u8, trace, "secret.txt") == null);
     try std.testing.expect(std.mem.find(u8, trace, "abc123") == null);
+}
+
+test "processQueuedPrompt assigns trace lineage to subagent runs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "subagent-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "agent");
+
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.origin = .subagent;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    debug_trace.shutdown();
+
+    const trace = try readTraceFile(alloc, trace_path, 65536);
+    defer alloc.free(trace);
+    const prompt_start = std.mem.find(u8, trace, "event=prompt_start") orelse
+        return error.TestExpectedEqual;
+    const prompt_line_end = std.mem.findScalarPos(u8, trace, prompt_start, '\n') orelse
+        trace.len;
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace[prompt_start..prompt_line_end],
+        "subagent_id=",
+    ) != null);
+}
+
+test "processQueuedPrompt trace emits one canonical result for tool execution errors" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "tool-error-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "tool");
+
+    const calls = [_]ToolCall{toolCall("call_error", "read_file", "{\"path\":\"missing.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls, .finish_reason = .tool_calls },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const FailingExecution = struct {
+        fn execute(_: *anyopaque, _: ToolExecutionRequest) !ToolExecutionResult {
+            return error.SystemResources;
+        }
+    };
+    var override_context: u8 = 0;
+    hooks.tool_execution_override = ToolExecutionOverride{
+        .context = &override_context,
+        .execute_fn = FailingExecution.execute,
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFile(alloc, trace_path, 65536);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(trace, "event=after_tool_execution"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(trace, "event=execution_result"),
+    );
+    try std.testing.expect(std.mem.find(u8, trace, "err=SystemResources") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "model_output_bytes=") != null);
 }

@@ -64,9 +64,11 @@ async function disablePromptHistory(
 ): Promise<void> {
   await session.sendText("/settings");
   await session.waitForText("←→ Change", TIMEOUT);
-  for (let index = 0; index < 10; index += 1) {
-    await session.sendKeys("Down");
-  }
+  await session.sendLiteral("prompt history");
+  await session.waitForPane(
+    (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
+    TIMEOUT,
+  );
   await session.sendKeys("Left");
   const deadline = Date.now() + TIMEOUT;
   let enabled: unknown;
@@ -494,7 +496,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/output quiet");
-        await session.waitForText("Fx needs access to Vercel AI Gateway", TIMEOUT);
+        await session.waitForText("fx needs access to Vercel AI Gateway", TIMEOUT);
         expect(composerContains(await session.capturePane(), "/output quiet")).toBe(
           true,
         );

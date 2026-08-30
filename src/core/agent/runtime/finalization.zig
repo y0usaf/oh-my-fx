@@ -87,8 +87,7 @@ pub const TurnFinalizationGuard = struct {
         }
     }
 
-    fn cleanup_agent_terminal_leases(self: *TurnFinalizationGuard) !void {
-        var first_error: ?anyerror = null;
+    fn cleanup_agent_terminal_leases(self: *TurnFinalizationGuard) void {
         for (self.agent_terminal_leases.items) |session_id| {
             self.deps.release_agent_terminal_lease(
                 self.deps.ctx,
@@ -99,10 +98,8 @@ pub const TurnFinalizationGuard = struct {
                     "turn lease cleanup failed turn_id={d} session_id={s} err={s}",
                     .{ self.turn_id, session_id, @errorName(err) },
                 );
-                if (first_error == null) first_error = err;
             };
         }
-        if (first_error) |err| return err;
     }
 
     pub fn finish(
@@ -123,13 +120,7 @@ pub const TurnFinalizationGuard = struct {
             return;
         }
 
-        self.cleanup_agent_terminal_leases() catch |err| {
-            self.state = .fatal;
-            if (finished_prompt) |finished| {
-                types.freeFinishedPrompt(std.heap.c_allocator, finished);
-            }
-            return err;
-        };
+        self.cleanup_agent_terminal_leases();
 
         self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
             self.state = .fatal;
@@ -166,16 +157,18 @@ pub fn finishAssistantTerminalWithExecution(
     finish_trace: *PromptFinishTrace,
     trace_outcome: []const u8,
 ) !void {
-    const turn: HistoryTurn = .{ .assistant = .{
+    const completed_summary = summary.finish();
+    var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(assistant_text),
         .execution = execution,
     } };
+    types.setHistoryTurnSummary(&turn, completed_summary);
     const finished = try types.dupeFinishedPrompt(
         std.heap.c_allocator,
         .{
             .turn = turn,
-            .summary = summary.finish(),
+            .summary = completed_summary,
         },
     );
 

@@ -861,12 +861,12 @@ pub fn Runtime(comptime App: type) type {
                     if (should_emit) {
                         const body = try types.renderContextNoticeBody(app.alloc, notice);
                         defer app.alloc.free(body);
-                        try app.writeDomainNotice(.{
+                        app.writeDomainNotice(.{
                             .topic = "context",
                             .tone = .warning,
                             .body = body,
                             .visibility = .full_only,
-                        }, true);
+                        }, true) catch return error.WriteFailed;
                     }
                 }
             }
@@ -1293,7 +1293,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
     test_builtin_tools.terminal,
     test_builtin_tools.memory,
-    test_builtin_tools.semantic_search,
+    test_builtin_tools.grep_files,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
@@ -2214,38 +2214,6 @@ test "tool labels preserve memory action value and invalid argument fallback" {
     };
     const invalid = try app.describeToolAction(arena, invalid_call);
     try std.testing.expect(std.mem.find(u8, invalid, "Working") != null);
-}
-
-test "tool labels preserve semantic_search query value and default fallback" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const search_call: ToolCall = .{
-        .id = "semantic_search",
-        .name = "semantic_search",
-        .arguments_json = "{\"query\":\"state machines\"}",
-    };
-    const active = try app.describeToolAction(arena, search_call);
-    try std.testing.expect(std.mem.find(u8, active, "Searching") != null);
-    try std.testing.expect(std.mem.find(u8, active, "state machines") != null);
-
-    const completed = try app.describeToolActionCompleted(arena, search_call);
-    try std.testing.expect(std.mem.find(u8, completed, "Searched") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "state machines") != null);
-
-    const defaulted_call: ToolCall = .{
-        .id = "semantic_search_default",
-        .name = "semantic_search",
-        .arguments_json = "{\"query\":3}",
-    };
-    const defaulted = try app.describeToolAction(arena, defaulted_call);
-    try std.testing.expect(std.mem.find(u8, defaulted, "Searching") != null);
-    try std.testing.expect(std.mem.find(u8, defaulted, "query") != null);
 }
 
 test "native web_search labels preserve bounded query and domain filters" {

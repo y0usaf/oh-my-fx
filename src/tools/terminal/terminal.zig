@@ -1005,6 +1005,23 @@ fn buildRequest(
     return .{ .value = request, .authority = authority };
 }
 
+inline fn failActionRequest(err: anytype) @TypeOf(err)!contracts.ActionRequest {
+    return @errorCast(failActionRequestDynamic(err));
+}
+
+noinline fn failActionRequestDynamic(err: anyerror) anyerror!contracts.ActionRequest {
+    return err;
+}
+
+test "terminal action request failures preserve exact error types and identities" {
+    const invalid = failActionRequest(error.InvalidRequest);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidRequest}!contracts.ActionRequest,
+    );
+    try std.testing.expectError(error.InvalidRequest, invalid);
+    try std.testing.expectError(error.OutOfMemory, failActionRequest(error.OutOfMemory));
+}
+
 fn buildAuthorizedRequest(
     arena: Allocator,
     input: *const Input,
@@ -1017,7 +1034,8 @@ fn buildAuthorizedRequest(
         .read => .{ .read = .{
             .session_id = session_id,
             .cursor = .{
-                .segment = input.cursor_segment orelse return error.InvalidRawCursor,
+                .segment = input.cursor_segment orelse
+                    return failActionRequest(error.InvalidRawCursor),
                 .offset = input.cursor_offset orelse 0,
             },
             .authority = authority,
@@ -1029,7 +1047,8 @@ fn buildAuthorizedRequest(
         .write => .{ .write = .{
             .session_id = session_id,
             .payload = if (input.write) |write|
-                try buildWritePayload(arena, write)
+                buildWritePayload(arena, write) catch |err|
+                    return failActionRequest(err)
             else
                 null,
             .lease = input.lease,
@@ -1037,17 +1056,18 @@ fn buildAuthorizedRequest(
         } },
         .wait => .{ .wait = .{
             .session_id = session_id,
-            .return_when = try buildReturnCondition(input.return_when orelse
-                return error.MissingReturnCondition),
+            .return_when = buildReturnCondition(input.return_when orelse
+                return failActionRequest(error.MissingReturnCondition)) catch |err|
+                return failActionRequest(err),
             .safety_ceiling_ms = input.wait_ceiling_ms orelse
-                return error.MissingWaitCeiling,
+                return failActionRequest(error.MissingWaitCeiling),
             .authority = authority,
         } },
         .monitor => .{ .monitor = .{
             .session_id = session_id,
-            .operation = try buildMonitorOperation(
-                input.monitor orelse return error.InvalidMonitor,
-            ),
+            .operation = buildMonitorOperation(input.monitor orelse
+                return failActionRequest(error.InvalidMonitor)) catch |err|
+                return failActionRequest(err),
             .authority = authority,
         } },
         .inspect => .{ .inspect = .{
@@ -1061,19 +1081,23 @@ fn buildAuthorizedRequest(
         .resize => .{ .resize = .{
             .session_id = session_id,
             .dimensions = .{
-                .rows = input.rows orelse return error.InvalidDimensions,
-                .columns = input.columns orelse return error.InvalidDimensions,
+                .rows = input.rows orelse
+                    return failActionRequest(error.InvalidDimensions),
+                .columns = input.columns orelse
+                    return failActionRequest(error.InvalidDimensions),
             },
             .authority = authority,
         } },
         .signal => .{ .signal = .{
             .session_id = session_id,
-            .signal = input.signal orelse return error.InvalidRequest,
+            .signal = input.signal orelse
+                return failActionRequest(error.InvalidRequest),
             .authority = authority,
         } },
         .close => .{ .close = .{
             .session_id = session_id,
-            .policy = input.close_policy orelse return error.InvalidRequest,
+            .policy = input.close_policy orelse
+                return failActionRequest(error.InvalidRequest),
             .authority = authority,
         } },
     };

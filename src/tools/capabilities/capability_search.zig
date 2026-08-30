@@ -1,6 +1,7 @@
 const std = @import("std");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
 const result_store = @import("../../core/session/result_store.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const skill_search = @import("../skills/skill_search.zig");
@@ -8,15 +9,7 @@ const skill_search = @import("../skills/skill_search.zig");
 const Allocator = std.mem.Allocator;
 const mcp_result_limit: usize = 8;
 
-const Input = struct {
-    query: []u8,
-    prepared: lexical_relevance.PreparedQuery,
-
-    fn deinit(self: *Input, alloc: Allocator) void {
-        alloc.free(self.query);
-        self.* = undefined;
-    }
-};
+const Input = tool_args.OwnedSearchQueryInput;
 
 const ProjectionCheck = union(enum) {
     valid,
@@ -30,42 +23,10 @@ pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return failure(ctx.allocator, "capability_search arguments must be valid JSON"),
+    return switch (try tool_args.decodeOwnedSearchQuery(ctx.allocator, args_json, "capability_search")) {
+        .failure => |body| .{ .failure = body },
+        .input => |input| .{ .input = .{ .ptr = input, .deinit_fn = tool_args.destroyOwnedSearchQueryInput } },
     };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return failure(ctx.allocator, "capability_search arguments must be an object");
-    }
-    const query_value = parsed.value.object.get("query") orelse {
-        return failure(ctx.allocator, "capability_search field \"query\" is required");
-    };
-    if (query_value != .string) {
-        return failure(ctx.allocator, "capability_search field \"query\" must be a string");
-    }
-    if (query_value.string.len > lexical_relevance.max_query_bytes) {
-        return failure(ctx.allocator, "capability_search query must not exceed 4096 bytes");
-    }
-
-    const query = try ctx.allocator.dupe(u8, query_value.string);
-    errdefer ctx.allocator.free(query);
-    const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
-        error.QueryTooLong => unreachable,
-        error.TooManyTokens => {
-            const result = try failure(
-                ctx.allocator,
-                "capability_search query must not exceed 64 tokens",
-            );
-            ctx.allocator.free(query);
-            return result;
-        },
-    };
-    const input = try ctx.allocator.create(Input);
-    errdefer ctx.allocator.destroy(input);
-    input.* = .{ .query = query, .prepared = prepared };
-    return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
 }
 
 pub fn validate(
@@ -118,16 +79,6 @@ pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
 
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
-}
-
-fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
-    const input: *Input = @ptrCast(@alignCast(ptr));
-    input.deinit(alloc);
-    alloc.destroy(input);
-}
-
-fn failure(alloc: Allocator, message: []const u8) Allocator.Error!tool_dispatch.DecodeResult {
-    return .{ .failure = try alloc.dupe(u8, message) };
 }
 
 fn executionFailure(

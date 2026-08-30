@@ -172,8 +172,22 @@ pub const ToolLifecycleEvent = union(enum) {
     turn_finished: TurnFinished,
 };
 
+pub const TurnPhase = enum {
+    thinking,
+    generating,
+    running,
+};
+
+pub const TurnPhaseUpdate = struct {
+    turn_id: u64,
+    step_id: u64,
+    phase: TurnPhase,
+};
+
 pub const StreamState = struct {
     active: bool = false,
+    phase: TurnPhase = .thinking,
+    phase_step_id: u64 = 0,
     chunks: usize = 0,
     read_count: usize = 0,
     list_count: usize = 0,
@@ -184,22 +198,13 @@ pub const StreamState = struct {
     subagent_count: usize = 0,
     token_progress: TurnTokenProgress = .{},
     last_activity_kind: ?ToolActivityKind = null,
-    /// When the turn started; 0 hides the Thinking elapsed counter and its
-    /// wall-clock blink. Monotonic for the whole turn: tool boundaries never
-    /// reset it.
+    /// When the turn started; 0 hides the elapsed counter and activity blink.
+    /// Monotonic for the whole turn: phase and tool boundaries never reset it.
     turn_started_ms: i64 = 0,
     /// When fx started waiting on user input (approval or question); 0 means
-    /// not waiting. While set, the Thinking clock freezes at this instant;
+    /// not waiting. While set, the turn clock freezes at this instant;
     /// on resume the wait is excluded by shifting turn_started_ms forward.
     waiting_since_ms: i64 = 0,
-    /// Assistant text reached the transcript in the current stretch: the
-    /// status row stays with the response instead of flipping back to Thinking
-    /// whenever the pacer catches up. A tool start opens the next stretch.
-    assistant_text_started: bool = false,
-    /// The model is streaming tool arguments that open no status row of their
-    /// own, so the turn is producing output the transcript cannot show yet.
-    /// Cleared as soon as assistant text resumes or the tool itself starts.
-    composing_tool_payload: bool = false,
 };
 
 pub const RouteRecoveryUnsafeReason = enum {
@@ -914,9 +919,12 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
+    /// User guidance consumed between model steps, in presentation order.
+    steering: [][]u8 = &.{},
+    turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
-        return self.tool_steps.len == 0 and self.files.len == 0;
+        return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
     }
 };
 
@@ -995,6 +1003,8 @@ pub const ToolUsage = struct {
 };
 
 pub const TurnSummary = struct {
+    started_at_ms: i64 = 0,
+    completed_at_ms: i64 = 0,
     thinking_duration_ms: u64 = 0,
     turn_duration_ms: u64 = 0,
     token_progress: TurnTokenProgress = .{},
@@ -1558,6 +1568,24 @@ pub const HistoryTurn = union(enum) {
     interrupted: InterruptedHistoryTurn,
 };
 
+pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
+    switch (turn.*) {
+        .assistant => |*entry| entry.execution.turn_summary = summary,
+        .background_command => |*entry| entry.execution.turn_summary = summary,
+        .interrupted => |*entry| entry.execution.turn_summary = summary,
+        .compacted_summary => {},
+    }
+}
+
+pub fn historyTurnSummary(turn: HistoryTurn) ?TurnSummary {
+    return switch (turn) {
+        .assistant => |entry| entry.execution.turn_summary,
+        .background_command => |entry| entry.execution.turn_summary,
+        .interrupted => |entry| entry.execution.turn_summary,
+        .compacted_summary => null,
+    };
+}
+
 pub const FinishedPromptProjection = enum {
     history_default,
     assistant_text,
@@ -2014,15 +2042,20 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const tool_steps = try dupeToolExecutionSteps(alloc, memory.tool_steps);
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
+    errdefer freeFileEvidenceSlice(alloc, files);
+    const steering = try dupePermissionFeedback(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
+        .steering = steering,
+        .turn_summary = memory.turn_summary,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
+    freePermissionFeedback(alloc, memory.steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {

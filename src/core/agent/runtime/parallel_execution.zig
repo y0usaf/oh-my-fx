@@ -18,12 +18,10 @@ pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
 
     const tool = registry.lookup(call.name) orelse return false;
     return switch (tool.executor_kind) {
-        .list_files, .glob_files => tool.activity_kind == .list,
+        .glob_files => tool.activity_kind == .list,
         .read_file,
         .read_tool_result,
-        .semantic_search,
         .grep_files,
-        .file_info,
         .skill,
         .web_fetch,
         .web_search,
@@ -574,7 +572,7 @@ test "parallel read-only execution preserves order and failure fan-in" {
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
         toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "file_info", "{\"path\":\"c\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output", .delay_ms = 20 },
@@ -603,7 +601,7 @@ test "parallel read-only execution preserves exact cancelled identity and comple
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
         toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "file_info", "{\"path\":\"c\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output", .delay_ms = 10 },
@@ -650,7 +648,7 @@ test "parallel read-only execution does not relabel earlier ordinary cancellatio
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
         toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "file_info", "{\"path\":\"c\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .err = error.Cancelled, .delay_ms = 1 },
