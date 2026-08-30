@@ -731,10 +731,10 @@ describe("gateway stream lifecycle", () => {
       expect(serializedToolNames(oracleRequest)).toEqual(
         AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(25);
+      expect(request.tools).toHaveLength(17);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [22],
+        providerToolIndices: [14],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");
@@ -1235,21 +1235,9 @@ describe("gateway stream lifecycle", () => {
         );
         expect(full).toContain("● Context:");
         expect(full).not.toContain("[context]");
-        const reviewGrid = await tui.capturePaneGrid();
-        const reviewNavigationRow = reviewGrid.findIndex((row) =>
-          row.includes("┃ Review · ←/→ switch · ctrl o close")
-        );
-        expect(reviewNavigationRow).toBeGreaterThan(0);
-        expect(reviewGrid[reviewNavigationRow - 1]!.trim()).toBe("");
-
-        await tui.sendKeys("Right");
-        await tui.waitForPane(
-          (text) => text.includes("Full detail · ←/→ switch · ctrl o close"),
-          15_000,
-        );
         const fullGrid = await tui.capturePaneGrid();
         const fullNavigationRow = fullGrid.findIndex((row) =>
-          row.includes("┃ Full detail · ←/→ switch · ctrl o close")
+          row.includes("┃ Full detail · ctrl o close")
         );
         expect(fullNavigationRow).toBeGreaterThan(0);
         expect(fullGrid[fullNavigationRow - 1]!.trim()).toBe("");
@@ -1283,11 +1271,6 @@ describe("gateway stream lifecycle", () => {
         );
         expect(finalFull.split("project instruction file").length - 1).toBe(1);
         expect(finalFull.split("skill catalog omitted").length - 1).toBe(1);
-        await tui.sendKeys("Right");
-        await tui.waitForPane(
-          (text) => text.includes("Full detail · ←/→ switch · ctrl o close"),
-          15_000,
-        );
         await tui.sendKeys("C-o");
 
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1406,11 +1389,6 @@ describe("gateway stream lifecycle", () => {
         expect(full.indexOf("reason=oversized rule file")).toBeLessThan(
           full.indexOf("reason=selection cap"),
         );
-        await tui.sendKeys("Right");
-        await tui.waitForPane(
-          (text) => text.includes("Full detail · ←/→ switch · ctrl o close"),
-          15_000,
-        );
         await tui.sendKeys("C-o");
         await tui.waitForPane(
           (text) =>
@@ -1505,11 +1483,6 @@ describe("gateway stream lifecycle", () => {
         );
         expect(full).toContain("● Context:");
         expect(full).not.toContain("[context]");
-        await tui.sendKeys("Right");
-        await tui.waitForPane(
-          (text) => text.includes("Full detail · ←/→ switch · ctrl o close"),
-          15_000,
-        );
         await tui.sendKeys("C-o");
         await tui.waitForPane(
           (text) =>
@@ -2158,7 +2131,7 @@ describe("gateway stream lifecycle", () => {
           'data: {"type":"tool-input-start","id":"call_1","toolName":"read_file"}\n\n' +
             'data: {"type":"tool-input-delta","id":"call_1","delta":"{\\"path\\":\\"victim.txt\\"}"}\n\n' +
             'data: {"type":"tool-input-end","id":"call_1"}\n\n' +
-            'data: {"type":"tool-call","toolCallId":"call_1","toolName":"delete_file"}\n\n' +
+            'data: {"type":"tool-call","toolCallId":"call_1","toolName":"edit_file"}\n\n' +
             'data: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"}}\n\n' +
             "data: [DONE]\n\n",
         );
@@ -2182,7 +2155,7 @@ describe("gateway stream lifecycle", () => {
 
       expect(existsSync(victimPath)).toBe(true);
       expect(json.tool_calls).not.toContainEqual({
-        name: "delete_file",
+        name: "edit_file",
         status: "success",
       });
     } finally {
@@ -2245,7 +2218,7 @@ describe("gateway stream lifecycle", () => {
           toolCallId: MALFORMED_CALL_ID,
           toolName: MALFORMED_TOOL_NAME,
           output: expect.objectContaining({
-            type: "text",
+            type: "error-text",
             value: expect.stringContaining("tool_execution_failed"),
           }),
         }),
@@ -2607,8 +2580,8 @@ describe("gateway stream lifecycle", () => {
     mkdirSync(blockedPath);
     chmodSync(blockedPath, 0);
     const responses = [
-      fakeGatewayToolCall("os_access_denial_context", "list_files", { path: blockedPath }),
-      fakeGatewayToolCall(callId, "list_files", { path: blockedPath }),
+      fakeGatewayToolCall("os_access_denial_context", "glob_files", { pattern: "*", path: blockedPath }),
+      fakeGatewayToolCall(callId, "glob_files", { pattern: "*", path: blockedPath }),
       fakeGatewayFinalText("Reported the operating-system access denial."),
     ];
     const gateway = startGateway(() =>
@@ -2632,16 +2605,16 @@ describe("gateway stream lifecycle", () => {
       const resultPart = parts.find((part) =>
         part.type === "tool-result" &&
         part.toolCallId === callId &&
-        part.toolName === "list_files"
+        part.toolName === "glob_files"
       );
       const output = contentText(resultPart?.output);
 
       expect(result.code).toBe(0);
-      expect(result.stderr).toContain(`Listing ${blockedPath}`);
+      expect(result.stderr).toContain("Matching *");
       expect(json.error).toBeUndefined();
       expect(gateway.requestCount()).toBe(3);
       expect(output).toContain("tool_execution_failed");
-      expect(output).toContain("list_files");
+      expect(output).toContain("glob_files");
       expect(output).toContain(blockedPath);
       expect(output).toContain("AccessDenied");
       expect(output).toContain("Do not retry");
@@ -2855,6 +2828,14 @@ describe("gateway stream lifecycle", () => {
         expect.objectContaining({ input: { request: {} } }),
       );
       expect(historicalResults).toHaveLength(1);
+      expect(historicalResults[0]).toEqual(
+        expect.objectContaining({
+          output: expect.objectContaining({
+            type: "error-text",
+            value: expect.stringContaining("tool_execution_failed"),
+          }),
+        }),
+      );
       expect(gateway.requests[2].body).toContain("tool_execution_failed");
       expect(gateway.requests[2].body).not.toContain(malformedArguments);
       const resumeTrace = readFileSync(resumeTracePath, "utf8");
@@ -2920,6 +2901,157 @@ describe("gateway stream lifecycle", () => {
       );
       expect(result.stderr).not.toContain("SIGKILL");
       expect(readFileSync(outputPath, "utf8")).toBe(`${payload}\n`);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("indeterminate terminal termination reports one truthful result without replaying effects", async () => {
+    const root = createFixtureRoot("terminal-indeterminate-outcome");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "command-effect.txt");
+    const callId = "terminal_indeterminate_1";
+    let observedFailure = "";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(callId, "terminal", {
+            action: "exec",
+            command: "printf 'effect\\n' >> command-effect.txt",
+            timeout_ms: 30_000,
+          });
+        case 1:
+          observedFailure = toolResultOutput(body, callId);
+          return fakeGatewayFinalText("Indeterminate command outcome acknowledged without retry.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the mutation exactly once."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT: "1",
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        exit_code: number;
+        output: string;
+        tool_calls: Array<{
+          name: string;
+          status: string;
+          command_result?: { termination_indeterminate?: boolean };
+        }>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toContain("acknowledged without retry");
+      expect(gateway.requestCount()).toBe(2);
+      expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
+      expect(observedFailure).toContain("could not be confirmed");
+      expect(observedFailure).toContain("Do not retry");
+      expect(observedFailure).not.toContain("Unexpected");
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "terminal",
+        status: "error",
+        command_result: { termination_indeterminate: true },
+      });
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination became indeterminate",
+      );
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("suffixless stored result handle remains readable", async () => {
+    const root = createFixtureRoot("suffixless-tool-result-handle");
+    const tracePath = join(root.root, "trace.log");
+    const readFileCallId = "suffixless_handle_read_file_1";
+    const readResultCallId = "suffixless_handle_read_result_1";
+    const needle = "E2E_SUFFIX_NEEDLE";
+    const lines = Array.from(
+      { length: 500 },
+      (_, index) => `fixture line ${index.toString().padStart(3, "0")}: ${"x".repeat(72)}`,
+    );
+    lines[300] = needle;
+    writeFileSync(join(root.workspace, "large-result.txt"), `${lines.join("\n")}\n`);
+
+    let step = 0;
+    let canonicalHandle = "";
+    let suffixlessHandle = "";
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(readFileCallId, "read_file", {
+            path: "large-result.txt",
+          });
+        case 1: {
+          const output = toolResultOutput(body, readFileCallId);
+          const match = output.match(
+            /<tool_result_handle>([^<]+)<\/tool_result_handle>/,
+          );
+          canonicalHandle = match?.[1] ?? "";
+          expect(canonicalHandle.endsWith(".txt")).toBe(true);
+          suffixlessHandle = canonicalHandle.slice(0, -4);
+          return fakeGatewayToolCall(readResultCallId, "read_tool_result", {
+            handle: suffixlessHandle,
+            query: needle,
+          });
+        }
+        case 2: {
+          const output = toolResultOutput(body, readResultCallId);
+          expect(output).toContain(needle);
+          expect(output).toContain(
+            `<tool_result_query handle="${canonicalHandle}">`,
+          );
+          return fakeGatewayFinalText("Suffixless result handle inspected.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Inspect the retained large result."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const sessionRoot = join(root.home, ".fx", "sessions", json.session_id);
+
+      expect(result.code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toContain("Suffixless result handle inspected.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.tool_calls).toContainEqual({ name: "read_file", status: "success" });
+      expect(json.tool_calls).toContainEqual({
+        name: "read_tool_result",
+        status: "success",
+      });
+      expect(existsSync(join(sessionRoot, "tool-results", canonicalHandle))).toBe(true);
+      const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
+      expect(sessionEvents).toContain(suffixlessHandle);
+      expect(sessionEvents).toContain(canonicalHandle);
+      expect(sessionEvents).toContain(needle);
+      expect(result.stderr).not.toContain("ResultHandleNotFound");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

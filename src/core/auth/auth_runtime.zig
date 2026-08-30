@@ -803,6 +803,46 @@ pub const Runtime = struct {
         };
     }
 
+    /// Fieldwise initialization avoids retaining inactive credential and
+    /// worker payloads in a static release-binary template.
+    pub fn initInto(
+        storage: *Self,
+        validator: api_key_validator.Provider,
+        transport: oauth_transport.Provider,
+        secret_store: host.SecretStore,
+    ) void {
+        comptime {
+            if (std.meta.fields(Self).len != 24) {
+                @compileError("update Runtime.initInto for the changed field set");
+            }
+        }
+        storage.* = undefined;
+        storage.api_key_validator = validator;
+        storage.oauth_transport = transport;
+        storage.secret_store = secret_store;
+        storage.selected_credential = null;
+        storage.credential_refresh_failure_source = null;
+        storage.source_inventory = .empty;
+        storage.stored_key_status = .not_attempted;
+        storage.onboarding_skipped = false;
+        storage.picker_active = false;
+        storage.picker_selection = null;
+        storage.picker_include_skip = false;
+        storage.picker_stage = .root;
+        storage.provider_picker_active = .gateway;
+        storage.fx_login_session_available = false;
+        storage.team_selection = null;
+        storage.team_query = .empty;
+        storage.sign_in_flow = .{};
+        storage.sign_in_source = .fx_login;
+        storage.sign_in_returns_to_root = false;
+        storage.sign_in_code_visible = false;
+        storage.sign_in_code_input = .empty;
+        storage.api_key_input = .empty;
+        storage.api_key_returns_to_root = false;
+        storage.api_key_save = .{};
+    }
+
     pub fn deinit(self: *Self, alloc: Allocator) void {
         self.api_key_save.deinit(alloc);
         self.sign_in_flow.deinit(alloc);
@@ -1752,6 +1792,30 @@ pub const Runtime = struct {
     }
 };
 
+test "auth in-place initialization preserves empty runtime state" {
+    var runtime: Runtime = undefined;
+    Runtime.initInto(
+        &runtime,
+        api_key_validator.unavailable_provider,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+    );
+    defer runtime.deinit(std.testing.allocator);
+
+    try std.testing.expect(runtime.selected_credential == null);
+    try std.testing.expect(runtime.credential_refresh_failure_source == null);
+    try std.testing.expect(runtime.source_inventory.count() == 0);
+    try std.testing.expect(runtime.stored_key_status == .not_attempted);
+    try std.testing.expect(!runtime.picker_active);
+    try std.testing.expect(runtime.picker_selection == null);
+    try std.testing.expect(runtime.picker_stage == .root);
+    try std.testing.expect(runtime.provider_picker_active == .gateway);
+    try std.testing.expect(runtime.team_selection == null);
+    try std.testing.expect(runtime.team_query.items.len == 0);
+    try std.testing.expect(runtime.sign_in_code_input.items.len == 0);
+    try std.testing.expect(runtime.api_key_input.items.len == 0);
+}
+
 fn probeCredentialSource(raw_context: ?*anyopaque, alloc: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
     return credentials.sourceExists(alloc, self.secret_store, source);
@@ -2085,7 +2149,7 @@ test "auth runtime exposes one current Gateway credential for prompt admission" 
     try std.testing.expectEqual(credentials.Source.fx_login, gateway_credential.source);
 }
 
-test "auth runtime withholds an Fx credential across its expiry boundary" {
+test "auth runtime withholds an fx credential across its expiry boundary" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);

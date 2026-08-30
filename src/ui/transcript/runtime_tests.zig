@@ -1223,7 +1223,7 @@ fn createProductionCappedFoldedRecoveryTransition(
         .owned_top_row = initial_owned_top,
         .max_transcript_bytes = 2 * 1024 * 1024,
         .max_retained_transcript_bytes = 2 * 1024 * 1024,
-        .full_transcript = .{ .depth = .review },
+        .full_transcript = .{ .depth = .full },
     };
     defer runtime.deinit(alloc);
     try runtime.enableShadowVt(alloc);
@@ -2598,7 +2598,7 @@ test "folded inexact growth advances only materialized viewport rows" {
             content_bottom,
         ),
         .owned_top_row = initial_owned_top,
-        .full_transcript = .{ .depth = .review },
+        .full_transcript = .{ .depth = .full },
     };
     defer runtime.deinit(alloc);
     try runtime.enableShadowVt(alloc);
@@ -4237,7 +4237,7 @@ test "zero measured reverse restores folded source origin without endpoint" {
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(24, 12, 8),
         .owned_top_row = 1,
-        .full_transcript = .{ .depth = .review },
+        .full_transcript = .{ .depth = .full },
     };
     defer runtime.deinit(alloc);
     try runtime.folded_command_blocks.append(alloc, .{
@@ -4275,7 +4275,7 @@ test "zero measured reverse restores folded source origin with inexact endpoint 
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(24, 12, 8),
         .owned_top_row = 1,
-        .full_transcript = .{ .depth = .review },
+        .full_transcript = .{ .depth = .full },
     };
     defer runtime.deinit(alloc);
     try runtime.folded_command_blocks.append(alloc, .{
@@ -4363,7 +4363,7 @@ test "measured history origin matrix restores hard soft wide and folded sources"
         var runtime = TranscriptRuntime{
             .layout = transcriptTestLayout(case.source_cols, 12, 8),
             .owned_top_row = 1,
-            .full_transcript = .{ .depth = if (case.folded) .review else .inline_mode },
+            .full_transcript = .{ .depth = if (case.folded) .full else .inline_mode },
         };
         defer runtime.deinit(alloc);
         if (case.folded) {
@@ -5083,7 +5083,7 @@ test "measured resize releases one physical boundary row" {
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(20, 8, 4),
         .owned_top_row = 1,
-        .full_transcript = .{ .depth = .review },
+        .full_transcript = .{ .depth = .full },
     };
     defer runtime.deinit(alloc);
     try runtime.enableShadowVt(alloc);
@@ -7684,8 +7684,8 @@ test "attempt source projections leave transcript runtime and commit state uncha
 
 fn checkPrepareTranscriptSourceAllocationFailures(alloc: Allocator) !void {
     const welcome =
-        "Fx welcome banner line one\n" ++
-        "Fx welcome banner line two\n";
+        "fx welcome banner line one\n" ++
+        "fx welcome banner line two\n";
     const summary = "● 2 command lines folded\n";
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(24, 10, 6),
@@ -7817,7 +7817,7 @@ test "tail-capped raw fallback rebases retained folded indices and invalidates r
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(40, 10, 6),
         .owned_top_row = 1,
-        .full_transcript = .{ .depth = .review },
+        .full_transcript = .{ .depth = .full },
     };
     defer runtime.deinit(alloc);
 
@@ -8558,7 +8558,7 @@ test "full transcript paint replaces the fold summary with captured lines" {
     try runtime.folded_command_blocks.append(alloc, .{ .summary_transcript_index = 2 });
     try runtime.folded_command_blocks.items[0].lines.append(alloc, .{ .stream = .stdout, .text = try alloc.dupe(u8, "hidden-1") });
     try runtime.folded_command_blocks.items[0].lines.append(alloc, .{ .stream = .stderr, .text = try alloc.dupe(u8, "hidden-2") });
-    runtime.full_transcript.depth = .review;
+    runtime.full_transcript.depth = .full;
 
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
@@ -8623,7 +8623,7 @@ test "source-less surface paint keeps transcript lines one to one under full tra
 
     try runtime.transcript.appendSlice(alloc, "a\nsummary\nb\n");
     try runtime.folded_command_blocks.append(alloc, .{ .summary_transcript_index = 2 });
-    runtime.full_transcript.depth = .review;
+    runtime.full_transcript.depth = .full;
 
     var metrics: Metrics = .{};
     var prepared = try runtime.prepareTranscriptSurfacePaintForArea(
@@ -8851,7 +8851,7 @@ test "command output stores terminal-safe text for live consolidated and full tr
 
     runtime.has_committed_frame = true;
     runtime.owned_top_row = 5;
-    try std.testing.expect(try runtime.setTranscriptPresentationDepth(alloc, .review));
+    try std.testing.expect(try runtime.setTranscriptPresentationDepth(alloc, .full));
     var projection = try full_transcript_screen.buildProjection(
         alloc,
         runtime.entries.items,
@@ -10834,7 +10834,7 @@ fn setup_user_prompt_card_admission_runtime(
     runtime.replaceable_start = 1;
     runtime.replaceable_row = 2;
     runtime.transcript_cache_origin_untrimmed = true;
-    runtime.full_transcript.depth = .review;
+    runtime.full_transcript.depth = .full;
     runtime.full_transcript.scroll_rows = 3;
     runtime.full_transcript.follow_tail = false;
     runtime.full_transcript.anchor_entry_id = seed_id;
@@ -11939,13 +11939,13 @@ test "historical tool detail insertion preserves entry id order" {
         20,
         .{
             .id = "updated-call",
-            .name = "list_files",
+            .name = "glob_files",
             .arguments_json = "{\"path\":\"src\"}",
         },
         .list,
         .{
             .tool_call_id = @constCast("updated-call"),
-            .tool_name = @constCast("list_files"),
+            .tool_name = @constCast("glob_files"),
             .status = .success,
             .output = @constCast("updated result"),
             .output_bytes = 14,
@@ -11954,7 +11954,7 @@ test "historical tool detail insertion preserves entry id order" {
     );
     try std.testing.expectEqual(@as(usize, 3), runtime.tool_details.items.len);
     const updated = runtime.toolDetailForEntry(20).?;
-    try std.testing.expectEqualStrings("list_files", updated.tool_name);
+    try std.testing.expectEqualStrings("glob_files", updated.tool_name);
     try std.testing.expectEqualStrings("{\"path\":\"src\"}", updated.arguments_json.?);
     try std.testing.expectEqualStrings("updated result", updated.result.?);
 }
@@ -12274,7 +12274,7 @@ test "context notices stay canonical and ordered across compact and full project
     try std.testing.expect(std.mem.find(u8, compact_before_open, "context-first") == null);
     try std.testing.expect(std.mem.find(u8, compact_before_open, "ordinary-system") != null);
 
-    try std.testing.expect(try runtime.setTranscriptPresentationDepth(alloc, .review));
+    try std.testing.expect(try runtime.setTranscriptPresentationDepth(alloc, .full));
     _ = try runtime.appendSemanticNotice(alloc, .{
         .topic = "context",
         .tone = .warning,
@@ -12445,7 +12445,7 @@ fn setupRecordedCommandOutputAtomicFixture(
         .arguments_json = "{\"command\":\"printf atomic\"}",
     } });
     const status_entry_id = runtime.toolActivityRecord(lifecycle_id).?.entry_id;
-    runtime.full_transcript.depth = .review;
+    runtime.full_transcript.depth = .full;
     runtime.full_transcript.scroll_rows = 3;
     runtime.full_transcript.follow_tail = false;
     runtime.full_transcript.anchor_entry_id = status_entry_id;
@@ -12651,7 +12651,7 @@ test "retention capped command output retargets a missing source anchor" {
     try runtime.command_output_blocks.items[0].live_entry_ids.append(alloc, missing_entry_id);
     try runtime.command_output_blocks.items[0].live_entry_ids.append(alloc, retained_entry_id);
     runtime.command_output_display.open_command_block = 0;
-    runtime.full_transcript.depth = .review;
+    runtime.full_transcript.depth = .full;
     runtime.full_transcript.anchor_entry_id = missing_entry_id;
     try removeRawEntriesForTest(&runtime, alloc, &.{missing_entry_id});
 
@@ -14281,7 +14281,7 @@ test "transcript lifecycle identity updates are idempotent and atomic" {
         runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
             .id = lifecycleId(1, "target"),
             .reconciles_provisional_call_id = "alias",
-            .tool_name = "list_files",
+            .tool_name = "glob_files",
             .activity_kind = .list,
         } }),
     );

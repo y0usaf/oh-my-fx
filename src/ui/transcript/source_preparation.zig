@@ -794,6 +794,7 @@ fn buildCompactTranscriptProjectionInterruptible(
         self.tool_details.items,
         self.layout.cols,
         focused_entry_id,
+        collapseToolCalls(self),
         .{
             .marker_style = user_message_card.promptMarkerStyle(),
             .text_style = ui_render.statusline_style,
@@ -905,6 +906,14 @@ fn buildCommandOutputOverridesInterruptible(
         }
     }
     return overrides;
+}
+
+fn collapseToolCalls(self: anytype) bool {
+    const Shell = @TypeOf(self.*);
+    return if (comptime @hasField(Shell, "collapse_tool_calls"))
+        self.collapse_tool_calls
+    else
+        false;
 }
 
 fn observationEnabled(self: anytype, alloc: Allocator) bool {

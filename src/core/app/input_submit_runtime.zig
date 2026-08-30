@@ -415,11 +415,21 @@ pub fn SubmitRuntime(comptime App: type) type {
             );
         }
 
+        pub const Intent = enum { queue, steer };
+
         pub fn submitInput(app: *App, max_prompt_history: usize) !void {
             try submit(app, max_prompt_history);
         }
 
+        pub fn submitSteering(app: *App, max_prompt_history: usize) !void {
+            try submitWithIntent(app, max_prompt_history, .steer);
+        }
+
         pub fn submit(app: *App, max_prompt_history: usize) !void {
+            try submitWithIntent(app, max_prompt_history, .queue);
+        }
+
+        fn submitWithIntent(app: *App, max_prompt_history: usize, intent: Intent) !void {
             if (comptime @hasField(App, "submission")) {
                 if (app.submission.pending) |pending| {
                     debug_trace.eventf(
@@ -498,7 +508,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
                     if (!try preflightPrompt(app)) return;
-                    const admission = try enqueuePromptForSubmit(app, "", &.{}, null);
+                    const admission = try enqueuePromptForSubmit(app, "", &.{}, null, intent);
                     if (admission == .rejected) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -622,6 +632,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     display_skill_tokens,
                     &accepted_draft,
                     images,
+                    intent,
                 )
             else
                 try enqueuePromptForSubmit(
@@ -629,6 +640,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     visual_text.text,
                     display_skill_tokens,
                     &accepted_draft,
+                    intent,
                 );
             if (admission == .rejected) return;
             commitStableExtractedImageIds(app, extracted.images);
@@ -842,10 +854,13 @@ pub fn SubmitRuntime(comptime App: type) type {
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
             accepted_draft: ?*const AcceptedDraftProjection,
+            intent: Intent,
         ) !PromptAdmission {
-            switch (try installPendingSubmission(app, prompt, skill_tokens)) {
-                .installed => return .pending,
-                .unavailable => {},
+            if (intent == .queue) {
+                switch (try installPendingSubmission(app, prompt, skill_tokens)) {
+                    .installed => return .pending,
+                    .unavailable => {},
+                }
             }
             const resume_review = if (comptime @hasField(App, "queued_prompt_review"))
                 app.queued_prompt_review.active()
@@ -866,7 +881,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                 }
             }
 
-            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) blk: {
+            const accepted = if (intent == .steer and
+                (comptime @hasDecl(App, "steerPrompt")))
+                try App.steerPrompt(app, prompt)
+            else if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) blk: {
                 if (accepted_draft) |draft| {
                     break :blk try App.enqueuePromptWithReviewDraft(
                         app,
@@ -951,6 +969,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             skill_tokens: []const registered_entities.SkillTokenSpan,
             accepted_draft: *const AcceptedDraftProjection,
             staged_images: *std.ArrayList(types.ImageAttachment),
+            intent: Intent,
         ) !PromptAdmission {
             const original_images = app.pending_images;
             app.pending_images = staged_images.*;
@@ -965,6 +984,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 prompt,
                 skill_tokens,
                 accepted_draft,
+                intent,
             );
             if (admission == .rejected) {
                 staged_images.* = app.pending_images;

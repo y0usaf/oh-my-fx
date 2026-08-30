@@ -1301,7 +1301,7 @@ pub const Store = struct {
             alloc,
             workspace_root,
             options,
-        ) orelse return error.NoSavedSessions;
+        ) orelse return session_log.failLoadedWritableSession(error.NoSavedSessions);
         defer alloc.free(selected);
         var loaded = try self.resumeExactForWrite(
             alloc,
@@ -3227,7 +3227,9 @@ pub const Store = struct {
         if (std.mem.eql(u8, loaded.state.workspace_root, workspace_root)) {
             return loaded;
         }
-        if (!allow_rebind) return error.SessionTargetChanged;
+        if (!allow_rebind) {
+            return session_log.failLoadedWritableSession(error.SessionTargetChanged);
+        }
 
         const rebound = session_event.Event{ .workspace_rebound = .{
             .previous_workspace_root = loaded.state.workspace_root,
@@ -3240,7 +3242,7 @@ pub const Store = struct {
             .rollback_before_adapter_continue,
             options.log,
         ) catch |err| switch (err) {
-            error.SessionPersistenceDegraded => return error.SessionWorkspaceRebindFailed,
+            error.SessionPersistenceDegraded => return session_log.failLoadedWritableSession(error.SessionWorkspaceRebindFailed),
             else => return err,
         };
         return loaded;
@@ -8774,12 +8776,12 @@ test "schema v3 load repairs duplicate-key tool arguments before gateway project
 
     var calls = [_]session.ToolCall{.{
         .id = @constCast("persisted_duplicate_call"),
-        .name = @constCast("list_files"),
+        .name = @constCast("glob_files"),
         .arguments_json = @constCast(duplicate_arguments),
     }};
     var results = [_]session.PersistedToolResult{.{
         .tool_call_id = @constCast("persisted_duplicate_call"),
-        .tool_name = @constCast("list_files"),
+        .tool_name = @constCast("glob_files"),
         .status = .success,
         .output = @constCast("stale success"),
         .output_bytes = 13,

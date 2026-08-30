@@ -96,13 +96,26 @@ fn nativeKeychainDelete(_: ?*anyopaque, alloc: Allocator) KeychainError!bool {
 fn selectStorageBackend(
     os_tag: std.Target.Os.Tag,
     keychain_disabled: bool,
+    keychain_available: bool,
 ) StorageBackend {
-    if (os_tag == .macos and !keychain_disabled) return .macos_keychain;
+    if (os_tag == .macos and !keychain_disabled and keychain_available) {
+        return .macos_keychain;
+    }
     return .profile_file;
 }
 
-fn storageBackend() StorageBackend {
-    return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
+fn storageBackend(
+    alloc: Allocator,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !StorageBackend {
+    const disabled = native_keychain.isDisabled();
+    const available = if (builtin.os.tag == .macos and !disabled) blk: {
+        break :blk if (cancel_flag) |flag|
+            try native_keychain.userDefaultKeychainAvailableCancellable(alloc, flag)
+        else
+            try native_keychain.userDefaultKeychainAvailable(alloc);
+    } else false;
+    return selectStorageBackend(builtin.os.tag, disabled, available);
 }
 
 fn selectReadDecision(
@@ -209,7 +222,7 @@ fn loadControlled(
     configured_issuer: ?[]const u8,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?mcp_auth.Credentials {
-    const backend = storageBackend();
+    const backend = try storageBackend(alloc, cancel_flag);
     var locked = (try openLockedDirForReadControlled(
         backend,
         cancel_flag,
@@ -274,7 +287,7 @@ pub fn save(
     server_identity: []const u8,
     credentials: mcp_auth.Credentials,
 ) !SaveResult {
-    const backend = storageBackend();
+    const backend = try storageBackend(alloc, null);
     var locked = try openOrCreateLockedDir();
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
@@ -306,7 +319,7 @@ pub fn delete(
     server_identity: []const u8,
     endpoint: []const u8,
 ) !DeleteResult {
-    const backend = storageBackend();
+    const backend = try storageBackend(alloc, null);
     var locked = (try openLockedDirForRead(backend)) orelse return .{};
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
@@ -1033,19 +1046,23 @@ test "credential store isolation cleans up every allocation failure" {
 test "credential backend selection is explicit and platform scoped" {
     try std.testing.expectEqual(
         StorageBackend.macos_keychain,
-        selectStorageBackend(.macos, false),
+        selectStorageBackend(.macos, false, true),
     );
     try std.testing.expectEqual(
         StorageBackend.profile_file,
-        selectStorageBackend(.macos, true),
+        selectStorageBackend(.macos, false, false),
     );
     try std.testing.expectEqual(
         StorageBackend.profile_file,
-        selectStorageBackend(.linux, false),
+        selectStorageBackend(.macos, true, true),
     );
     try std.testing.expectEqual(
         StorageBackend.profile_file,
-        selectStorageBackend(.windows, false),
+        selectStorageBackend(.linux, false, true),
+    );
+    try std.testing.expectEqual(
+        StorageBackend.profile_file,
+        selectStorageBackend(.windows, false, true),
     );
 }
 

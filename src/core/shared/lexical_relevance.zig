@@ -18,6 +18,20 @@ pub const PreparedQuery = struct {
     }
 };
 
+inline fn failPreparedQuery(err: anytype) @TypeOf(err)!PreparedQuery {
+    return @errorCast(failPreparedQueryDynamic(err));
+}
+
+noinline fn failPreparedQueryDynamic(err: anyerror) anyerror!PreparedQuery {
+    return err;
+}
+
+test "prepared query failures preserve exact error types and identities" {
+    const too_long = failPreparedQuery(error.QueryTooLong);
+    try std.testing.expect(@TypeOf(too_long) == error{QueryTooLong}!PreparedQuery);
+    try std.testing.expectError(error.QueryTooLong, too_long);
+}
+
 pub const Score = struct {
     exact_identity: bool = false,
     strong_hits: usize = 0,
@@ -25,7 +39,7 @@ pub const Score = struct {
 };
 
 pub fn prepare(query: []const u8) PrepareError!PreparedQuery {
-    if (query.len > max_query_bytes) return error.QueryTooLong;
+    if (query.len > max_query_bytes) return failPreparedQuery(error.QueryTooLong);
 
     var prepared = PreparedQuery{
         .raw = query,

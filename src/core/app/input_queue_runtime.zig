@@ -558,6 +558,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 commits[filled] = .{
                     .turn_id = entry.draft.turn_id,
+                    .kind = entry.draft.kind,
                     .prompt = prompt_copy,
                     .images = images_copy,
                     .skill_display_spans = spans_copy,

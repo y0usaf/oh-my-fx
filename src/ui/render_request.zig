@@ -68,7 +68,7 @@ const animation_max_phase: i16 = 31;
 pub const animation_interval_ms: i64 = 50;
 pub const max_consecutive_input_pending_aborts: u8 = 4;
 /// Marker blink half-period: 10 frames on, 10 frames off at the 50ms cadence,
-/// matching the 1s period of the wall-clock-synced thinking blink.
+/// matching the 1s period of the wall-clock-synced activity blink.
 pub const blink_half_period_frames: i16 = 10;
 
 comptime {
@@ -76,10 +76,10 @@ comptime {
     // the marker visibly stutters at the wrap.
     const cycle = animation_max_phase + animation_padding + 1;
     std.debug.assert(@mod(cycle, 2 * blink_half_period_frames) == 0);
-    // Frame-phase blink (tool markers) and wall-clock blink (thinking
-    // counter) must share one tempo or the two markers drift visibly apart.
+    // Frame-phase blink (tool markers) and the wall-clock activity blink must
+    // share one tempo or the two markers drift visibly apart.
     std.debug.assert(
-        blink_half_period_frames * animation_interval_ms == activity_status.thinking_blink_half_period_ms,
+        blink_half_period_frames * animation_interval_ms == activity_status.activity_blink_half_period_ms,
     );
 }
 

@@ -50,7 +50,9 @@ pub fn streamModelCompletion(
     usage: ?*session_usage.Usage,
     usage_allocator: Allocator,
 ) !StreamResult {
-    if (request_value.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (request_value.cancel_flag.load(.seq_cst)) {
+        return agent_stream_provider.failResult(error.Cancelled);
+    }
     const started_at_ms = io_mod.milliTimestamp();
     var admission = InvocationAdmission{
         .usage = usage,
@@ -70,7 +72,7 @@ pub fn streamModelCompletion(
     };
     errdefer result.deinit(alloc);
     const observation = admission.observation orelse
-        return error.ProviderAdmissionMissing;
+        return agent_stream_provider.failResult(error.ProviderAdmissionMissing);
 
     recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx);
     switch (result) {

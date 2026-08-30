@@ -541,6 +541,8 @@ describe("fx ask presentation", () => {
       expect(pane).toContain("bold and docs");
       expect(pane).toContain("first item");
       expect(pane).toContain("const answer: u8 = 42;");
+      expect(pane).toContain("─ zig ─");
+      expect(pane).not.toContain("│ const answer: u8 = 42;");
       expect(pane).not.toContain("# Ask presentation");
       expect(pane).not.toContain("**bold**");
       expect(escaped).toContain("\x1b[");
@@ -589,7 +591,7 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "--no-color keeps the TTY layout without Fx styles or hyperlinks",
+    "--no-color keeps the TTY layout without fx styles or hyperlinks",
     async () => {
       const root = createRoot();
       const gateway = startFakeGateway([fakeGatewayFinalText(MARKDOWN)]);

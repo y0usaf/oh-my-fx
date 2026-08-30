@@ -58,6 +58,7 @@ pub const ComposedInputRows = struct {
 pub fn composeQueuedSummaryRow(
     alloc: Allocator,
     queued_count: usize,
+    steering_count: usize,
     queued_paused: bool,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -67,8 +68,15 @@ pub fn composeQueuedSummaryRow(
     // The paused hint row already owns the controls, so it drops the affordance.
     const affordance = if (queued_paused) "" else " · ↑ to edit";
     var row_buf: [max_top_row_len]u8 = undefined;
+    const ordinary_count = queued_count -| steering_count;
     const label = if (queued_count == 0)
         "queued"
+    else if (ordinary_count == 0 and steering_count == 1)
+        std.fmt.bufPrint(&row_buf, "1 steering message{s}", .{affordance}) catch "1 steering message"
+    else if (ordinary_count == 0)
+        std.fmt.bufPrint(&row_buf, "{d} steering messages{s}", .{ steering_count, affordance }) catch "steering messages"
+    else if (steering_count > 0)
+        std.fmt.bufPrint(&row_buf, "{d} pending messages · {d} steering{s}", .{ queued_count, steering_count, affordance }) catch "pending messages"
     else if (queued_count == 1)
         std.fmt.bufPrint(&row_buf, "1 queued message{s}", .{affordance}) catch "1 queued message"
     else
@@ -84,10 +92,13 @@ pub fn composeQueueReviewHintRow(
     width: u16,
     empty_draft: bool,
     cancel_all_available: bool,
+    steering: bool,
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     try row.appendSlice(alloc, ui_render.dim_style);
-    const hint = if (cancel_all_available)
+    const hint = if (steering)
+        "steering paused · enter to apply"
+    else if (cancel_all_available)
         "paused · enter to send · press esc to cancel all queued"
     else if (empty_draft)
         "paused · delete again to remove queued prompt · enter to send unchanged"
@@ -99,17 +110,24 @@ pub fn composeQueueReviewHintRow(
 }
 
 test "collapsed queue banner counts the waiting prompts and offers the review" {
-    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, false, 80);
+    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, 0, false, 80);
     defer single.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, single.items, "1 queued message · ↑ to edit") != null);
 
-    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, false, 80);
+    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, 0, false, 80);
     defer many.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, many.items, "3 queued messages · ↑ to edit") != null);
 }
 
+test "collapsed queue banner identifies pending steering" {
+    var row = try composeQueuedSummaryRow(std.testing.allocator, 1, 1, false, 80);
+    defer row.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.find(u8, row.items, "1 steering message · ↑ to edit") != null);
+}
+
 test "collapsed queue banner drops the affordance while the review is paused" {
-    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, true, 80);
+    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, 0, true, 80);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "2 queued messages") != null);
@@ -117,7 +135,7 @@ test "collapsed queue banner drops the affordance while the review is paused" {
 }
 
 test "queue review hint explains empty draft deletion" {
-    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, true, false);
+    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, true, false, false);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "delete again to remove queued prompt") != null);
@@ -125,10 +143,17 @@ test "queue review hint explains empty draft deletion" {
 }
 
 test "post-cancel queue review hint offers cancelling every queued prompt" {
-    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, true);
+    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, true, false);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "press esc to cancel all queued") != null);
+}
+
+test "steering review hint says enter applies steering" {
+    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, false, true);
+    defer row.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.find(u8, row.items, "steering paused · enter to apply") != null);
 }
 
 // Ordered widest-first; every fallback keeps the enter/esc controls so narrow
@@ -580,9 +605,9 @@ pub fn composeCompactCommandMenuHintRow(
             "←→ Esc",
         },
         .usage => [_][]const u8{
-            "←→ Scope     ↑↓ Model     Enter Expand     R Refresh     Esc Close",
-            "←→ Scope  ↑↓ Model  Enter Expand  R Refresh  Esc",
-            "←→ ↑↓  Enter  R  Esc",
+            "Tab Scope     ↑↓ Model     Enter Expand     R Refresh     Esc Close",
+            "Tab Scope  ↑↓ Model  Enter Expand  R Refresh  Esc",
+            "Tab ↑↓  Enter  R  Esc",
         },
         .workspace => [_][]const u8{
             "↑↓ Navigate     Enter Use     Esc Close",

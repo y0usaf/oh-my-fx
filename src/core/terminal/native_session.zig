@@ -4893,6 +4893,23 @@ fn screenDurable(
     ) catch return error.OutOfMemory;
 }
 
+inline fn failReconstructedGrid(err: anytype) @TypeOf(err)!terminal_engine.Grid {
+    return @errorCast(failReconstructedGridDynamic(err));
+}
+
+noinline fn failReconstructedGridDynamic(err: anyerror) anyerror!terminal_engine.Grid {
+    return err;
+}
+
+test "reconstructed grid failures preserve exact error types and identities" {
+    const corrupt = failReconstructedGrid(error.ScreenCorrupt);
+    try std.testing.expect(
+        @TypeOf(corrupt) == error{ScreenCorrupt}!terminal_engine.Grid,
+    );
+    try std.testing.expectError(error.ScreenCorrupt, corrupt);
+    try std.testing.expectError(error.OutOfMemory, failReconstructedGrid(error.OutOfMemory));
+}
+
 fn reconstructEngine(
     alloc: Allocator,
     durable: *terminal_store.DurableSession,
@@ -4943,7 +4960,7 @@ fn reconstructEngine(
         output,
     )) {
         try durable.mark_screen_unavailable(.raw_gap, io_mod.milliTimestamp());
-        return error.ScreenRawGap;
+        return failReconstructedGrid(error.ScreenRawGap);
     }
 
     var grid = terminal_engine.Grid.restoreCheckpoint(
@@ -4981,14 +4998,14 @@ fn reconstructEngine(
         checkpoint.envelope.applied_cursor,
         output,
     ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => return failReconstructedGrid(error.OutOfMemory),
         error.ScreenRawGap, error.MissingJournalSegment => {
             try durable.mark_screen_unavailable(.raw_gap, io_mod.milliTimestamp());
-            return error.ScreenRawGap;
+            return failReconstructedGrid(error.ScreenRawGap);
         },
         error.ScreenCorrupt, error.CorruptJournalSegment => {
             try durable.mark_screen_unavailable(.corrupt, io_mod.milliTimestamp());
-            return error.ScreenCorrupt;
+            return failReconstructedGrid(error.ScreenCorrupt);
         },
         else => return err,
     };
@@ -5045,11 +5062,11 @@ fn replayFromStart(
     replayEngine(alloc, durable, &grid, initial, output) catch |err| switch (err) {
         error.ScreenRawGap, error.MissingJournalSegment => {
             try durable.mark_screen_unavailable(.raw_gap, io_mod.milliTimestamp());
-            return error.ScreenRawGap;
+            return failReconstructedGrid(error.ScreenRawGap);
         },
         error.ScreenCorrupt, error.CorruptJournalSegment => {
             try durable.mark_screen_unavailable(.corrupt, io_mod.milliTimestamp());
-            return error.ScreenCorrupt;
+            return failReconstructedGrid(error.ScreenCorrupt);
         },
         else => return err,
     };

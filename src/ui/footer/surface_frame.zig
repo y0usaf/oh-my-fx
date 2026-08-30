@@ -520,7 +520,13 @@ fn buildFooterSurfaceProjection(
     else if (question_projection) |projection|
         try question_ui.questionPanelRowsForLayout(alloc, projection, shell.layout.cols)
     else if (compact_command_menu) |menu|
-        @min(compact_command_menu_presentation.desiredRowCount(menu), shell.layout.rows -| 3)
+        @min(
+            compact_command_menu_presentation.desiredRowCount(
+                menu,
+                shell.layout.cols,
+            ),
+            shell.layout.rows -| 3,
+        )
     else if (show_auth_picker)
         picker_presentation.authPickerReservedRows(
             ctx.auth_picker,
@@ -736,7 +742,7 @@ fn assembleSurfaceFooterFrame(
         .activity_label = activity_label,
         .tool_activity_label = tool_activity_label,
         .shimmer_pos = assembly.planner_input.ctx.shimmer_pos,
-        .thinking_blink = activity_status.thinkingBlinkVisible(
+        .thinking_blink = activity_status.activityBlinkVisible(
             assembly.planner_input.ctx.stream,
             assembly.planner_input.ctx.now_ms,
         ),
@@ -2812,7 +2818,7 @@ test "transcript viewer reserves a blank row above its navigation footer" {
     defer shell.deinit(alloc);
 
     var ctx = surfaceTestContext(&input);
-    ctx.transcript_depth = .review;
+    ctx.transcript_depth = .full;
     var review = try measureSurfaceFooter(alloc, &shell, prompt.projection(), ctx);
     defer review.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 1), review.frameLayoutMeasurement().top_gap_rows);

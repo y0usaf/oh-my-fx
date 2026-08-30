@@ -272,6 +272,7 @@ pub const RenderContext = struct {
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,
     queued_count: usize,
+    steering_count: usize = 0,
     queued_paused: bool = false,
     queued_cancel_all_available: bool = false,
     queued_prompt_cards: []const QueuedPromptCard = &.{},
@@ -481,54 +482,32 @@ pub fn frameOwnedActivityProjection(
 ) ActivityProjection {
     if (approval != null or ctx.question != null) return .none;
     switch (ctx.activity) {
-        .tool_slot => return thinkingActivityProjection(buf, shell, ctx),
+        .tool_slot => {},
         .turn_thinking => |thinking| {
             if (thinking.tone != .thinking) return ctx.activity;
-            return thinkingActivityProjection(buf, shell, ctx);
         },
-        .none => return thinkingActivityProjection(buf, shell, ctx),
+        .none => {},
     }
+    return turnActivityProjection(buf, shell, ctx);
 }
 
-fn thinkingActivityProjection(
+fn turnActivityProjection(
     buf: []u8,
     shell: *TranscriptRuntime,
     ctx: RenderContext,
 ) ActivityProjection {
     _ = shell;
-    // The markerless counter row belongs to the response: the text landing on
-    // screen is its own progress report, and it keeps the row through the gaps
-    // where the pacer waits on the next chunk. Once the model switches to a
-    // tool payload nothing will print for a while, so the row takes the marker
-    // back and starts blinking again.
-    if (ctx.stream.active and ctx.stream.assistant_text_started and ctx.stream.composing_tool_payload) {
-        return .{ .turn_thinking = .{
-            .label = activity_status.buildQuietTurnLabel(buf, ctx.stream, ctx.now_ms),
-        } };
-    }
-    if (ctx.writing_response or (ctx.stream.active and ctx.stream.assistant_text_started)) {
-        return .{ .turn_thinking = .{
-            .label = activity_status.buildStreamingLabel(buf, ctx.stream),
-            .tone = if (ctx.stream.active) .thinking else .neutral,
-        } };
-    }
     if (!ctx.stream.active) {
-        if (!ctx.completed_assistant_presentation_tail) return .none;
-        const presentation_stream: StreamState = .{ .active = true };
+        if (!ctx.writing_response and !ctx.completed_assistant_presentation_tail) return .none;
         return .{ .turn_thinking = .{
-            .label = activity_status.buildThinkingLabel(buf, presentation_stream, ctx.now_ms) orelse "• Thinking",
+            .label = activity_status.buildCompletedTurnLabel(buf, ctx.stream),
+            .tone = .neutral,
         } };
     }
-    var thinking_stream = ctx.stream;
-    thinking_stream.last_activity_kind = null;
-    thinking_stream.read_count = 0;
-    thinking_stream.list_count = 0;
-    thinking_stream.write_count = 0;
-    thinking_stream.edit_count = 0;
-    thinking_stream.open_count = 0;
-    thinking_stream.command_count = 0;
-    thinking_stream.subagent_count = 0;
-    if (activity_status.buildThinkingLabel(buf, thinking_stream, ctx.now_ms)) |label| {
+
+    var visible_stream = ctx.stream;
+    visible_stream.last_activity_kind = null;
+    if (activity_status.buildTurnLabel(buf, visible_stream, ctx.now_ms)) |label| {
         return .{ .turn_thinking = .{ .label = label } };
     }
     return .{ .turn_thinking = .{
@@ -795,6 +774,8 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
     const ctx: RenderContext = .{
         .stream = .{
             .active = true,
+            .phase = .running,
+            .turn_started_ms = 1_000,
             .command_count = 1,
             .last_activity_kind = .command,
             .token_progress = .{
@@ -818,6 +799,7 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
             .active = true,
             .kind = .command,
         } },
+        .now_ms = 13_000,
         .input = &input,
     };
 
@@ -825,7 +807,7 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
     const projection = frameOwnedActivityProjection(&active_buf, &shell, ctx, null);
     switch (projection) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "• Thinking (↑50k ↓1.2k)",
+            "• Running (12s) (↑50k ↓1.2k)",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -833,10 +815,11 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
 
     var streaming_buf: [256]u8 = undefined;
     var streaming_ctx = ctx;
+    streaming_ctx.stream.phase = .generating;
     streaming_ctx.writing_response = true;
     switch (frameOwnedActivityProjection(&streaming_buf, &shell, streaming_ctx, null)) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "  (↑50k ↓1.2k)",
+            "• Generating (12s) (↑50k ↓1.2k)",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -912,6 +895,8 @@ test "frame-owned activity shows live streaming token progress" {
     const ctx: RenderContext = .{
         .stream = .{
             .active = true,
+            .phase = .generating,
+            .turn_started_ms = 1_000,
             .token_progress = .{
                 .input_tokens = 50_000,
                 .output_tokens = 1_250,
@@ -929,42 +914,42 @@ test "frame-owned activity shows live streaming token progress" {
         .selected_subagent_label = null,
         .selected_subagent_status = null,
         .activity = .none,
+        .now_ms = 13_000,
         .input = &input,
     };
 
     var active_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("  (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqualStrings("• Generating (12s) (↑50k ↓1.2k)", thinking.label);
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
-    // Pacer caught up mid-response and is waiting on the next chunk: the quiet
-    // row holds for the whole response instead of flipping inside every gap.
+    // Pacer caught up mid-response and is waiting on the next chunk: the
+    // Generating phase holds instead of flipping inside every gap.
     var drained_ctx = ctx;
     drained_ctx.writing_response = false;
-    drained_ctx.stream.assistant_text_started = true;
     var drained_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&drained_buf, &shell, drained_ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("  (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqualStrings("• Generating (12s) (↑50k ↓1.2k)", thinking.label);
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
-    // The model moved on to a tool payload that prints nothing: the marker
-    // comes back with the turn clock so the row does not read as finished.
+    // The model moved on to a tool payload that prints nothing: only the phase
+    // word changes while the marker, turn clock, and token totals remain.
     var composing_ctx = drained_ctx;
-    composing_ctx.stream.composing_tool_payload = true;
+    composing_ctx.stream.phase = .running;
     composing_ctx.stream.turn_started_ms = 1_000;
     composing_ctx.now_ms = 13_000;
     var stalled_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&stalled_buf, &shell, composing_ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("• (12s) (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqualStrings("• Running (12s) (↑50k ↓1.2k)", thinking.label);
             try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
