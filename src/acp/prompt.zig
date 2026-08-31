@@ -1903,8 +1903,8 @@ fn pushRouteRecoveryStatus(
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const text = switch (emission) {
-        .assistant_source => |text| text,
-        .assistant_rendered => return,
+        .assistant_source => return,
+        .assistant_rendered => |text| text,
         .operational => |text| text,
     };
     if (text.len == 0) return;
@@ -2204,12 +2204,12 @@ fn formatAcpElicitationMessage(
     return switch (request.mode) {
         .form => std.fmt.allocPrint(
             alloc,
-            "fx received a form request from MCP server {s}. {s}",
+            "Fx received a form request from MCP server {s}. {s}",
             .{ server_name, request.message },
         ),
         .url => std.fmt.allocPrint(
             alloc,
-            "fx received a URL request from MCP server {s} for host {s}. {s}",
+            "Fx received a URL request from MCP server {s} for host {s}. {s}",
             .{ server_name, request.url_host orelse "unknown", request.message },
         ),
         .unknown => error.McpInputRequired,
@@ -2443,13 +2443,21 @@ fn activeMcp(ctx: *AcpContext) ?*mcp_runtime.McpRuntime {
 fn onBackgroundUrlReady(_: *anyopaque, _: u64, _: []const u8) void {}
 
 pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
+    if (std.mem.eql(u8, tool_name, "list_files")) return .read;
     if (std.mem.eql(u8, tool_name, "glob_files")) return .read;
     if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
     if (std.mem.eql(u8, tool_name, "read_file")) return .read;
+    if (std.mem.eql(u8, tool_name, "file_info")) return .read;
+    if (std.mem.eql(u8, tool_name, "ast_symbols")) return .search;
+    if (std.mem.eql(u8, tool_name, "semantic_search")) return .search;
     if (std.mem.eql(u8, tool_name, "web_fetch")) return .read;
     if (std.mem.eql(u8, tool_name, "web_search")) return .search;
     if (std.mem.eql(u8, tool_name, "write_file")) return .edit;
     if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
+    if (std.mem.eql(u8, tool_name, "delete_file")) return .delete;
+    if (std.mem.eql(u8, tool_name, "rename_file")) return .move;
+    if (std.mem.eql(u8, tool_name, "copy_file")) return .move;
+    if (std.mem.eql(u8, tool_name, "create_folder")) return .edit;
     if (std.mem.eql(u8, tool_name, "terminal")) return .execute;
     if (std.mem.eql(u8, tool_name, "run_command")) return .execute;
     if (std.mem.eql(u8, tool_name, "memory")) return .other;
@@ -2560,6 +2568,8 @@ test "mapToolKind maps common tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("read_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("write_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("edit_file"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.delete, mapToolKind("delete_file"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.move, mapToolKind("rename_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("grep_files"));
     try std.testing.expectEqual(acp_types.ToolCallKind.execute, mapToolKind("run_command"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("unknown_tool"));
@@ -2963,8 +2973,14 @@ test "parsePromptInput releases partial resource state across allocation failure
     }
 }
 
-test "mapToolKind maps surviving tools" {
+test "mapToolKind maps all file tools" {
+    try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("list_files"));
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("glob_files"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("file_info"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("ast_symbols"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("semantic_search"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.move, mapToolKind("copy_file"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("create_folder"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("memory"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("skill"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("install_skill"));
@@ -3065,29 +3081,20 @@ test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
     }
 }
 
-test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicates and writer failure" {
+test "ACP stream adapter strips ANSI from agent chunks and suppresses writer failure" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
-    const source_spans = [_][]const u8{
-        "# Heading\n\n- **bold** item\n",
-        "| A | B |\n| - | - |\n| 1 | 2 |\n",
-        "```zig\nconst x = 1;\n```\n",
-    };
-    const rendered_spans = [_][]const u8{
-        "Heading\n\nbold item\n",
-        "A  B\n1  2\n",
-        "\xe2\x94\x82 const x = 1;\n",
+    const spans = [_][]const u8{
+        "\x1b[1mbold\x1b[22m and \x1b[3mitalic\x1b[23m\n",
+        "\x1b]8;id=fx-1;https://example.com\x1b\\docs\x1b]8;;\x1b\\\n",
+        "\x1b[2m\xe2\x94\x82 \x1b[22mconst x = **literal**;\n",
     };
     const expected_spans = [_][]const u8{
-        source_spans[0],
-        source_spans[1],
-        source_spans[2],
-        "status\n[docs](https://example.com)\n",
+        "bold and italic\n",
+        "[docs](https://example.com)\n",
+        "\xe2\x94\x82 const x = **literal**;\n",
     };
-    const operational_span =
-        "\x1b[1mstatus\x1b[22m\n" ++
-        "\x1b]8;id=fx-1;https://example.com\x1b\\docs\x1b]8;;\x1b\\\n";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3108,12 +3115,8 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
         };
         const deps = agentRuntimeDeps(&ctx);
 
-        for (source_spans, rendered_spans) |source, rendered| {
-            try deps.push_text(deps.ctx, .{ .assistant_source = source });
-            try deps.push_text(deps.ctx, .{ .assistant_rendered = rendered });
-        }
-        try deps.push_text(deps.ctx, .{ .assistant_source = "" });
-        try deps.push_text(deps.ctx, .{ .operational = operational_span });
+        for (spans) |span| try deps.push_text(deps.ctx, .{ .assistant_rendered = span });
+        try deps.push_text(deps.ctx, .{ .assistant_rendered = "" });
         try capture.sync(io_mod.getIo());
     }
 
@@ -3142,7 +3145,7 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
 
         notification_count += 1;
     }
-    try std.testing.expectEqual(expected_spans.len, notification_count);
+    try std.testing.expectEqual(spans.len, notification_count);
 
     var failed_output = try tmp.dir.createFile(io_mod.getIo(), "acp-stream-failure.jsonl", .{});
     failed_output.close(io_mod.getIo());
@@ -3162,7 +3165,7 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
     try std.testing.expect(writer_failed);
 
     const failed_deps = agentRuntimeDeps(&failed_ctx);
-    try failed_deps.push_text(failed_deps.ctx, .{ .assistant_source = "writer failure remains suppressed" });
+    try failed_deps.push_text(failed_deps.ctx, .{ .assistant_rendered = "writer failure remains suppressed" });
 }
 
 test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
@@ -3644,6 +3647,17 @@ fn writeArgsJson(alloc: Allocator, path: []const u8, content: []const u8) ![]u8 
     return try out.toOwnedSlice();
 }
 
+fn semanticSearchArgsJson(alloc: Allocator, query: []const u8, path: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"query\":");
+    try std.json.Stringify.value(query, .{}, &out.writer);
+    try out.writer.writeAll(",\"path\":");
+    try std.json.Stringify.value(path, .{}, &out.writer);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
 fn createSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []const u8) !void {
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
@@ -4099,6 +4113,78 @@ test "ACP admits default-safe web fetch without a rule" {
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied_outcome.decision);
     state.active_session.?.permission_rules.deinit(alloc);
     state.active_session.?.permission_rules = .{};
+}
+
+test "ACP auto mode requires review when only one copy target is configured" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "external");
+    {
+        var source = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
+        defer source.close(io_mod.getIo());
+        try source.writeStreamingAll(io_mod.getIo(), "source\n");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
+    defer alloc.free(external);
+
+    var state = try initTestAcpState(alloc, workspace, .auto);
+    defer state.deinit();
+    const pattern = try std.fmt.allocPrint(arena, "{s}/**", .{external});
+    state.active_session.?.permission_rules = try testPermissionRuleSet(alloc, "copy_file", pattern, .allow);
+    defer state.active_session.?.permission_rules.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+
+    const source = try std.fs.path.join(arena, &.{ workspace, "source.txt" });
+    const destination = try std.fs.path.join(arena, &.{ external, "copied.txt" });
+    const args = try std.fmt.allocPrint(arena, "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}", .{ source, destination });
+    const decision = (try requestToolPermissionOutcome(&ctx, arena, .{
+        .id = "call_1",
+        .name = "copy_file",
+        .arguments_json = args,
+    }, .auto, &.{}, &.{})).decision;
+
+    try std.testing.expectEqual(ToolPermissionDecision.deny, decision);
+}
+
+test "ACP permission rejects semantic_search outside workspace target" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var workspace_tmp = std.testing.tmpDir(.{});
+    defer workspace_tmp.cleanup();
+    try workspace_tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var external_tmp = std.testing.tmpDir(.{});
+    defer external_tmp.cleanup();
+    {
+        var file = try external_tmp.dir.createFile(io_mod.getIo(), "outside.txt", .{ .truncate = true });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "needle external\n");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, workspace_tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const external = try io_mod.dirRealpathAlloc(alloc, external_tmp.dir, ".");
+    defer alloc.free(external);
+
+    var state = try initTestAcpState(alloc, workspace, .auto);
+    defer state.deinit();
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+
+    const args = try semanticSearchArgsJson(arena, "needle", external);
+    const decision = (try requestToolPermissionOutcome(&ctx, arena, .{
+        .id = "semantic",
+        .name = "semantic_search",
+        .arguments_json = args,
+    }, .auto, &.{}, &.{})).decision;
+
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, decision);
 }
 
 test "ACP admits default-safe web_search before execution" {

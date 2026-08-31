@@ -358,6 +358,7 @@ pub const LabelArgKind = enum {
     command,
     description,
     source,
+    old_path,
     action,
     query,
     selector,
@@ -367,13 +368,22 @@ pub const LabelArgKind = enum {
 pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
 
 pub const ExecutorKind = enum {
+    list_files,
     glob_files,
     grep_files,
     read_file,
     read_tool_result,
     write_file,
     edit_file,
+    delete_file,
+    rename_file,
+    copy_file,
+    create_folder,
+    file_info,
+    ast_symbols,
     memory,
+    semantic_search,
+    open_file,
     web_fetch,
     web_search,
     run_command,
@@ -426,7 +436,7 @@ pub const Tool = struct {
     /// never reaches a call-time permission check, so advertisement is its only
     /// enforcement point and requires an already-settled allow.
     provider_executed: bool = false,
-    executor_kind: ExecutorKind = .read_file,
+    executor_kind: ExecutorKind = .list_files,
     activity_kind: core_types.ToolActivityKind = .read,
     requires_approval: bool = false,
     approval_policy: ApprovalPolicy = .standard,
@@ -577,6 +587,7 @@ fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
         .command => optionalStringArg(args, "command"),
         .description => optionalStringArg(args, "description"),
         .source => optionalStringArg(args, "source"),
+        .old_path => optionalStringArg(args, "old_path"),
         .action => optionalStringArg(args, "action"),
         .query => optionalStringArg(args, "query"),
         .selector => optionalStringArg(args, "selector"),

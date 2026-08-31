@@ -65,6 +65,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    const genome_mod = addGenomeModule(b, "native", target, optimize);
+    exe.root_module.addImport("genome", genome_mod);
 
     b.installArtifact(exe);
 
@@ -89,6 +91,11 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    const genome_tests = b.addTest(.{ .root_module = genome_mod });
+    const run_genome_tests = b.addRunArtifact(genome_tests);
+    const genome_test_step = b.step("test-genome", "Run genome symbol extraction tests");
+    genome_test_step.dependOn(&run_genome_tests.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
@@ -307,6 +314,63 @@ pub fn build(b: *std.Build) void {
         pgso_ir_step.dependOn(&missing_artifact.step);
     }
 }
+fn addGenomeModule(
+    b: *std.Build,
+    comptime name_prefix: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const genome_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/genome/symbols.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    genome_mod.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
+    genome_mod.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
+
+    const flags = [_][]const u8{ "-std=gnu11", "-fno-sanitize=undefined" };
+    genome_mod.addCSourceFile(.{
+        .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
+        .flags = &flags,
+    });
+
+    const grammars = [_]struct { dir: []const u8, scanner: bool }{
+        .{ .dir = "typescript", .scanner = true },
+        .{ .dir = "tsx", .scanner = true },
+        .{ .dir = "python", .scanner = true },
+        .{ .dir = "go", .scanner = false },
+        .{ .dir = "rust", .scanner = true },
+        .{ .dir = "nix", .scanner = true },
+        .{ .dir = "zig", .scanner = false },
+    };
+    inline for (grammars) |g| {
+        const lib = b.addLibrary(.{
+            .name = name_prefix ++ "_ts_" ++ g.dir,
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        lib.root_module.addIncludePath(b.path("vendor/grammars/" ++ g.dir ++ "/src"));
+        if (g.scanner) lib.root_module.addIncludePath(b.path("vendor/grammars/" ++ g.dir));
+        lib.root_module.addCSourceFile(.{
+            .file = b.path("vendor/grammars/" ++ g.dir ++ "/src/parser.c"),
+            .flags = if (std.mem.eql(u8, g.dir, "zig"))
+                &(flags ++ .{ "-Wno-unused-but-set-variable", "-Wno-override-init" })
+            else
+                &(flags ++ .{"-Wno-unused-but-set-variable"}),
+        });
+        if (g.scanner) lib.root_module.addCSourceFile(.{
+            .file = b.path("vendor/grammars/" ++ g.dir ++ "/src/scanner.c"),
+            .flags = &flags,
+        });
+        genome_mod.linkLibrary(lib);
+    }
+    return genome_mod;
+}
 
 fn addWasmArtifact(
     b: *std.Build,
@@ -358,6 +422,7 @@ fn addWasmArtifact(
         }),
     });
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
+    wasm_exe.root_module.addImport("genome", addGenomeModule(b, "wasm", wasm_target, .ReleaseSmall));
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step(name ++ "-wasm", description);
@@ -395,6 +460,7 @@ fn addNapiArtifact(
         }),
     });
     lib.root_module.addImport("build_options", napi_options.createModule());
+    lib.root_module.addImport("genome", addGenomeModule(b, "napi", target, .ReleaseSafe));
     const node_include = b.option(
         []const u8,
         "node-include-dir",
