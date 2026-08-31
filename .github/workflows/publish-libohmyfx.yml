@@ -204,8 +204,8 @@ jobs:
         with:
           name: libfx-wasm
           path: |
-            zig-out/bin/fx-core.wasm
-            zig-out/bin/fx-term.wasm
+            zig-out/bin/omfx-core.wasm
+            zig-out/bin/omfx-term.wasm
           if-no-files-found: error
 
   publish:
@@ -246,8 +246,8 @@ jobs:
       - name: Restore package artifact layout
         run: |
           mkdir -p zig-out/bin
-          cp wasm-artifacts/fx-core.wasm zig-out/bin/fx-core.wasm
-          cp wasm-artifacts/fx-term.wasm zig-out/bin/fx-term.wasm
+          cp wasm-artifacts/fx-core.wasm zig-out/bin/omfx-core.wasm
+          cp wasm-artifacts/fx-term.wasm zig-out/bin/omfx-term.wasm
 
       - name: Stage package without executing repository code
         env:

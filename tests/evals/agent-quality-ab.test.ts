@@ -30,7 +30,7 @@ describe("agent quality A/B harness helpers", () => {
 
   test("rejects bare fx and relative binary paths", () => {
     expect(() => requireAbsoluteExecutableBinary("fx", "baseline")).toThrow(/absolute path/);
-    expect(() => requireAbsoluteExecutableBinary("./zig-out/bin/fx", "candidate")).toThrow(/absolute path/);
+    expect(() => requireAbsoluteExecutableBinary("./zig-out/bin/omfx", "candidate")).toThrow(/absolute path/);
   });
 
   test("redacts credential-looking values", () => {

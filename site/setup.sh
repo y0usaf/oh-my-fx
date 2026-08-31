@@ -40,7 +40,7 @@ main() {
   )
 
   mkdir -p "$BIN_DIR"
-  cp "$TMP_DIR/oh-my-fx/zig-out/bin/fx" "$BIN_DIR/fx"
+  cp "$TMP_DIR/oh-my-fx/zig-out/bin/omfx" "$BIN_DIR/fx"
   chmod +x "$BIN_DIR/fx"
 
   # The CLI has no --version flag, so read the version constant from source.

@@ -273,7 +273,7 @@ test "selected release channel is owned by the upgrade runtime" {
 }
 
 test "development build paths disable auto upgrade" {
-    try std.testing.expect(isDevelopmentBuildPath("/repo/zig-out/bin/fx"));
+    try std.testing.expect(isDevelopmentBuildPath("/repo/zig-out/bin/omfx"));
     try std.testing.expect(isDevelopmentBuildPath("C:\\repo\\zig-out\\bin\\fx.exe"));
     try std.testing.expect(!isDevelopmentBuildPath("/Users/me/.local/bin/fx"));
 }

@@ -319,7 +319,7 @@ jobs:
 
       - name: Report binary size
         run: |
-          bytes=$(stat -c%s zig-out/bin/fx)
+          bytes=$(stat -c%s zig-out/bin/omfx)
           mib=$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1048576 }')
           echo "${{ matrix.name }}: $bytes bytes ($mib MiB)"
           echo "${{ matrix.name }}: $bytes bytes ($mib MiB)" >> "$GITHUB_STEP_SUMMARY"

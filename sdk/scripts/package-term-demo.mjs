@@ -10,7 +10,7 @@ const outputDir = resolve(process.argv[2] || resolve(repoRoot, "sdk/dist/term-de
 const htmlPath = resolve(repoRoot, "sdk/term-demo.html");
 const browserPath = resolve(repoRoot, "sdk/browser.js");
 const sdkPath = resolve(repoRoot, "sdk/fx-sdk.js");
-const wasmPath = resolve(repoRoot, "zig-out/bin/fx-term.wasm");
+const wasmPath = resolve(repoRoot, "zig-out/bin/omfx-term.wasm");
 
 const [htmlSource, browserBytes, sdkBytes, wasmBytes] = await Promise.all([
   readFile(htmlPath, "utf8"),

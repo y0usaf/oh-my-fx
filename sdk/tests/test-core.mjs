@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { createFxAgent, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-core.wasm");
+const defaultWasm = resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm");
 const wasmPath = resolve(process.argv[2] || defaultWasm);
 
 if (!supportsJspi()) {

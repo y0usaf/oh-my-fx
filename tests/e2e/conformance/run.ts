@@ -24,7 +24,7 @@ if (installedPackage.version !== runnerVersion) {
 const runner = join(runnerRoot, "dist", "index.js");
 const client = resolve(packageRoot, "client.ts");
 const baseline = resolve(packageRoot, "expected-failures.yml");
-const fxBin = resolve(packageRoot, "../../../zig-out/bin/fx");
+const fxBin = resolve(packageRoot, "../../../zig-out/bin/omfx");
 if (!existsSync(fxBin)) {
   throw new Error(
     `missing freshly built fx binary at ${fxBin}; run FX_SOUND=0 zig build from the repository root`,

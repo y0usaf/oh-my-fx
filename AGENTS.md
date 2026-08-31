@@ -18,15 +18,15 @@ If you cannot run the binary in your environment, say so explicitly and ask the 
 
 ### Always use the built binary in this repo
 
-When running fx for verification, **always use the freshly-built binary at** **`./zig-out/bin/fx`** from this checkout. Never run `fx` from `PATH`, never rely on whatever is at `~/.fx/bin/fx`, and never assume an installed copy reflects your change.
+When running fx for verification, **always use the freshly-built binary at** **`./zig-out/bin/omfx`** from this checkout. Never run `fx` from `PATH`, never rely on whatever is at `~/.fx/bin/fx`, and never assume an installed copy reflects your change.
 
 * The user may have an older `fx` on their PATH (e.g. installed via `fx upgrade` or the CDN install script). Running that one will not exercise your edits.
 
-* `zig build` writes to `zig-out/bin/fx`. That is the only binary that contains your latest change.
+* `zig build` writes to `zig-out/bin/omfx`. That is the only binary that contains your latest change.
 
 * When a user reports "still not working" after you believe you fixed something, do not assume they are running the wrong binary. Assume your fix is incomplete and investigate further. If you genuinely suspect a PATH mismatch, ask — do not silently copy binaries into `~/.fx/bin/`.
 
-* In any shell invocation — tmux, direct run, scripts — reference fx as `/Users/<you>/path/to/repo/zig-out/bin/fx` (absolute) or `./zig-out/bin/fx` (when cwd is the repo root). Bare `fx` is always wrong for dev verification.
+* In any shell invocation — tmux, direct run, scripts — reference fx as `/Users/<you>/path/to/repo/zig-out/bin/omfx` (absolute) or `./zig-out/bin/omfx` (when cwd is the repo root). Bare `fx` is always wrong for dev verification.
 
 ## Language and Toolchain
 
@@ -56,6 +56,13 @@ The test suites under `tests/` use Bun but are separate from the Zig codebase. S
 * Prefer `snake_case` for all Zig identifiers. Types use `PascalCase` per Zig convention.
 
 * Keep `pub` surface area minimal. Only mark declarations `pub` when they are used outside the file.
+
+## Attribution
+
+When you port a feature, design, or idea from another project, name the source
+in the Credits section of `README.md` with the specific feature it influenced,
+not just a link. License obligations for copied material go in
+`THIRD_PARTY_NOTICES.md`, not the README.
 
 ## Architecture
 
@@ -268,7 +275,7 @@ Keep PR titles as clean imperative sentences, such as `Restore feedback report f
 
 ## Full CI on Feature Branches
 
-Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/fx`.
+Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/omfx`.
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. `.github/workflows/full-ci.yml` runs the following on all four supported native runner architectures:
 
@@ -455,7 +462,7 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 ## Before Marking a PR Ready
 
 1. Run `zig fmt --check src/` and the focused tests for the changed path.
-2. Build and exercise the change locally with `./zig-out/bin/fx`.
+2. Build and exercise the change locally with `./zig-out/bin/omfx`.
 3. Push a clean checkpoint commit and open a draft PR immediately.
 4. Require **Full CI** and the final ship gate to pass on the exact current commit across all four native runners.
 5. Update docs if behavior changed.
