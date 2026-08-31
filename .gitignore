@@ -59,3 +59,6 @@ benchmarks/baseline.json
 # Nix build output
 /result
 __pycache__/
+
+# Local worktrees
+.worktrees/
