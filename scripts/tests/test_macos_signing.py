@@ -14,8 +14,8 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "sign-and-notarize-macos.sh"
 RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
-PUBLISH_LIBFX_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "publish-libfx.yml"
+PUBLISH_LIBOHMYFX_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "publish-libohmyfx.yml"
 )
 PGSO_WORKFLOW_PATH = (
     REPO_ROOT / ".github" / "workflows" / "pgso-macos-arm64.yml"
@@ -462,10 +462,12 @@ else:
 class MacosSigningWorkflowTests(unittest.TestCase):
     def test_every_privileged_publish_job_uses_an_environment_gate(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
-        publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
+        publish_libohmyfx = PUBLISH_LIBOHMYFX_WORKFLOW_PATH.read_text(
+            encoding="utf-8"
+        )
 
         release_job = release.split("  release:\n", 1)[1]
-        npm_publish_job = publish_libfx.split("  publish:\n", 1)[1]
+        npm_publish_job = publish_libohmyfx.split("  publish:\n", 1)[1]
 
         self.assertIn("environment: release", release_job)
         self.assertIn("environment: npm", npm_publish_job)
@@ -479,7 +481,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         self.assertIn("runs-on: macos-15-intel", release)
         self.assertIn("sign-macos-arm64:", release)
         self.assertEqual(2, release.count("environment: apple-signing"))
-        self.assertIn("scripts/sign-and-notarize-macos.sh zig-out/bin/fx", release)
+        self.assertIn("scripts/sign-and-notarize-macos.sh zig-out/bin/omfx", release)
         self.assertNotIn("sign-stable-release:", pgso)
         self.assertNotIn("package_release", pgso)
         self.assertNotIn("environment: apple-signing", pgso)

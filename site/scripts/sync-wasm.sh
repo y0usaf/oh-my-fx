@@ -10,5 +10,5 @@ SOURCE="${1:-$(cd "$ROOT/../.." && pwd)}"
 
 cd "$SOURCE"
 nix shell nixpkgs#zig --command zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
-cp zig-out/bin/fx-term.wasm "$ROOT/fx-term.wasm"
+cp zig-out/bin/omfx-term.wasm "$ROOT/fx-term.wasm"
 echo "synced: $ROOT/fx-term.wasm ($(stat -c%s "$ROOT/fx-term.wasm") bytes)"

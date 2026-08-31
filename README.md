@@ -2,14 +2,17 @@
 <img src="assets/omfx.svg" alt="oh-my-fx — Why should Pi have all the fun?" width="560">
 </p>
 
+*What more could I say? I wouldn't be here today
+If the old school didn't pave the way.*
+
 ## Credits
 
 oh-my-fx is inspired by:
 
-- [fx](https://github.com/vercel-labs/fx)
+- [fx](https://github.com/vercel-labs/fx) — the base harness: embedding model, CLI form factor, Unix-shell output style
 - [Pi](https://github.com/earendil-works/pi)
-- [Oh My Pi](https://github.com/can1357/oh-my-pi)
-- [Crush](https://github.com/charmbracelet/crush)
+- [Oh My Pi](https://github.com/can1357/oh-my-pi) — laid the foundation of a "batteries included" layer on top of a minimalist harness
+- [Crush](https://github.com/charmbracelet/crush) — beautiful TUI design
 
 <details>
 <summary>Original vercel-labs/fx README</summary>
@@ -161,7 +164,7 @@ Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
 git clone https://github.com/vercel-labs/fx.git
 cd fx
 zig build -Doptimize=ReleaseSafe
-./zig-out/bin/fx
+./zig-out/bin/omfx
 ```
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
