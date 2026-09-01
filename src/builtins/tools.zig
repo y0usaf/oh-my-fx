@@ -72,14 +72,14 @@ const terminal_exec_only_cwd_description =
 const terminal_exec_only_command_description =
     "Command to run.";
 const terminal_exec_only_profile_description =
-    "Profile for exec; omission defaults to user, while clean skips user initialization files. User execution supports the configured Bash or zsh login shell. Bash login execution reads login initialization files; .bashrc is available only when sourced by the login profile.";
+    "Profile for exec; omission defaults to user, while clean skips user initialization files. User execution runs the embedded rush shell with user initialization files.";
 const terminal_exec_only_timeout_description =
     "Maximum foreground runtime in milliseconds. Choose the shortest realistic finite budget; use terminal start for work that must remain alive.";
 
 const terminal_shell_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{ "user_login", "executable" } } },
-        .{ .name = "path", .json_type = .string, .description = "Required for kind=executable; use an absolute path to Bash or zsh." },
+        .{ .name = "path", .json_type = .string, .description = "Optional; omfx always runs its embedded rush shell and resolves the executable itself." },
         .{ .name = "clean_start", .json_type = .boolean },
     },
     .additional_properties = false,
@@ -177,7 +177,7 @@ const terminal_properties = [_]model_tool_schema.Property{
     .{ .name = "session_id", .json_type = .string, .description = "Required for session-targeted actions. Set null for start and list; owner-catalog authority is private." },
     .{ .name = "cwd", .json_type = .string, .description = "Working directory for exec or start; defaults to the workspace." },
     .{ .name = "command", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_command_bytes }, .description = "Command for exec, or optional command for start; omit on start for an interactive shell." },
-    .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "Startup profile for exec or start; omission defaults to user, while clean skips user startup files. User-profile execution supports the configured Bash or zsh login shell. Bash login execution reads login startup files; .bashrc is available only when sourced by the login profile. For start, an explicit shell is used instead of the default profile and is mutually exclusive with profile." },
+    .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "Startup profile for exec or start; omission defaults to user, while clean skips user startup files. The shell is always the embedded rush runtime; the profile only controls whether user startup files run. For start, an explicit shell is used instead of the default profile and is mutually exclusive with profile." },
     .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = terminal_impl.exec_timeout_min_ms, .maximum = terminal_impl.exec_timeout_max_ms }, .description = "Required for exec. Maximum foreground runtime in milliseconds; use start for persistent work." },
     .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &terminal_shell_schema } },
     .{ .name = "backend", .json_type = .string, .shape = &.{ .enum_values = &.{ "native", "tmux" } }, .description = "Start backend or optional list filter." },

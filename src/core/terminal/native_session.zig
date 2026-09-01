@@ -1087,7 +1087,6 @@ const SupportedRegistry = struct {
                 .start,
                 switch (err) {
                     error.CapacityExceeded => .capacity_exceeded,
-                    error.MissingLoginShell => .shell_unavailable,
                     error.RelativeShellPath,
                     error.UnsupportedShell,
                     => .invalid_request,
