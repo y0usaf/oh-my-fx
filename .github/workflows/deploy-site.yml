@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - "site/**"
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
       - ".github/workflows/deploy-site.yml"
   workflow_dispatch:
 
@@ -13,6 +16,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          cache-key: deploy-site-wasm
+      - name: Build terminal wasm
+        run: |
+          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
+          cp zig-out/bin/omfx-term.wasm site/fx-term.wasm
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

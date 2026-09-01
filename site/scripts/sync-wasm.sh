@@ -6,7 +6,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SOURCE="${1:-$(cd "$ROOT/../.." && pwd)}"
+SOURCE="${1:-$(cd "$ROOT/.." && pwd)}"
 
 cd "$SOURCE"
 nix shell nixpkgs#zig --command zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
