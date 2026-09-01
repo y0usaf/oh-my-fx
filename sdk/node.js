@@ -20,8 +20,8 @@ const fetchOperationApplied = 1;
 const fetchOperationBackpressure = 2;
 
 const require = createRequire(import.meta.url);
-const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url);
-const defaultTermWasm = new URL("./fx-term.wasm", import.meta.url);
+const defaultCoreWasm = new URL("./omfx-core.wasm", import.meta.url);
+const defaultTermWasm = new URL("./omfx-term.wasm", import.meta.url);
 const defaultNativeCandidates = [
   "./libfx.node",
   `./libfx.${process.platform}-${process.arch}.node`,

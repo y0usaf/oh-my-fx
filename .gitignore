@@ -64,4 +64,4 @@ __pycache__/
 .worktrees/
 
 # Generated site assets (built by deploy-site.yml or sync-wasm.sh)
-site/fx-term.wasm
+site/omfx-term.wasm

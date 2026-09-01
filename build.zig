@@ -384,8 +384,8 @@ fn addWasmArtifact(
         .os_tag = .wasi,
     });
     const name = switch (surface) {
-        .core => "fx-core",
-        .term => "fx-term",
+        .core => "omfx-core",
+        .term => "omfx-term",
         .none => unreachable,
     };
     const description = switch (surface) {

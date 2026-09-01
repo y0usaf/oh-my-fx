@@ -135,8 +135,8 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | Surface | Use |
 | --- | --- |
 | `fx acp` | Connect the native agent to editors and other Agent Client Protocol clients. |
-| `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
-| `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
+| `createFxAgent()` | Embed the agent core in a JavaScript host with `omfx-core.wasm`. |
+| `createFxTerminal()` | Embed the interactive terminal with `omfx-term.wasm`. |
 
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
 

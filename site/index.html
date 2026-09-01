@@ -503,7 +503,7 @@ if (!supportsJspi()) {
       .then(() => fitAddon.fit())
       .catch(() => {});
 
-    const response = await fetch("./fx-term.wasm");
+    const response = await fetch("./omfx-term.wasm");
     if (!response.ok) throw new Error("wasm fetch failed: " + response.status);
     const module = await WebAssembly.compile(await response.arrayBuffer());
 

@@ -24,7 +24,7 @@ jobs:
       - name: Build terminal wasm
         run: |
           zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
-          cp zig-out/bin/fx-term.wasm site/fx-term.wasm
+          cp zig-out/bin/omfx-term.wasm site/omfx-term.wasm
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

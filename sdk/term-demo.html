@@ -6,9 +6,9 @@
   <title>fx terminal WebAssembly demo</title>
   <script>
     // The production packager replaces these defaults with content-addressed values.
-    const fxWasmAsset = "./fx-term.wasm";
+    const fxWasmAsset = "./omfx-term.wasm";
     const fxWasmIntegrity = "";
-    const fxWasmUrl = fxWasmAsset === "./fx-term.wasm" &&
+    const fxWasmUrl = fxWasmAsset === "./omfx-term.wasm" &&
       (location.hostname === "localhost" || location.hostname === "127.0.0.1")
       ? "../zig-out/bin/omfx-term.wasm"
       : fxWasmAsset;

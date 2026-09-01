@@ -246,8 +246,6 @@ jobs:
       - name: Restore package artifact layout
         run: |
           mkdir -p zig-out/bin
-          cp wasm-artifacts/fx-core.wasm zig-out/bin/omfx-core.wasm
-          cp wasm-artifacts/fx-term.wasm zig-out/bin/omfx-term.wasm
 
       - name: Stage package without executing repository code
         env:
@@ -274,7 +272,7 @@ jobs:
           rm -rf sdk/dist/libfx
           mkdir -p sdk/dist/libfx
           cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js LICENSE sdk/dist/libfx/
-          cp wasm-artifacts/fx-core.wasm wasm-artifacts/fx-term.wasm sdk/dist/libfx/
+          cp wasm-artifacts/omfx-core.wasm wasm-artifacts/omfx-term.wasm sdk/dist/libfx/
           cp native-addons/*.node sdk/dist/libfx/
           jq --arg version "$LIBFX_VERSION" '.version = $version | del(.files)' \
             sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
@@ -289,7 +287,7 @@ jobs:
           const names = new Set(report.files.map(({ path }) => path));
           const required = [
             "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
-            "fx-core.wasm", "fx-term.wasm",
+            "omfx-core.wasm", "omfx-term.wasm",
             "libfx.linux-x64.node", "libfx.linux-arm64.node",
             "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
           ];

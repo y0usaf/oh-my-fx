@@ -284,7 +284,7 @@
         const agent = await createFxAgent({
           wasm: location.hostname === "localhost" || location.hostname === "127.0.0.1"
             ? "../zig-out/bin/omfx-core.wasm"
-            : "./fx-core.wasm",
+            : "./omfx-core.wasm",
           env: { AI_GATEWAY_API_KEY: localStorage.getItem("FX_API_KEY") || "sdk-test-key" },
           fetch: dispatchFetch,
           onEvent: observe,

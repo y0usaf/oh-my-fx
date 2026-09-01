@@ -29,8 +29,8 @@
     "browser.js",
     "node.js",
     "fx-sdk.js",
-    "fx-core.wasm",
-    "fx-term.wasm",
+    "omfx-core.wasm",
+    "omfx-term.wasm",
     "*.node",
     "README.md",
     "LICENSE"
