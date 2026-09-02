@@ -1,18 +1,9 @@
 {
   "version": 1,
   "intentional_exclusions": {
-    "ci-shards.test.ts": "The suite validates the E2E shard planner rather than fx runtime behavior.",
-    "context-limits-live.test.ts": "The suite requires a real model credential and live provider responses.",
-    "notifications.test.ts": "Sound-related tests are prohibited on the production training host.",
-    "tmux-helpers.test.ts": "The suite validates E2E harness helpers rather than fx runtime behavior.",
+    "notifications.test.ts": "The suite requires a real model credential and is not deterministic.",
     "tui-agent.test.ts": "The suite requires a real model credential and is not deterministic.",
-    "tui-command-permissions.test.ts": "The file contains a sound scenario and cannot be run safely as a whole.",
-    "tui-direct-write-audit.test.ts": "The suite validates a repository audit tool rather than the candidate runtime.",
-    "tui-keybindings.test.ts": "The file-wide guard requires a real model credential.",
-    "tui-render-lab.test.ts": "The suite validates render-lab infrastructure and owns separate native opt-in scenarios.",
-    "tui-render-live-stress.test.ts": "The suite requires a real model credential and explicit live stress opt-in.",
-    "web-fetch-live.test.ts": "The suite requires explicit live-network opt-in.",
-    "web-search-live.test.ts": "The suite requires a real model credential and live provider responses."
+    "tui-command-permissions.test.ts": "The file contains a sound scenario and cannot be run safely as a whole."
   },
   "defaults": {
     "cwd": "tests/e2e",
