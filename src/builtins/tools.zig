@@ -790,8 +790,6 @@ pub const ast_symbols = ToolSpec{
     .irreversible_fn = ast_symbols_impl.isIrreversible,
 };
 
-
-
 pub const web_fetch = ToolSpec{
     .name = "web_fetch",
     .description = web_fetch_description,
@@ -2048,8 +2046,7 @@ test "built-in tools register exact active local order" {
         try std.testing.expectEqualStrings(expected, all[index].name);
     }
 
-    for ([_][]const u8{
-    }) |removed| {
+    for ([_][]const u8{}) |removed| {
         try std.testing.expect(lookup(removed) == null);
     }
 }
