@@ -661,7 +661,6 @@ fn checkLivePreviewRegistryAllocation(alloc: Allocator) !void {
     );
 }
 
-
 const CommitContext = struct {
     persistence: Persistence,
     response: communication.ApprovalResponse,
@@ -682,11 +681,6 @@ const CommitContext = struct {
         };
     }
 };
-
-
-
-
-
 
 fn checkPendingRoutePageAllocation(alloc: Allocator, registry: *Registry) !void {
     var first = try registry.snapshotPendingRoutes(alloc, 0, 8);

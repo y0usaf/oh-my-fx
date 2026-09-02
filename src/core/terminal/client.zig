@@ -65,7 +65,6 @@ noinline fn failCompletionDynamic(err: anyerror) anyerror!Completion {
     return err;
 }
 
-
 const Intent = struct {
     correlation_id: contracts.CorrelationId,
     request: contracts.OwnedActionRequest,
@@ -1080,15 +1079,3 @@ fn checkIntentAllocationFailures(alloc: Allocator) !void {
     var rollback = runtime.rollbackAdmissionLocked(intent.correlation_id);
     rollback.deinit(alloc);
 }
-
-
-
-
-
-
-
-
-
-
-
-

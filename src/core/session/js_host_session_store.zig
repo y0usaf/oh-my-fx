@@ -182,4 +182,3 @@ fn nextCapacity(current: usize, maximum: usize) ?usize {
     if (current >= maximum) return null;
     return @min(current * 2, maximum);
 }
-

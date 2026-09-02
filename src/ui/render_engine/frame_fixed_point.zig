@@ -169,12 +169,3 @@ fn solveFixedPointForTest(
         FixedPointTestContext.resolveCandidate,
     );
 }
-
-
-
-
-
-
-
-
-

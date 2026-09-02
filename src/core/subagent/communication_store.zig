@@ -923,15 +923,6 @@ fn canonicalWireByteCount(
     return bytes.len;
 }
 
-
-
-
-
-
-
-
-
-
 const CapacityTestGrants = struct {
     grants: []types.PermissionGrant,
     tool_bytes: []u8,
@@ -1023,20 +1014,6 @@ fn registerCapacityTestApproval(
     });
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkCommunicationCodecAllocationFailures(alloc: Allocator) !void {
     var ledger = try communication.Ledger.init(alloc, "child");
     defer ledger.deinit(alloc);
@@ -1052,7 +1029,6 @@ fn checkCommunicationCodecAllocationFailures(alloc: Allocator) !void {
     var restored = try decode(alloc, bytes);
     defer restored.deinit(alloc);
 }
-
 
 fn checkCommunicationCompactionAllocationFailures(alloc: Allocator) !void {
     var ledger = try communication.Ledger.init(alloc, "child");
@@ -1072,7 +1048,6 @@ fn checkCommunicationCompactionAllocationFailures(alloc: Allocator) !void {
     defer alloc.free(bytes);
     try std.testing.expect(bytes.len < raw.len);
 }
-
 
 fn checkCapacityMutationAllocationFailures(alloc: Allocator) !void {
     var ledger = try communication.Ledger.init(alloc, "child");
@@ -1118,8 +1093,6 @@ fn checkCapacityMutationAllocationFailures(alloc: Allocator) !void {
     const bytes = try encode(alloc, ledger);
     defer alloc.free(bytes);
 }
-
-
 
 fn fuzzCommunicationRecord(_: void, smith: *std.testing.Smith) !void {
     var buffer: [8192]u8 = undefined;

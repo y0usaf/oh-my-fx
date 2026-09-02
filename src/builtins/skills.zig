@@ -874,18 +874,6 @@ fn renameWithCommitFailure(ctx: ?*anyopaque, old_path: []const u8, new_path: []c
     try renameInstallPath(null, old_path, new_path);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
     if (std.fs.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
@@ -923,39 +911,6 @@ fn expectNoAbsoluteFile(path: []const u8) !void {
     } else |_| {}
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const StaticSkill = struct {
     name: []const u8,
     info: SkillInfo,
@@ -980,12 +935,3 @@ fn staticCommandRequest(skills_dir: []const u8, static_ctx: *StaticSkillCtx) Com
         .find_skill = findStaticSkill,
     };
 }
-
-
-
-
-
-
-
-
-

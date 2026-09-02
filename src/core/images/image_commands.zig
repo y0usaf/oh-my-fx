@@ -342,9 +342,6 @@ fn countSnapshotFiles(snapshot_dir: []const u8) !usize {
     return count;
 }
 
-
-
-
 fn expectBadgeProjection(alloc: std.mem.Allocator, app: *const FakeApp, expected: []const u8) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -357,14 +354,6 @@ fn expectBadgeProjection(alloc: std.mem.Allocator, app: *const FakeApp, expected
     );
     try std.testing.expectEqualStrings(expected, out.written());
 }
-
-
-
-
-
-
-
-
 
 fn checkImageInsertionAllocationFailureIsAtomic(
     failing: *std.testing.FailingAllocator,
@@ -401,12 +390,3 @@ fn checkImageInsertionAllocationFailureIsAtomic(
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.image_tokens.items.len);
     try std.testing.expectEqual(@as(usize, 8), app.next_image_id_counter);
 }
-
-
-
-
-
-
-
-
-

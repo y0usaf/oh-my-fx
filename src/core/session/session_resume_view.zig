@@ -286,10 +286,3 @@ const test_capture = Capture{
     .terminal_cols = 80,
     .complete = true,
 };
-
-
-
-
-
-
-

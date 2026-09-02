@@ -1954,8 +1954,6 @@ pub fn directCommand(expanded: []const u8) ?[]const u8 {
     return expanded[1..];
 }
 
-
-
 fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !void {
     const draft = try buildQueuedPromptDraft(
         alloc,
@@ -1979,7 +1977,6 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
     try std.testing.expectEqual(@as(usize, 1), draft.images.len);
     try std.testing.expectEqual(@as(usize, 1), draft.skill_display_spans.len);
 }
-
 
 const PendingLifecycleFake = struct {
     alloc: std.mem.Allocator,
@@ -2108,8 +2105,3 @@ fn expectPendingSnapshotMissing(path: []const u8) !void {
         std.Io.Dir.openFileAbsolute(std.testing.io, path, .{}),
     );
 }
-
-
-
-
-

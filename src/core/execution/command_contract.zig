@@ -241,6 +241,3 @@ fn writeOptionalIntField(writer: *std.Io.Writer, comptime name: []const u8, valu
         try writer.writeAll("null");
     }
 }
-
-
-

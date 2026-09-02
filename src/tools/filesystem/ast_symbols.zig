@@ -143,6 +143,4 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
 
-
 fn testNoopInputDeinit(_: *anyopaque, _: Allocator) void {}
-

@@ -510,17 +510,6 @@ fn fakeRuntime(fake: *FakeProvider) Runtime {
     });
 }
 
-
-
-
-
-
-
-
-
-
-
-
 var permission_decider_calls: usize = 0;
 
 fn denyPermission(_: *const tool_dispatch.Tool, _: tool_dispatch.ToolInput, _: tool_dispatch.DispatchContext) @import("../permissions/permission_gate.zig").Decision {
@@ -533,11 +522,6 @@ fn allowPermission(_: *const tool_dispatch.Tool, _: tool_dispatch.ToolInput, _: 
     return .{ .action = .allow, .reason = "test allow" };
 }
 
-
-
-
-
-
 const SearchConfigStress = struct {
     runtime: *Runtime,
     inputs: Inputs,
@@ -546,6 +530,3 @@ const SearchConfigStress = struct {
         for (0..2000) |_| self.runtime.configure(self.inputs);
     }
 };
-
-
-

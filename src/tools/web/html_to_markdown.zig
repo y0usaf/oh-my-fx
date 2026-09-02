@@ -526,6 +526,3 @@ fn namedEntity(entity: []const u8) ?[]const u8 {
     }
     return null;
 }
-
-
-

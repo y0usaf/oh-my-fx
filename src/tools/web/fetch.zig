@@ -632,34 +632,3 @@ const web_fetch_dispatch_tool = tool_dispatch.Tool{
     .reads_only_fn = readsOnly,
     .irreversible_fn = isIrreversible,
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

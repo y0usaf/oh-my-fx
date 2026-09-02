@@ -801,16 +801,6 @@ fn projectForTest(alloc: std.mem.Allocator, chunks: []const []const u8) ![]u8 {
     return projected.toOwnedSlice(alloc);
 }
 
-
-
-
-
-
-
-
-
-
-
 fn createListingFiles(
     dir: std.Io.Dir,
     full_length_count: usize,
@@ -836,7 +826,6 @@ fn createListingFiles(
     }
 }
 
-
 fn injectedPlan(
     cwd: []const u8,
     stages: []const command_effect.DirectStage,
@@ -847,13 +836,6 @@ fn injectedPlan(
         .stages = stages,
     };
 }
-
-
-
-
-
-
-
 
 const CallbackCapture = struct {
     stdout: [512]u8 = undefined,
@@ -887,13 +869,3 @@ const CallbackCapture = struct {
         }
     }
 };
-
-
-
-
-
-
-
-
-
-

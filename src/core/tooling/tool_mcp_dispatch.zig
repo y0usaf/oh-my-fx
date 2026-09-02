@@ -235,6 +235,3 @@ fn semanticFailure(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     return .{ .failure = try ctx.allocator.dupe(u8, message) };
 }
-
-
-

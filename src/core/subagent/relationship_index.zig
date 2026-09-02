@@ -1263,7 +1263,6 @@ fn lookupFileName(child_id: []const u8) [87]u8 {
     return buffer;
 }
 
-
 fn headersEqual(a: Header, b: Header) bool {
     return a.storage_epoch == b.storage_epoch and
         a.generation == b.generation and
@@ -1320,9 +1319,6 @@ fn mapReplace(err: anyerror) Error {
         else => error.StoreUnavailable,
     };
 }
-
-
-
 
 fn fuzzRelationshipIndex(_: void, smith: *std.testing.Smith) !void {
     var buffer: [8192]u8 = undefined;

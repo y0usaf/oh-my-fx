@@ -90,8 +90,3 @@ fn admittedFeatures() BackendCapabilities {
 
 const test_primary_backend = SearchBackendId{ .value = "test.primary" };
 const test_secondary_backend = SearchBackendId{ .value = "test.secondary" };
-
-
-
-
-

@@ -43,5 +43,3 @@ fn sendPrepared(
 ) anyerror!stream_provider.Result {
     return openai_codex.streamPrepared(alloc, request, payload);
 }
-
-

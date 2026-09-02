@@ -67,6 +67,3 @@ pub fn decodeJson(
 
     return answers;
 }
-
-
-

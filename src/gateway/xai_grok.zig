@@ -520,10 +520,6 @@ fn mapReducerError(err: anyerror) anyerror {
     };
 }
 
-
-
-
-
 fn testModelRequest(
     secret_value: []const u8,
     source: types.CredentialSource,
@@ -553,7 +549,6 @@ fn testModelRequest(
         .cancel_flag = cancelled,
     };
 }
-
 
 const TestResponseMode = enum {
     slow_head,
@@ -750,11 +745,9 @@ fn runXaiTestStream(deadline: ?std.Io.Clock.Timestamp) !stream_provider.Result {
     return agent_stream_provider.stream(std.testing.allocator, request);
 }
 
-
 fn ignoreTestChunk(_: *anyopaque, _: []const u8) void {}
 fn ignoreTestEvent(_: *anyopaque, _: stream_provider.Event) void {}
 fn admitTestRequest(_: *anyopaque) !void {}
-
 
 fn deinitTestCompletion(completion: *types.ModelCompletion) void {
     if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -872,6 +865,3 @@ fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
     try out.writer.writeAll(terminal);
     return out.toOwnedSlice();
 }
-
-
-

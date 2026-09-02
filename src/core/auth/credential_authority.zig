@@ -39,5 +39,3 @@ pub fn derive(
     hash.final(&bytes);
     return .{ .bytes = bytes };
 }
-
-

@@ -62,11 +62,6 @@ pub fn openDirAbsoluteNoFollow(path: []const u8, options: std.Io.Dir.OpenOptions
     return result;
 }
 
-
-
-
-
-
 /// Opens an existing regular file without following the final symlink and
 /// without waiting on a special file that races the initial metadata check.
 /// The caller owns the returned file.
@@ -216,9 +211,6 @@ fn makeFileBlocking(file: *std.Io.File) !void {
     }
     file.flags.nonblocking = false;
 }
-
-
-
 
 pub fn setEnvironMap(m: *const std.process.Environ.Map) void {
     global_environ = m;
@@ -843,23 +835,6 @@ fn readTempFile(alloc: std.mem.Allocator, dir: std.Io.Dir, name: []const u8, max
     return readFileToEnd(alloc, &file, max_bytes);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const DurableFailureState = struct {
     fail_temp_sync: bool = false,
     fail_parent_sync: bool = false,
@@ -898,12 +873,3 @@ fn testLockSleep(ctx: ?*anyopaque, millis: u64) void {
     const state: *DurableFailureState = @ptrCast(@alignCast(ctx.?));
     state.now_ms += @intCast(millis);
 }
-
-
-
-
-
-
-
-
-

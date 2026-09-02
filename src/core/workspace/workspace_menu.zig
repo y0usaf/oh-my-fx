@@ -76,5 +76,3 @@ fn savedEntryCount(entries: []const workspace_access.Entry) usize {
     for (entries) |entry| count += @intFromBool(entry.saved);
     return count;
 }
-
-

@@ -67,7 +67,6 @@ pub fn resolveTurnPreferences(
     };
 }
 
-
 pub const WorkOutcome = enum {
     completed,
     failed,
@@ -2925,7 +2924,6 @@ fn appendSlotLiveEvent(
     if (!slot.finished) slot.live.appendEvent(owner.alloc, event);
 }
 
-
 fn checkLivePresentationCloneAllocationFailures(alloc: Allocator) !void {
     var state = LivePresentationState{};
     defer state.deinit(alloc);
@@ -2951,7 +2949,6 @@ fn checkLivePresentationCloneAllocationFailures(alloc: Allocator) !void {
     var snapshot = (try state.clone(alloc)) orelse return error.TestUnexpectedResult;
     snapshot.deinit(alloc);
 }
-
 
 fn slotMain(slot: *Slot) void {
     var prior_result: ?ChildResult = null;
@@ -3556,7 +3553,6 @@ fn serviceFailureReason(err: ServiceError) []const u8 {
     };
 }
 
-
 fn mapOpenControlError(err: session_store.OpenSubagentControlError) ControlError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -3608,9 +3604,6 @@ fn mapControlSaveError(err: control_store.SaveError) ControlError {
         => error.ControlStoreFailed,
     };
 }
-
-
-
 
 fn testRecord(
     alloc: Allocator,
@@ -4318,12 +4311,6 @@ fn captureTestNotificationPolicy(
     )).?;
 }
 
-
-
-
-
-
-
 fn checkNotificationScheduleRegistrationAllocationFailures(alloc: Allocator) !void {
     const durable_alloc = std.testing.allocator;
     var env = try TestEnvironment.init(durable_alloc);
@@ -4347,7 +4334,6 @@ fn checkNotificationScheduleRegistrationAllocationFailures(alloc: Allocator) !vo
     try owner.registerNotificationSchedule("child", "work-a", 150);
     try std.testing.expectEqual(@as(usize, 2), owner.notification_schedules.items.len);
 }
-
 
 fn checkNotificationCleanupAllocationFailures(alloc: Allocator) !void {
     const durable_alloc = std.testing.allocator;
@@ -4386,11 +4372,6 @@ fn checkNotificationCleanupAllocationFailures(alloc: Allocator) !void {
     };
 }
 
-
-
-
-
-
 fn checkNotificationOwnerPollAllocationFailures(alloc: Allocator) !void {
     const durable_alloc = std.testing.allocator;
     var env = try TestEnvironment.init(durable_alloc);
@@ -4413,12 +4394,6 @@ fn checkNotificationOwnerPollAllocationFailures(alloc: Allocator) !void {
     const report = try owner.pollNotifications();
     try std.testing.expectEqual(@as(usize, 1), report.due);
 }
-
-
-
-
-
-
 
 fn expectOwnerStartAllocationFailure(fail_index: usize) !void {
     const durable_alloc = std.testing.allocator;
@@ -4453,20 +4428,6 @@ fn expectOwnerStartAllocationFailure(fail_index: usize) !void {
         failing_allocator.freed_bytes,
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const FailNthControlSync = struct {
     fail_at: usize,
@@ -4677,16 +4638,6 @@ fn runToolActivityProjectionFailure(indeterminate: bool) !void {
     try std.testing.expectEqual(@as(usize, 1), final_count);
 }
 
-
-
-
-
-
-
-
-
-
-
 const ProcessBoundaryExecution = struct {
     ready_fd: std.c.fd_t,
     release_fd: std.c.fd_t,
@@ -4810,15 +4761,6 @@ fn waitExternalExecutionProcess(pid: std.c.pid_t) !u8 {
         }
     }
 }
-
-
-
-
-
-
-
-
-
 
 fn waitForPendingToolApproval(
     alloc: Allocator,
@@ -5152,8 +5094,6 @@ fn freeTestStrings(alloc: Allocator, values: [][]u8) void {
     alloc.free(values);
 }
 
-
-
 fn checkAdmissionAllocationFailures(alloc: Allocator) !void {
     var snapshot = try domain.captureAdmission(alloc, .{
         .parent_id = "parent",
@@ -5165,7 +5105,6 @@ fn checkAdmissionAllocationFailures(alloc: Allocator) !void {
     });
     snapshot.deinit(alloc);
 }
-
 
 fn checkRecoveryAllocationFailures(alloc: Allocator) !void {
     var record = try testRecord(alloc, .persistent, &.{ "first", "second" });
@@ -5179,4 +5118,3 @@ fn checkCancellationAllocationFailures(alloc: Allocator) !void {
     defer record.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), try cancelWork(alloc, &record, "stop", 2));
 }
-

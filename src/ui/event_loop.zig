@@ -121,7 +121,6 @@ pub fn run(terminal: anytype, should_exit: *bool, poll_timeout_ms: i32, callback
     return .requested_exit;
 }
 
-
 const EventLoopTestTrace = struct {
     bytes: [8]u8 = undefined,
     len: usize = 0,
@@ -233,15 +232,6 @@ fn useLongerPollTimeout(_: *anyopaque, default_timeout_ms: i32) i32 {
     return default_timeout_ms * 2;
 }
 
-
-
-
-
-
-
-
-
-
 const EventLoopClosedTerminal = struct {
     poll_result: shell_runtime.PollResult,
 
@@ -253,7 +243,3 @@ const EventLoopClosedTerminal = struct {
         return 0;
     }
 };
-
-
-
-

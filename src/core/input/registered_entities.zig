@@ -699,6 +699,3 @@ fn isWordChar(codepoint: u21) bool {
 fn isWhitespaceRune(codepoint: u21) bool {
     return codepoint == ' ' or codepoint == '\t' or codepoint == '\n' or codepoint == '\r';
 }
-
-
-

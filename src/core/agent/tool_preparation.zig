@@ -510,13 +510,6 @@ const test_classifiers: Classifiers = .{
     .stop_policy = testNoClassification,
 };
 
-
-
-
-
-
-
-
 fn checkPreparationAllocationFailures(alloc: Allocator, workspace: []const u8) !void {
     const builtin_tools = @import("../../builtins/tools.zig");
     const tools = [_]tool_dispatch.Tool{builtin_tools.write_file};
@@ -532,4 +525,3 @@ fn checkPreparationAllocationFailures(alloc: Allocator, workspace: []const u8) !
     defer result.deinit(alloc);
     try std.testing.expect(result == .candidate);
 }
-

@@ -1060,24 +1060,6 @@ fn buildWithStyleAndStats(
     return projection;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     var entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 2, .bytes = "● Running second", .class = .tool_status } },
@@ -1115,18 +1097,3 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
         projection.entry_actions.items[0].override.bytes,
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

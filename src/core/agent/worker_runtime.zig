@@ -1914,9 +1914,6 @@ fn recoveryContinuationAdmission(
     return queued_count == 0 and (!processing or terminal_pause_ready);
 }
 
-
-
-
 fn dupeOwnedQuestionEntry(alloc: std.mem.Allocator, entry: types.QuestionBatchEntry) !OwnedQuestionEntry {
     const question_dup = try alloc.dupe(u8, entry.question);
     errdefer alloc.free(question_dup);
@@ -2121,13 +2118,6 @@ fn discardQueuedPrompt(
     freeQueuedPrompt(alloc, prompt);
 }
 
-
-
-
-
-
-
-
 fn checkHistoryPropagationAllocation(
     alloc: std.mem.Allocator,
     snapshot_path: []const u8,
@@ -2193,9 +2183,6 @@ fn checkHistoryPropagationAllocation(
     return true;
 }
 
-
-
-
 fn checkFinishOwnershipHandoffAllocation(
     alloc: std.mem.Allocator,
     snapshot_path: []const u8,
@@ -2232,7 +2219,6 @@ fn checkFinishOwnershipHandoffAllocation(
         std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{}),
     );
 }
-
 
 pub fn dupeSkillBindings(alloc: std.mem.Allocator, bindings: []const SkillBinding) ![]SkillBinding {
     if (bindings.len == 0) return &.{};
@@ -2608,15 +2594,6 @@ fn freeEventList(alloc: std.mem.Allocator, events: *std.ArrayList(WorkerEvent)) 
     events.deinit(alloc);
 }
 
-
-
-
-
-
-
-
-
-
 fn checkStateSnapshotFailurePreservesPendingEvents(alloc: std.mem.Allocator) !void {
     const owner_alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
@@ -2646,26 +2623,6 @@ fn checkStateSnapshotFailurePreservesPendingEvents(alloc: std.mem.Allocator) !vo
     try std.testing.expect(runtime.worker_events.items[0] == .command_output_complete);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const QueueTakeThreadState = struct {
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -2682,15 +2639,6 @@ fn runQueueTake(state: *QueueTakeThreadState, runtime: *WorkerRuntime) void {
     };
     state.finished.store(true, .seq_cst);
 }
-
-
-
-
-
-
-
-
-
 
 const EnqueueThreadState = struct {
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -2719,15 +2667,6 @@ fn waitForEnqueueThreadStart(state: *EnqueueThreadState) !void {
     return error.TestExpectedEqual;
 }
 
-
-
-
-
-
-
-
-
-
 fn checkToolLifecycleDupAllocationFailure(alloc: std.mem.Allocator) !void {
     const owned = try dupeToolLifecycleEvent(alloc, .{ .authoritative_started = .{
         .id = .{ .turn_id = 7, .call_id = "final" },
@@ -2751,16 +2690,6 @@ fn checkToolLifecycleDupAllocationFailure(alloc: std.mem.Allocator) !void {
     );
 }
 
-
-
-
-
-
-
-
-
-
-
 fn checkSemanticWorkerEventDuplicationAllocationFailure(alloc: std.mem.Allocator) !void {
     const ordinary = try dupeWorkerEvent(alloc, .{ .semantic_notice = .{
         .topic = "context",
@@ -2783,8 +2712,6 @@ fn checkSemanticWorkerEventDuplicationAllocationFailure(alloc: std.mem.Allocator
     try std.testing.expectEqualStrings("publish failed", error_event.error_text.body);
 }
 
-
-
 fn checkSemanticNoticeEnqueueAllocationFailure(alloc: std.mem.Allocator) !void {
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
@@ -2802,7 +2729,6 @@ fn checkSemanticNoticeEnqueueAllocationFailure(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("permissions", events.items[0].semantic_notice.topic);
     try std.testing.expectEqualStrings("approval", events.items[0].semantic_notice.body);
 }
-
 
 const PermissionThreadState = struct {
     decision: ?types.ToolPermissionDecision = null,
@@ -2851,13 +2777,6 @@ fn waitForPermissionLabel(worker: *WorkerRuntime, expected: []const u8) !u64 {
     return error.TestExpectedEqual;
 }
 
-
-
-
-
-
-
-
 const QuestionThreadState = struct {
     answers: ?[][]u8 = null,
     err: ?anyerror = null,
@@ -2892,7 +2811,3 @@ fn freeAnswers(alloc: std.mem.Allocator, answers: ?[][]u8) void {
         alloc.free(labels);
     }
 }
-
-
-
-

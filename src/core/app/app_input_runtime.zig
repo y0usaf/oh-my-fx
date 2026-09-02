@@ -3250,9 +3250,6 @@ fn armEscapeClearForTest(input_runtime: *core_input_runtime.Runtime, armed_ms: i
     ).next;
 }
 
-
-
-
 const RoutingFakeApp = struct {
     pub const input_byte_limit: usize = 4096;
 
@@ -3751,176 +3748,6 @@ fn appendRoutingSessionPickerSummary(
     });
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn currentQuestionChoiceForRoutingTest(prompt: *const question_prompt.QuestionPrompt) u8 {
     return prompt.entries.items[prompt.current_index].choice_index;
 }
@@ -3947,7 +3774,6 @@ fn primeComposerHistoryForTest(comptime App: type, app: *App, draft: []const u8)
     try app.input_runtime.textReplacementState().replace(app.alloc, draft);
     try input_completion_runtime.CompletionRuntime(App).navigatePromptHistory(app, -1);
 }
-
 
 fn openRoutingModelMenu(app: *RoutingFakeApp, model_ids: []const []const u8) !void {
     const menu = &app.model_cache.menu;
@@ -3997,14 +3823,6 @@ fn activateRoutingDecision(app: *RoutingFakeApp, kind: RoutingDecisionKind) !voi
     }
 }
 
-
-
-
-
-
-
-
-
 const RoutingDraftKind = enum {
     text,
     paste,
@@ -4042,91 +3860,6 @@ fn expectRoutingDraftForGuard(app: *const RoutingFakeApp, kind: RoutingDraftKind
         },
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const routing_file_approval_preview_lines =
     [_]@import("../output/diff.zig").PreviewLine{
@@ -4228,23 +3961,6 @@ const ApprovalOwnershipApp = struct {
     approval_screen: interaction_state.ApprovalScreenState = .{},
     subagents: ApprovalOwnershipSubagents = .{},
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const FakeSubmitApp = struct {
     pub const input_byte_limit: usize = 4096;
@@ -4677,34 +4393,6 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn runRepeatedImageCommand(alloc: std.mem.Allocator, input: []const u8) !void {
     var app = FakeSubmitApp{ .alloc = alloc, .prompt_admitted = false, .queue_admitted = false };
     defer app.deinit();
@@ -4715,27 +4403,6 @@ fn runRepeatedImageCommand(alloc: std.mem.Allocator, input: []const u8) !void {
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
     try Runtime(FakeSubmitApp).submit(&app, 100);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkAcceptedPromptCleanupAcrossAllocationFailures(failing: *std.testing.FailingAllocator) !void {
     const alloc = failing.allocator();
@@ -4754,25 +4421,6 @@ fn checkAcceptedPromptCleanupAcrossAllocationFailures(failing: *std.testing.Fail
         try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const PromptHistoryBusyLockState = struct {
     now_ms: i64 = 0,
@@ -4793,21 +4441,6 @@ const PromptHistoryBusyLockState = struct {
         self.now_ms += @intCast(millis);
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkImagePathPasteAllocationFailureIsAtomic(
     failing: *std.testing.FailingAllocator,
@@ -4835,15 +4468,3 @@ fn checkImagePathPasteAllocationFailureIsAtomic(
     try std.testing.expectEqual(@as(usize, 7), app.pending_images.items[0].id);
     try std.testing.expectEqual(@as(usize, 8), app.next_image_id_counter);
 }
-
-
-
-
-
-
-
-
-
-
-
-

@@ -1398,9 +1398,6 @@ fn freeTeams(alloc: Allocator, teams: *std.ArrayList(Team)) void {
     teams.deinit(alloc);
 }
 
-
-
-
 fn readLine(alloc: Allocator) ![]u8 {
     var read_buf: [1024]u8 = undefined;
     var reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buf);
@@ -1417,7 +1414,6 @@ fn writeStdoutFmt(comptime fmt: []const u8, args: anytype) !void {
     const text = try std.fmt.bufPrint(&buf, fmt, args);
     try writeStdout(text);
 }
-
 
 const ScriptedPollResult = enum {
     pending,
@@ -1723,7 +1719,6 @@ fn waitForSignInTransition(
     return runtime.pollTransition(alloc);
 }
 
-
 const WithholdingTokenFixture = struct {
     io_backend: std.Io.Threaded = .init_single_threaded,
     server: std.Io.net.Server,
@@ -1822,20 +1817,3 @@ fn makeLoopbackPreparedLogin(alloc: Allocator, token_endpoint: []const u8) !Prep
 fn elapsedAwakeMs(started: std.Io.Clock.Timestamp) i64 {
     return started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

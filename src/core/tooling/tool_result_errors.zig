@@ -429,14 +429,3 @@ fn writeMaskedJsonString(alloc: Allocator, writer: *std.Io.Writer, value: []cons
     defer if (masked.ptr != value.ptr) alloc.free(masked);
     try std.json.Stringify.value(masked, .{}, writer);
 }
-
-
-
-
-
-
-
-
-
-
-

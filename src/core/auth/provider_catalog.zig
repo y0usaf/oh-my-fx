@@ -55,4 +55,3 @@ pub fn find(id: model_provider.ProviderId) *const Entry {
 pub fn label(id: model_provider.ProviderId) []const u8 {
     return find(id).route_name;
 }
-

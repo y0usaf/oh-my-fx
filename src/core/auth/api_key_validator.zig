@@ -27,4 +27,3 @@ fn validateUnavailable(_: ?*anyopaque, _: Allocator, _: []const u8) Result {
 pub const unavailable_provider = Provider{
     .validate_fn = validateUnavailable,
 };
-

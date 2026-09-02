@@ -920,15 +920,6 @@ fn expectTexts(entries: []const LoadedPromptHistoryEntry, expected: []const []co
     }
 }
 
-
-
-
-
-
-
-
-
-
 const LockFailureState = struct {
     now_ms: i64 = 0,
 };
@@ -950,10 +941,3 @@ fn lockSleep(ctx: ?*anyopaque, millis: u64) void {
     const state: *LockFailureState = @ptrCast(@alignCast(ctx.?));
     state.now_ms += @intCast(millis);
 }
-
-
-
-
-
-
-

@@ -931,16 +931,6 @@ const StaleCatalog = struct {
     }
 };
 
-
-
-
-
-
-
-
-
-
-
 fn runRepeatedAuthChangeCycle(iteration: usize) !void {
     var runtime = Runtime.init(std.testing.allocator, "/v1/models");
     defer runtime.deinit();
@@ -969,11 +959,3 @@ fn runRepeatedAuthChangeCycle(iteration: usize) !void {
     try std.testing.expectEqual(@as(usize, 1), snapshot.items.len);
     try std.testing.expectEqualStrings(model_id, snapshot.items[0]);
 }
-
-
-
-
-
-
-
-

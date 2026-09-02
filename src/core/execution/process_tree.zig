@@ -682,13 +682,6 @@ fn openLinuxProcFile(path: []const u8) !?std.Io.File {
     };
 }
 
-
-
-
-
-
-
-
 fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
     return switch (builtin.os.tag) {
         .linux => try captureLinuxSnapshot(alloc, pid),
@@ -903,5 +896,3 @@ const Darwin = struct {
         buffersize: c_int,
     ) c_int;
 };
-
-

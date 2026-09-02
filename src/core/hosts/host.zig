@@ -265,11 +265,3 @@ pub fn operatingSystemText(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u
     if (release.len == 0) return alloc.dupe(u8, sysname);
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ sysname, release });
 }
-
-
-
-
-
-
-
-

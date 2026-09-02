@@ -119,8 +119,6 @@ fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
 
-
-
 fn callFixture(
     _: *anyopaque,
     alloc: Allocator,

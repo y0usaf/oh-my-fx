@@ -367,12 +367,6 @@ fn writeOptionalCount(writer: *std.Io.Writer, count: ?usize) !void {
     if (count) |value| try writer.print("{d}", .{value}) else try writer.writeAll("unknown");
 }
 
-
-
-
-
-
-
 fn emptyServerSnapshot() ServerSnapshot {
     return .{
         .configured_name = &.{},

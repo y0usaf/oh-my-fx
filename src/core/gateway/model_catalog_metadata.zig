@@ -22,4 +22,3 @@ pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabiliti
         .max_output_tokens = optionalPositiveU32(entry.max_tokens),
     };
 }
-

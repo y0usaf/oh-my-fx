@@ -3275,7 +3275,6 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
     };
 }
 
-
 fn validateGenerationId(id: []const u8) !void {
     if (!types.validGatewayGenerationId(id)) return error.InvalidGenerationId;
 }
@@ -3439,30 +3438,6 @@ fn testGatewayUsageReference(
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const TestGenerationUsageProvider = struct {
     outcome: enum {
         found,
@@ -3521,30 +3496,3 @@ const TestGenerationUsageProvider = struct {
         };
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

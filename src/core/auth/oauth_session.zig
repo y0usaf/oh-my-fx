@@ -958,10 +958,6 @@ fn check_load_allocation_failures(alloc: Allocator, dir: *std.Io.Dir) !void {
     defer session.deinit(alloc);
 }
 
-
-
-
-
 const alternate_test_session_json = "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\",\"access_token\":\"keychain-access\",\"refresh_token\":\"keychain-refresh\",\"expires_at_ms\":2,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}";
 
 const FakeOAuthKeychain = struct {
@@ -1031,20 +1027,6 @@ fn testKeychainMutation(dir: std.Io.Dir, keychain: KeychainBackend) !Mutation {
     );
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const DeleteSyncProbe = struct {
     sync_count: usize = 0,
     fail: bool = false,
@@ -1055,7 +1037,3 @@ const DeleteSyncProbe = struct {
         if (self.fail) return error.InjectedSyncFailure;
     }
 };
-
-
-
-

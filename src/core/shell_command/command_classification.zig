@@ -307,30 +307,3 @@ fn is_ascii_upper(ch: u8) bool {
 fn is_ascii_digit(ch: u8) bool {
     return ch >= '0' and ch <= '9';
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

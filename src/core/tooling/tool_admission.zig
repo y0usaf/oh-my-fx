@@ -887,7 +887,6 @@ fn literalShellToken(raw: []const u8) bool {
     return !escaped and !in_single and !in_double;
 }
 
-
 /// An unavailable or invalid automatic review never executes anything. It is
 /// returned to the primary model as neutral advisory unavailability.
 fn traceReviewerUnavailable(call: ToolCall) void {
@@ -2429,21 +2428,6 @@ fn isAvailableDynamicTool(input: Input, name: []const u8) bool {
     }, name);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkFileMutationPreparationAllocationFailures(alloc: Allocator, workspace: []const u8) !void {
     var prepared = switch (try prepareFileMutationCall(alloc, .{
         .id = "allocation-write",
@@ -2458,7 +2442,6 @@ fn checkFileMutationPreparationAllocationFailures(alloc: Allocator, workspace: [
     };
     defer prepared.deinit(alloc);
 }
-
 
 fn decodeRegistryOwnedWrite(
     ctx: tool_dispatch.DispatchContext,
@@ -2475,12 +2458,6 @@ fn decodeRegistryOwnedWrite(
         "{\"path\":\"registered.txt\",\"content\":\"registered\\n\"}",
     );
 }
-
-
-
-
-
-
 
 const FakeAutoClassifier = struct {
     calls: usize = 0,
@@ -2567,7 +2544,6 @@ fn testInputWithClassifier(
     };
 }
 
-
 const test_review_tool_calls = [_]ToolCall{
     .{ .id = "test-review", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf test\"}" },
 };
@@ -2614,41 +2590,3 @@ const RecordingPrompter = struct {
         return .{ .context = @ptrCast(self), .request_fn = request };
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -228,11 +228,6 @@ fn approvalFileRequest(
     };
 }
 
-
-
-
-
-
 fn checkApprovalPromptCloneAllocationFailures(alloc: Allocator) !void {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
@@ -244,4 +239,3 @@ fn checkApprovalPromptCloneAllocationFailures(alloc: Allocator) !void {
     };
     try std.testing.expect(try prompt.syncRequest(alloc, request));
 }
-

@@ -763,7 +763,6 @@ pub fn generatePkce(
     return .{ .verifier = verifier, .challenge = challenge };
 }
 
-
 pub fn bearerHeaderAlloc(alloc: Allocator, access_token: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
 }
@@ -2182,17 +2181,3 @@ fn fuzzAuthorizationParsers(_: void, smith: *std.testing.Smith) !void {
         metadata.deinit(alloc);
     } else |_| {}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-

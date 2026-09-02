@@ -7,7 +7,6 @@ pub const default_operation_timeout_ms: u32 = 60_000;
 pub const default_elicitation_timeout_ms: u32 = 30 * 60_000;
 pub const default_restart_limit: u8 = 1;
 
-
 pub const max_profile_config_warning_key_bytes: usize = 128;
 
 pub const ProfileConfigWarningCause = enum {
@@ -145,7 +144,6 @@ pub const TransportPrecommit = struct {
     }
 };
 
-
 pub const McpTransport = enum { stdio, http, sse };
 
 pub const ConfigSource = enum {
@@ -246,11 +244,6 @@ pub const McpServerConfig = struct {
     }
 };
 
-
-
-
-
-
 pub fn freeOwnedStrings(alloc: Allocator, values: []const []const u8) void {
     if (values.len == 0) return;
     for (values) |value| alloc.free(value);
@@ -283,4 +276,3 @@ pub fn freeHttpHeaders(alloc: Allocator, headers: []const McpHttpHeader) void {
     }
     alloc.free(headers);
 }
-

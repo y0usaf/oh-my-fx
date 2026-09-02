@@ -189,11 +189,3 @@ pub fn visualRowsForLine(text: []const u8, cols: u16) u16 {
     if (wrote_on_current_row) rows_with_content = rows;
     return if (rows_with_content == 0) 1 else rows_with_content;
 }
-
-
-
-
-
-
-
-

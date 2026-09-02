@@ -99,6 +99,3 @@ fn encodeRecordId(
         out[index * 2 + 1] = alphabet[byte & 0x0f];
     }
 }
-
-
-

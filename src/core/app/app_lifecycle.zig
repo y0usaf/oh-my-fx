@@ -1125,7 +1125,6 @@ fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8
     return if (trimmed.len > 0) trimmed else configured orelse default_model;
 }
 
-
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
     return alloc.dupe(u8, initialModelId(default_model, configured));
 }
@@ -1211,10 +1210,6 @@ const TestEnv = struct {
     }
 };
 
-
-
-
-
 fn minimalLayout() types.Layout {
     return .{
         .rows = 1,
@@ -1227,37 +1222,8 @@ fn minimalLayout() types.Layout {
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
 }
-
-
-

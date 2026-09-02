@@ -68,4 +68,3 @@ pub const Preferences = struct {
         }
     }
 };
-

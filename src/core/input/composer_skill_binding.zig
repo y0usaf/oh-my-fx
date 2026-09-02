@@ -80,7 +80,6 @@ const Fixture = struct {
     }
 };
 
-
 fn checkAllocationFailureIsAtomic(
     failing: *std.testing.FailingAllocator,
     fail_offset: ?usize,
@@ -136,4 +135,3 @@ fn checkAllocationFailureIsAtomic(
     try std.testing.expectEqual(@as(?usize, null), fixture.vertical_navigation.preferredColumn());
     try std.testing.expect(fixture.input_limit_rejection.owner == null);
 }
-

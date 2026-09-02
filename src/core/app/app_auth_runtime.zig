@@ -1223,8 +1223,6 @@ pub fn Runtime(comptime App: type) type {
     };
 }
 
-
-
 const TestModelCache = struct {
     reset_count: usize = 0,
 
@@ -1286,7 +1284,6 @@ const BusySignInApp = struct {
         return host.unavailable_url_opener;
     }
 };
-
 
 const TestTeam = struct {
     name: []const u8,
@@ -1611,32 +1608,3 @@ const TestApp = struct {
         if (self.preference_write_succeeds) self.last_preference_source = source;
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

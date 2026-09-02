@@ -254,11 +254,3 @@ pub fn projectOffsetThroughExpansion(
     }
     return output_offset;
 }
-
-
-
-
-
-
-
-

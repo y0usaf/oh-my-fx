@@ -2967,7 +2967,6 @@ fn cloneBackgroundRecord(alloc: Allocator, record: background_store.Record) !bac
     };
 }
 
-
 fn findBackgroundRecord(records: []const background_store.Record, target: PersistedRecordTarget) ?background_store.Record {
     return switch (target) {
         .last => if (records.len == 0) null else records[0],
@@ -3284,8 +3283,6 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         else => null,
     };
 }
-
-
 
 fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
     return .{
@@ -3770,72 +3767,6 @@ fn testCommandCatalog() CommandCatalog {
     const builtin_commands = @import("../../builtins/commands.zig");
     return builtin_commands.top_level_registry;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const CaptureOutput = struct {
     stdout: std.Io.Writer.Allocating,

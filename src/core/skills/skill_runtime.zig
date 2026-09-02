@@ -269,7 +269,6 @@ pub const SkillMenuOrigin = enum {
     }
 };
 
-
 pub const SkillMenuTarget = struct {
     start: usize = 0,
     end: usize = 0,
@@ -1804,8 +1803,6 @@ fn staticSkill(name: []const u8, description: []const u8, source: SkillSource) S
     };
 }
 
-
-
 const test_workspace_roots = [_]skill_contract.RootSpec{
     .{ .source = .workspace_shared, .path = "skills" },
     .{ .source = .workspace_codex, .path = ".codex/skills" },
@@ -1826,17 +1823,6 @@ const test_root_policy: skill_contract.RootPolicy = .{
 const test_managed_root_policy: skill_contract.RootPolicy = .{
     .managed_root_source = .global_fx,
 };
-
-
-
-
-
-
-
-
-
-
-
 
 fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
     if (std.fs.path.dirname(sub_path)) |parent| {
@@ -1896,39 +1882,6 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 
     return io_mod.readFileToEnd(alloc, &file, max_bytes);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkContainedLinkedSkillAllocationFailures(
     alloc: Allocator,
     workspace_root: []const u8,
@@ -1941,17 +1894,6 @@ fn checkContainedLinkedSkillAllocationFailures(
     try std.testing.expect(discovery.skills[0].read_authority != null);
 }
 
-
-
-
-
-
-
-
-
-
-
-
 fn checkLoadVisibleSkillsAllocationFailures(
     alloc: Allocator,
     workspace_root: []const u8,
@@ -1963,7 +1905,6 @@ fn checkLoadVisibleSkillsAllocationFailures(
     try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
     try std.testing.expectEqual(@as(usize, 1), discovery.diagnostics.len);
 }
-
 
 fn checkLinkedMetadataAllocationFailures(
     alloc: Allocator,
@@ -1982,8 +1923,6 @@ fn checkLinkedMetadataAllocationFailures(
     };
     candidate.deinit();
 }
-
-
 
 var stable_test_environ: ?*std.process.Environ.Map = null;
 
@@ -2030,8 +1969,3 @@ const TestEnviron = struct {
         alloc.destroy(self);
     }
 };
-
-
-
-
-

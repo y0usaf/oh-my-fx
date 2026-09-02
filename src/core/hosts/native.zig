@@ -249,5 +249,3 @@ fn logUnsuccessfulTerm(term: std.process.Child.Term) void {
         .unknown => |status| debug_trace.logf("host", "clipboard copy failed term=unknown status={d}", .{status}),
     }
 }
-
-

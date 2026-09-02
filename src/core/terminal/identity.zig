@@ -8,4 +8,3 @@ pub fn profileUser(buffer: *[64]u8) ?[]const u8 {
     }
     return null;
 }
-

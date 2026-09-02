@@ -1075,7 +1075,6 @@ pub fn allowsExternalPath(tool_name: []const u8) bool {
     return false;
 }
 
-
 pub fn isFilesystemMutationTool(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "write_file") or
         std.mem.eql(u8, tool_name, "edit_file");
@@ -1908,43 +1907,6 @@ fn checkSuggestedSessionGrantsAllocFailures(alloc: std.mem.Allocator) !void {
     defer freeGrants(alloc, path_grants);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn testFileTargets(
     canonical_path: []const u8,
     external: bool,
@@ -2018,13 +1980,6 @@ fn checkExternalStructuredFileGrantOfferAllocationFailures(
     );
 }
 
-
-
-
-
-
-
-
 fn testWriteMutationInput(path: []const u8) file_mutation_contract.FileMutationInput {
     return .{ .write = .{
         .path = @constCast(path),
@@ -2040,7 +1995,6 @@ fn testEditMutationInput(path: []const u8) file_mutation_contract.FileMutationIn
     } };
 }
 
-
 fn checkFileTargetPreparationAllocationFailures(alloc: std.mem.Allocator, workspace: []const u8) !void {
     var prepared = switch (try prepareFileMutationTargets(
         alloc,
@@ -2052,11 +2006,3 @@ fn checkFileTargetPreparationAllocationFailures(alloc: std.mem.Allocator, worksp
     };
     defer prepared.deinit(alloc);
 }
-
-
-
-
-
-
-
-

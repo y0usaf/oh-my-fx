@@ -1462,7 +1462,6 @@ fn reviewLineQualifies(op: diff_mod.PreviewOp) bool {
     };
 }
 
-
 fn testLayout(rows: u16, cols: u16) Layout {
     return .{
         .rows = rows,
@@ -1540,25 +1539,3 @@ fn testFileRequest() permission_request.PermissionRequest {
         },
     };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

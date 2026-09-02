@@ -202,36 +202,12 @@ fn testSlashRegistry() SlashRegistry {
     return builtin_commands.slash_registry;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn parsedIsUnknown(parsed: ParsedCommand) bool {
     return switch (parsed) {
         .unknown => true,
         else => false,
     };
 }
-
-
 
 const TestContext = struct {
     called: []const u8 = "",
@@ -345,12 +321,3 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .unknown = unexpectedPayload,
     };
 }
-
-
-
-
-
-
-
-
-

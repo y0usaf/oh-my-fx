@@ -3031,7 +3031,6 @@ pub fn preparedRequestFingerprint(request: permission_request.PermissionRequest)
     return digest;
 }
 
-
 pub fn stableDeliveryId(
     source_id: []const u8,
     work_id: []const u8,
@@ -3717,12 +3716,6 @@ fn hashU64(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
     hash.update(&bytes);
 }
 
-
-
-
-
-
-
 fn checkRetentionGapAllocationFailures(alloc: Allocator) !void {
     var ledger = try Ledger.init(alloc, "child");
     defer ledger.deinit(alloc);
@@ -3776,19 +3769,6 @@ fn checkRetentionGapAllocationFailures(alloc: Allocator) !void {
     );
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn testFileApprovalRequest() permission_request.FileApprovalRequest {
     return .{
         .kind = .edit,
@@ -3806,8 +3786,6 @@ fn testFileApprovalRequest() permission_request.FileApprovalRequest {
         .scope = .{ .external_tree = "/tmp/project" },
     };
 }
-
-
 
 fn checkFileApprovalRegistrationAllocationFailures(alloc: Allocator) !void {
     var ledger = try Ledger.init(alloc, "child");
@@ -3828,14 +3806,6 @@ fn checkFileApprovalRegistrationAllocationFailures(alloc: Allocator) !void {
     try std.testing.expect(ledger.approvals[0].file != null);
 }
 
-
-
-
-
-
-
-
-
 fn fillEscapingUnicodeMessage(content: []u8) void {
     const pattern = "\"\\\n🦎";
     var offset: usize = 0;
@@ -3844,18 +3814,6 @@ fn fillEscapingUnicodeMessage(content: []u8) void {
     }
     @memset(content[offset..], 'x');
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkCommunicationAllocationFailures(alloc: Allocator) !void {
     var ledger = try Ledger.init(alloc, "child");
@@ -3906,4 +3864,3 @@ fn checkCommunicationAllocationFailures(alloc: Allocator) !void {
     var cloned = try ledger.clone(alloc);
     defer cloned.deinit(alloc);
 }
-

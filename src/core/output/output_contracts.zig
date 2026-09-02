@@ -2053,35 +2053,3 @@ fn writeSessionUserTurnJson(writer: *std.Io.Writer, user: types.UserTurn) !void 
 
     try writer.writeAll("]}");
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

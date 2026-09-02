@@ -282,11 +282,6 @@ fn optionalStringDup(alloc: Allocator, maybe_value: ?std.json.Value) !?[]u8 {
     }
 }
 
-
-
-
-
-
 fn makeAssistantTurn(text: []const u8) session.HistoryTurn {
     return makeAssistantTurnWithImages(text, &.{});
 }

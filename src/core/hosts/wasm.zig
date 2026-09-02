@@ -13,5 +13,3 @@ pub fn operatingSystemText(
 ) std.mem.Allocator.Error![]u8 {
     return alloc.dupe(u8, @tagName(os_tag));
 }
-
-

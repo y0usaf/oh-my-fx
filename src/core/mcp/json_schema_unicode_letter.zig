@@ -649,4 +649,3 @@ pub fn contains(codepoint: u21) bool {
     }
     return false;
 }
-

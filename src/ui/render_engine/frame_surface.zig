@@ -677,27 +677,3 @@ fn shadowGrid(alloc: Allocator, cols: u16, rows: u16) !vt_emulator.Grid {
     try grid.feed("\x1b[1;1Hshell");
     return grid;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

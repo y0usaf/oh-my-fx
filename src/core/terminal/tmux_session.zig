@@ -1322,7 +1322,6 @@ fn supported() bool {
     return host_capabilities.terminalSupportForOs(builtin.os.tag).isSupported();
 }
 
-
 fn probe(alloc: Allocator) !void {
     const result = std.process.run(alloc, io_mod.getIo(), .{
         .argv = &.{ "tmux", "-V" },
@@ -1599,7 +1598,6 @@ fn parseTmuxCursorBlinking(text: []const u8) !bool {
     if (text.len == 0) return false;
     return parseTmuxBool(text);
 }
-
 
 fn runTmuxNoOutput(
     alloc: Allocator,
@@ -2341,11 +2339,3 @@ fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
 }
 
 extern "c" fn tcsetpgrp(fd: c_int, pgrp: std.posix.pid_t) c_int;
-
-
-
-
-
-
-
-

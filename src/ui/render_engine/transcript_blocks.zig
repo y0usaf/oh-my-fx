@@ -1708,8 +1708,6 @@ pub fn renderEntriesForFullPresentationInterruptible(
     try out.writer.splatByteAll('\n', sequence.finalNewlineCount());
 }
 
-
-
 fn renderedBlockHasContent(block: RenderedBlock) bool {
     return block.bytes.len > 0;
 }
@@ -2055,7 +2053,6 @@ pub fn renderEntriesWithProjectionToBytes(
     })).bytes;
 }
 
-
 pub fn renderedEntryStartLine(
     alloc: Allocator,
     entries: []const TranscriptEntry,
@@ -2227,7 +2224,6 @@ pub fn renderEntriesForPreparationInterruptible(
         .line_provenance = owned_provenance,
     };
 }
-
 
 const BoundarySplit = struct {
     content_len: usize,
@@ -2424,8 +2420,6 @@ pub fn footerBoundaryGapRowsForTail(kind: ?TranscriptBlockKind) u16 {
     };
 }
 
-
-
 fn appendBlockSeparator(out: *std.ArrayList(u8), alloc: Allocator, gap_rows: u16) !void {
     try out.appendNTimes(alloc, '\n', 1 + gap_rows);
 }
@@ -2501,19 +2495,6 @@ fn appendWithoutAsciiWhitespace(out: *std.ArrayList(u8), alloc: Allocator, text:
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn appendUserTestEntry(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator, id: u32, text: []const u8) !void {
     const text_dup = try alloc.dupe(u8, text);
     errdefer alloc.free(text_dup);
@@ -2521,49 +2502,6 @@ fn appendUserTestEntry(entries: *std.ArrayList(TranscriptEntry), alloc: Allocato
     errdefer alloc.free(images);
     try entries.append(alloc, .{ .user_turn = .{ .id = id, .turn = .{ .text = text_dup, .images = images } } });
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkCodeBlockRenderAllocationFailures(alloc: Allocator) !void {
     const base = std.testing.allocator;
@@ -2579,12 +2517,3 @@ fn checkCodeBlockRenderAllocationFailures(alloc: Allocator) !void {
     const block = try renderEntryToBlock(alloc, entry, 80, .{});
     defer block.deinit(alloc);
 }
-
-
-
-
-
-
-
-
-

@@ -391,7 +391,6 @@ pub fn queuedBannerRows(ctx: RenderContext) u16 {
     });
 }
 
-
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {
     if (tool_before_activity) return 0;
     return shell.transientAssistantGapRows();
@@ -569,8 +568,6 @@ pub fn activityProjectionLabel(projection: ActivityProjection) ?[]const u8 {
     };
 }
 
-
-
 fn wrappedStatusRowCount(label: []const u8, cols: u16, max_rows: u16) u16 {
     if (max_rows <= 1 or cols == 0) return 1;
     if (display_width.visibleWidthIgnoringAnsi(label) <= cols) return 1;
@@ -617,13 +614,3 @@ pub fn appendActivityToolLabel(
         .none, .turn_thinking => {},
     }
 }
-
-
-
-
-
-
-
-
-
-

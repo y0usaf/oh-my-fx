@@ -533,8 +533,3 @@ pub const allowlistArgCompletionPrefix = command_specs.allowlistArgCompletionPre
 pub const statuslineArgCompletionPrefix = command_specs.statuslineArgCompletionPrefix;
 pub const notificationsArgCompletionPrefix = command_specs.notificationsArgCompletionPrefix;
 pub const permissionsArgCompletionPrefix = command_specs.permissionsArgCompletionPrefix;
-
-
-
-
-

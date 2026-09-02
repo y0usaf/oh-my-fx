@@ -60,13 +60,6 @@ pub const PermissionRequest = struct {
     }
 };
 
-
-
-
-
-
-
-
 pub const PreviewCloneError = diff_mod.PreviewValidationError || error{
     OutOfMemory,
     RequestProjectionTooLarge,
@@ -482,9 +475,3 @@ fn checkOwnedRequestAllocFailures(alloc: Allocator) !void {
     });
     defer owned.deinit(alloc);
 }
-
-
-
-
-
-

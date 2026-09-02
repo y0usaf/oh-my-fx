@@ -1029,12 +1029,6 @@ fn lifecycleReason(lifecycle: contracts.Lifecycle) ReturnReason {
     return if (lifecycle == .exited or lifecycle == .closed) .exited else .lost;
 }
 
-
-
-
-
-
-
 const DirectReturnTestSubagents = struct {
     fn isViewActive(_: *const DirectReturnTestSubagents) bool {
         return false;
@@ -1051,4 +1045,3 @@ const DirectReturnTestApp = struct {
     metrics: types.Metrics = .{},
     subagents: DirectReturnTestSubagents = .{},
 };
-

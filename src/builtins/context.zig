@@ -914,33 +914,6 @@ fn createSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []co
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkLaterSelectionAllocationFailures(alloc: Allocator, workspace: []const u8, target: []const u8) !void {
     var context = try selectApplicableProjectContext(alloc, .{
         .workspace_root = workspace,
@@ -950,7 +923,6 @@ fn checkLaterSelectionAllocationFailures(alloc: Allocator, workspace: []const u8
     });
     defer context.deinit(alloc);
 }
-
 
 const GitInfo = struct {
     branch: ?[]const u8 = null,
@@ -1485,24 +1457,6 @@ fn writeSinglePathGitIndex(dir: std.Io.Dir, index_path: []const u8, file_path: [
     try writeTestFile(dir, index_path, bytes.items);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn appendStatic(input: StaticContextInput, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     if (input.project_context.len > 0) {
         try messages.append(arena, .{ .role = .system, .content = input.project_context });
@@ -1723,13 +1677,6 @@ fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) == null);
 }
 
-
-
-
-
-
-
-
 fn checkPromptContextSnapshotAllocationFailures(alloc: Allocator, live_log: []const u8, historical_log: []const u8) !void {
     var fixture = PromptContextFixture{};
     defer fixture.deinit(std.testing.allocator);
@@ -1779,12 +1726,3 @@ fn expectDefaultPromptContains(needle: []const u8) !void {
 fn expectDefaultPromptDoesNotContain(needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, gateway_system_prompt, needle) == null);
 }
-
-
-
-
-
-
-
-
-

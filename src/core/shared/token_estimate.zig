@@ -29,4 +29,3 @@ pub const StreamingEstimator = struct {
         return span_bytes / 4 + @intFromBool(span_bytes % 4 != 0);
     }
 };
-

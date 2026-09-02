@@ -336,25 +336,9 @@ fn beginBackgroundSampleForTest(monitor: *Monitor, now_ms: i64) !void {
     try std.testing.expectEqual(QueryRequest.background, monitor.takeQueryRequest(now_ms + 2).?);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     const io_mod = @import("../../core/shared/io.zig");
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
     return try io_mod.readFileToEnd(alloc, &file, 8192);
 }
-
-
-

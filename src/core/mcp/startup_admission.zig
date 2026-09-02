@@ -40,6 +40,3 @@ pub fn decide(
         .acp_startup => .connect,
     };
 }
-
-
-

@@ -206,9 +206,6 @@ pub const MalformedArgumentsRetryState = struct {
     }
 };
 
-
-
-
 /// Human denials retained only for the current agent turn. Entries use the
 /// canonical external file action rather than the provider's tool-call ID.
 pub const TurnFileMutationDenials = struct {
@@ -270,7 +267,6 @@ pub fn deferCapturedCommandLifecycleForAutoPermissionNotice(
             call,
         );
 }
-
 
 pub fn requestToolPermissionTraced(
     hooks: *const AgentRuntimeDeps,
@@ -572,9 +568,6 @@ fn containsName(values: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-
-
-
 fn appendLocalGrant(arena: Allocator, grants: *std.ArrayList(PermissionGrant), grant: PermissionGrant) !void {
     if (permissions.sessionGrantAllowed(grants.items, grant.tool_name, grant.target_path)) return;
     try grants.append(arena, grant);
@@ -683,6 +676,3 @@ pub noinline fn recordRejectedToolCall(
     const record = deps.record_tool_call_rejected orelse return;
     try record(deps.ctx, arena, call, model_output, command_result_json);
 }
-
-
-

@@ -106,8 +106,6 @@ const RecordingClient = struct {
     }
 };
 
-
-
 fn testInvocation(kind: hooks.ScopeKind) hooks.Invocation {
     return .{
         .scope = .{

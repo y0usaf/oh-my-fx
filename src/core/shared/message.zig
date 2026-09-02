@@ -146,11 +146,3 @@ pub fn freeToolCalls(alloc: std.mem.Allocator, tool_calls: []const ToolCall) voi
     }
     if (tool_calls.len > 0) alloc.free(tool_calls);
 }
-
-
-
-
-
-
-
-
