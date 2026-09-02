@@ -99,9 +99,9 @@ supplement, and binary hashes, and aggregation rejects any mismatch.
 The output root contains:
 
 ```text
-control/bin/fx
-instrumented/fx
-candidate/fx
+control/bin/omfx
+instrumented/omfx
+candidate/omfx
 profiles/merged.profdata
 profiles/supplements/
 heavy/
