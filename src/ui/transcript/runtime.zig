@@ -558,95 +558,6 @@ const PendingBuildProbe = struct {
     }
 };
 
-fn checkAutoPermissionNoticeAllocationFailures(alloc: Allocator) !void {
-    var runtime = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-    const cursor_row_before = runtime.cursor_row;
-    const cursor_col_before = runtime.cursor_col;
-
-    _ = runtime.appendSemanticNotice(alloc, .{
-        .topic = "system",
-        .tone = .information,
-        .body = "Auto agent approved this request: Running command.",
-        .visibility = .full_only,
-    }) catch |err| {
-        try std.testing.expectEqual(@as(usize, 0), runtime.entries.items.len);
-        try std.testing.expectEqual(@as(usize, 0), runtime.transcript.items.len);
-        try std.testing.expectEqual(cursor_row_before, runtime.cursor_row);
-        try std.testing.expectEqual(cursor_col_before, runtime.cursor_col);
-        return switch (err) {
-            error.WriteFailed => error.OutOfMemory,
-            else => err,
-        };
-    };
-
-    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), runtime.transcript.items.len);
-}
-
-fn checkToolDetailResultReplacementAllocationFailures(alloc: Allocator) !void {
-    var runtime = TranscriptRuntime{};
-    defer runtime.deinit(alloc);
-
-    var tool_name: ?[]u8 = try alloc.dupe(u8, "read_file");
-    errdefer if (tool_name) |value| alloc.free(value);
-    var previous_result: ?[]u8 = try alloc.dupe(u8, "previous result");
-    errdefer if (previous_result) |value| alloc.free(value);
-    var previous_artifact: ?[]u8 = try alloc.dupe(u8, "fx-command-previous.log");
-    errdefer if (previous_artifact) |value| alloc.free(value);
-    try runtime.tool_details.append(alloc, .{
-        .entry_id = 1,
-        .tool_name = tool_name.?,
-        .result = previous_result.?,
-        .command_artifact_handle = previous_artifact.?,
-    });
-    tool_name = null;
-    previous_result = null;
-    previous_artifact = null;
-
-    runtime.updateToolDetailTerminal(
-        alloc,
-        1,
-        null,
-        "read_file",
-        .read,
-        .completed,
-        "replacement result",
-        null,
-        "fx-command-replacement.log",
-        null,
-    ) catch |err| {
-        try std.testing.expectEqualStrings(
-            "previous result",
-            runtime.toolDetailForEntry(1).?.result.?,
-        );
-        try std.testing.expectEqualStrings(
-            "fx-command-previous.log",
-            runtime.toolDetailForEntry(1).?.command_artifact_handle.?,
-        );
-        return err;
-    };
-    try std.testing.expectEqualStrings(
-        "replacement result",
-        runtime.toolDetailForEntry(1).?.result.?,
-    );
-    try std.testing.expectEqualStrings(
-        "fx-command-replacement.log",
-        runtime.toolDetailForEntry(1).?.command_artifact_handle.?,
-    );
-}
-
 fn entryIndex(runtime: *const TranscriptRuntime, entry_id: u32) ?usize {
     for (runtime.entries.items, 0..) |entry, index| {
         if (entry.id() == entry_id) return index;
@@ -7176,46 +7087,6 @@ fn acceptedTranscriptRowsForInlineRows(
     };
 }
 
-fn resolveAndSealTranscriptTransitionForRuntimeTest(
-    runtime: *TranscriptRuntime,
-    alloc: Allocator,
-    source: *TranscriptPreparationSource,
-    prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
-    target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
-    plan: *render_engine.paint_plan.PaintPlan,
-    scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
-) !TranscriptTransition {
-    const scroll_facts = try runtime.prepareTranscriptScrollFactsForFrame(
-        alloc,
-        source,
-        prepared,
-        false,
-        false,
-    );
-    const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
-        runtime.committed_frame_layout.transcript_area,
-        plan.invalidation,
-    );
-    const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
-        alloc,
-        source,
-        prepared,
-        target_layout,
-        scroll_plan,
-        scroll_facts,
-        destructive_invalidation,
-        plan.activity == .overlay_entry,
-    );
-    resolved.applyToPaintPlan(plan);
-    return runtime.sealTranscriptTransition(
-        alloc,
-        source,
-        prepared,
-        plan,
-        resolved,
-    );
-}
-
 fn testFrameCommitResult(
     committed_rows: u16,
     shadow_state: render_engine.terminal_diff.ShadowCommitState,
@@ -7314,18 +7185,6 @@ fn reflowedRows(
             (@as(u32, occupied_col) - 1) / target_cols + 1;
     }
     return total;
-}
-
-fn invalidationTestLayout() Layout {
-    return .{
-        .rows = 24,
-        .cols = 80,
-        .content_bottom = 20,
-        .divider_top_row = 21,
-        .input_row = 22,
-        .divider_bottom_row = 23,
-        .hint_row = 24,
-    };
 }
 
 fn testLayoutWithRows(rows: u16) Layout {

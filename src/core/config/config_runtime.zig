@@ -1742,12 +1742,6 @@ const TestHome = struct {
     }
 };
 
-fn expectPermissionRule(rule: types.PermissionRule, permission: []const u8, pattern: []const u8, action: types.PermissionAction) !void {
-    try std.testing.expectEqualStrings(permission, rule.permission);
-    try std.testing.expectEqualStrings(pattern, rule.pattern);
-    try std.testing.expectEqual(action, rule.action);
-}
-
 fn expectIgnoredProjectKey(diagnostics: []const ConfigDiagnostic, key: []const u8) !void {
     for (diagnostics) |diagnostic| {
         if (diagnostic.layer != .project or
@@ -1759,23 +1753,6 @@ fn expectIgnoredProjectKey(diagnostics: []const ConfigDiagnostic, key: []const u
         if (std.mem.eql(u8, diagnostic.setting_key.?, key)) return;
     }
     return error.TestExpectedEqual;
-}
-
-fn readSettingsBytesForTest(alloc: Allocator, home: []const u8) ![]u8 {
-    const path = try profile_paths.settingsPath(alloc, home);
-    defer alloc.free(path);
-
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, max_settings_bytes);
-}
-
-fn expectOneTrailingNewline(bytes: []const u8) !void {
-    try std.testing.expect(bytes.len > 0);
-    try std.testing.expectEqual(@as(u8, '\n'), bytes[bytes.len - 1]);
-    if (bytes.len > 1) {
-        try std.testing.expect(bytes[bytes.len - 2] != '\n');
-    }
 }
 
 fn workspaceOverrideObject(root: *std.json.Value, workspace_root: []const u8) !*std.json.ObjectMap {

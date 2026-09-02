@@ -1584,18 +1584,6 @@ fn mapLoadError(err: communication_store.LoadError) DegradedReason {
     };
 }
 
-fn checkFileApprovalProjectionAllocationFailures(
-    alloc: Allocator,
-    approval: communication.Approval,
-) !void {
-    var projected = try projectApproval(alloc, approval);
-    defer projected.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        approval.file.?.preview.path,
-        projected.file.?.preview.path,
-    );
-}
-
 fn checkExtendedProjectionAllocationFailures(alloc: Allocator) !void {
     var command = try domain.validateCommand(alloc, .{ .create = .{
         .name = "configured child",
@@ -1649,97 +1637,11 @@ fn checkExtendedProjectionAllocationFailures(alloc: Allocator) !void {
     snapshot.deinit(alloc);
 }
 
-fn checkPendingApprovalProjectionPageAllocation(alloc: Allocator, source: Source) !void {
-    var projected = try projectPendingApprovals(alloc, source);
-    defer projected.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 10), projected.total);
-    try std.testing.expectEqual(@as(usize, 8), projected.offset);
-    try std.testing.expectEqual(@as(usize, 2), projected.approvals.len);
-}
-
 fn findNodeInProjection(nodes: []const Node, child_id: []const u8) ?*const Node {
     for (nodes) |*node| {
         if (std.mem.eql(u8, node.child_id, child_id)) return node;
     }
     return null;
-}
-
-const ProjectionTestEnvironment = struct {
-    tmp: std.testing.TmpDir,
-    home: []u8,
-    workspace: []u8,
-    store: session_store.Store,
-
-    fn init(alloc: Allocator) !ProjectionTestEnvironment {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-        try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-        errdefer alloc.free(home);
-        const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-        errdefer alloc.free(workspace);
-        return .{
-            .tmp = tmp,
-            .home = home,
-            .workspace = workspace,
-            .store = try session_store.Store.initFromHome(alloc, home, workspace),
-        };
-    }
-
-    fn deinit(self: *ProjectionTestEnvironment, alloc: Allocator) void {
-        self.store.deinit(alloc);
-        alloc.free(self.home);
-        alloc.free(self.workspace);
-        self.tmp.cleanup();
-        self.* = undefined;
-    }
-
-    fn createSession(self: *ProjectionTestEnvironment, alloc: Allocator, id: []const u8) !void {
-        var state = try projectionTestState(alloc, id, self.workspace);
-        defer state.deinit(alloc);
-        var loaded = try self.store.startWritableSession(alloc, state);
-        loaded.deinit(alloc);
-    }
-
-    fn createVisibleSession(self: *ProjectionTestEnvironment, alloc: Allocator, id: []const u8) !void {
-        var state = try projectionTestState(alloc, id, self.workspace);
-        defer state.deinit(alloc);
-        const history = try alloc.alloc(session.HistoryTurn, 1);
-        history[0] = session.makeAssistantTurn(alloc, "visible prompt", "visible response") catch |err| {
-            alloc.free(history);
-            return err;
-        };
-        state.history = history;
-        var loaded = try self.store.startWritableSession(alloc, state);
-        loaded.deinit(alloc);
-    }
-};
-
-fn projectionTestState(
-    alloc: Allocator,
-    id: []const u8,
-    workspace: []const u8,
-) !session_codec.DurableSessionState {
-    const owned_id = try alloc.dupe(u8, id);
-    errdefer alloc.free(owned_id);
-    const origin = try alloc.dupe(u8, workspace);
-    errdefer alloc.free(origin);
-    const current = try alloc.dupe(u8, workspace);
-    errdefer alloc.free(current);
-    const model = try alloc.dupe(u8, "test/model");
-    return .{
-        .id = owned_id,
-        .origin_workspace_root = origin,
-        .workspace_root = current,
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{ .model = model, .effort = types.ReasoningEffort.literal("high"), .fast_mode = false },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
 }
 
 fn testChildChatPage(

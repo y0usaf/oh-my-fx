@@ -457,18 +457,3 @@ fn expectDecodeFailure(args_json: []const u8, code: []const u8) !void {
         },
     }
 }
-
-fn expectCommandTag(args_json: []const u8, expected: std.meta.Tag(domain.Command)) !void {
-    const alloc = std.testing.allocator;
-    const result = try decode(.{ .allocator = alloc }, args_json);
-    switch (result) {
-        .failure => |message| {
-            defer alloc.free(message);
-            return error.TestUnexpectedResult;
-        },
-        .input => |input| {
-            defer input.deinit(alloc);
-            try std.testing.expectEqual(expected, std.meta.activeTag(input.as(Input).command));
-        },
-    }
-}

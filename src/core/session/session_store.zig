@@ -4739,30 +4739,6 @@ const LatestBarrierLockContext = struct {
     }
 };
 
-const TempStore = struct {
-    home: []u8,
-    workspace: []u8,
-    store: Store,
-
-    fn deinit(self: *TempStore, alloc: Allocator) void {
-        self.store.deinit(alloc);
-        alloc.free(self.workspace);
-        alloc.free(self.home);
-    }
-};
-
-fn initTempStore(alloc: Allocator, tmp: *std.testing.TmpDir) !TempStore {
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    errdefer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    errdefer alloc.free(workspace);
-    var store = try Store.initFromHome(alloc, home, workspace);
-    errdefer store.deinit(alloc);
-    return .{ .home = home, .workspace = workspace, .store = store };
-}
-
 fn testDurableState(
     alloc: Allocator,
     id: []const u8,
@@ -5083,31 +5059,6 @@ fn writeStaleWritableHistoryFixture(
         &session_dir,
         "session.json",
         stale_manifest,
-    );
-}
-
-fn writeDeferredTokenForTest(
-    alloc: Allocator,
-    store: Store,
-    session_id: []const u8,
-    workspace_root: []const u8,
-) !void {
-    var target = try store.resumeTargetForWrite(
-        alloc,
-        .{ .id = session_id },
-        workspace_root,
-        .{},
-    );
-    const position = target.position;
-    target.deinit(alloc);
-    var sessions = store.canonical_root.sessions orelse return error.TestExpectedEqual;
-    const cache = try LatestCache.init(alloc, &sessions, .{}, .maintain);
-    defer cache.deinit(alloc);
-    try cache.writeDeferredToken(
-        alloc,
-        session_id,
-        workspace_root,
-        position,
     );
 }
 
@@ -5491,16 +5442,6 @@ fn createHistoryPageFixture(
     try replaceHistoryPageFixture(alloc, store, id, 20, count, label);
 }
 
-fn expectHistoryPagePrompts(page: HistoryPage, expected: []const []const u8) !void {
-    try std.testing.expectEqual(expected.len, page.turns.len);
-    for (page.turns, expected) |turn, prompt| {
-        switch (turn) {
-            .assistant => |assistant| try std.testing.expectEqualStrings(prompt, assistant.user.text),
-            else => return error.TestExpectedEqual,
-        }
-    }
-}
-
 fn writeLegacyV2Fixture(
     alloc: Allocator,
     store: Store,
@@ -5523,42 +5464,6 @@ fn writeLegacyV2Fixture(
     const schema_start = std.mem.find(u8, text, schema) orelse
         return error.InvalidSessionFormat;
     text[schema_start + schema.len - 1] = '2';
-    const path = try writeSessionFixture(alloc, store, id, text);
-    alloc.free(path);
-}
-
-fn writeLargeLegacyFixture(
-    alloc: Allocator,
-    store: Store,
-    id: []const u8,
-    workspace_root: []const u8,
-    updated_at_ms: i64,
-) !void {
-    const base = try session_json.renderSessionJson(
-        alloc,
-        id,
-        10,
-        updated_at_ms,
-        session.ConversationLanguage.literal("en"),
-        workspace_root,
-        &.{},
-        .{},
-    );
-    defer alloc.free(base);
-    if (base.len == 0 or base[0] != '{') return error.InvalidSessionFormat;
-    const filler = try alloc.alloc(u8, session_projection.manifest_max_bytes + 1024);
-    defer alloc.free(filler);
-    @memset(filler, 'x');
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"ignored_large_field\":\"");
-    try out.writer.writeAll(filler);
-    try out.writer.writeAll("\",");
-    try out.writer.writeAll(base[1..]);
-    const text = try out.toOwnedSlice();
-    defer alloc.free(text);
-    try std.testing.expect(text.len > session_projection.manifest_max_bytes);
     const path = try writeSessionFixture(alloc, store, id, text);
     alloc.free(path);
 }
@@ -5593,34 +5498,6 @@ fn writeFixtureEntry(
     try writeRawFile(path, bytes);
 }
 
-fn corruptPendingReplacementTimestampForTest(
-    alloc: Allocator,
-    store: Store,
-    id: []const u8,
-    prior_bytes: u64,
-) !void {
-    const session_dir = try sessionDirPath(alloc, store.sessions_dir, id);
-    defer alloc.free(session_dir);
-    const path = try std.fs.path.join(alloc, &.{ session_dir, "events.jsonl" });
-    defer alloc.free(path);
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{ .mode = .read_write });
-    defer file.close(io_mod.getIo());
-    const length = try file.length(io_mod.getIo());
-    if (length <= prior_bytes) return error.TestUnexpectedResult;
-    const tail_len = std.math.cast(usize, length - prior_bytes) orelse
-        return error.TestUnexpectedResult;
-    const tail = try alloc.alloc(u8, tail_len);
-    defer alloc.free(tail);
-    const count = try file.readPositionalAll(io_mod.getIo(), tail, prior_bytes);
-    if (count != tail.len) return error.TestUnexpectedResult;
-    const needle = "\"timestamp_ms\":20";
-    const match = std.mem.lastIndexOf(u8, tail, needle) orelse
-        return error.TestUnexpectedResult;
-    tail[match + needle.len - 1] = '1';
-    try file.writePositionalAll(io_mod.getIo(), tail, prior_bytes);
-    try file.sync(io_mod.getIo());
-}
-
 const MigrationBoundaryFailure = struct {
     target: session_log.Boundary,
     remaining_matches: usize = 0,
@@ -5642,25 +5519,6 @@ const MigrationBoundaryFailure = struct {
                     .context = self,
                     .boundary_fn = callback,
                 },
-            },
-        };
-    }
-};
-
-const ArmedBoundaryFailure = struct {
-    target: session_log.Boundary,
-    armed: bool = false,
-
-    fn callback(context: ?*anyopaque, boundary: session_log.Boundary) !void {
-        const self: *ArmedBoundaryFailure = @ptrCast(@alignCast(context.?));
-        if (self.armed and boundary == self.target) return error.InjectedBoundaryFailure;
-    }
-
-    fn logOptions(self: *ArmedBoundaryFailure) session_log.Options {
-        return .{
-            .test_controls = .{
-                .context = self,
-                .boundary_fn = callback,
             },
         };
     }
@@ -5889,81 +5747,3 @@ const MigrationInterruptedStableCopyCorruption = struct {
         };
     }
 };
-
-fn expectWorkspaceRebindPublicationFailureRepair(
-    session_id: []const u8,
-    force_compaction: bool,
-) !void {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace_a = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace-a");
-    defer alloc.free(workspace_a);
-    const workspace_b = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace-b");
-    defer alloc.free(workspace_b);
-
-    var store_a = try Store.initFromHome(alloc, home, workspace_a);
-    defer store_a.deinit(alloc);
-    var state = try testDurableState(alloc, session_id, workspace_a);
-    defer state.deinit(alloc);
-    var initial = try store_a.startWritableSession(alloc, state);
-    const initial_generation = initial.position.log_generation;
-    initial.deinit(alloc);
-
-    var failure = ArmedBoundaryFailure{
-        .target = .before_latest_cache_ready,
-        .armed = true,
-    };
-    var store_b = try Store.initFromHome(alloc, home, workspace_b);
-    defer store_b.deinit(alloc);
-    var rebind_options = failure.logOptions();
-    if (force_compaction) {
-        rebind_options.compaction_frame_threshold = 1;
-        rebind_options.compaction_byte_threshold = 1;
-    }
-    var rebound = try store_b.resumeTargetForWrite(
-        alloc,
-        .{ .id = state.id },
-        workspace_b,
-        .{ .log = rebind_options },
-    );
-    defer rebound.deinit(alloc);
-
-    try std.testing.expectEqualStrings(workspace_b, rebound.state.workspace_root);
-    try std.testing.expectEqual(
-        force_compaction,
-        !std.mem.eql(
-            u8,
-            &initial_generation,
-            &rebound.position.log_generation,
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidSessionIndex,
-        readLatestPointer(store_b, alloc, workspace_b),
-    );
-    try std.testing.expect(rebound.needsFinalStateReplacement(false));
-
-    failure.armed = false;
-    var current = try rebound.state.dupe(alloc);
-    defer current.deinit(alloc);
-    _ = try rebound.commitStateReplacement(
-        alloc,
-        current,
-        .compaction,
-        .retry_expected_tail,
-        .{},
-    );
-    try std.testing.expect(!rebound.needsFinalStateReplacement(false));
-
-    const pointer_value = try readLatestPointer(store_b, alloc, workspace_b) orelse
-        return error.TestExpectedEqual;
-    var pointer = pointer_value;
-    defer pointer.deinit(alloc);
-    try std.testing.expectEqualStrings(state.id, pointer.session_id);
-}

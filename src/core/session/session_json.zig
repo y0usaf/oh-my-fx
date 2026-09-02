@@ -13,25 +13,6 @@ pub const LegacySchemaVersion = enum(u8) {
     v2 = 2,
 };
 
-const TestStoredSession = struct {
-    id: []u8,
-    workspace_root: ?[]u8 = null,
-    created_at_ms: i64,
-    updated_at_ms: i64,
-    conversation_language: session.ConversationLanguage,
-    history: []session.HistoryTurn,
-    total_input_tokens: u64 = 0,
-    total_output_tokens: u64 = 0,
-    total_web_search_requests: u64 = 0,
-
-    fn deinit(self: *TestStoredSession, alloc: Allocator) void {
-        if (self.id.len > 0) alloc.free(self.id);
-        if (self.workspace_root) |workspace_root| alloc.free(workspace_root);
-        session.freeHistoryTurnSlice(alloc, self.history);
-        self.* = undefined;
-    }
-};
-
 /// Renders one session record as JSON; caller owns the returned slice and frees with allocator.free.
 pub const SessionTokenUsage = struct {
     input: u64 = 0,
@@ -1335,36 +1316,6 @@ fn parseOptionalStringArray(alloc: Allocator, maybe_value: ?std.json.Value) ![][
     return items;
 }
 
-const legacy_execution_memory_fixture =
-    "{\"schema_version\":1,\"id\":\"execution-ownership\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
-    "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
-    "{\"kind\":\"assistant\",\"user\":{\"text\":\"inspect\",\"images\":[]},\"assistant\":\"done\"," ++
-    "\"execution\":{\"schema_version\":2,\"tool_steps\":[" ++
-    "{\"assistant\":\"checking\",\"tool_calls\":[{\"id\":\"call_write\",\"name\":\"write_file\",\"arguments_json\":\"{}\",\"provider_result\":null}],\"tool_results\":[{\"tool_call_id\":\"call_write\",\"tool_name\":\"write_file\",\"status\":\"success\",\"output\":\"wrote\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5,\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1,\"permission_feedback\":[\"read it\"]}]}],\"files\":[" ++
-    "{\"path\":\"src/main.zig\",\"new_path\":null,\"tool_call_id\":\"call_read\",\"tool_name\":\"read_file\"," ++
-    "\"action\":\"read\",\"status\":\"success\",\"model_view_covers_full_file\":true,\"stale\":false}]}}]}";
-
-fn checkLegacyExecutionMemoryAllocationFailures(alloc: Allocator) !void {
-    var loaded = try parseStoredSession(
-        TestStoredSession,
-        alloc,
-        legacy_execution_memory_fixture,
-    );
-    defer loaded.deinit(alloc);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        loaded.history[0].assistant.execution.tool_steps.len,
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        loaded.history[0].assistant.execution.files.len,
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        loaded.history[0].assistant.execution.tool_steps[0].tool_results[0].permission_feedback.len,
-    );
-}
-
 fn legacySessionWithToolStep(
     alloc: Allocator,
     calls: []const u8,
@@ -1380,22 +1331,4 @@ fn legacySessionWithToolStep(
         results,
         "]}],\"files\":[]}}]}",
     });
-}
-
-fn checkLegacyToolArgumentRepairAllocationFailures(alloc: Allocator) !void {
-    const json =
-        "{\"schema_version\":1,\"id\":\"legacy-oom\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
-        "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
-        "{\"kind\":\"assistant\",\"user\":{\"text\":\"inspect\",\"images\":[]},\"assistant\":\"failed\"," ++
-        "\"execution\":{\"schema_version\":1,\"tool_steps\":[{\"assistant\":null,\"tool_calls\":[" ++
-        "{\"id\":\"call_bad\",\"name\":\"read_file\",\"arguments_json\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\",\"provider_result\":null}" ++
-        "],\"tool_results\":[{\"tool_call_id\":\"call_bad\",\"tool_name\":\"read_file\",\"status\":\"success\"," ++
-        "\"output\":\"stale\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5," ++
-        "\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}]}],\"files\":[]}}]}";
-
-    var loaded = try parseStoredSession(TestStoredSession, alloc, json);
-    defer loaded.deinit(alloc);
-    const step = loaded.history[0].assistant.execution.tool_steps[0];
-    try std.testing.expectEqualStrings("{}", step.tool_calls[0].arguments_json);
-    try std.testing.expectEqual(session.PersistedToolStatus.failure, step.tool_results[0].status);
 }

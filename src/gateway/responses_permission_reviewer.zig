@@ -89,37 +89,6 @@ fn buildReviewPayload(
     });
 }
 
-pub fn buildPayloadForTest(
-    alloc: Allocator,
-    model: []const u8,
-    messages: []const types.ChatMessage,
-    target_call_id: []const u8,
-    deadline: std.Io.Clock.Timestamp,
-    cancel_flag: *std.atomic.Value(bool),
-    build_fn: BuildFn,
-) ![]u8 {
-    var runtime = Runtime{
-        .input = .{},
-        .adapter = .{
-            .source = .ai_gateway_api_key,
-            .model = model,
-            .build_fn = build_fn,
-            .validate_fn = validateUnavailable,
-            .send_fn = undefined,
-        },
-    };
-    return buildReviewPayload(
-        &runtime,
-        alloc,
-        model,
-        "",
-        messages,
-        target_call_id,
-        deadline,
-        cancel_flag,
-    );
-}
-
 fn validateUnavailable(_: Allocator, _: permission_auto_classifier.ProviderInput) !void {}
 
 const OwnedResult = struct {

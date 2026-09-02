@@ -1006,24 +1006,3 @@ fn parseI64(value: ?std.json.Value) !i64 {
     const number = try parseU64(value);
     return std.math.cast(i64, number) orelse error.InvalidUsageStore;
 }
-
-fn makeTestFact(
-    alloc: Allocator,
-    id: []const u8,
-    created_at_ms: i64,
-    input_tokens: u64,
-) !usage_report.GenerationFact {
-    const id_copy = try alloc.dupe(u8, id);
-    errdefer alloc.free(id_copy);
-    return .{
-        .id = id_copy,
-        .created_at_ms = created_at_ms,
-        .model = try alloc.dupe(u8, "provider/model"),
-        .input_tokens = input_tokens,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .total_cost = 0.25,
-    };
-}

@@ -3101,29 +3101,6 @@ pub fn paintPreparedTranscriptIntoSurface(
     return result;
 }
 
-pub fn paintTranscriptIntoSurface(
-    self: anytype,
-    alloc: Allocator,
-    surface: *frame_surface.FrameSurface,
-    batch: VisibleTranscriptBatch,
-    line_visual_rows: []const u16,
-    total_lines: usize,
-    transcript_ends_with_newline: bool,
-) !paint_plan.TranscriptPaintResult {
-    return paintTranscriptIntoSurfaceWithLimit(
-        self,
-        alloc,
-        surface,
-        batch,
-        line_visual_rows,
-        total_lines,
-        transcript_ends_with_newline,
-        null,
-        &.{},
-        null,
-    );
-}
-
 fn paintTranscriptIntoSurfaceWithLimit(
     self: anytype,
     alloc: Allocator,
@@ -3203,92 +3180,6 @@ fn paintTranscriptIntoSurfaceWithLimit(
     };
 }
 
-const TestFullRepaintMode = enum {
-    enabled,
-    diagnostic_wipe_only,
-};
-
-const TestFooterGeometry = struct {
-    top: u16 = 0,
-};
-
-const TestFooterViewport = struct {
-    externally_invalidated: bool = false,
-    has_frame: bool = false,
-    geometry: TestFooterGeometry = .{},
-
-    fn invalidateAfterExternalClear(self: *TestFooterViewport) void {
-        self.externally_invalidated = true;
-    }
-};
-
-const TestPaintTrace = struct {
-    transcript_log_frame: bool = false,
-};
-
-const TestTranscriptPainterHost = struct {
-    alloc: Allocator,
-    layout: types.Layout,
-    shadow: ?*vt_emulator.Grid = null,
-    emitted: std.ArrayList(u8) = .empty,
-    footer_viewport: TestFooterViewport = .{},
-    paint_trace: TestPaintTrace = .{},
-    reflow_clear_guard_rows: u16 = 0,
-    viewport_clear_pending: bool = false,
-    owned_top_row: u16 = 1,
-    last_visible_transcript_last_row: u16 = 0,
-    last_visible_transcript_last_row_blank: bool = false,
-    cursor_row: u16 = 1,
-    cursor_col: u16 = 1,
-    extra_input_rows: u16 = 0,
-    replaceable_last_line: bool = false,
-    replaceable_start: usize = 0,
-    replaceable_row: u16 = 1,
-
-    fn init(alloc: Allocator, layout: types.Layout) TestTranscriptPainterHost {
-        return .{
-            .alloc = alloc,
-            .layout = layout,
-            .cursor_row = if (layout.content_bottom == 0) 1 else layout.content_bottom,
-        };
-    }
-
-    fn deinit(self: *TestTranscriptPainterHost) void {
-        self.emitted.deinit(self.alloc);
-    }
-
-    fn emit(self: *TestTranscriptPainterHost, _: *Metrics, bytes: []const u8) !void {
-        try self.emitted.appendSlice(self.alloc, bytes);
-        if (self.shadow) |shadow| try shadow.feed(bytes);
-    }
-
-    fn footerTopRowForExtra(self: *TestTranscriptPainterHost, _: u16) u16 {
-        return self.layout.divider_top_row;
-    }
-};
-
-const TestTranscriptBatch = struct {
-    transcript_bytes: []u8,
-    hard_lines: ?HardLineStarts = null,
-    lines: []VisibleTranscriptLine,
-    line_visual_rows: []u16,
-    ends_with_newline: bool = false,
-
-    fn deinit(self: *TestTranscriptBatch, alloc: Allocator) void {
-        if (self.hard_lines) |hard_lines| hard_lines.deinit(alloc);
-        alloc.free(self.transcript_bytes);
-        alloc.free(self.lines);
-        alloc.free(self.line_visual_rows);
-    }
-
-    fn batch(self: TestTranscriptBatch) VisibleTranscriptBatch {
-        return .{
-            .transcript = .{ .bytes = self.transcript_bytes },
-            .lines = self.lines,
-        };
-    }
-};
-
 fn testLayout(cols: u16, rows: u16, content_bottom: u16) types.Layout {
     return .{
         .rows = rows,
@@ -3298,55 +3189,6 @@ fn testLayout(cols: u16, rows: u16, content_bottom: u16) types.Layout {
         .input_row = content_bottom + 2,
         .divider_bottom_row = content_bottom + 3,
         .hint_row = rows,
-    };
-}
-
-fn transcriptTestBatch(alloc: Allocator, bytes: []const u8, cols: u16) !TestTranscriptBatch {
-    const owned = try alloc.dupe(u8, bytes);
-    errdefer alloc.free(owned);
-    const hard_lines = try buildHardLineStarts(alloc, owned);
-    errdefer hard_lines.deinit(alloc);
-    const line_count = hard_lines.len();
-    const lines = try alloc.alloc(VisibleTranscriptLine, line_count);
-    errdefer alloc.free(lines);
-    const line_visual_rows = try alloc.alloc(u16, line_count);
-    errdefer alloc.free(line_visual_rows);
-
-    var index: usize = 0;
-    while (index < line_count) : (index += 1) {
-        const ref = hardLineRefAt(hard_lines, owned.len, index);
-        lines[index] = visibleFromTranscript(ref);
-        line_visual_rows[index] = visualRowsForLine(ref.resolve(owned), cols);
-    }
-
-    return .{
-        .transcript_bytes = owned,
-        .hard_lines = hard_lines,
-        .lines = lines,
-        .line_visual_rows = line_visual_rows,
-        .ends_with_newline = hard_lines.ends_with_newline,
-    };
-}
-
-fn foldedTestBatch(
-    alloc: Allocator,
-    stdout_text: []const u8,
-    stderr_text: []const u8,
-    cols: u16,
-) !TestTranscriptBatch {
-    const lines = try alloc.alloc(VisibleTranscriptLine, 2);
-    errdefer alloc.free(lines);
-    const line_visual_rows = try alloc.alloc(u16, 2);
-    errdefer alloc.free(line_visual_rows);
-    lines[0] = .{ .folded_line = .{ .text = stdout_text, .stream = .stdout } };
-    lines[1] = .{ .folded_line = .{ .text = stderr_text, .stream = .stderr } };
-    const effective_cols: u16 = if (cols > 2) cols - 2 else cols;
-    line_visual_rows[0] = visualRowsForLine(stripTrailingNewline(stdout_text), effective_cols);
-    line_visual_rows[1] = visualRowsForLine(stripTrailingNewline(stderr_text), effective_cols);
-    return .{
-        .transcript_bytes = try alloc.dupe(u8, ""),
-        .lines = lines,
-        .line_visual_rows = line_visual_rows,
     };
 }
 
@@ -3363,67 +3205,6 @@ fn testFooterRows(layout: types.Layout) render_engine.footer_layout.FooterRows {
         .hint = layout.hint_row,
         .total_rows = layout.rows - layout.divider_top_row + 1,
     };
-}
-
-fn testPaintPlan(layout: types.Layout, selection: ViewportSelection) paint_plan.PaintPlan {
-    const preserved_band = if (selection.top_row > 1)
-        paint_plan.FrameBand{ .top = 1, .bottom = selection.top_row - 1, .owner = .preserved_shell }
-    else
-        paint_plan.FrameBand.empty(.preserved_shell);
-    return .{
-        .layout = layout,
-        .viewport = selection,
-        .footer = testFooterRows(layout),
-        .activity = .none,
-        .preserved_band = preserved_band,
-        .transcript_band = .{ .top = selection.top_row, .bottom = selection.bottom_row, .owner = .transcript },
-        .activity_band = paint_plan.FrameBand.empty(.activity),
-        .footer_band = .{ .top = layout.divider_top_row, .bottom = layout.rows, .owner = .footer },
-        .invalidation = paint_plan.FrameInvalidationSet.empty(),
-        .footer_clean_allowed = true,
-        .synchronized_update = false,
-        .cursor_target = null,
-        .footer_reservation_source = .none,
-        .bottom_reserved_rows = 0,
-        .preserve_scrollback = true,
-    };
-}
-
-fn expectTranscriptSurfacePaint(
-    alloc: Allocator,
-    layout: types.Layout,
-    selection: ViewportSelection,
-    batch: TestTranscriptBatch,
-) !vt_emulator.Grid {
-    var surface_shadow = try vt_emulator.Grid.init(alloc, layout.cols, layout.rows);
-    defer surface_shadow.deinit();
-    var surface = try frame_surface.FrameSurface.initFromShadow(alloc, testPaintPlan(layout, selection), surface_shadow);
-    defer surface.deinit();
-    var surface_host = TestTranscriptPainterHost.init(alloc, layout);
-    defer surface_host.deinit();
-    const result = try paintTranscriptIntoSurface(
-        &surface_host,
-        alloc,
-        &surface,
-        batch.batch(),
-        batch.line_visual_rows,
-        batch.lines.len,
-        batch.ends_with_newline,
-    );
-    var target = try surface.copyToTargetGrid(alloc);
-    errdefer target.deinit();
-
-    try std.testing.expect(result.first_row >= selection.top_row);
-    try std.testing.expect(result.last_row <= selection.bottom_row);
-    try std.testing.expect(result.replaceable_start_row >= selection.top_row);
-    try std.testing.expectEqual(@as(u16, @intCast(result.last_row - selection.top_row + 1)), result.painted_rows);
-    const cursor = surface.cursor_target.?;
-    try std.testing.expect(cursor.row >= selection.top_row);
-    try std.testing.expect(cursor.row <= selection.bottom_row);
-    try std.testing.expect(cursor.col >= 1);
-    try surface.validate();
-
-    return target;
 }
 
 fn expectGridContains(grid: *vt_emulator.Grid, alloc: Allocator, needle: []const u8) !void {

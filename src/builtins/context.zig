@@ -1399,64 +1399,6 @@ fn gitReadExpired(started_ns: i128) bool {
     return elapsed > context_contract.Limits.git_read_budget_ns;
 }
 
-fn appendBeU16(list: *std.ArrayList(u8), alloc: Allocator, value: u16) !void {
-    var buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, buf[0..2], value, .big);
-    try list.appendSlice(alloc, &buf);
-}
-
-fn appendBeU32(list: *std.ArrayList(u8), alloc: Allocator, value: u32) !void {
-    var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], value, .big);
-    try list.appendSlice(alloc, &buf);
-}
-
-fn appendZeroes(list: *std.ArrayList(u8), alloc: Allocator, count: usize) !void {
-    var i: usize = 0;
-    while (i < count) : (i += 1) try list.append(alloc, 0);
-}
-
-fn u32TimePart(ns: i128, divisor: i128) !u32 {
-    const value = if (divisor == std.time.ns_per_s) @divFloor(ns, divisor) else @mod(ns, std.time.ns_per_s);
-    if (value < 0 or value > std.math.maxInt(u32)) return error.TimeOutOfRange;
-    return @intCast(value);
-}
-
-fn writeSinglePathGitIndex(dir: std.Io.Dir, index_path: []const u8, file_path: []const u8, index_rel_path: []const u8) !void {
-    const alloc = std.testing.allocator;
-    const stat = try dir.statFile(io_mod.getIo(), file_path, .{});
-    const mtime_sec = try u32TimePart(stat.mtime.nanoseconds, std.time.ns_per_s);
-    const mtime_nsec = try u32TimePart(stat.mtime.nanoseconds, 1);
-    const size: u32 = @intCast(stat.size);
-
-    var bytes: std.ArrayList(u8) = .empty;
-    defer bytes.deinit(alloc);
-
-    try bytes.appendSlice(alloc, "DIRC");
-    try appendBeU32(&bytes, alloc, 2);
-    try appendBeU32(&bytes, alloc, 1);
-
-    const entry_start = bytes.items.len;
-    try appendBeU32(&bytes, alloc, mtime_sec);
-    try appendBeU32(&bytes, alloc, mtime_nsec);
-    try appendBeU32(&bytes, alloc, mtime_sec);
-    try appendBeU32(&bytes, alloc, mtime_nsec);
-    try appendBeU32(&bytes, alloc, 0);
-    try appendBeU32(&bytes, alloc, 0);
-    try appendBeU32(&bytes, alloc, 0o100644);
-    try appendBeU32(&bytes, alloc, 0);
-    try appendBeU32(&bytes, alloc, 0);
-    try appendBeU32(&bytes, alloc, size);
-    try appendZeroes(&bytes, alloc, 20);
-    try appendBeU16(&bytes, alloc, @intCast(index_rel_path.len));
-    try bytes.appendSlice(alloc, index_rel_path);
-    try bytes.append(alloc, 0);
-    while ((bytes.items.len - entry_start) % 8 != 0) try bytes.append(alloc, 0);
-    try appendZeroes(&bytes, alloc, 20);
-
-    try writeTestFile(dir, index_path, bytes.items);
-}
-
 fn appendStatic(input: StaticContextInput, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     if (input.project_context.len > 0) {
         try messages.append(arena, .{ .role = .system, .content = input.project_context });
@@ -1639,90 +1581,10 @@ fn containsLogPath(paths: []const []const u8, log_path: []const u8) bool {
     return false;
 }
 
-const PromptContextFixture = struct {
-    background: BackgroundRuntime = .{},
-    session: SessionRuntime = .{ .max_history_turns = 8 },
-    workspace_root: []const u8 = "/tmp",
-    project_context: []const u8 = "",
-    permission_mode: types.PermissionMode = .ask,
-    tracker: ?*change_tracker.ChangeTracker = null,
-    interactive: bool = true,
-
-    fn deinit(self: *PromptContextFixture, alloc: Allocator) void {
-        self.background.deinit(alloc);
-        self.session.deinit(alloc);
-    }
-
-    fn transientInput(self: *PromptContextFixture) TransientContextInput {
-        return .{
-            .workspace_root = self.workspace_root,
-            .interactive = self.interactive,
-            .permission_mode = self.permission_mode,
-            .tracker = self.tracker,
-            .background = &self.background,
-            .session = &self.session,
-        };
-    }
-
-    fn staticInput(self: *PromptContextFixture) StaticContextInput {
-        return .{ .project_context = self.project_context };
-    }
-};
-
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) != null);
 }
 
 fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) == null);
-}
-
-fn checkPromptContextSnapshotAllocationFailures(alloc: Allocator, live_log: []const u8, historical_log: []const u8) !void {
-    var fixture = PromptContextFixture{};
-    defer fixture.deinit(std.testing.allocator);
-
-    _ = try fixture.background.registerBackground(std.testing.allocator, .{
-        .pid = "12345",
-        .command = "npm run dev",
-        .cwd = fixture.workspace_root,
-        .log_path = live_log,
-        .expect_url = true,
-    });
-    const historical_id = try fixture.background.registerBackground(std.testing.allocator, .{
-        .pid = "historical",
-        .command = "npm run preview",
-        .cwd = fixture.workspace_root,
-        .log_path = historical_log,
-        .expect_url = true,
-    });
-    try std.testing.expect(fixture.background.supervisor.markStopped(historical_id));
-    try fixture.session.appendBackgroundCommandHistoryTurn(std.testing.allocator, "start preview", .{
-        .pid = "historical",
-        .command = "npm run preview",
-        .cwd = fixture.workspace_root,
-        .log_path = historical_log,
-        .expect_url = true,
-    });
-    fixture.background.requestStop();
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
-    appendTransient(fixture.transientInput(), arena, &messages) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
-        else => return err,
-    };
-    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
-    try expectContains(messages.items[2].content.?, live_log);
-    try expectContains(messages.items[3].content.?, historical_log);
-}
-
-fn expectDefaultPromptContains(needle: []const u8) !void {
-    try std.testing.expect(std.mem.find(u8, gateway_system_prompt, needle) != null);
-}
-
-fn expectDefaultPromptDoesNotContain(needle: []const u8) !void {
-    try std.testing.expect(std.mem.find(u8, gateway_system_prompt, needle) == null);
 }

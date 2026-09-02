@@ -594,73 +594,6 @@ fn pendingRoutePageOffset(total: usize, requested: usize, limit: usize) usize {
     return @min(requested - (requested % limit), last_page);
 }
 
-fn checkPendingRouteSnapshotAllocation(
-    alloc: Allocator,
-    registry: *Registry,
-) !void {
-    var snapshot = try registry.snapshotPendingRoutes(alloc, 0, 8);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.revision);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.routes.len);
-    try std.testing.expectEqualStrings("approval-race", snapshot.routes[0].request_id);
-    try std.testing.expectEqualStrings("child", snapshot.routes[0].child_id);
-}
-
-fn checkLivePreviewRegistryAllocation(alloc: Allocator) !void {
-    const FakePersistence = struct {
-        fn register(
-            _: ?*anyopaque,
-            _: communication.ApprovalInput,
-        ) PersistenceError!void {}
-
-        fn commit(
-            _: ?*anyopaque,
-            _: communication.ApprovalResponse,
-            _: [32]u8,
-        ) PersistenceError!void {}
-
-        fn invalidate(
-            _: ?*anyopaque,
-            _: []const u8,
-            _: []const u8,
-            _: communication.ApprovalStatus,
-            _: i64,
-        ) PersistenceError!void {}
-    };
-
-    var worker: worker_runtime.WorkerRuntime = .{};
-    defer worker.deinit(std.testing.allocator);
-    var registry = Registry{
-        .alloc = alloc,
-        .persistence = .{
-            .register_fn = FakePersistence.register,
-            .commit_response_fn = FakePersistence.commit,
-            .invalidate_fn = FakePersistence.invalidate,
-        },
-    };
-    defer registry.deinit();
-    try registry.registerTool(
-        "preview-approval",
-        "child",
-        "root",
-        "work",
-        .{
-            .id = 17,
-            .label = "mcp_fixture_echo",
-            .tool_arguments_preview = "{\"text\":\"sentinel\"}",
-        },
-        &.{},
-        &worker,
-        1,
-    );
-    var snapshot = try registry.snapshotPendingRoutes(alloc, 0, 8);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "{\"text\":\"sentinel\"}",
-        snapshot.routes[0].tool_arguments_preview.?,
-    );
-}
-
 const CommitContext = struct {
     persistence: Persistence,
     response: communication.ApprovalResponse,
@@ -681,14 +614,3 @@ const CommitContext = struct {
         };
     }
 };
-
-fn checkPendingRoutePageAllocation(alloc: Allocator, registry: *Registry) !void {
-    var first = try registry.snapshotPendingRoutes(alloc, 0, 8);
-    defer first.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 10), first.total);
-    try std.testing.expectEqual(@as(?usize, 8), first.next_offset);
-
-    var second = try registry.snapshotPendingRoutes(alloc, first.next_offset.?, 8);
-    defer second.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), second.routes.len);
-}

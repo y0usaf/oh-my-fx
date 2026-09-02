@@ -600,20 +600,3 @@ fn hashU64(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
     std.mem.writeInt(u64, &bytes, value, .little);
     hash.update(&bytes);
 }
-
-fn checkGrantMergeResolutionAllocationFailures(alloc: Allocator) !void {
-    const host = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("read"), .target_path = @constCast("src/**") },
-        .{ .tool_name = @constCast("bash"), .target_path = @constCast("zig build*") },
-    };
-    const durable = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("read"), .target_path = @constCast("src/**") },
-        .{ .tool_name = @constCast("custom"), .target_path = @constCast("zig build*") },
-    };
-    const merged = try mergeGrants(alloc, &host, &durable);
-    defer types.freePermissionGrantSlice(alloc, merged);
-    try std.testing.expectEqual(@as(usize, 3), merged.len);
-    try std.testing.expectEqualStrings("read", merged[0].tool_name);
-    try std.testing.expectEqualStrings("bash", merged[1].tool_name);
-    try std.testing.expectEqualStrings("custom", merged[2].tool_name);
-}

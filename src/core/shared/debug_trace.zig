@@ -319,18 +319,6 @@ pub fn resetForTest() void {
     next_subagent_id.store(1, .seq_cst);
 }
 
-pub fn configureForTest(alloc: Allocator, path: []const u8) !void {
-    const owned = try alloc.dupe(u8, path);
-    defer alloc.free(owned);
-    try configure(.{ .file_path = owned });
-}
-
-pub fn configureForTestWithScopes(alloc: Allocator, path: []const u8, scope_filter: []const u8) !void {
-    const owned = try alloc.dupe(u8, path);
-    defer alloc.free(owned);
-    try configure(.{ .file_path = owned, .scope_filter = scope_filter });
-}
-
 pub fn configure(options: Options) !void {
     const zio = io_mod.getIo();
     state_mutex.lockUncancelable(zio);

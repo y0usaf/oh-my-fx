@@ -32,7 +32,6 @@ const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_authority = @import("../subagent/authority.zig");
-const subagent_communication_store = @import("../subagent/communication_store.zig");
 const subagent_control_store = @import("../subagent/control_store.zig");
 const subagent_create_store = @import("../subagent/create_store.zig");
 const subagent_domain = @import("../subagent/domain.zig");
@@ -41,7 +40,6 @@ const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const subagent_tool_result = @import("../subagent/tool_result.zig");
 const session_runtime = @import("../session/session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
-const session_codec_mod = @import("../session/session_codec.zig");
 const task_helpers = @import("../tasks/task_helpers.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
@@ -77,10 +75,6 @@ else
     struct {};
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
-else
-    struct {};
-const test_browser_workspace_tools = if (builtin.is_test)
-    @import("../../builtins/browser_workspace_tools.zig")
 else
     struct {};
 const js_host_workspace = @import("../hosts/js_host_workspace.zig");
@@ -2024,56 +2018,6 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.read_tool_result,
 } };
 
-fn matchesTestRunCommandCompatibility(command: []const u8) bool {
-    return std.mem.startsWith(u8, command, "fx-compatibility-probe");
-}
-
-fn executeTestRunCommandCompatibility(
-    ctx: tool_dispatch.DispatchContext,
-    _: []const u8,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return .{ .success = try ctx.allocator.dupe(u8, "registered compatibility\n") };
-}
-
-const test_compatible_tool = blk: {
-    var tool = test_builtin_tools.install_skill;
-    tool.run_command_compatibility = .{
-        .matches = matchesTestRunCommandCompatibility,
-        .execute = executeTestRunCommandCompatibility,
-    };
-    break :blk tool;
-};
-
-fn executeFailingRunCommandCompatibility(
-    ctx: tool_dispatch.DispatchContext,
-    _: []const u8,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return .{ .failure = try tool_result_errors.formatToolExecutionErrorJson(
-        ctx.allocator,
-        "terminal",
-        error.SkillInstallFailed,
-    ) };
-}
-
-const test_failing_compatible_tool = blk: {
-    var tool = test_builtin_tools.install_skill;
-    tool.run_command_compatibility = .{
-        .matches = matchesTestRunCommandCompatibility,
-        .execute = executeFailingRunCommandCompatibility,
-    };
-    break :blk tool;
-};
-
-const test_compatibility_registry = tool_dispatch.Registry{ .tools = &.{
-    test_builtin_tools.terminal,
-    test_compatible_tool,
-} };
-
-const test_failing_compatibility_registry = tool_dispatch.Registry{ .tools = &.{
-    test_builtin_tools.terminal,
-    test_failing_compatible_tool,
-} };
-
 fn gatherNoopTestContext(_: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
     return .{};
 }
@@ -2243,108 +2187,6 @@ const TestRuntime = struct {
     }
 };
 
-fn subagentTestState(
-    alloc: Allocator,
-    id: []const u8,
-    workspace: []const u8,
-) !session_codec_mod.DurableSessionState {
-    const owned_id = try alloc.dupe(u8, id);
-    errdefer alloc.free(owned_id);
-    const origin = try alloc.dupe(u8, workspace);
-    errdefer alloc.free(origin);
-    const current = try alloc.dupe(u8, workspace);
-    errdefer alloc.free(current);
-    const model = try alloc.dupe(u8, "test/model");
-    return .{
-        .id = owned_id,
-        .origin_workspace_root = origin,
-        .workspace_root = current,
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
-        .preferences = .{ .model = model, .effort = types.ReasoningEffort.literal("high"), .fast_mode = false },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-}
-
-const SubagentTestEnvironment = struct {
-    tmp: std.testing.TmpDir,
-    home: []u8,
-    workspace: []u8,
-    store: session_store.Store,
-
-    fn init(alloc: Allocator) !SubagentTestEnvironment {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-        try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-        errdefer alloc.free(home);
-        const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-        errdefer alloc.free(workspace);
-        return .{
-            .tmp = tmp,
-            .home = home,
-            .workspace = workspace,
-            .store = try session_store.Store.initFromHome(alloc, home, workspace),
-        };
-    }
-
-    fn deinit(self: *SubagentTestEnvironment, alloc: Allocator) void {
-        self.store.deinit(alloc);
-        alloc.free(self.home);
-        alloc.free(self.workspace);
-        self.tmp.cleanup();
-        self.* = undefined;
-    }
-
-    fn createSession(
-        self: *SubagentTestEnvironment,
-        alloc: Allocator,
-        id: []const u8,
-    ) !void {
-        var state = try subagentTestState(alloc, id, self.workspace);
-        defer state.deinit(alloc);
-        var loaded = try self.store.startWritableSession(alloc, state);
-        loaded.deinit(alloc);
-    }
-};
-
-const SubagentTestAuthority = struct {
-    root_id: []const u8,
-
-    fn resolver(self: *SubagentTestAuthority) subagent_authority.HostResolver {
-        return .{ .context = self, .resolve_fn = resolve };
-    }
-
-    fn resolve(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        root_id: []const u8,
-    ) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
-        const self: *SubagentTestAuthority = @ptrCast(@alignCast(raw.?));
-        if (!std.mem.eql(u8, self.root_id, root_id)) {
-            return error.HostAuthorityUnavailable;
-        }
-        return subagent_tool_host.captureHostAuthority(
-            alloc,
-            .{
-                .tool_set = .{
-                    .registry = test_tool_registry,
-                    .order = &.{},
-                    .read_only_tool_names = &.{},
-                },
-                .mode = .full,
-            },
-            &.{},
-            .{},
-            &.{},
-        );
-    }
-};
-
 fn subagentResultStringAlloc(
     alloc: Allocator,
     result_json: []const u8,
@@ -2387,49 +2229,6 @@ fn persistSubagentToolResult(
     try runtime.session.appendHistoryEntry(alloc, turn);
 }
 
-fn expectSingleSubagentCreateEffects(
-    alloc: Allocator,
-    env: *SubagentTestEnvironment,
-    child_id: []const u8,
-) !void {
-    var child_ids = try env.store.listSubagentControlSessionIds(alloc);
-    defer {
-        for (child_ids.items) |id| alloc.free(id);
-        child_ids.deinit(alloc);
-    }
-    try std.testing.expectEqual(@as(usize, 2), child_ids.items.len);
-
-    var capability = try env.store.openSubagentControlCapabilityReadOnly(
-        alloc,
-        child_id,
-        .{},
-    );
-    defer capability.deinit();
-    const control = subagent_control_store.Store{
-        .capability = &capability,
-        .expected_child_id = child_id,
-    };
-    var record = try control.load(alloc);
-    defer record.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), record.operations.len);
-    try std.testing.expectEqual(@as(usize, 1), record.events.len);
-    try std.testing.expectEqual(@as(usize, 0), record.queue.len);
-
-    const communications = subagent_communication_store.Store{
-        .capability = &capability,
-        .expected_session_id = child_id,
-    };
-    if (try communications.loadOptional(alloc)) |loaded| {
-        var ledger = loaded;
-        defer ledger.deinit(alloc);
-        return error.TestUnexpectedCommunicationEffect;
-    }
-
-    var child = try env.store.loadReadOnly(alloc, child_id);
-    defer child.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), child.history.len);
-}
-
 const SubagentAgentLoopExecutor = struct {
     runtime: *TestRuntime,
 
@@ -2442,237 +2241,12 @@ const SubagentAgentLoopExecutor = struct {
     }
 };
 
-const CancelTestCommandOnOutput = struct {
-    flag: *std.atomic.Value(bool),
-    needle: []const u8,
-    seen: bool = false,
-
-    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, chunk: []const u8) !void {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (std.mem.find(u8, chunk, self.needle) == null) return;
-        self.seen = true;
-        self.flag.store(true, .seq_cst);
-    }
-};
-
-const TestCommandOutputCapture = struct {
-    alloc: Allocator,
-    bytes: std.ArrayList(u8) = .empty,
-    stdout_chunks: usize = 0,
-    stderr_chunks: usize = 0,
-
-    fn deinit(self: *@This()) void {
-        self.bytes.deinit(self.alloc);
-    }
-
-    fn onChunk(
-        raw_ctx: *anyopaque,
-        _: ?types.ToolLifecycleId,
-        stream: command_contract.CommandOutputStream,
-        chunk: []const u8,
-    ) !void {
-        const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-        try self.bytes.appendSlice(self.alloc, chunk);
-        switch (stream) {
-            .stdout => self.stdout_chunks += 1,
-            .stderr => self.stderr_chunks += 1,
-        }
-    }
-};
-
-fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"action\":\"exec\",\"command\":");
-    try std.json.Stringify.value(command, .{}, &out.writer);
-    try out.writer.writeAll(",\"timeout_ms\":600000}");
-    return out.toOwnedSlice();
-}
-
-fn runCommandArgsWithCleanProfileForTest(alloc: Allocator, command: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"action\":\"exec\",\"command\":");
-    try std.json.Stringify.value(command, .{}, &out.writer);
-    try out.writer.writeAll(",\"profile\":\"clean\",\"timeout_ms\":600000}");
-    return out.toOwnedSlice();
-}
-
-fn executeTestRunCommand(
-    ctx: Context,
-    arena: Allocator,
-    call: ToolCall,
-) !ToolExecutionResult {
-    const terminal_call = try terminalExecCallForTest(arena, call);
-    const command_ctx = try tool_admission.runCommandContext(ctx.admissionInput(), arena, terminal_call);
-    return executeToolCallAuthorized(ctx, .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = terminal_call,
-        .authority = .{ .run_command = .{ .shell_allowed = .{
-            .fingerprint = .init(command_ctx),
-            .source = .configured_rule,
-        } } },
-        .session_grants = ctx.session_grants,
-        .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
-        .max_tool_result_bytes = ctx.max_tool_result_bytes,
-    });
-}
-
-fn terminalExecCallForTest(arena: Allocator, call: ToolCall) !ToolCall {
-    if (std.mem.eql(u8, call.name, "terminal")) return call;
-    if (!std.mem.eql(u8, call.name, "run_command")) return call;
-    var args = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena,
-        call.arguments_json,
-        .{ .allocate = .alloc_always },
-    );
-    if (args != .object) return error.InvalidToolArguments;
-    try args.object.put(arena, "action", .{ .string = "exec" });
-    try args.object.put(arena, "timeout_ms", .{ .integer = 600_000 });
-    var out: std.Io.Writer.Allocating = .init(arena);
-    defer out.deinit();
-    try std.json.Stringify.value(args, .{}, &out.writer);
-    var migrated = call;
-    migrated.name = "terminal";
-    migrated.arguments_json = try out.toOwnedSlice();
-    return migrated;
-}
-
-fn unexpectedTestPrompt(
-    _: *anyopaque,
-    _: Allocator,
-    _: permission_request.PermissionRequest,
-    _: ToolCall,
-    _: ?*const diff_mod.FileReview,
-    _: ?[]const types.PermissionGrant,
-) anyerror!permission_request.OwnedPermissionResponse {
-    return error.TestUnexpectedPrompt;
-}
-
-const TestAutoReview = struct {
-    calls: usize = 0,
-    decision: permission_auto_classifier.Decision = .clear,
-    risk: permission_auto_classifier.Risk = .low,
-    rationale: []const u8 = "test automatic review",
-    action_tag: ?std.meta.Tag(permission_auto_classifier.Action) = null,
-    exact_command: ?[]const u8 = null,
-    exact_arguments_json: ?[]const u8 = null,
-    file_display_path: ?[]const u8 = null,
-    file_additions: usize = 0,
-    file_deletions: usize = 0,
-    file_review_rows: usize = 0,
-    target_path: ?[]const u8 = null,
-
-    fn review(
-        raw_ctx: *anyopaque,
-        alloc: Allocator,
-        request: permission_auto_classifier.ReviewRequest,
-    ) anyerror!permission_auto_classifier.ParseOutcome {
-        const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-        self.calls += 1;
-        self.target_path = if (request.targets.len > 0)
-            request.targets[0].path
-        else
-            null;
-        self.action_tag = std.meta.activeTag(request.action);
-        switch (request.action) {
-            .command => |command| self.exact_command = command.command,
-            .file_mutation => |file| {
-                self.file_display_path = file.display_path;
-                self.file_additions = file.additions;
-                self.file_deletions = file.deletions;
-                self.file_review_rows = file.review.rowCount();
-            },
-            .tool => |tool| {
-                self.exact_arguments_json = tool.arguments_json;
-            },
-        }
-        return .{ .valid = .{
-            .risk = self.risk,
-            .decision = self.decision,
-            .rationale = try alloc.dupe(u8, self.rationale),
-        } };
-    }
-
-    fn classifier(self: *@This()) permission_auto_classifier.Classifier {
-        return .withOverride(self, review);
-    }
-};
-
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) != null);
 }
 
 fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) == null);
-}
-
-fn expectCommandResultField(json: []const u8, field: []const u8, expected: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const value = parsed.value.object.get(field) orelse return error.TestExpectedEqual;
-    try std.testing.expect(value == .string);
-    try std.testing.expectEqualStrings(expected, value.string);
-}
-
-fn expectCommandResultBool(json: []const u8, field: []const u8, expected: bool) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const value = parsed.value.object.get(field) orelse return error.TestExpectedEqual;
-    try std.testing.expect(value == .bool);
-    try std.testing.expectEqual(expected, value.bool);
-}
-
-fn expectCommandResultInt(json: []const u8, field: []const u8, expected: anytype) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const value = parsed.value.object.get(field) orelse return error.TestExpectedEqual;
-    try std.testing.expect(value == .integer);
-    try std.testing.expectEqual(@as(i64, @intCast(expected)), value.integer);
-}
-
-fn expectCommandResultNull(json: []const u8, field: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const value = parsed.value.object.get(field) orelse return error.TestExpectedEqual;
-    try std.testing.expect(value == .null);
-}
-
-fn expectCommandResultStringPrefix(json: []const u8, field: []const u8, prefix: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const value = parsed.value.object.get(field) orelse return error.TestExpectedEqual;
-    try std.testing.expect(value == .string);
-    try std.testing.expect(std.mem.startsWith(u8, value.string, prefix));
-}
-
-fn expectToolErrorField(json: []const u8, field: []const u8, expected: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const error_obj = parsed.value.object.get("error").?.object;
-    const value = error_obj.get(field) orelse return error.TestExpectedEqual;
-    try std.testing.expect(value == .string);
-    try std.testing.expectEqualStrings(expected, value.string);
-}
-
-fn expectToolErrorDetailString(json: []const u8, field: []const u8, expected: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const details = parsed.value.object.get("error").?.object.get("details").?.object;
-    const value = details.get(field) orelse return error.TestExpectedEqual;
-    try std.testing.expect(value == .string);
-    try std.testing.expectEqualStrings(expected, value.string);
-}
-
-fn expectToolErrorDetailInt(json: []const u8, field: []const u8, expected: i64) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const details = parsed.value.object.get("error").?.object.get("details").?.object;
-    const value = details.get(field) orelse return error.TestExpectedEqual;
-    try std.testing.expect(value == .integer);
-    try std.testing.expectEqual(expected, value.integer);
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
@@ -2682,24 +2256,6 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
     var file = try dir.createFile(std.testing.io, path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), content);
-}
-
-fn writeLargeTestFile(dir: std.Io.Dir, path: []const u8, prefix: []const u8, fill_len: usize) !void {
-    if (std.fs.path.dirname(path)) |parent| {
-        try dir.createDirPath(io_mod.getIo(), parent);
-    }
-    var file = try dir.createFile(std.testing.io, path, .{ .truncate = true });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), prefix);
-
-    var chunk: [4096]u8 = undefined;
-    @memset(&chunk, 'x');
-    var remaining = fill_len;
-    while (remaining > 0) {
-        const n = @min(remaining, chunk.len);
-        try file.writeStreamingAll(io_mod.getIo(), chunk[0..n]);
-        remaining -= n;
-    }
 }
 
 fn readTraceFileForTest(alloc: Allocator, trace_path: []const u8) ![]u8 {
@@ -2772,22 +2328,6 @@ const WebSearchProgressCapture = struct {
         return self.query_buf[0..self.query_len];
     }
 };
-
-fn expectToolOutput(ctx: Context, tool_name: []const u8, args_json: []const u8, expected: []const u8) !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const result = try executeToolCall(ctx, arena, .{
-        .id = "1",
-        .name = tool_name,
-        .arguments_json = args_json,
-    });
-    try std.testing.expectEqualStrings(expected, result.model_output);
-    if (result.diff_entry) |payload| {
-        diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
-    }
-}
 
 fn absolutePathExists(path: []const u8) bool {
     _ = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{}) catch return false;
@@ -2876,33 +2416,6 @@ fn registryOwnedMcpSelectCall(
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned mcp_select_tool") };
 }
 
-const QuestionBridgeThreadState = struct {
-    worker: *WorkerRuntime,
-    entries: []const types.QuestionBatchEntry,
-    answers: ?[][]u8 = null,
-    err: ?Allocator.Error = null,
-};
-
-fn runQuestionBridge(state: *QuestionBridgeThreadState) void {
-    state.answers = requestQuestionBatchWithWorker(
-        state.worker,
-        std.testing.allocator,
-        state.entries,
-    ) catch |err| {
-        state.err = err;
-        return;
-    };
-}
-
-fn waitForQuestionBridgeSnapshot(worker: *WorkerRuntime) !worker_runtime.PendingQuestionBatchSnapshot {
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        if (try worker.snapshotPendingQuestionBatch(std.testing.allocator)) |snapshot| return snapshot;
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    return error.TestExpectedEqual;
-}
-
 fn fakeWorkspaceNonzero(
     alloc: Allocator,
     command: []const u8,
@@ -2976,97 +2489,6 @@ const PermissionThreadState = struct {
     err: ?anyerror = null,
 };
 
-const FilePermissionThreadState = struct {
-    decision: ?ToolPermissionDecision = null,
-    file_authority: bool = false,
-    prepared: bool = false,
-    additions: usize = 0,
-    expected_grant_target: []const u8 = "",
-    expected_workspace_offer: bool = false,
-    frozen_offer_matches: bool = false,
-    err: ?anyerror = null,
-};
-
-fn runFilePermissionOutcome(
-    state: *FilePermissionThreadState,
-    req_ctx: Context,
-    call: ToolCall,
-    mode: PermissionMode,
-) void {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const outcome = tool_admission.requestPermissionOutcome(
-        req_ctx.admissionInput(),
-        arena_state.allocator(),
-        call,
-        mode,
-        &.{},
-    ) catch |err| {
-        state.err = err;
-        return;
-    };
-    if (outcome.tool_failure != null) {
-        state.err = error.UnexpectedToolFailure;
-        return;
-    }
-    state.decision = outcome.decision;
-    const authority = outcome.execution_authority orelse return;
-    switch (authority) {
-        .file_mutation => |file_authority| {
-            state.file_authority = true;
-            state.prepared = file_authority.prepared != null;
-            if (file_authority.prepared) |prepared| {
-                state.additions = prepared.preview.additions;
-            }
-            if (file_authority.grant_offer) |offer| {
-                state.frozen_offer_matches = fileGrantOfferMatchesExpectation(
-                    offer,
-                    state.expected_grant_target,
-                    state.expected_workspace_offer,
-                );
-            }
-        },
-        else => state.err = error.UnexpectedExecutionAuthority,
-    }
-}
-
-fn fileGrantOfferMatchesExpectation(
-    offer: file_mutation_contract.FileGrantOffer,
-    expected_target: []const u8,
-    expected_workspace: bool,
-) bool {
-    const workspace_permissions = [_][]const u8{ "edit", "read", "glob", "grep" };
-    for (offer.grants) |grant| {
-        if (!std.mem.eql(u8, grant.target_path, expected_target)) return false;
-    }
-    if (expected_workspace) {
-        if (offer.scope != .workspace_files) return false;
-        if (offer.grants.len != workspace_permissions.len) return false;
-        for (workspace_permissions) |permission| {
-            var found = false;
-            for (offer.grants) |grant| {
-                found = found or std.mem.eql(
-                    u8,
-                    grant.tool_name,
-                    permission,
-                );
-            }
-            if (!found) return false;
-        }
-        return true;
-    }
-    return switch (offer.scope) {
-        .workspace_files => false,
-        .external_tree => |root| offer.grants.len == 1 and
-            std.mem.eql(u8, offer.grants[0].tool_name, "edit") and
-            std.mem.eql(
-                u8,
-                root,
-                expected_target[0 .. expected_target.len - "/**".len],
-            ),
-    };
-}
-
 fn testFileMutationArgs(
     alloc: Allocator,
     kind: file_mutation_contract.Kind,
@@ -3121,20 +2543,6 @@ fn runPermissionRequest(state: *PermissionThreadState, req_ctx: Context, call: T
         return;
     };
     state.decision = outcome.decision;
-}
-
-fn waitForPermissionPrompt(worker: *WorkerRuntime, expected: []const u8) !u64 {
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        var snapshot = try worker.snapshotState(std.testing.allocator);
-        defer snapshot.deinit(std.testing.allocator);
-        if (snapshot.pending_permission_request) |request| {
-            try expectContains(request.label, expected);
-            return request.id;
-        }
-        io_mod.sleep(1 * std.time.ns_per_ms);
-    }
-    return error.TestExpectedEqual;
 }
 
 const McpFixture = struct {
@@ -3224,86 +2632,6 @@ const McpFixture = struct {
     }
 };
 
-const vision_test_registry_tools = [_]tool_dispatch.Tool{test_builtin_tools.vision};
-
-const VisionGatewayResponse = struct {
-    status: std.http.Status = .ok,
-    content: ?[]const u8 = null,
-    usage: types.Usage = .{},
-    generation_id: ?[]const u8 = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-};
-
-const VisionGatewayFixture = struct {
-    alloc: Allocator,
-    responses: []const VisionGatewayResponse,
-    allocation_probe: ?*std.testing.FailingAllocator = null,
-    allocation_index_at_stream: ?usize = null,
-    payloads: std.ArrayList([]u8) = .empty,
-    call_count: usize = 0,
-    cancel_after_call: ?usize = null,
-    last_api_key: []const u8 = "",
-    last_team: ?[]const u8 = null,
-    last_model: []const u8 = "",
-    last_retry_count: usize = 0,
-
-    fn deinit(self: *VisionGatewayFixture) void {
-        for (self.payloads.items) |payload| self.alloc.free(payload);
-        self.payloads.deinit(self.alloc);
-    }
-
-    fn provider(self: *VisionGatewayFixture) agent_stream_provider.Provider {
-        var result = test_builtin_gateway.agent_stream_provider;
-        result.context = self;
-        result.stream_fn = stream;
-        return result;
-    }
-
-    fn stream(
-        context: ?*anyopaque,
-        _: Allocator,
-        request: agent_stream_provider.ModelRequest,
-    ) anyerror!agent_stream_provider.Result {
-        const self: *VisionGatewayFixture = @ptrCast(@alignCast(context.?));
-        if (self.allocation_probe) |probe| {
-            self.allocation_index_at_stream = probe.alloc_index;
-        }
-        const response_index = self.call_count;
-        self.call_count += 1;
-        const payload = try test_builtin_gateway.buildAgentRequest(self.alloc, request.data());
-        defer self.alloc.free(payload);
-        try self.payloads.append(self.alloc, try self.alloc.dupe(u8, payload));
-        self.last_api_key = request.credential.secret;
-        self.last_team = request.credential.tenant;
-        self.last_model = request.model;
-        self.last_retry_count = request.retry_count;
-        if (self.cancel_after_call == self.call_count) request.cancel_flag.store(true, .seq_cst);
-        if (response_index >= self.responses.len) return error.UnexpectedVisionGatewayCall;
-        const response = self.responses[response_index];
-        try request.admission.admit();
-        request.delivery.markPossiblySent();
-        if (response.status != .ok) return .{ .failed = .{ .kind = .provider_error } };
-        return .{ .completed = .{
-            .completion = .{
-                .content = response.content,
-                .generation_id = response.generation_id,
-                .finish_reason = .stop,
-                .usage = response.usage,
-            },
-            .usage = .{ .deferred = .{
-                .provider = .gateway,
-                .generation_id = response.generation_id orelse "gen_test",
-                .scope = "https://ai-gateway.vercel.sh",
-                .tenant = request.credential.tenant,
-                .credential_source = request.credential.source orelse .ai_gateway_api_key,
-                .credential_identity = credential_authority.derive(
-                    request.credential.source orelse .ai_gateway_api_key,
-                    request.credential.account_id,
-                ),
-            } },
-        } };
-    }
-};
-
 fn makeVisionCatalog(
     alloc: Allocator,
     dir: std.Io.Dir,
@@ -3381,142 +2709,6 @@ fn visionProviderSuccessReversed(alloc: Allocator, image_ids: []const usize) ![]
     }
     try out.writer.writeAll("]}");
     return out.toOwnedSlice();
-}
-
-fn executeVisionForTest(
-    rt: *TestRuntime,
-    alloc: Allocator,
-    args_json: []const u8,
-    catalog: []const types.ImageAttachment,
-) !ToolExecutionResult {
-    return executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = alloc,
-        .result_allocator = alloc,
-        .call = .{ .id = "vision-call", .name = "vision", .arguments_json = args_json },
-        .authority = .ordinary,
-        .authorized_image_catalog = catalog,
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-    });
-}
-
-fn executeVisionPathForTest(
-    rt: *TestRuntime,
-    alloc: Allocator,
-    args_json: []const u8,
-    canonical_paths: []const []const u8,
-) !ToolExecutionResult {
-    const targets = try alloc.alloc(
-        command_admission.VisionPathExecutionTarget,
-        canonical_paths.len,
-    );
-    var initialized: usize = 0;
-    defer {
-        for (targets[0..initialized]) |target| {
-            alloc.free(@constCast(target.canonical_path));
-        }
-        alloc.free(targets);
-    }
-    for (canonical_paths, targets) |path, *target| {
-        var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{
-            .allow_directory = false,
-            .follow_symlinks = false,
-        });
-        defer file.close(io_mod.getIo());
-        const stat = try file.stat(io_mod.getIo());
-        target.* = .{
-            .canonical_path = try alloc.dupe(u8, path),
-            .identity = pathing.fileIdentity(
-                try pathing.descriptorDevice(file.handle),
-                stat,
-            ),
-        };
-        initialized += 1;
-    }
-    return executeVisionPathTargetsForTest(rt, alloc, args_json, targets);
-}
-
-fn executeVisionPathTargetsForTest(
-    rt: *TestRuntime,
-    alloc: Allocator,
-    args_json: []const u8,
-    targets: []const command_admission.VisionPathExecutionTarget,
-) !ToolExecutionResult {
-    return executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = alloc,
-        .result_allocator = alloc,
-        .call = .{ .id = "vision-call", .name = "vision", .arguments_json = args_json },
-        .authority = .{ .vision_paths = .{ .targets = targets } },
-        .authorized_image_catalog = &.{},
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-    });
-}
-
-fn visionRequestAllocationCount(args_json: []const u8) !usize {
-    var probe = std.testing.FailingAllocator.init(
-        std.testing.allocator,
-        .{ .resize_fail_index = 0 },
-    );
-    const alloc = probe.allocator();
-    const request = try tool_contracts.vision.parse_vision_request(alloc, args_json);
-    request.deinit(alloc);
-    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
-    return probe.alloc_index;
-}
-
-fn visionProviderParseAllocationCount(provider_json: []const u8) !usize {
-    var probe = std.testing.FailingAllocator.init(
-        std.testing.allocator,
-        .{ .resize_fail_index = 0 },
-    );
-    const alloc = probe.allocator();
-    const parsed = try tool_contracts.vision.parse_vision_provider_result(
-        alloc,
-        provider_json,
-        provider_json.len,
-    );
-    parsed.deinit(alloc);
-    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
-    return probe.alloc_index;
-}
-
-fn visionAllocationIndexAtGateway(
-    catalog: []const types.ImageAttachment,
-    args_json: []const u8,
-    provider_json: []const u8,
-) !usize {
-    const base = std.testing.allocator;
-    var probe = std.testing.FailingAllocator.init(
-        base,
-        .{ .resize_fail_index = 0 },
-    );
-    const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
-    var fixture = VisionGatewayFixture{
-        .alloc = base,
-        .responses = &responses,
-        .allocation_probe = &probe,
-    };
-    defer fixture.deinit();
-    var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
-        .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
-        .session_allocator = base,
-        .context_limits = .{ .image_adapter_output_bytes = .{
-            .value = .{ .bytes = 64 * 1024 },
-            .source = .command_line,
-        } },
-    };
-    defer rt.deinit(base);
-    const alloc = probe.allocator();
-
-    const result = try executeVisionForTest(&rt, alloc, args_json, catalog);
-    alloc.free(@constCast(result.model_output));
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
-    return fixture.allocation_index_at_stream orelse error.TestExpectedEqual;
 }
 
 const OneShotFailingAllocator = struct {
@@ -3598,44 +2790,3 @@ const OneShotFailingAllocator = struct {
         self.failing.allocator().rawFree(memory, alignment, return_address);
     }
 };
-
-fn expectVisionOutOfMemoryAt(
-    fail_index: usize,
-    expected_gateway_calls: usize,
-    catalog: []const types.ImageAttachment,
-    args_json: []const u8,
-    provider_json: []const u8,
-) !void {
-    const base = std.testing.allocator;
-    var failing = OneShotFailingAllocator.init(base, fail_index);
-    const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
-    var fixture = VisionGatewayFixture{ .alloc = base, .responses = &responses };
-    defer fixture.deinit();
-    var rt = TestRuntime{
-        .agent_stream_provider = fixture.provider(),
-        .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
-        .session_allocator = base,
-        .context_limits = .{ .image_adapter_output_bytes = .{
-            .value = .{ .bytes = 64 * 1024 },
-            .source = .command_line,
-        } },
-    };
-    defer rt.deinit(base);
-    const alloc = failing.allocator();
-
-    if (executeVisionForTest(&rt, alloc, args_json, catalog)) |result| {
-        alloc.free(@constCast(result.model_output));
-        if (result.interactive_notice != null or result.system_notice != null) {
-            return error.OutOfMemoryProducedVisionNotice;
-        }
-        return error.OutOfMemoryReturnedVisionResult;
-    } else |err| {
-        try std.testing.expectEqual(error.OutOfMemory, err);
-    }
-    try std.testing.expect(failing.failing.has_induced_failure);
-    try std.testing.expectEqual(expected_gateway_calls, fixture.call_count);
-    try std.testing.expectEqual(
-        failing.failing.allocated_bytes,
-        failing.failing.freed_bytes,
-    );
-}

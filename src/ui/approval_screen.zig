@@ -1474,45 +1474,6 @@ fn testLayout(rows: u16, cols: u16) Layout {
     };
 }
 
-fn paintTest(
-    alloc: Allocator,
-    approval: approval_prompt.Projection,
-    screen_state: *interaction_state.ApprovalScreenState,
-    entries: []const transcript_blocks.TranscriptEntry,
-    styles: transcript_blocks.Styles,
-    layout: Layout,
-    clear_display: bool,
-) !Paint {
-    return switch (try transcriptDocumentPlan(approval, screen_state, entries, layout)) {
-        .none => paint(alloc, approval, screen_state, .none, layout, clear_display),
-        .progressive => |present| paint(
-            alloc,
-            approval,
-            screen_state,
-            .{ .progressive = present },
-            layout,
-            clear_display,
-        ),
-        .projected => {
-            const transcript = try transcript_blocks.renderEntriesToBytes(
-                alloc,
-                entries,
-                layout.cols,
-                styles,
-            );
-            defer alloc.free(transcript);
-            return paint(
-                alloc,
-                approval,
-                screen_state,
-                .{ .projected = transcript },
-                layout,
-                clear_display,
-            );
-        },
-    };
-}
-
 const test_preview_lines = [_]diff_mod.PreviewLine{
     .{
         .op = .addition,

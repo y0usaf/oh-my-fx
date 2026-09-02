@@ -281,10 +281,3 @@ fn cloneClippedRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayLis
     try row_text.appendClipped(alloc, &row, text, width);
     return row;
 }
-
-const help_menu_test_specs = [_]command_specs.SlashSpec{
-    .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general },
-    .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general },
-    .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
-};
-const help_menu_test_registry = command_specs.SlashRegistry{ .commands = help_menu_test_specs[0..] };

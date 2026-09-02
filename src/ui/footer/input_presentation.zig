@@ -936,15 +936,3 @@ fn testRenderContext(input: *const InputRuntime) RenderContext {
         .input = input,
     };
 }
-
-fn syncHintTestQuestion(prompt: *question_prompt.QuestionPrompt) !void {
-    const opts = [_]types.QuestionOption{
-        .{ .label = "Yes", .description = "go ahead" },
-        .{ .label = "No", .description = null },
-        .{ .label = "Maybe", .description = "decide later" },
-    };
-    const entries = [_]types.QuestionBatchEntry{
-        .{ .question = "Should we proceed?", .options = &opts },
-    };
-    try prompt.syncFrom(std.testing.allocator, &entries);
-}

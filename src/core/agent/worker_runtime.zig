@@ -2118,108 +2118,6 @@ fn discardQueuedPrompt(
     freeQueuedPrompt(alloc, prompt);
 }
 
-fn checkHistoryPropagationAllocation(
-    alloc: std.mem.Allocator,
-    snapshot_path: []const u8,
-    fail_index: usize,
-) !bool {
-    {
-        var file = try std.Io.Dir.createFileAbsolute(
-            std.testing.io,
-            snapshot_path,
-            .{ .truncate = true },
-        );
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "snapshot");
-    }
-    var images = [_]types.ImageAttachment{.{
-        .id = 1,
-        .path = @constCast("/tmp/source.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = @constCast(snapshot_path),
-        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    }};
-    const turn: types.HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = @constCast("active"), .images = &images },
-        .assistant = @constCast("done"),
-    } };
-
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(alloc);
-    const first = try makePrompt(alloc, "first queued", "model");
-    var owns_first = true;
-    errdefer if (owns_first) freeQueuedPrompt(alloc, first);
-    try runtime.enqueuePrompt(alloc, first);
-    owns_first = false;
-    const second = try makePrompt(alloc, "second queued", "model");
-    var owns_second = true;
-    errdefer if (owns_second) freeQueuedPrompt(alloc, second);
-    try runtime.enqueuePrompt(alloc, second);
-    owns_second = false;
-
-    var active = ActivePromptSnapshotOwnership.init(&images);
-    runtime.beginActivePromptSnapshots(&active);
-    defer runtime.endActivePromptSnapshots(&active);
-
-    var failing = std.testing.FailingAllocator.init(
-        alloc,
-        .{ .fail_index = fail_index },
-    );
-    runtime.propagateHistoryTurn(failing.allocator(), turn, 8) catch |err| {
-        if (!failing.has_induced_failure) return err;
-        for (runtime.queued_prompts.items) |prompt| {
-            try std.testing.expectEqual(@as(usize, 0), prompt.history.len);
-            try std.testing.expectEqual(@as(usize, 0), prompt.authorized_image_catalog.len);
-            try std.testing.expectEqual(@as(usize, 0), prompt.snapshot_file_ownerships.len);
-        }
-        return false;
-    };
-
-    for (runtime.queued_prompts.items) |prompt| {
-        try std.testing.expectEqual(@as(usize, 1), prompt.history.len);
-        try std.testing.expectEqual(@as(usize, 1), prompt.authorized_image_catalog.len);
-        try std.testing.expectEqual(@as(usize, 1), prompt.snapshot_file_ownerships.len);
-    }
-    return true;
-}
-
-fn checkFinishOwnershipHandoffAllocation(
-    alloc: std.mem.Allocator,
-    snapshot_path: []const u8,
-) !void {
-    {
-        var file = try std.Io.Dir.createFileAbsolute(
-            std.testing.io,
-            snapshot_path,
-            .{ .truncate = true },
-        );
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "snapshot");
-    }
-    const images = [_]types.ImageAttachment{.{
-        .id = 1,
-        .path = @constCast("/tmp/source.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = @constCast(snapshot_path),
-        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    }};
-    var active = ActivePromptSnapshotOwnership.init(&images);
-    const ownership = active.handoff(alloc) catch |err| {
-        active.deinit();
-        try std.testing.expectError(
-            error.FileNotFound,
-            std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{}),
-        );
-        return err;
-    };
-    active.deinit();
-    ownership.?.release();
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{}),
-    );
-}
-
 pub fn dupeSkillBindings(alloc: std.mem.Allocator, bindings: []const SkillBinding) ![]SkillBinding {
     if (bindings.len == 0) return &.{};
     const copy = try alloc.alloc(SkillBinding, bindings.len);
@@ -2589,74 +2487,10 @@ fn makePromptWithGrant(alloc: std.mem.Allocator, text: []const u8, model: []cons
     return prompt;
 }
 
-fn freeEventList(alloc: std.mem.Allocator, events: *std.ArrayList(WorkerEvent)) void {
-    for (events.items) |event| freeWorkerEvent(alloc, event);
-    events.deinit(alloc);
-}
-
-fn checkStateSnapshotFailurePreservesPendingEvents(alloc: std.mem.Allocator) !void {
-    const owner_alloc = std.testing.allocator;
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(owner_alloc);
-
-    try runtime.pushEvent(owner_alloc, .{ .command_output_complete = null });
-    runtime.worker_processing = true;
-    runtime.pending_permission_waiting = true;
-    runtime.pending_permission_request_shared =
-        try permission_request.OwnedPermissionRequest.dupe(
-            owner_alloc,
-            .{ .id = 17, .label = "pending command completion" },
-        );
-
-    var snapshot = runtime.snapshotState(alloc) catch |err| {
-        try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
-        try std.testing.expect(runtime.worker_events.items[0] == .command_output_complete);
-        try std.testing.expectEqualStrings(
-            "pending command completion",
-            runtime.pending_permission_request_shared.?.label,
-        );
-        return err;
-    };
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.pending_event_count);
-    try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
-    try std.testing.expect(runtime.worker_events.items[0] == .command_output_complete);
-}
-
-const QueueTakeThreadState = struct {
-    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    err: ?anyerror = null,
-    job: ?QueuedPrompt = null,
-};
-
-fn runQueueTake(state: *QueueTakeThreadState, runtime: *WorkerRuntime) void {
-    state.started.store(true, .seq_cst);
-    state.job = runtime.waitAndTakeNextPrompt(std.testing.allocator) catch |err| {
-        state.err = err;
-        state.finished.store(true, .seq_cst);
-        return;
-    };
-    state.finished.store(true, .seq_cst);
-}
-
 const EnqueueThreadState = struct {
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     err: ?anyerror = null,
 };
-
-fn runEnqueuePrompt(state: *EnqueueThreadState, runtime: *WorkerRuntime, text: []const u8, model: []const u8) void {
-    const prompt = makePrompt(std.testing.allocator, text, model) catch |err| {
-        state.err = err;
-        return;
-    };
-    state.started.store(true, .seq_cst);
-    runtime.enqueuePrompt(std.testing.allocator, prompt) catch |err| {
-        freeQueuedPrompt(std.testing.allocator, prompt);
-        state.err = err;
-        return;
-    };
-}
 
 fn waitForEnqueueThreadStart(state: *EnqueueThreadState) !void {
     var attempts: usize = 0;
@@ -2665,69 +2499,6 @@ fn waitForEnqueueThreadStart(state: *EnqueueThreadState) !void {
         io_mod.sleep(1 * std.time.ns_per_ms);
     }
     return error.TestExpectedEqual;
-}
-
-fn checkToolLifecycleDupAllocationFailure(alloc: std.mem.Allocator) !void {
-    const owned = try dupeToolLifecycleEvent(alloc, .{ .authoritative_started = .{
-        .id = .{ .turn_id = 7, .call_id = "final" },
-        .reconciles_provisional_call_id = "provisional",
-        .tool_name = "read_file",
-        .activity_kind = .read,
-    } });
-    defer freeToolLifecycleEvent(alloc, owned);
-
-    try std.testing.expectEqualStrings(
-        "final",
-        owned.authoritative_started.id.call_id,
-    );
-    try std.testing.expectEqualStrings(
-        "provisional",
-        owned.authoritative_started.reconciles_provisional_call_id.?,
-    );
-    try std.testing.expectEqualStrings(
-        "read_file",
-        owned.authoritative_started.tool_name,
-    );
-}
-
-fn checkSemanticWorkerEventDuplicationAllocationFailure(alloc: std.mem.Allocator) !void {
-    const ordinary = try dupeWorkerEvent(alloc, .{ .semantic_notice = .{
-        .topic = "context",
-        .tone = .warning,
-        .body = "source limit reached",
-        .visibility = .full_only,
-    } });
-    defer freeWorkerEvent(alloc, ordinary);
-
-    const error_event = try dupeWorkerEvent(alloc, .{ .error_text = .{
-        .topic = "github",
-        .tone = .@"error",
-        .body = "publish failed",
-    } });
-    defer freeWorkerEvent(alloc, error_event);
-
-    try std.testing.expectEqualStrings("context", ordinary.semantic_notice.topic);
-    try std.testing.expectEqualStrings("source limit reached", ordinary.semantic_notice.body);
-    try std.testing.expectEqualStrings("github", error_event.error_text.topic);
-    try std.testing.expectEqualStrings("publish failed", error_event.error_text.body);
-}
-
-fn checkSemanticNoticeEnqueueAllocationFailure(alloc: std.mem.Allocator) !void {
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(alloc);
-
-    try runtime.pushEvent(alloc, .{ .semantic_notice = .{
-        .topic = "permissions",
-        .tone = .success,
-        .body = "approval",
-        .visibility = .full_only,
-    } });
-    var events = runtime.takeEvents();
-    defer freeEventList(alloc, &events);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expect(events.items[0] == .semantic_notice);
-    try std.testing.expectEqualStrings("permissions", events.items[0].semantic_notice.topic);
-    try std.testing.expectEqualStrings("approval", events.items[0].semantic_notice.body);
 }
 
 const PermissionThreadState = struct {
@@ -2745,64 +2516,6 @@ fn runPermissionRequest(state: *PermissionThreadState, runtime: *WorkerRuntime, 
     };
     defer response.deinit();
     state.decision = response.decision;
-}
-
-fn submitPermissionDecisionForTest(
-    runtime: *WorkerRuntime,
-    request_id: u64,
-    decision: types.ToolPermissionDecision,
-) PermissionSubmissionResult {
-    return runtime.submitPermissionResponse(
-        request_id,
-        permission_request.OwnedPermissionResponse.init(
-            std.testing.allocator,
-            decision,
-            null,
-        ),
-    );
-}
-
-fn waitForPermissionLabel(worker: *WorkerRuntime, expected: []const u8) !u64 {
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        var snapshot = try worker.snapshotState(std.testing.allocator);
-        defer snapshot.deinit(std.testing.allocator);
-        if (snapshot.pending_permission_request) |request| {
-            try std.testing.expectEqualStrings(expected, request.label);
-            try std.testing.expect(request.id != 0);
-            return request.id;
-        }
-        io_mod.sleep(1 * std.time.ns_per_ms);
-    }
-    return error.TestExpectedEqual;
-}
-
-const QuestionThreadState = struct {
-    answers: ?[][]u8 = null,
-    err: ?anyerror = null,
-};
-
-fn runQuestionRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
-    state.answers = runtime.requestQuestionBatchAnswerBlocking(std.testing.allocator, entries) catch |err| {
-        state.err = err;
-        return;
-    };
-}
-
-fn runRouteRecoveryRequest(state: *QuestionThreadState, runtime: *WorkerRuntime, entries: []const types.QuestionBatchEntry) void {
-    state.answers = runtime.requestRouteRecoveryAnswerBlocking(std.testing.allocator, entries) catch |err| {
-        state.err = err;
-        return;
-    };
-}
-
-fn waitForQuestionSnapshot(worker: *WorkerRuntime) !PendingQuestionBatchSnapshot {
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        if (try worker.snapshotPendingQuestionBatch(std.testing.allocator)) |snapshot| return snapshot;
-        io_mod.sleep(1 * std.time.ns_per_ms);
-    }
-    return error.TestExpectedEqual;
 }
 
 fn freeAnswers(alloc: std.mem.Allocator, answers: ?[][]u8) void {

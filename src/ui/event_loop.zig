@@ -135,40 +135,6 @@ const EventLoopTestTrace = struct {
     }
 };
 
-const EventLoopTestTerminal = struct {
-    polls: *usize,
-    burst_reads: ?*usize = null,
-    observed_timeout_ms: ?*i32 = null,
-
-    fn pollInput(self: EventLoopTestTerminal, timeout_ms: i32) !shell_runtime.PollResult {
-        self.polls.* += 1;
-        if (self.observed_timeout_ms) |observed| {
-            if (self.polls.* == 1) observed.* = timeout_ms;
-        }
-        if (self.burst_reads) |reads| {
-            if (reads.* < 2) return .{ .readable = true };
-            return if (timeout_ms == 0) .{} else .{ .hung_up = true };
-        }
-        if (self.polls.* > 1) return .{ .hung_up = true };
-        return .{ .readable = true };
-    }
-
-    fn read(self: EventLoopTestTerminal, buf: []u8) !usize {
-        const bytes = if (self.burst_reads) |reads| blk: {
-            const chunk = if (reads.* == 0) "ab" else "de";
-            reads.* += 1;
-            break :blk chunk;
-        } else "ab";
-        @memcpy(buf[0..bytes.len], bytes);
-        return bytes.len;
-    }
-};
-
-fn collectEventLoopTestFacts(ctx: *anyopaque) !void {
-    const trace: *EventLoopTestTrace = @ptrCast(@alignCast(ctx));
-    trace.append('t');
-}
-
 fn noCollectedEventLoopByte(_: *anyopaque) ?u8 {
     return null;
 }
@@ -181,51 +147,12 @@ fn nextCollectedEventLoopByte(ctx: *anyopaque) ?u8 {
     return byte;
 }
 
-fn handleEventLoopTestByte(ctx: *anyopaque, byte: u8) !void {
-    const trace: *EventLoopTestTrace = @ptrCast(@alignCast(ctx));
-    trace.append(byte);
-}
-
-fn commitEventLoopTestFrame(ctx: *anyopaque) !void {
-    const trace: *EventLoopTestTrace = @ptrCast(@alignCast(ctx));
-    trace.append('c');
-    trace.should_exit.* = true;
-}
-
-fn commitEventLoopTestFrameWithoutExit(ctx: *anyopaque) !void {
-    const trace: *EventLoopTestTrace = @ptrCast(@alignCast(ctx));
-    trace.append('c');
-}
-
-fn settleEventLoopTestDeliveryEpoch(ctx: *anyopaque) !void {
-    const trace: *EventLoopTestTrace = @ptrCast(@alignCast(ctx));
-    trace.append('s');
-}
-
-fn collectAndExitEventLoopTest(ctx: *anyopaque) !void {
-    const trace: *EventLoopTestTrace = @ptrCast(@alignCast(ctx));
-    trace.append('t');
-    trace.should_exit.* = true;
-}
-
-fn handleAndExitEventLoopTestByte(ctx: *anyopaque, byte: u8) !void {
-    const trace: *EventLoopTestTrace = @ptrCast(@alignCast(ctx));
-    trace.append(byte);
-    trace.should_exit.* = true;
-}
-
 fn rejectUnexpectedEventLoopByte(_: *anyopaque, _: u8) !void {
     return error.UnexpectedByte;
 }
 
 fn rejectUnexpectedEventLoopCommit(_: *anyopaque) !void {
     return error.UnexpectedCommit;
-}
-
-fn failEventLoopTestCommit(ctx: *anyopaque) !void {
-    const trace: *EventLoopTestTrace = @ptrCast(@alignCast(ctx));
-    trace.append('c');
-    return error.FinalCommitFailed;
 }
 
 fn useLongerPollTimeout(_: *anyopaque, default_timeout_ms: i32) i32 {

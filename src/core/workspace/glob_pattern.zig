@@ -167,9 +167,3 @@ fn matchSegment(pattern: []const u8, candidate: []const u8) bool {
     }
     return pattern_index == pattern.len;
 }
-
-fn expectCompiledMatch(pattern: []const u8, candidate_path: []const u8, expected: bool) !void {
-    var compiled = try Pattern.compile(std.testing.allocator, pattern);
-    defer compiled.deinit(std.testing.allocator);
-    try std.testing.expectEqual(expected, compiled.matchesPath(candidate_path));
-}

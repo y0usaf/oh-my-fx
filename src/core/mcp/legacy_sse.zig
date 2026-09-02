@@ -200,26 +200,6 @@ pub const Parser = struct {
     }
 };
 
-fn expectLegacySseDelimiterSplits(payload: []const u8) !void {
-    const alloc = std.testing.allocator;
-    for (0..payload.len + 1) |split| {
-        var parser = Parser.init(alloc, payload.len, 128, 1);
-        defer parser.deinit();
-        var events: std.ArrayList(Event) = .empty;
-        defer {
-            for (events.items) |*event| event.deinit(alloc);
-            events.deinit(alloc);
-        }
-        try parser.feed(payload[0..split], &events);
-        try parser.feed(payload[split..], &events);
-        try parser.finish();
-        try std.testing.expectEqual(@as(usize, 1), events.items.len);
-        try std.testing.expectEqualStrings("message", events.items[0].kind.?);
-        try std.testing.expectEqualStrings("one\ntwo", events.items[0].data);
-        try std.testing.expectEqualStrings("event-1", events.items[0].id.?);
-    }
-}
-
 fn checkCompleteEventAllocationFailures(alloc: Allocator) !void {
     var parser = Parser.init(alloc, 1024, 256, 4);
     defer parser.deinit();
@@ -230,24 +210,4 @@ fn checkCompleteEventAllocationFailures(alloc: Allocator) !void {
     }
 
     try parser.feed("event: message\ndata: payload\nid: event-1\n\n", &events);
-}
-
-fn fuzzParser(_: void, smith: *std.testing.Smith) !void {
-    const alloc = std.testing.allocator;
-    var input_buffer: [1024]u8 = undefined;
-    const input_len: usize = @intCast(smith.slice(&input_buffer));
-    const input = input_buffer[0..input_len];
-    const split = input.len / 2;
-
-    var parser = Parser.init(alloc, input_buffer.len, 256, 16);
-    defer parser.deinit();
-    var events: std.ArrayList(Event) = .empty;
-    defer {
-        for (events.items) |*event| event.deinit(alloc);
-        events.deinit(alloc);
-    }
-
-    parser.feed(input[0..split], &events) catch return;
-    parser.feed(input[split..], &events) catch return;
-    parser.finish() catch return;
 }

@@ -498,30 +498,3 @@ fn freeApplicableTargets(alloc: Allocator, targets: []context_contract.Applicabl
     for (targets) |target| alloc.free(@constCast(target.path));
     if (targets.len > 0) alloc.free(targets);
 }
-
-fn testNoClassification(_: ?*anyopaque, _: Allocator, _: ToolCall) anyerror!?CallbackTerminal {
-    return null;
-}
-
-const test_classifiers: Classifiers = .{
-    .idempotent = testNoClassification,
-    .validation = testNoClassification,
-    .availability = testNoClassification,
-    .stop_policy = testNoClassification,
-};
-
-fn checkPreparationAllocationFailures(alloc: Allocator, workspace: []const u8) !void {
-    const builtin_tools = @import("../../builtins/tools.zig");
-    const tools = [_]tool_dispatch.Tool{builtin_tools.write_file};
-    var result = try prepareReadyCall(alloc, .{
-        .id = "write",
-        .name = "write_file",
-        .arguments_json = "{\"path\":\"build/new.txt\",\"content\":\"contents\"}",
-    }, .{
-        .tool_registry = .{ .tools = &tools },
-        .workspace_root = workspace,
-        .classifiers = test_classifiers,
-    });
-    defer result.deinit(alloc);
-    try std.testing.expect(result == .candidate);
-}

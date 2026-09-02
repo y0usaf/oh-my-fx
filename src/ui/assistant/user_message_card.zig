@@ -384,18 +384,6 @@ fn collectLogicalLinesWithFirstPrefix(
     }
 }
 
-fn assertRowStructure(card: []const u8) !void {
-    var it = std.mem.splitScalar(u8, card, '\n');
-    while (it.next()) |row| {
-        if (row.len == 0) continue;
-        try std.testing.expect(std.mem.find(u8, row, user_turn_rail) != null);
-        try std.testing.expect(std.mem.find(u8, row, "❯") == null);
-        try std.testing.expect(std.mem.find(u8, row, "\x1b[48;") == null);
-        try std.testing.expect(std.mem.find(u8, row, "\x1b[K") == null);
-        try std.testing.expect(std.mem.endsWith(u8, row, reset_style));
-    }
-}
-
 fn countRows(card: []const u8) usize {
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, card, '\n');

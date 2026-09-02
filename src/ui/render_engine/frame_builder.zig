@@ -413,30 +413,6 @@ const TestShell = struct {
     }
 };
 
-const BuilderSink = struct {
-    bytes: std.ArrayList(u8) = .empty,
-    fail: bool = false,
-    write_calls: usize = 0,
-
-    fn deinit(self: *BuilderSink, alloc: Allocator) void {
-        self.bytes.deinit(alloc);
-    }
-
-    fn sink(self: *BuilderSink) terminal_diff.FrameSink {
-        return .{ .ctx = self, .write_frame = writeFrame };
-    }
-
-    fn writeFrame(ctx: *anyopaque, _: *Metrics, bytes: []const u8) terminal_diff.FrameSinkWriteResult {
-        const self: *BuilderSink = @ptrCast(@alignCast(ctx));
-        self.write_calls += 1;
-        if (self.fail and self.write_calls == 1) return .{ .partial = .{ .accepted_bytes = 0, .err = error.TestFrameWriteFailure } };
-        self.bytes.appendSlice(std.testing.allocator, bytes) catch |err| {
-            return .{ .partial = .{ .accepted_bytes = 0, .err = err } };
-        };
-        return .complete;
-    }
-};
-
 fn testScrollPlan(rows: u16) frame_scroll_plan.FrameScrollPlan {
     return frame_scroll_plan.merge(4, 1, 0, rows);
 }
@@ -485,37 +461,6 @@ fn testPlan() paint_plan.PaintPlan {
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
-}
-
-fn resizedTestPlan() paint_plan.PaintPlan {
-    var plan = testPlan();
-    plan.layout = .{
-        .rows = 6,
-        .cols = 4,
-        .content_bottom = 4,
-        .divider_top_row = 5,
-        .input_row = 5,
-        .divider_bottom_row = 5,
-        .hint_row = 6,
-    };
-    plan.viewport.bottom_row = 4;
-    plan.viewport.last_visible_row = 4;
-    plan.footer = .{
-        .top = 5,
-        .top_divider = 5,
-        .banner = 5,
-        .banner_active = false,
-        .input_base = 5,
-        .picker_divider = 5,
-        .picker_start = 6,
-        .bottom_divider = 5,
-        .hint = 6,
-        .total_rows = 2,
-    };
-    plan.transcript_band.bottom = 4;
-    plan.footer_band = .{ .top = 5, .bottom = 6, .owner = .footer };
-    plan.cursor_target = .{ .row = 5, .col = 1, .visible = true };
-    return plan;
 }
 
 const PaintCtx = struct {

@@ -1967,37 +1967,6 @@ const ApiKeySaveFixture = struct {
     }
 };
 
-fn enterTestApiKey(runtime: *Runtime, alloc: Allocator, value: []const u8) !void {
-    runtime.openApiKeyPicker(alloc);
-    for (value) |byte| try std.testing.expect(try runtime.appendApiKeyByte(alloc, byte));
-}
-
-fn appendTestTeam(
-    selection: *login_flow.TeamSelection,
-    alloc: Allocator,
-    id_value: []const u8,
-    slug_value: []const u8,
-    name_value: []const u8,
-) !void {
-    const id = try alloc.dupe(u8, id_value);
-    errdefer alloc.free(id);
-    const slug = try alloc.dupe(u8, slug_value);
-    errdefer alloc.free(slug);
-    const name = try alloc.dupe(u8, name_value);
-    errdefer alloc.free(name);
-    try selection.teams.append(alloc, .{ .id = id, .slug = slug, .name = name });
-}
-
-fn expectApiKeyAllocationCleared(
-    runtime: *const Runtime,
-    backing: []const u8,
-    sentinel: []const u8,
-) !void {
-    try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.items.len);
-    try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
-    try std.testing.expect(std.mem.indexOf(u8, backing, sentinel) == null);
-}
-
 const LogoutFixture = struct {
     existing: SourceSet,
     load_count: usize = 0,
@@ -2014,62 +1983,3 @@ const LogoutFixture = struct {
         return try makeTestCredential(alloc, @tagName(source), source, null, null);
     }
 };
-
-fn makeManualCodeTestLogin(alloc: Allocator) !login_flow.PreparedLogin {
-    const issuer = try alloc.dupe(u8, "https://issuer.test");
-    errdefer alloc.free(issuer);
-    const authorization_endpoint = try alloc.dupe(u8, "https://issuer.test/authorize");
-    errdefer alloc.free(authorization_endpoint);
-    const token_endpoint = try alloc.dupe(u8, "https://issuer.test/token");
-    errdefer alloc.free(token_endpoint);
-    const device_code = try alloc.dupe(u8, "device-code");
-    errdefer alloc.free(device_code);
-    const user_code = try alloc.dupe(u8, "");
-    errdefer alloc.free(user_code);
-    const verification_uri = try alloc.dupe(u8, "https://issuer.test/authorize");
-    errdefer alloc.free(verification_uri);
-    const client_id = try alloc.dupe(u8, "client-id");
-    errdefer alloc.free(client_id);
-    return .{
-        .metadata = .{
-            .issuer = issuer,
-            .device_authorization_endpoint = authorization_endpoint,
-            .token_endpoint = token_endpoint,
-        },
-        .device = .{
-            .device_code = device_code,
-            .user_code = user_code,
-            .verification_uri = verification_uri,
-            .expires_in = 300,
-            .interval = 1,
-        },
-        .client_id = client_id,
-    };
-}
-
-fn pendingManualCodeTestPoll(
-    _: ?*anyopaque,
-    _: Allocator,
-    _: oauth_transport.Provider,
-    _: oauth.Metadata,
-    _: []const u8,
-    _: []const u8,
-    cancel_flag: *std.atomic.Value(bool),
-    _: std.Io.Clock.Timestamp,
-) !oauth.PollResult {
-    while (!cancel_flag.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
-    return error.Cancelled;
-}
-
-fn acceptManualCodeForTest(_: ?*anyopaque, _: Allocator, _: []const u8) !void {}
-
-fn enterPendingTestSignIn(runtime: *Runtime, alloc: Allocator, accepts_manual_code: bool) !void {
-    const prepared = try makeManualCodeTestLogin(alloc);
-    try std.testing.expect(try runtime.sign_in_flow.startPrepared(alloc, prepared, .{
-        .poll = .{ .poll_device_token = pendingManualCodeTestPoll },
-        .submit_manual_code = if (accepts_manual_code) acceptManualCodeForTest else null,
-    }));
-    runtime.picker_active = true;
-    runtime.picker_stage = .sign_in;
-    runtime.sign_in_source = .grok_subscription;
-}

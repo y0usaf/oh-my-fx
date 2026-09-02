@@ -2453,67 +2453,9 @@ pub fn transcriptLineCount(text: []const u8) usize {
     return total;
 }
 
-fn deinitTestEntries(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator) void {
-    for (entries.items) |*entry| entry.deinit(alloc);
-    entries.deinit(alloc);
-}
-
-fn appendRawTestEntry(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator, id: u32, text: []const u8, class: RawEntryClass) !void {
-    const bytes = try alloc.dupe(u8, text);
-    errdefer alloc.free(bytes);
-    try entries.append(alloc, .{ .raw_bytes = .{ .id = id, .bytes = bytes, .class = class } });
-}
-
-fn appendAssistantTestEntry(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator, id: u32, text: []const u8) !void {
-    var segments: AssistantTurnSegments = .{};
-    errdefer segments.deinit(alloc);
-    try segments.text.appendSlice(alloc, text);
-    try entries.append(alloc, .{ .assistant_turn = .{ .id = id, .segments = segments } });
-}
-
-fn appendSemanticNoticeTestEntry(
-    entries: *std.ArrayList(TranscriptEntry),
-    alloc: Allocator,
-    id: u32,
-    notice: types.SemanticNotice,
-) !void {
-    const owned = try types.dupeSemanticNotice(alloc, notice);
-    errdefer types.freeSemanticNotice(alloc, owned);
-    try entries.append(alloc, .{ .semantic_notice = .{
-        .id = id,
-        .topic = owned.topic,
-        .tone = owned.tone,
-        .body = owned.body,
-        .visibility = owned.visibility,
-    } });
-}
-
 fn appendWithoutAsciiWhitespace(out: *std.ArrayList(u8), alloc: Allocator, text: []const u8) !void {
     for (text) |byte| switch (byte) {
         ' ', '\t', '\r', '\n' => {},
         else => try out.append(alloc, byte),
     };
-}
-
-fn appendUserTestEntry(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator, id: u32, text: []const u8) !void {
-    const text_dup = try alloc.dupe(u8, text);
-    errdefer alloc.free(text_dup);
-    const images = try alloc.alloc(types.ImageAttachment, 0);
-    errdefer alloc.free(images);
-    try entries.append(alloc, .{ .user_turn = .{ .id = id, .turn = .{ .text = text_dup, .images = images } } });
-}
-
-fn checkCodeBlockRenderAllocationFailures(alloc: Allocator) !void {
-    const base = std.testing.allocator;
-    var entry = TranscriptEntry{ .assistant_code_block = .{
-        .id = 1,
-        .block = .{
-            .language = try base.dupe(u8, "zig"),
-            .code = try base.dupe(u8, "const value = \"ready\"; // highlighted\n"),
-        },
-    } };
-    defer entry.deinit(base);
-
-    const block = try renderEntryToBlock(alloc, entry, 80, .{});
-    defer block.deinit(alloc);
 }

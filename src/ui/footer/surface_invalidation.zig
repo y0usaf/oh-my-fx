@@ -268,52 +268,6 @@ fn mergeAttemptInvalidation(
     return collapsed orelse if (overlapped) merged else null;
 }
 
-fn surfaceTestPlan() PaintPlan {
-    return .{
-        .layout = .{
-            .rows = 8,
-            .cols = 40,
-            .content_bottom = 4,
-            .divider_top_row = 5,
-            .input_row = 6,
-            .divider_bottom_row = 7,
-            .hint_row = 8,
-        },
-        .viewport = .{
-            .top_row = 2,
-            .bottom_row = 4,
-            .start_line = 0,
-            .partial_skip_rows = 0,
-            .line_count = 1,
-            .last_visible_row = 2,
-        },
-        .footer = .{
-            .top = 5,
-            .top_divider = 5,
-            .banner = 5,
-            .banner_active = false,
-            .input_base = 6,
-            .picker_divider = 7,
-            .picker_start = 8,
-            .bottom_divider = 7,
-            .hint = 8,
-            .total_rows = 4,
-        },
-        .activity = .none,
-        .preserved_band = .{ .top = 1, .bottom = 1, .owner = .preserved_shell },
-        .transcript_band = .{ .top = 2, .bottom = 4, .owner = .transcript },
-        .activity_band = paint_plan.FrameBand.empty(.activity),
-        .footer_band = .{ .top = 5, .bottom = 8, .owner = .footer },
-        .invalidation = paint_plan.FrameInvalidationSet.empty(),
-        .footer_clean_allowed = true,
-        .synchronized_update = true,
-        .cursor_target = .{ .row = 6, .col = 1, .visible = true },
-        .footer_reservation_source = .footer_layout,
-        .bottom_reserved_rows = 0,
-        .preserve_scrollback = true,
-    };
-}
-
 fn surfaceHasInvalidation(
     set: paint_plan.FrameInvalidationSet,
     reason: paint_plan.FrameInvalidationReason,

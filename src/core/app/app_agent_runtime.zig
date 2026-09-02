@@ -1709,43 +1709,6 @@ fn testAgentStreamProvider(stream_fn: agent_stream_provider.StreamFn) agent_stre
     return provider;
 }
 
-const TestCatalogProvider = struct {
-    saw_expected_input: bool = false,
-
-    fn appendEntry(
-        alloc: Allocator,
-        catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
-        id_text: []const u8,
-    ) !void {
-        const id = try alloc.dupe(u8, id_text);
-        errdefer alloc.free(id);
-        const model_type = try alloc.dupe(u8, "language");
-        errdefer alloc.free(model_type);
-        try catalog.append(alloc, .{ .id = id, .model_type = model_type });
-    }
-
-    fn fetch(
-        raw_context: ?*anyopaque,
-        alloc: Allocator,
-        input: model_catalog.FetchInput,
-    ) Allocator.Error!model_catalog.ProviderResult {
-        const self: *TestCatalogProvider = @ptrCast(@alignCast(raw_context.?));
-        self.saw_expected_input =
-            std.mem.eql(u8, input.access.authorizationCredential() orelse "", "api-key") and
-            input.access.teamContext() == null and
-            input.access.credentialSource() == .ai_gateway_api_key and
-            std.mem.eql(u8, input.endpoint, "/catalog") and
-            input.cancel_flag == null and
-            input.view == .full;
-
-        var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
-        errdefer model_catalog.freeModelCatalog(alloc, &catalog);
-        try appendEntry(alloc, &catalog, "provider/first");
-        try appendEntry(alloc, &catalog, "provider/second");
-        return .{ .catalog = catalog };
-    }
-};
-
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
     return .{
         .prompt = try alloc.dupe(u8, "draft an issue"),

@@ -6351,20 +6351,6 @@ fn testPersistence(cwd: []const u8) contracts.StartPersistence {
     };
 }
 
-fn outputOwnerTestDefinition(
-    condition: contracts.MonitorCondition,
-) contracts.MonitorDefinition {
-    return .{
-        .condition = condition,
-        .check_schedule = if (condition.requires_polling())
-            .{ .interval_ms = 25 }
-        else
-            null,
-        .notify_schedule = .on_match,
-        .lifetime = .until_session_end,
-    };
-}
-
 fn checkSessionInitAllocationFailures(alloc: Allocator) !void {
     var fixture = try TestDurableFixture.init(alloc);
     defer fixture.deinit();

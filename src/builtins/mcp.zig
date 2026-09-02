@@ -1204,21 +1204,6 @@ fn request(home: ?[]const u8, fixture: *ListFixture) CommandRequest {
     };
 }
 
-fn expectBlock(result: CommandResult, expected: []const u8) !void {
-    switch (result.display) {
-        .block => |text| try std.testing.expectEqualStrings(expected, text),
-        .line => return error.TestExpectedEqual,
-    }
-}
-
-fn expectLine(result: CommandResult, expected: []const u8, reload: bool) !void {
-    switch (result.display) {
-        .line => |text| try std.testing.expectEqualStrings(expected, text),
-        .block => return error.TestExpectedEqual,
-    }
-    try std.testing.expectEqual(reload, result.reload);
-}
-
 fn tmpRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
 }

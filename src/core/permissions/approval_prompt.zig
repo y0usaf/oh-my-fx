@@ -203,39 +203,3 @@ pub const ApprovalPrompt = struct {
         self.review_request_id = 0;
     }
 };
-
-fn approvalPreview() diff_mod.FileChangePreview {
-    return .{
-        .path = "note.txt",
-        .lines = &.{
-            .{ .op = .deletion, .old_line = 2, .text = "before" },
-            .{ .op = .addition, .new_line = 2, .text = "after" },
-        },
-        .additions = 1,
-        .deletions = 1,
-        .truncated = false,
-    };
-}
-
-fn approvalFileRequest(
-    preview: diff_mod.FileChangePreview,
-) permission_request.FileApprovalRequest {
-    return .{
-        .kind = .edit,
-        .intent = .mutation,
-        .preview = preview,
-        .scope = .workspace_files,
-    };
-}
-
-fn checkApprovalPromptCloneAllocationFailures(alloc: Allocator) !void {
-    var prompt = ApprovalPrompt{};
-    defer prompt.deinit(alloc);
-
-    const request: permission_request.PermissionRequest = .{
-        .id = 7,
-        .label = "edit_file state.zig",
-        .file = approvalFileRequest(approvalPreview()),
-    };
-    try std.testing.expect(try prompt.syncRequest(alloc, request));
-}

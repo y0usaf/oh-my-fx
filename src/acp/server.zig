@@ -1888,35 +1888,3 @@ const AcpModelBoundaryFailure = struct {
         } };
     }
 };
-
-fn acpModelTestState(
-    alloc: Allocator,
-    id: []const u8,
-    workspace_root: []const u8,
-) !session_codec.DurableSessionState {
-    const owned_id = try alloc.dupe(u8, id);
-    errdefer alloc.free(owned_id);
-    const origin_workspace_root = try alloc.dupe(u8, workspace_root);
-    errdefer alloc.free(origin_workspace_root);
-    const current_workspace_root = try alloc.dupe(u8, workspace_root);
-    errdefer alloc.free(current_workspace_root);
-    const model = try alloc.dupe(u8, "old-model");
-    errdefer alloc.free(model);
-    const history = try alloc.alloc(session_runtime.HistoryTurn, 0);
-    return .{
-        .id = owned_id,
-        .origin_workspace_root = origin_workspace_root,
-        .workspace_root = current_workspace_root,
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
-        .preferences = .{
-            .model = model,
-            .effort = .auto,
-            .fast_mode = false,
-        },
-        .history = history,
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-}

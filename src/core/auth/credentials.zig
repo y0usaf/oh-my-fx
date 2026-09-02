@@ -663,48 +663,6 @@ pub fn sourceRefreshable(source: Source) bool {
     return source == .fx_login or source == .chatgpt_subscription or source == .grok_subscription;
 }
 
-var stable_credential_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableCredentialTestEnviron() !*const std.process.Environ.Map {
-    if (stable_credential_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_credential_test_environ = map;
-    return map;
-}
-
-const CredentialTestEnv = struct {
-    alloc: std.mem.Allocator,
-    map: std.process.Environ.Map,
-
-    /// Installs exactly `entries`, so anything the resolver reads from the real
-    /// environment, `HOME` included, is absent for the duration of the test.
-    fn install(alloc: std.mem.Allocator, entries: []const [2][]const u8) !*CredentialTestEnv {
-        _ = try stableCredentialTestEnviron();
-
-        const self = try alloc.create(CredentialTestEnv);
-        errdefer alloc.destroy(self);
-        self.* = .{
-            .alloc = alloc,
-            .map = std.process.Environ.Map.init(alloc),
-        };
-        errdefer self.map.deinit();
-
-        for (entries) |entry| try self.map.put(entry[0], entry[1]);
-        io_mod.setEnvironMap(&self.map);
-        return self;
-    }
-
-    fn deinit(self: *CredentialTestEnv) void {
-        if (stable_credential_test_environ) |map| io_mod.setEnvironMap(map);
-        self.map.deinit();
-        const alloc = self.alloc;
-        alloc.destroy(self);
-    }
-};
-
 const SecretStoreFixture = struct {
     value: ?[]const u8 = null,
     disabled: bool = false,
@@ -750,47 +708,5 @@ const SecretStoreFixture = struct {
         _: ?*anyopaque,
     ) host.SecretStoreWriteError!bool {
         return false;
-    }
-};
-
-/// A HOME holding an fx login whose session is expired and whose refresh token
-/// the issuer rejects, which is what an expired or revoked login looks like on
-/// disk. Paired with `oauth_transport.unavailable_provider`, the refresh fails.
-const ExpiredFxLoginFixture = struct {
-    alloc: std.mem.Allocator,
-    tmp: std.testing.TmpDir,
-    env: *CredentialTestEnv,
-    home: []u8,
-
-    fn install(alloc: std.mem.Allocator) !ExpiredFxLoginFixture {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
-        errdefer alloc.free(home);
-
-        try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
-        const auth_path = try std.fs.path.join(alloc, &.{ home, ".fx", "auth.json" });
-        defer alloc.free(auth_path);
-        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
-            .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
-        });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(
-            io_mod.getIo(),
-            "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\"," ++
-                "\"access_token\":\"access\",\"refresh_token\":\"rejected-refresh\"," ++
-                "\"expires_at_ms\":1,\"scope\":\"openid offline_access\"," ++
-                "\"token_type\":\"Bearer\",\"team_slug\":\"team-slug\",\"team_id\":\"team-id\"}",
-        );
-
-        const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
-        return .{ .alloc = alloc, .tmp = tmp, .env = env, .home = home };
-    }
-
-    fn deinit(self: *ExpiredFxLoginFixture) void {
-        self.env.deinit();
-        self.alloc.free(self.home);
-        self.tmp.cleanup();
     }
 };

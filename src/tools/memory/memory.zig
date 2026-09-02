@@ -254,35 +254,6 @@ fn expectDecodeFailure(args_json: []const u8, expected: []const u8) !void {
     }
 }
 
-fn expectMemoryOutput(args_json: []const u8, expected: []const u8) !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const output = try execute(arena, args_json);
-    try std.testing.expectEqualStrings(expected, output);
-}
-
-fn expectValidationFailure(args_json: []const u8, expected: []const u8) !void {
-    const alloc = std.testing.allocator;
-    const decoded = try decode(.{ .allocator = alloc }, args_json);
-    switch (decoded) {
-        .failure => |body| {
-            defer alloc.free(body);
-            try std.testing.expect(false);
-        },
-        .input => |input| {
-            defer input.deinit(alloc);
-            const reason = (try validate(.{ .allocator = alloc }, input)) orelse {
-                try std.testing.expect(false);
-                return;
-            };
-            defer alloc.free(reason);
-            try std.testing.expectEqualStrings(expected, reason);
-        },
-    }
-}
-
 fn setTestHome(home: ?[]const u8) !void {
     const map = try std.heap.c_allocator.create(std.process.Environ.Map);
     map.* = std.process.Environ.Map.init(std.heap.c_allocator);

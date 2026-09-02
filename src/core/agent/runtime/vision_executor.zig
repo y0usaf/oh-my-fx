@@ -487,22 +487,6 @@ fn totalFailureStatusDetail(records: []const vision_contracts.VisionImageResult)
     };
 }
 
-fn parseBatchAttemptForTest(json: []const u8) !BatchAttempt {
-    const parsed = vision_contracts.parse_vision_provider_result(
-        std.testing.allocator,
-        json,
-        json.len,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .invalid_response,
-    };
-    return .{ .parsed = parsed };
-}
-
-fn retryableAttemptForTest(attempt: anyerror!BatchAttempt) !bool {
-    return (try attempt).retryable();
-}
-
 fn modeledProviderCallCount(attempt: BatchAttempt) usize {
     return if (attempt.retryable()) 2 else 1;
 }

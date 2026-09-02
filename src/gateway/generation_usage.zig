@@ -231,14 +231,3 @@ fn parseOptionalNonNegativeInteger(value: ?std.json.Value) !?u64 {
     if (actual == .null) return null;
     return try parseNonNegativeInteger(actual);
 }
-
-fn fuzzGenerationRecord(_: void, smith: *std.testing.Smith) !void {
-    var buffer: [4096]u8 = undefined;
-    const len: usize = @intCast(smith.slice(&buffer));
-    var record = parseGenerationRecord(
-        std.testing.allocator,
-        buffer[0..len],
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-    ) catch return;
-    defer freeGenerationRecord(std.testing.allocator, &record);
-}

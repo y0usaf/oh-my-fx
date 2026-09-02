@@ -1319,12 +1319,3 @@ fn mapReplace(err: anyerror) Error {
         else => error.StoreUnavailable,
     };
 }
-
-fn fuzzRelationshipIndex(_: void, smith: *std.testing.Smith) !void {
-    var buffer: [8192]u8 = undefined;
-    const len: usize = @intCast(smith.slice(&buffer));
-    _ = decodeHeader(buffer[0..len]) catch {};
-    _ = decodePage(buffer[0..len], 0, 0) catch {};
-    var lookup = decodeLookup(std.testing.allocator, buffer[0..len]) catch return;
-    lookup.deinit(std.testing.allocator);
-}

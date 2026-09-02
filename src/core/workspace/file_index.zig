@@ -1438,87 +1438,11 @@ fn spansFromMatchedOffsets(
     return span_count;
 }
 
-fn expectValidSearchSpans(result: SearchResult) !void {
-    var previous_end: usize = 0;
-    for (result.matched_spans) |span| {
-        try std.testing.expect(span.byte_start < span.byte_end);
-        try std.testing.expect(span.byte_start >= previous_end);
-        try std.testing.expect(span.byte_end <= result.path.len);
-        try std.testing.expect(std.unicode.utf8ValidateSlice(result.path[span.byte_start..span.byte_end]));
-        previous_end = span.byte_end;
-    }
-}
-
-fn TestSearchBuffer(comptime capacity: usize) type {
-    return struct {
-        results: [capacity]SearchResult = undefined,
-        spans: [capacity * max_path_len]MatchSpan = undefined,
-
-        fn run(self: *@This(), index: *const FileIndex, query: []const u8) SearchError![]const SearchResult {
-            const count = try index.searchTyped(query, &self.results, &self.spans);
-            return self.results[0..count];
-        }
-    };
-}
-
-fn expectFirstSearchPath(raw: []const u8, query: []const u8, expected: []const u8) !void {
-    const alloc = std.testing.allocator;
-    var index = FileIndex{};
-    defer index.deinit(alloc);
-    try index.buildFromRaw(alloc, raw);
-
-    var search: TestSearchBuffer(8) = .{};
-    const results = try search.run(&index, query);
-    try std.testing.expect(results.len > 0);
-    try std.testing.expectEqualStrings(expected, results[0].path);
-}
-
 fn containsCandidate(candidates: []const Candidate, path: []const u8, kind: CandidateKind) bool {
     for (candidates) |candidate| {
         if (candidate.kind == kind and std.mem.eql(u8, candidate.path, path)) return true;
     }
     return false;
-}
-
-fn runGitForFileIndexTest(alloc: Allocator, cwd: []const u8, argv: []const []const u8) !void {
-    const result = try std.process.run(alloc, io_mod.getIo(), .{
-        .argv = argv,
-        .cwd = .{ .path = cwd },
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        .signal, .stopped, .unknown => return error.TestUnexpectedResult,
-    }
-}
-
-const TestLoaderGate = struct {
-    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    cleanup_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    cleanup_release: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
-    cleanup_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    publish_count: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    outcome: GenerationState,
-};
-
-fn testLoaderThread(generation: *Generation, gate: *TestLoaderGate) void {
-    gate.started.store(true, .release);
-    while (!gate.release.load(.acquire)) std.atomic.spinLoopHint();
-    gate.cleanup_started.store(true, .release);
-    while (!gate.cleanup_release.load(.acquire)) std.atomic.spinLoopHint();
-    gate.cleanup_finished.store(true, .release);
-    _ = gate.publish_count.fetchAdd(1, .seq_cst);
-    const outcome: LoaderOutcome = switch (gate.outcome) {
-        .loading => unreachable,
-        .ready => .ready,
-        .failed => .{ .failed = .{ .stage = .storage, .err = error.TestLoaderFailure } },
-        .canceled => .canceled,
-    };
-    publishLoaderOutcomeAfterCleanup(generation, outcome);
 }
 
 fn waitForTestFlag(flag: *const std.atomic.Value(bool)) !void {
@@ -1541,65 +1465,6 @@ fn waitForGenerationState(generation: *const Generation, expected: GenerationSta
     }
 }
 
-const TestReapAttempt = struct {
-    index: *FileIndex,
-    alloc: Allocator,
-    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    visible_changed: bool = false,
-};
-
-fn testReapThread(attempt: *TestReapAttempt) void {
-    attempt.started.store(true, .release);
-    attempt.visible_changed = attempt.index.joinThreadIfDone(attempt.alloc);
-    attempt.finished.store(true, .release);
-}
-
-fn expectReapReturnsDuringCleanup(index: *FileIndex, alloc: Allocator, gate: *TestLoaderGate) !void {
-    var attempt: TestReapAttempt = .{ .index = index, .alloc = alloc };
-    const thread = try std.Thread.spawn(.{}, testReapThread, .{&attempt});
-    waitForTestFlag(&attempt.started) catch |err| {
-        gate.cleanup_release.store(true, .release);
-        thread.join();
-        return err;
-    };
-    waitForTestFlag(&attempt.finished) catch |err| {
-        gate.cleanup_release.store(true, .release);
-        thread.join();
-        return err;
-    };
-    thread.join();
-    try std.testing.expect(!attempt.visible_changed);
-    try std.testing.expect(!gate.cleanup_release.load(.acquire));
-}
-
-fn installTestLoader(
-    index: *FileIndex,
-    alloc: Allocator,
-    raw_list: []const u8,
-    gate: *TestLoaderGate,
-) !*Generation {
-    const generation_id = index.generation + 1;
-    const generation = try Generation.create(alloc, generation_id);
-    errdefer generation.destroy(alloc);
-    try generation.fillProgressive(alloc, .{ .file_raw = raw_list }, null);
-
-    index.loading_generation = generation;
-    index.generation = generation_id;
-    index.thread = std.Thread.spawn(.{}, testLoaderThread, .{ generation, gate }) catch |err| {
-        index.loading_generation = null;
-        return err;
-    };
-    waitForTestFlag(&gate.started) catch |err| {
-        gate.release.store(true, .release);
-        index.thread.?.join();
-        index.thread = null;
-        index.loading_generation = null;
-        return err;
-    };
-    return generation;
-}
-
 fn checkBuildFromRawAllocationFailures(alloc: Allocator) !void {
     var index = FileIndex{};
     defer index.deinit(alloc);
@@ -1615,26 +1480,6 @@ fn checkBuildFromCandidatesAllocationFailures(alloc: Allocator) !void {
     var index = FileIndex{};
     defer index.deinit(alloc);
     try index.buildFromCandidates(alloc, &candidates);
-}
-
-fn fuzzRawListAndQuery(_: void, smith: *std.testing.Smith) !void {
-    var bytes: [4096]u8 = undefined;
-    const len: usize = @intCast(smith.slice(&bytes));
-    const split = len / 2;
-
-    var index = FileIndex{};
-    defer index.deinit(std.testing.allocator);
-    try index.buildFromRaw(std.testing.allocator, bytes[0..split]);
-
-    var typed_results: [8]SearchResult = undefined;
-    var span_storage: [8 * max_path_len]MatchSpan = undefined;
-    const typed_count = try index.searchTyped(bytes[split..len], &typed_results, &span_storage);
-    for (typed_results[0..typed_count]) |typed| {
-        try std.testing.expect(typed.path.len <= max_path_len);
-        try std.testing.expect(text_utils.isTerminalSafe(typed.path));
-        try std.testing.expectEqual(CandidateKind.file, typed.kind);
-        try expectValidSearchSpans(typed);
-    }
 }
 
 fn sleepBlocking(milliseconds: u64) void {

@@ -410,16 +410,3 @@ fn testPlan(
         .preserve_scrollback = true,
     };
 }
-
-fn testSurface(plan: paint_plan.PaintPlan) !struct {
-    shadow: vt_emulator.Grid,
-    surface: frame_surface.FrameSurface,
-} {
-    var shadow = try vt_emulator.Grid.init(std.testing.allocator, plan.layout.cols, plan.layout.rows);
-    errdefer shadow.deinit();
-    try shadow.feed("\x1b[1;1Hshell");
-
-    var surface = try frame_surface.FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
-    errdefer surface.deinit();
-    return .{ .shadow = shadow, .surface = surface };
-}

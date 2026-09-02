@@ -792,15 +792,6 @@ fn foregroundCommandStatusFromTerm(term: std.process.Child.Term) command_contrac
     };
 }
 
-fn projectForTest(alloc: std.mem.Allocator, chunks: []const []const u8) ![]u8 {
-    var projector: DirectOutputProjector = .{};
-    var projected: std.ArrayList(u8) = .empty;
-    errdefer projected.deinit(alloc);
-    for (chunks) |chunk| try projector.push(alloc, chunk, &projected);
-    try projector.finish(alloc, &projected);
-    return projected.toOwnedSlice(alloc);
-}
-
 fn createListingFiles(
     dir: std.Io.Dir,
     full_length_count: usize,

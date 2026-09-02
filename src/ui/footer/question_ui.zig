@@ -530,34 +530,3 @@ fn writeTruncated(writer: *std.Io.Writer, text: []const u8, budget: usize) !void
     try writer.writeAll(prefix);
     try writer.writeAll("…");
 }
-
-fn expectQuestionPanelRowsMatch(
-    prompt: *const question_prompt.QuestionPrompt,
-    width: u16,
-) !void {
-    const projection = prompt.projection().?;
-    const text = try composeQuestionPanelText(std.testing.allocator, projection, width);
-    defer std.testing.allocator.free(text);
-
-    var line_start: usize = 0;
-    var serialized_rows: u16 = 0;
-    while (line_start < text.len) {
-        _ = nextPanelLine(text, &line_start);
-        serialized_rows += 1;
-    }
-
-    const measured_rows = try questionPanelRowsForLayout(std.testing.allocator, projection, width);
-    try std.testing.expectEqual(serialized_rows, measured_rows);
-}
-
-fn expectVisibleIndentBefore(text: []const u8, needle: []const u8, expected: usize) !void {
-    const needle_start = std.mem.find(u8, text, needle) orelse return error.TestExpectedEqual;
-    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..needle_start], '\n')) |newline|
-        newline + 1
-    else
-        0;
-    try std.testing.expectEqual(
-        expected,
-        display_width.visibleWidthIgnoringAnsi(text[line_start..needle_start]),
-    );
-}

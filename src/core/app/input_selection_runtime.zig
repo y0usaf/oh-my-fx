@@ -76,23 +76,3 @@ const TestInput = struct {
         };
     }
 };
-
-const TestClipboard = struct {
-    copied: std.ArrayList(u8) = .empty,
-    succeed: bool = true,
-
-    fn deinit(self: *TestClipboard, alloc: std.mem.Allocator) void {
-        self.copied.deinit(alloc);
-    }
-
-    fn clipboard(self: *TestClipboard) host.Clipboard {
-        return .{ .context = self, .copy_fn = copy };
-    }
-
-    fn copy(raw_context: ?*anyopaque, bytes: []const u8) host.ClipboardError!bool {
-        const self: *TestClipboard = @ptrCast(@alignCast(raw_context.?));
-        if (!self.succeed) return false;
-        self.copied.appendSlice(std.testing.allocator, bytes) catch return error.CopyFailed;
-        return true;
-    }
-};

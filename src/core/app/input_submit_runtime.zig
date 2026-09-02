@@ -1954,30 +1954,6 @@ pub fn directCommand(expanded: []const u8) ?[]const u8 {
     return expanded[1..];
 }
 
-fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !void {
-    const draft = try buildQueuedPromptDraft(
-        alloc,
-        77,
-        "hello $review",
-        &.{.{
-            .id = 5,
-            .path = @constCast("/tmp/image.png"),
-            .media_type = @constCast("image/png"),
-        }},
-        &.{.{
-            .raw_start = 6,
-            .raw_end = 13,
-            .name = "review",
-            .path = "/tmp/review/SKILL.md",
-        }},
-    );
-    defer worker_runtime.freeQueuedPromptDraft(alloc, draft);
-    try std.testing.expectEqual(@as(u64, 77), draft.turn_id);
-    try std.testing.expectEqualStrings("hello $review", draft.prompt);
-    try std.testing.expectEqual(@as(usize, 1), draft.images.len);
-    try std.testing.expectEqual(@as(usize, 1), draft.skill_display_spans.len);
-}
-
 const PendingLifecycleFake = struct {
     alloc: std.mem.Allocator,
     submission: State = .{},
@@ -2090,18 +2066,4 @@ fn pendingLifecycleFakeWithSnapshot(
             &.{},
         )) },
     };
-}
-
-fn writePendingSnapshotFixture(tmp: *std.testing.TmpDir, name: []const u8) ![]u8 {
-    var file = try tmp.dir.createFile(std.testing.io, name, .{});
-    defer file.close(std.testing.io);
-    try file.writeStreamingAll(std.testing.io, "snapshot");
-    return io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, name);
-}
-
-fn expectPendingSnapshotMissing(path: []const u8) !void {
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.openFileAbsolute(std.testing.io, path, .{}),
-    );
 }
