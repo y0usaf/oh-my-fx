@@ -184,7 +184,3 @@ fn writeFailed(step: []const u8, err: anyerror) StoreError {
     debug_trace.logf("stored_key", "store failed step={s} err={s}", .{ step, @errorName(err) });
     return error.StoredKeyWriteFailed;
 }
-
-
-
-

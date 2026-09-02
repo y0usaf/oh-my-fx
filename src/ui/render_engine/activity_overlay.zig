@@ -145,9 +145,3 @@ pub fn suppressEntryOverlayForBanner(activity: *ActivityPlacement, banner_active
         .none, .transient_row => {},
     }
 }
-
-
-
-
-
-

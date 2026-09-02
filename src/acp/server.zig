@@ -1873,16 +1873,6 @@ pub fn applySessionMode(registry: mode_registry.Registry, session: *ActiveSessio
     session.permission_mode = mode.permission_mode;
 }
 
-
-
-
-
-
-
-
-
-
-
 const AcpModelBoundaryFailure = struct {
     target: session_log.Boundary,
 
@@ -1930,9 +1920,3 @@ fn acpModelTestState(
         .total_output_tokens = 0,
     };
 }
-
-
-
-
-
-

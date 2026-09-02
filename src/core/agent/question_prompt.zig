@@ -691,8 +691,6 @@ fn currentChoiceIndex(prompt: *const QuestionPrompt) u8 {
     return prompt.entries.items[prompt.current_index].choice_index;
 }
 
-
-
 fn checkQuestionPromptSyncAllocationFailures(alloc: Allocator) !void {
     var prompt = QuestionPrompt{};
     defer prompt.deinit(alloc);
@@ -706,39 +704,3 @@ fn checkQuestionPromptSyncAllocationFailures(alloc: Allocator) !void {
     };
     try prompt.syncFrom(alloc, &entries);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

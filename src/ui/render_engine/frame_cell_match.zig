@@ -87,9 +87,6 @@ fn resourceIdsMatchByBytes(
     return std.mem.eql(u8, left, right);
 }
 
-
-
-
 fn cellMatchTestPlan() paint_plan.PaintPlan {
     return .{
         .layout = .{

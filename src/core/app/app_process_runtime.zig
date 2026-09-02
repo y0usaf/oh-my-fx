@@ -142,13 +142,6 @@ const DummyApp = struct {
     worker_thread: ?std.Thread = null,
 };
 
-
-
-
-
-
-
-
 const TestWorkerApp = struct {
     worker: worker_runtime.WorkerRuntime = .{},
     worker_thread: ?std.Thread = null,
@@ -195,6 +188,3 @@ fn queuePrompt(app: *TestWorkerApp, text: []const u8) !void {
     errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);
     try app.worker.enqueuePrompt(std.heap.c_allocator, prompt);
 }
-
-
-

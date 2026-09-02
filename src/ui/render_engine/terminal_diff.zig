@@ -994,8 +994,6 @@ fn blankResetReplayShadow(
     return next;
 }
 
-
-
 fn feedCanonicalScroll(shadow: *vt_emulator.Grid, target_rows: u16, accepted_scroll_rows: u16) !void {
     var scroll: std.Io.Writer.Allocating = .init(shadow.alloc);
     defer scroll.deinit();
@@ -1592,9 +1590,6 @@ fn flush_test_frame(
     });
 }
 
-
-
-
 fn expect_grid_and_cursor_equal(expected: vt_emulator.Grid, actual: vt_emulator.Grid) !void {
     try std.testing.expectEqual(expected.cols, actual.cols);
     try std.testing.expectEqual(expected.rows, actual.rows);
@@ -1683,67 +1678,3 @@ fn makeCombiningSurface(alloc: Allocator, previous: vt_emulator.Grid, plan: pain
     surface.cursor_target = .{ .row = 3, .col = 2, .visible = true };
     return surface;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

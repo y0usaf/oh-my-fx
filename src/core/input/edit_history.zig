@@ -157,5 +157,3 @@ pub const State = struct {
         stack.clearRetainingCapacity();
     }
 };
-
-

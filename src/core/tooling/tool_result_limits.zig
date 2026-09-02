@@ -94,7 +94,3 @@ pub fn truncateText(arena: std.mem.Allocator, opts: TruncateOptions) ![]const u8
     if (prefix_len == 0) return try arena.dupe(u8, opts.marker);
     return try std.mem.concat(arena, u8, &.{ opts.text[0..prefix_len], opts.marker });
 }
-
-
-
-

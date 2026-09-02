@@ -293,5 +293,3 @@ fn validateModelId(id: []const u8) !void {
         if (byte <= 0x20 or byte == 0x7f) return error.InvalidCodexModelCatalog;
     }
 }
-
-

@@ -127,12 +127,3 @@ fn resolveAllocated(input: Input, requested_rows: u16) FooterRows {
         .composer_top_chrome_rows = 1,
     };
 }
-
-
-
-
-
-
-
-
-

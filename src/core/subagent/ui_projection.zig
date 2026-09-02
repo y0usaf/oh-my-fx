@@ -594,10 +594,6 @@ pub const ChildChat = struct {
     }
 };
 
-
-
-
-
 pub const ChildUnavailable = enum {
     not_found,
     unreadable,
@@ -1422,7 +1418,6 @@ fn dupeBounded(alloc: Allocator, value: []const u8) ![]u8 {
     return alloc.dupe(u8, value[0..@min(value.len, max_summary_bytes)]);
 }
 
-
 fn cloneDiagnostics(
     alloc: Allocator,
     diagnostics: []const manager_mod.TreeDiagnostic,
@@ -1574,7 +1569,6 @@ fn hashValue(hash: *std.hash.Wyhash, value: anytype) void {
     hash.update(std.mem.asBytes(&copy));
 }
 
-
 fn mapLoadError(err: communication_store.LoadError) DegradedReason {
     return switch (err) {
         error.CommunicationNotFound => .session_unavailable,
@@ -1590,7 +1584,6 @@ fn mapLoadError(err: communication_store.LoadError) DegradedReason {
     };
 }
 
-
 fn checkFileApprovalProjectionAllocationFailures(
     alloc: Allocator,
     approval: communication.Approval,
@@ -1602,7 +1595,6 @@ fn checkFileApprovalProjectionAllocationFailures(
         projected.file.?.preview.path,
     );
 }
-
 
 fn checkExtendedProjectionAllocationFailures(alloc: Allocator) !void {
     var command = try domain.validateCommand(alloc, .{ .create = .{
@@ -1657,10 +1649,6 @@ fn checkExtendedProjectionAllocationFailures(alloc: Allocator) !void {
     snapshot.deinit(alloc);
 }
 
-
-
-
-
 fn checkPendingApprovalProjectionPageAllocation(alloc: Allocator, source: Source) !void {
     var projected = try projectPendingApprovals(alloc, source);
     defer projected.deinit(alloc);
@@ -1675,7 +1663,6 @@ fn findNodeInProjection(nodes: []const Node, child_id: []const u8) ?*const Node 
     }
     return null;
 }
-
 
 const ProjectionTestEnvironment = struct {
     tmp: std.testing.TmpDir,
@@ -1755,8 +1742,6 @@ fn projectionTestState(
     };
 }
 
-
-
 fn testChildChatPage(
     alloc: Allocator,
     session_id_value: []const u8,
@@ -1795,7 +1780,6 @@ fn testChildChatPage(
     };
 }
 
-
 fn checkChildChatPageCacheAllocationFailures(alloc: Allocator) !void {
     var cache = ChildChatPageCache{};
     defer cache.deinit(alloc);
@@ -1817,7 +1801,6 @@ fn checkChildChatPageCacheAllocationFailures(alloc: Allocator) !void {
     );
 }
 
-
 fn checkTurnSourceProjectionAllocationFailures(alloc: Allocator) !void {
     var turn = try session.makeAssistantTurn(alloc, "same prompt", "answer");
     defer session.freeHistoryTurn(alloc, turn);
@@ -1831,7 +1814,6 @@ fn checkTurnSourceProjectionAllocationFailures(alloc: Allocator) !void {
     const sources = try projectTurnSources(alloc, &.{turn}, &messages);
     freeTurnSources(alloc, sources);
 }
-
 
 fn makeProjectionTaggedHistory(alloc: Allocator, count: usize) ![]session.HistoryTurn {
     const turns = try alloc.alloc(session.HistoryTurn, count);
@@ -1850,4 +1832,3 @@ fn makeProjectionTaggedHistory(alloc: Allocator, count: usize) ![]session.Histor
     }
     return turns;
 }
-

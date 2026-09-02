@@ -243,10 +243,3 @@ pub fn deleteRange(
     }
     return true;
 }
-
-
-
-
-
-
-

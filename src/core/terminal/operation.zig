@@ -203,7 +203,6 @@ noinline fn failOwnedAuthorityClaimDynamic(err: anyerror) anyerror!OwnedAuthorit
     return err;
 }
 
-
 pub fn ownAuthorityClaim(
     alloc: Allocator,
     authority_claim: contracts.AuthorityClaim,
@@ -396,8 +395,6 @@ pub fn execute(
     return backend.executeAuthorized(request, cancelled);
 }
 
-
-
 fn test_preparation() AuthorityPreparation {
     return .{
         .profile_user = "profile-user",
@@ -411,9 +408,6 @@ fn test_preparation() AuthorityPreparation {
         .lifetime = .session,
     };
 }
-
-
-
 
 fn check_preparation_allocation_failures(alloc: Allocator) !void {
     var prepared = try construct_start_persistence(
@@ -435,4 +429,3 @@ fn check_preparation_allocation_failures(alloc: Allocator) !void {
     );
     defer owned_claim.deinit();
 }
-

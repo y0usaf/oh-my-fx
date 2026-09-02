@@ -943,10 +943,6 @@ const CatalogTestApp = struct {
     }
 };
 
-
-
-
-
 const TerminalOpenTestSubagents = struct {
     selected_id: []const u8 = "terminal-a",
     manager_active: bool = true,
@@ -971,4 +967,3 @@ const TerminalOpenTestApp = struct {
         return self.open_result;
     }
 };
-

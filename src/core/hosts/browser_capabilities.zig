@@ -6,4 +6,3 @@ pub const model_context =
     "Do not attempt curl, wget, package managers, raw sockets, or equivalent network workarounds through terminal commands. " ++
     "If the user asks for external web content, explain this limitation immediately and say that locally installed fx provides the full tool suite. " ++
     "When a browser workspace terminal is advertised, use it only for the files and commands that workspace exposes.";
-

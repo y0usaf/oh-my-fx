@@ -71,6 +71,3 @@ fn recordCompleteFrame(metrics: *Metrics, bytes: []const u8) terminal_diff.Frame
 pub fn frameSinkFrom(ctx: *anyopaque, write_frame: *const fn (*anyopaque, *Metrics, []const u8) terminal_diff.FrameSinkWriteResult) terminal_diff.FrameSink {
     return .{ .ctx = ctx, .write_frame = write_frame };
 }
-
-
-

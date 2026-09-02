@@ -202,16 +202,3 @@ pub fn writeAvailableCommandsUpdate(w: *std.Io.Writer, commands_json: []const u8
     try w.writeAll(commands_json);
     try w.writeAll("}");
 }
-
-
-
-
-
-
-
-
-
-
-
-
-

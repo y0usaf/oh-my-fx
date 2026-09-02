@@ -126,6 +126,3 @@ fn checkpoint_reason(
         .resize_uncheckpointed => .resize_uncheckpointed,
     };
 }
-
-
-

@@ -56,4 +56,3 @@ fn declaredKind(mime: []const u8) Kind {
     if (std.mem.startsWith(u8, mime, "application/") and std.mem.endsWith(u8, mime, "+xml")) return .text;
     return .binary;
 }
-

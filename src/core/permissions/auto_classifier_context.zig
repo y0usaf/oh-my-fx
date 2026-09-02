@@ -596,12 +596,3 @@ fn writeHeadTail(writer: *std.Io.Writer, text: []const u8, max_content_bytes: us
         .up,
     );
 }
-
-
-
-
-
-
-
-
-

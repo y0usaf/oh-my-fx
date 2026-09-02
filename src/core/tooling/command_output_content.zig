@@ -543,12 +543,6 @@ fn expectCanonicalEqual(expected: CanonicalOutput, actual: CanonicalOutput) !voi
     }
 }
 
-
-
-
-
-
-
 fn fuzzCommandOutputContent(_: void, smith: *std.testing.Smith) anyerror!void {
     const alloc = std.testing.allocator;
     var input_buffer: [4096]u8 = undefined;
@@ -566,4 +560,3 @@ fn fuzzCommandOutputContent(_: void, smith: *std.testing.Smith) anyerror!void {
         parsed.deinit(alloc);
     }
 }
-

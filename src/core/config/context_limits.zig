@@ -220,7 +220,3 @@ pub fn lineSafePrefixLength(bytes: []const u8, max_bytes: usize) usize {
     if (std.mem.lastIndexOfScalar(u8, bytes[0..utf8_end], '\n')) |newline| return newline + 1;
     return utf8_end;
 }
-
-
-
-

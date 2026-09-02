@@ -307,7 +307,6 @@ noinline fn failResultDynamic(err: anyerror) anyerror!Result {
     return err;
 }
 
-
 pub const StreamFn = *const fn (
     context: ?*anyopaque,
     alloc: Allocator,
@@ -331,4 +330,3 @@ fn unavailableStream(_: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Res
 pub const unavailable_provider = Provider{
     .stream_fn = unavailableStream,
 };
-

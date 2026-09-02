@@ -206,6 +206,3 @@ const Fixture = struct {
         ).next;
     }
 };
-
-
-

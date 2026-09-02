@@ -1110,18 +1110,6 @@ const second_compatibility_tool = blk: {
     break :blk tool;
 };
 
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkAdmitToolCallAskFailureAllocationFailures(alloc: Allocator) !void {
     const registry = Registry{ .tools = &.{mock_tool} };
     const admission = try admitToolCall(.{
@@ -1142,9 +1130,6 @@ fn checkAdmitToolCallAskFailureAllocationFailures(alloc: Allocator) !void {
     }
 }
 
-
-
-
 fn expectPermissionDeniedBody(body: []const u8, tool_name: []const u8, reason: core_types.ToolPermissionDenialReason) !void {
     try std.testing.expect(tool_result_errors.isToolPermissionDeniedOutput(body));
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -1156,5 +1141,3 @@ fn expectPermissionDeniedBody(body: []const u8, tool_name: []const u8, reason: c
     try std.testing.expectEqualStrings(@tagName(reason), error_obj.get("reason").?.string);
     try std.testing.expect(error_obj.get("denied").?.bool);
 }
-
-

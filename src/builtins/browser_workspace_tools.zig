@@ -50,8 +50,6 @@ pub fn selectToolSet(comptime native_tools: bool, workspace_available: bool) too
     return if (workspace_available) advertisement_set else tool_set.empty;
 }
 
-
-
 fn expectDecodeFailure(arguments_json: []const u8) !void {
     const decoded = try registry.tools[0].decode(.{
         .allocator = std.testing.allocator,
@@ -64,6 +62,3 @@ fn expectDecodeFailure(arguments_json: []const u8) !void {
         .failure => |body| std.testing.allocator.free(body),
     }
 }
-
-
-

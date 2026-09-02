@@ -271,12 +271,3 @@ pub fn exactContinuationOverlap(
     }
     return matched;
 }
-
-
-
-
-
-
-
-
-

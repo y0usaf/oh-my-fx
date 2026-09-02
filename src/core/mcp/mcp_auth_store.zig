@@ -883,14 +883,6 @@ fn dupeOptionalString(
     return try alloc.dupe(u8, value.string);
 }
 
-
-
-
-
-
-
-
-
 fn checkCredentialStoreIsolationAllocationFailures(alloc: Allocator) !void {
     const json =
         \\{"version":1,"credentials":[
@@ -903,9 +895,6 @@ fn checkCredentialStoreIsolationAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), store.credentials.items.len);
     try std.testing.expectEqual(@as(usize, 1), store.rejected_entries);
 }
-
-
-
 
 var stable_test_environ: ?*std.process.Environ.Map = null;
 
@@ -1066,12 +1055,3 @@ fn testCredentials(
         .token_endpoint = try alloc.dupe(u8, "https://issuer.example/token"),
     };
 }
-
-
-
-
-
-
-
-
-

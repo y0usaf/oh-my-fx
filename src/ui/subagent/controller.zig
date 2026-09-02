@@ -603,7 +603,3 @@ pub const Controller = struct {
 
 pub const statusLabelPublic = subagent_runtime.statusLabelPublic;
 pub const childInputFailureDisplay = subagent_runtime.childInputFailureDisplay;
-
-
-
-

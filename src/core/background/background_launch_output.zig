@@ -163,5 +163,3 @@ fn randomLogName(alloc: Allocator) ![]u8 {
         .{encoded[0..]},
     );
 }
-
-

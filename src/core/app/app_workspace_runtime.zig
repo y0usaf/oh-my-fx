@@ -133,4 +133,3 @@ const TestFileIndex = struct {
         self.last_additional_count = scope.additional_directories.len;
     }
 };
-

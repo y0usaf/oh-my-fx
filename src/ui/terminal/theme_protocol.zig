@@ -52,9 +52,6 @@ pub fn truecolorSupportedForValues(colorterm: ?[]const u8, term_program: ?[]cons
     return true;
 }
 
-
-
-
 pub fn parseColorFgBgLight(colorfgbg: []const u8) bool {
     var last_semi: ?usize = null;
     for (colorfgbg, 0..) |byte, i| {
@@ -72,8 +69,3 @@ fn normalizeOsc11Component(part: []const u8) ?u32 {
     const maximum = (@as(u32, 1) << bits) - 1;
     return @divTrunc(value * 0xffff, maximum);
 }
-
-
-
-
-

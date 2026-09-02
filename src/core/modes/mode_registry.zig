@@ -69,5 +69,3 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
     }
     return false;
 }
-
-

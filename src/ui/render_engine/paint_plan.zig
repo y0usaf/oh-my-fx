@@ -576,14 +576,6 @@ pub fn transcriptBottomLimit(
     return bottom;
 }
 
-
-
-
-
-
-
-
-
 fn validPlan() PaintPlan {
     return .{
         .layout = .{
@@ -630,14 +622,3 @@ fn validPlan() PaintPlan {
         .preserve_scrollback = true,
     };
 }
-
-
-
-
-
-
-
-
-
-
-

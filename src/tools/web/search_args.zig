@@ -200,7 +200,3 @@ fn expectDecodeInput(args_json: []const u8, expected_query: []const u8) !tool_di
         },
     }
 }
-
-
-
-

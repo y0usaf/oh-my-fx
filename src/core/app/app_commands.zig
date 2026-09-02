@@ -2941,13 +2941,6 @@ fn renderThematicRuleTimelineBody(alloc: std.mem.Allocator, text: []const u8) ![
     return std.fmt.allocPrint(alloc, "  {s}\n", .{trimmed});
 }
 
-
-
-
-
-
-
-
 fn isBannerNoiseLine(line: []const u8) bool {
     if (line.len == 0) return true;
     if (std.mem.find(u8, line, "\xe2\x96\x91") != null) return true;
@@ -3558,7 +3551,6 @@ const McpCommandFakeApp = struct {
     }
 };
 
-
 const ClearCommandFakeApp = struct {
     clear_count: usize = 0,
     new_count: usize = 0,
@@ -3581,7 +3573,6 @@ const QuitCommandFakeApp = struct {
     should_exit: bool = false,
     session_persistence: app_session_runtime.Persistence = .{},
 };
-
 
 const ClipboardCommandFakeApp = struct {
     const CopyOutcome = enum {
@@ -3712,28 +3703,3 @@ fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: [
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), content);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

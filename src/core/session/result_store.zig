@@ -459,9 +459,6 @@ fn validateHandle(handle: []const u8) !void {
     }
 }
 
-
-
-
 const PrepareRoute = enum {
     legacy,
     managed,
@@ -532,8 +529,6 @@ fn expectLargeResultPreparationLeavesNoOrphan(route: PrepareRoute) !void {
     }
     try std.testing.expect(reached_success);
 }
-
-
 
 fn expectExistingLargeResultSurvivesPreparationFailure(
     route: PrepareRoute,
@@ -615,12 +610,3 @@ fn expectExistingLargeResultSurvivesPreparationFailure(
     }
     try std.testing.expect(reached_success);
 }
-
-
-
-
-
-
-
-
-

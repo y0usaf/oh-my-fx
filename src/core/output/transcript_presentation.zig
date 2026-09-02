@@ -269,7 +269,3 @@ fn next_bookmark_item_row(item_rows: []const ItemRow, current_row: u32) ?u32 {
     }
     return null;
 }
-
-
-
-

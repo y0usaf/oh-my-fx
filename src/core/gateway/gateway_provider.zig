@@ -103,7 +103,6 @@ pub const Provider = struct {
     chat_url: ChatUrlProvider,
 };
 
-
 const CapabilityResolverState = enum {
     idle,
     ready,
@@ -225,7 +224,6 @@ noinline fn failCapabilitiesDynamic(err: anyerror) anyerror!model_capabilities.C
     return err;
 }
 
-
 const FakeCatalog = struct {
     outcome: enum {
         cancelled,
@@ -290,7 +288,6 @@ const FakeCatalog = struct {
     }
 };
 
-
 const FakeChatUrl = struct {
     resolved: []const u8,
 
@@ -300,8 +297,3 @@ const FakeChatUrl = struct {
         return self.resolved;
     }
 };
-
-
-
-
-

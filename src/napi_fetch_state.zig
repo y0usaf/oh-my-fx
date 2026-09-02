@@ -164,6 +164,3 @@ fn stale(phase: Phase, handle: Handle) Decision {
 fn expectDecision(expected: Decision, actual: Decision) !void {
     try std.testing.expectEqualDeep(expected, actual);
 }
-
-
-

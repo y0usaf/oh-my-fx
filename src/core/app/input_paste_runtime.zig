@@ -570,4 +570,3 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
     };
 }
-

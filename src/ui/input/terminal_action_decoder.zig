@@ -243,11 +243,3 @@ fn shouldReplayControlAfterBareEscape(byte: u8) bool {
         else => false,
     };
 }
-
-
-
-
-
-
-
-

@@ -156,5 +156,3 @@ fn deinitItems(alloc: Allocator, items: []const ResultItem) void {
     for (items) |item| item.deinit(alloc);
     if (items.len > 0) alloc.free(items);
 }
-
-

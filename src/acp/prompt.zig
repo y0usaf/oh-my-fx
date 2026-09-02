@@ -1707,7 +1707,6 @@ fn persistAcpHistoryTurn(
     };
 }
 
-
 fn setRecoveryCheckpoint(
     raw_ctx: *anyopaque,
     checkpoint: session_codec.RecoveryCheckpoint,
@@ -2381,31 +2380,6 @@ fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: T
     return std.fmt.allocPrint(arena, "{s}", .{call.name});
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const AcpContextRegistryFixture = struct {
     var gather_calls: usize = 0;
     var gather_error: ?context_contract.ProviderError = null;
@@ -2536,13 +2510,6 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
     };
 }
 
-
-
-
-
-
-
-
 fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []const u8, action: types.PermissionAction) !types.PermissionRuleSet {
     var rules = types.PermissionRuleSet{
         .rules = try alloc.alloc(types.PermissionRule, 1),
@@ -2581,16 +2548,3 @@ fn createSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []co
         return err;
     };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-

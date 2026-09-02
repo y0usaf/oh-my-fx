@@ -89,4 +89,3 @@ fn configIdForPermissionMode(mode: PermissionMode) []const u8 {
         .yolo => "code",
     };
 }
-

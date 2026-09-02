@@ -217,5 +217,3 @@ pub const AttentionRequiredHandler = struct {
         input: AttentionRequiredInput,
     ) HandlerError!void,
 };
-
-

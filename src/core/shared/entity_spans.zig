@@ -51,5 +51,3 @@ pub fn overlaps(a: Span, b: Span) bool {
 pub fn containsSpan(outer: Span, inner: Span) bool {
     return outer.raw_start <= inner.raw_start and inner.raw_end <= outer.raw_end;
 }
-
-

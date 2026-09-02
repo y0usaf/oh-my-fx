@@ -345,6 +345,3 @@ fn mcpMoreAvailable(value: std.json.Value) bool {
     const candidate = value.object.get("more_available") orelse return false;
     return candidate == .bool and candidate.bool;
 }
-
-
-

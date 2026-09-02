@@ -204,7 +204,6 @@ pub const missing_grok_credential_message = "fx needs a Grok subscription login 
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
-
 pub const Credential = struct {
     token: []u8,
     source: Source,
@@ -664,14 +663,6 @@ pub fn sourceRefreshable(source: Source) bool {
     return source == .fx_login or source == .chatgpt_subscription or source == .grok_subscription;
 }
 
-
-
-
-
-
-
-
-
 var stable_credential_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableCredentialTestEnviron() !*const std.process.Environ.Map {
@@ -762,16 +753,6 @@ const SecretStoreFixture = struct {
     }
 };
 
-
-
-
-
-
-
-
-
-
-
 /// A HOME holding an fx login whose session is expired and whose refresh token
 /// the issuer rejects, which is what an expired or revoked login looks like on
 /// disk. Paired with `oauth_transport.unavailable_provider`, the refresh fails.
@@ -813,4 +794,3 @@ const ExpiredFxLoginFixture = struct {
         self.tmp.cleanup();
     }
 };
-

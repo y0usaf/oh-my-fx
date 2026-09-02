@@ -75,5 +75,3 @@ pub fn signInCompletion(
             .{ .activate_source = .grok_subscription },
     };
 }
-
-

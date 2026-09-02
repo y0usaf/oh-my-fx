@@ -2445,22 +2445,6 @@ fn parseOptionalU32(value: std.json.Value) !?u32 {
     return @intCast(number);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn persistedResultForTest(call_id: []const u8, tool_name: []const u8) session.PersistedToolResult {
     return .{
         .tool_call_id = @constCast(call_id),
@@ -2537,8 +2521,6 @@ fn checkCurrentToolArgumentRepairAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqual(session.PersistedToolStatus.failure, step.tool_results[0].status);
     try std.testing.expectEqual(@as(usize, 1), step.tool_results[0].permission_feedback.len);
 }
-
-
 
 fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) !void {
     try std.testing.expectEqualStrings(expected.id, actual.id);
@@ -2706,14 +2688,6 @@ fn expectOptionalBytesEqual(expected: anytype, actual: @TypeOf(expected)) !void 
     try std.testing.expectEqual(expected != null, actual != null);
     if (expected) |bytes| try std.testing.expectEqualSlices(u8, bytes, actual.?);
 }
-
-
-
-
-
-
-
-
 
 fn fuzzWorkProvenanceHistoryTurn(_: void, smith: *std.testing.Smith) !void {
     var buffer: [4096]u8 = undefined;

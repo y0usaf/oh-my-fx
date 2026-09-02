@@ -277,7 +277,6 @@ noinline fn failEnvelopeDynamic(err: anyerror) anyerror!Envelope {
     return err;
 }
 
-
 pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
     if (line.len > event_frame_max_bytes) return failEnvelope(error.EventFrameTooLarge);
     if (line.len == 0 or line[line.len - 1] != '\n') {
@@ -449,7 +448,6 @@ inline fn failReduction(err: anytype) @TypeOf(err)!Reduction {
 noinline fn failReductionDynamic(err: anyerror) anyerror!Reduction {
     return err;
 }
-
 
 pub fn reduceJsonlFrom(
     alloc: Allocator,
@@ -1599,16 +1597,6 @@ fn sha256(bytes: []const u8) Digest {
     return hash;
 }
 
-
-
-
-
-
-
-
-
-
-
 fn singleEventTestState(id: []const u8) session_codec.DurableSessionState {
     return .{
         .id = @constCast(id),
@@ -1627,10 +1615,6 @@ fn singleEventTestState(id: []const u8) session_codec.DurableSessionState {
         .total_output_tokens = 2,
     };
 }
-
-
-
-
 
 fn checkHistoryProvenanceReplayAllocationFailures(alloc: Allocator) !void {
     var state: ?session_codec.DurableSessionState = null;
@@ -1675,10 +1659,6 @@ fn checkHistoryProvenanceReplayAllocationFailures(alloc: Allocator) !void {
         state.?.history[0].assistant.user.work_id.?,
     );
 }
-
-
-
-
 
 fn identifier(seed: u8) Identifier {
     var value: Identifier = undefined;

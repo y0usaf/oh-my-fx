@@ -239,26 +239,3 @@ fn splitTerminalScrollRows(
         .inline_advance_rows = inline_advance_rows,
     };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

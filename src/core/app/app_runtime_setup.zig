@@ -105,7 +105,3 @@ fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []cons
 const test_root_policy: skill_contract.RootPolicy = .{
     .managed_root_source = .global_fx,
 };
-
-
-
-

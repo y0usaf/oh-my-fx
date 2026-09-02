@@ -57,4 +57,3 @@ pub fn handleMatchesContentDigest(
     const expected = std.fmt.bytesToHex(digest[0..8].*, .lower);
     return std.mem.eql(u8, encoded, &expected);
 }
-

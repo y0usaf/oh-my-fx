@@ -3944,8 +3944,6 @@ pub const Runtime = struct {
     }
 };
 
-
-
 pub fn paint(
     alloc: Allocator,
     runtime: *Runtime,
@@ -5569,7 +5567,6 @@ fn adjacentVisibleTerminal(
     return null;
 }
 
-
 fn terminalSnapshotsEqual(
     current: ?terminal_projection.Snapshot,
     next: terminal_projection.Snapshot,
@@ -5634,75 +5631,6 @@ fn restoredScroll(
     const selected = visibleIndex(nodes, raw_index, archived);
     return selected -| (offset orelse return 0);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkChildRouteAllocationFailures(alloc: Allocator) !void {
     var runtime = Runtime{};
@@ -5811,9 +5739,6 @@ fn checkCheckpointTwoRouteAllocationFailures(alloc: Allocator) !void {
         }
     }
 }
-
-
-
 
 const TestAttachCandidate = struct {
     id: []const u8,

@@ -729,7 +729,3 @@ fn consumeStep(limits: Limits, steps: *usize) Error!void {
     steps.* = std.math.add(usize, steps.*, 1) catch return error.PatternLimitExceeded;
     if (steps.* > limits.max_steps) return error.PatternLimitExceeded;
 }
-
-
-
-

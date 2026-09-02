@@ -538,7 +538,6 @@ fn verifyOpenedSessionFile(
     }
 }
 
-
 /// Reports whether `name` exists directly under the session dir, mapping
 /// unsafe link/dir shapes to `error.SessionPathUnsafe`.
 pub fn entryExistsRelative(

@@ -394,9 +394,3 @@ fn testRuntime(clock: *MutableClock, max_converted_bytes: usize, max_entries: us
         .max_metadata_bytes = max_metadata_bytes,
     });
 }
-
-
-
-
-
-

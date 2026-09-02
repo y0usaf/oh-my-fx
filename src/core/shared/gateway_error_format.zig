@@ -351,12 +351,3 @@ fn trimBreakWhitespace(text: []const u8) []const u8 {
     while (index < text.len and (text[index] == ' ' or text[index] == '\t')) : (index += 1) {}
     return text[index..];
 }
-
-
-
-
-
-
-
-
-

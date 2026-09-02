@@ -30,5 +30,3 @@ pub fn joinVisibleSegments(
     if (later.len == 0) return alloc.dupe(u8, earlier);
     return std.fmt.allocPrint(alloc, "{s}\n{s}", .{ earlier, later });
 }
-
-

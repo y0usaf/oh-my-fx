@@ -222,9 +222,3 @@ pub fn gatewayHttpErrorDetail(
     try out.writer.writeAll("Provider rejected the prompt as too large. Latest local tool evidence remains in session history/result handles; no local tool actions were replayed.");
     return out.toOwnedSlice();
 }
-
-
-
-
-
-

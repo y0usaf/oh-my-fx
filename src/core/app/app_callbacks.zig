@@ -79,10 +79,6 @@ fn preparedDiffPayloadWithFullAllocator(
     );
 }
 
-
-
-
-
 pub fn Bindings(comptime App: type) type {
     return struct {
         pub fn agentRuntimeDeps(app: *App) agent_runtime.AgentRuntimeDeps {
@@ -1568,13 +1564,6 @@ const NoOverridePersistentApp = struct {
     }
 };
 
-
-
-
-
-
-
-
 const committed_preview_lines = [_]diff_mod.PreviewLine{
     .{
         .op = .deletion,
@@ -1605,15 +1594,3 @@ fn testCommittedFileHandoff() file_mutation.CommittedFileHandoff {
         },
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-

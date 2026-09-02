@@ -462,8 +462,6 @@ fn snapshotModelCatalogForView(
     return .{ .servers = servers };
 }
 
-
-
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.validateToolCall(context.toolContext(), arena, call);

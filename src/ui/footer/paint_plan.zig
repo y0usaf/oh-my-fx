@@ -171,7 +171,6 @@ pub noinline fn composerTopChromeRows() u16 {
     return 0;
 }
 
-
 fn plannerFooterReservedBaseRows(input: FooterPlannerInput) u16 {
     return footer_layout.reservedBaseRows(input.input_visible, input.composer_top_chrome_rows);
 }
@@ -1326,14 +1325,6 @@ fn expectFrameCellForeground(frame: *const footer_viewport.ComposedFooterFrame, 
     return error.TestUnexpectedResult;
 }
 
-
-
-
-
-
-
-
-
 fn expectGenericPickerSelectionAtRow(
     kind: input_presentation.PickerKind,
     selection_index: usize,
@@ -1419,13 +1410,3 @@ fn expectGenericPickerSelectionAtRow(
 fn expectGenericPickerSelectionAtBottom(kind: input_presentation.PickerKind) !void {
     try expectGenericPickerSelectionAtRow(kind, 5, 0, 5);
 }
-
-
-
-
-
-
-
-
-
-

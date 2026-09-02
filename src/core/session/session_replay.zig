@@ -163,7 +163,6 @@ noinline fn failExactReplayDynamic(err: anyerror) anyerror!ExactReplay {
     return err;
 }
 
-
 pub fn replayExactPosition(
     alloc: Allocator,
     file: std.Io.File,
@@ -367,8 +366,3 @@ fn checkRecoveryValidationAllocationFailures(
         try validateCommitPositionForRecovery(alloc, file, position),
     );
 }
-
-
-
-
-

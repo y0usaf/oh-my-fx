@@ -744,4 +744,3 @@ fn writeProvenanceSummary(
         else => try writer.writeAll(@tagName(source)),
     }
 }
-

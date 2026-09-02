@@ -117,7 +117,6 @@ fn decideLiveSessionTransition(
     };
 }
 
-
 fn nextImageIdForResumedHistory(
     alloc: Allocator,
     history: []const types.HistoryTurn,
@@ -169,7 +168,6 @@ pub fn shouldCreateResumeHandoff(state: ResumeHandoffState) bool {
         (!state.is_pristine or state.intent == .upgrade_requested) and
         !state.has_unresolved_degraded_tail;
 }
-
 
 /// Owns `session_id`; callers must release it with `deinit`.
 pub const ResumeHandoff = struct {
@@ -992,7 +990,6 @@ pub const Persistence = struct {
         self.* = undefined;
     }
 };
-
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -5456,13 +5453,6 @@ fn makeJsHostTestState(
     };
 }
 
-
-
-
-
-
-
-
 fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, workspace: []u8 } {
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
@@ -5591,15 +5581,6 @@ fn writeSessionFixture(
     );
 }
 
-
-
-
-
-
-
-
-
-
 const HandoffDegradedFailure = struct {
     fn hit(_: ?*anyopaque, point: session_log.Boundary) !void {
         if (point == .after_event_sync or
@@ -5614,43 +5595,6 @@ const HandoffDegradedFailure = struct {
         return .{ .boundary_fn = hit };
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
     const alloc = std.testing.allocator;
@@ -5748,15 +5692,6 @@ fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
     try std.testing.expectEqual(@as(usize, 1), artifacts.names.len);
 }
 
-
-
-
-
-
-
-
-
-
 const SnapshotOwnershipProbe = struct {
     transfers: usize = 0,
 
@@ -5778,28 +5713,6 @@ const SnapshotOwnershipProbe = struct {
         };
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn createHeldSessionPickerTask(
     generation: u64,
@@ -5851,10 +5764,6 @@ fn waitForSessionPickerPrewarm(app: *TestApp) !void {
     return error.TestExpectedEqual;
 }
 
-
-
-
-
 const ReconciliationOriginUsage = struct {
     replaced_provider: ?model_provider.ProviderId = null,
     replaced_source: ?types.CredentialSource = null,
@@ -5899,8 +5808,3 @@ const ReconciliationOriginApp = struct {
     selected_provider: model_provider.ProviderId,
     selected_model: std.ArrayList(u8) = .empty,
 };
-
-
-
-
-

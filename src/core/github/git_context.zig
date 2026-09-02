@@ -106,8 +106,3 @@ fn writeBody(writer: *std.Io.Writer, value: ?[]const u8, fallback: []const u8) !
     try writer.writeAll(body);
     if (body.len == 0 or body[body.len - 1] != '\n') try writer.writeByte('\n');
 }
-
-
-
-
-

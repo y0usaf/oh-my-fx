@@ -71,5 +71,3 @@ pub fn executePreparedCommand(
         },
     };
 }
-
-

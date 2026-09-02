@@ -294,6 +294,3 @@ fn failure(alloc: Allocator, message: []const u8) Allocator.Error!tool_dispatch.
 fn semanticFailure(alloc: Allocator, message: []const u8) Allocator.Error!tool_dispatch.ToolResult {
     return .{ .failure = try alloc.dupe(u8, message) };
 }
-
-
-

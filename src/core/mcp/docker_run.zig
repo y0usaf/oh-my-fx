@@ -166,5 +166,3 @@ fn readContainerId(alloc: Allocator, path: []const u8) ![]u8 {
     alloc.free(bytes);
     return owned;
 }
-
-

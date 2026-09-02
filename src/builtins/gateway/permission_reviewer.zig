@@ -429,12 +429,3 @@ fn testConfig(fake: *FakeStream, cancel_flag: ?*std.atomic.Value(bool)) GatewayC
         .stream_fn = FakeStream.execute,
     };
 }
-
-
-
-
-
-
-
-
-

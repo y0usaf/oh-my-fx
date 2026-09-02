@@ -146,4 +146,3 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
         else => {},
     }
 }
-

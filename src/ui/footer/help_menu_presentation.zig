@@ -288,8 +288,3 @@ const help_menu_test_specs = [_]command_specs.SlashSpec{
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
 };
 const help_menu_test_registry = command_specs.SlashRegistry{ .commands = help_menu_test_specs[0..] };
-
-
-
-
-

@@ -1013,7 +1013,6 @@ noinline fn failActionRequestDynamic(err: anyerror) anyerror!contracts.ActionReq
     return err;
 }
 
-
 fn buildAuthorizedRequest(
     arena: Allocator,
     input: *const Input,
@@ -1660,33 +1659,3 @@ fn closePresentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

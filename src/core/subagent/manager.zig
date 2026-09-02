@@ -151,7 +151,6 @@ pub fn latestWorkFailure(events: []const domain.Event) ?WorkFailure {
     return null;
 }
 
-
 pub const Inspection = struct {
     child_id: []u8,
     generation: u64,
@@ -4346,7 +4345,6 @@ fn targetAuthorizationDecision(
     return .unauthorized;
 }
 
-
 fn relationshipApprovalMatches(
     approval: communication.Approval,
     command: domain.RelationshipCommand,
@@ -5018,19 +5016,6 @@ fn clearCanonicalParentForTest(
     try store.save(alloc, record);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn seedCapacityPolicyLedger(
     alloc: Allocator,
     sessions: *session_store.Store,
@@ -5104,7 +5089,6 @@ fn admitCapacityPolicy(
     try store.save(alloc, ledger);
 }
 
-
 fn setupRunningIntervalWork(
     alloc: Allocator,
     env: *TestEnvironment,
@@ -5162,50 +5146,12 @@ fn setupRunningIntervalWork(
     try control.save(alloc, record);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn fuzzTreeCursor(_: void, smith: *std.testing.Smith) !void {
     var buffer: [4096]u8 = undefined;
     const len: usize = @intCast(smith.slice(&buffer));
     var parsed = parseTreeCursor(std.testing.allocator, buffer[0..len]) catch return;
     parsed.deinit(std.testing.allocator);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 noinline fn resumablePageContains(
     page: session_store.ResumableSessionPage,
@@ -5216,7 +5162,6 @@ noinline fn resumablePageContains(
     }
     return false;
 }
-
 
 const LockFailureClock = struct { now_ms: i64 = 0 };
 
@@ -5280,17 +5225,6 @@ const PublishCapture = struct {
         self.generation = record.generation;
     }
 };
-
-
-
-
-
-
-
-
-
-
-
 
 const ProcessMutation = union(enum) {
     send: struct {
@@ -5643,9 +5577,6 @@ fn runProcessMutationPair(
     };
 }
 
-
-
-
 const ProcessDeliveryRaceAction = union(enum) {
     reparent: []const u8,
     detach,
@@ -5857,6 +5788,3 @@ fn expectDeliveryProjectionAllocationCleanup(
     }
     try std.testing.expect(succeeded);
 }
-
-
-

@@ -1343,15 +1343,6 @@ fn formatDuration(buf: anytype, duration_ms: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "Unavailable";
 }
 
-
-
-
-
-
-
-
-
-
 fn testUsageTotals(tokens: u64, cost: f64) usage_report.Totals {
     return .{
         .total_tokens = tokens,
@@ -1364,7 +1355,3 @@ fn testUsageTotals(tokens: u64, cost: f64) usage_report.Totals {
         .total_cost = cost,
     };
 }
-
-
-
-

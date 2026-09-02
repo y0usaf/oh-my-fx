@@ -142,7 +142,3 @@ pub fn advance(state: State, owner: Owner, byte: u8) Transition {
         .step = .{ .scalar = .{ .owner = owner, .bytes = next.bytes, .len = next.len } },
     };
 }
-
-
-
-

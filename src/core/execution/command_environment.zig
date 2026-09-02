@@ -113,6 +113,3 @@ pub const Host = enum {
     native,
     workspace_clean,
 };
-
-
-

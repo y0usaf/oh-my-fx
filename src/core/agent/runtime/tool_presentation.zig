@@ -1422,23 +1422,6 @@ fn eligibleActionLabel(tool_name: []const u8) []const u8 {
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkProvisionalLifecycleAllocationFailures(alloc: Allocator) !void {
     var capture = ProvisionalStatusTestCapture{ .alloc = alloc, .retain_events = false };
     defer capture.deinit();
@@ -1449,14 +1432,3 @@ fn checkProvisionalLifecycleAllocationFailures(alloc: Allocator) !void {
     try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null);
     try std.testing.expect(statuses.has("read_1"));
 }
-
-
-
-
-
-
-
-
-
-
-

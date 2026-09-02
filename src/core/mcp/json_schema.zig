@@ -1464,7 +1464,6 @@ fn fuzzJsonSchema(_: void, smith: *std.testing.Smith) !void {
     };
 }
 
-
 fn checkValidationAllocationFailures(alloc: Allocator) !void {
     const result = try validateText(
         alloc,
@@ -1487,25 +1486,3 @@ fn checkDraft7AllocationFailures(alloc: Allocator) !void {
     );
     try std.testing.expect(result == .valid);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

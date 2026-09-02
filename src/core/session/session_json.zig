@@ -345,7 +345,6 @@ fn writeImageSnapshotLocatorJson(writer: *std.Io.Writer, value: ?[]const u8) !vo
     try std.json.Stringify.value(locator, .{}, writer);
 }
 
-
 fn writeStringArrayJson(writer: *std.Io.Writer, items: anytype) !void {
     try writer.writeByte('[');
     for (items, 0..) |item, i| {
@@ -955,7 +954,6 @@ fn parseOptionalLifecycleId(
     };
 }
 
-
 fn optionalU32(maybe_value: ?std.json.Value) !?u32 {
     const value = maybe_value orelse return error.InvalidSessionFormat;
     if (value == .null) return null;
@@ -1337,14 +1335,6 @@ fn parseOptionalStringArray(alloc: Allocator, maybe_value: ?std.json.Value) ![][
     return items;
 }
 
-
-
-
-
-
-
-
-
 const legacy_execution_memory_fixture =
     "{\"schema_version\":1,\"id\":\"execution-ownership\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
     "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
@@ -1374,15 +1364,6 @@ fn checkLegacyExecutionMemoryAllocationFailures(alloc: Allocator) !void {
         loaded.history[0].assistant.execution.tool_steps[0].tool_results[0].permission_feedback.len,
     );
 }
-
-
-
-
-
-
-
-
-
 
 fn legacySessionWithToolStep(
     alloc: Allocator,
@@ -1418,11 +1399,3 @@ fn checkLegacyToolArgumentRepairAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("{}", step.tool_calls[0].arguments_json);
     try std.testing.expectEqual(session.PersistedToolStatus.failure, step.tool_results[0].status);
 }
-
-
-
-
-
-
-
-

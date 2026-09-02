@@ -99,7 +99,6 @@ pub const OpenMode = enum {
 
 pub const CommitPosition = session_replay.CommitPosition;
 
-
 pub const FailedTailDisposition = enum {
     retry_expected_tail,
     rollback_before_adapter_continue,
@@ -989,7 +988,6 @@ pub inline fn failLoadedWritableSession(err: anytype) @TypeOf(err)!LoadedWritabl
 noinline fn failLoadedWritableSessionDynamic(err: anyerror) anyerror!LoadedWritableSession {
     return err;
 }
-
 
 pub const Root = struct {
     sessions: ?io_mod.VerifiedDir,
@@ -4616,7 +4614,6 @@ const TempRoot = struct {
     }
 };
 
-
 fn testState(alloc: Allocator, id: []const u8, updated_at_ms: i64) !session_codec.DurableSessionState {
     return .{
         .id = try alloc.dupe(u8, id),
@@ -4813,18 +4810,6 @@ fn capturePublicationBytesForTest(
     return .{ .events = events, .watermark = watermark, .intent = intent };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {
     return .{ .history_turn_committed = .{
         .conversation_language = state.conversation_language,
@@ -4833,43 +4818,3 @@ fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {
         .turn = state.history[state.history.len - 1],
     } };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

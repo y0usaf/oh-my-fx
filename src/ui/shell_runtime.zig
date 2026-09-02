@@ -333,7 +333,6 @@ fn failTmuxHistoryClearForTest(_: Allocator, _: []const u8) !void {
     return error.TestTmuxHistoryClearFailure;
 }
 
-
 pub fn detectSyncUpdatesEnabled(_: Allocator) bool {
     const override = io_mod.getenv("FX_SYNC_UPDATES");
 
@@ -536,8 +535,6 @@ fn vtimeIndex() usize {
     };
 }
 
-
-
 const TestPty = struct {
     master: std.posix.fd_t,
     slave: std.posix.fd_t,
@@ -574,7 +571,3 @@ const TestPty = struct {
 fn closeTestFd(fd: std.posix.fd_t) void {
     (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(io_mod.getIo());
 }
-
-
-
-

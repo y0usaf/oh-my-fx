@@ -1756,19 +1756,6 @@ fn expectNoStageFiles(root: []const u8) !void {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 const TestPreparedMutation = struct {
     input: file_mutation_contract.FileMutationInput,
     policy: PolicyEvaluatedFileTargets,
@@ -1836,13 +1823,6 @@ fn readTestFile(
     defer file.close(std.testing.io);
     return io_mod.readFileToEnd(alloc, &file, max_content_bytes + 1);
 }
-
-
-
-
-
-
-
 
 const CreatedParentReplacement = enum {
     none,
@@ -1986,15 +1966,3 @@ fn moveParentAfterFinalValidation(ctx: ?*anyopaque) anyerror!void {
     const state: *MoveParentTestState = @ptrCast(@alignCast(ctx.?));
     try moveParentForTest(state);
 }
-
-
-
-
-
-
-
-
-
-
-
-
