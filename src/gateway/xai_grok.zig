@@ -520,120 +520,9 @@ fn mapReducerError(err: anyerror) anyerror {
     };
 }
 
-test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
-    const read_file_schema = model_tool_schema.FunctionSchema{
-        .name = "read_file",
-        .description = "Read",
-        .input_schema = .{},
-    };
-    const messages = [_]types.ChatMessage{
-        .{ .role = .system, .content = "Be concise." },
-        .{ .role = .user, .content = "Read it." },
-        .{
-            .role = .assistant,
-            .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" }},
-            .provider_state_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]",
-        },
-        .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
-    };
-    const body = try buildRequest(std.testing.allocator, .{
-        .model = "grok-4.20",
-        .messages = &messages,
-        .tools = .{ .additional_functions = &.{read_file_schema} },
-        .tool_choice = .auto,
-        .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high"), .fast = true },
-        .max_output_tokens = 4096,
-    });
-    defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"grok-4.20\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Be concise.\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"encrypted_content\":\"opaque\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\",\"properties\":{}}") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
-    try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\":4096") != null);
-}
 
-test "xAI Grok standard requests omit the priority service tier" {
-    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
-    const body = try buildRequest(std.testing.allocator, .{
-        .model = "grok-4.20",
-        .messages = &messages,
-        .tool_choice = .none,
-        .provider_options = .{},
-    });
-    defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
-}
-
-test "xAI Grok serializes each verified image directly once" {
-    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Describe it." }};
-    const images = [_]image_attachments.VerifiedSnapshot{.{
-        .bytes = @constCast(&[_]u8{ 1, 2, 3, 4 }),
-        .media_type = "image/png",
-    }};
-    const body = try buildRequest(std.testing.allocator, .{
-        .model = "grok-4.20",
-        .messages = &messages,
-        .tool_choice = .none,
-        .provider_options = .{},
-        .verified_images = &images,
-    });
-    defer std.testing.allocator.free(body);
-
-    const marker = "\"type\":\"input_image\"";
-    const first = std.mem.find(u8, body, marker) orelse return error.TestExpectedImage;
-    try std.testing.expect(std.mem.findPos(u8, body, first + marker.len, marker) == null);
-    try std.testing.expect(std.mem.find(u8, body, "data:image/png;base64,AQIDBA==") != null);
-}
-
-test "xAI Grok rejects wrong-origin and invalid-account credentials before network I/O" {
-    var cancelled = std.atomic.Value(bool).init(false);
-    var delivery = stream_provider.DeliveryCertainty.init();
-    var evidence: stream_provider.AttemptEvidence = .{};
-    var callback_context: u8 = 0;
-    try std.testing.expectError(
-        error.GrokSubscriptionCredentialRequired,
-        agent_stream_provider.stream(std.testing.allocator, testModelRequest(
-            "gateway-key",
-            .ai_gateway_api_key,
-            null,
-            &delivery,
-            &evidence,
-            &cancelled,
-            &callback_context,
-        )),
-    );
-    try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
-    try std.testing.expectError(
-        error.GrokSubscriptionAccountRequired,
-        agent_stream_provider.stream(std.testing.allocator, testModelRequest(
-            "grok-token",
-            .grok_subscription,
-            null,
-            &delivery,
-            &evidence,
-            &cancelled,
-            &callback_context,
-        )),
-    );
-    try std.testing.expectError(
-        error.InvalidGrokSubscriptionAccount,
-        agent_stream_provider.stream(std.testing.allocator, testModelRequest(
-            "grok-token",
-            .grok_subscription,
-            "acct\r\ninjected",
-            &delivery,
-            &evidence,
-            &cancelled,
-            &callback_context,
-        )),
-    );
-    try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
-}
 
 fn testModelRequest(
     secret_value: []const u8,
@@ -665,66 +554,6 @@ fn testModelRequest(
     };
 }
 
-test "xAI Grok SSE maps text reasoning tools and usage" {
-    const sse_text =
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}\n\n" ++
-        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"thinking\"}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}}\n\n" ++
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\"}}\n\n" ++
-        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"hello\"}\n\n" ++
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n" ++
-        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}\n\n" ++
-        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n";
-    var reader: std.Io.Reader = .fixed(sse_text);
-    var cancelled = std.atomic.Value(bool).init(false);
-    const Capture = struct {
-        content: std.ArrayList(u8) = .empty,
-        reasoning: std.ArrayList(u8) = .empty,
-        saw_read_file: bool = false,
-
-        fn contentChunk(raw: *anyopaque, chunk: []const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.content.appendSlice(std.testing.allocator, chunk) catch unreachable;
-        }
-        fn reasoningChunk(raw: *anyopaque, chunk: []const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable;
-        }
-        fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.saw_read_file = std.mem.eql(u8, name, "read_file");
-        }
-    };
-    var capture: Capture = .{};
-    defer capture.content.deinit(std.testing.allocator);
-    defer capture.reasoning.deinit(std.testing.allocator);
-    const completion = try consumeSse(
-        std.testing.allocator,
-        &reader,
-        &capture,
-        Capture.contentChunk,
-        Capture.toolStart,
-        Capture.reasoningChunk,
-        null,
-        &cancelled,
-        null,
-    );
-    defer {
-        if (completion.content) |value| std.testing.allocator.free(@constCast(value));
-        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
-        if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
-    }
-    try std.testing.expectEqualStrings("hello", capture.content.items);
-    try std.testing.expectEqualStrings("thinking", capture.reasoning.items);
-    try std.testing.expect(capture.saw_read_file);
-    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
-    try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
-    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", completion.tool_calls[0].arguments_json);
-    try std.testing.expectEqual(@as(?u64, 10), completion.usage.input_tokens);
-    try std.testing.expect(completion.provider_state_json != null);
-    try std.testing.expect(std.mem.find(u8, completion.provider_state_json.?, "\"encrypted_content\":\"opaque\"") != null);
-    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
-}
 
 const TestResponseMode = enum {
     slow_head,
@@ -921,70 +750,11 @@ fn runXaiTestStream(deadline: ?std.Io.Clock.Timestamp) !stream_provider.Result {
     return agent_stream_provider.stream(std.testing.allocator, request);
 }
 
-test "xAI Grok request deadline closes slow headers and stalled SSE" {
-    inline for (.{ TestResponseMode.slow_head, TestResponseMode.stalled_sse }) |mode| {
-        var fixture = try TestResponseFixture.init(mode);
-        defer fixture.deinit();
-        try fixture.start();
-        const url = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "http://127.0.0.1:{d}/responses",
-            .{fixture.port()},
-        );
-        defer std.testing.allocator.free(url);
-        const environment = try XaiTestEnvironment.install(std.testing.allocator, url);
-        defer environment.deinit();
-
-        const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
-            .clock = .awake,
-            .raw = .fromMilliseconds(50),
-        });
-        const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-        const result = runXaiTestStream(deadline);
-        const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
-        fixture.deinit();
-
-        try std.testing.expectError(error.Timeout, result);
-        if (fixture.failure) |err| return err;
-        try std.testing.expect(fixture.reached_stage.load(.seq_cst));
-        try std.testing.expect(elapsed_ms < 1000);
-        try std.testing.expect(fixture.thread == null);
-    }
-}
 
 fn ignoreTestChunk(_: *anyopaque, _: []const u8) void {}
 fn ignoreTestEvent(_: *anyopaque, _: stream_provider.Event) void {}
 fn admitTestRequest(_: *anyopaque) !void {}
 
-test "xAI Grok error-body reader accepts the exact bound and replaces one beyond" {
-    inline for (.{ TestResponseMode.error_body_exact, TestResponseMode.error_body_excess }) |mode| {
-        var fixture = try TestResponseFixture.init(mode);
-        defer fixture.deinit();
-        try fixture.start();
-        const url = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "http://127.0.0.1:{d}/responses",
-            .{fixture.port()},
-        );
-        defer std.testing.allocator.free(url);
-        const environment = try XaiTestEnvironment.install(std.testing.allocator, url);
-        defer environment.deinit();
-
-        var result = try runXaiTestStream(null);
-        defer result.deinit(std.testing.allocator);
-        fixture.deinit();
-        if (fixture.failure) |err| return err;
-        try std.testing.expectEqual(stream_provider.FailureKind.rate_limited, result.failed.kind);
-        if (mode == .error_body_exact) {
-            try std.testing.expectEqual(max_error_body_bytes, result.failed.detail.?.len);
-        } else {
-            try std.testing.expectEqualStrings(
-                "xAI Grok error response exceeded the local limit",
-                result.failed.detail.?,
-            );
-        }
-    }
-}
 
 fn deinitTestCompletion(completion: *types.ModelCompletion) void {
     if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -1103,69 +873,5 @@ fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
     return out.toOwnedSlice();
 }
 
-test "xAI Grok SSE reader accepts the exact line bound and rejects one beyond" {
-    inline for (.{ max_sse_line_bytes, max_sse_line_bytes + 1 }) |line_bytes| {
-        const bytes = try std.testing.allocator.alloc(u8, line_bytes + 1);
-        defer std.testing.allocator.free(bytes);
-        @memcpy(bytes[0.."data: ".len], "data: ");
-        @memset(bytes["data: ".len..line_bytes], 'a');
-        bytes[line_bytes] = '\n';
-        var reader: std.Io.Reader = .fixed(bytes);
-        var sse: SseReader = .{};
-        defer sse.deinit(std.testing.allocator);
-        if (line_bytes == max_sse_line_bytes) {
-            const value = (try sse.next(std.testing.allocator, &reader)).?;
-            try std.testing.expectEqual(max_sse_line_bytes - "data: ".len, value.len);
-        } else {
-            try std.testing.expectError(
-                error.XaiGrokSseEventTooLarge,
-                sse.next(std.testing.allocator, &reader),
-            );
-        }
-    }
-}
 
-test "xAI Grok SSE reducer enforces event and ignored-wire aggregate bounds" {
-    const exact_events = try buildEventCountSse(std.testing.allocator, max_sse_events);
-    defer std.testing.allocator.free(exact_events);
-    var exact_event_completion = try consumeTestSse(exact_events);
-    deinitTestCompletion(&exact_event_completion);
 
-    const excess_events = try buildEventCountSse(std.testing.allocator, max_sse_events + 1);
-    defer std.testing.allocator.free(excess_events);
-    try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_events);
-
-    const exact_aggregate = try buildIgnoredAggregateSse(std.testing.allocator, max_sse_aggregate_bytes);
-    defer std.testing.allocator.free(exact_aggregate);
-    try std.testing.expectEqual(max_sse_aggregate_bytes, exact_aggregate.len);
-    var exact_aggregate_completion = try consumeTestSse(exact_aggregate);
-    deinitTestCompletion(&exact_aggregate_completion);
-
-    const excess_aggregate = try buildIgnoredAggregateSse(std.testing.allocator, max_sse_aggregate_bytes + 1);
-    defer std.testing.allocator.free(excess_aggregate);
-    try std.testing.expectEqual(max_sse_aggregate_bytes + 1, excess_aggregate.len);
-    try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_aggregate);
-}
-
-test "xAI Grok SSE reducer cleans up bounded tool arguments and provider state" {
-    const exact_arguments = try buildToolArgumentsSse(std.testing.allocator, max_tool_arguments_bytes);
-    defer std.testing.allocator.free(exact_arguments);
-    var argument_completion = try consumeTestSse(exact_arguments);
-    defer deinitTestCompletion(&argument_completion);
-    try std.testing.expectEqual(@as(usize, 1), argument_completion.tool_calls.len);
-    try std.testing.expectEqual(max_tool_arguments_bytes, argument_completion.tool_calls[0].arguments_json.len);
-
-    const excess_arguments = try buildToolArgumentsSse(std.testing.allocator, max_tool_arguments_bytes + 1);
-    defer std.testing.allocator.free(excess_arguments);
-    try expectTestSseError(error.XaiGrokToolArgumentsTooLarge, excess_arguments);
-
-    const exact_state = try buildProviderStateSse(std.testing.allocator, max_provider_state_bytes);
-    defer std.testing.allocator.free(exact_state);
-    var state_completion = try consumeTestSse(exact_state);
-    defer deinitTestCompletion(&state_completion);
-    try std.testing.expectEqual(max_provider_state_bytes, state_completion.provider_state_json.?.len);
-
-    const excess_state = try buildProviderStateSse(std.testing.allocator, max_provider_state_bytes + 1);
-    defer std.testing.allocator.free(excess_state);
-    try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_state);
-}

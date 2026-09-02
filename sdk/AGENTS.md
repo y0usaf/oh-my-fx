@@ -11,8 +11,8 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 | Concern | Source of truth |
 | --- | --- |
 | Shared loader, host imports, adapters, and public JavaScript exports | `sdk/fx-sdk.js` |
-| Headless ACP composition for `fx-core.wasm` | `src/wasm_core_main.zig` |
-| Interactive terminal entry point for `fx-term.wasm` | `src/wasm_term_main.zig` and `runWasmTerminal` in `src/main.zig` |
+| Headless ACP composition for `omfx-core.wasm` | `src/wasm_core_main.zig` |
+| Interactive terminal entry point for `omfx-term.wasm` | `src/wasm_term_main.zig` and `runWasmTerminal` in `src/main.zig` |
 | Native and WebAssembly capability policy | `src/core/hosts/runtime_profile.zig` |
 | Host-backed terminal session persistence | `src/core/app/app_session_runtime.zig` and `sdk/fx-sdk.js` |
 | Browser workspace contract and `terminal.exec` bridge | `src/core/hosts/js_host_workspace.zig` and `src/tools/terminal/browser_terminal.zig` |
@@ -27,7 +27,7 @@ Do not treat the demos or this file as the implementation contract. When prose a
 ## Preserve these invariants
 
 - Keep `sdk/fx-sdk.js` a dependency-free ECMAScript module. A bundler, framework, or runtime package must not become necessary to load the SDK.
-- Keep the core and terminal surfaces distinct. `fx-core.wasm` starts the headless ACP server; `fx-term.wasm` starts the interactive terminal. Shared loader changes must be validated against both.
+- Keep the core and terminal surfaces distinct. `omfx-core.wasm` starts the headless ACP server; `omfx-term.wasm` starts the interactive terminal. Shared loader changes must be validated against both.
 - Detect JavaScript Promise Integration (JSPI) by capability through `supportsJspi()`. Do not replace feature detection with browser or version sniffing. Keep loader errors, demo fallback states, and the compatibility statement in `sdk/README.md` consistent.
 - Treat JavaScript host stores as durable contracts. Session and OAuth snapshots are opaque bytes with optimistic revisions. Preserve `FX_SESSION_REVISION_CONFLICT` and `FX_OAUTH_SESSION_REVISION_CONFLICT`. Persist configuration only after fx accepts it, and do not collapse prompt-history outcomes into generic success.
 - Preserve cancellation and lifecycle behavior. Fetch cancellation must reach the host `AbortSignal`; terminal subscriptions must be released exactly once; `abort()` must settle `exited` and must not leave input or resize listeners attached.

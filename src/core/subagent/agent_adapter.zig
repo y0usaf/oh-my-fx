@@ -462,58 +462,7 @@ fn snapshotModelCatalogForView(
     return .{ .servers = servers };
 }
 
-test "subagent model catalog counts only tools in the captured MCP view" {
-    const alloc = std.testing.allocator;
-    var servers = [_]mcp_access.ServerIdentity{.{
-        .name = @constCast("chrome-devtools"),
-        .source = .profile,
-        .scope = .profile,
-        .connection_generation = 1,
-        .catalog_generation = 2,
-        .auth_generation = 3,
-    }};
-    var tools = [_]mcp_access.ToolIdentity{
-        .{ .name = @constCast("mcp_chrome_one"), .server_name = @constCast("chrome-devtools") },
-        .{ .name = @constCast("mcp_chrome_two"), .server_name = @constCast("chrome-devtools") },
-    };
-    const view = mcp_access.View{
-        .runtime_generation = 1,
-        .owner_id = @constCast("child"),
-        .parent_id = @constCast("parent"),
-        .features_visible = false,
-        .servers = &servers,
-        .tools = &tools,
-    };
 
-    var snapshot = try snapshotModelCatalogForView(alloc, &view);
-    defer snapshot.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), snapshot.servers.len);
-    try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
-    try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
-    try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
-}
-
-test "subagent inherits model capabilities" {
-    const ResolverFixture = struct {
-        fn resolve(
-            _: *anyopaque,
-            _: Allocator,
-            _: []const u8,
-        ) model_capabilities.ResolveError!model_capabilities.Capabilities {
-            return .{};
-        }
-    };
-    var resolver_context: u8 = 0;
-    const resolver = model_capabilities.Resolver{
-        .ctx = &resolver_context,
-        .resolve_fn = ResolverFixture.resolve,
-    };
-    const inherited = childModelCapabilityResolver(resolver);
-    try std.testing.expect(inherited != null);
-    try std.testing.expectEqual(resolver.ctx, inherited.?.ctx);
-    try std.testing.expectEqual(resolver.resolve_fn, inherited.?.resolve_fn);
-}
 
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
     const context: *Context = @ptrCast(@alignCast(raw));

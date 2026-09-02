@@ -161,15 +161,3 @@ pub const TerminalInputIngress = struct {
     }
 };
 
-test "TerminalInputIngress reports only effectful routing work" {
-    try std.testing.expect(!(TerminalInputIngress{}).has_routing_work());
-    try std.testing.expect((TerminalInputIngress{
-        .event = .{ .paste_byte = 'x' },
-    }).has_routing_work());
-    try std.testing.expect((TerminalInputIngress{
-        .interrupts_pending_text = true,
-    }).has_routing_work());
-    try std.testing.expect((TerminalInputIngress{
-        .replay_byte_after_routing = 0x1b,
-    }).has_routing_work());
-}

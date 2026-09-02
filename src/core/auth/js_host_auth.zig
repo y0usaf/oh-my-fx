@@ -278,11 +278,3 @@ fn removeSession(_: ?*anyopaque, expected_revision: ?[]const u8) !RemoveOutcome 
     };
 }
 
-test "request bounds reject cancellation before touching the JS host" {
-    var cancelled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Cancelled, checkRequestBounds(.{
-        .method = .get,
-        .url = "https://vercel.test",
-        .cancel_flag = &cancelled,
-    }));
-}

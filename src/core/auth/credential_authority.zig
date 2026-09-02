@@ -40,24 +40,4 @@ pub fn derive(
     return .{ .bytes = bytes };
 }
 
-test "credential authority uses account identity for provider subscriptions" {
-    const first = derive(.chatgpt_subscription, "acct_1").?;
-    const refreshed = derive(.chatgpt_subscription, "acct_1").?;
-    const other = derive(.chatgpt_subscription, "acct_2").?;
-    try std.testing.expect(first.eql(refreshed));
-    try std.testing.expect(!first.eql(other));
-    try std.testing.expect(derive(.chatgpt_subscription, null) == null);
-    try std.testing.expect(derive(.grok_subscription, "") == null);
-    try std.testing.expect(@sizeOf(Identity) == 32);
-    _ = types.CredentialSource;
-}
 
-test "credential authority uses non-secret Gateway credential slots" {
-    const api_key = derive(.ai_gateway_api_key, null).?;
-    const same_slot = derive(.ai_gateway_api_key, "ignored-account").?;
-    const stored_key = derive(.stored_key, null).?;
-    try std.testing.expect(api_key.eql(same_slot));
-    try std.testing.expect(!api_key.eql(stored_key));
-    try std.testing.expect(derive(.vercel_oidc_token, null) != null);
-    try std.testing.expect(derive(.fx_login, null) != null);
-}

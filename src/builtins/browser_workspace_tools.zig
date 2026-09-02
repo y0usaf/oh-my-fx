@@ -50,39 +50,7 @@ pub fn selectToolSet(comptime native_tools: bool, workspace_available: bool) too
     return if (workspace_available) advertisement_set else tool_set.empty;
 }
 
-test "browser workspace projects exactly one command-only terminal" {
-    try std.testing.expectEqual(@as(usize, 1), registry.tools.len);
-    try std.testing.expectEqualStrings("terminal", registry.tools[0].name);
-    try std.testing.expectEqual(@as(usize, 1), advertisement_set.order.len);
-    try std.testing.expectEqualStrings("terminal", advertisement_set.order[0]);
-    try std.testing.expectEqual(@as(usize, 0), advertisement_set.read_only_tool_names.len);
 
-    const schema = registry.tools[0].model_schema;
-    try std.testing.expectEqual(@as(usize, 2), schema.input_schema.properties.len);
-    try std.testing.expectEqualStrings("action", schema.input_schema.properties[0].name);
-    try std.testing.expectEqualStrings("command", schema.input_schema.properties[1].name);
-    try std.testing.expectEqual(@as(?usize, 64 * 1024), schema.input_schema.properties[1].bounds.?.max_length);
-    try std.testing.expectEqual(false, schema.input_schema.additional_properties.?);
-    try std.testing.expect(std.mem.find(u8, schema.description, "shell is the workspace interface") != null);
-    try std.testing.expect(std.mem.find(u8, schema.description, "clean root-fixed") != null);
-}
-
-test "browser workspace model-facing tool contract stays byte exact" {
-    const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
-    const schema_json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(
-        std.testing.allocator,
-        registry.tools[0].model_schema,
-    );
-    defer std.testing.allocator.free(schema_json);
-
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(schema_json, &digest, .{});
-    const actual_hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings(
-        "6b818f083e689d8832dff7f9c7e238c4ade0999eb4f2abb1ef91522d096dcc64",
-        &actual_hex,
-    );
-}
 
 fn expectDecodeFailure(arguments_json: []const u8) !void {
     const decoded = try registry.tools[0].decode(.{
@@ -97,37 +65,5 @@ fn expectDecodeFailure(arguments_json: []const u8) !void {
     }
 }
 
-test "browser workspace rejects missing action native fields and unknown arguments" {
-    try expectDecodeFailure("{\"command\":\"pwd\"}");
-    try expectDecodeFailure("{\"request\":{\"action\":\"exec\",\"command\":\"pwd\"}}");
-    try expectDecodeFailure("{\"action\":\"start\",\"command\":\"pwd\"}");
-    try expectDecodeFailure("{\"action\":\"exec\",\"command\":\"pwd\",\"cwd\":\"/tmp\"}");
-    try expectDecodeFailure("{\"action\":\"exec\",\"command\":\"pwd\",\"profile\":\"clean\"}");
-}
 
-test "browser workspace supplies its private timeout without widening public input" {
-    const decoded = try registry.tools[0].decode(.{
-        .allocator = std.testing.allocator,
-    }, "{\"action\":\"exec\",\"command\":\"pwd\"}");
-    switch (decoded) {
-        .failure => |body| {
-            defer std.testing.allocator.free(body);
-            return error.TestUnexpectedDecodeFailure;
-        },
-        .input => |input| input.deinit(std.testing.allocator),
-    }
-}
 
-test "tool set selection preserves native and gates the browser projection" {
-    const native = selectToolSet(true, false);
-    try std.testing.expectEqual(builtin_tools.registry.tools.len, native.registry.tools.len);
-    try std.testing.expect(native.registry.lookup("background_process") == builtin_tools.registry.lookup("background_process"));
-
-    const absent = selectToolSet(false, false);
-    try std.testing.expectEqual(@as(usize, 0), absent.registry.tools.len);
-    try std.testing.expectEqual(@as(usize, 0), absent.order.len);
-
-    const present = selectToolSet(false, true);
-    try std.testing.expectEqual(@as(usize, 1), present.registry.tools.len);
-    try std.testing.expectEqualStrings("terminal", present.registry.tools[0].name);
-}

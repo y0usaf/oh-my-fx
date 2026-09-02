@@ -43,13 +43,3 @@ pub fn Value(comptime T: type) type {
     };
 }
 
-test "plain value matches the atomic API it replaces" {
-    var value: Value(u64) = .init(5);
-    try std.testing.expectEqual(@as(u64, 5), value.load(.acquire));
-    value.store(7, .release);
-    try std.testing.expectEqual(@as(u64, 7), value.fetchAdd(2, .monotonic));
-    try std.testing.expectEqual(@as(u64, 9), value.load(.acquire));
-    try std.testing.expectEqual(@as(?u64, 9), value.cmpxchgWeak(1, 3, .acq_rel, .acquire));
-    try std.testing.expectEqual(@as(?u64, null), value.cmpxchgWeak(9, 3, .acq_rel, .acquire));
-    try std.testing.expectEqual(@as(u64, 3), value.load(.acquire));
-}

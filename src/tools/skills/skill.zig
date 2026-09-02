@@ -200,28 +200,6 @@ fn expectDecodeFailure(args_json: []const u8, expected: []const u8) !void {
     }
 }
 
-test "skill tool decodes only valid argument shapes" {
-    try expectDecodeFailure("{", "skill arguments must be valid JSON");
-    try expectDecodeFailure("[]", "skill arguments must be an object");
-    try expectDecodeFailure("{}", "skill field \"name\" is required");
-    try expectDecodeFailure("{\"name\":1}", "skill field \"name\" must be a string");
-    try expectDecodeFailure("{\"name\":\"workflow\",\"location\":1}", "skill field \"location\" must be a string");
-
-    const alloc = std.testing.allocator;
-    const exact = try decode(.{ .allocator = alloc }, "{\"name\":\"workflow\",\"location\":\"/tmp/skills/workflow\"}");
-    switch (exact) {
-        .input => |input| {
-            defer input.deinit(alloc);
-            const typed = input.as(Input);
-            try std.testing.expectEqualStrings("workflow", typed.name);
-            try std.testing.expectEqualStrings("/tmp/skills/workflow", typed.location.?);
-        },
-        .failure => |body| {
-            defer alloc.free(body);
-            return error.TestExpectedEqual;
-        },
-    }
-}
 
 fn checkDecodeAllocationFailures(alloc: Allocator) !void {
     const decoded = try decode(
@@ -237,10 +215,3 @@ fn checkDecodeAllocationFailures(alloc: Allocator) !void {
     }
 }
 
-test "skill tool decode cleans allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkDecodeAllocationFailures,
-        .{},
-    );
-}

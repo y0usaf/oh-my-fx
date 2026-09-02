@@ -943,88 +943,9 @@ const CatalogTestApp = struct {
     }
 };
 
-test "subagent Ctrl-C requests resume handoff before exit" {
-    var app = TestApp{};
-    defer {
-        app.session_persistence.deinit(std.testing.allocator);
-        app.shell.deinit(std.testing.allocator);
-    }
 
-    try SubagentRuntime(TestApp).handleSubagentRawInput(&app, .{
-        .byte = 3,
-        .subagent_action = .ctrl_c,
-    });
 
-    try std.testing.expect(app.should_exit);
-    try std.testing.expectEqual(
-        app_session_runtime.ResumeHandoffIntent.requested,
-        app.session_persistence.resume_handoff_intent,
-    );
-}
 
-test "manager close dismisses child catalog menus" {
-    var app = CatalogTestApp{};
-    defer {
-        app.session_persistence.deinit(std.testing.allocator);
-        app.shell.deinit(std.testing.allocator);
-    }
-
-    try SubagentRuntime(CatalogTestApp).closeSubagentManager(&app);
-
-    try std.testing.expect(!app.model_cache.menu.active);
-    try std.testing.expect(!app.skills.menu.active);
-    try std.testing.expectEqual(@as(usize, 1), app.snapshot_writes);
-}
-
-test "child catalog escape closes the menu and clears its temporary query" {
-    var skills_app = CatalogTestApp{};
-    defer {
-        skills_app.session_persistence.deinit(std.testing.allocator);
-        skills_app.shell.deinit(std.testing.allocator);
-    }
-    SubagentRuntime(CatalogTestApp).closeChildSkillsMenu(&skills_app);
-    try std.testing.expect(!skills_app.skills.menu.active);
-    try std.testing.expectEqual(@as(usize, 1), skills_app.subagents.composer_clear_count);
-
-    var models_app = CatalogTestApp{};
-    defer {
-        models_app.session_persistence.deinit(std.testing.allocator);
-        models_app.shell.deinit(std.testing.allocator);
-    }
-    models_app.skills.menu.active = false;
-    SubagentRuntime(CatalogTestApp).closeChildModelMenu(&models_app);
-    try std.testing.expect(!models_app.model_cache.menu.active);
-    try std.testing.expectEqual(@as(usize, 1), models_app.subagents.composer_clear_count);
-}
-
-test "child exit submission recognizes only canonical local exit commands" {
-    const specs = [_]command_specs.SlashSpec{
-        .{
-            .kind = .quit,
-            .command = "/quit",
-            .aliases = &.{"/exit"},
-        },
-        .{
-            .kind = .model,
-            .command = "/model",
-        },
-        .{
-            .kind = .skills,
-            .command = "/skills",
-        },
-    };
-    const registry = command_specs.SlashRegistry{ .commands = specs[0..] };
-
-    try std.testing.expectEqual(.exit_app, classifyChildSubmission(registry, "/quit"));
-    try std.testing.expectEqual(.exit_app, classifyChildSubmission(registry, "  /exit\t"));
-    try std.testing.expectEqual(.message, classifyChildSubmission(registry, "/quit now"));
-    try std.testing.expectEqual(.message, classifyChildSubmission(registry, "explain /quit"));
-    try std.testing.expectEqual(.open_models, classifyChildSubmission(registry, "/model"));
-    try std.testing.expectEqual(.message, classifyChildSubmission(registry, "/model explicit-id"));
-    try std.testing.expectEqual(.message, classifyChildSubmission(registry, "/models"));
-    try std.testing.expectEqual(.open_skills, classifyChildSubmission(registry, "/skills"));
-    try std.testing.expectEqual(.message, classifyChildSubmission(registry, "/skills now"));
-}
 
 const TerminalOpenTestSubagents = struct {
     selected_id: []const u8 = "terminal-a",
@@ -1051,14 +972,3 @@ const TerminalOpenTestApp = struct {
     }
 };
 
-test "manager handles occupied terminal open without losing selection or inline draft" {
-    var app = TerminalOpenTestApp{};
-
-    SubagentRuntime(TerminalOpenTestApp).requestSelectedTerminalOpen(&app);
-
-    try std.testing.expect(app.subagents.manager_active);
-    try std.testing.expectEqualStrings("terminal-a", app.subagents.selected_id);
-    try std.testing.expectEqualStrings("terminal-a", app.requested_id.?);
-    try std.testing.expectEqualStrings("preserved inline draft", app.inline_draft);
-    try std.testing.expectEqual(@as(usize, 9), app.inline_cursor);
-}

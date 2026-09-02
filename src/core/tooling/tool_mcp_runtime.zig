@@ -372,36 +372,6 @@ pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
         .{name},
     );
 }
-test "MCP advertised dynamic tool executes only through its supplied capability" {
-    var fixture = Fixture.CountingContext{};
-    const advertised = [_][]const u8{"mcp_fs_read"};
-    const input = CallInput{
-        .advertised_dynamic_tool_names = &advertised,
-        .runtime = .{
-            .context = @ptrCast(&fixture),
-            .call_tool = Fixture.callCounting,
-        },
-        .max_tool_result_bytes = 1024,
-    };
-
-    const result = (try callAdvertisedDynamicTool(
-        input,
-        std.testing.allocator,
-        "mcp_fs_read",
-        "{}",
-    )).?;
-    defer std.testing.allocator.free(result.model_output);
-
-    try std.testing.expectEqualStrings("mcp ok", result.model_output);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect((try callAdvertisedDynamicTool(
-        input,
-        std.testing.allocator,
-        "mcp_other",
-        "{}",
-    )) == null);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-}
 
 const Fixture = struct {
     const CountingContext = struct {

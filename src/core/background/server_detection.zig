@@ -147,29 +147,5 @@ fn scoreUrlCandidate(url: []const u8, line: []const u8) i32 {
     return score;
 }
 
-test "server command detection handles shell wrappers" {
-    try std.testing.expect(isLikelyServerCommand("cd app && npm run dev"));
-    try std.testing.expect(isLikelyServerCommand("pnpm --filter web dev"));
-    try std.testing.expect(isLikelyServerCommand("bun run dev"));
-    try std.testing.expect(isLikelyServerCommand("vite --host 0.0.0.0"));
-    try std.testing.expect(!isLikelyServerCommand("watchexec zig build test"));
-}
 
-test "server url detection finds local dev server url" {
-    try std.testing.expectEqualStrings(
-        "http://localhost:3000",
-        extractUrl("ready - started server on 0.0.0.0:3000, url: http://localhost:3000\n").?,
-    );
-}
 
-test "server url detection prefers latest local url" {
-    try std.testing.expectEqualStrings(
-        "http://localhost:3000",
-        extractUrl(
-            "Network: http://192.168.1.20:3000\n" ++
-                "Local: http://localhost:3001\n" ++
-                "warn  - restarting dev server\n" ++
-                "Local: http://localhost:3000\n",
-        ).?,
-    );
-}

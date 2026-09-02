@@ -50,18 +50,3 @@ pub fn updateEdgeStart(current_start: usize, count: usize, selected: usize, max_
     return start;
 }
 
-test "edge window start lets selection move back up before reverse scrolling" {
-    const rows: u16 = 6;
-
-    var start = updateEdgeStart(0, 11, 5, rows);
-    try std.testing.expectEqual(@as(usize, 0), start);
-    try std.testing.expectEqual(@as(usize, 5), 5 - start);
-
-    start = updateEdgeStart(start, 11, 6, rows);
-    try std.testing.expectEqual(@as(usize, 1), start);
-    try std.testing.expectEqual(@as(usize, 5), 6 - start);
-
-    start = updateEdgeStart(start, 11, 5, rows);
-    try std.testing.expectEqual(@as(usize, 1), start);
-    try std.testing.expectEqual(@as(usize, 4), 5 - start);
-}

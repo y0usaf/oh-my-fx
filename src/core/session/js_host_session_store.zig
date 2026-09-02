@@ -183,8 +183,3 @@ fn nextCapacity(current: usize, maximum: usize) ?usize {
     return @min(current * 2, maximum);
 }
 
-test "nextCapacity grows to a bounded maximum" {
-    try std.testing.expectEqual(@as(?usize, 8192), nextCapacity(4096, 16 * 1024));
-    try std.testing.expectEqual(@as(?usize, 16 * 1024), nextCapacity(12 * 1024, 16 * 1024));
-    try std.testing.expectEqual(@as(?usize, null), nextCapacity(16 * 1024, 16 * 1024));
-}

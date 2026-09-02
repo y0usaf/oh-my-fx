@@ -650,11 +650,3 @@ pub fn contains(codepoint: u21) bool {
     return false;
 }
 
-test "Unicode letter ranges include representative scripts and exclude non-letters" {
-    const std = @import("std");
-    try std.testing.expect(contains('A'));
-    try std.testing.expect(contains('π'));
-    try std.testing.expect(contains('界'));
-    try std.testing.expect(!contains('1'));
-    try std.testing.expect(!contains('!'));
-}

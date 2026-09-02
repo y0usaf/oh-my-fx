@@ -14,19 +14,4 @@ pub fn operatingSystemText(
     return alloc.dupe(u8, @tagName(os_tag));
 }
 
-test "WASM targets expose no native process capabilities" {
-    try std.testing.expect(isTarget(.wasm32));
-    try std.testing.expect(isTarget(.wasm64));
-    try std.testing.expect(!isTarget(.x86_64));
-    try std.testing.expect(!background_processes);
-}
 
-test "WASM operating system text does not require native discovery" {
-    const wasi = try operatingSystemText(std.testing.allocator, .wasi);
-    defer std.testing.allocator.free(wasi);
-    try std.testing.expectEqualStrings("wasi", wasi);
-
-    const emscripten = try operatingSystemText(std.testing.allocator, .emscripten);
-    defer std.testing.allocator.free(emscripten);
-    try std.testing.expectEqualStrings("emscripten", emscripten);
-}

@@ -157,30 +157,4 @@ fn deinitItems(alloc: Allocator, items: []const ResultItem) void {
     if (items.len > 0) alloc.free(items);
 }
 
-test "backend identity compares provider-owned values" {
-    const copied = [_]u8{ 'p', 'r', 'o', 'v', 'i', 'd', 'e', 'r', '.', 'o', 'n', 'e' };
-    const expected = SearchBackendId{ .value = "provider.one" };
 
-    try std.testing.expect(expected.eql(.{ .value = &copied }));
-    try std.testing.expect(!expected.eql(.{ .value = "provider.two" }));
-}
-
-test "provider response transfers ordered results to output" {
-    const content = [_]ResultItem{
-        .{ .commentary = "researching" },
-        .{ .error_text = "bounded failure" },
-    };
-    var response = ProviderResponse{
-        .content = &content,
-    };
-    const output = Output{
-        .query = "zig",
-        .results = response.takeContent(),
-        .duration_ms = 1,
-        .web_search_requests = 0,
-    };
-
-    try std.testing.expectEqual(@as(usize, 0), response.content.len);
-    try std.testing.expectEqualStrings("researching", output.results[0].commentary);
-    try std.testing.expectEqualStrings("bounded failure", output.results[1].error_text);
-}

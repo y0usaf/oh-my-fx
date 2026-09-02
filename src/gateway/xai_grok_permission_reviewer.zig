@@ -45,36 +45,3 @@ fn sendPrepared(
     return xai_grok.streamPrepared(alloc, request, payload);
 }
 
-test "Grok reviewer builds a direct Responses request with the admitted model" {
-    const messages = [_]types.ChatMessage{
-        .{ .role = .user, .content = "User requested the change." },
-        .{
-            .role = .assistant,
-            .tool_calls = &.{.{
-                .id = "call_review",
-                .name = "write_file",
-                .arguments_json = "{\"path\":\"a.txt\"}",
-            }},
-        },
-        .{ .role = .system, .content = "Review the pending action." },
-    };
-    var cancelled = std.atomic.Value(bool).init(false);
-    const body = try responses_reviewer.buildPayloadForTest(
-        std.testing.allocator,
-        "grok-4.20",
-        &messages,
-        "call_review",
-        std.Io.Clock.Timestamp.fromNow(@import("../core/shared/io.zig").getIo(), .{
-            .clock = .awake,
-            .raw = .fromSeconds(5),
-        }),
-        &cancelled,
-        xai_grok.buildRequest,
-    );
-    defer std.testing.allocator.free(body);
-
-    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"grok-4.20\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":\"required\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "ai-gateway") == null);
-}

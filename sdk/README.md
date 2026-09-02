@@ -20,8 +20,8 @@ Requirements:
 The package includes:
 
 - Native Node addons for Linux and macOS on x64 and arm64
-- `fx-core.wasm` for headless agents
-- `fx-term.wasm` for interactive terminals
+- `omfx-core.wasm` for headless agents
+- `omfx-term.wasm` for interactive terminals
 - A dependency-free JavaScript host layer
 
 ## Exports
@@ -160,7 +160,7 @@ for await (const update of turn) {
 }
 ```
 
-The browser entry point resolves `fx-core.wasm` and `fx-term.wasm` relative to
+The browser entry point resolves `omfx-core.wasm` and `omfx-term.wasm` relative to
 the installed package. Pass `wasm` explicitly to provide a URL, `Response`,
 `ArrayBuffer`, typed array, or precompiled `WebAssembly.Module`.
 

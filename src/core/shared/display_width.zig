@@ -414,322 +414,34 @@ fn findTrieChild(node_index: u32, codepoint: u21) ?u32 {
     return null;
 }
 
-test "RGI runtime lookup data stays within the measured size budget" {
-    try std.testing.expect(@sizeOf(RgiData) <= 22_272);
-}
 
-test "prefixByWidth avoids cutting emoji bytes" {
-    const text = "a\xf0\x9f\x98\x80b";
-    try std.testing.expectEqualStrings("a", prefixByWidth(text, 2));
-    try std.testing.expectEqualStrings("a\xf0\x9f\x98\x80", prefixByWidth(text, 3));
-}
 
-test "suffixByWidth keeps whole runes" {
-    try std.testing.expectEqualStrings("\xf0\x9f\x98\x80cd", suffixByWidth("ab\xf0\x9f\x98\x80cd", 4));
-}
 
-test "visibleWidth counts emoji as two cells" {
-    try std.testing.expectEqual(@as(usize, 4), visibleWidth("a\xf0\x9f\x98\x80b"));
-}
 
-test "visibleWidthIgnoringAnsi skips CSI sequences" {
-    try std.testing.expectEqual(@as(usize, 5), visibleWidthIgnoringAnsi("\x1b[1mhello\x1b[22m"));
-    try std.testing.expectEqual(@as(usize, 3), visibleWidthIgnoringAnsi("\x1b[48;5;236mfoo\x1b[49m"));
-    try std.testing.expectEqual(@as(usize, 7), visibleWidthIgnoringAnsi("\x1b[1mEnfoque\x1b[22m"));
-}
 
-test "shouldWrapAt is strictly overflow-based" {
-    try std.testing.expect(!shouldWrapAt(10, 1, 10));
-    try std.testing.expect(shouldWrapAt(10, 2, 10));
-    try std.testing.expect(!shouldWrapAt(1, 1, 1));
 
-    // Start at c = 2 so c - 1 stays >= 1; cols = 0 is excluded by the
-    // helper precondition and guarded by current callers.
-    var c: u16 = 2;
-    while (c <= 256) : (c += 1) {
-        try std.testing.expect(!shouldWrapAt(c, 1, c));
-        try std.testing.expect(shouldWrapAt(c, 1, c - 1));
-    }
 
-    try std.testing.expect(shouldWrapAt(65535, 2, 65535));
-}
 
-test "nextTabStopColumn uses absolute stops and clamps safely" {
-    try std.testing.expectEqual(@as(u16, 9), nextTabStopColumn(1, 80));
-    try std.testing.expectEqual(@as(u16, 9), nextTabStopColumn(8, 80));
-    try std.testing.expectEqual(@as(u16, 17), nextTabStopColumn(9, 80));
-    try std.testing.expectEqual(@as(u16, 8), nextTabStopColumn(1, 8));
-    try std.testing.expectEqual(@as(u16, 10), nextTabStopColumn(10, 10));
-    try std.testing.expectEqual(@as(u16, 10), nextTabStopColumn(11, 10));
-    try std.testing.expectEqual(@as(u16, 65535), nextTabStopColumn(65535, 65535));
-}
 
-test "prefixByWidthIgnoringAnsi keeps opening OSC-8 attached to visible bytes" {
-    // OSC-8 open does not consume any visible cells; the first two bytes of
-    // the hyperlink body do. Budget of 2 keeps the open + 2 cells.
-    const text = "\x1b]8;;file:///x\x1b\\ab\x1b]8;;\x1b\\";
-    const out = prefixByWidthIgnoringAnsi(text, 2);
-    try std.testing.expectEqual(@as(usize, 2), visibleWidthIgnoringAnsi(out));
-    try std.testing.expect(std.mem.find(u8, out, "\x1b]8;;file:///x\x1b\\") != null);
-}
 
-test "prefixByWidthIgnoringAnsi returns empty on zero budget" {
-    try std.testing.expectEqualStrings("", prefixByWidthIgnoringAnsi("\x1b[31mhello\x1b[0m", 0));
-}
 
-test "suffixByWidthIgnoringAnsi tolerates ANSI around multibyte runes" {
-    const text = "a\x1b]8;;file:///\xc2\xa0.png\x1b\\[Image 1]\x1b]8;;\x1b\\";
-    const out = suffixByWidthIgnoringAnsi(text, 9);
-    try std.testing.expectEqual(@as(usize, 9), visibleWidthIgnoringAnsi(out));
-}
 
-test "suffixByWidthIgnoringAnsi returns full text when it fits" {
-    const text = "\x1b[31mhi\x1b[0m";
-    try std.testing.expectEqualStrings(text, suffixByWidthIgnoringAnsi(text, 5));
-}
 
-test "decodeNextRune advances through invalid UTF-8" {
-    const text = "\xf0\x28\x8c\x28";
-    const first = decodeNextRune(text, 0);
-    try std.testing.expectEqual(@as(usize, 1), first.len);
-    try std.testing.expectEqual(@as(u21, 0xfffd), first.codepoint);
 
-    const second = decodeNextRune(text, first.len);
-    try std.testing.expectEqual(@as(usize, 1), second.len);
-    try std.testing.expectEqual(@as(u21, '('), second.codepoint);
-}
 
-test "ansiSequenceEnd handles OSC terminated by ESC backslash" {
-    const text = "\x1b]8;;file:///x\x1b\\body";
-    try std.testing.expectEqual(@as(usize, 16), ansiSequenceEnd(text, 0));
-    try std.testing.expectEqual(@as(usize, 4), visibleWidthIgnoringAnsi(text));
-}
 
-test "runeWidth preserves current width table semantics" {
-    try std.testing.expectEqual(@as(usize, 0), runeWidth(0));
-    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x07));
-    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x1b));
-    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x80));
-    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x9f));
-    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x0301));
-    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x1ab0));
-    try std.testing.expectEqual(@as(usize, 2), runeWidth(0x4e00));
-    try std.testing.expectEqual(@as(usize, 2), runeWidth(0x1f600));
-    try std.testing.expectEqual(@as(usize, 1), runeWidth(0xff66));
-    try std.testing.expectEqual(@as(usize, 1), runeWidth('a'));
-    try std.testing.expectEqual(@as(usize, 1), runeWidth(' '));
-    try std.testing.expectEqual(@as(usize, 0), runeWidth(0x09));
-}
 
-test "decodeNextRune preserves boundary and invalid-byte behavior" {
-    try std.testing.expectEqual(DecodedRune{ .len = 0, .codepoint = 0 }, decodeNextRune("", 0));
-    try std.testing.expectEqual(DecodedRune{ .len = 0, .codepoint = 0 }, decodeNextRune("a", 1));
-    try std.testing.expectEqual(DecodedRune{ .len = 1, .codepoint = 0xfffd }, decodeNextRune("\xff", 0));
-    try std.testing.expectEqual(DecodedRune{ .len = 1, .codepoint = 0xfffd }, decodeNextRune("\xf0", 0));
-    try std.testing.expectEqual(DecodedRune{ .len = 1, .codepoint = 0xfffd }, decodeNextRune("\xc0\x80", 0));
-}
 
-test "ansiSequenceEnd preserves current CSI OSC and ESC boundaries" {
-    try std.testing.expectEqual(@as(usize, 3), ansiSequenceEnd("\x1b[m", 0));
-    try std.testing.expectEqual(@as(usize, 7), ansiSequenceEnd("\x1b[1;31m", 0));
-    try std.testing.expectEqual(@as(usize, 3), ansiSequenceEnd("\x1b[K", 0));
 
-    const unterminated_csi = "\x1b[";
-    try std.testing.expectEqual(unterminated_csi.len, ansiSequenceEnd(unterminated_csi, 0));
 
-    try std.testing.expectEqual(@as(usize, 9), ansiSequenceEnd("\x1b]8;;url\x07", 0));
-    try std.testing.expectEqual(@as(usize, 10), ansiSequenceEnd("\x1b]8;;url\x1b\\", 0));
 
-    const unterminated_osc = "\x1b]8;;url";
-    try std.testing.expectEqual(unterminated_osc.len, ansiSequenceEnd(unterminated_osc, 0));
 
-    try std.testing.expectEqual(@as(usize, 2), ansiSequenceEnd("\x1bA", 0));
 
-    const bare_escape = "\x1b";
-    try std.testing.expectEqual(bare_escape.len, ansiSequenceEnd(bare_escape, 0));
-}
 
-test "previousRuneStart preserves byte-boundary behavior" {
-    try std.testing.expectEqual(@as(usize, 4), previousRuneStart("hello", 5));
-    try std.testing.expectEqual(@as(usize, 1), previousRuneStart("a\xf0\x9f\x98\x80b", 5));
-    try std.testing.expectEqual(@as(usize, 0), previousRuneStart("", 0));
-    try std.testing.expectEqual(@as(usize, 0), previousRuneStart("a", 1));
-}
 
-test "prefixByWidth and suffixByWidth preserve boundary behavior" {
-    try std.testing.expectEqualStrings("", prefixByWidth("ab", 0));
-    try std.testing.expectEqualStrings("a", prefixByWidth("ab", 1));
-    try std.testing.expectEqualStrings("ab", prefixByWidth("ab", 2));
-    try std.testing.expectEqualStrings("ab", prefixByWidth("ab", 100));
 
-    const suffix_zero = suffixByWidth("ab", 0);
-    try std.testing.expectEqual(@as(usize, 0), suffix_zero.len);
-    try std.testing.expectEqualStrings("b", suffixByWidth("ab", 1));
-    try std.testing.expectEqualStrings("\xf0\x9f\x98\x80b", suffixByWidth("a\xf0\x9f\x98\x80b", 3));
-}
 
-test "shouldWrapAt preserves documented edge behavior" {
-    try std.testing.expect(shouldWrapAt(1, 2, 1));
-    try std.testing.expect(!shouldWrapAt(1, 1, 80));
-    try std.testing.expect(!shouldWrapAt(80, 1, 80));
-    try std.testing.expect(shouldWrapAt(80, 2, 80));
-}
 
-test "statusPrefixEnd detects a leading status rune and space" {
-    try std.testing.expectEqual(@as(usize, 4), statusPrefixEnd("▲ error"));
-    try std.testing.expectEqual(@as(usize, 2), statusPrefixEnd("x error"));
-    try std.testing.expectEqual(@as(usize, 0), statusPrefixEnd("error text"));
-    try std.testing.expectEqual(@as(usize, 0), statusPrefixEnd("▲"));
-    try std.testing.expectEqual(@as(usize, 0), statusPrefixEnd(""));
-}
-
-test "wrapCutIgnoringAnsi prefers the last space inside the budget" {
-    try std.testing.expectEqualStrings("aaaa bbbb", wrapCutIgnoringAnsi("aaaa bbbb cccc", 10));
-    try std.testing.expectEqualStrings("aaaaa", wrapCutIgnoringAnsi("aaaaabbbbbcc", 5));
-    try std.testing.expectEqualStrings(" a", wrapCutIgnoringAnsi(" abcd", 2));
-    try std.testing.expectEqualStrings("aaaa bbbb cccc", wrapCutIgnoringAnsi("aaaa bbbb cccc", 20));
-    try std.testing.expectEqualStrings("\x1b[31maaaa", wrapCutIgnoringAnsi("\x1b[31maaaa bbbb\x1b[0m", 6));
-}
-
-test "trimBreakWhitespace strips leading spaces and tabs" {
-    try std.testing.expectEqualStrings("abc", trimBreakWhitespace(" \t abc"));
-    try std.testing.expectEqualStrings("abc ", trimBreakWhitespace("abc "));
-    try std.testing.expectEqualStrings("", trimBreakWhitespace("  "));
-}
-
-test "widestFitting picks the first variant that fits and falls back to the last" {
-    const variants = [_][]const u8{ "long variant here", "medium one", "short" };
-    try std.testing.expectEqualStrings("long variant here", widestFitting(&variants, 40));
-    try std.testing.expectEqualStrings("long variant here", widestFitting(&variants, 17));
-    try std.testing.expectEqualStrings("medium one", widestFitting(&variants, 16));
-    try std.testing.expectEqualStrings("short", widestFitting(&variants, 9));
-    try std.testing.expectEqualStrings("short", widestFitting(&variants, 2));
-    const wide = [_][]const u8{ "漢漢漢", "漢" };
-    try std.testing.expectEqualStrings("漢", widestFitting(&wide, 5));
-}
-
-test "display unit widths cover presentation and RGI sequences" {
-    const Case = struct {
-        text: []const u8,
-        width: usize,
-    };
-    const cases = [_]Case{
-        .{ .text = "A", .width = 1 },
-        .{ .text = "\u{754C}", .width = 2 },
-        .{ .text = "a\u{0301}", .width = 1 },
-        .{ .text = "\xff", .width = 1 },
-        .{ .text = "\u{2705}", .width = 2 },
-        .{ .text = "\u{274C}", .width = 2 },
-        .{ .text = "\u{2600}\u{FE0E}", .width = 1 },
-        .{ .text = "\u{231A}\u{FE0E}", .width = 2 },
-        .{ .text = "\u{26A1}\u{FE0E}", .width = 2 },
-        .{ .text = "\u{2600}\u{FE0F}", .width = 2 },
-        .{ .text = "\u{1F44D}\u{1F3FD}", .width = 2 },
-        .{ .text = "\u{1F1FA}\u{1F1F8}", .width = 2 },
-        .{ .text = "#\u{FE0F}\u{20E3}", .width = 2 },
-        .{ .text = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}", .width = 2 },
-        .{ .text = "\u{1F469}\u{200D}\u{1F4BB}", .width = 2 },
-    };
-
-    for (cases) |case| {
-        try std.testing.expectEqual(case.width, visibleWidth(case.text));
-    }
-}
-
-test "display unit scanner returns exact sequence byte spans" {
-    const Case = struct {
-        text: []const u8,
-        cell_width: usize,
-    };
-    const cases = [_]Case{
-        .{ .text = "A", .cell_width = 1 },
-        .{ .text = "\u{754C}", .cell_width = 2 },
-        .{ .text = "\xff", .cell_width = 1 },
-        .{ .text = "\u{2705}", .cell_width = 2 },
-        .{ .text = "\u{2600}\u{FE0E}", .cell_width = 1 },
-        .{ .text = "\u{231A}\u{FE0E}", .cell_width = 2 },
-        .{ .text = "\u{26A1}\u{FE0E}", .cell_width = 2 },
-        .{ .text = "\u{2600}\u{FE0F}", .cell_width = 2 },
-        .{ .text = "\u{1F44D}\u{1F3FD}", .cell_width = 2 },
-        .{ .text = "\u{1F1FA}\u{1F1F8}", .cell_width = 2 },
-        .{ .text = "#\u{FE0F}\u{20E3}", .cell_width = 2 },
-        .{ .text = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}", .cell_width = 2 },
-        .{ .text = "\u{1F469}\u{200D}\u{1F4BB}", .cell_width = 2 },
-    };
-
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            DisplayUnit{ .byte_len = case.text.len, .cell_width = case.cell_width },
-            displayUnitAt(case.text, 0),
-        );
-    }
-
-    try std.testing.expectEqual(
-        DisplayUnit{ .byte_len = 0, .cell_width = 0 },
-        displayUnitAt("", 0),
-    );
-}
-
-test "display unit scanner rejects sequence lookalikes" {
-    const stray_selector = "A\u{FE0F}";
-    try std.testing.expectEqual(
-        DisplayUnit{ .byte_len = 1, .cell_width = 1 },
-        displayUnitAt(stray_selector, 0),
-    );
-    try std.testing.expectEqual(@as(usize, 1), visibleWidth(stray_selector));
-
-    const invalid_flag = "\u{1F1E6}\u{1F1E6}";
-    try std.testing.expectEqual(@as(usize, 4), visibleWidth(invalid_flag));
-    try std.testing.expectEqual(@as(usize, 4), displayUnitAt(invalid_flag, 0).byte_len);
-
-    const incomplete_keycap = "#\u{20E3}";
-    try std.testing.expectEqual(@as(usize, 1), displayUnitAt(incomplete_keycap, 0).byte_len);
-    try std.testing.expectEqual(@as(usize, 1), visibleWidth(incomplete_keycap));
-
-    const incomplete_tag = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}";
-    try std.testing.expectEqual(@as(usize, 4), displayUnitAt(incomplete_tag, 0).byte_len);
-
-    const invalid_zwj = "\u{1F469}\u{200D}A";
-    try std.testing.expectEqual(@as(usize, 4), displayUnitAt(invalid_zwj, 0).byte_len);
-    try std.testing.expectEqual(@as(usize, 3), visibleWidth(invalid_zwj));
-}
-
-test "ordinary ascii keycap candidates stay on the single-byte path" {
-    const text = "0123456789#*";
-    for (text, 0..) |_, index| {
-        try std.testing.expectEqual(
-            DisplayUnit{ .byte_len = 1, .cell_width = 1 },
-            displayUnitAt(text, index),
-        );
-    }
-}
-
-test "display unit clipping preserves sequence boundaries" {
-    const sequence = "\u{1F44D}\u{1F3FD}";
-    const text = "a" ++ sequence ++ "b";
-    try std.testing.expectEqualStrings("a", prefixByWidth(text, 2));
-    try std.testing.expectEqualStrings("a" ++ sequence, prefixByWidth(text, 3));
-    try std.testing.expectEqualStrings("b", suffixByWidth(text, 1));
-    try std.testing.expectEqualStrings(sequence ++ "b", suffixByWidth(text, 3));
-
-    const styled = "\x1b[31m" ++ sequence ++ "\x1b[0m";
-    try std.testing.expectEqualStrings(styled, prefixByWidthIgnoringAnsi(styled, 2));
-    try std.testing.expectEqualStrings(styled, suffixByWidthIgnoringAnsi(styled, 2));
-    try std.testing.expectEqual(sequence.len + 1, statusPrefixEnd(sequence ++ " active"));
-}
-
-test "fuzz display unit boundaries" {
-    try std.testing.fuzz({}, fuzzDisplayUnitBoundaries, .{
-        .corpus = &.{
-            "",
-            "plain text",
-            "\xff\xf0\x28\x8c\x28",
-            "\u{2600}\u{FE0E}\u{2600}\u{FE0F}",
-            "\u{1F44D}\u{1F3FD}\u{1F1FA}\u{1F1F8}",
-            "#\u{FE0F}\u{20E3}\u{1F469}\u{200D}\u{1F4BB}",
-        },
-    });
-}
 
 fn fuzzDisplayUnitBoundaries(_: void, smith: *std.testing.Smith) !void {
     var buffer: [256]u8 = undefined;

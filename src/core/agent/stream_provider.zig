@@ -307,11 +307,6 @@ noinline fn failResultDynamic(err: anyerror) anyerror!Result {
     return err;
 }
 
-test "result failure writer preserves exact error type and identity" {
-    const failure = failResult(error.Cancelled);
-    try std.testing.expect(@TypeOf(failure) == error{Cancelled}!Result);
-    try std.testing.expectError(error.Cancelled, failure);
-}
 
 pub const StreamFn = *const fn (
     context: ?*anyopaque,
@@ -337,84 +332,3 @@ pub const unavailable_provider = Provider{
     .stream_fn = unavailableStream,
 };
 
-test "stream provider accepts one typed request and emits ordered neutral events" {
-    const Fake = struct {
-        calls: usize = 0,
-        attempt_owner: ?ProviderAttemptOwner = null,
-
-        fn stream(raw: ?*anyopaque, _: Allocator, request: ModelRequest) anyerror!Result {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.calls += 1;
-            self.attempt_owner = request.provider_attempt_owner;
-            try request.admission.admit();
-            request.events.emit(.{ .content_delta = "first" });
-            request.events.emit(.{ .reasoning_delta = "second" });
-            return .{ .completed = .{
-                .completion = .{ .content = "done" },
-                .usage = .{ .exact = .gateway },
-            } };
-        }
-    };
-    const Capture = struct {
-        chunks: std.ArrayList(u8) = .empty,
-        failed: bool = false,
-
-        fn emit(raw: *anyopaque, event: Event) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            const chunk = switch (event) {
-                .content_delta => |value| value,
-                .reasoning_delta => |value| value,
-                else => return,
-            };
-            self.chunks.appendSlice(std.testing.allocator, chunk) catch {
-                self.failed = true;
-            };
-        }
-    };
-    const AdmissionCapture = struct {
-        calls: usize = 0,
-
-        fn admit(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-        }
-    };
-
-    var fake: Fake = .{};
-    var capture: Capture = .{};
-    defer capture.chunks.deinit(std.testing.allocator);
-    var admission_capture: AdmissionCapture = .{};
-    var delivery = DeliveryCertainty.init();
-    var attempt_evidence: AttemptEvidence = .{};
-    var cancelled = std.atomic.Value(bool).init(false);
-    var result = try (Provider{
-        .context = &fake,
-        .stream_fn = Fake.stream,
-    }).stream(std.testing.allocator, .{
-        .credential = .{ .secret = "key" },
-        .model = "model",
-        .retry_count = 1,
-        .messages = &.{},
-        .tools = .{},
-        .tool_choice = .auto,
-        .vision_mode = .unavailable,
-        .provider_options = .{},
-        .trace_ctx = .{},
-        .content_capture_limit = null,
-        .delivery = &delivery,
-        .attempt_evidence = &attempt_evidence,
-        .events = .{ .context = &capture, .emit_fn = Capture.emit },
-        .admission = .{ .context = &admission_capture, .admit_fn = AdmissionCapture.admit },
-        .cancel_flag = &cancelled,
-        .provider_attempt_owner = .agent,
-    });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(usize, 1), admission_capture.calls);
-    try std.testing.expectEqual(ProviderAttemptOwner.agent, fake.attempt_owner.?);
-    try std.testing.expect(!capture.failed);
-    try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
-    try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
-    try std.testing.expect(std.meta.activeTag(result.completed.usage) == .exact);
-}

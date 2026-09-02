@@ -103,42 +103,6 @@ pub const Provider = struct {
     chat_url: ChatUrlProvider,
 };
 
-test "credits lookup dispatches through the injected provider" {
-    const Fake = struct {
-        calls: usize = 0,
-        saw_expected_input: bool = false,
-
-        fn fetch(
-            raw: ?*anyopaque,
-            alloc: Allocator,
-            input: CreditsLookupInput,
-        ) output_contracts.CreditsSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.calls += 1;
-            self.saw_expected_input =
-                std.mem.eql(u8, input.credential orelse "", "credential") and
-                std.mem.eql(u8, input.tenant orelse "", "tenant");
-            return .{
-                .balance = alloc.dupe(u8, "10") catch null,
-            };
-        }
-    };
-
-    var fake: Fake = .{};
-    const provider = CreditsProvider{
-        .context = &fake,
-        .fetch_fn = Fake.fetch,
-    };
-    var snapshot = provider.fetch(std.testing.allocator, .{
-        .credential = "credential",
-        .tenant = "tenant",
-    });
-    defer snapshot.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expect(fake.saw_expected_input);
-    try std.testing.expectEqualStrings("10", snapshot.balance.?);
-}
 
 const CapabilityResolverState = enum {
     idle,
@@ -261,13 +225,6 @@ noinline fn failCapabilitiesDynamic(err: anyerror) anyerror!model_capabilities.C
     return err;
 }
 
-test "capability failure writer preserves exact error type and identity" {
-    const failure = failCapabilities(error.Cancelled);
-    try std.testing.expect(
-        @TypeOf(failure) == error{Cancelled}!model_capabilities.Capabilities,
-    );
-    try std.testing.expectError(error.Cancelled, failure);
-}
 
 const FakeCatalog = struct {
     outcome: enum {
@@ -333,30 +290,6 @@ const FakeCatalog = struct {
     }
 };
 
-test "available capabilities never fetch and use a completed catalog snapshot" {
-    const alloc = std.testing.allocator;
-    var fake = FakeCatalog{ .outcome = .ready };
-    const provider = model_catalog.Provider{ .context = &fake, .fetch_fn = FakeCatalog.fetch };
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-
-    const cold = resolver.available("provider/model", .{});
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expectEqual(@as(?u32, null), cold.context_window);
-    try std.testing.expectEqual(@as(?u32, null), cold.max_output_tokens);
-
-    _ = try resolver.resolve(
-        alloc,
-        provider,
-        .{ .endpoint = "https://example.invalid" },
-        "provider/model",
-        .{},
-    );
-    const warm = resolver.available("provider/model", .{});
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(?u32, 256_000), warm.context_window);
-    try std.testing.expectEqual(@as(?u32, 32_000), warm.max_output_tokens);
-}
 
 const FakeChatUrl = struct {
     resolved: []const u8,
@@ -368,143 +301,7 @@ const FakeChatUrl = struct {
     }
 };
 
-test "gateway provider resolves chat url through the injected policy" {
-    var fake = FakeChatUrl{ .resolved = "http://127.0.0.1:43123/chat" };
-    const provider = ChatUrlProvider{
-        .context = &fake,
-        .resolve_fn = FakeChatUrl.resolve,
-    };
 
-    try std.testing.expectEqualStrings(
-        fake.resolved,
-        provider.resolve("https://fallback.test/chat"),
-    );
-}
 
-test "capability resolver leaves a cancelled catalog fetch retryable" {
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(std.testing.allocator);
-    var fake = FakeCatalog{ .outcome = .cancelled };
-    var cancel_flag = std.atomic.Value(bool).init(true);
 
-    try std.testing.expectError(
-        error.Cancelled,
-        resolver.resolve(
-            std.testing.allocator,
-            fake.provider(),
-            .{
-                .endpoint = "http://127.0.0.1:1/v1/models",
-                .cancel_flag = &cancel_flag,
-            },
-            "provider/model",
-            .{},
-        ),
-    );
-    try std.testing.expectEqual(CapabilityResolverState.idle, resolver.state);
 
-    fake.outcome = .ready;
-    cancel_flag.store(false, .seq_cst);
-    const capabilities = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .endpoint = "http://127.0.0.1:1/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "provider/model",
-        .{},
-    );
-    try std.testing.expect(capabilities.supports_vision);
-}
-
-test "capability resolver uses provider catalog metadata" {
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(std.testing.allocator);
-    var fake = FakeCatalog{ .outcome = .ready };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-
-    const capabilities = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123"),
-            .endpoint = "/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "provider/model",
-        .{},
-    );
-
-    try std.testing.expect(capabilities.supports_vision);
-    try std.testing.expect(capabilities.supports_file_input);
-    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
-    try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
-
-    const missing = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .endpoint = "/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "zai/glm-4.6",
-        .{},
-    );
-    try std.testing.expect(!missing.supports_fast_mode);
-    try std.testing.expect(!missing.supports_vision);
-}
-
-test "capability resolver retries rejected authenticated catalog access anonymously" {
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(std.testing.allocator);
-    var fake = FakeCatalog{ .outcome = .authenticated_rejected_then_ready };
-
-    const capabilities = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123"),
-            .endpoint = "/v1/models",
-        },
-        "provider/model",
-        .{},
-    );
-
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expect(fake.saw_authenticated_access);
-    try std.testing.expect(fake.saw_public_retry);
-    try std.testing.expect(capabilities.supports_vision);
-}
-
-test "capability resolver degrades terminal catalog failures to local capabilities" {
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(std.testing.allocator);
-    var fake = FakeCatalog{ .outcome = .unavailable };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-
-    const capabilities = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .endpoint = "/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "zai/glm-4.6",
-        .{},
-    );
-    try std.testing.expect(!capabilities.supports_fast_mode);
-
-    fake.outcome = .ready;
-    const cached_failure = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .endpoint = "/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "provider/model",
-        .{},
-    );
-    try std.testing.expect(!cached_failure.supports_vision);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-}

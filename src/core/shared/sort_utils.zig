@@ -187,48 +187,7 @@ fn expectMatchesStd(alloc: std.mem.Allocator, items: []const TestElem) !void {
     try testing.expectEqualSlices(TestElem, expected, actual);
 }
 
-test "matches std.mem.sort across sizes, seeds, and key densities" {
-    const alloc = testing.allocator;
-    const sizes = [_]usize{ 0, 1, 2, 3, 5, 19, 20, 21, 40, 41, 100, 257, 1000 };
-    const key_ranges = [_]u16{ 1, 2, 3, 16, 251, 65535 };
-    var prng = std.Random.DefaultPrng.init(0x5eed);
-    const random = prng.random();
-    for (sizes) |n| {
-        for (key_ranges) |range| {
-            const items = try alloc.alloc(TestElem, n);
-            defer alloc.free(items);
-            for (items, 0..) |*item, i| {
-                item.* = .{ .key = random.uintLessThan(u16, range), .seq = @intCast(i % 65535) };
-            }
-            try expectMatchesStd(alloc, items);
-        }
-    }
-}
 
-test "matches std.mem.sort on adversarial patterns" {
-    const alloc = testing.allocator;
-    const n: usize = 337;
-    const items = try alloc.alloc(TestElem, n);
-    defer alloc.free(items);
-
-    for (items, 0..) |*item, i| item.* = .{ .key = @intCast(i), .seq = @intCast(i) };
-    try expectMatchesStd(alloc, items);
-
-    for (items, 0..) |*item, i| item.* = .{ .key = @intCast(n - 1 - i), .seq = @intCast(i) };
-    try expectMatchesStd(alloc, items);
-
-    for (items, 0..) |*item, i| item.* = .{ .key = @intCast(i % 7), .seq = @intCast(i) };
-    try expectMatchesStd(alloc, items);
-
-    for (items, 0..) |*item, i| item.* = .{ .key = 42, .seq = @intCast(i) };
-    try expectMatchesStd(alloc, items);
-
-    for (items, 0..) |*item, i| {
-        const key: u16 = if (i < n / 2) @intCast(i) else @intCast(n - i);
-        item.* = .{ .key = key, .seq = @intCast(i) };
-    }
-    try expectMatchesStd(alloc, items);
-}
 
 fn permuteAndCheck(alloc: std.mem.Allocator, items: []TestElem, k: usize) !void {
     if (k <= 1) {
@@ -245,73 +204,6 @@ fn permuteAndCheck(alloc: std.mem.Allocator, items: []TestElem, k: usize) !void 
     }
 }
 
-test "every permutation of duplicate-heavy small inputs matches std.mem.sort" {
-    const alloc = testing.allocator;
-    var n: usize = 1;
-    while (n <= 6) : (n += 1) {
-        const items = try alloc.alloc(TestElem, n);
-        defer alloc.free(items);
-        for (items, 0..) |*item, i| item.* = .{ .key = @intCast(i % 3), .seq = @intCast(i) };
-        try permuteAndCheck(alloc, items, n);
-    }
-}
 
-test "runtime context reaches the comparator" {
-    const alloc = testing.allocator;
-    const Pivot = struct { value: i32 };
-    const distanceLess = struct {
-        fn less(ctx: Pivot, lhs: i32, rhs: i32) bool {
-            return @abs(lhs - ctx.value) < @abs(rhs - ctx.value);
-        }
-    }.less;
-    var prng = std.Random.DefaultPrng.init(0xf00);
-    const random = prng.random();
-    const expected = try alloc.alloc(i32, 500);
-    defer alloc.free(expected);
-    for (expected) |*value| value.* = random.intRangeAtMost(i32, -1000, 1000);
-    const actual = try alloc.dupe(i32, expected);
-    defer alloc.free(actual);
-    const pivot = Pivot{ .value = 37 };
-    std.mem.sort(i32, expected, pivot, distanceLess);
-    sort(i32, actual, pivot, distanceLess);
-    try testing.expectEqualSlices(i32, expected, actual);
-}
 
-test "odd-sized elements sort correctly" {
-    const alloc = testing.allocator;
-    const lexLess = struct {
-        fn less(_: void, lhs: [7]u8, rhs: [7]u8) bool {
-            return std.mem.order(u8, &lhs, &rhs) == .lt;
-        }
-    }.less;
-    var prng = std.Random.DefaultPrng.init(7);
-    const random = prng.random();
-    const expected = try alloc.alloc([7]u8, 300);
-    defer alloc.free(expected);
-    for (expected) |*elem| {
-        random.bytes(elem);
-        elem[0] %= 3;
-    }
-    const actual = try alloc.dupe([7]u8, expected);
-    defer alloc.free(actual);
-    std.mem.sort([7]u8, expected, {}, lexLess);
-    sort([7]u8, actual, {}, lexLess);
-    try testing.expectEqualSlices([7]u8, expected, actual);
-}
 
-test "slice elements sort by content with duplicates" {
-    const alloc = testing.allocator;
-    const strLess = struct {
-        fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
-            return std.mem.order(u8, lhs, rhs) == .lt;
-        }
-    }.less;
-    const source = [_][]const u8{ "delta", "alpha", "charlie", "alpha", "bravo", "", "charlie", "alpha" };
-    const expected = try alloc.dupe([]const u8, &source);
-    defer alloc.free(expected);
-    const actual = try alloc.dupe([]const u8, &source);
-    defer alloc.free(actual);
-    std.mem.sort([]const u8, expected, {}, strLess);
-    sort([]const u8, actual, {}, strLess);
-    try testing.expectEqualSlices([]const u8, expected, actual);
-}

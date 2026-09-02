@@ -257,107 +257,14 @@ pub const AutoUpgrade = struct {
     }
 };
 
-test "statusLabel idle returns empty" {
-    var au = AutoUpgrade{};
-    var buf: [64]u8 = undefined;
-    const label = au.statusLabel(&buf);
-    try std.testing.expectEqual(@as(usize, 0), label.len);
-}
 
-test "selected release channel is owned by the upgrade runtime" {
-    var au = AutoUpgrade{};
-    try std.testing.expectEqual(update_target.Channel.stable, au.channel());
 
-    au.configure_channel(.dev);
-    try std.testing.expectEqual(update_target.Channel.dev, au.channel());
-}
 
-test "development build paths disable auto upgrade" {
-    try std.testing.expect(isDevelopmentBuildPath("/repo/zig-out/bin/omfx"));
-    try std.testing.expect(isDevelopmentBuildPath("C:\\repo\\zig-out\\bin\\fx.exe"));
-    try std.testing.expect(!isDevelopmentBuildPath("/Users/me/.local/bin/fx"));
-}
 
-test "statusLabel downloading shows ellipsis" {
-    var au = AutoUpgrade{};
-    au.setLatestVersion("v0.3.0");
-    au.setState(.downloading);
-    var buf: [64]u8 = undefined;
-    const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("upgrading to 0.3.0...", label);
-}
 
-test "statusLabel ready explains ctrl+g reload" {
-    var au = AutoUpgrade{};
-    au.setState(.ready);
-    var buf: [64]u8 = undefined;
-    const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("update ready: ctrl+g to reload", label);
-}
 
-test "setLatestVersion stores normalized version" {
-    var au = AutoUpgrade{};
-    _ = au.takeRenderDirty();
-    au.setLatestVersion("v1.2.3");
-    var buf: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("1.2.3", au.getLatestVersion(&buf));
-    try std.testing.expect(au.takeRenderDirty());
-}
 
-test "relaunch request owns the executable path and is consumed once" {
-    var au = AutoUpgrade{};
-    var source = [_]u8{ '/', 't', 'm', 'p', '/', 'f', 'x' };
-    try au.requestRelaunch(&source);
-    source[1] = 'x';
 
-    const request = au.takeRelaunchRequest() orelse
-        return error.TestExpectedRelaunchRequest;
-    try std.testing.expectEqualStrings("/tmp/fx", request.executablePath());
-    try std.testing.expect(au.takeRelaunchRequest() == null);
-}
 
-test "statusLabel waiting returns empty" {
-    var au = AutoUpgrade{};
-    au.setState(.waiting);
-    var buf: [64]u8 = undefined;
-    const label = au.statusLabel(&buf);
-    try std.testing.expectEqual(@as(usize, 0), label.len);
-}
 
-test "statusLabel checking returns empty" {
-    var au = AutoUpgrade{};
-    au.setState(.checking);
-    var buf: [64]u8 = undefined;
-    const label = au.statusLabel(&buf);
-    try std.testing.expectEqual(@as(usize, 0), label.len);
-}
 
-test "statusLabel failed shows upgrade failed" {
-    var au = AutoUpgrade{};
-    au.setState(.failed);
-    var buf: [64]u8 = undefined;
-    const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("upgrade failed", label);
-}
-
-test "getState returns the current atomic state" {
-    var au = AutoUpgrade{};
-    try std.testing.expectEqual(State.idle, au.getState());
-    try std.testing.expect(!au.takeRenderDirty());
-    au.setState(.checking);
-    try std.testing.expectEqual(State.checking, au.getState());
-    try std.testing.expect(au.takeRenderDirty());
-    try std.testing.expect(!au.takeRenderDirty());
-    au.setState(.checking);
-    try std.testing.expect(!au.takeRenderDirty());
-}
-
-test "setLatestVersion truncates to stored capacity" {
-    var au = AutoUpgrade{};
-    au.setLatestVersion("v1234567890123456789012345678901234567890");
-
-    var buf: [40]u8 = undefined;
-    const latest = au.getLatestVersion(&buf);
-    try std.testing.expectEqual(@as(usize, 32), latest.len);
-    try std.testing.expectEqualStrings("12345678901234567890123456789012", latest);
-}

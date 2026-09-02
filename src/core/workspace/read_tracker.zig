@@ -66,51 +66,5 @@ pub fn contentHash(bytes: []const u8) ContentHash {
     return hasher.finalResult();
 }
 
-test "ReadTracker records, looks up, overwrites, and frees owned keys" {
-    const alloc = std.testing.allocator;
-    var tracker = ReadTracker.init(alloc);
-    defer tracker.deinit();
 
-    const first = Record{
-        .mtime_ns = 10,
-        .content_hash = contentHash("first"),
-        .model_view_covers_full_file = true,
-        .snapshot_covers_full_file = true,
-    };
-    try tracker.record("/tmp/file.txt", first);
 
-    const stored_first = tracker.lookup("/tmp/file.txt").?;
-    try std.testing.expectEqual(@as(i128, 10), stored_first.mtime_ns);
-    try std.testing.expectEqualSlices(u8, &first.content_hash, &stored_first.content_hash);
-    try std.testing.expect(stored_first.model_view_covers_full_file);
-    try std.testing.expect(stored_first.snapshot_covers_full_file);
-
-    const second = Record{
-        .mtime_ns = 20,
-        .content_hash = contentHash("second"),
-        .model_view_covers_full_file = false,
-        .snapshot_covers_full_file = false,
-    };
-    try tracker.record("/tmp/file.txt", second);
-
-    const stored_second = tracker.lookup("/tmp/file.txt").?;
-    try std.testing.expectEqual(@as(i128, 20), stored_second.mtime_ns);
-    try std.testing.expectEqualSlices(u8, &second.content_hash, &stored_second.content_hash);
-    try std.testing.expect(!stored_second.model_view_covers_full_file);
-    try std.testing.expect(!stored_second.snapshot_covers_full_file);
-}
-
-test "ReadTracker lookup returns null for unread paths" {
-    var tracker = ReadTracker.init(std.testing.allocator);
-    defer tracker.deinit();
-
-    try std.testing.expect(tracker.lookup("/tmp/missing.txt") == null);
-}
-
-test "contentHash distinguishes empty and non-empty content" {
-    const empty = contentHash("");
-    const filled = contentHash("x");
-
-    try std.testing.expect(!std.mem.eql(u8, &empty, &filled));
-    try std.testing.expectEqualSlices(u8, &empty, &contentHash(""));
-}

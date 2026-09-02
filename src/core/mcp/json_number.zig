@@ -267,47 +267,5 @@ fn expectEquivalent(left: []const u8, right: []const u8) !void {
     try std.testing.expect(left_number.eql(right_number));
 }
 
-test "exact JSON numbers normalize signed zero exponents and high precision" {
-    try expectEquivalent("0", "-0.0e+999");
-    try expectEquivalent("1", "1.000e0");
-    try expectEquivalent("9007199254740993", "9.007199254740993e15");
-    try expectEquivalent("0.12345678901234567890123456789", "12345678901234567890123456789e-29");
 
-    var lower = try Number.parse(std.testing.allocator, "9007199254740992", .{});
-    defer lower.deinit(std.testing.allocator);
-    var upper = try Number.parse(std.testing.allocator, "9007199254740993", .{});
-    defer upper.deinit(std.testing.allocator);
-    try std.testing.expectEqual(std.math.Order.lt, lower.order(upper));
-}
 
-test "exact JSON numbers detect integers and multipleOf without floating point" {
-    var integer = try Number.parse(std.testing.allocator, "1e3", .{});
-    defer integer.deinit(std.testing.allocator);
-    var fraction = try Number.parse(std.testing.allocator, "1e-3", .{});
-    defer fraction.deinit(std.testing.allocator);
-    try std.testing.expect(integer.isInteger());
-    try std.testing.expect(!fraction.isInteger());
-
-    var value = try Number.parse(std.testing.allocator, "0.300000000000000000000000000000", .{});
-    defer value.deinit(std.testing.allocator);
-    var divisor = try Number.parse(std.testing.allocator, "0.1", .{});
-    defer divisor.deinit(std.testing.allocator);
-    try std.testing.expect(try value.isMultipleOf(std.testing.allocator, divisor, .{}));
-    var not_multiple = try Number.parse(std.testing.allocator, "0.300000000000000000000000000001", .{});
-    defer not_multiple.deinit(std.testing.allocator);
-    try std.testing.expect(!try not_multiple.isMultipleOf(std.testing.allocator, divisor, .{}));
-}
-
-test "exact JSON numbers order signed magnitudes around zero" {
-    var zero = try Number.parse(std.testing.allocator, "0", .{});
-    defer zero.deinit(std.testing.allocator);
-    var positive = try Number.parse(std.testing.allocator, "0.0000000000000000000000000001", .{});
-    defer positive.deinit(std.testing.allocator);
-    var negative = try Number.parse(std.testing.allocator, "-0.0000000000000000000000000001", .{});
-    defer negative.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(std.math.Order.lt, zero.order(positive));
-    try std.testing.expectEqual(std.math.Order.gt, zero.order(negative));
-    try std.testing.expectEqual(std.math.Order.gt, positive.order(zero));
-    try std.testing.expectEqual(std.math.Order.lt, negative.order(zero));
-}

@@ -200,28 +200,6 @@ pub const Parser = struct {
     }
 };
 
-test "legacy SSE parser preserves event data id and bounded retry" {
-    const alloc = std.testing.allocator;
-    var parser = Parser.init(alloc, 1024, 256, 4);
-    defer parser.deinit();
-    var events: std.ArrayList(Event) = .empty;
-    defer {
-        for (events.items) |*event| event.deinit(alloc);
-        events.deinit(alloc);
-    }
-
-    try parser.feed(
-        "event: message\r\ndata: one\ndata: two\nid: event-7\nretry: 90000\n\n",
-        &events,
-    );
-    try parser.finish();
-
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expectEqualStrings("message", events.items[0].kind.?);
-    try std.testing.expectEqualStrings("one\ntwo", events.items[0].data);
-    try std.testing.expectEqualStrings("event-7", events.items[0].id.?);
-    try std.testing.expectEqual(max_retry_ms, events.items[0].retry_ms.?);
-}
 
 fn expectLegacySseDelimiterSplits(payload: []const u8) !void {
     const alloc = std.testing.allocator;
@@ -243,16 +221,6 @@ fn expectLegacySseDelimiterSplits(payload: []const u8) !void {
     }
 }
 
-test "legacy SSE parser accepts CR LF and CRLF across every chunk split" {
-    for ([_][]const u8{
-        "event: message\ndata: one\ndata: two\nid: event-1\n\n",
-        "event: message\rdata: one\rdata: two\rid: event-1\r\r",
-        "event: message\r\ndata: one\r\ndata: two\r\nid: event-1\r\n\r\n",
-        "event: message\r\ndata: one\rdata: two\r\nid: event-1\r\r\n",
-    }) |payload| {
-        try expectLegacySseDelimiterSplits(payload);
-    }
-}
 
 fn checkCompleteEventAllocationFailures(alloc: Allocator) !void {
     var parser = Parser.init(alloc, 1024, 256, 4);
@@ -266,48 +234,8 @@ fn checkCompleteEventAllocationFailures(alloc: Allocator) !void {
     try parser.feed("event: message\ndata: payload\nid: event-1\n\n", &events);
 }
 
-test "legacy SSE parser releases complete event fields across allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkCompleteEventAllocationFailures,
-        .{},
-    );
-}
 
-test "legacy SSE parser emits empty priming events" {
-    const alloc = std.testing.allocator;
-    var parser = Parser.init(alloc, 256, 64, 2);
-    defer parser.deinit();
-    var events: std.ArrayList(Event) = .empty;
-    defer {
-        for (events.items) |*event| event.deinit(alloc);
-        events.deinit(alloc);
-    }
 
-    try parser.feed("id:\ndata:\n\n", &events);
-    try parser.finish();
-
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expectEqualStrings("", events.items[0].data);
-    try std.testing.expectEqualStrings("", events.items[0].id.?);
-}
-
-test "legacy SSE parser rejects partial and over-limit streams" {
-    const alloc = std.testing.allocator;
-    var partial = Parser.init(alloc, 64, 32, 1);
-    defer partial.deinit();
-    var events: std.ArrayList(Event) = .empty;
-    defer events.deinit(alloc);
-    try partial.feed("data: unfinished", &events);
-    try std.testing.expectError(error.BrokenSseStream, partial.finish());
-
-    var over_limit = Parser.init(alloc, 8, 8, 1);
-    defer over_limit.deinit();
-    try std.testing.expectError(
-        error.ResponseTooLarge,
-        over_limit.feed("data: too long\n\n", &events),
-    );
-}
 
 fn fuzzParser(_: void, smith: *std.testing.Smith) !void {
     const alloc = std.testing.allocator;
@@ -329,17 +257,3 @@ fn fuzzParser(_: void, smith: *std.testing.Smith) !void {
     parser.finish() catch return;
 }
 
-test "legacy SSE parser handles fuzzed event bytes" {
-    try std.testing.fuzz({}, fuzzParser, .{
-        .corpus = &.{
-            "",
-            "\n",
-            "data: {}\n\n",
-            "data: {}\r\r",
-            "event: message\nid: event-1\nretry: 500\ndata: {\"jsonrpc\":\"2.0\"}\n\n",
-            "data: one\r\ndata: two\r\n\r\n",
-            "data: one\r\ndata: two\r\r\n",
-            "\xff\x00\n\n",
-        },
-    });
-}

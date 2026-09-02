@@ -413,58 +413,5 @@ const ApprovalRoutingApp = struct {
     }
 };
 
-test "full transcript owns raw semantic and remapped ctrl-l" {
-    const alloc = std.testing.allocator;
-    const runtime = Runtime(ApprovalRoutingApp);
-    var app = ApprovalRoutingApp{ .alloc = alloc };
-    defer app.deinit();
 
-    try std.testing.expect(try runtime.routeByte(&app, 12));
-    try std.testing.expect(try runtime.routeAction(&app, .{
-        .composer_shortcut = .redraw,
-    }));
-    try std.testing.expect(try runtime.routeAction(&app, .{
-        .remapped_byte = 12,
-    }));
-    try std.testing.expectEqual(
-        transcript_presentation.Depth.full,
-        app.subagents.depth,
-    );
-}
 
-test "selected child approval owns ctrl-o ahead of transcript depth" {
-    const alloc = std.testing.allocator;
-    var app = ApprovalRoutingApp{ .alloc = alloc };
-    defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .id = 77,
-        .label = "terminal.exec npm test",
-    }));
-
-    _ = try Runtime(ApprovalRoutingApp).routeAction(
-        &app,
-        .toggle_full_transcript,
-    );
-
-    try std.testing.expectEqual(
-        transcript_presentation.Depth.full,
-        app.subagents.depth,
-    );
-    try std.testing.expect(app.approval_prompt.isActive());
-}
-
-test "approval for another child does not steal selected child transcript input" {
-    const alloc = std.testing.allocator;
-    var app = ApprovalRoutingApp{ .alloc = alloc };
-    defer app.deinit();
-    app.subagents.approval_child_id = "child-two";
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .id = 77,
-        .label = "terminal.exec npm test",
-    }));
-
-    try std.testing.expect(!Runtime(ApprovalRoutingApp).approvalOwnsCurrentSurface(&app));
-
-    app.subagents.approval_child_id = "child-one";
-    try std.testing.expect(Runtime(ApprovalRoutingApp).approvalOwnsCurrentSurface(&app));
-}

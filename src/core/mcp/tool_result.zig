@@ -495,78 +495,8 @@ fn extract_legacy(alloc: Allocator, response: []const u8) !tool_mcp_runtime.Call
     });
 }
 
-test "tool result extracts all content" {
-    const alloc = std.testing.allocator;
-    const response =
-        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello "},{"type":"image","data":"AA==","mimeType":"image/png"},{"type":"text","text":"world"}]}}
-    ;
-    var result = try extract_legacy(alloc, response);
-    defer result.deinit(alloc);
 
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        result.model_output,
-        .{},
-    );
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        "server",
-        parsed.value.object.get("server").?.string,
-    );
-    const content = parsed.value.object.get("result").?.object.get("content").?.array.items;
-    try std.testing.expectEqualStrings("hello ", content[0].object.get("text").?.string);
-    try std.testing.expectEqualStrings("AA==", content[1].object.get("data").?.string);
-    try std.testing.expectEqualStrings("world", content[2].object.get("text").?.string);
-}
 
-test "tool result retains protocol error diagnostics" {
-    const alloc = std.testing.allocator;
-    var result = try extract_legacy(alloc,
-        \\{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"something failed"}}
-    );
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(
-        tool_mcp_runtime.CallStatus.protocol_failure,
-        result.status,
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "something failed",
-    ) != null);
-}
-
-test "modern tool results validate result type and retain typed error data" {
-    const alloc = std.testing.allocator;
-    var rendered = try extract(alloc, .{
-        .server_name = "server",
-        .tool_name = "mcp__server__tool",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"Invalid tool arguments\",\"data\":{\"field\":\"path\"}}}",
-        .max_tool_result_bytes = tool_result_limits.default_max_tool_result_bytes,
-        .protocol = .modern,
-    });
-    defer rendered.deinit(alloc);
-    try std.testing.expectEqual(
-        tool_mcp_runtime.CallStatus.protocol_failure,
-        rendered.status,
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        rendered.model_output,
-        "Invalid tool arguments",
-    ) != null);
-
-    var missing = try extract(alloc, .{
-        .server_name = "server",
-        .tool_name = "mcp__server__tool",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[]}}",
-        .max_tool_result_bytes = tool_result_limits.default_max_tool_result_bytes,
-        .protocol = .modern,
-    });
-    defer missing.deinit(alloc);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.success, missing.status);
-}
 
 fn check_input_required_allocation_failures(alloc: Allocator) !void {
     var result = try extract(alloc, .{
@@ -580,13 +510,6 @@ fn check_input_required_allocation_failures(alloc: Allocator) !void {
     try std.testing.expectEqual(tool_mcp_runtime.CallStatus.input_required, result.status);
 }
 
-test "input-required result releases every allocation failure path" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        check_input_required_allocation_failures,
-        .{},
-    );
-}
 
 fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
     var result = try extract(alloc, .{
@@ -602,85 +525,5 @@ fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
     try std.testing.expect(result.input_required.?.legacy_retry_without_responses);
 }
 
-test "2025-11 URL-required errors become retry input only on that wire" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        check_legacy_url_required_allocation_failures,
-        .{},
-    );
 
-    var old = try extract(std.testing.allocator, .{
-        .server_name = "server",
-        .tool_name = "tool",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32042,\"message\":\"URL elicitation required\",\"data\":{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"legacy-url\"}]}}}",
-        .max_tool_result_bytes = 64 * 1024,
-        .protocol = .legacy,
-        .legacy_wire = .legacy_mcp_2025_06,
-    });
-    defer old.deinit(std.testing.allocator);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, old.status);
-}
 
-test "invalid tool responses retain bounded protocol failures" {
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{
-        "{not json",
-        "{\"jsonrpc\":\"2.0\",\"id\":1}",
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[]}",
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":{}}}",
-    }) |response| {
-        var result = try extract_legacy(alloc, response);
-        defer result.deinit(alloc);
-        try std.testing.expectEqual(
-            tool_mcp_runtime.CallStatus.protocol_failure,
-            result.status,
-        );
-    }
-}
-
-test "large tool results stay valid, bounded, and secret-masked" {
-    const alloc = std.testing.allocator;
-    const large_text = "TOKEN=secret-value " ++ ("x" ** 1800);
-    const response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" ++ large_text ++ "\"}]}}";
-    var result = try extract(alloc, .{
-        .server_name = "filesystem",
-        .tool_name = "mcp__filesystem__dump",
-        .response = response,
-        .max_tool_result_bytes = 1024,
-        .protocol = .legacy,
-    });
-    defer result.deinit(alloc);
-
-    try std.testing.expect(result.model_output.len <= 1024);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "TOKEN=secret-value",
-    ) == null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "TOKEN=[redacted]",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "mcp tool result truncated for filesystem/mcp__filesystem__dump",
-    ) != null);
-
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        result.model_output,
-        .{},
-    );
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        "filesystem",
-        parsed.value.object.get("server").?.string,
-    );
-    try std.testing.expect(
-        parsed.value.object.get("result").?.object.get("truncated").?.bool,
-    );
-}

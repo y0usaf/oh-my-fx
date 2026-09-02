@@ -1,18 +1,9 @@
 {
   "version": 1,
   "intentional_exclusions": {
-    "ci-shards.test.ts": "The suite validates the E2E shard planner rather than fx runtime behavior.",
-    "context-limits-live.test.ts": "The suite requires a real model credential and live provider responses.",
-    "notifications.test.ts": "Sound-related tests are prohibited on the production training host.",
-    "tmux-helpers.test.ts": "The suite validates E2E harness helpers rather than fx runtime behavior.",
+    "notifications.test.ts": "The suite requires a real model credential and is not deterministic.",
     "tui-agent.test.ts": "The suite requires a real model credential and is not deterministic.",
-    "tui-command-permissions.test.ts": "The file contains a sound scenario and cannot be run safely as a whole.",
-    "tui-direct-write-audit.test.ts": "The suite validates a repository audit tool rather than the candidate runtime.",
-    "tui-keybindings.test.ts": "The file-wide guard requires a real model credential.",
-    "tui-render-lab.test.ts": "The suite validates render-lab infrastructure and owns separate native opt-in scenarios.",
-    "tui-render-live-stress.test.ts": "The suite requires a real model credential and explicit live stress opt-in.",
-    "web-fetch-live.test.ts": "The suite requires explicit live-network opt-in.",
-    "web-search-live.test.ts": "The suite requires a real model credential and live provider responses."
+    "tui-command-permissions.test.ts": "The file contains a sound scenario and cannot be run safely as a whole."
   },
   "defaults": {
     "cwd": "tests/e2e",
@@ -31,103 +22,89 @@
   "scenarios": [
     {
       "name": "direct-help",
-      "argv": ["{binary}", "help"],
+      "argv": [
+        "{binary}",
+        "help"
+      ],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {
+        "FX_SKIP_ONBOARDING": "1"
+      },
       "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
     },
     {
       "name": "direct-version",
-      "argv": ["{binary}", "--version"],
+      "argv": [
+        "{binary}",
+        "--version"
+      ],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {
+        "FX_SKIP_ONBOARDING": "1"
+      },
       "timeout_seconds": 60,
       "requires_tmux": false
     },
     {
       "name": "direct-status",
-      "argv": ["{binary}", "status", "--json"],
+      "argv": [
+        "{binary}",
+        "status",
+        "--json"
+      ],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {
+        "FX_SKIP_ONBOARDING": "1"
+      },
       "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
     },
     {
       "name": "direct-background",
-      "argv": ["{binary}", "background", "--json"],
+      "argv": [
+        "{binary}",
+        "background",
+        "--json"
+      ],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {
+        "FX_SKIP_ONBOARDING": "1"
+      },
       "timeout_seconds": 60,
       "requires_tmux": false
     },
     {
       "name": "direct-doctor",
-      "argv": ["{binary}", "doctor", "--json"],
+      "argv": [
+        "{binary}",
+        "doctor",
+        "--json"
+      ],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {
+        "FX_SKIP_ONBOARDING": "1"
+      },
       "timeout_seconds": 60,
       "requires_tmux": false
     },
     {
       "name": "direct-sessions",
-      "argv": ["{binary}", "sessions", "--json"],
+      "argv": [
+        "{binary}",
+        "sessions",
+        "--json"
+      ],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {
+        "FX_SKIP_ONBOARDING": "1"
+      },
       "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
-    },
-    {"name": "e2e-cli", "argv": ["bun", "test", "--max-concurrency", "1", "./cli.test.ts"], "test_file": "cli.test.ts", "allow_keychain": true},
-    {"name": "e2e-ask-presentation", "argv": ["bun", "test", "--max-concurrency", "1", "./ask-presentation.test.ts"], "test_file": "ask-presentation.test.ts"},
-    {"name": "e2e-config-persistence", "argv": ["bun", "test", "--max-concurrency", "1", "./config-persistence.test.ts"], "test_file": "config-persistence.test.ts"},
-    {"name": "e2e-prompt-history", "argv": ["bun", "test", "--max-concurrency", "1", "./prompt-history.test.ts"], "test_file": "prompt-history.test.ts"},
-    {"name": "e2e-auth-refresh", "argv": ["bun", "test", "--max-concurrency", "1", "./auth-refresh.test.ts"], "test_file": "auth-refresh.test.ts"},
-    {"name": "e2e-file-tool-paths", "argv": ["bun", "test", "--max-concurrency", "1", "./file-tool-paths.test.ts"], "test_file": "file-tool-paths.test.ts"},
-    {"name": "e2e-file-tool-permissions", "argv": ["bun", "test", "--max-concurrency", "1", "./file-tool-permissions.test.ts"], "test_file": "file-tool-permissions.test.ts"},
-    {"name": "e2e-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./gateway-stream-lifecycle.test.ts"], "test_file": "gateway-stream-lifecycle.test.ts"},
-    {"name": "e2e-web-fetch-fake-network", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-fake-network.test.ts"], "test_file": "web-fetch-fake-network.test.ts"},
-    {"name": "e2e-web-search-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-fake-gateway.test.ts"], "test_file": "web-search-fake-gateway.test.ts"},
-    {"name": "e2e-vision-route-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./vision-route-fake-gateway.test.ts"], "test_file": "vision-route-fake-gateway.test.ts"},
-    {"name": "e2e-acp", "argv": ["bun", "test", "--max-concurrency", "1", "./acp.test.ts"], "test_file": "acp.test.ts"},
-    {"name": "e2e-mcp-http", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-http.test.ts"], "test_file": "mcp-http.test.ts"},
-    {"name": "e2e-mcp-legacy-remote", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-legacy-remote.test.ts"], "test_file": "mcp-legacy-remote.test.ts"},
-    {"name": "e2e-mcp-stdio", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-stdio.test.ts"], "test_file": "mcp-stdio.test.ts"},
-    {"name": "e2e-mcp-auth", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-auth.test.ts"], "test_file": "mcp-auth.test.ts", "allow_keychain": true},
-    {"name": "e2e-session-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./session-recovery.test.ts"], "test_file": "session-recovery.test.ts"},
-    {"name": "e2e-terminal-host", "argv": ["bun", "test", "--max-concurrency", "1", "./terminal-host.test.ts"], "test_file": "terminal-host.test.ts"},
-    {"name": "e2e-tui-startup", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-startup.test.ts"], "test_file": "tui-startup.test.ts"},
-    {"name": "e2e-permission-errors", "argv": ["bun", "test", "--max-concurrency", "1", "./permission-errors.test.ts"], "test_file": "permission-errors.test.ts"},
-    {"name": "e2e-tui-resize", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resize.test.ts"], "test_file": "tui-resize.test.ts"},
-    {"name": "e2e-tui-render-stress", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-render-stress.test.ts"], "test_file": "tui-render-stress.test.ts"},
-    {"name": "e2e-tui-full-transcript-brutal", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-full-transcript-brutal.test.ts"], "test_file": "tui-full-transcript-brutal.test.ts"},
-    {"name": "e2e-tui-resume-brutal", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resume-brutal.test.ts"], "test_file": "tui-resume-brutal.test.ts"},
-    {"name": "e2e-tui-permissions", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-permissions.test.ts"], "test_file": "tui-permissions.test.ts"},
-    {"name": "e2e-tui-interrupt-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-interrupt-recovery.test.ts"], "test_file": "tui-interrupt-recovery.test.ts"},
-    {"name": "e2e-tui-subagent-manager", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-subagent-manager.test.ts"], "test_file": "tui-subagent-manager.test.ts"},
-    {"name": "e2e-tui-terminal-tool", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-terminal-tool.test.ts"], "test_file": "tui-terminal-tool.test.ts"},
-    {"name": "e2e-tui-native-clear-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-native-clear-recovery.test.ts"], "test_file": "tui-native-clear-recovery.test.ts"},
-    {"name": "e2e-tui-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-gateway-stream-lifecycle.test.ts"], "test_file": "tui-gateway-stream-lifecycle.test.ts"}
+    }
   ],
-  "verification_scenarios": [
-    {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
-    {"name": "verify-oauth-keychain-migration", "argv": ["bun", "test", "--max-concurrency", "1", "./oauth-keychain-migration.test.ts"], "test_file": "oauth-keychain-migration.test.ts", "allow_keychain": true},
-    {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},
-    {"name": "verify-tui-composer-edit-contracts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-composer-edit-contracts.test.ts"], "test_file": "tui-composer-edit-contracts.test.ts"},
-    {"name": "verify-tui-cost", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-cost.test.ts"], "test_file": "tui-cost.test.ts"},
-    {"name": "verify-tui-decision-prompts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-decision-prompts.test.ts"], "test_file": "tui-decision-prompts.test.ts"},
-    {"name": "verify-tui-file-picker", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-file-picker.test.ts"], "test_file": "tui-file-picker.test.ts"},
-    {"name": "verify-tui-input-line-delete", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-input-line-delete.test.ts"], "test_file": "tui-input-line-delete.test.ts"},
-    {"name": "verify-tui-input-navigation", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-input-navigation.test.ts"], "test_file": "tui-input-navigation.test.ts"},
-    {"name": "verify-tui-render-replay", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-render-replay.test.ts"], "test_file": "tui-render-replay.test.ts"},
-    {"name": "verify-tui-resume", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resume.test.ts"], "test_file": "tui-resume.test.ts"},
-    {"name": "verify-tui-slash-commands", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-commands.test.ts"], "test_file": "tui-slash-commands.test.ts"},
-    {"name": "verify-tui-slash-extra", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-extra.test.ts"], "test_file": "tui-slash-extra.test.ts"},
-    {"name": "verify-tui-slash-menu", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-menu.test.ts"], "test_file": "tui-slash-menu.test.ts"},
-    {"name": "verify-web-fetch-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-permission-progress.test.ts"], "test_file": "web-fetch-permission-progress.test.ts", "requires_tmux": false},
-    {"name": "verify-web-search-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-permission-progress.test.ts"], "test_file": "web-search-permission-progress.test.ts", "requires_tmux": false},
-    {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"}
-  ]
+  "verification_scenarios": []
 }

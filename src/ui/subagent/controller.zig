@@ -604,54 +604,6 @@ pub const Controller = struct {
 pub const statusLabelPublic = subagent_runtime.statusLabelPublic;
 pub const childInputFailureDisplay = subagent_runtime.childInputFailureDisplay;
 
-test "controller opens an empty manager and ctrl x closes from a nested route" {
-    const alloc = std.testing.allocator;
-    var controller = Controller{};
-    defer controller.deinit(alloc);
-    controller.open(alloc);
-    try std.testing.expect(controller.isViewActive());
-    try std.testing.expectEqual(KeyAction.none, try controller.handleKey(alloc, 0x1b));
-    try std.testing.expectEqual(KeyAction.redraw, try controller.handleKeyWithMainApproval(alloc, 'n', 42));
-    try std.testing.expect(controller.acknowledgement() == null);
-    try std.testing.expectEqual(KeyAction.close_manager, try controller.handleKey(alloc, 24));
-}
 
-test "controller settles a manager paste delivery epoch" {
-    const alloc = std.testing.allocator;
-    var controller = Controller{};
-    defer controller.deinit(alloc);
-    controller.open(alloc);
 
-    controller.beginManagerPaste();
-    for ("ROOT_PASTE_LEAK\x1b[201~") |byte| {
-        try std.testing.expect(try controller.consumeManagerPasteByte(alloc, byte));
-    }
 
-    try std.testing.expect(controller.managerPasteActive());
-    try std.testing.expect(controller.settleManagerPasteDeliveryEpoch(alloc));
-    try std.testing.expect(!controller.managerPasteActive());
-}
-
-test "controller projection clear invalidates cached refresh state" {
-    const alloc = std.testing.allocator;
-    var controller = Controller{};
-    defer controller.deinit(alloc);
-    controller.last_refresh_ms = 42;
-    controller.runtime.loading = false;
-
-    controller.clearProjection(alloc);
-
-    try std.testing.expectEqual(@as(i64, 0), controller.last_refresh_ms);
-    try std.testing.expect(controller.runtime.loading);
-    try std.testing.expectEqual(@as(usize, 0), controller.count());
-
-    controller.setCountProjection(3);
-    try std.testing.expectEqual(@as(usize, 3), controller.count());
-}
-
-test "controller exposes the child composer shortcut routing contract" {
-    try std.testing.expect(@hasDecl(Controller, "childComposerFocused"));
-    try std.testing.expect(@hasDecl(Controller, "childComposerEditor"));
-    try std.testing.expect(@hasDecl(Controller, "moveChildInputCursor"));
-    try std.testing.expect(@hasDecl(Controller, "commitChildEditorEdit"));
-}

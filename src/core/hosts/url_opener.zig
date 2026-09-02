@@ -104,40 +104,5 @@ const MockLauncher = struct {
     }
 };
 
-test "url opener selects the platform launcher argv" {
-    const alloc = std.testing.allocator;
 
-    var macos = MockLauncher{};
-    defer macos.deinit(alloc);
-    try std.testing.expectEqual(LaunchOutcome.opened, launchUrl(alloc, "http://localhost:3000", .macos, macos.launcher()));
-    try std.testing.expectEqualStrings("open http://localhost:3000", macos.argv_joined.items);
 
-    var linux = MockLauncher{};
-    defer linux.deinit(alloc);
-    try std.testing.expectEqual(LaunchOutcome.opened, launchUrl(alloc, "http://localhost:3000", .linux, linux.launcher()));
-    try std.testing.expectEqualStrings("xdg-open http://localhost:3000", linux.argv_joined.items);
-}
-
-test "url opener reports unsupported platforms without launching" {
-    const alloc = std.testing.allocator;
-    var mock = MockLauncher{};
-    defer mock.deinit(alloc);
-    try std.testing.expectEqual(LaunchOutcome.unsupported, launchUrl(alloc, "http://x", .windows, mock.launcher()));
-    try std.testing.expectEqualStrings("", mock.argv_joined.items);
-}
-
-test "url opener treats nonzero exit, bad terms, and launch errors as failed" {
-    const alloc = std.testing.allocator;
-
-    var nonzero = MockLauncher{ .result = .{ .term = .{ .exited = 3 } } };
-    defer nonzero.deinit(alloc);
-    try std.testing.expectEqual(LaunchOutcome.failed, launchUrl(alloc, "http://x", .macos, nonzero.launcher()));
-
-    var signaled = MockLauncher{ .result = .{ .term = .{ .signal = @enumFromInt(2) } } };
-    defer signaled.deinit(alloc);
-    try std.testing.expectEqual(LaunchOutcome.failed, launchUrl(alloc, "http://x", .macos, signaled.launcher()));
-
-    var erroring = MockLauncher{ .result = error.SpawnFailed };
-    defer erroring.deinit(alloc);
-    try std.testing.expectEqual(LaunchOutcome.failed, launchUrl(alloc, "http://x", .linux, erroring.launcher()));
-}

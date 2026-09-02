@@ -1,6 +1,0 @@
-# MCP 2026-07-28
-# @modelcontextprotocol/conformance 0.2.0-alpha.10
-# Source revision a9896553900a2ef61787b57adfcbbe936a8ab1f9
-#
-# S07 has no expected MCP 2026-07-28 client conformance failures.
-client: []

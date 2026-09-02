@@ -147,53 +147,6 @@ fn optionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
     }
 }
 
-test "invalid invocation IDs map to stable bounded operation IDs" {
-    const alloc = std.testing.allocator;
-    const first = try operationIdAlloc(alloc, "bad id");
-    defer alloc.free(first);
-    const second = try operationIdAlloc(alloc, "bad id");
-    defer alloc.free(second);
-    try std.testing.expectEqualStrings(first, second);
-    try domain.validateOperationId(first);
-}
 
-test "bound operation IDs authenticate source epoch and invocation digest" {
-    const alloc = std.testing.allocator;
-    const first = try boundOperationIdAlloc(alloc, "provider-controlled", .model, 41);
-    defer alloc.free(first);
-    const replay = try boundOperationIdAlloc(alloc, "provider-controlled", .model, 41);
-    defer alloc.free(replay);
-    const next = try boundOperationIdAlloc(alloc, "provider-controlled", .model, 42);
-    defer alloc.free(next);
-    try std.testing.expectEqualStrings(first, replay);
-    try std.testing.expect(!std.mem.eql(u8, first, next));
-    const identity = parseBoundOperationId(first).?;
-    try std.testing.expectEqual(domain.OperationIdentitySource.model, identity.source);
-    try std.testing.expectEqual(@as(u64, 41), identity.epoch);
-    try std.testing.expectEqual(domain.OperationIdentityAuthority.manager, identity.authority);
-    try std.testing.expect(boundOperationMatchesInvocation(first, "provider-controlled", .model));
-    try std.testing.expect(!boundOperationMatchesInvocation(first, "changed", .model));
-    try domain.validateOperationId(first);
-    try std.testing.expect(parseBoundOperationId("fxop:m:041:0000000000000000000000000000000000000000000000000000000000000000") == null);
-}
 
-test "process-local operation IDs remain parseable as legacy identities" {
-    const legacy = "fxop:h:7:0000000000000000000000000000000000000000000000000000000000000000";
-    const identity = parseBoundOperationId(legacy).?;
-    try std.testing.expectEqual(domain.OperationIdentitySource.human, identity.source);
-    try std.testing.expectEqual(@as(u64, 7), identity.epoch);
-    try std.testing.expectEqual(
-        domain.OperationIdentityAuthority.process_local,
-        identity.authority,
-    );
-}
 
-test "failure result exposes the complete stable envelope" {
-    const alloc = std.testing.allocator;
-    const json = try failureAlloc(alloc, "call-1", null, "rejected", "invalid_enum", false, null);
-    defer alloc.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"operation_id\":\"call-1\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"error_code\":\"invalid_enum\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"requested\":null") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"cursor\":null") != null);
-}

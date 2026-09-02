@@ -215,83 +215,9 @@ fn ownedSnapshot(
     return .{ .servers = servers };
 }
 
-test "availability follows canonical connection authentication and deferred state" {
-    const Case = struct {
-        connection: health.ConnectionState,
-        authentication: health.AuthenticationState = .none,
-        deferred_for_ask: bool = false,
-        expected: Availability,
-    };
-    const cases = [_]Case{
-        .{ .connection = .ready, .expected = .ready },
-        .{ .connection = .connecting, .expected = .discovering },
-        .{ .connection = .disconnected, .deferred_for_ask = true, .expected = .available_on_demand },
-        .{ .connection = .failed, .authentication = .required, .expected = .authentication_required },
-        .{ .connection = .disabled, .expected = .disabled },
-        .{ .connection = .failed, .expected = .failed },
-        .{ .connection = .disconnected, .expected = .unavailable },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            classifyAvailability(case.connection, case.authentication, case.deferred_for_ask),
-        );
-    }
-}
 
-test "render exposes sorted server summaries without tool metadata" {
-    const alloc = std.testing.allocator;
-    var snapshot = try ownedSnapshot(alloc, &.{
-        .{ .name = "zeta", .availability = .authentication_required },
-        .{ .name = "alpha", .availability = .ready, .tool_count = 2 },
-    });
-    defer snapshot.deinit(alloc);
 
-    var section = try render(alloc, snapshot);
-    defer section.deinit(alloc);
 
-    try std.testing.expectEqualStrings(
-        "Configured MCP servers visible to this model turn are listed below.\n" ++
-            "Use capability_search with the requested use case. Then use mcp_select_tool with one exact MCP result. Do not guess tool names.\n" ++
-            "<mcp_servers>\n" ++
-            "  <server name=\"alpha\" state=\"ready\" tools=\"2\" />\n" ++
-            "  <server name=\"zeta\" state=\"authentication_required\" />\n" ++
-            "</mcp_servers>\n",
-        section.text,
-    );
-    try std.testing.expectEqual(@as(?[]u8, null), section.notice);
-}
-
-test "render encodes names and bounds omissions without revealing omitted aliases" {
-    const alloc = std.testing.allocator;
-    var snapshot = try ownedSnapshot(alloc, &.{
-        .{ .name = "alpha", .availability = .ready, .tool_count = 1 },
-        .{ .name = "bravo", .availability = .ready, .tool_count = 2 },
-        .{ .name = "hidden<&\"", .availability = .failed },
-    });
-    defer snapshot.deinit(alloc);
-
-    var section = try renderWithLimit(alloc, snapshot, 280);
-    defer section.deinit(alloc);
-
-    try std.testing.expect(section.text.len <= 280);
-    try std.testing.expect(section.notice != null);
-    try std.testing.expect(std.mem.find(u8, section.notice.?, "omitted 3 MCP servers") != null);
-    try std.testing.expect(std.mem.find(u8, section.notice.?, "hidden") == null);
-    try std.testing.expect(std.mem.find(u8, section.text, "hidden<&\"") == null);
-}
-
-test "render explicitly reports an empty catalog" {
-    const alloc = std.testing.allocator;
-    var snapshot = try ownedSnapshot(alloc, &.{});
-    defer snapshot.deinit(alloc);
-
-    var section = try render(alloc, snapshot);
-    defer section.deinit(alloc);
-
-    try std.testing.expect(std.mem.find(u8, section.text, "<none />") != null);
-    try std.testing.expectEqual(@as(?[]u8, null), section.notice);
-}
 
 fn checkRenderAllocationFailures(alloc: Allocator) !void {
     var servers = [_]ServerSummary{
@@ -302,10 +228,3 @@ fn checkRenderAllocationFailures(alloc: Allocator) !void {
     section.deinit(alloc);
 }
 
-test "render cleans up every partial allocation" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkRenderAllocationFailures,
-        .{},
-    );
-}

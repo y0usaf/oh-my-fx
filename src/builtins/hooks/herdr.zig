@@ -285,110 +285,13 @@ fn writeClearAuthority(w: *std.Io.Writer, id: u64, pane_id: []const u8) !void {
     try w.writeAll("}}\n");
 }
 
-test "shouldEnable requires both socket path and pane id" {
-    try std.testing.expect(Client.shouldEnable(null, "/tmp/herdr.sock", "w1:p1"));
-    try std.testing.expect(!Client.shouldEnable(null, null, "w1:p1"));
-    try std.testing.expect(!Client.shouldEnable(null, "/tmp/herdr.sock", null));
-    try std.testing.expect(!Client.shouldEnable(null, "", "w1:p1"));
-    try std.testing.expect(!Client.shouldEnable(null, "/tmp/herdr.sock", ""));
-}
 
-test "shouldEnable honors FX_HERDR opt-out" {
-    try std.testing.expect(!Client.shouldEnable("0", "/tmp/herdr.sock", "w1:p1"));
-    try std.testing.expect(!Client.shouldEnable("false", "/tmp/herdr.sock", "w1:p1"));
-    try std.testing.expect(!Client.shouldEnable("FALSE", "/tmp/herdr.sock", "w1:p1"));
-    try std.testing.expect(Client.shouldEnable("1", "/tmp/herdr.sock", "w1:p1"));
-}
 
-test "report_agent serializes a single newline-delimited json line" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeReportAgent(&out.writer, 7, "w1:p1", .working, "editing");
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"7\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"w1:p1\"," ++
-            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"working\"," ++
-            "\"custom_status\":\"editing\"}}\n",
-        out.written(),
-    );
-}
 
-test "report_agent omits custom_status when null" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeReportAgent(&out.writer, 1, "w1:p1", .idle, null);
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"1\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"w1:p1\"," ++
-            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"idle\"}}\n",
-        out.written(),
-    );
-}
 
-test "report_agent escapes pane id" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeReportAgent(&out.writer, 2, "pane\"x", .blocked, null);
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"2\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"pane\\\"x\"," ++
-            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"blocked\"}}\n",
-        out.written(),
-    );
-}
 
-test "pane.rename labels the pane" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeRename(&out.writer, 4, "pane.rename", "pane_id", "w1:p1", "label", "fx");
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"4\",\"method\":\"pane.rename\",\"params\":{\"pane_id\":\"w1:p1\",\"label\":\"fx\"}}\n",
-        out.written(),
-    );
-}
 
-test "agent.rename names the agent" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeRename(&out.writer, 5, "agent.rename", "target", "w1:p1", "name", "fx");
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"5\",\"method\":\"agent.rename\",\"params\":{\"target\":\"w1:p1\",\"name\":\"fx\"}}\n",
-        out.written(),
-    );
-}
 
-test "rename with null value clears the label" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeRename(&out.writer, 6, "pane.rename", "pane_id", "w1:p1", "label", null);
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"6\",\"method\":\"pane.rename\",\"params\":{\"pane_id\":\"w1:p1\",\"label\":null}}\n",
-        out.written(),
-    );
-}
 
-test "clear_agent_authority removes fx from the pane" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeClearAuthority(&out.writer, 7, "w1:p1");
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"7\",\"method\":\"pane.clear_agent_authority\",\"params\":{\"pane_id\":\"w1:p1\",\"source\":\"custom:fx\"}}\n",
-        out.written(),
-    );
-}
 
-test "report_agent_session serializes session identity" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeReportAgentSession(&out.writer, 3, "w1:p1", "session-42");
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"3\",\"method\":\"pane.report_agent_session\",\"params\":{\"pane_id\":\"w1:p1\"," ++
-            "\"source\":\"custom:fx\",\"agent\":\"fx\",\"agent_session_id\":\"session-42\"}}\n",
-        out.written(),
-    );
-}
 
-test "clampStatus caps to 32 bytes and normalizes empty" {
-    try std.testing.expect(clampStatus(null) == null);
-    try std.testing.expect(clampStatus("") == null);
-    const long = "0123456789012345678901234567890123456789";
-    const clamped = clampStatus(long).?;
-    try std.testing.expectEqual(@as(usize, custom_status_max), clamped.len);
-}

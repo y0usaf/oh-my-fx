@@ -32,7 +32,7 @@ const browserHash = digest(packagedBrowser);
 const browserName = `browser.${browserHash}.js`;
 
 const replacements = [
-  ['const fxWasmAsset = "./fx-term.wasm";', `const fxWasmAsset = "./${wasmName}";`],
+  ['const fxWasmAsset = "./omfx-term.wasm";', `const fxWasmAsset = "./${wasmName}";`],
   ['const fxWasmIntegrity = "";', `const fxWasmIntegrity = "${integrity(wasmBytes)}";`],
   ['from "./browser.js";', `from "./${browserName}";`],
 ];

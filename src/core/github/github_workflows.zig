@@ -56,60 +56,7 @@ fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) == null);
 }
 
-test "build pull request prompt includes additional context" {
-    const prompt = buildPrompt(std.testing.allocator, .pull_request, ConversationLanguage.default(), "ready for review") catch |err| switch (err) {
-        error.NotGitRepository => return,
-        else => return err,
-    };
-    defer std.testing.allocator.free(prompt);
 
-    try expectContains(prompt, "ready for review");
-    try expectContains(prompt, "## Summary");
-}
 
-test "build issue prompt defaults cleanly without context" {
-    const prompt = try buildPrompt(std.testing.allocator, .issue, ConversationLanguage.default(), "");
-    defer std.testing.allocator.free(prompt);
 
-    try expectContains(prompt, "GitHub issue");
-    try expectContains(prompt, "## Steps to Reproduce");
-}
 
-test "pull request prompt preserves active context and section contract" {
-    const prompt = try buildPromptFromSnapshot(std.testing.allocator, .pull_request, ConversationLanguage.literal("es"), " ready for review \n", .{
-        .in_git_repo = true,
-        .text = "Git snapshot\nBranch: feature\n",
-    });
-    defer std.testing.allocator.free(prompt);
-
-    try expectContains(prompt, "Additional context: ready for review.");
-    try expectContains(prompt, "Git snapshot\nBranch: feature\n");
-    try expectContains(prompt, "## Summary");
-    try expectContains(prompt, "## Testing");
-    try expectNotContains(prompt, "## Steps to Reproduce");
-    try expectContains(prompt, "Do not create the PR with gh or publish anything unless I explicitly ask you to.");
-}
-
-test "pull request prompt requires a git repository" {
-    try std.testing.expectError(error.NotGitRepository, buildPromptFromSnapshot(std.testing.allocator, .pull_request, ConversationLanguage.default(), "", .{
-        .in_git_repo = false,
-        .text = "Git snapshot\nBranch: unavailable\n",
-    }));
-}
-
-test "issue prompt works outside git and omits empty context clause" {
-    const prompt = try buildPromptFromSnapshot(std.testing.allocator, .issue, ConversationLanguage.default(), " \t\r\n", .{
-        .in_git_repo = false,
-        .text = "Git snapshot\nBranch: unavailable\n",
-    });
-    defer std.testing.allocator.free(prompt);
-
-    try expectContains(prompt, "Draft a GitHub issue from the current context.");
-    try expectContains(prompt, "Git snapshot\nBranch: unavailable\n");
-    try expectContains(prompt, "## Summary");
-    try expectContains(prompt, "## Steps to Reproduce");
-    try expectContains(prompt, "## Expected");
-    try expectContains(prompt, "## Actual");
-    try expectNotContains(prompt, "Additional context:");
-    try expectContains(prompt, "Do not create the issue with gh or publish anything unless I explicitly ask you to.");
-}

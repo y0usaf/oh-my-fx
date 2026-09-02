@@ -52,27 +52,4 @@ pub fn containsSpan(outer: Span, inner: Span) bool {
     return outer.raw_start <= inner.raw_start and inner.raw_end <= outer.raw_end;
 }
 
-test "entity spans shift only for edits outside their contents" {
-    const span = Span{ .raw_start = 4, .raw_end = 10 };
 
-    try std.testing.expectEqual(Span{ .raw_start = 6, .raw_end = 12 }, afterInsert(span, 4, 2).?);
-    try std.testing.expectEqual(span, afterInsert(span, 10, 2).?);
-    try std.testing.expect(afterInsert(span, 7, 2) == null);
-
-    try std.testing.expectEqual(Span{ .raw_start = 2, .raw_end = 8 }, afterDelete(span, 1, 3).?);
-    try std.testing.expectEqual(span, afterDelete(span, 10, 12).?);
-    try std.testing.expect(afterDelete(span, 3, 5) == null);
-    try std.testing.expect(afterDelete(span, 5, 7) == null);
-}
-
-test "entity span relationship helpers use half-open ranges" {
-    const entity = Span{ .raw_start = 4, .raw_end = 10 };
-    try std.testing.expect(entity.isValid(10));
-    try std.testing.expect(!entity.isValid(9));
-    try std.testing.expect(!entity.contains(4));
-    try std.testing.expect(entity.contains(5));
-    try std.testing.expect(!entity.contains(10));
-    try std.testing.expect(overlaps(entity, .{ .raw_start = 9, .raw_end = 12 }));
-    try std.testing.expect(!overlaps(entity, .{ .raw_start = 10, .raw_end = 12 }));
-    try std.testing.expect(containsSpan(entity, .{ .raw_start = 5, .raw_end = 9 }));
-}

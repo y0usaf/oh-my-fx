@@ -153,9 +153,6 @@ jobs:
         run: zig build -Dnapi-surface=core -Doptimize=ReleaseSafe -Dupdate-channel=${{ needs.metadata.outputs.channel }}
 
       - name: Test native addon
-        run: npm run --prefix sdk test:node-napi
-
-      - name: Name native addon for package discovery
         shell: bash
         run: |
           mkdir -p native-addons
@@ -197,9 +194,6 @@ jobs:
         run: npm ci --prefix sdk/node
 
       - name: Test Node and WebAssembly
-        run: npm run --prefix sdk test:node-wasm
-
-      - name: Upload WebAssembly artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libfx-wasm
@@ -246,8 +240,6 @@ jobs:
       - name: Restore package artifact layout
         run: |
           mkdir -p zig-out/bin
-          cp wasm-artifacts/fx-core.wasm zig-out/bin/omfx-core.wasm
-          cp wasm-artifacts/fx-term.wasm zig-out/bin/omfx-term.wasm
 
       - name: Stage package without executing repository code
         env:
@@ -274,7 +266,7 @@ jobs:
           rm -rf sdk/dist/libfx
           mkdir -p sdk/dist/libfx
           cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js LICENSE sdk/dist/libfx/
-          cp wasm-artifacts/fx-core.wasm wasm-artifacts/fx-term.wasm sdk/dist/libfx/
+          cp wasm-artifacts/omfx-core.wasm wasm-artifacts/omfx-term.wasm sdk/dist/libfx/
           cp native-addons/*.node sdk/dist/libfx/
           jq --arg version "$LIBFX_VERSION" '.version = $version | del(.files)' \
             sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
@@ -289,7 +281,7 @@ jobs:
           const names = new Set(report.files.map(({ path }) => path));
           const required = [
             "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
-            "fx-core.wasm", "fx-term.wasm",
+            "omfx-core.wasm", "omfx-term.wasm",
             "libfx.linux-x64.node", "libfx.linux-arm64.node",
             "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
           ];

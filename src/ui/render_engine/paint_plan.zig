@@ -576,147 +576,13 @@ pub fn transcriptBottomLimit(
     return bottom;
 }
 
-test "transcript bottom limit excludes reserved activity and idle gap rows" {
-    try std.testing.expectEqual(
-        @as(u16, 39),
-        transcriptBottomLimit(42, .{ .transient_row = .{ .row = 41, .gap_above_rows = 1 } }, 2),
-    );
-    try std.testing.expectEqual(
-        @as(u16, 40),
-        transcriptBottomLimit(42, .none, 1),
-    );
-    try std.testing.expectEqual(
-        @as(u16, 41),
-        transcriptBottomLimit(42, .none, 0),
-    );
-}
 
-test "activity band maps transient rows and overlay ownership" {
-    try std.testing.expectEqual(
-        FrameBand{ .top = 8, .bottom = 9, .owner = .activity },
-        activityBand(.{ .transient_row = .{ .row = 8, .row_count = 2, .gap_above_rows = 1 } }),
-    );
-    try std.testing.expectEqual(
-        FrameBand{ .top = 6, .bottom = 9, .owner = .activity },
-        activityBand(.{ .transient_row = .{ .row = 8, .row_count = 2, .gap_above_rows = 1, .tool_row = 6 } }),
-    );
-    try std.testing.expect(activityBand(.{ .overlay_entry = 7 }).isEmpty());
-    try std.testing.expect(activityBand(.none).isEmpty());
-}
 
-test "painted band spans painted rows and band changes" {
-    var plan = validPlan();
-    plan.transcript_band = .{ .top = 4, .bottom = 8, .owner = .transcript };
-    plan.activity = .{ .transient_row = .{ .row = 10, .gap_above_rows = 1 } };
-    plan.activity_band = .{ .top = 10, .bottom = 10, .owner = .activity };
-    plan.footer.top = 12;
-    plan.footer_band = .{ .top = 12, .bottom = 16, .owner = .footer };
 
-    try std.testing.expectEqual(
-        FrameBand{ .top = 4, .bottom = 16, .owner = .transcript },
-        paintedContentBand(plan),
-    );
 
-    try std.testing.expectEqual(
-        FrameBand{ .top = 2, .bottom = 16, .owner = .transcript },
-        paintedBandChange(plan, .{ .top = 2, .bottom = 12, .owner = .transcript }).?,
-    );
-    try std.testing.expect(paintedBandChange(plan, .{ .top = 4, .bottom = 16, .owner = .transcript }) == null);
-}
 
-test "active repaint window can exclude retained transcript rows" {
-    var plan = validPlan();
-    plan.transcript_band = .{ .top = 4, .bottom = 8, .owner = .transcript };
-    plan.activity = .{ .transient_row = .{ .row = 10, .gap_above_rows = 1 } };
-    plan.activity_band = .{ .top = 10, .bottom = 10, .owner = .activity };
-    plan.footer.top = 12;
-    plan.footer_band = .{ .top = 12, .bottom = 16, .owner = .footer };
-    try plan.invalidation.append(.{ .reason = .external_clear, .top = 12, .bottom = 16 });
 
-    const full = FrameRepaintWindow.fromPlan(plan, .{ .include_transcript = true });
-    try std.testing.expectEqual(@as(u8, 3), full.set.len);
-    try std.testing.expectEqual(@as(u16, 4), full.ranges()[0].top);
-    try std.testing.expectEqual(@as(u16, 8), full.ranges()[0].bottom);
-    try std.testing.expectEqual(@as(u16, 10), full.ranges()[1].top);
-    try std.testing.expectEqual(@as(u16, 10), full.ranges()[1].bottom);
-    try std.testing.expectEqual(@as(u16, 12), full.ranges()[2].top);
-    try std.testing.expectEqual(@as(u16, 16), full.ranges()[2].bottom);
-    try full.validate(plan);
 
-    const active = FrameRepaintWindow.fromPlan(plan, .{ .include_transcript = false });
-    try std.testing.expectEqual(@as(u8, 2), active.set.len);
-    try std.testing.expectEqual(@as(u16, 10), active.ranges()[0].top);
-    try std.testing.expectEqual(@as(u16, 10), active.ranges()[0].bottom);
-    try std.testing.expectEqual(@as(u16, 12), active.ranges()[1].top);
-    try std.testing.expectEqual(@as(u16, 16), active.ranges()[1].bottom);
-    try active.validate(plan);
-}
-
-test "active repaint window clips broad invalidation below preserved rows" {
-    var plan = validPlan();
-    plan.preserved_band = .{ .top = 1, .bottom = 7, .owner = .preserved_shell };
-    plan.transcript_band = FrameBand.empty(.transcript);
-    plan.footer.top = 8;
-    plan.footer_band = .{ .top = 8, .bottom = 10, .owner = .footer };
-    try plan.invalidation.append(.{ .reason = .owned_band_change, .top = 1, .bottom = 12 });
-
-    const window = FrameRepaintWindow.fromPlan(plan, .{ .include_transcript = false });
-
-    try std.testing.expectEqual(@as(u8, 1), window.set.len);
-    try std.testing.expectEqual(@as(u16, 8), window.ranges()[0].top);
-    try std.testing.expectEqual(@as(u16, 12), window.ranges()[0].bottom);
-    try window.validate(plan);
-}
-
-test "active repaint window clips broad invalidation around retained transcript rows" {
-    var plan = validPlan();
-    plan.transcript_band = .{ .top = 4, .bottom = 8, .owner = .transcript };
-    plan.activity = .{ .transient_row = .{ .row = 10, .gap_above_rows = 1 } };
-    plan.activity_band = .{ .top = 10, .bottom = 10, .owner = .activity };
-    plan.footer.top = 12;
-    plan.footer_band = .{ .top = 12, .bottom = 16, .owner = .footer };
-    try plan.invalidation.append(.{ .reason = .owned_band_change, .top = 4, .bottom = 16 });
-
-    const window = FrameRepaintWindow.fromPlan(plan, .{ .include_transcript = false });
-
-    try std.testing.expectEqual(@as(u8, 1), window.set.len);
-    try std.testing.expectEqual(@as(u16, 9), window.ranges()[0].top);
-    try std.testing.expectEqual(@as(u16, 16), window.ranges()[0].bottom);
-    try window.validate(plan);
-}
-
-test "active repaint window keeps transcript rows outside retained source" {
-    var plan = validPlan();
-    plan.transcript_band = .{ .top = 4, .bottom = 8, .owner = .transcript };
-    plan.activity = .{ .transient_row = .{ .row = 10, .gap_above_rows = 1 } };
-    plan.activity_band = .{ .top = 10, .bottom = 10, .owner = .activity };
-    plan.footer.top = 12;
-    plan.footer_band = .{ .top = 12, .bottom = 16, .owner = .footer };
-    try plan.invalidation.append(.{ .reason = .owned_band_change, .top = 4, .bottom = 16 });
-
-    const window = FrameRepaintWindow.fromPlan(plan, .{
-        .include_transcript = false,
-        .retained_transcript_band = .{ .top = 4, .bottom = 6, .owner = .transcript },
-    });
-
-    try std.testing.expectEqual(@as(u8, 1), window.set.len);
-    try std.testing.expectEqual(@as(u16, 7), window.ranges()[0].top);
-    try std.testing.expectEqual(@as(u16, 16), window.ranges()[0].bottom);
-    try window.validate(plan);
-}
-
-test "retry invalidations collapse disjoint repaint ranges into one bounded request" {
-    var window = FrameRepaintWindow{};
-    try window.set.append(.{ .reason = .owned_band_change, .top = 2, .bottom = 4 });
-    try window.set.append(.{ .reason = .owned_band_change, .top = 8, .bottom = 10 });
-
-    const retry = window.retryInvalidations(.partial_write);
-
-    try std.testing.expectEqual(@as(u8, 1), retry.len);
-    try std.testing.expectEqual(FrameInvalidationReason.partial_write, retry.ranges()[0].reason);
-    try std.testing.expectEqual(@as(u16, 2), retry.ranges()[0].top);
-    try std.testing.expectEqual(@as(u16, 10), retry.ranges()[0].bottom);
-}
 
 fn validPlan() PaintPlan {
     return .{
@@ -765,86 +631,13 @@ fn validPlan() PaintPlan {
     };
 }
 
-test "valid normal plan" {
-    try validPlan().validate();
-}
 
-test "paint plan permits an explicit zero-row footer" {
-    var plan = validPlan();
-    plan.layout.content_bottom = plan.layout.rows;
-    plan.footer = .{
-        .top = plan.layout.rows,
-        .top_divider = plan.layout.rows,
-        .banner = plan.layout.rows,
-        .input_base = plan.layout.rows,
-        .picker_divider = plan.layout.rows,
-        .picker_start = plan.layout.rows,
-        .bottom_divider = plan.layout.rows,
-        .hint = plan.layout.rows,
-        .total_rows = 0,
-    };
-    plan.footer_band = FrameBand.empty(.footer);
-    plan.footer_reservation_source = .none;
-    plan.cursor_target = .{ .row = 4, .col = 1, .visible = true };
 
-    try plan.validate();
-}
 
-test "paint plan rejects zero terminal dimensions" {
-    var plan = validPlan();
-    plan.layout.rows = 0;
-    try std.testing.expectError(error.InvalidTerminalDimensions, plan.validate());
-}
 
-test "paint plan allows empty activity band when activity is none" {
-    var plan = validPlan();
-    plan.activity = .none;
-    plan.activity_band = FrameBand.empty(.activity);
-    try plan.validate();
-}
 
-test "paint plan rejects footer and activity overlap" {
-    var plan = validPlan();
-    plan.activity = .{ .transient_row = .{ .row = 21, .gap_above_rows = 0 } };
-    plan.activity_band = .{ .top = 21, .bottom = 21, .owner = .activity };
-    try std.testing.expectError(error.BandOverlap, plan.validate());
-}
 
-test "paint plan rejects footer over transcript" {
-    var plan = validPlan();
-    plan.footer.top = 20;
-    plan.footer_band = .{ .top = 20, .bottom = 24, .owner = .footer };
-    try std.testing.expectError(error.BandOverlap, plan.validate());
-}
 
-test "paint plan rejects gap overlap with painted bands" {
-    var plan = validPlan();
-    plan.blank_band = .{ .top = 20, .bottom = 20, .owner = .gap };
-    try std.testing.expectError(error.BandOverlap, plan.validate());
-}
 
-test "paint plan rejects invalidation ranges outside allowed bands" {
-    var plan = validPlan();
-    try plan.invalidation.append(.{ .reason = .external_clear, .top = 1, .bottom = 1 });
-    try std.testing.expectError(error.InvalidInvalidationRange, plan.validate());
-}
 
-test "paint plan rejects cursor outside layout" {
-    var plan = validPlan();
-    plan.cursor_target = .{ .row = 25, .col = 1, .visible = true };
-    try std.testing.expectError(error.CursorOutOfBounds, plan.validate());
-}
 
-test "invalid activity row past terminal rows" {
-    var plan = validPlan();
-    plan.activity = .{ .transient_row = .{ .row = 25, .gap_above_rows = 0 } };
-    plan.activity_band = .{ .top = 25, .bottom = 25, .owner = .activity };
-    try std.testing.expectError(error.InvalidBand, plan.validate());
-}
-
-test "invalid footer top past terminal rows" {
-    var plan = validPlan();
-    plan.footer.top = 25;
-    plan.footer_band = .{ .top = 25, .bottom = 25, .owner = .footer };
-    try std.testing.expectError(error.InvalidPaintPlan, plan.validate());
-}

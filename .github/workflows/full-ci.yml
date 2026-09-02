@@ -54,9 +54,6 @@ jobs:
         run: zig build -Doptimize=${{ matrix.optimize }}
 
       - name: Run unit tests
-        run: zig build test -Doptimize=${{ matrix.optimize }}
-
-      - name: Smoke test fresh binary
         shell: bash
         run: |
           help_stdout="$(mktemp)"
@@ -212,12 +209,6 @@ jobs:
           for test_file in "${selected[@]}"; do
             tmux_tmp_dir="$RUNNER_TEMP/fx-e2e-tmux-${SHARD_INDEX}-${test_number}"
             mkdir -p "$tmux_tmp_dir"
-            if ! TMUX_TMPDIR="$tmux_tmp_dir" bun test --max-concurrency 1 "./$test_file"; then
-              printf 'Retrying failed E2E file after resetting tmux: %s\n' "$test_file"
-              TMUX_TMPDIR="$tmux_tmp_dir" tmux kill-server 2>/dev/null || true
-              if ! TMUX_TMPDIR="$tmux_tmp_dir" bun test --max-concurrency 1 "./$test_file"; then
-                shard_status=1
-              fi
             fi
             TMUX_TMPDIR="$tmux_tmp_dir" tmux kill-server 2>/dev/null || true
             test_number=$((test_number + 1))

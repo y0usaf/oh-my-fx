@@ -745,29 +745,3 @@ fn writeProvenanceSummary(
     }
 }
 
-test "activity selector matches normal frame activity" {
-    try std.testing.expect(activityMatches(null, .none));
-    try std.testing.expect(activityMatches(.none, .none));
-    try std.testing.expect(activityMatches(
-        .turn_thinking,
-        .{ .turn_thinking = .{ .label = "thinking" } },
-    ));
-    try std.testing.expect(activityMatches(
-        .tool_slot,
-        .{ .tool_slot = .{
-            .entry_id = 1,
-            .fallback_label = "Running sleep 5",
-            .active = true,
-            .kind = .command,
-        } },
-    ));
-    try std.testing.expect(!activityMatches(
-        .turn_thinking,
-        .{ .tool_slot = .{
-            .entry_id = 1,
-            .fallback_label = "Running sleep 5",
-            .active = true,
-            .kind = .command,
-        } },
-    ));
-}

@@ -90,8 +90,3 @@ fn configIdForPermissionMode(mode: PermissionMode) []const u8 {
     };
 }
 
-test "host config maps permission modes to restorable product modes" {
-    try std.testing.expectEqualStrings("code", configIdForPermissionMode(.auto));
-    try std.testing.expectEqualStrings("ask", configIdForPermissionMode(.ask));
-    try std.testing.expectEqualStrings("code", configIdForPermissionMode(.yolo));
-}

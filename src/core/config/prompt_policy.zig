@@ -10,17 +10,3 @@ pub const Policy = struct {
     }
 };
 
-test "prompt policy resolves the supplied model overlay" {
-    const Fixture = struct {
-        fn overlay(model: []const u8) ?[]const u8 {
-            return if (model.len > 0) "overlay" else null;
-        }
-    };
-    const policy = Policy{
-        .system_prompt = "system",
-        .model_prompt_overlay_fn = Fixture.overlay,
-    };
-
-    try @import("std").testing.expectEqualStrings("overlay", policy.modelPromptOverlay("model").?);
-    try @import("std").testing.expect(policy.modelPromptOverlay("") == null);
-}

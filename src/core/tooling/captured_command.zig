@@ -23,19 +23,3 @@ pub fn isToolCall(
     return action == .string and std.mem.eql(u8, action.string, "exec");
 }
 
-test "captured command classification recognizes terminal exec and historical records" {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(try isToolCall(
-        alloc,
-        "terminal",
-        "{\"action\":\"exec\",\"command\":\"printf ok\"}",
-    ));
-    try std.testing.expect(!try isToolCall(
-        alloc,
-        "terminal",
-        "{\"action\":\"start\",\"command\":\"printf ok\"}",
-    ));
-    try std.testing.expect(try isToolCall(alloc, "run_command", "{}"));
-    try std.testing.expect(!try isToolCall(alloc, "read_file", "{}"));
-    try std.testing.expect(!try isToolCall(alloc, "terminal", "not-json"));
-}

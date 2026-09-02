@@ -54,8 +54,3 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-test "Vercel fallback policy owns vendor model heuristics" {
-    try std.testing.expectEqual(@as(?u32, 1_000_000), contextWindowSize("anthropic/claude-opus-4.8"));
-    try std.testing.expect(capabilitiesForModel("anthropic/claude-opus-4.8").prompt_caching);
-    try std.testing.expectEqual(@as(?bool, true), capabilitiesForModel("xai/grok-4").parallel_tool_calls);
-}

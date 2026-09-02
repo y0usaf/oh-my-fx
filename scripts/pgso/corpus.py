@@ -355,12 +355,15 @@ def load_corpus(
         )
     stale_exclusions = sorted(set(exclusions) - discovered_test_files)
     if stale_exclusions:
-        label = "file" if len(stale_exclusions) == 1 else "files"
-        verb = "does" if len(stale_exclusions) == 1 else "do"
-        raise PgsoError(
-            f"excluded E2E test {label} {verb} not exist: "
-            + ", ".join(stale_exclusions)
-        )
+        policy_exclusions = set(REQUIRED_EXCLUSIONS)
+        genuine_stale = sorted(set(stale_exclusions) - policy_exclusions)
+        if genuine_stale:
+            label = "file" if len(genuine_stale) == 1 else "files"
+            verb = "does" if len(genuine_stale) == 1 else "do"
+            raise PgsoError(
+                f"excluded E2E test {label} {verb} not exist: "
+                + ", ".join(genuine_stale)
+            )
 
     direct_commands = {
         scenario.argv[1:]

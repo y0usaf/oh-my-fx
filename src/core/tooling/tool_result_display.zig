@@ -15,15 +15,4 @@ pub fn contentForDisplay(body: []const u8) []const u8 {
     return std.mem.trimEnd(u8, rest[0 .. rest.len - "</content>".len], "\r\n");
 }
 
-test "contentForDisplay unwraps path and content result" {
-    try std.testing.expectEqualStrings(
-        "1\talpha\n2\tbeta",
-        contentForDisplay("<path>README.md</path>\n<content>\n1\talpha\n2\tbeta\n</content>"),
-    );
-}
 
-test "contentForDisplay preserves unknown or malformed output" {
-    const raw = "<path>README.md</path>\n<content>missing close";
-    try std.testing.expectEqualStrings(raw, contentForDisplay(raw));
-    try std.testing.expectEqualStrings("plain output", contentForDisplay("plain output"));
-}

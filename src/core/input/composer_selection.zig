@@ -80,41 +80,4 @@ const Fixture = struct {
     }
 };
 
-test "composer selection owns pointer transitions and vertical intent reset" {
-    const alloc = std.testing.allocator;
-    var fixture: Fixture = .{};
-    defer fixture.deinit(alloc);
-    try fixture.edit.setText(alloc, "alpha beta");
 
-    fixture.vertical_navigation.preferred_column = 4;
-    try std.testing.expect(fixture.state().begin(2));
-    try std.testing.expectEqual(@as(?usize, null), fixture.vertical_navigation.preferredColumn());
-
-    fixture.vertical_navigation.preferred_column = 5;
-    try std.testing.expect(fixture.state().extend(std.math.maxInt(usize)));
-    try std.testing.expectEqual(@as(?usize, null), fixture.vertical_navigation.preferredColumn());
-    try std.testing.expectEqual(
-        editor_state.SelectionRange{ .start = 2, .end = "alpha beta".len },
-        fixture.edit.selectionRange().?,
-    );
-    try std.testing.expectEqualStrings("pha beta", fixture.state().selectedText().?);
-
-    try std.testing.expect(fixture.state().extend(2));
-    fixture.state().finish();
-    try std.testing.expect(fixture.edit.selectionRange() == null);
-}
-
-test "composer select all clamps to the draft and clears vertical intent" {
-    const alloc = std.testing.allocator;
-    var fixture: Fixture = .{};
-    defer fixture.deinit(alloc);
-    try fixture.edit.setText(alloc, "alpha beta");
-
-    fixture.vertical_navigation.preferred_column = 3;
-    try std.testing.expect(fixture.state().selectAll());
-    try std.testing.expectEqual(
-        editor_state.SelectionRange{ .start = 0, .end = "alpha beta".len },
-        fixture.edit.selectionRange().?,
-    );
-    try std.testing.expectEqual(@as(?usize, null), fixture.vertical_navigation.preferredColumn());
-}

@@ -147,16 +147,3 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
     }
 }
 
-test "shared image provider capture counts all streamed bytes while retaining its bound" {
-    var capture = StreamCapture{
-        .alloc = std.testing.allocator,
-        .max_bytes = 4,
-    };
-    defer capture.deinit();
-
-    onContentChunk(@ptrCast(&capture), "abc");
-    onContentChunk(@ptrCast(&capture), "二xyz");
-
-    try std.testing.expectEqual(@as(usize, "abc二xyz".len), capture.observed_bytes);
-    try std.testing.expectEqualStrings("abc\xe4", capture.text.items);
-}

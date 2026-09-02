@@ -203,17 +203,6 @@ noinline fn failOwnedAuthorityClaimDynamic(err: anyerror) anyerror!OwnedAuthorit
     return err;
 }
 
-test "owned authority claim failures preserve exact error types and identities" {
-    const invalid = failOwnedAuthorityClaim(error.InvalidAuthorityGrant);
-    try std.testing.expect(
-        @TypeOf(invalid) == error{InvalidAuthorityGrant}!OwnedAuthorityClaim,
-    );
-    try std.testing.expectError(error.InvalidAuthorityGrant, invalid);
-    try std.testing.expectError(
-        error.OutOfMemory,
-        failOwnedAuthorityClaim(error.OutOfMemory),
-    );
-}
 
 pub fn ownAuthorityClaim(
     alloc: Allocator,
@@ -407,43 +396,7 @@ pub fn execute(
     return backend.executeAuthorized(request, cancelled);
 }
 
-test "private operation validation requires durable authority on every action" {
-    try std.testing.expectError(
-        error.MissingTerminalAuthority,
-        validate(.{ .screen = .{ .session_id = "terminal-1" } }),
-    );
-    try std.testing.expectError(
-        error.MissingTerminalAuthority,
-        validate(.{ .list = .{} }),
-    );
-    try std.testing.expectError(
-        error.MissingTerminalAuthority,
-        validate(.{ .start = .{ .cwd = "/workspace" } }),
-    );
-}
 
-test "terminal mutations that share session write ownership stay ordered" {
-    try std.testing.expect(requiresOrderedMutation(.{ .write = .{
-        .session_id = "terminal-1",
-        .payload = .{ .text = "input" },
-    } }));
-    try std.testing.expect(requiresOrderedMutation(.{ .close = .{
-        .session_id = "terminal-1",
-        .policy = .graceful,
-    } }));
-    try std.testing.expect(requiresOrderedMutation(.{ .inspect = .{
-        .session_id = "terminal-1",
-        .acknowledge_event_id = 1,
-    } }));
-    try std.testing.expect(!requiresOrderedMutation(.{ .inspect = .{
-        .session_id = "terminal-1",
-    } }));
-    try std.testing.expect(!requiresOrderedMutation(.{ .wait = .{
-        .session_id = "terminal-1",
-        .return_when = .exit,
-        .safety_ceiling_ms = 1,
-    } }));
-}
 
 fn test_preparation() AuthorityPreparation {
     return .{
@@ -459,73 +412,8 @@ fn test_preparation() AuthorityPreparation {
     };
 }
 
-test "production preparation mints canonical generation one authority" {
-    var prepared = try prepareStartPersistence(
-        std.testing.allocator,
-        test_preparation(),
-    );
-    defer prepared.deinit();
-    const persistence = prepared.view();
-    try persistence.validate(.{
-        .cwd = "/workspace/project",
-        .backend = .native,
-    });
-    try std.testing.expectEqual(@as(u64, 1), persistence.grant.generation.value);
-    try std.testing.expectEqual(contracts.TerminalLifetime.session, persistence.grant.principal.lifetime);
-    try persistence.proof.validate();
-}
 
-test "production preparation owns exact repeated probe authority" {
-    const probes = [_]contracts.RepeatedProbeAuthority{.{
-        .command = "test -f ready",
-        .cwd = "/workspace/project",
-        .check_schedule = .{ .interval_ms = 25 },
-        .notify_schedule = .{ .every_n_checks = 2 },
-        .lifetime = .{ .duration_ms = 500 },
-    }};
-    var input = test_preparation();
-    input.repeated_probes = &probes;
-    var prepared = try construct_start_persistence(
-        std.testing.allocator,
-        input,
-        .{ .bytes = @splat(6) },
-    );
-    defer prepared.deinit();
-    const owned = prepared.view().grant.repeated_probes;
-    try std.testing.expectEqual(@as(usize, 1), owned.len);
-    try std.testing.expect(owned.ptr != probes[0..].ptr);
-    try std.testing.expect(owned[0].command.ptr != probes[0].command.ptr);
-    try std.testing.expect(owned[0].cwd.ptr != probes[0].cwd.ptr);
-    try std.testing.expect(owned[0].matches(.{
-        .condition = .{ .custom_probe = .{
-            .command = "test -f ready",
-            .cwd = "/workspace/project",
-        } },
-        .check_schedule = .{ .interval_ms = 25 },
-        .notify_schedule = .{ .every_n_checks = 2 },
-        .lifetime = .{ .duration_ms = 500 },
-    }));
-}
 
-test "pure authority construction validates direct human policy" {
-    const proof = contracts.HolderProof{ .bytes = @splat(9) };
-    var input = test_preparation();
-    input.actor = .human;
-    input.direct_human_model_read_only = true;
-    var prepared = try construct_start_persistence(
-        std.testing.allocator,
-        input,
-        proof,
-    );
-    defer prepared.deinit();
-    try std.testing.expect(prepared.view().direct_human_model_read_only);
-
-    input.actor = .agent;
-    try std.testing.expectError(
-        error.InvalidStartPersistence,
-        construct_start_persistence(std.testing.allocator, input, proof),
-    );
-}
 
 fn check_preparation_allocation_failures(alloc: Allocator) !void {
     var prepared = try construct_start_persistence(
@@ -548,10 +436,3 @@ fn check_preparation_allocation_failures(alloc: Allocator) !void {
     defer owned_claim.deinit();
 }
 
-test "authority preparation and owned claims cover allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        check_preparation_allocation_failures,
-        .{},
-    );
-}

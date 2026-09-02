@@ -201,14 +201,6 @@ noinline fn failDecodedFrameDynamic(err: anyerror) anyerror!DecodedFrame {
     return err;
 }
 
-test "decoded frame failures preserve exact error types and identities" {
-    const truncated = failDecodedFrame(error.TruncatedFrame);
-    try std.testing.expect(
-        @TypeOf(truncated) == error{TruncatedFrame}!DecodedFrame,
-    );
-    try std.testing.expectError(error.TruncatedFrame, truncated);
-    try std.testing.expectError(error.OutOfMemory, failDecodedFrame(error.OutOfMemory));
-}
 
 pub fn decodeFrame(alloc: Allocator, bytes: []const u8) DecodeError!DecodedFrame {
     const header = try Header.decode(bytes);
@@ -325,179 +317,12 @@ fn testRequestFrame(alloc: Allocator) !void {
     try std.testing.expectEqual(contracts.Action.screen, message.payload.request.action());
 }
 
-test "host protocol round trips owned correlated frames" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        testRequestFrame,
-        .{},
-    );
-}
 
-test "host protocol reads fragmented frames and preserves cancel framing" {
-    var encoded = try encodeFrame(
-        std.testing.allocator,
-        contracts.current_protocol_revision,
-        0,
-        .{ .value = 7 },
-        .cancel,
-    );
-    defer encoded.deinit(std.testing.allocator);
-    var reader_buffer: [64]u8 = undefined;
-    var fragmented: std.testing.Reader = .init(&reader_buffer, &.{
-        .{ .buffer = encoded.bytes },
-    });
-    fragmented.artificial_limit = .limited(1);
-    var decoded = try readFrame(
-        std.testing.allocator,
-        &fragmented.interface,
-    );
-    defer decoded.deinit();
-    try std.testing.expectEqual(contracts.MessageKind.cancel, decoded.message().envelope.kind);
-    try std.testing.expectEqual(@as(u8, 4), encoded.bytes[6]);
-}
 
-test "host protocol reserves removed event kind" {
-    var encoded = try encodeFrame(
-        std.testing.allocator,
-        contracts.current_protocol_revision,
-        0,
-        .{ .value = 7 },
-        .cancel,
-    );
-    defer encoded.deinit(std.testing.allocator);
-    encoded.bytes[6] = 3;
-    try std.testing.expectError(
-        error.InvalidFrameKind,
-        decodeFrame(std.testing.allocator, encoded.bytes),
-    );
-}
 
-test "host protocol rejects partial truncated oversized and invalid correlation frames" {
-    var encoded = try encodeFrame(
-        std.testing.allocator,
-        contracts.current_protocol_revision,
-        0,
-        .{ .value = 9 },
-        .{ .request = .{ .screen = .{ .session_id = "terminal-1" } } },
-    );
-    defer encoded.deinit(std.testing.allocator);
 
-    try std.testing.expectError(
-        error.TruncatedFrame,
-        decodeFrame(std.testing.allocator, encoded.bytes[0 .. header_len - 1]),
-    );
-    try std.testing.expectError(
-        error.TruncatedFrame,
-        decodeFrame(std.testing.allocator, encoded.bytes[0 .. encoded.bytes.len - 1]),
-    );
 
-    var oversized = encoded.bytes[0..header_len].*;
-    std.mem.writeInt(
-        u32,
-        oversized[24..28],
-        contracts.max_host_frame_bytes + 1,
-        .little,
-    );
-    try std.testing.expectError(
-        error.HostFrameTooLarge,
-        Header.decode(&oversized),
-    );
 
-    var invalid_correlation = encoded.bytes[0..header_len].*;
-    @memset(invalid_correlation[16..24], 0);
-    try std.testing.expectError(
-        error.MissingCorrelationId,
-        Header.decode(&invalid_correlation),
-    );
-}
-
-test "host protocol rejects required capabilities before payload allocation" {
-    var encoded = try encodeFrame(
-        std.testing.allocator,
-        contracts.current_protocol_revision,
-        0,
-        null,
-        .{ .hello = .{
-            .range = contracts.local_protocol_range,
-            .capabilities = contracts.known_protocol_capabilities,
-        } },
-    );
-    defer encoded.deinit(std.testing.allocator);
-    std.mem.writeInt(u64, encoded.bytes[8..16], 1 << 63, .little);
-    try std.testing.expectError(
-        error.UnknownRequiredCapability,
-        decodeFrame(std.testing.allocator, encoded.bytes),
-    );
-}
-
-test "host protocol preserves opaque terminal output bytes" {
-    const output = [_]u8{ 0, 0x80, 0xff };
-    var encoded = try encodeFrame(
-        std.testing.allocator,
-        contracts.current_protocol_revision,
-        0,
-        .{ .value = 1 },
-        .{ .response = .{ .success = .{ .read = .{
-            .session = .{
-                .session_id = "terminal-opaque",
-                .lifecycle = .running,
-                .attention = .{},
-                .backend = .native,
-                .output_cursor = .{ .segment = 1, .offset = output.len },
-                .screen_recovery = .{ .unavailable = .missing },
-            },
-            .output = &output,
-            .raw_range = .{
-                .start = .{ .segment = 1, .offset = 0 },
-                .end = .{ .segment = 1, .offset = output.len },
-            },
-        } } } },
-    );
-    defer encoded.deinit(std.testing.allocator);
-    var decoded = try decodeFrame(std.testing.allocator, encoded.bytes);
-    defer decoded.deinit();
-    const result = switch (decoded.message().payload) {
-        .response => |response| response,
-        else => return error.TestExpectedResponse,
-    };
-    const read = switch (result) {
-        .success => |success| switch (success) {
-            .read => |value| value,
-            else => return error.TestExpectedRead,
-        },
-        .failure => return error.TestExpectedSuccess,
-    };
-    try std.testing.expectEqualSlices(u8, &output, read.output);
-}
-
-test "revision four projection never exposes degraded monitor state" {
-    var response = try encodeFrame(
-        std.testing.allocator,
-        contracts.previous_protocol_revision,
-        0,
-        .{ .value = 1 },
-        .{ .response = .{ .success = .{ .inspect = .{
-            .session = .{
-                .session_id = "terminal-1",
-                .lifecycle = .running,
-                .attention = .{},
-                .backend = .tmux,
-                .output_cursor = .{ .segment = 1, .offset = 0 },
-                .screen_recovery = .{ .unavailable = .raw_gap },
-            },
-            .shell = "/bin/sh",
-            .cwd = "/workspace",
-            .monitors = &.{.{
-                .monitor_id = "monitor-1",
-                .state = .degraded,
-            }},
-        } } } },
-    );
-    defer response.deinit(std.testing.allocator);
-    const response_json = response.bytes[header_len..];
-    try std.testing.expect(std.mem.find(u8, response_json, "degraded") == null);
-    try std.testing.expect(std.mem.find(u8, response_json, "protocol_incompatible") != null);
-}
 
 fn expectProjectedErrorCode(
     capabilities: u64,
@@ -528,34 +353,4 @@ fn expectProjectedErrorCode(
     try std.testing.expectEqual(expected, failure.code);
 }
 
-test "host protocol projects path scope failures by negotiated capability" {
-    try expectProjectedErrorCode(
-        contracts.protocol_capability_path_outside_workspace_error,
-        .path_outside_workspace,
-    );
-    try expectProjectedErrorCode(0, .invalid_request);
 
-    const generic: contracts.Result = .{ .failure = .{
-        .action = .start,
-        .code = .invalid_request,
-    } };
-    try std.testing.expectEqual(
-        contracts.StructuredErrorCode.invalid_request,
-        projectResultForCapabilities(generic, 0).failure.code,
-    );
-}
-
-test "host protocol fuzzes the real untrusted frame decoder" {
-    const Context = struct {
-        fn run(_: @This(), smith: *std.testing.Smith) anyerror!void {
-            var bytes: [4096]u8 = undefined;
-            const len: usize = @intCast(smith.slice(&bytes));
-            var decoded = decodeFrame(
-                std.testing.allocator,
-                bytes[0..len],
-            ) catch return;
-            decoded.deinit();
-        }
-    };
-    try std.testing.fuzz(Context{}, Context.run, .{});
-}

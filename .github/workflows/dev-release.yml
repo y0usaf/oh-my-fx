@@ -85,9 +85,9 @@ jobs:
       - name: Package web artifacts
         run: |
           cp sdk/fx-sdk.js fx-sdk.js
-          cp zig-out/bin/omfx-term.wasm fx-term.wasm
           sha256sum fx-sdk.js > fx-sdk.js.sha256
-          sha256sum fx-term.wasm > fx-term.wasm.sha256
+          cp zig-out/bin/omfx-term.wasm .
+          sha256sum omfx-term.wasm > omfx-term.wasm.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -96,8 +96,8 @@ jobs:
           path: |
             fx-sdk.js
             fx-sdk.js.sha256
-            fx-term.wasm
-            fx-term.wasm.sha256
+            omfx-term.wasm
+            omfx-term.wasm.sha256
 
   publish:
     needs: [build, web]
@@ -133,7 +133,7 @@ jobs:
           jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" \
             '{version: $version, commit: $commit}' > dev.json
           sha256sum --check fx-sdk.js.sha256
-          sha256sum --check fx-term.wasm.sha256
+          sha256sum --check omfx-term.wasm.sha256
 
       - name: Move candidate tag
         run: |
@@ -156,5 +156,5 @@ jobs:
             fx-*.tar.gz.sha256
             fx-sdk.js
             fx-sdk.js.sha256
-            fx-term.wasm
-            fx-term.wasm.sha256
+            omfx-term.wasm
+            omfx-term.wasm.sha256

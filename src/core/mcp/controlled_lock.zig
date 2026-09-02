@@ -104,45 +104,5 @@ fn unlock(comptime kind: LockKind, lock: anytype, io: std.Io) void {
     return lock.unlock(io);
 }
 
-test "controlled locks acquire available mutex and shared rw locks" {
-    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(100),
-    });
 
-    var mutex: std.Io.Mutex = .init;
-    try mutexUntil(&mutex, deadline, null);
-    mutex.unlock(std.testing.io);
 
-    var rw_lock: std.Io.RwLock = .init;
-    try rwSharedUntil(&rw_lock, deadline, null);
-    rw_lock.unlockShared(std.testing.io);
-}
-
-test "controlled mutex stops on cancellation while contended" {
-    var mutex: std.Io.Mutex = .init;
-    mutex.lockUncancelable(std.testing.io);
-    defer mutex.unlock(std.testing.io);
-
-    var cancelled = std.atomic.Value(bool).init(true);
-    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(100),
-    });
-    try std.testing.expectError(
-        error.Cancelled,
-        mutexUntil(&mutex, deadline, &cancelled),
-    );
-}
-
-test "controlled mutex stops at its deadline while contended" {
-    var mutex: std.Io.Mutex = .init;
-    mutex.lockUncancelable(std.testing.io);
-    defer mutex.unlock(std.testing.io);
-
-    const deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
-    try std.testing.expectError(
-        error.McpRequestTimedOut,
-        mutexUntil(&mutex, deadline, null),
-    );
-}

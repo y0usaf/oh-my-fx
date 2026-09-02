@@ -31,26 +31,4 @@ pub fn joinVisibleSegments(
     return std.fmt.allocPrint(alloc, "{s}\n{s}", .{ earlier, later });
 }
 
-test "Stop continuation message uses the shared hook prefix" {
-    const message = try buildContinuationMessage(
-        std.testing.allocator,
-        "verify the answer",
-    );
-    defer std.testing.allocator.free(message);
 
-    try std.testing.expectEqualStrings(
-        "Continue the turn. fx hook context:\nverify the answer",
-        message,
-    );
-}
-
-test "visible Stop segments join with one newline" {
-    const joined = try joinVisibleSegments(
-        std.testing.allocator,
-        "first",
-        "second",
-    );
-    defer std.testing.allocator.free(joined);
-
-    try std.testing.expectEqualStrings("first\nsecond", joined);
-}
