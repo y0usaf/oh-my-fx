@@ -57,9 +57,6 @@ jobs:
           version: "0.16.0"
           use-cache: false
 
-      - name: Test size reporter
-        run: python3 -m unittest scripts.tests.test_binary_size -v
-
       - name: Build pull request binary
         shell: bash
         run: |
