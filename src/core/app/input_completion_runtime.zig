@@ -1493,15 +1493,6 @@ noinline fn clobberCompletionStack() void {
     std.mem.doNotOptimizeAway(&bytes);
 }
 
-
-
-
-
-
-
-
-
-
 fn expectInlineSkillCompletionInactive(app: *InlineCompletionTestApp) !void {
     const rt = CompletionRuntime(InlineCompletionTestApp);
     try std.testing.expectEqual(
@@ -1513,6 +1504,3 @@ fn expectInlineSkillCompletionInactive(app: *InlineCompletionTestApp) !void {
         try rt.autocompleteInlineSkillCompletion(app, 4096),
     );
 }
-
-
-

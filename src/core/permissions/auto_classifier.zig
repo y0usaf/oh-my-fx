@@ -793,7 +793,6 @@ fn serializeEvidence(
     return .{ .text = try out.toOwnedSlice(), .action_complete = action_complete };
 }
 
-
 fn validateReviewTurn(turn: ReviewTurnContext) bool {
     if (turn.model.len == 0 or turn.target_call_id.len == 0) return false;
     if (turn.current_root_request.len == 0 or
@@ -811,7 +810,6 @@ fn validateReviewTurn(turn: ReviewTurnContext) bool {
 
     return true;
 }
-
 
 fn buildReviewInstruction(
     alloc: std.mem.Allocator,
@@ -1008,7 +1006,6 @@ fn toolsJsonAlloc(alloc: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(alloc, "[{s}]", .{schema_json});
 }
 
-
 fn buildTestReviewPayload(
     _: *anyopaque,
     alloc: std.mem.Allocator,
@@ -1097,29 +1094,3 @@ fn parseArguments(alloc: std.mem.Allocator, arguments_json: []const u8) !ParseOu
         .rationale = try alloc.dupe(u8, rationale_value.string),
     } };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

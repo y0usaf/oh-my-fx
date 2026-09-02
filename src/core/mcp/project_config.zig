@@ -871,7 +871,6 @@ noinline fn failServerConfigDynamic(err: anyerror) anyerror!McpServerConfig {
     return err;
 }
 
-
 fn parseServerEntry(
     alloc: Allocator,
     name: []const u8,
@@ -1312,24 +1311,3 @@ fn freeHttpHeaderEnvList(alloc: Allocator, headers: *std.ArrayList(McpHttpHeader
     }
     headers.deinit(alloc);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

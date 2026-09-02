@@ -49,7 +49,3 @@ fn appendEphemeralOverlayMessages(alloc: Allocator, messages: *std.ArrayList(Cha
         try messages.append(alloc, copy);
     }
 }
-
-
-
-

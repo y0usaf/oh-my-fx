@@ -190,8 +190,6 @@ fn writeMetadata(writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"io.modelcontextprotocol/related-task\":{\"taskId\":\"fx-test\"}}");
 }
 
-
-
 fn checkCompletionAllocationFailures(alloc: Allocator) !void {
     var result = try parseResult(
         alloc,
@@ -201,4 +199,3 @@ fn checkCompletionAllocationFailures(alloc: Allocator) !void {
     );
     defer result.deinit(alloc);
 }
-

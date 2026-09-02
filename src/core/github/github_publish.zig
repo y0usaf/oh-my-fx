@@ -133,15 +133,3 @@ fn publishResultFromProcess(alloc: Allocator, result: CompletedProcess) !Publish
     alloc.free(result.stdout);
     return .{ .ok = true, .text = text };
 }
-
-
-
-
-
-
-
-
-
-
-
-

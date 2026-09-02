@@ -141,6 +141,3 @@ pub fn defaultForRunCommand(
         .approval_required => |reason| .{ .approval_required = reason },
     };
 }
-
-
-

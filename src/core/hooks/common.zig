@@ -9,4 +9,3 @@ pub const RegistrationError = definitions.RegistrationError;
 pub const ViewError = definitions.ViewError;
 pub const HandlerError = definitions.HandlerError;
 pub const MutationDispatchError = definitions.MutationDispatchError;
-

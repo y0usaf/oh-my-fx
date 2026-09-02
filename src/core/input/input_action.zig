@@ -160,4 +160,3 @@ pub const TerminalInputIngress = struct {
             self.replay_byte_after_routing != null;
     }
 };
-

@@ -1251,20 +1251,12 @@ fn awakeMilliseconds() i64 {
         std.math.maxInt(i64);
 }
 
-
-
-
-
-
-
 fn checkSseEventIdAllocationFailures(alloc: Allocator) !void {
     var event_id: ?[]u8 = null;
     defer if (event_id) |value| alloc.free(value);
     try replaceEventId(alloc, &event_id, "event-1");
     try replaceEventId(alloc, &event_id, "event-2");
 }
-
-
 
 fn testClientWithSession(alloc: Allocator, session_id: []const u8) !*Client {
     const client = try alloc.create(Client);
@@ -1278,7 +1270,6 @@ fn testClientWithSession(alloc: Allocator, session_id: []const u8) !*Client {
     };
     return client;
 }
-
 
 /// Stands in for a request that is already in flight: it holds a use lease and
 /// keeps reading `session_id` as an outgoing header would, then releases.
@@ -1305,5 +1296,3 @@ const LeaseProbe = struct {
         self.client.releaseUse();
     }
 };
-
-

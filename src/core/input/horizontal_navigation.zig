@@ -139,7 +139,3 @@ fn moveWordRight(
     }
     return edit.moveCursorTo(raw_offset, extend_selection);
 }
-
-
-
-

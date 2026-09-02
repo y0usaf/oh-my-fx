@@ -1792,7 +1792,6 @@ pub const Runtime = struct {
     }
 };
 
-
 fn probeCredentialSource(raw_context: ?*anyopaque, alloc: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
     return credentials.sourceExists(alloc, self.secret_store, source);
@@ -1999,24 +1998,6 @@ fn expectApiKeyAllocationCleared(
     try std.testing.expect(std.mem.indexOf(u8, backing, sentinel) == null);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const LogoutFixture = struct {
     existing: SourceSet,
     load_count: usize = 0,
@@ -2033,35 +2014,6 @@ const LogoutFixture = struct {
         return try makeTestCredential(alloc, @tagName(source), source, null, null);
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn makeManualCodeTestLogin(alloc: Allocator) !login_flow.PreparedLogin {
     const issuer = try alloc.dupe(u8, "https://issuer.test");
@@ -2121,6 +2073,3 @@ fn enterPendingTestSignIn(runtime: *Runtime, alloc: Allocator, accepts_manual_co
     runtime.picker_stage = .sign_in;
     runtime.sign_in_source = .grok_subscription;
 }
-
-
-

@@ -284,14 +284,3 @@ fn writeClearAuthority(w: *std.Io.Writer, id: u64, pane_id: []const u8) !void {
     try jsonrpc.writeJsonStr(source, w);
     try w.writeAll("}}\n");
 }
-
-
-
-
-
-
-
-
-
-
-

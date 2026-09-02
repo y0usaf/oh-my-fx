@@ -389,10 +389,6 @@ const FakeInfoHost = struct {
     }
 };
 
-
-
-
-
 const FakeExecHost = struct {
     var status: i32 = 0;
     var stdout: []const u8 = "";
@@ -442,8 +438,3 @@ const FakeExecHost = struct {
         calls = 0;
     }
 };
-
-
-
-
-

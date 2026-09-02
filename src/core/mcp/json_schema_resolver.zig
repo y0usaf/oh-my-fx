@@ -500,5 +500,3 @@ fn keywordContainsSchemas(dialect: Dialect, keyword: []const u8) bool {
         std.mem.eql(u8, keyword, "not") or
         (dialect == .draft_2020_12 and std.mem.eql(u8, keyword, "contentSchema"));
 }
-
-

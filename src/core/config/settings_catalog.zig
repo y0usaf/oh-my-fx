@@ -416,10 +416,3 @@ fn updateWindowStart(start: usize, count: usize, selected: usize, visible: u16) 
     if (selected >= start + width) return selected - width + 1;
     return @min(start, count - width);
 }
-
-
-
-
-
-
-

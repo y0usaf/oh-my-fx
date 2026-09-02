@@ -147,9 +147,3 @@ pub fn resolveProviderOptionsForCapabilities(
     resolved.fast = fast_mode and capabilities.supports_fast_mode;
     return resolved;
 }
-
-
-
-
-
-

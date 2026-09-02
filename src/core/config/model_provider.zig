@@ -27,5 +27,3 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
         .grok => selected == .grok_subscription,
     };
 }
-
-

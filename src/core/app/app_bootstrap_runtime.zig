@@ -877,11 +877,3 @@ fn readTraceForTest(alloc: Allocator, path: []const u8) ![]u8 {
 }
 
 fn resizeHandlerForTest(_: std.posix.SIG) callconv(.c) void {}
-
-
-
-
-
-
-
-

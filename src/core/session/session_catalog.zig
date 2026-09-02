@@ -86,6 +86,3 @@ fn matchesQuery(summary: session_store.SessionSummary, query: []const u8) bool {
     }
     return false;
 }
-
-
-

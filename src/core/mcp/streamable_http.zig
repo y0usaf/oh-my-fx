@@ -1255,23 +1255,6 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectModernSseDelimiterSplits(payload: []const u8) !void {
     const alloc = std.testing.allocator;
     for (0..payload.len + 1) |split| {
@@ -1289,7 +1272,6 @@ fn expectModernSseDelimiterSplits(payload: []const u8) !void {
         try std.testing.expectEqualStrings("one\ntwo", events.items[0].data);
     }
 }
-
 
 fn fuzzModernSseParser(_: void, smith: *std.testing.Smith) !void {
     const alloc = std.testing.allocator;
@@ -1309,13 +1291,6 @@ fn fuzzModernSseParser(_: void, smith: *std.testing.Smith) !void {
     parser.feed(input[split..], &events) catch return;
     parser.finish() catch return;
 }
-
-
-
-
-
-
-
 
 fn findHeader(headers: *const OwnedHeaders, name: []const u8) ?[]const u8 {
     for (headers.items.items) |header| {

@@ -34,7 +34,6 @@ const CancelledEventAdmission = enum {
 
 const reset_style = ui_render.reset_style;
 
-
 fn allocDimmedTranscriptLine(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     if (std.mem.endsWith(u8, text, "\n")) {
         return std.fmt.allocPrint(alloc, "{s}{s}{s}\n", .{ ui_render.dim_style, text[0 .. text.len - 1], reset_style });
@@ -1059,7 +1058,6 @@ fn formatWebFetchProgress(alloc: std.mem.Allocator, progress: types.WebFetchProg
     };
 }
 
-
 const FakeSnapshot = struct {
     processing: bool = false,
     active_turn_id: u64 = 0,
@@ -1893,77 +1891,3 @@ fn queueTurnFinished(
         .outcome = outcome,
     } });
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -435,5 +435,3 @@ fn freeRecord(
     alloc.free(@constCast(record.id.call_id));
     if (record.tool_name) |tool_name| alloc.free(@constCast(tool_name));
 }
-
-

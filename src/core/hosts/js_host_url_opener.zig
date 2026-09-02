@@ -16,4 +16,3 @@ fn open(
 fn openWith(call: anytype, url: []const u8) bool {
     return call(url.ptr, url.len) == 1;
 }
-

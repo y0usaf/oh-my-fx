@@ -729,21 +729,6 @@ fn durableIdentifier(alloc: Allocator, value: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "redacted-{s}", .{&hex});
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectEquivalentNormalExecutionMemory(
     expected: types.ExecutionMemory,
     actual: types.ExecutionMemory,

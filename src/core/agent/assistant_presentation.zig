@@ -82,7 +82,6 @@ pub fn parseTablePayload(alloc: Allocator, buf: []const u8) !payload.TablePayloa
     return block_render.parseTablePayload(alloc, buf, &link_id_counter);
 }
 
-
 const isPipeLine = bp.isPipeLine;
 const max_link_url_bytes = ansi.max_link_url_bytes;
 const horizontal_rule_width = ansi.horizontal_rule_width;
@@ -638,63 +637,6 @@ fn registerFootnoteThunk(ctx: *anyopaque, alloc: Allocator, label: []const u8) a
     return self.registerFootnoteReference(alloc, label);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkSetextLookaheadAllocationFailures(alloc: Allocator) !void {
     const Capture = struct {
         fn deliver(_: *anyopaque, _: *std.ArrayList(u8)) !void {}
@@ -713,7 +655,6 @@ fn checkSetextLookaheadAllocationFailures(alloc: Allocator) !void {
     try processor.pushWithCompletions(alloc, "allocation title\n---\n", &out, .{ .thematic_rule = &completion });
     try std.testing.expectEqualStrings("\x1b[1mallocation title\x1b[22m\n", out.items);
 }
-
 
 fn checkDefinitionListAllocationFailures(alloc: Allocator) !void {
     const Capture = struct {
@@ -744,13 +685,6 @@ fn checkDefinitionListAllocationFailures(alloc: Allocator) !void {
     );
 }
 
-
-
-
-
-
-
-
 fn checkFootnoteAllocationFailures(alloc: Allocator) !void {
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -766,66 +700,3 @@ fn checkFootnoteAllocationFailures(alloc: Allocator) !void {
     );
     try processor.flush(alloc, &out);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

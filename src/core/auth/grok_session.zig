@@ -251,6 +251,3 @@ fn requiredInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
     if (value != .integer) return error.InvalidGrokAuthSession;
     return value.integer;
 }
-
-
-

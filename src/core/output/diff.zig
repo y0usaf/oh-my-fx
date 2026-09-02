@@ -53,7 +53,6 @@ pub fn freeDiffEntryPayload(alloc: Allocator, payload: DiffEntryPayload) void {
     if (payload.full) |full| full.deinit(alloc);
 }
 
-
 pub fn wrapWithMarkers(alloc: Allocator, id: u32, content: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -1796,44 +1795,3 @@ fn appendTrailingNewlineMarker(
         try new_lines.append(alloc, trailing_newline_added_marker);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

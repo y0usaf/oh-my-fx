@@ -34,6 +34,3 @@ pub fn write_compact(writer: *std.Io.Writer, json: []const u8) !void {
         }
     }
 }
-
-
-

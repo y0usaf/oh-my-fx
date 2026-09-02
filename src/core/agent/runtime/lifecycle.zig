@@ -101,7 +101,6 @@ pub const PreparedToolCall = union(enum) {
     }
 };
 
-
 pub noinline fn prepareToolCallForLifecycle(
     result_allocator: Allocator,
     lifecycle: LifecycleContext,

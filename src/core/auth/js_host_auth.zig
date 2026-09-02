@@ -277,4 +277,3 @@ fn removeSession(_: ?*anyopaque, expected_revision: ?[]const u8) !RemoveOutcome 
         else => error.OAuthSessionStoreUnavailable,
     };
 }
-

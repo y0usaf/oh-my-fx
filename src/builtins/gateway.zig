@@ -334,10 +334,6 @@ fn finalizeAgentRequestBody(
     return identified;
 }
 
-
-
-
-
 fn streamAgentCompletion(
     _: ?*anyopaque,
     alloc: Allocator,
@@ -647,7 +643,6 @@ const OAuthHttpOperation = struct {
     }
 };
 
-
 fn validateApiKey(
     _: ?*anyopaque,
     alloc: Allocator,
@@ -668,7 +663,6 @@ fn apiKeyValidationForStatus(status: std.http.Status) api_key_validator_contract
         else => .unavailable,
     };
 }
-
 
 pub fn preferredWebSearchBackendsOverride(raw: ?[]const u8) !?[]const web_search_contract.SearchBackendId {
     const value = raw orelse return null;
@@ -1206,13 +1200,6 @@ fn deinitHits(alloc: Allocator, hits: []web_search_contract.Source) void {
     if (hits.len > 0) alloc.free(hits);
 }
 
-
-
-
-
-
-
-
 fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackendId) !void {
     const alloc = std.testing.allocator;
     var cancel_flag = std.atomic.Value(bool).init(false);
@@ -1264,15 +1251,6 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
     try std.testing.expectEqual(@as(usize, 1), response.content[0].search.content.len);
     try std.testing.expectEqual(@as(u32, 1), response.usage.?.web_search_requests);
 }
-
-
-
-
-
-
-
-
-
 
 const FakeStream = struct {
     calls: usize = 0,
@@ -1340,9 +1318,6 @@ const FakeStream = struct {
     }
 };
 
-
-
-
 fn stubFetchCreditsError(
     _: Allocator,
     _: ?[]const u8,
@@ -1402,21 +1377,6 @@ fn stubFetchForbiddenCredits(
         .body = try alloc.dupe(u8, "{\"error\":{\"code\":\"credit_card_required\",\"message\":\"Buy credits to use AI Gateway.\"}}"),
     };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub fn fetchModelIds(alloc: std.mem.Allocator, access: credentials.CatalogAccess, path: []const u8) !std.ArrayList([]u8) {
     return fetchModelIdsForView(alloc, access, path, null, .full);
@@ -1609,7 +1569,6 @@ fn isInvalidGatewayResponse(err: anyerror) bool {
     };
 }
 
-
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
     const base_url = if (base_url_override) |candidate| blk: {
         if (gateway_client.isLoopbackHttpUrl(candidate)) break :blk candidate;
@@ -1669,8 +1628,6 @@ fn installLoopbackModelsEnv(alloc: std.mem.Allocator, port: u16) !*ModelsUrlTest
     return ModelsUrlTestEnv.install(alloc, models_url);
 }
 
-
-
 fn expectModelCatalogTeamHeaderOmitted(gateway_team: ?[]const u8) !void {
     var fixture = try gateway_client.TestModelCatalogFixture.init();
     defer fixture.deinit();
@@ -1687,8 +1644,6 @@ fn expectModelCatalogTeamHeaderOmitted(gateway_team: ?[]const u8) !void {
     try std.testing.expect(fixture.capturedHeaderValue(gateway_client.vercel_ai_gateway_team_header) == null);
     if (fixture.failure()) |err| return err;
 }
-
-
 
 fn parseModelIdsForView(
     alloc: std.mem.Allocator,
@@ -1901,19 +1856,9 @@ fn tagListContains(value: std.json.Value, needle: []const u8) bool {
     return false;
 }
 
-
-
 fn idsContain(ids: []const []const u8, needle: []const u8) bool {
     for (ids) |id| {
         if (std.mem.eql(u8, id, needle)) return true;
     }
     return false;
 }
-
-
-
-
-
-
-
-

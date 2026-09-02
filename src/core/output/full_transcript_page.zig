@@ -62,9 +62,3 @@ pub fn nextAnchor(range: SourceRange, total_entries: usize) ?Anchor {
     if (range.end >= total_entries) return null;
     return .{ .entry_index = range.end };
 }
-
-
-
-
-
-

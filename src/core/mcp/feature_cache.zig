@@ -391,13 +391,3 @@ fn testMetadata(key: CacheKey, generation: u64, content: []const u8) SnapshotMet
         .content_digest = digest(content),
     };
 }
-
-
-
-
-
-
-
-
-
-

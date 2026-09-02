@@ -187,5 +187,3 @@ pub const State = struct {
         self.picker.resetActiveModelPickerIndex();
     }
 };
-
-

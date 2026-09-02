@@ -1746,25 +1746,6 @@ const TestCatalogProvider = struct {
     }
 };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
     return .{
         .prompt = try alloc.dupe(u8, "draft an issue"),
@@ -1776,11 +1757,3 @@ fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     };
 }
-
-
-
-
-
-
-
-

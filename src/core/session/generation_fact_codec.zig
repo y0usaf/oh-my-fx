@@ -115,4 +115,3 @@ fn parseCost(value: ?std.json.Value) error{InvalidGenerationFact}!f64 {
     }
     return number;
 }
-

@@ -71,4 +71,3 @@ fn unavailable(
 pub const unavailable_provider = Provider{
     .execute_fn = unavailable,
 };
-

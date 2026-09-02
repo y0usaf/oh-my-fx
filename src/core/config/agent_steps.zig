@@ -23,7 +23,3 @@ pub fn resolveMaxAgentStepsWithOverride(
 pub fn allowsStep(limit: usize, completed_steps: usize) bool {
     return limit == 0 or completed_steps < limit;
 }
-
-
-
-

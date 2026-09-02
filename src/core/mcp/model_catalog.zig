@@ -215,10 +215,6 @@ fn ownedSnapshot(
     return .{ .servers = servers };
 }
 
-
-
-
-
 fn checkRenderAllocationFailures(alloc: Allocator) !void {
     var servers = [_]ServerSummary{
         .{ .name = @constCast("alpha"), .availability = .ready, .tool_count = 2 },
@@ -227,4 +223,3 @@ fn checkRenderAllocationFailures(alloc: Allocator) !void {
     var section = try render(alloc, .{ .servers = &servers });
     section.deinit(alloc);
 }
-
