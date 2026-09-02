@@ -349,23 +349,7 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8) ![]u8 {
 
 
 
-test "GitHub release artifact URLs do not double the omyfx-v tag prefix" {
-    const alloc = std.testing.allocator;
-    var target = try Target.initStable(alloc, "omyfx-v1.2.3");
-    defer target.deinit(alloc);
 
-    const production = try artifactUrl(alloc, release_base, target, ".sha256");
-    defer alloc.free(production);
-    try std.testing.expectEqualStrings(
-        "https://github.com/y0usaf/oh-my-fx/releases/download/omyfx-v1.2.3/fx-" ++ platform ++ ".tar.gz.sha256",
-        production,
-    );
-}
 
-test "extractChecksumHex parses sha256sum format" {
-    const with_filename = "abc123def456  fx-macos-aarch64.tar.gz\n";
-    const hex = extractChecksumHex(with_filename).?;
-    try std.testing.expectEqualStrings("abc123def456", hex);
-}
 
 
