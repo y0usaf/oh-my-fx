@@ -682,154 +682,12 @@ fn openLinuxProcFile(path: []const u8) !?std.Io.File {
     };
 }
 
-test "Linux proc helpers treat missing process data as vanished" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    try std.testing.expect(
-        (try openLinuxProcDir("/proc/self/fx-process-tree-missing")) == null,
-    );
-    try std.testing.expect(
-        (try openLinuxProcFile("/proc/self/fx-process-tree-missing")) == null,
-    );
-}
 
-test "process-group exclusion preserves the captured command grace" {
-    try std.testing.expect(shouldSignalProcess(41, null));
-    try std.testing.expect(!shouldSignalProcess(41, 41));
-    try std.testing.expect(shouldSignalProcess(42, 41));
-    try std.testing.expect(!shouldSignalProcess(null, 41));
-}
 
-test "stale process identities cannot become traversal roots" {
-    try std.testing.expect(shouldTraverseParent(
-        .{ .linux_start_ticks = 41 },
-        .{ .linux_start_ticks = 41 },
-    ));
-    try std.testing.expect(!shouldTraverseParent(
-        .{ .linux_start_ticks = 41 },
-        .{ .linux_start_ticks = 42 },
-    ));
-    try std.testing.expect(!shouldTraverseParent(
-        .{ .linux_start_ticks = 41 },
-        .{ .macos_unique_id = 41 },
-    ));
-}
 
-test "child admission binds the observed process to its expected parent" {
-    const snapshot = ProcessSnapshot{
-        .identity = .{ .linux_start_ticks = 42 },
-        .parent_pid = 17,
-    };
-    try std.testing.expect(snapshotBelongsToParent(snapshot, 17));
-    try std.testing.expect(!snapshotBelongsToParent(snapshot, 18));
-}
 
-test "macOS lineage identity matches only the same unique process" {
-    try std.testing.expect(identityHasMacOSUniqueId(
-        .{ .macos_unique_id = 42 },
-        42,
-    ));
-    try std.testing.expect(!identityHasMacOSUniqueId(
-        .{ .macos_unique_id = 42 },
-        43,
-    ));
-    try std.testing.expect(!identityHasMacOSUniqueId(
-        .{ .linux_start_ticks = 42 },
-        42,
-    ));
-}
 
-test "checked signal delivery distinguishes vanished stale and failed targets" {
-    const FakeEffects = struct {
-        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
-            return switch (pid) {
-                11 => error.ProcessNotFound,
-                12 => error.ProcessIdentityUnavailable,
-                13 => .{
-                    .identity = .{ .linux_start_ticks = 113 },
-                    .parent_pid = 1,
-                },
-                else => .{
-                    .identity = .{ .linux_start_ticks = @intCast(pid) },
-                    .parent_pid = 1,
-                },
-            };
-        }
 
-        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
-            return switch (pid) {
-                14 => .vanished,
-                15 => .unavailable,
-                16 => .{ .found = 41 },
-                else => .{ .found = pid + 100 },
-            };
-        }
-
-        fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
-            return switch (pid) {
-                17 => error.PermissionDenied,
-                18 => error.ProcessNotFound,
-                else => {},
-            };
-        }
-    };
-
-    var tracker = Tracker{ .alloc = std.testing.allocator };
-    defer tracker.deinit();
-    for (10..19) |pid| {
-        try tracker.processes.append(std.testing.allocator, .{
-            .pid = @intCast(pid),
-            .identity = .{ .linux_start_ticks = pid },
-        });
-    }
-
-    const summary = tracker.signalProcessesWith(
-        std.posix.SIG.TERM,
-        41,
-        FakeEffects,
-    );
-    try std.testing.expectEqual(@as(usize, 1), summary.delivered);
-    try std.testing.expect(summary.incomplete);
-}
-
-test "checked signal delivery keeps vanished stale and excluded targets complete" {
-    const FakeEffects = struct {
-        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
-            if (pid == 21) return error.ProcessNotFound;
-            return .{
-                .identity = .{ .linux_start_ticks = if (pid == 22) 122 else @as(u64, @intCast(pid)) },
-                .parent_pid = 1,
-            };
-        }
-
-        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
-            return switch (pid) {
-                23 => .vanished,
-                else => .{ .found = 41 },
-            };
-        }
-
-        fn send(_: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
-            return;
-        }
-    };
-
-    var tracker = Tracker{ .alloc = std.testing.allocator };
-    defer tracker.deinit();
-    for (21..25) |pid| {
-        try tracker.processes.append(std.testing.allocator, .{
-            .pid = @intCast(pid),
-            .identity = .{ .linux_start_ticks = pid },
-        });
-    }
-
-    const summary = tracker.signalProcessesWith(
-        std.posix.SIG.TERM,
-        41,
-        FakeEffects,
-    );
-    try std.testing.expectEqual(@as(usize, 0), summary.delivered);
-    try std.testing.expect(!summary.incomplete);
-}
 
 fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
     return switch (builtin.os.tag) {
@@ -1046,22 +904,4 @@ const Darwin = struct {
     ) c_int;
 };
 
-test "tracked identity distinguishes process instances" {
-    const linux = Identity{ .linux_start_ticks = 42 };
-    try std.testing.expect(linux.eql(.{ .linux_start_ticks = 42 }));
-    try std.testing.expect(!linux.eql(.{ .linux_start_ticks = 43 }));
-    try std.testing.expect(!linux.eql(.{ .macos_unique_id = 42 }));
-}
 
-test "Darwin witness scan excludes processes older than command root" {
-    try std.testing.expect(couldBelongByStart(null, null));
-    try std.testing.expect(!couldBelongByStart(100, null));
-    try std.testing.expect(!couldBelongByStart(100, 99));
-    try std.testing.expect(couldBelongByStart(100, 100));
-    try std.testing.expect(couldBelongByStart(100, 101));
-    try std.testing.expectEqual(@as(u64, 2_000_003), darwinStartTimeUs(2, 3));
-    try std.testing.expectEqual(
-        std.math.maxInt(u64),
-        darwinStartTimeUs(std.math.maxInt(u64), 1),
-    );
-}

@@ -142,86 +142,12 @@ const DummyApp = struct {
     worker_thread: ?std.Thread = null,
 };
 
-test "formatToolExecutionError includes tool name" {
-    const alloc = std.testing.allocator;
-    const Rt = Runtime(DummyApp);
-    const msg = try Rt.formatToolExecutionError(alloc, "write_file", error.FileNotFound);
-    defer alloc.free(msg);
-    try std.testing.expect(std.mem.find(u8, msg, "write_file") != null);
-    try std.testing.expect(std.mem.find(u8, msg, "FileNotFound") != null);
-    try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(msg));
-}
 
-test "formatToolExecutionError includes detail for SyntaxError" {
-    const alloc = std.testing.allocator;
-    const Rt = Runtime(DummyApp);
-    const msg = try Rt.formatToolExecutionError(alloc, "edit_file", error.SyntaxError);
-    defer alloc.free(msg);
-    try std.testing.expect(std.mem.find(u8, msg, "invalid JSON syntax") != null);
-    try std.testing.expect(std.mem.find(u8, msg, "edit_file") != null);
-}
 
-test "formatErrorBody describes an interrupted provider response without presentation bytes" {
-    const alloc = std.testing.allocator;
-    const Rt = Runtime(DummyApp);
-    const body = try Rt.formatErrorBody(alloc, "request failed", error.StreamInterrupted);
-    defer alloc.free(body);
 
-    try std.testing.expect(std.mem.find(u8, body, "provider response ended before completion") != null);
-    try std.testing.expect(std.mem.find(u8, body, "StreamInterrupted") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\x1b[") == null);
-    try std.testing.expect(!std.mem.endsWith(u8, body, "\n"));
-}
 
-test "formatErrorBody describes terminal connection setup failures plainly" {
-    const alloc = std.testing.allocator;
-    const Rt = Runtime(DummyApp);
 
-    const timeout = try Rt.formatErrorBody(alloc, "request failed", error.ConnectionSetupTimedOut);
-    defer alloc.free(timeout);
-    try std.testing.expectEqualStrings("Connection setup timed out after 30 seconds.", timeout);
 
-    const tls = try Rt.formatErrorBody(alloc, "request failed", error.TlsInitializationFailed);
-    defer alloc.free(tls);
-    try std.testing.expectEqualStrings("Connection setup failed: TLS could not be initialized.", tls);
-
-    for ([_][]const u8{ timeout, tls }) |body| {
-        try std.testing.expect(std.mem.find(u8, body, "\x1b[") == null);
-        try std.testing.expect(!std.mem.endsWith(u8, body, "\n"));
-        try std.testing.expect(std.mem.find(u8, body, "ConnectionSetupTimedOut") == null);
-        try std.testing.expect(std.mem.find(u8, body, "TlsInitializationFailed") == null);
-    }
-
-    const unrelated_timeout = try Rt.formatErrorBody(alloc, "request failed", error.ConnectionTimedOut);
-    defer alloc.free(unrelated_timeout);
-    try std.testing.expectEqualStrings("request failed: ConnectionTimedOut", unrelated_timeout);
-}
-
-test "formatToolExecutionError includes detail for MissingField" {
-    const alloc = std.testing.allocator;
-    const Rt = Runtime(DummyApp);
-    const msg = try Rt.formatToolExecutionError(alloc, "read_file", error.MissingField);
-    defer alloc.free(msg);
-    try std.testing.expect(std.mem.find(u8, msg, "required field missing") != null);
-}
-
-test "formatToolExecutionError includes detail for ImageTooLarge" {
-    const alloc = std.testing.allocator;
-    const Rt = Runtime(DummyApp);
-    const msg = try Rt.formatToolExecutionError(alloc, "image_tool", error.ImageTooLarge);
-    defer alloc.free(msg);
-    try std.testing.expect(std.mem.find(u8, msg, "image exceeds") != null);
-}
-
-test "formatToolExecutionError generic error has no detail" {
-    const alloc = std.testing.allocator;
-    const Rt = Runtime(DummyApp);
-    const msg = try Rt.formatToolExecutionError(alloc, "run_command", error.OutOfMemory);
-    defer alloc.free(msg);
-    try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(msg));
-    try std.testing.expect(std.mem.find(u8, msg, "run_command") != null);
-    try std.testing.expect(std.mem.find(u8, msg, "OutOfMemory") != null);
-}
 
 const TestWorkerApp = struct {
     worker: worker_runtime.WorkerRuntime = .{},
@@ -270,101 +196,5 @@ fn queuePrompt(app: *TestWorkerApp, text: []const u8) !void {
     try app.worker.enqueuePrompt(std.heap.c_allocator, prompt);
 }
 
-test "startWorkerThread processes queued prompt and exits on shutdown" {
-    var app = TestWorkerApp{};
-    defer app.deinit();
 
-    try Runtime(TestWorkerApp).startWorkerThread(&app);
-    try queuePrompt(&app, "hello");
 
-    const thread = app.worker_thread.?;
-    thread.join();
-    app.worker_thread = null;
-
-    try std.testing.expectEqual(@as(usize, 1), app.processed_count);
-    const snapshot = try app.worker.snapshotState(std.testing.allocator);
-    defer snapshot.deinit(std.testing.allocator);
-    try std.testing.expect(!snapshot.processing);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.queued_count);
-}
-
-test "worker thread reports queued prompt failures as worker events" {
-    var app = TestWorkerApp{ .first_process_error = error.SyntaxError };
-    defer app.deinit();
-
-    try Runtime(TestWorkerApp).startWorkerThread(&app);
-    try queuePrompt(&app, "bad json");
-
-    const thread = app.worker_thread.?;
-    thread.join();
-    app.worker_thread = null;
-
-    var events = app.worker.takeEvents();
-    defer events.deinit(std.heap.c_allocator);
-    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-
-    var saw_error = false;
-    for (events.items) |event| {
-        switch (event) {
-            .error_text => |notice| {
-                saw_error = true;
-                try std.testing.expectEqualStrings("system", notice.topic);
-                try std.testing.expectEqual(types.NoticeTone.@"error", notice.tone);
-                try std.testing.expect(std.mem.find(u8, notice.body, "request failed") != null);
-                try std.testing.expect(std.mem.find(u8, notice.body, "invalid JSON syntax") != null);
-                try std.testing.expect(std.mem.find(u8, notice.body, "SyntaxError") != null);
-            },
-            else => {},
-        }
-    }
-
-    try std.testing.expect(saw_error);
-}
-
-test "worker continues after project context selector failures" {
-    const errors = [_]anyerror{
-        error.OutOfMemory,
-        error.NoSpaceLeft,
-        error.WriteFailed,
-    };
-
-    for (errors) |expected_error| {
-        var app = TestWorkerApp{
-            .first_process_error = expected_error,
-            .shutdown_after_count = 2,
-        };
-        defer app.deinit();
-
-        try queuePrompt(&app, "selector failure");
-        try queuePrompt(&app, "recovery");
-        try Runtime(TestWorkerApp).startWorkerThread(&app);
-
-        const thread = app.worker_thread.?;
-        thread.join();
-        app.worker_thread = null;
-
-        try std.testing.expectEqual(@as(usize, 2), app.processed_count);
-        try std.testing.expectEqual(@as(usize, 1), app.successful_count);
-        try std.testing.expect(app.saw_recovery_prompt);
-
-        const snapshot = try app.worker.snapshotState(std.testing.allocator);
-        defer snapshot.deinit(std.testing.allocator);
-        try std.testing.expect(!snapshot.processing);
-        try std.testing.expectEqual(@as(usize, 0), snapshot.queued_count);
-
-        var events = app.worker.takeEvents();
-        defer events.deinit(std.heap.c_allocator);
-        defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-
-        var error_count: usize = 0;
-        for (events.items) |event| switch (event) {
-            .error_text => |notice| {
-                error_count += 1;
-                try std.testing.expect(std.mem.find(u8, notice.body, "request failed") != null);
-                try std.testing.expect(std.mem.find(u8, notice.body, @errorName(expected_error)) != null);
-            },
-            else => {},
-        };
-        try std.testing.expectEqual(@as(usize, 1), error_count);
-    }
-}

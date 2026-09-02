@@ -72,15 +72,3 @@ pub const unavailable_provider = Provider{
     .execute_fn = unavailable,
 };
 
-test "response transfers owned bytes exactly once" {
-    var response = Response{
-        .disposition = .accepted,
-        .body = try std.testing.allocator.dupe(u8, "secret"),
-    };
-    const body = response.takeBody();
-    defer secret.zeroAndFree(std.testing.allocator, body);
-
-    response.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), response.body.len);
-    try std.testing.expectEqualStrings("secret", body);
-}

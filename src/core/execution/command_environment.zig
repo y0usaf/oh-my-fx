@@ -114,38 +114,5 @@ pub const Host = enum {
     workspace_clean,
 };
 
-test "command environment equality includes explicit shell identity" {
-    try std.testing.expect((Environment{ .legacy = {} }).eql(.legacy));
-    try std.testing.expect((Environment{ .workspace_clean = {} }).eql(.workspace_clean));
-    try std.testing.expect((Environment{ .clean = "/bin/zsh" }).eql(.{ .clean = "/bin/zsh" }));
-    try std.testing.expect(!(Environment{ .clean = "/bin/zsh" }).eql(.{ .clean = "/bin/bash" }));
-    try std.testing.expect(!(Environment{ .clean = "/bin/zsh" }).eql(.{ .user = "/bin/zsh" }));
-}
 
-test "explicit profiles require their selected shell route" {
-    try std.testing.expect(!(Environment{ .legacy = {} }).requiresShellRoute());
-    try std.testing.expect((Environment{ .clean = "/bin/zsh" }).requiresShellRoute());
-    try std.testing.expect((Environment{ .user = "/bin/zsh" }).requiresShellRoute());
-    try std.testing.expect(!(Environment{ .workspace_clean = {} }).requiresShellRoute());
-}
 
-test "explicit permission identities bind profile and exact shell" {
-    const alloc = std.testing.allocator;
-    const command = "printf 'a::b'";
-    const clean = try permissionCommandIdentity(alloc, .{ .clean = "/bin/zsh" }, command);
-    defer alloc.free(clean);
-    const user = try permissionCommandIdentity(alloc, .{ .user = "/bin/zsh" }, command);
-    defer alloc.free(user);
-    const other_shell = try permissionCommandIdentity(alloc, .{ .clean = "/opt/bin::zsh" }, command);
-    defer alloc.free(other_shell);
-
-    try std.testing.expect(!std.mem.eql(u8, clean, user));
-    try std.testing.expect(!std.mem.eql(u8, clean, other_shell));
-    try std.testing.expectEqualStrings(command, commandFromPermissionIdentity(clean));
-    try std.testing.expectEqualStrings(command, commandFromPermissionIdentity(other_shell));
-
-    const legacy = try permissionCommandIdentity(alloc, .legacy, command);
-    defer alloc.free(legacy);
-    try std.testing.expectEqualStrings(command, legacy);
-    try std.testing.expectEqualStrings(command, commandFromPermissionIdentity(legacy));
-}

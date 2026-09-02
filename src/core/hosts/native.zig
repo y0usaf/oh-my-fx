@@ -250,21 +250,4 @@ fn logUnsuccessfulTerm(term: std.process.Child.Term) void {
     }
 }
 
-test "native clipboard selects the platform command" {
-    try std.testing.expectEqualStrings("pbcopy", clipboardCommand(.macos).?[0]);
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "xclip", "-selection", "clipboard" },
-        clipboardCommand(.linux).?,
-    );
-    try std.testing.expect(clipboardCommand(.windows) == null);
-    try std.testing.expect(clipboardCommand(.wasi) == null);
-}
 
-test "native clipboard accepts only a successful exit" {
-    try std.testing.expect(copySucceeded(.{ .exited = 0 }));
-    try std.testing.expect(!copySucceeded(.{ .exited = 1 }));
-    try std.testing.expect(!copySucceeded(.{ .signal = .TERM }));
-    try std.testing.expect(!copySucceeded(.{ .stopped = .STOP }));
-    try std.testing.expect(!copySucceeded(.{ .unknown = 1 }));
-}

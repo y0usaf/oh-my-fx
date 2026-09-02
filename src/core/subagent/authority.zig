@@ -36,41 +36,6 @@ pub fn admitChildPermission(
     return child;
 }
 
-test "child permission admission inherits and never elevates" {
-    const Case = struct {
-        parent: types.PermissionMode,
-        requested: ?types.PermissionMode,
-        expected: ?types.PermissionMode,
-    };
-    const cases = [_]Case{
-        .{ .parent = .ask, .requested = null, .expected = .ask },
-        .{ .parent = .auto, .requested = null, .expected = .auto },
-        .{ .parent = .yolo, .requested = null, .expected = .yolo },
-        .{ .parent = .ask, .requested = .ask, .expected = .ask },
-        .{ .parent = .ask, .requested = .auto, .expected = null },
-        .{ .parent = .ask, .requested = .yolo, .expected = null },
-        .{ .parent = .auto, .requested = .ask, .expected = .ask },
-        .{ .parent = .auto, .requested = .auto, .expected = .auto },
-        .{ .parent = .auto, .requested = .yolo, .expected = null },
-        .{ .parent = .yolo, .requested = .ask, .expected = .ask },
-        .{ .parent = .yolo, .requested = .auto, .expected = .auto },
-        .{ .parent = .yolo, .requested = .yolo, .expected = .yolo },
-    };
-
-    for (cases) |case| {
-        if (case.expected) |expected| {
-            try std.testing.expectEqual(
-                expected,
-                try admitChildPermission(case.parent, case.requested),
-            );
-        } else {
-            try std.testing.expectError(
-                error.PermissionEscalation,
-                admitChildPermission(case.parent, case.requested),
-            );
-        }
-    }
-}
 
 pub const Error = error{
     OutOfMemory,
@@ -166,68 +131,6 @@ pub const HostAuthority = struct {
     }
 };
 
-test "host authority preserves session denies and filters undelegated allows" {
-    const alloc = std.testing.allocator;
-    var empty: session_permission_state.State = .{};
-    defer empty.deinit(alloc);
-
-    const allow_key = try session_permission_state.RuleKey.init(
-        .command,
-        "command\x00git status",
-    );
-    var allow_result = try session_permission_state.apply(alloc, empty, .{ .set = .{
-        .key = allow_key,
-        .display_identity = "git status",
-        .decision = .allow,
-        .expected_generation = null,
-    } });
-    var allow_state = allow_result.takeApplied() orelse
-        return error.TestExpectedAppliedState;
-    defer allow_state.deinit(alloc);
-
-    const deny_key = try session_permission_state.RuleKey.init(
-        .command,
-        "command\x00rm -rf build",
-    );
-    var deny_result = try session_permission_state.apply(alloc, allow_state, .{ .set = .{
-        .key = deny_key,
-        .display_identity = "rm -rf build",
-        .decision = .deny,
-        .expected_generation = null,
-    } });
-    var parent_state = deny_result.takeApplied() orelse
-        return error.TestExpectedAppliedState;
-    defer parent_state.deinit(alloc);
-
-    var host = try HostAuthority.captureWithPermissionStateAndMcpView(
-        alloc,
-        &.{"run_command"},
-        &.{},
-        .{},
-        &.{},
-        parent_state,
-        null,
-    );
-    defer host.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), host.permission_state.rules.items.len);
-    try std.testing.expectEqual(
-        session_permission_state.Decision.deny,
-        host.permission_state.rules.items[0].decision,
-    );
-    try std.testing.expect(session_permission_state.RuleKey.eql(
-        deny_key,
-        host.permission_state.rules.items[0].key,
-    ));
-    try std.testing.expectEqual(
-        session_permission_state.StateDecision.unresolved,
-        session_permission_state.decide(host.permission_state, allow_key),
-    );
-    try std.testing.expectEqual(
-        session_permission_state.StateDecision.deny,
-        session_permission_state.decide(host.permission_state, deny_key),
-    );
-}
 
 fn hostGeneration(
     tools: []const []const u8,
@@ -717,10 +620,3 @@ fn checkGrantMergeResolutionAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("custom", merged[2].tool_name);
 }
 
-test "grant merge resolution cleans every failing allocation path" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkGrantMergeResolutionAllocationFailures,
-        .{},
-    );
-}

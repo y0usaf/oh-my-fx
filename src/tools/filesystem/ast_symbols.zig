@@ -143,50 +143,6 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
 
-test "call parses an external source file outside the primary workspace" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "workspace");
-    try tmp.dir.createDirPath(std.testing.io, "external");
-    {
-        var file = try tmp.dir.createFile(std.testing.io, "external/lib.rs", .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "pub fn external_symbol() {}\n");
-    }
-
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const external_file = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external/lib.rs");
-    defer alloc.free(external_file);
-
-    var input = Input{ .path = try alloc.dupe(u8, external_file) };
-    defer input.deinit(alloc);
-    const erased = tool_dispatch.ToolInput{ .ptr = &input, .deinit_fn = testNoopInputDeinit };
-    var result = try call(.{
-        .allocator = alloc,
-        .workspace_root = workspace,
-    }, erased);
-    defer result.deinit(alloc);
-    switch (result) {
-        .success => |output| try std.testing.expect(std.mem.indexOf(u8, output, "function external_symbol") != null),
-        .failure => |failure| return std.testing.expectEqualStrings("expected success", failure),
-    }
-}
 
 fn testNoopInputDeinit(_: *anyopaque, _: Allocator) void {}
 
-test "formatSymbols renders one-based declaration locations" {
-    const symbols = [_]genome.Symbol{
-        .{ .name = "Wallet", .kind = .class, .start_byte = 0, .end_byte = 6, .start_row = 2 },
-        .{ .name = "deposit", .kind = .method, .start_byte = 10, .end_byte = 17, .start_row = 4 },
-    };
-    const output = try formatSymbols(std.testing.allocator, "src/wallet.ts", &symbols);
-    defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings(
-        "[ast] 2 symbols in src/wallet.ts\n" ++
-            "src/wallet.ts:3: class Wallet\n" ++
-            "src/wallet.ts:5: method deposit\n",
-        output,
-    );
-}

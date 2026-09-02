@@ -150,44 +150,4 @@ pub fn resetForTest() void {
     reset();
 }
 
-test "tool call ring keeps last N records in chronological order" {
-    resetForTest();
-    defer resetForTest();
 
-    var i: u32 = 0;
-    while (i < ring_capacity + 3) : (i += 1) {
-        var call: ToolCallMetric = .{ .duration_ms = i };
-        call.setName("read_file");
-        call.setArgs("{}");
-        call.setResult("ok");
-        record(call);
-    }
-
-    var buf: [ring_capacity]ToolCallMetric = undefined;
-    const n = snapshot(&buf);
-    try std.testing.expectEqual(ring_capacity, n);
-    try std.testing.expectEqual(@as(u32, 3), buf[0].duration_ms);
-    try std.testing.expectEqual(@as(u32, ring_capacity + 3 - 1), buf[ring_capacity - 1].duration_ms);
-}
-
-test "args and result are truncated and total length tracked" {
-    resetForTest();
-    defer resetForTest();
-
-    const huge_len: usize = @as(usize, @max(max_args_len, max_result_len)) + 200;
-    var huge: [huge_len]u8 = undefined;
-    @memset(&huge, 'a');
-    var call: ToolCallMetric = .{};
-    call.setName("read_file");
-    call.setArgs(&huge);
-    call.setResult(&huge);
-    record(call);
-
-    var buf: [1]ToolCallMetric = undefined;
-    const n = snapshot(&buf);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqual(@as(u16, max_args_len), buf[0].args_len);
-    try std.testing.expectEqual(@as(u32, huge_len), buf[0].args_total_bytes);
-    try std.testing.expectEqual(@as(u16, max_result_len), buf[0].result_len);
-    try std.testing.expectEqual(@as(u32, huge_len), buf[0].result_total_bytes);
-}

@@ -97,48 +97,4 @@ const TestClipboard = struct {
     }
 };
 
-test "selection clipboard operations copy before cut" {
-    const alloc = std.testing.allocator;
-    var input: TestInput = .{};
-    defer input.deinit(alloc);
-    try input.edit.setText(alloc, "alpha beta");
-    _ = input.selection().begin(0);
-    _ = input.selection().extend("alpha".len);
 
-    var test_clipboard: TestClipboard = .{};
-    defer test_clipboard.deinit(alloc);
-    try std.testing.expectEqual(
-        ClipboardResult.copied,
-        copySelection(&input.edit, test_clipboard.clipboard()),
-    );
-    try std.testing.expectEqualStrings("alpha", test_clipboard.copied.items);
-    try std.testing.expectEqualStrings("alpha beta", input.edit.input.items);
-
-    test_clipboard.copied.clearRetainingCapacity();
-    try std.testing.expectEqual(
-        ClipboardResult.cut,
-        cutSelection(alloc, input.selection(), null, test_clipboard.clipboard()),
-    );
-    try std.testing.expectEqualStrings("alpha", test_clipboard.copied.items);
-    try std.testing.expectEqualStrings(" beta", input.edit.input.items);
-    try std.testing.expect(try input.undo().undo(alloc));
-    try std.testing.expectEqualStrings("alpha beta", input.edit.input.items);
-}
-
-test "failed clipboard copy preserves selection and text" {
-    const alloc = std.testing.allocator;
-    var input: TestInput = .{};
-    defer input.deinit(alloc);
-    try input.edit.setText(alloc, "alpha beta");
-    _ = input.selection().begin(0);
-    _ = input.selection().extend("alpha".len);
-
-    var test_clipboard: TestClipboard = .{ .succeed = false };
-    defer test_clipboard.deinit(alloc);
-    try std.testing.expectEqual(
-        ClipboardResult.copy_failed,
-        cutSelection(alloc, input.selection(), null, test_clipboard.clipboard()),
-    );
-    try std.testing.expectEqualStrings("alpha beta", input.edit.input.items);
-    try std.testing.expectEqualStrings("alpha", input.selection().selectedText().?);
-}

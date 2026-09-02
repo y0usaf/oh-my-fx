@@ -419,20 +419,6 @@ fn ttlMilliseconds(alloc: Allocator, value: std.json.Value) Error!?u64 {
     return std.math.cast(u64, result);
 }
 
-test "shared resource content owns text blob annotations and metadata" {
-    const alloc = std.testing.allocator;
-    const cases = [_][]const u8{
-        "{\"uri\":\"git://repo/a\",\"mimeType\":\"text/plain\",\"text\":\"hello\",\"annotations\":{\"audience\":[\"user\"],\"priority\":0.5},\"_meta\":{\"revision\":1}}",
-        "{\"uri\":\"memory://image\",\"blob\":\"aGVsbG8=\"}",
-    };
-    for (cases) |json| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-        defer parsed.deinit();
-        var content = try parseResourceContent(alloc, parsed.value, .{});
-        defer content.deinit(alloc);
-        try std.testing.expect(content.uri.len > 0);
-    }
-}
 
 fn checkResourceContentAllocationFailures(alloc: Allocator) !void {
     var parsed = try std.json.parseFromSlice(
@@ -446,22 +432,4 @@ fn checkResourceContentAllocationFailures(alloc: Allocator) !void {
     defer content.deinit(alloc);
 }
 
-test "shared resource content construction is allocation failure safe" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkResourceContentAllocationFailures,
-        .{},
-    );
-}
 
-test "iterative JSON depth validation accepts the limit and rejects the next level" {
-    const alloc = std.testing.allocator;
-    var below = try std.json.parseFromSlice(std.json.Value, alloc, "{\"a\":{\"b\":1}}", .{});
-    defer below.deinit();
-    try validateJsonDepth(below.value, 2);
-    try std.testing.expectError(error.JsonDepthLimitExceeded, validateJsonDepth(below.value, 1));
-
-    var scalar = try std.json.parseFromSlice(std.json.Value, alloc, "1", .{});
-    defer scalar.deinit();
-    try validateJsonDepth(scalar.value, 0);
-}

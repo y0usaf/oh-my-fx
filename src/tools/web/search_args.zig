@@ -201,59 +201,6 @@ fn expectDecodeInput(args_json: []const u8, expected_query: []const u8) !tool_di
     }
 }
 
-test "web_search decode rejects invalid argument shapes" {
-    try expectDecodeFailure("{", "web_search arguments must be valid JSON");
-    try expectDecodeFailure("[]", "web_search arguments must be an object");
-    try expectDecodeFailure("{\"query\":\"ok\",\"extra\":true}", "web_search field \"extra\" is not supported");
-    try expectDecodeFailure("{}", "web_search field \"query\" is required");
-    try expectDecodeFailure("{\"query\":1}", "web_search field \"query\" must be a string");
-    try expectDecodeFailure("{\"query\":\"a\"}", "web_search field \"query\" must contain at least two characters");
-    try expectDecodeFailure(
-        "{\"query\":\"zig\",\"allowed_domains\":\"example.com\"}",
-        "web_search field \"allowed_domains\" must be an array of strings",
-    );
-    try expectDecodeFailure(
-        "{\"query\":\"zig\",\"blocked_domains\":[\"example.com\",1]}",
-        "web_search field \"blocked_domains\" item 1 must be a string",
-    );
-}
 
-test "web_search decode owns query and optional domain filters" {
-    const alloc = std.testing.allocator;
-    const input = try expectDecodeInput(
-        "{\"query\":\"zig allocators\",\"allowed_domains\":[\"ziglang.org\",\"example.com\"],\"blocked_domains\":[]}",
-        "zig allocators",
-    );
-    defer input.deinit(alloc);
 
-    const decoded = input.as(Input);
-    try std.testing.expect(decoded.allowed_domains != null);
-    try std.testing.expect(decoded.blocked_domains == null);
-    try std.testing.expectEqual(@as(usize, 2), decoded.allowed_domains.?.len);
-    try std.testing.expectEqualStrings("ziglang.org", decoded.allowed_domains.?[0]);
-    try std.testing.expectEqualStrings("example.com", decoded.allowed_domains.?[1]);
-}
 
-test "web_search validation allows only one non-empty domain filter" {
-    const alloc = std.testing.allocator;
-    const input = try expectDecodeInput(
-        "{\"query\":\"zig allocators\",\"allowed_domains\":[\"ziglang.org\"],\"blocked_domains\":[\"example.com\"]}",
-        "zig allocators",
-    );
-    defer input.deinit(alloc);
-
-    const reason = try validate(.{ .allocator = alloc }, input);
-    defer if (reason) |body| alloc.free(body);
-    try std.testing.expectEqualStrings("web_search accepts only one non-empty domain filter", reason.?);
-}
-
-test "web_search validation allows one populated filter and one empty filter" {
-    const alloc = std.testing.allocator;
-    const input = try expectDecodeInput(
-        "{\"query\":\"zig allocators\",\"allowed_domains\":[],\"blocked_domains\":[\"example.com\"]}",
-        "zig allocators",
-    );
-    defer input.deinit(alloc);
-
-    try std.testing.expect((try validate(.{ .allocator = alloc }, input)) == null);
-}

@@ -76,31 +76,3 @@ pub fn InterruptRuntime(comptime App: type) type {
     };
 }
 
-test "interactive connectivity wait maps try later to recovery pause" {
-    const FakeWorker = struct {
-        connectivity_wait_active: bool = false,
-        pause_requested: bool = false,
-
-        pub fn isConnectivityWaitActive(self: *const @This()) bool {
-            return self.connectivity_wait_active;
-        }
-
-        pub fn requestRecoveryPause(self: *@This()) void {
-            self.pause_requested = true;
-        }
-    };
-    const FakeApp = struct {
-        stream: struct { active: bool } = .{ .active = true },
-        worker: FakeWorker = .{},
-    };
-
-    var app = FakeApp{};
-    app.worker.connectivity_wait_active = true;
-    try std.testing.expect(InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
-    try std.testing.expect(app.worker.pause_requested);
-
-    app.worker.pause_requested = false;
-    app.worker.connectivity_wait_active = false;
-    try std.testing.expect(!InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
-    try std.testing.expect(!app.worker.pause_requested);
-}

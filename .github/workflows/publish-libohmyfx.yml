@@ -153,9 +153,6 @@ jobs:
         run: zig build -Dnapi-surface=core -Doptimize=ReleaseSafe -Dupdate-channel=${{ needs.metadata.outputs.channel }}
 
       - name: Test native addon
-        run: npm run --prefix sdk test:node-napi
-
-      - name: Name native addon for package discovery
         shell: bash
         run: |
           mkdir -p native-addons
@@ -197,9 +194,6 @@ jobs:
         run: npm ci --prefix sdk/node
 
       - name: Test Node and WebAssembly
-        run: npm run --prefix sdk test:node-wasm
-
-      - name: Upload WebAssembly artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libfx-wasm

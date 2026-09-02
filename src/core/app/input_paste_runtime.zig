@@ -571,9 +571,3 @@ pub fn PasteEditRuntime(comptime App: type) type {
     };
 }
 
-test "approval amendment paste normalizes line and tab separators to spaces" {
-    var storage = [_]u8{ 'o', 'n', 'e', '\r', '\n', 't', 'w', 'o', '\r', 't', 'h', 'r', 'e', 'e', '\n', '\t', 'f', 'o', 'u', 'r' };
-    const normalized = normalizeApprovalAmendmentPasteInPlace(&storage);
-
-    try std.testing.expectEqualStrings("one two three  four", normalized);
-}

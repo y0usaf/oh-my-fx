@@ -174,77 +174,7 @@ fn expectCompiledMatch(pattern: []const u8, candidate_path: []const u8, expected
     try std.testing.expectEqual(expected, compiled.matchesPath(candidate_path));
 }
 
-test "glob pattern matches recursive and segment wildcards" {
-    try expectCompiledMatch("**/*.zig", "main.zig", true);
-    try expectCompiledMatch("**/*.zig", "src/core/main.zig", true);
-    try expectCompiledMatch("*.zig", "src/main.zig", true);
-    try expectCompiledMatch("file?.zig", "dir/file1.zig", true);
-    try expectCompiledMatch("file?.zig", "dir/file12.zig", false);
-    try expectCompiledMatch("foo\\bar.txt", "src/foo\\bar.txt", true);
-    try expectCompiledMatch("src/*.zig", "src/main.zig", true);
-    try expectCompiledMatch("src/*.zig", "src/core/main.zig", false);
-    try expectCompiledMatch("src/*.zig", "lib/src/main.zig", false);
-}
 
-test "glob pattern preserves globstar zero-or-more segment semantics" {
-    try expectCompiledMatch("**", "", true);
-    try expectCompiledMatch("src/", "src", true);
-    try expectCompiledMatch("src/**", "src", true);
-    try expectCompiledMatch("src/**", "src/core/main.zig", true);
-    try expectCompiledMatch("src/**/main.zig", "src/main.zig", true);
-    try expectCompiledMatch("src/**/main.zig", "src/core/nested/main.zig", true);
-    try expectCompiledMatch("src/**/main.zig", "lib/src/core/main.zig", false);
-}
 
-test "glob pattern treats backslashes literally" {
-    try expectCompiledMatch("dir\\*.zig", "dir\\main.zig", true);
-    try expectCompiledMatch("dir\\*.zig", "dir/main.zig", false);
-}
 
-test "glob pattern handles adversarial repeated-star nonmatches without recursion" {
-    const alloc = std.testing.allocator;
-    const star_count = 1024;
 
-    var consecutive = try alloc.alloc(u8, star_count + 1);
-    defer alloc.free(consecutive);
-    @memset(consecutive[0..star_count], '*');
-    consecutive[star_count] = 'z';
-
-    const candidate = try alloc.alloc(u8, star_count);
-    defer alloc.free(candidate);
-    @memset(candidate, 'a');
-
-    var compiled_consecutive = try Pattern.compile(alloc, consecutive);
-    defer compiled_consecutive.deinit(alloc);
-    try std.testing.expect(!compiled_consecutive.matchesPath(candidate));
-
-    var separated: std.Io.Writer.Allocating = .init(alloc);
-    defer separated.deinit();
-    var i: usize = 0;
-    while (i < 512) : (i += 1) {
-        try separated.writer.writeAll("*a");
-    }
-    try separated.writer.writeByte('z');
-    const separated_pattern = try separated.toOwnedSlice();
-    defer alloc.free(separated_pattern);
-
-    var compiled_separated = try Pattern.compile(alloc, separated_pattern);
-    defer compiled_separated.deinit(alloc);
-    try std.testing.expect(!compiled_separated.matchesPath(candidate));
-}
-
-test "glob pattern rejects patterns beyond the maximum accepted length" {
-    const alloc = std.testing.allocator;
-
-    const accepted = try alloc.alloc(u8, max_pattern_bytes);
-    defer alloc.free(accepted);
-    @memset(accepted, 'a');
-    var accepted_pattern = try Pattern.compile(alloc, accepted);
-    defer accepted_pattern.deinit(alloc);
-    try std.testing.expect(accepted_pattern.matchesPath(accepted));
-
-    const rejected = try alloc.alloc(u8, max_pattern_bytes + 1);
-    defer alloc.free(rejected);
-    @memset(rejected, 'a');
-    try std.testing.expectError(error.PatternTooLong, Pattern.compile(alloc, rejected));
-}

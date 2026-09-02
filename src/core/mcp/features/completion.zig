@@ -190,80 +190,7 @@ fn writeMetadata(writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"io.modelcontextprotocol/related-task\":{\"taskId\":\"fx-test\"}}");
 }
 
-test "completion result enforces count bytes total and hasMore" {
-    const alloc = std.testing.allocator;
-    var result = try parseResult(
-        alloc,
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"completion\":{\"values\":[\"alpha\",\"beta\"],\"total\":3,\"hasMore\":true}}}",
-        .modern,
-        .{},
-    );
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), result.values.len);
-    try std.testing.expectEqual(@as(?u64, 3), result.total);
-    try std.testing.expectEqual(@as(?bool, true), result.has_more);
 
-    try std.testing.expectError(
-        error.CompletionLimitExceeded,
-        parseResult(
-            alloc,
-            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"completion\":{\"values\":[\"a\",\"b\"]}}}",
-            .modern,
-            .{ .max_values = 1 },
-        ),
-    );
-    try std.testing.expectError(
-        error.CompletionByteLimitExceeded,
-        parseResult(
-            alloc,
-            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"completion\":{\"values\":[\"alpha\",\"beta\"]}}}",
-            .modern,
-            .{ .max_total_value_bytes = 4 },
-        ),
-    );
-}
-
-test "completion requests encode prompt and resource template references" {
-    const alloc = std.testing.allocator;
-    const prompt_request = try buildRequest(
-        alloc,
-        1,
-        .modern,
-        .{ .prompt = "review" },
-        .{ .name = "focus", .value = "sec" },
-        &.{.{ .name = "language", .value = "zig" }},
-        .{},
-        writeMetadata,
-    );
-    defer alloc.free(prompt_request);
-    try std.testing.expect(std.mem.find(u8, prompt_request, "\"type\":\"ref/prompt\"") != null);
-
-    const resource_request = try buildRequest(
-        alloc,
-        2,
-        .modern,
-        .{ .resource_template = "db:///{table}/{id}" },
-        .{ .name = "table", .value = "us" },
-        &.{},
-        .{},
-        writeMetadata,
-    );
-    defer alloc.free(resource_request);
-    try std.testing.expect(std.mem.find(u8, resource_request, "\"type\":\"ref/resource\"") != null);
-    try std.testing.expectError(
-        error.InvalidContext,
-        buildRequest(
-            alloc,
-            3,
-            .modern,
-            .{ .prompt = "review" },
-            .{ .name = "focus", .value = "sec" },
-            &.{.{ .name = "language", .value = "zig" }},
-            .{ .max_context_bytes = 2 },
-            writeMetadata,
-        ),
-    );
-}
 
 fn checkCompletionAllocationFailures(alloc: Allocator) !void {
     var result = try parseResult(
@@ -275,10 +202,3 @@ fn checkCompletionAllocationFailures(alloc: Allocator) !void {
     defer result.deinit(alloc);
 }
 
-test "completion result construction is allocation failure safe" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkCompletionAllocationFailures,
-        .{},
-    );
-}

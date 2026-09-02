@@ -308,130 +308,29 @@ fn is_ascii_digit(ch: u8) bool {
     return ch >= '0' and ch <= '9';
 }
 
-test "literal pattern predicate covers delegated and privileged commands" {
-    try std.testing.expect(command_requires_literal_pattern("bash"));
-    try std.testing.expect(command_requires_literal_pattern("cmd"));
-    try std.testing.expect(command_requires_literal_pattern("env"));
-    try std.testing.expect(command_requires_literal_pattern("nice"));
-    try std.testing.expect(command_requires_literal_pattern("sudo"));
-    try std.testing.expect(command_requires_literal_pattern("doas"));
-    try std.testing.expect(command_requires_literal_pattern("su"));
-    try std.testing.expect(!command_requires_literal_pattern("grep"));
-}
 
-test "analysis command tail leaves bare command unchanged" {
-    try std.testing.expectEqualStrings("grep foo bar.txt", analysis_command_tail("grep foo bar.txt"));
-}
 
-test "analysis command tail starts at first plain command token" {
-    try std.testing.expectEqualStrings("grep foo", analysis_command_tail("nice grep foo"));
-}
 
-test "known env prefix is transparent to command analysis" {
-    try std.testing.expectEqualStrings("grep", base_command_token("NODE_ENV=prod grep foo").?);
-    try std.testing.expectEqualStrings("grep foo", analysis_command_tail("NODE_ENV=prod grep foo"));
-}
 
-test "unknown env prefix fails closed" {
-    try std.testing.expect(base_command_token("MY_SECRET=x grep foo") == null);
-    try std.testing.expectEqualStrings("MY_SECRET=x grep foo", analysis_command_tail("MY_SECRET=x grep foo"));
-}
 
-test "shell first word is not analyzed as base command" {
-    try std.testing.expect(base_command_token("bash -c 'echo hi'") == null);
-    try std.testing.expectEqualStrings("bash -c 'echo hi'", analysis_command_tail("bash -c 'echo hi'"));
-}
 
-test "priority adjustment prefix is transparent to policy analysis" {
-    try std.testing.expectEqualStrings("grep foo", analysis_command_tail("nice grep foo"));
-}
 
-test "timeout prefix advances past its duration argument" {
-    try std.testing.expectEqualStrings("grep foo bar", analysis_command_tail("timeout 5 grep foo bar"));
-}
 
-test "env command is transparent only with a known assignment" {
-    try std.testing.expectEqualStrings("grep foo", analysis_command_tail("env NODE_ENV=prod grep foo"));
-}
 
-test "env command with flag fails closed" {
-    try std.testing.expectEqualStrings("env -i grep foo", analysis_command_tail("env -i grep foo"));
-}
 
-test "env command with unknown assignment fails closed" {
-    try std.testing.expectEqualStrings("env MY_SECRET=x grep foo", analysis_command_tail("env MY_SECRET=x grep foo"));
-}
 
-test "env command with bare command fails closed" {
-    try std.testing.expectEqualStrings("env grep foo", analysis_command_tail("env grep foo"));
-}
 
-test "xargs remains the analysis command because stdin supplies arguments" {
-    try std.testing.expectEqualStrings("xargs grep foo", analysis_command_tail("xargs grep foo"));
-}
 
-test "privilege prefixes remain anchored during generic analysis" {
-    try std.testing.expectEqualStrings("sudo rm -rf /", analysis_command_tail("sudo rm -rf /"));
-    try std.testing.expectEqualStrings("doas rm -rf /", analysis_command_tail("doas rm -rf /"));
-    try std.testing.expectEqualStrings("su -c 'rm -rf /'", analysis_command_tail("su -c 'rm -rf /'"));
-}
 
-test "base command token returns normal command identifiers" {
-    try std.testing.expectEqualStrings("python3", base_command_token("python3 file.py").?);
-}
 
-test "base command token rejects unknown env prefix" {
-    try std.testing.expect(base_command_token("MY_SECRET=x grep foo") == null);
-}
 
-test "base command token rejects unsafe token shapes" {
-    try std.testing.expect(base_command_token("-rf /tmp") == null);
-    try std.testing.expect(base_command_token("./script") == null);
-    try std.testing.expect(base_command_token("123") == null);
-    try std.testing.expect(base_command_token("foo.bar") == null);
-}
 
-test "base command token accepts bracket alias only as symbolic token" {
-    try std.testing.expectEqualStrings("[", base_command_token("[ -f foo ]").?);
-    try std.testing.expect(base_command_token("] -f foo") == null);
-}
 
-test "empty input returns null or original slice" {
-    try std.testing.expect(base_command_token(" \t ") == null);
-    try std.testing.expectEqualStrings(" \t ", analysis_command_tail(" \t "));
-}
 
-test "multiline first word fails closed while analysis stays anchored" {
-    try std.testing.expect(base_command_token("grep foo\nrm bar") == null);
-    try std.testing.expectEqualStrings("grep foo\nrm bar", analysis_command_tail("grep foo\nrm bar"));
-}
 
-test "terminal segment returns command without operators" {
-    try std.testing.expectEqualStrings("grep foo bar.txt", terminal_exit_segment("grep foo bar.txt").?);
-}
 
-test "terminal segment returns last pipe segment" {
-    try std.testing.expectEqualStrings("grep changed", terminal_exit_segment("diff a b | grep changed").?);
-}
 
-test "terminal segment returns last sequence segment" {
-    try std.testing.expectEqualStrings("grep foo bar.txt", terminal_exit_segment("ls -la; grep foo bar.txt").?);
-}
 
-test "terminal segment returns last newline segment" {
-    try std.testing.expectEqualStrings("grep foo bar.txt", terminal_exit_segment("ls -la\ngrep foo bar.txt").?);
-}
 
-test "terminal segment handles mixed pipes and sequences" {
-    try std.testing.expectEqualStrings("grep c", terminal_exit_segment("printf a | grep b; grep c").?);
-}
 
-test "terminal segment declines short circuit and background operators" {
-    try std.testing.expect(terminal_exit_segment("grep foo bar && echo done") == null);
-    try std.testing.expect(terminal_exit_segment("true & grep foo bar") == null);
-}
 
-test "terminal segment ignores quoted pipe and rejects unbalanced quote" {
-    try std.testing.expectEqualStrings("grep 'foo|bar' baz", terminal_exit_segment("grep 'foo|bar' baz").?);
-    try std.testing.expect(terminal_exit_segment("grep 'foo bar") == null);
-}

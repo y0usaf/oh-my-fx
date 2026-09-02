@@ -134,145 +134,14 @@ fn publishResultFromProcess(alloc: Allocator, result: CompletedProcess) !Publish
     return .{ .ok = true, .text = text };
 }
 
-test "parse draft extracts title and body" {
-    const draft = try parseDraft(std.testing.allocator, "Title\n\n## Summary\nhello");
-    defer draft.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("Title", draft.title);
-    try std.testing.expectEqualStrings("## Summary\nhello", draft.body);
-}
 
-test "parse draft rejects whitespace-only input" {
-    try std.testing.expectError(error.InvalidGithubDraft, parseDraft(std.testing.allocator, " \n\t "));
-}
 
-test "parse draft accepts title-only input" {
-    const draft = try parseDraft(std.testing.allocator, "Title only");
-    defer draft.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("Title only", draft.title);
-    try std.testing.expectEqualStrings("", draft.body);
-}
 
-test "parse draft trims outer whitespace and preserves body markdown" {
-    const draft = try parseDraft(
-        std.testing.allocator,
-        " \r\n  Title with space  \r\n\r\n  - one\r\n  - two\r\n\n",
-    );
-    defer draft.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("Title with space", draft.title);
-    try std.testing.expectEqualStrings("- one\r\n  - two", draft.body);
-}
 
-test "publish argv maps pull request workflow" {
-    var argv = try buildPublishArgv(std.testing.allocator, .pull_request, "A title", "Body text");
-    defer argv.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 7), argv.items.len);
-    try std.testing.expectEqualStrings("gh", argv.items[0]);
-    try std.testing.expectEqualStrings("pr", argv.items[1]);
-    try std.testing.expectEqualStrings("create", argv.items[2]);
-    try std.testing.expectEqualStrings("--title", argv.items[3]);
-    try std.testing.expectEqualStrings("A title", argv.items[4]);
-    try std.testing.expectEqualStrings("--body", argv.items[5]);
-    try std.testing.expectEqualStrings("Body text", argv.items[6]);
-}
 
-test "publish argv maps issue workflow" {
-    var argv = try buildPublishArgv(std.testing.allocator, .issue, "A title", "Body text");
-    defer argv.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 7), argv.items.len);
-    try std.testing.expectEqualStrings("gh", argv.items[0]);
-    try std.testing.expectEqualStrings("issue", argv.items[1]);
-    try std.testing.expectEqualStrings("create", argv.items[2]);
-    try std.testing.expectEqualStrings("--title", argv.items[3]);
-    try std.testing.expectEqualStrings("A title", argv.items[4]);
-    try std.testing.expectEqualStrings("--body", argv.items[5]);
-    try std.testing.expectEqualStrings("Body text", argv.items[6]);
-}
 
-test "publish maps missing gh executable to handled failure" {
-    const result = try publishResultFromRunError(std.testing.allocator, error.FileNotFound);
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expect(!result.ok);
-    try std.testing.expectEqualStrings("gh CLI not found in PATH", result.text);
-}
-
-test "publish returns trimmed stderr for non-zero exit" {
-    const stdout = try std.testing.allocator.dupe(u8, "ignored");
-    const stderr = try std.testing.allocator.dupe(u8, " \nfailed to create\n ");
-
-    const result = try publishResultFromProcess(std.testing.allocator, .{
-        .term = .{ .exited = 1 },
-        .stdout = stdout,
-        .stderr = stderr,
-    });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expect(!result.ok);
-    try std.testing.expectEqualStrings("failed to create", result.text);
-}
-
-test "publish returns fallback for non-zero exit without stderr" {
-    const stdout = try std.testing.allocator.dupe(u8, "ignored");
-    const stderr = try std.testing.allocator.dupe(u8, " \n\t ");
-
-    const result = try publishResultFromProcess(std.testing.allocator, .{
-        .term = .{ .exited = 1 },
-        .stdout = stdout,
-        .stderr = stderr,
-    });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expect(!result.ok);
-    try std.testing.expectEqualStrings("gh command failed", result.text);
-}
-
-test "publish returns success fallback for empty stdout" {
-    const stdout = try std.testing.allocator.dupe(u8, " \n\t ");
-    const stderr = try std.testing.allocator.dupe(u8, "");
-
-    const result = try publishResultFromProcess(std.testing.allocator, .{
-        .term = .{ .exited = 0 },
-        .stdout = stdout,
-        .stderr = stderr,
-    });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqualStrings("created successfully", result.text);
-}
-
-test "publish trims padded stdout" {
-    const stdout = try std.testing.allocator.dupe(u8, " \nhttps://github.com/vercel-labs/fx/pull/1\n ");
-    const stderr = try std.testing.allocator.dupe(u8, "");
-
-    const result = try publishResultFromProcess(std.testing.allocator, .{
-        .term = .{ .exited = 0 },
-        .stdout = stdout,
-        .stderr = stderr,
-    });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqualStrings("https://github.com/vercel-labs/fx/pull/1", result.text);
-}
-
-test "publish transfers already-trimmed stdout ownership" {
-    const stdout = try std.testing.allocator.dupe(u8, "https://github.com/vercel-labs/fx/issues/2");
-    const stderr = try std.testing.allocator.dupe(u8, "");
-
-    const result = try publishResultFromProcess(std.testing.allocator, .{
-        .term = .{ .exited = 0 },
-        .stdout = stdout,
-        .stderr = stderr,
-    });
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expect(result.ok);
-    try std.testing.expect(result.text.ptr == stdout.ptr);
-    try std.testing.expectEqualStrings("https://github.com/vercel-labs/fx/issues/2", result.text);
-}

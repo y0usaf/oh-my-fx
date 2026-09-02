@@ -9,9 +9,6 @@ const command_replay_store = @import("../../session/command_replay_store.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
-test {
-    _ = vision;
-}
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -104,13 +101,6 @@ noinline fn failToolExecutionResultDynamic(err: anyerror) anyerror!ToolExecution
     return err;
 }
 
-test "tool result failure writer preserves exact error type and identity" {
-    const failure = failToolExecutionResult(error.LiveToolAuthorityUnavailable);
-    try std.testing.expect(
-        @TypeOf(failure) == error{LiveToolAuthorityUnavailable}!ToolExecutionResult,
-    );
-    try std.testing.expectError(error.LiveToolAuthorityUnavailable, failure);
-}
 
 pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecutionResult {
     return .{

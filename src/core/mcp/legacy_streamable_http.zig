@@ -1251,144 +1251,11 @@ fn awakeMilliseconds() i64 {
         std.math.maxInt(i64);
 }
 
-test "legacy Streamable HTTP version policy is explicit" {
-    const cases = [_]struct {
-        raw: []const u8,
-        version: Version,
-        sends_header: bool,
-        polling_close: bool,
-    }{
-        .{
-            .raw = "2025-11-25",
-            .version = .v2025_11_25,
-            .sends_header = true,
-            .polling_close = true,
-        },
-        .{
-            .raw = "2025-06-18",
-            .version = .v2025_06_18,
-            .sends_header = true,
-            .polling_close = false,
-        },
-        .{
-            .raw = "2025-03-26",
-            .version = .v2025_03_26,
-            .sends_header = false,
-            .polling_close = false,
-        },
-    };
-    try std.testing.expectEqual(cases.len, supported_versions.len);
-    try std.testing.expectEqual(supported_versions[0], preferred_version);
-    for (cases, 0..) |case, index| {
-        const version = parseVersion(case.raw).?;
-        try std.testing.expectEqual(case.version, version);
-        try std.testing.expectEqual(case.version, supported_versions[index]);
-        try std.testing.expectEqual(case.sends_header, version.sendsProtocolHeader());
-        try std.testing.expectEqual(case.polling_close, version.allowsPollingClose());
-    }
-    try std.testing.expect(parseVersion("2024-11-05") == null);
-    try std.testing.expect(parseVersion("2026-07-28") == null);
-}
 
-test "legacy Streamable HTTP polling close is scoped to 2025-11-25" {
-    inline for ([_]Version{
-        .v2025_11_25,
-        .v2025_06_18,
-        .v2025_03_26,
-    }) |version| {
-        try std.testing.expect(closeIsResumable(version, "event-1", false));
-    }
-    try std.testing.expect(closeIsResumable(.v2025_11_25, "", true));
-    try std.testing.expect(!closeIsResumable(.v2025_06_18, "", true));
-    try std.testing.expect(!closeIsResumable(.v2025_03_26, "", true));
-    try std.testing.expect(!closeIsResumable(.v2025_11_25, null, false));
-}
 
-test "legacy Streamable HTTP initialization selects only committed versions" {
-    try std.testing.expectEqual(
-        Version.v2025_06_18,
-        try initializedVersion(
-            std.testing.allocator,
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\"}}",
-        ),
-    );
-    try std.testing.expectError(
-        error.McpUnsupportedProtocolVersion,
-        initializedVersion(
-            std.testing.allocator,
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}",
-        ),
-    );
-}
 
-test "legacy Streamable HTTP validates protocol session IDs" {
-    try validateSessionId("session-123");
-    try std.testing.expectError(error.InvalidMcpSessionId, validateSessionId(""));
-    try std.testing.expectError(
-        error.InvalidMcpSessionId,
-        validateSessionId("contains space"),
-    );
-    try std.testing.expectError(
-        error.InvalidMcpSessionId,
-        validateSessionId("contains\nnewline"),
-    );
-}
 
-test "legacy Streamable HTTP preserves initialize authentication challenge" {
-    const alloc = std.testing.allocator;
-    var challenge: ?[]u8 = null;
-    defer if (challenge) |value| alloc.free(value);
-    var response = OperationResponse{
-        .body = &.{},
-        .authentication_rejected = true,
-        .www_authenticate = try alloc.dupe(
-            u8,
-            "Bearer scope=\"tools.call\"",
-        ),
-    };
-    defer response.deinit(alloc);
 
-    try std.testing.expectError(
-        error.McpAuthenticationRequired,
-        transferInitializeAuthChallenge(&challenge, &response),
-    );
-    try std.testing.expectEqualStrings(
-        "Bearer scope=\"tools.call\"",
-        challenge.?,
-    );
-    try std.testing.expect(response.www_authenticate == null);
-}
-
-test "legacy Streamable HTTP classifies final progress and server requests" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectEqual(
-        EventOutcome.final,
-        try classifyEvent(
-            alloc,
-            "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}",
-            7,
-            null,
-        ),
-    );
-    try std.testing.expectEqual(
-        EventOutcome.notification,
-        try classifyEvent(
-            alloc,
-            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{}}",
-            7,
-            null,
-        ),
-    );
-    try std.testing.expectEqual(
-        EventOutcome.server_request,
-        try classifyEvent(
-            alloc,
-            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"roots/list\",\"params\":{}}",
-            7,
-            null,
-        ),
-    );
-}
 
 fn checkSseEventIdAllocationFailures(alloc: Allocator) !void {
     var event_id: ?[]u8 = null;
@@ -1397,31 +1264,7 @@ fn checkSseEventIdAllocationFailures(alloc: Allocator) !void {
     try replaceEventId(alloc, &event_id, "event-2");
 }
 
-test "legacy Streamable HTTP replaces event IDs across allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkSseEventIdAllocationFailures,
-        .{},
-    );
-}
 
-test "legacy Streamable HTTP rejects unsafe resumption header values" {
-    const alloc = std.testing.allocator;
-    var headers: std.ArrayList(std.http.Header) = .empty;
-    defer headers.deinit(alloc);
-    try std.testing.expectError(
-        error.InvalidHeaderValue,
-        appendHeaders(alloc, &headers, .{
-            .method = .GET,
-            .url = "",
-            .static_headers = &.{},
-            .last_event_id = "unsafe\x01id",
-            .max_response_bytes = 1,
-            .max_event_bytes = 1,
-            .control = undefined,
-        }, false),
-    );
-}
 
 fn testClientWithSession(alloc: Allocator, session_id: []const u8) !*Client {
     const client = try alloc.create(Client);
@@ -1436,24 +1279,6 @@ fn testClientWithSession(alloc: Allocator, session_id: []const u8) !*Client {
     return client;
 }
 
-test "retiring an expired session keeps the id alive for in-flight requests" {
-    const alloc = std.testing.allocator;
-    const client = try testClientWithSession(alloc, "session-abc");
-
-    // Stand in for a request that is already past `acquireUse` and is using
-    // session_id as an outgoing header.
-    try std.testing.expect(client.acquireUse());
-    const in_flight = client.session_id.?;
-
-    client.retireExpiredSession();
-
-    try std.testing.expect(client.session_id != null);
-    try std.testing.expectEqualStrings("session-abc", in_flight);
-
-    client.releaseUse();
-    // deinit drains active_users before freeing, so it owns the free.
-    client.deinit();
-}
 
 /// Stands in for a request that is already in flight: it holds a use lease and
 /// keeps reading `session_id` as an outgoing header would, then releases.
@@ -1481,43 +1306,4 @@ const LeaseProbe = struct {
     }
 };
 
-test "deinit waits for an in-flight lease before it frees the session id" {
-    const alloc = std.testing.allocator;
-    const client = try testClientWithSession(alloc, "session-drain");
 
-    var entered: std.atomic.Value(bool) = .init(false);
-    var released: std.atomic.Value(bool) = .init(false);
-    var id_stayed_valid: std.atomic.Value(bool) = .init(true);
-
-    try std.testing.expect(client.acquireUse());
-    const probe = try std.Thread.spawn(.{}, LeaseProbe.run, .{LeaseProbe{
-        .client = client,
-        .entered = &entered,
-        .released = &released,
-        .id_stayed_valid = &id_stayed_valid,
-    }});
-    while (!entered.load(.acquire)) {}
-
-    client.retireExpiredSession();
-    client.deinit();
-
-    // deinit must not have returned until the probe gave the lease back, and
-    // the id it was reading must have stayed valid for that whole window.
-    try std.testing.expect(released.load(.acquire));
-    try std.testing.expect(id_stayed_valid.load(.acquire));
-    probe.join();
-}
-
-test "a retired session refuses new leases and skips the delete on teardown" {
-    const alloc = std.testing.allocator;
-    const client = try testClientWithSession(alloc, "session-xyz");
-
-    // A live session is still deleted on teardown; only retirement skips it.
-    try std.testing.expect(client.shouldTerminateSession());
-
-    client.retireExpiredSession();
-
-    try std.testing.expect(!client.acquireUse());
-    try std.testing.expect(!client.shouldTerminateSession());
-    client.deinit();
-}

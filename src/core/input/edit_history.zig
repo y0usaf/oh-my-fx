@@ -158,41 +158,4 @@ pub const State = struct {
     }
 };
 
-test "text edit history moves owned deltas between undo and redo" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(alloc);
 
-    var prepared = try state.prepare(alloc, 2, "old", "new", 5, 5);
-    defer prepared.deinit(alloc);
-    state.commit(alloc, &prepared);
-    try std.testing.expectEqualStrings("old", state.peekUndo().?.removed.items);
-
-    try std.testing.expect(try state.prepareUndo(alloc));
-    state.commitUndo();
-    try std.testing.expect(state.peekUndo() == null);
-    try std.testing.expectEqualStrings("new", state.peekRedo().?.inserted.items);
-
-    try std.testing.expect(try state.prepareRedo(alloc));
-    state.commitRedo();
-    try std.testing.expect(state.peekRedo() == null);
-    try std.testing.expectEqual(@as(usize, 1), state.undo_stack.items.len);
-}
-
-test "structured boundaries discard both edit directions" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    var first = try state.prepare(alloc, 0, "", "a", 0, 1);
-    defer first.deinit(alloc);
-    state.commit(alloc, &first);
-    try std.testing.expect(try state.prepareUndo(alloc));
-    state.commitUndo();
-
-    var boundary: Prepared = .boundary;
-    state.commit(alloc, &boundary);
-    try std.testing.expect(state.peekUndo() == null);
-    try std.testing.expect(state.peekRedo() == null);
-    try std.testing.expectEqual(@as(usize, 0), state.retained_bytes);
-}

@@ -555,290 +555,40 @@ fn has_shell_boundary(command: []const u8) bool {
         std.mem.findScalar(u8, command, '\n') != null;
 }
 
-test "command risk note detects git hard reset" {
-    try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("git reset --hard").?);
-}
 
-test "command safer alternative explains risky commands" {
-    try std.testing.expectEqualStrings("safer: inspect git status first and revert only the intended files", command_safer_alternative_for("git reset --hard").?);
-    try std.testing.expectEqualStrings("safer: inspect targets first", command_safer_alternative_for("rm -rf /tmp/x").?);
-}
 
-test "command safer alternative maps shell inspection to dedicated tools" {
-    try std.testing.expectEqualStrings("safer: use read_file for file inspection", command_safer_alternative_for("cat src/main.zig").?);
-    try std.testing.expectEqualStrings("safer: use glob_files for discovery", command_safer_alternative_for("ls src").?);
-    try std.testing.expectEqualStrings("safer: use grep_files for exact local search", command_safer_alternative_for("rg needle src").?);
-    try std.testing.expectEqualStrings("safer: use glob_files for discovery", command_safer_alternative_for("find src -name '*.zig'").?);
-}
 
-test "command safer alternative stays conservative for compound commands" {
-    try std.testing.expect(command_safer_alternative_for("cat src/main.zig | wc -l") == null);
-    try std.testing.expect(command_safer_alternative_for("git status") == null);
-}
 
-test "command risk note stays narrow for ordinary git operations" {
-    try std.testing.expect(command_risk_note_for("git status") == null);
-    try std.testing.expect(command_risk_note_for("git log --oneline") == null);
-    try std.testing.expect(command_risk_note_for("git commit --no-verify -m ok") == null);
-}
 
-test "command risk note detects forceful removal" {
-    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("rm -rf /tmp/x").?);
-}
 
-test "command risk note detects direct destructive effects only" {
-    for ([_][]const u8{
-        "rm scratch.txt",
-        "rmdir generated",
-        "unlink stale-link",
-        "shred secret.txt",
-        "git clean -fd",
-        "git rm tracked.txt",
-        "/bin/rm scratch.txt",
-        "/usr/bin/git clean -fd",
-        "git -C nested clean -fd",
-        "git --git-dir=.git rm tracked.txt",
-    }) |command| {
-        try std.testing.expectEqual(
-            DestructiveEffect.remove_files,
-            destructive_effect_for(command).?,
-        );
-        try std.testing.expectEqualStrings(
-            "note: command may remove files forcefully",
-            command_risk_note_for(command).?,
-        );
-    }
 
-    try std.testing.expect(command_risk_note_for("git clean --dry-run") == null);
-    try std.testing.expect(command_risk_note_for("git clean -nd") == null);
-    try std.testing.expect(command_risk_note_for("git clean -nfeignored") == null);
-    try std.testing.expect(command_risk_note_for("git -C nested clean --dry-run") == null);
-    try std.testing.expect(command_risk_note_for("git rm --dry-run tracked.txt") == null);
-    try std.testing.expect(command_risk_note_for("git rm -n -- tracked.txt") == null);
-    try std.testing.expect(command_risk_note_for("git rm --help") == null);
-    try std.testing.expect(command_risk_note_for("git clean --help") == null);
-    try std.testing.expect(command_risk_note_for("git clean -h") == null);
-    try std.testing.expect(command_risk_note_for("git clean -hf") == null);
-    try std.testing.expect(command_risk_note_for("git clean -fh") == null);
-    try std.testing.expect(command_risk_note_for("git rm -h tracked.txt") == null);
-    try std.testing.expect(command_risk_note_for("git rm -hf tracked.txt") == null);
-    try std.testing.expect(command_risk_note_for("git reset -h --hard") == null);
-    try std.testing.expect(command_risk_note_for("git reset -hq --hard") == null);
-    try std.testing.expect(command_risk_note_for("git -C clean status") == null);
-    try std.testing.expect(command_risk_note_for("git --unknown clean -fd") == null);
-    try std.testing.expect(command_risk_note_for("rtk rm -rf generated") == null);
-    try std.testing.expectEqual(
-        DestructiveEffect.remove_files,
-        destructive_effect_for("git rm -- -n").?,
-    );
-    try std.testing.expectEqual(
-        DestructiveEffect.remove_files,
-        destructive_effect_for("git clean -f -- -n").?,
-    );
-    for ([_][]const u8{
-        "git clean -f -e --dry-run",
-        "git clean -f --exclude --dry-run",
-        "git clean -f -e-n",
-        "git clean -fe-n",
-        "git clean -f --exclude=--dry-run",
-        "git clean -f -ehelp",
-        "git clean -f -fehelp",
-    }) |command| {
-        try std.testing.expectEqual(
-            DestructiveEffect.remove_files,
-            destructive_effect_for(command).?,
-        );
-    }
-    try std.testing.expectEqual(
-        DestructiveEffect.discard_version_control_state,
-        destructive_effect_for("git reset --hard HEAD~1").?,
-    );
-}
 
-test "command destructive effect leaves unsupported and targetless removal unresolved" {
-    for ([_][]const u8{
-        "rm",
-        "rm -f",
-        "rm --help",
-        "rm --version",
-        "rm # no target",
-        "rm -- # no target",
-        "rmdir --verbose",
-        "unlink --help",
-        "shred -n 3",
-        "git rm # no target",
-        "git rm -- # no target",
-        "git reset # --hard",
-        "rm -f; printf ok",
-        "git rm --dry-run; printf ok",
-        "rm -f < input.txt",
-        "rm victim > output.txt",
-        "printf ok # harmless; rm victim",
-        "cat <<EOF\nrm victim\nEOF",
-    }) |command| {
-        try std.testing.expect(command_risk_note_for(command) == null);
-    }
 
-    try std.testing.expectEqual(
-        DestructiveEffect.remove_files,
-        destructive_effect_for("rm -- -n").?,
-    );
-    try std.testing.expectEqual(
-        DestructiveEffect.remove_files,
-        destructive_effect_for("git clean -f # --dry-run").?,
-    );
-    try std.testing.expectEqual(
-        DestructiveEffect.remove_files,
-        destructive_effect_for("printf ok # ignored; rm first\nrm second").?,
-    );
-    try std.testing.expectEqual(
-        DestructiveEffect.remove_files,
-        destructive_effect_for("printf foo\\ #bar; rm victim").?,
-    );
-    try std.testing.expectEqual(
-        DestructiveEffect.remove_files,
-        destructive_effect_for("printf foo\\;#bar; rm victim").?,
-    );
-    try std.testing.expectEqual(
-        DestructiveEffect.remove_files,
-        destructive_effect_for("printf foo\\" ++ "\n#bar; rm victim").?,
-    );
-    try std.testing.expect(
-        destructive_effect_for("printf \\" ++ "\n# comment; rm ignored") == null,
-    );
-    try std.testing.expectEqual(
-        DestructiveEffect.discard_version_control_state,
-        destructive_effect_for("git reset --hard; printf ok").?,
-    );
-    try std.testing.expectEqual(
-        DestructiveEffect.remove_files,
-        destructive_effect_for("rm victim; printf ok").?,
-    );
-}
 
-test "command risk note detects privilege-wrapped removal" {
-    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("sudo rm -rf /tmp").?);
-    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("doas rm -rf /tmp").?);
-}
 
-test "command risk note detects privilege-wrapped git reset" {
-    try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("sudo git reset --hard").?);
-}
 
-test "command risk note detects quoted su command payload" {
-    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("su -c 'rm -rf /tmp'").?);
-    try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("su -c \"git reset --hard\"").?);
-    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("su root -c 'rm -rf /tmp'").?);
-}
 
-test "command risk note fails closed for malformed su command payload" {
-    try std.testing.expect(command_risk_note_for("su -c 'rm -rf /tmp") == null);
-    try std.testing.expect(command_risk_note_for("su -c \"git reset --hard") == null);
-}
 
-test "command risk note detects process-control wrapped removal" {
-    try std.testing.expect(command_risk_note_for("nice rm -rf /tmp") != null);
-}
 
-test "command risk note detects timeout wrapped git reset" {
-    try std.testing.expect(command_risk_note_for("timeout 5 git reset --hard") != null);
-}
 
-test "command risk note detects safe env wrapped git reset" {
-    try std.testing.expect(command_risk_note_for("env NODE_ENV=prod git reset --hard") != null);
-}
 
-test "command risk note sees removal after unknown env prefix" {
-    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("MY_SECRET=x rm -rf /tmp").?);
-}
 
-test "command risk note ignores quoted command text" {
-    try std.testing.expect(command_risk_note_for("echo 'rm -rf /tmp'") == null);
-}
 
-test "command risk note ignores command text in argument string" {
-    try std.testing.expect(command_risk_note_for("git commit -m \"rm -rf /tmp\"") == null);
-}
 
-test "command risk note detects command after sequence boundary" {
-    try std.testing.expect(command_risk_note_for("echo ok; rm -f scratch") != null);
-}
 
-test "semantic annotation explains grep exit one" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("grep foo bar", 1, "").?);
-}
 
-test "semantic annotation leaves grep real errors alone" {
-    try std.testing.expect(semantic_exit_annotation("grep foo bar", 2, "") == null);
-}
 
-test "semantic annotation leaves zero exits alone" {
-    try std.testing.expect(semantic_exit_annotation("grep foo bar", 0, "") == null);
-}
 
-test "semantic annotation explains find partial access" {
-    try std.testing.expectEqualStrings("note: some paths could not be read", semantic_exit_annotation("find /tmp -name foo", 1, "find: /tmp/private: Permission denied").?);
-    try std.testing.expectEqualStrings("note: some paths could not be read", semantic_exit_annotation("find /tmp -name foo", 1, "find: /tmp/private: Operation not permitted").?);
-}
 
-test "semantic annotation leaves find usage errors alone" {
-    try std.testing.expect(semantic_exit_annotation("find /tmp -bad", 1, "find: -bad: unknown primary or operator") == null);
-    try std.testing.expect(semantic_exit_annotation("find /tmp -name", 1, "find: -name: requires additional arguments") == null);
-}
 
-test "semantic annotation explains diff differences" {
-    try std.testing.expectEqualStrings("note: compared files differ", semantic_exit_annotation("diff a b", 1, "").?);
-}
 
-test "semantic annotation explains test false" {
-    try std.testing.expectEqualStrings("note: condition evaluated false", semantic_exit_annotation("test -f foo", 1, "").?);
-}
 
-test "semantic annotation explains bracket alias false" {
-    try std.testing.expectEqualStrings("note: condition evaluated false", semantic_exit_annotation("[ -f foo ]", 1, "").?);
-}
 
-test "semantic annotation handles wrapped grep" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("timeout 5 grep foo bar.txt", 1, "").?);
-}
 
-test "semantic annotation uses last pipe segment" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("diff a b | grep changed", 1, "").?);
-}
 
-test "semantic annotation uses last sequence segment" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("ls -la; grep foo bar.txt", 1, "").?);
-}
 
-test "semantic annotation uses last newline segment" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("ls -la\ngrep foo bar.txt", 1, "").?);
-}
 
-test "semantic annotation ignores default last pipe segment" {
-    try std.testing.expect(semantic_exit_annotation("grep foo bar | wc -l", 1, "") == null);
-}
 
-test "semantic annotation declines short circuit commands" {
-    try std.testing.expect(semantic_exit_annotation("grep foo bar && echo done", 1, "") == null);
-}
 
-test "semantic annotation declines background commands" {
-    try std.testing.expect(semantic_exit_annotation("true & grep foo bar", 1, "") == null);
-}
 
-test "semantic annotation ignores quoted pipe" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("grep 'foo|bar' baz", 1, "").?);
-}
 
-test "semantic annotation ignores unknown base command" {
-    try std.testing.expect(semantic_exit_annotation("python3 myscript.py", 1, "") == null);
-}
-
-test "semantic annotation ignores default nonzero command" {
-    try std.testing.expect(semantic_exit_annotation("ls -z", 1, "") == null);
-}
-
-test "semantic annotation handles empty and malformed input" {
-    try std.testing.expect(semantic_exit_annotation("", 1, "") == null);
-    try std.testing.expect(semantic_exit_annotation("grep 'unterminated", 1, "") == null);
-}

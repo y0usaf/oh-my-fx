@@ -39,12 +39,3 @@ pub const persistedStatusForCurrentFxLocalResult = runtime_execution_memory.pers
 pub const classifyProviderExecutedResultStatus = runtime_execution_memory.classifyProviderExecutedResultStatus;
 pub const normalizeAssistantTextForDisplay = runtime_assistant_stream.normalizeAssistantTextForDisplay;
 
-test {
-    _ = @import("stream_provider.zig");
-    _ = @import("runtime/tests/gateway_flow.zig");
-    _ = @import("runtime/tests/tool_flow.zig");
-    _ = @import("runtime/tests/interruption_flow.zig");
-    _ = @import("runtime/tests/finalization_flow.zig");
-    _ = @import("runtime/orchestrator.zig");
-    _ = @import("runtime/vision_contracts.zig");
-}

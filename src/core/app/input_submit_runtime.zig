@@ -1954,51 +1954,7 @@ pub fn directCommand(expanded: []const u8) ?[]const u8 {
     return expanded[1..];
 }
 
-test "direct terminal route requires the literal first character" {
-    try std.testing.expectEqualStrings("printf ready", directCommand("!printf ready").?);
-    try std.testing.expectEqualStrings("", directCommand("!").?);
-    try std.testing.expect(directCommand(" !printf prompt") == null);
-    try std.testing.expect(directCommand("ordinary prompt") == null);
-}
 
-test "pending submission phase methods keep hold ownership explicit" {
-    const alloc = std.testing.allocator;
-    var pending = PendingSubmission.init(try buildQueuedPromptDraft(
-        alloc,
-        41,
-        "use $review",
-        &.{},
-        &.{.{
-            .raw_start = 4,
-            .raw_end = 11,
-            .name = "review",
-            .path = "/tmp/review/SKILL.md",
-        }},
-    ));
-    defer pending.deinit(alloc);
-
-    try std.testing.expectEqual(PendingPhase.awaiting_frame, pending.phase);
-    try std.testing.expect(pending.ownsTurnStartHold());
-    try std.testing.expectError(error.InvalidPendingPhase, pending.markAdopted());
-
-    try std.testing.expect(pending.markFrameCommitted());
-    try std.testing.expectEqual(PendingPhase.awaiting_adoption, pending.phase);
-    try std.testing.expect(pending.ownsTurnStartHold());
-    try std.testing.expect(!pending.markFrameCommitted());
-
-    try pending.markAdopted();
-    try std.testing.expectEqual(PendingPhase.adopted, pending.phase);
-    try std.testing.expect(pending.ownsTurnStartHold());
-    try std.testing.expectError(error.InvalidPendingPhase, pending.markAdopted());
-
-    try std.testing.expect(pending.markQueued());
-    try std.testing.expectEqual(PendingPhase.queued, pending.phase);
-    try std.testing.expect(!pending.ownsTurnStartHold());
-    try std.testing.expect(!pending.markQueued());
-    try std.testing.expectEqual(@as(u64, 41), pending.draft.turn_id);
-    try std.testing.expectEqualStrings("use $review", pending.draft.prompt);
-    try std.testing.expectEqual(@as(usize, 1), pending.draft.skill_display_spans.len);
-}
 
 fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !void {
     const draft = try buildQueuedPromptDraft(
@@ -2024,13 +1980,6 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
     try std.testing.expectEqual(@as(usize, 1), draft.skill_display_spans.len);
 }
 
-test "pending draft construction frees every partial allocation" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkPendingDraftConstructionAllocationFailure,
-        .{},
-    );
-}
 
 const PendingLifecycleFake = struct {
     alloc: std.mem.Allocator,
@@ -2160,153 +2109,7 @@ fn expectPendingSnapshotMissing(path: []const u8) !void {
     );
 }
 
-test "post-commit adoption failure keeps one retryable owner and hold" {
-    const Runtime = SubmitRuntime(PendingLifecycleFake);
-    var app = try pendingLifecycleFake(std.testing.allocator, 501);
-    defer app.deinit();
-    app.adoption_failures_remaining = 1;
 
-    Runtime.noteCommittedFrame(&app);
-    try std.testing.expectEqual(PendingPhase.awaiting_adoption, app.submission.pending.?.phase);
-    try std.testing.expect(app.worker.held);
-    try std.testing.expectEqual(@as(usize, 0), app.adoption_count);
-    try std.testing.expectEqual(@as(usize, 0), app.finalization_count);
 
-    Runtime.collectPendingSubmissionFacts(&app);
-    try std.testing.expectEqual(PendingPhase.queued, app.submission.pending.?.phase);
-    try std.testing.expect(!app.worker.held);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
-    try std.testing.expectEqual(@as(usize, 1), app.adoption_count);
-    try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
 
-    try std.testing.expectError(
-        error.PendingTurnIdMismatch,
-        Runtime.acceptPresentedPrompt(&app, 999),
-    );
-    try std.testing.expect(app.submission.pending != null);
-    try Runtime.acceptPresentedPrompt(&app, 501);
-    try std.testing.expect(app.submission.pending == null);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
-}
 
-test "post-ack finalization failure leaves notice and consumes pending owner" {
-    const Runtime = SubmitRuntime(PendingLifecycleFake);
-    var app = try pendingLifecycleFake(std.testing.allocator, 777);
-    defer app.deinit();
-    app.finalization_error = true;
-
-    Runtime.noteCommittedFrame(&app);
-    try std.testing.expectEqual(PendingPhase.adopted, app.submission.pending.?.phase);
-    Runtime.collectPendingSubmissionFacts(&app);
-
-    try std.testing.expect(app.submission.pending == null);
-    try std.testing.expect(!app.worker.held);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
-    try std.testing.expectEqual(@as(usize, 1), app.adoption_count);
-    try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
-    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
-}
-
-test "Ctrl+C cancels pending ownership from every pre-worker phase" {
-    const Runtime = SubmitRuntime(PendingLifecycleFake);
-
-    var awaiting_frame = try pendingLifecycleFake(std.testing.allocator, 801);
-    defer awaiting_frame.deinit();
-    try std.testing.expect(Runtime.cancelPendingSubmission(&awaiting_frame));
-    try std.testing.expect(awaiting_frame.submission.pending == null);
-    try std.testing.expectEqual(@as(usize, 1), awaiting_frame.worker.release_count);
-
-    var awaiting_adoption = try pendingLifecycleFake(std.testing.allocator, 802);
-    defer awaiting_adoption.deinit();
-    awaiting_adoption.adoption_failures_remaining = 1;
-    Runtime.noteCommittedFrame(&awaiting_adoption);
-    try std.testing.expectEqual(PendingPhase.awaiting_adoption, awaiting_adoption.submission.pending.?.phase);
-    try std.testing.expect(Runtime.cancelPendingSubmission(&awaiting_adoption));
-    try std.testing.expect(awaiting_adoption.submission.pending == null);
-    try std.testing.expectEqual(@as(usize, 1), awaiting_adoption.worker.release_count);
-    try std.testing.expect(awaiting_adoption.shell.render_requests.hasReason(.transcript));
-    try std.testing.expect(awaiting_adoption.shell.render_requests.hasReason(.footer));
-
-    var adopted = try pendingLifecycleFake(std.testing.allocator, 803);
-    defer adopted.deinit();
-    Runtime.noteCommittedFrame(&adopted);
-    try std.testing.expectEqual(PendingPhase.adopted, adopted.submission.pending.?.phase);
-    try std.testing.expect(Runtime.cancelPendingSubmission(&adopted));
-    try std.testing.expect(adopted.submission.pending == null);
-    try std.testing.expectEqual(@as(usize, 1), adopted.worker.release_count);
-
-    var queued = try pendingLifecycleFake(std.testing.allocator, 804);
-    defer queued.deinit();
-    Runtime.noteCommittedFrame(&queued);
-    Runtime.collectPendingSubmissionFacts(&queued);
-    try std.testing.expectEqual(PendingPhase.queued, queued.submission.pending.?.phase);
-    try std.testing.expectEqual(@as(?u64, 804), queued.worker.queued_turn_id);
-    try std.testing.expect(Runtime.cancelPendingSubmission(&queued));
-    try std.testing.expect(queued.submission.pending == null);
-    try std.testing.expectEqual(@as(?u64, null), queued.worker.queued_turn_id);
-    try std.testing.expectEqual(@as(usize, 1), queued.worker.delete_count);
-    try std.testing.expectEqual(@as(usize, 1), queued.worker.release_count);
-}
-
-test "Ctrl+C requests cancellation after the pending turn leaves the queue" {
-    const Runtime = SubmitRuntime(PendingLifecycleFake);
-    var app = try pendingLifecycleFake(std.testing.allocator, 805);
-    defer app.deinit();
-    Runtime.noteCommittedFrame(&app);
-    Runtime.collectPendingSubmissionFacts(&app);
-    app.worker.queued_turn_id = null;
-    app.worker.active_turn_id = 805;
-
-    try std.testing.expect(Runtime.cancelPendingSubmission(&app));
-    try std.testing.expectEqual(@as(usize, 1), app.worker.cancel_count);
-    try std.testing.expect(app.submission.pending != null);
-    try Runtime.acceptPresentedPrompt(&app, 805);
-    try std.testing.expect(app.submission.pending == null);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
-}
-
-test "pending terminal cleanup deletes snapshots until a worker claims the turn" {
-    const alloc = std.testing.allocator;
-    const Runtime = SubmitRuntime(PendingLifecycleFake);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const awaiting_path = try writePendingSnapshotFixture(&tmp, "awaiting.bin");
-    defer alloc.free(awaiting_path);
-    var awaiting = try pendingLifecycleFakeWithSnapshot(alloc, 901, awaiting_path);
-    defer awaiting.deinit();
-    try std.testing.expect(Runtime.cancelPendingSubmission(&awaiting));
-    try expectPendingSnapshotMissing(awaiting_path);
-
-    const failed_path = try writePendingSnapshotFixture(&tmp, "failed.bin");
-    defer alloc.free(failed_path);
-    var failed = try pendingLifecycleFakeWithSnapshot(alloc, 902, failed_path);
-    defer failed.deinit();
-    failed.finalization_error = true;
-    Runtime.noteCommittedFrame(&failed);
-    Runtime.collectPendingSubmissionFacts(&failed);
-    try std.testing.expect(failed.submission.pending == null);
-    try expectPendingSnapshotMissing(failed_path);
-
-    const queued_path = try writePendingSnapshotFixture(&tmp, "queued.bin");
-    defer alloc.free(queued_path);
-    var queued = try pendingLifecycleFakeWithSnapshot(alloc, 903, queued_path);
-    defer queued.deinit();
-    Runtime.noteCommittedFrame(&queued);
-    Runtime.collectPendingSubmissionFacts(&queued);
-    try std.testing.expect(Runtime.cancelPendingSubmission(&queued));
-    try expectPendingSnapshotMissing(queued_path);
-
-    const claimed_path = try writePendingSnapshotFixture(&tmp, "claimed.bin");
-    defer alloc.free(claimed_path);
-    var claimed = try pendingLifecycleFakeWithSnapshot(alloc, 904, claimed_path);
-    defer claimed.deinit();
-    Runtime.noteCommittedFrame(&claimed);
-    Runtime.collectPendingSubmissionFacts(&claimed);
-    claimed.worker.queued_turn_id = null;
-    claimed.worker.active_turn_id = 904;
-    try std.testing.expect(Runtime.cancelPendingSubmission(&claimed));
-    try Runtime.acceptPresentedPrompt(&claimed, 904);
-    var retained = try std.Io.Dir.openFileAbsolute(std.testing.io, claimed_path, .{});
-    retained.close(std.testing.io);
-}

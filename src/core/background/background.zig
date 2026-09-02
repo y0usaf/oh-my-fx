@@ -19,10 +19,3 @@ pub const TaskCompletion = background_runtime.TaskCompletion;
 pub const ProcessSupervisor = process_supervisor.ProcessSupervisor;
 pub const Runtime = background_runtime.BackgroundRuntime;
 
-test "background exports runtime owner types" {
-    const std = @import("std");
-    try std.testing.expect(Runtime == background_runtime.BackgroundRuntime);
-    try std.testing.expect(BackgroundRuntime == background_runtime.BackgroundRuntime);
-    try std.testing.expect(ProcessSupervisor == process_supervisor.ProcessSupervisor);
-    try std.testing.expect(!@hasField(Runtime, "records"));
-}

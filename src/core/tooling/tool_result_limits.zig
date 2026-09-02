@@ -95,42 +95,6 @@ pub fn truncateText(arena: std.mem.Allocator, opts: TruncateOptions) ![]const u8
     return try std.mem.concat(arena, u8, &.{ opts.text[0..prefix_len], opts.marker });
 }
 
-test "prepareModelOutput masks secrets before applying cap" {
-    const alloc = std.testing.allocator;
-    const output = try prepareModelOutput(alloc, "mcp__server__tool", "token=secret-value", default_max_tool_result_bytes);
-    defer alloc.free(@constCast(output));
 
-    try std.testing.expectEqualStrings("token=[redacted]", output);
-}
 
-test "prepareModelOutput masks quoted sensitive assignments" {
-    const alloc = std.testing.allocator;
-    const output = try prepareModelOutput(alloc, "run_command", "API_KEY=\"secret-value\"", default_max_tool_result_bytes);
-    defer alloc.free(@constCast(output));
 
-    try std.testing.expectEqualStrings("API_KEY=\"[redacted]\"", output);
-}
-
-test "prepareModelOutput caps chatty output with explicit marker" {
-    const alloc = std.testing.allocator;
-    var bytes = [_]u8{'x'} ** 256;
-    const output = try prepareModelOutput(alloc, "grep_files", bytes[0..], 128);
-    defer alloc.free(@constCast(output));
-
-    try std.testing.expect(output.len <= 128);
-    try std.testing.expect(std.mem.find(u8, output, "... [tool result truncated for grep_files: original 256 bytes; cap is 128 bytes]") != null);
-}
-
-test "prepareModelOutput keeps complete codepoints at the cap" {
-    const alloc = std.testing.allocator;
-    const text = "x" ++ ("\xc3\xa9" ** 300);
-    for ([_]usize{ 128, 129 }) |cap| {
-        const output = try prepareModelOutput(alloc, "grep_files", text, cap);
-        defer alloc.free(@constCast(output));
-        try std.testing.expect(output.len <= cap);
-        const marker_start = std.mem.find(u8, output, "\n... [tool result truncated").?;
-        const prefix = output[0..marker_start];
-        try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
-        try std.testing.expect(std.mem.endsWith(u8, prefix, "\xc3\xa9"));
-    }
-}

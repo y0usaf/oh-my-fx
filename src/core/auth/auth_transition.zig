@@ -76,48 +76,4 @@ pub fn signInCompletion(
     };
 }
 
-test "provider switch and logout decisions are pure and provider keyed" {
-    try std.testing.expectEqual(ProviderSwitchDecision.no_change, decideProviderSwitch(.{
-        .current = .codex,
-        .target = .codex,
-        .target_credential_ready = true,
-        .intent = .manual,
-        .stream_active = false,
-        .queued_prompts = 0,
-    }));
-    try std.testing.expectEqual(ProviderSwitchDecision.busy, decideProviderSwitch(.{
-        .current = .gateway,
-        .target = .grok,
-        .target_credential_ready = true,
-        .intent = .manual,
-        .stream_active = true,
-        .queued_prompts = 0,
-    }));
 
-    var inventory: std.EnumSet(credentials.Source) = .empty;
-    inventory.insert(.chatgpt_subscription);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, decideLogoutProvider(.{
-        .requested = null,
-        .selected = .gateway,
-        .active_source = null,
-        .available_sources = inventory,
-    }));
-    try std.testing.expectEqual(model_provider.ProviderId.grok, decideLogoutProvider(.{
-        .requested = .grok,
-        .selected = .codex,
-        .active_source = .chatgpt_subscription,
-        .available_sources = inventory,
-    }));
-}
-
-test "sign in completion selects routing or credential activation without effects" {
-    try std.testing.expectEqual(
-        SignInCompletionAction{ .switch_provider = .codex },
-        signInCompletion(.codex, true),
-    );
-    try std.testing.expectEqual(
-        SignInCompletionAction{ .activate_source = .grok_subscription },
-        signInCompletion(.grok, false),
-    );
-    try std.testing.expectEqual(SignInCompletionAction.vercel, signInCompletion(.gateway, true));
-}

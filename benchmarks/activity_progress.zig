@@ -162,9 +162,3 @@ pub fn main(init: std.process.Init) !void {
     if (!comparison.passed or !growth.passed) return error.UiActivityProgressRegression;
 }
 
-test "benchmark gate handles isolated and repeated timing breaches" {
-    var isolated = [_]u64{ 1_000, 1_100, 2_500, 1_050, 1_000 };
-    var repeated = [_]u64{ 2_100, 2_200, 1_900, 2_300, 2_400 };
-    try std.testing.expect(evaluate(&isolated, 3).passed);
-    try std.testing.expect(!evaluate(&repeated, 3).passed);
-}

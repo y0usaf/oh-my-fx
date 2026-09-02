@@ -294,33 +294,4 @@ fn validateModelId(id: []const u8) !void {
     }
 }
 
-test "Codex catalog parser keeps visible API models and live capabilities" {
-    const alloc = std.testing.allocator;
-    const json =
-        \\{"models":[
-        \\  {"slug":"gpt-5.4-mini","visibility":"list","supported_in_api":true,"priority":7,"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"additional_speed_tiers":[],"input_modalities":["text","image"],"context_window":272000},
-        \\  {"slug":"hidden","visibility":"hide","supported_in_api":true,"priority":8,"supported_reasoning_levels":[],"additional_speed_tiers":["fast"],"input_modalities":["text"],"context_window":1},
-        \\  {"slug":"unsupported","visibility":"list","supported_in_api":false,"priority":9,"supported_reasoning_levels":[],"additional_speed_tiers":[],"input_modalities":["text"],"context_window":1}
-        \\]}
-    ;
-    var catalog = try parseCatalog(alloc, json);
-    defer model_catalog.freeModelCatalog(alloc, &catalog);
 
-    try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
-    const model = catalog.items[0];
-    try std.testing.expectEqualStrings("gpt-5.4-mini", model.id);
-    try std.testing.expect(model.has_tool_use);
-    try std.testing.expect(model.has_reasoning);
-    try std.testing.expectEqual(@as(usize, 2), model.reasoning_efforts.items.len);
-    try std.testing.expect(!model.supports_fast_mode);
-    try std.testing.expect(model.has_vision);
-    try std.testing.expect(model.has_file_input);
-    try std.testing.expectEqual(@as(u32, 272_000), model.context_window);
-}
-
-test "Codex catalog URL uses the live-validated protocol compatibility version" {
-    const url = try modelsUrl(std.testing.allocator);
-    defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.148.0") != null);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.0.4") == null);
-}

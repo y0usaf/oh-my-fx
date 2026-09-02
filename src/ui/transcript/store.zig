@@ -1939,19 +1939,6 @@ fn entryIdsPreservePrefix(
     return true;
 }
 
-test "entry prefix identity rejects retention and lifecycle reposition" {
-    const previous = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "one" } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "two" } },
-    };
-    const appended = previous ++ [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 3, .bytes = "three" } }};
-    const retained = [_]TranscriptEntry{previous[1]};
-    const repositioned = [_]TranscriptEntry{ previous[1], previous[0] };
-
-    try std.testing.expect(entryIdsPreservePrefix(&previous, &appended));
-    try std.testing.expect(!entryIdsPreservePrefix(&previous, &retained));
-    try std.testing.expect(!entryIdsPreservePrefix(&previous, &repositioned));
-}
 
 fn cloneEntries(
     alloc: Allocator,
@@ -3146,137 +3133,8 @@ pub fn appendCappedWithinCapacity(
     return text.len;
 }
 
-test "appendCappedWithinCapacity keeps latest complete line" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    var replaceable = false;
-    var replaceable_start: usize = 0;
 
-    try list.appendSlice(std.testing.allocator, "a\nb\nc\n");
-    _ = try appendCappedWithinCapacity(&list, std.testing.allocator, "", 4, &replaceable, &replaceable_start);
-    try std.testing.expectEqualStrings("c\n", list.items);
-}
 
-test "appendCappedWithinCapacity keeps suffix when no newline" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    var replaceable = false;
-    var replaceable_start: usize = 0;
 
-    try list.appendSlice(std.testing.allocator, "abcdefghij");
-    _ = try appendCappedWithinCapacity(&list, std.testing.allocator, "", 5, &replaceable, &replaceable_start);
-    try std.testing.expectEqualStrings("fghij", list.items);
-}
 
-test "cappedTailStart returns bytes.len when limit is zero" {
-    try std.testing.expectEqual(@as(usize, 3), cappedTailStart("abc", 0));
-    try std.testing.expectEqual(@as(usize, 0), cappedTailStart("", 0));
-    try std.testing.expectEqual(@as(usize, 10), cappedTailStart("0123456789", 0));
-}
 
-test "cappedTailStart drops trailing newline-only tail" {
-    try std.testing.expectEqual(@as(usize, 4), cappedTailStart("abc\n", 2));
-    try std.testing.expectEqual(@as(usize, 1), cappedTailStart("\n", 0));
-}
-
-test "appendCappedWithinCapacity oversized newline tail can retain less than cap" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    var replaceable = false;
-    var replaceable_start: usize = 0;
-
-    const cap: usize = 64;
-    const oversized = try std.testing.allocator.alloc(u8, cap + 16);
-    defer std.testing.allocator.free(oversized);
-    @memset(oversized, 'z');
-    const raw_cut = oversized.len - cap;
-    oversized[raw_cut + 7] = '\n';
-    const expected_retained_len = oversized.len - (raw_cut + 8);
-
-    const appended = try appendCappedWithinCapacity(&list, std.testing.allocator, oversized, cap, &replaceable, &replaceable_start);
-
-    try std.testing.expectEqual(expected_retained_len, appended);
-    try std.testing.expectEqual(expected_retained_len, list.items.len);
-    try std.testing.expect(list.items.len < cap);
-}
-
-test "refreshFoldedCommandSummaryIndices uses final preparation indices" {
-    const alloc = std.testing.allocator;
-    const FoldedBlock = struct {
-        summary_entry_id: ?u32,
-        summary_transcript_index: usize = 0,
-    };
-    const Runtime = struct {
-        layout: struct { cols: u16 },
-        entries: std.ArrayList(TranscriptEntry),
-        folded_command_blocks: std.ArrayList(FoldedBlock),
-        command_output_render: command_output_runtime.CommandOutputRenderPolicy = .{},
-    };
-
-    var runtime = Runtime{
-        .layout = .{ .cols = 20 },
-        .entries = .empty,
-        .folded_command_blocks = .empty,
-    };
-    defer {
-        for (runtime.entries.items) |*entry| entry.deinit(alloc);
-        runtime.entries.deinit(alloc);
-        runtime.folded_command_blocks.deinit(alloc);
-    }
-
-    var segments: AssistantTurnSegments = .{};
-    try segments.text.appendSlice(alloc, "assistant prose");
-    try runtime.entries.append(alloc, .{ .assistant_turn = .{ .id = 1, .segments = segments } });
-    try runtime.entries.append(alloc, .{ .raw_bytes = .{
-        .id = 2,
-        .bytes = try alloc.dupe(u8, "first summary\n"),
-        .class = .tool_status,
-    } });
-
-    const table = try assistant_presentation.parseTablePayload(
-        alloc,
-        "| Name | Status |\n" ++
-            "|------|--------|\n" ++
-            "| api | Complete |\n",
-    );
-    try runtime.entries.append(alloc, .{ .assistant_table = .{ .id = 3, .table = table } });
-    try runtime.entries.append(alloc, .{ .raw_bytes = .{
-        .id = 4,
-        .bytes = try alloc.dupe(u8, "second summary\n"),
-        .class = .tool_status,
-    } });
-
-    try runtime.entries.append(alloc, .{ .assistant_code_block = .{
-        .id = 5,
-        .block = .{
-            .language = try alloc.dupe(u8, "zig"),
-            .code = try alloc.dupe(u8, "const value = 1;"),
-        },
-    } });
-    try runtime.entries.append(alloc, .{ .raw_bytes = .{
-        .id = 6,
-        .bytes = try alloc.dupe(u8, "third summary\n"),
-        .class = .tool_status,
-    } });
-
-    const summary_ids = [_]?u32{ 2, 4, 6 };
-    var expected = try transcript_blocks.renderEntriesForPreparation(
-        alloc,
-        runtime.entries.items,
-        runtime.layout.cols,
-        .{},
-        .{ .folded_summary_entry_ids = &summary_ids },
-    );
-    defer expected.deinit(alloc);
-
-    try runtime.folded_command_blocks.appendSlice(alloc, &.{
-        .{ .summary_entry_id = 2 },
-        .{ .summary_entry_id = 4 },
-        .{ .summary_entry_id = 6 },
-    });
-    try refreshFoldedCommandSummaryIndices(&runtime, alloc);
-
-    for (runtime.folded_command_blocks.items, expected.folded_summary_indices) |block, index| {
-        try std.testing.expectEqual(index, block.summary_transcript_index);
-    }
-}

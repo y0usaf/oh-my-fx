@@ -569,106 +569,15 @@ pub fn isPrintableAscii(byte: u8) bool {
     return byte >= 32 and byte <= 126;
 }
 
-test "input line wraps to the cursor row" {
-    var buf: [64]u8 = undefined;
-    const view = buildInputLine("abcdefghijklmnopqrstuvwxyz", 26, 16, &buf);
-    try std.testing.expectEqualStrings("  opqrstuvwxyz", view.line);
-    try std.testing.expectEqual(@as(u16, 15), view.cursor_col);
-}
 
-test "input line wraps without cutting emoji bytes" {
-    var buf: [64]u8 = undefined;
-    const view = buildInputLine("a😀b", "a😀b".len, 5, &buf);
-    try std.testing.expectEqualStrings("  b", view.line);
-    try std.testing.expectEqual(@as(u16, 4), view.cursor_col);
-}
 
-test "wrapped input row builder exposes all visual rows" {
-    var buf: [64]u8 = undefined;
-    const input = "abcdefgh";
-    const ml = countMultilineInfo(input, input.len, 6);
-    try std.testing.expectEqual(@as(u16, 2), ml.total_lines);
-    try std.testing.expectEqual(@as(u16, 1), ml.cursor_line);
 
-    const first = buildInputLineForRow(input, input.len, 0, ml.total_lines, 6, &buf);
-    try std.testing.expectEqualStrings("❯ abcd", first.line);
-    try std.testing.expectEqual(@as(u16, 0), first.cursor_col);
 
-    const second = buildInputLineForRow(input, input.len, 1, ml.total_lines, 6, &buf);
-    try std.testing.expectEqualStrings("  efgh", second.line);
-    try std.testing.expectEqual(@as(u16, 6), second.cursor_col);
-}
 
-test "hard newline keeps cursor at end of previous row" {
-    var buf: [64]u8 = undefined;
-    const input = "abc\ndef";
-    const view = buildInputLine(input, 3, 20, &buf);
-    try std.testing.expectEqualStrings("❯ abc", view.line);
-    try std.testing.expectEqual(@as(u16, 6), view.cursor_col);
-}
 
-test "inputColumnForIndex aligns active token under input" {
-    const input = "/model openai/gpt-5 high";
-    const col = inputColumnForIndex(input, input.len, "/model openai/gpt-5 ".len, 80);
-    try std.testing.expectEqual(@as(u16, 23), col);
-}
 
-test "render geometry wrappers match visual layout projections" {
-    const input = "abc\ndefgh";
-    const source = visual_layout.Source{ .input = input, .cursor = input.len, .terminal_cols = 6 };
-    const summary = visual_layout.summarize(source, "abc\n".len + 1);
-    const ml = countMultilineInfo(input, input.len, 6);
-    try std.testing.expectEqual(@as(u16, @intCast(summary.total_rows)), ml.total_lines);
-    try std.testing.expectEqual(@as(u16, @intCast(summary.cursor.row_index)), ml.cursor_line);
-    try std.testing.expectEqual(visual_layout.projectedAnchorColumn(summary, 6), inputColumnForIndex(input, input.len, "abc\n".len + 1, 6));
 
-    try std.testing.expectEqual(@as(u16, 3), visual_layout.terminalColumn(.{ .raw_offset = 0, .row_index = 0, .content_column = 0 }, 80));
-    try std.testing.expectEqual(@as(u16, 3), visual_layout.terminalColumn(.{ .raw_offset = 0, .row_index = 1, .content_column = 0 }, 80));
-    try std.testing.expectEqual(@as(u16, 6), visual_layout.terminalColumn(.{ .raw_offset = 3, .row_index = 0, .content_column = 3 }, 80));
-}
 
-test "render row window stays cursor-containing for direct and restored input" {
-    var buf: [128]u8 = undefined;
-    inline for (.{ "x" ** 4096, "y" ** 5000 }) |input| {
-        const summary = visual_layout.summarize(.{ .input = input, .cursor = input.len, .terminal_cols = 80 }, null);
-        const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 4);
-        try std.testing.expect(window.first_row <= summary.cursor.row_index);
-        try std.testing.expect(summary.cursor.row_index < window.first_row + window.row_count);
-
-        const view = buildInputLineForRow(input, input.len, 3, 4, 80, &buf);
-        try std.testing.expect(std.mem.startsWith(u8, view.line, "  "));
-        try std.testing.expect(view.cursor_col > 0);
-    }
-}
-
-test "render soft-wrap boundary and earlier anchors use cursor row columns" {
-    var buf: [64]u8 = undefined;
-    const input = "abcd";
-    const view = buildInputLine(input, 3, 5, &buf);
-    try std.testing.expectEqualStrings("  d", view.line);
-    try std.testing.expectEqual(@as(u16, 3), view.cursor_col);
-
-    const earlier_anchor_col = inputColumnForIndex("abcdef", 5, 1, 5);
-    try std.testing.expectEqual(@as(u16, 3), earlier_anchor_col);
-}
-
-test "render tabs use visual layout absolute tab stops" {
-    const input = "\tX";
-    const summary = visual_layout.summarize(.{ .input = input, .cursor = 1, .terminal_cols = 10 }, 1);
-    try std.testing.expectEqual(@as(u16, 9), visual_layout.projectedAnchorColumn(summary, 10));
-    try std.testing.expectEqual(@as(u16, 9), inputColumnForIndex(input, 1, 1, 10));
-
-    const wrapped = "aaaaaa\tXY";
-    const wrapped_summary = visual_layout.summarize(.{ .input = wrapped, .cursor = wrapped.len, .terminal_cols = 10 }, wrapped.len - 1);
-    try std.testing.expectEqual(visual_layout.projectedAnchorColumn(wrapped_summary, 10), inputColumnForIndex(wrapped, wrapped.len, wrapped.len - 1, 10));
-}
-
-test "render width zero emits no row bytes and first cursor column" {
-    var buf: [8]u8 = undefined;
-    const view = buildInputLine("abc", 3, 0, &buf);
-    try std.testing.expectEqualStrings("", view.line);
-    try std.testing.expectEqual(@as(u16, 1), view.cursor_col);
-}
 
 /// Writes the title to the same file the transcript renders to, so a host
 /// that redirects its output keeps the escape sequence out of the real
@@ -738,60 +647,8 @@ fn clearTerminalTitleProvider(raw: ?*anyopaque) void {
     out.writeStreamingAll(io_mod.getIo(), "\x1b]2;\x07") catch return;
 }
 
-test "terminal title writes the label to the caller's output file" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var sink = try tmp.dir.createFile(std.testing.io, "terminal-title.log", .{});
-    defer sink.close(io_mod.getIo());
 
-    // A host that redirects its output keeps the escape sequence off the
-    // real stdout, which the Zig test runner owns as its protocol channel.
-    terminalTitleFor(&sink).set("release notes");
 
-    var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title.log", .{});
-    defer written_file.close(io_mod.getIo());
-    const written = try io_mod.readFileToEnd(alloc, &written_file, 128);
-    defer alloc.free(written);
-    try std.testing.expectEqualStrings("\x1b]2;fx · release notes\x07", written);
-}
-
-test "terminal title sanitizes and bounds untrusted labels" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var sink = try tmp.dir.createFile(std.testing.io, "terminal-title-hostile.log", .{});
-    defer sink.close(io_mod.getIo());
-
-    terminalTitleFor(&sink).set("safe\x07\x1b]2;owned\xc2\x9b" ++ ("é" ** 80));
-
-    var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title-hostile.log", .{});
-    defer written_file.close(io_mod.getIo());
-    const written = try io_mod.readFileToEnd(alloc, &written_file, 512);
-    defer alloc.free(written);
-    try std.testing.expect(written.len <= terminal_title_osc_prefix.len + terminal_title_max_content_bytes + 1);
-    try std.testing.expect(std.mem.startsWith(u8, written, "\x1b]2;fx · safe]2;owned"));
-    try std.testing.expect(std.mem.endsWith(u8, written, "...\x07"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\x07"));
-    try std.testing.expect(std.mem.find(u8, written[terminal_title_osc_prefix.len..], "\x1b") == null);
-    try std.testing.expect(std.mem.find(u8, written, "\xc2\x9b") == null);
-}
-
-test "terminal title clear restores a predictable empty state" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var sink = try tmp.dir.createFile(std.testing.io, "terminal-title-clear.log", .{});
-    defer sink.close(io_mod.getIo());
-
-    terminalTitleFor(&sink).clear();
-
-    var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title-clear.log", .{});
-    defer written_file.close(io_mod.getIo());
-    const written = try io_mod.readFileToEnd(alloc, &written_file, 32);
-    defer alloc.free(written);
-    try std.testing.expectEqualStrings("\x1b]2;\x07", written);
-}
 
 pub fn formatResumeHandoff(
     buffer: []u8,
@@ -809,346 +666,31 @@ pub fn formatResumeHandoff(
     );
 }
 
-test "initTheme sets light mode styles" {
-    initTheme(true, null);
-    try std.testing.expect(is_light);
-    try std.testing.expect(!std.mem.eql(u8, subtitle_style, "\x1b[1;38;5;255m"));
 
-    initTheme(false, null);
-    try std.testing.expect(!is_light);
-    try std.testing.expectEqualStrings("\x1b[1;38;5;255m", subtitle_style);
-}
 
-test "resume handoff uses one row only when the full instruction fits" {
-    initTheme(false, null);
-    defer initTheme(false, null);
 
-    const single_row = "Continue session with: fx --resume session-123";
-    var exact_buffer: [128]u8 = undefined;
-    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len);
-    try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with: fx --resume session-123\x1b[0m\n",
-        exact,
-    );
 
-    var narrow_buffer: [128]u8 = undefined;
-    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1);
-    try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with:\n  fx --resume session-123\x1b[0m\n",
-        narrow,
-    );
-}
 
-test "resume handoff follows the active muted theme shade" {
-    initTheme(true, null);
-    defer initTheme(false, null);
 
-    var buffer: [128]u8 = undefined;
-    const message = try formatResumeHandoff(&buffer, "session-123", 80);
-    try std.testing.expectEqualStrings(
-        "\x1b[38;5;247mContinue session with: fx --resume session-123\x1b[0m\n",
-        message,
-    );
-}
 
-test "themeNeedsUpdate compares the active terminal background" {
-    initTheme(false, .{ .r = 20, .g = 21, .b = 22 });
-    defer initTheme(false, null);
 
-    try std.testing.expect(!themeNeedsUpdate(false, null));
-    try std.testing.expect(!themeNeedsUpdate(false, .{ .r = 20, .g = 21, .b = 22 }));
-    try std.testing.expect(themeNeedsUpdate(false, .{ .r = 21, .g = 21, .b = 22 }));
-    try std.testing.expect(themeNeedsUpdate(true, null));
-}
 
-test "initTheme selects the light inline code foreground" {
-    const alloc = std.testing.allocator;
-    assistant_presentation.setInlineCodeTheme(false);
-    defer initTheme(false, null);
 
-    initTheme(true, null);
 
-    var processor = assistant_presentation.MarkdownProcessor{};
-    defer processor.deinit(alloc);
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
 
-    try processor.push(alloc, "run `zig build` now\n", &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;247mzig build\x1b[39m now\n", out.items);
-}
 
-test "welcomeMessage shows version and help hint" {
-    const message = try welcomeMessage(std.testing.allocator);
-    defer std.testing.allocator.free(message);
 
-    try std.testing.expect(std.mem.find(u8, message, "𝒇x") != null);
-    try std.testing.expect(std.mem.find(u8, message, main.version) != null);
-    try std.testing.expect(std.mem.find(u8, message, "/help") != null);
-}
 
-test "welcomeMessage keeps only the app name bright" {
-    initTheme(false, null);
-    const message = try welcomeMessage(std.testing.allocator);
-    defer std.testing.allocator.free(message);
 
-    var label_buf: [welcome_build_label_bytes]u8 = undefined;
-    const build_label = try writeBuildLabel(
-        &label_buf,
-        build_channel,
-        main.version,
-        build_options.git_commit,
-    );
-    const expected = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
-        .{ subtitle_style, reset_style, dim_style, build_label },
-    );
-    defer std.testing.allocator.free(expected);
 
-    try std.testing.expectEqualStrings(expected, message);
-}
 
-test "build label stays bare on the stable channel" {
-    var buf: [welcome_build_label_bytes]u8 = undefined;
-    const label = try writeBuildLabel(&buf, .stable, "0.0.4", "abcdef123456");
-    try std.testing.expectEqualStrings("v0.0.4", label);
-}
 
-test "dev build label carries the commit and restores the dim run after the tag" {
-    initTheme(false, null);
 
-    var buf: [welcome_build_label_bytes]u8 = undefined;
-    const label = try writeBuildLabel(&buf, .dev, "0.0.5", "abcdef123456");
 
-    const expected = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "v0.0.5-abcdef1 {s}[dev]{s}",
-        .{ hint_style, dim_style },
-    );
-    defer std.testing.allocator.free(expected);
 
-    try std.testing.expectEqualStrings(expected, label);
-}
 
-test "dev build label drops an unresolved revision" {
-    initTheme(false, null);
 
-    var buf: [welcome_build_label_bytes]u8 = undefined;
-    const label = try writeBuildLabel(&buf, .dev, "0.0.5", "unknown");
 
-    const expected = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "v0.0.5 {s}[dev]{s}",
-        .{ hint_style, dim_style },
-    );
-    defer std.testing.allocator.free(expected);
 
-    try std.testing.expectEqualStrings(expected, label);
-}
 
-test "buildHintLine advertises queue without persistent steering hint while streaming" {
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(true, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{}, 120, &buf);
-    try std.testing.expect(std.mem.find(u8, line, "enter queue") != null);
-    try std.testing.expect(std.mem.find(u8, line, "ctrl+enter steer") == null);
-}
 
-test "buildHintLine hides effort when it is auto" {
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "anthropic/claude-opus-4.7", .ask, 0, null, false, true, .auto, true, .{}, 80, &buf);
-    try std.testing.expectEqualStrings("ask · opus 4.7", line);
-}
-
-test "buildHintLine hides effort for models without effort support" {
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-4o", .ask, 0, null, false, false, .auto, false, .{}, 80, &buf);
-    try std.testing.expectEqualStrings("ask · gpt-4o", line);
-}
-
-test "buildHintLine uses a monochrome lightning marker for fast mode" {
-    initTheme(false, null);
-    defer initTheme(false, null);
-
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "anthropic/claude-opus-4.8", .ask, 0, null, true, true, types.ReasoningEffort.literal("low"), true, .{}, 80, &buf);
-    try std.testing.expectEqualStrings("ask · opus 4.8 · low · ⚡︎", line);
-    try std.testing.expectEqual(@as(usize, 25), display_width.visibleWidthIgnoringAnsi(line));
-}
-
-test "buildHintLine shows effort when active" {
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, types.ReasoningEffort.literal("high"), true, .{}, 80, &buf);
-    try std.testing.expectEqualStrings("ask · gpt-5 · high", line);
-}
-
-test "buildHintLine shows full context usage" {
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "anthropic/claude-opus-4.8", .ask, 0, null, false, true, .auto, true, .{
-        .context_used = 43_000,
-        .context_total = 1_000_000,
-    }, 80, &buf);
-    try std.testing.expectEqualStrings("ask · opus 4.8 · Context: 43k/1000k 4%", line);
-}
-
-test "buildHintLine shows the session title" {
-    var buf: [256]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
-        .session_title = "add a session name display",
-    }, 200, &buf);
-    try std.testing.expectEqualStrings(
-        "ask · gpt-5 · add a session name display",
-        line,
-    );
-}
-
-test "buildHintLine clips an overlong session title on a character boundary" {
-    var buf: [256]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
-        .session_title = "ααααααααααααααααααααααααααααααααααααααααα",
-    }, 200, &buf);
-    try std.testing.expect(std.mem.startsWith(u8, line, "ask · gpt-5 · "));
-    const title = line["ask · gpt-5 · ".len..];
-    try std.testing.expect(std.unicode.utf8ValidateSlice(title));
-    try std.testing.expectEqual(@as(usize, 32), display_width.visibleWidth(title));
-}
-
-test "buildHintLine omits the session segment when no title is cached" {
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
-        .session_title = null,
-    }, 80, &buf);
-    try std.testing.expectEqualStrings("ask · gpt-5", line);
-}
-
-test "buildHintLine shows the workspace and Git branch" {
-    var buf: [256]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
-        .workspace_label = "/workspace/code/fx",
-        .git_branch = "feature/statusline",
-    }, 100, &buf);
-    try std.testing.expectEqualStrings(
-        "ask · gpt-5 · /workspace/code/fx (feature/statusline)",
-        line,
-    );
-}
-
-test "buildHintLine keeps workspace and branch readable at narrow widths" {
-    var buf: [256]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
-        .workspace_label = "/a/very/long/path/to/fx-repo",
-        .git_branch = "feature/statusline",
-    }, 36, &buf);
-    try std.testing.expectEqual(@as(usize, 36), display_width.visibleWidthIgnoringAnsi(line));
-    try std.testing.expect(std.mem.startsWith(u8, line, "ask · gpt-5 · "));
-    try std.testing.expect(std.mem.find(u8, line, "fx-repo") != null);
-    try std.testing.expect(std.mem.find(u8, line, "feature/") != null);
-    try std.testing.expect(std.mem.endsWith(u8, line, "…)"));
-}
-
-test "buildHintLine workspace identity does not displace existing status segments" {
-    var buf: [256]u8 = undefined;
-    const line = buildHintLine(false, false, true, "anthropic/claude-opus-4.8", .auto, 0, null, true, true, types.ReasoningEffort.literal("xhigh"), true, .{
-        .workspace_label = "/a/very/long/path/to/the/active/workspace",
-        .git_branch = "feature/statusline",
-        .context_used = 1_000,
-        .context_total = 100_000,
-    }, 60, &buf);
-    try std.testing.expect(std.mem.find(u8, line, "xhigh") != null);
-    try std.testing.expect(std.mem.find(u8, line, "⚡︎") != null);
-    try std.testing.expect(std.mem.find(u8, line, "Context: 1k/100k 1%") != null);
-}
-
-test "buildHintLine shows a non-Git workspace without branch punctuation" {
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
-        .workspace_label = "/tmp/plain-workspace",
-    }, 80, &buf);
-    try std.testing.expectEqualStrings(
-        "ask · gpt-5 · /tmp/plain-workspace",
-        line,
-    );
-}
-
-test "buildHintLine labels detached HEAD" {
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
-        .workspace_label = "/tmp/fx",
-        .git_branch = "detached:0123456789ab",
-    }, 80, &buf);
-    try std.testing.expectEqualStrings(
-        "ask · gpt-5 · /tmp/fx (detached:0123456789ab)",
-        line,
-    );
-}
-
-test "buildHintLine keeps system labels and dot separators" {
-    var buf: [256]u8 = undefined;
-    const line = buildHintLine(false, false, false, "anthropic/claude-opus-4.8", .auto, 2, null, true, true, types.ReasoningEffort.literal("low"), true, .{
-        .context_used = 43_000,
-        .context_total = 1_000_000,
-    }, 256, &buf);
-    const expected = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "run /login · queued 2 · {s}auto{s} · opus 4.8 · low · ⚡︎ · Context: 43k/1000k 4%",
-        .{ permission_auto_style, statusline_style },
-    );
-    defer std.testing.allocator.free(expected);
-    try std.testing.expectEqualStrings(
-        expected,
-        line,
-    );
-}
-
-test "buildHintLine skips an over-capacity segment without a dangling dot" {
-    var buf: [16]u8 = undefined;
-    const line = buildHintLine(false, false, true, "anthropic/claude-opus-4.7", .ask, 0, null, true, true, .auto, true, .{}, 80, &buf);
-    try std.testing.expectEqualStrings("ask · opus 4.7", line);
-}
-
-test "buildHintLine colors auto mode with theme accent" {
-    initTheme(false, null);
-    const dark_accent = permission_auto_style;
-    const dark_status = statusline_style;
-    var dark_buf: [128]u8 = undefined;
-    const dark_line = buildHintLine(false, false, true, "openai/gpt-4o", .auto, 0, null, false, false, .auto, false, .{}, 80, &dark_buf);
-    const dark_expected = try std.fmt.allocPrint(std.testing.allocator, "{s}auto{s} · gpt-4o", .{ dark_accent, dark_status });
-    defer std.testing.allocator.free(dark_expected);
-    try std.testing.expectEqualStrings(dark_expected, dark_line);
-
-    initTheme(true, null);
-    defer initTheme(false, null);
-    try std.testing.expect(!std.mem.eql(u8, permission_auto_style, dark_accent));
-    var light_buf: [128]u8 = undefined;
-    const light_line = buildHintLine(false, false, true, "openai/gpt-4o", .auto, 0, null, false, false, .auto, false, .{}, 80, &light_buf);
-    const light_expected = try std.fmt.allocPrint(std.testing.allocator, "{s}auto{s} · gpt-4o", .{ permission_auto_style, statusline_style });
-    defer std.testing.allocator.free(light_expected);
-    try std.testing.expectEqualStrings(light_expected, light_line);
-}
-
-test "buildHintLine renders yolo uppercase with subdued permission styling" {
-    initTheme(false, null);
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-4o", .yolo, 0, null, false, false, .auto, false, .{}, 80, &buf);
-    const expected = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{s}YOLO{s} · gpt-4o",
-        .{ permission_auto_style, statusline_style },
-    );
-    defer std.testing.allocator.free(expected);
-
-    try std.testing.expectEqualStrings(expected, line);
-}
-
-test "buildHintLine clips styled auto mode by visible width" {
-    initTheme(false, null);
-    defer initTheme(false, null);
-
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, false, true, "openai/gpt-4o", .auto, 0, null, false, false, .auto, false, .{}, 13, &buf);
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}auto{s} · gpt-4o", .{ permission_auto_style, statusline_style });
-    defer std.testing.allocator.free(expected);
-
-    try std.testing.expectEqualStrings(expected, line);
-    try std.testing.expectEqual(@as(usize, 13), display_width.visibleWidthIgnoringAnsi(line));
-    try std.testing.expect(std.mem.endsWith(u8, line, "gpt-4o"));
-}

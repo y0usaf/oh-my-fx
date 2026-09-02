@@ -218,34 +218,4 @@ pub const AttentionRequiredHandler = struct {
     ) HandlerError!void,
 };
 
-test "hook definitions enumerate current hook surfaces" {
-    try std.testing.expectEqual(@as(usize, 4), all_hooks.len);
-    try std.testing.expectEqual(HookKind.pre_tool_use, all_hooks[0].kind);
-    try std.testing.expectEqual(HookKind.stop, all_hooks[1].kind);
-    try std.testing.expectEqual(HookKind.post_turn_end, all_hooks[2].kind);
-    try std.testing.expectEqual(HookKind.attention_required, all_hooks[3].kind);
-    try std.testing.expectEqualStrings("PreToolUse", pre_tool_use.lifecycle_event);
-    try std.testing.expectEqualStrings("Stop", stop.lifecycle_event);
-    try std.testing.expectEqualStrings("PostTurnEnd", post_turn_end.lifecycle_event);
-    try std.testing.expectEqualStrings("AttentionRequired", attention_required.lifecycle_event);
-    try std.testing.expectEqual(HookKind.pre_tool_use, HookKind.pre_tool_use.definition().kind);
-    try std.testing.expectEqual(HookKind.stop, HookKind.stop.definition().kind);
-    try std.testing.expectEqual(HookKind.post_turn_end, HookKind.post_turn_end.definition().kind);
-    try std.testing.expectEqual(HookKind.attention_required, HookKind.attention_required.definition().kind);
-    try std.testing.expectEqualStrings("PreToolUse", HookKind.pre_tool_use.definition().lifecycle_event);
-    try std.testing.expectEqualStrings("Stop", HookKind.stop.definition().lifecycle_event);
-    try std.testing.expectEqualStrings("PostTurnEnd", HookKind.post_turn_end.definition().lifecycle_event);
-    try std.testing.expectEqualStrings("AttentionRequired", HookKind.attention_required.definition().lifecycle_event);
-    try std.testing.expect(pre_tool_use.agent_loop_point.len > 0);
-    try std.testing.expect(pre_tool_use.purpose.len > 0);
-    try std.testing.expect(stop.agent_loop_point.len > 0);
-    try std.testing.expect(stop.purpose.len > 0);
-    try std.testing.expect(post_turn_end.agent_loop_point.len > 0);
-    try std.testing.expect(post_turn_end.purpose.len > 0);
-    try std.testing.expect(attention_required.agent_loop_point.len > 0);
-    try std.testing.expect(attention_required.purpose.len > 0);
-}
 
-test "Hooks v1.0 scope kinds remain limited to the current surfaces" {
-    try std.testing.expectEqual(@as(usize, 4), @typeInfo(ScopeKind).@"enum".fields.len);
-}

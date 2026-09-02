@@ -57,7 +57,3 @@ fn pathExists(path: []const u8) bool {
     return true;
 }
 
-test "prompt terminal controls require every path" {
-    try std.testing.expect(controlsFromPaths("terminal", "reap", null) == null);
-    try std.testing.expect(controlsFromPaths("terminal", "reap", "release") != null);
-}

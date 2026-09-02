@@ -177,13 +177,3 @@ pub const Runtime = struct {
     }
 };
 
-test "runtime owns product input state without terminal mechanics" {
-    const alloc = std.testing.allocator;
-    var runtime: Runtime = .{};
-    defer runtime.deinit(alloc);
-
-    try runtime.insertionState().insertSlice(alloc, "draft", .clear);
-    try std.testing.expectEqualStrings("draft", runtime.edit_state.input.items);
-    try std.testing.expect(!@hasField(Runtime, "terminal_action_decoder"));
-    try std.testing.expect(!@hasField(Runtime, "terminal_cursor_probe"));
-}

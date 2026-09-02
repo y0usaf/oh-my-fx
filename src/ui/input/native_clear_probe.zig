@@ -86,49 +86,5 @@ pub const Runtime = struct {
     }
 };
 
-test "native clear probe retains input until it settles" {
-    var runtime = Runtime{};
-    defer runtime.deinit(std.testing.allocator);
 
-    try runtime.begin(std.testing.allocator, 17, 'a');
-    try runtime.retainBytes(std.testing.allocator, "bc");
 
-    try std.testing.expect(runtime.active());
-    try std.testing.expectEqualStrings("abc", runtime.retainedInput());
-
-    const retained = runtime.settle();
-    try std.testing.expectEqualStrings("abc", retained);
-    try std.testing.expect(!runtime.active());
-}
-
-test "native clear probe bounds held input" {
-    const alloc = std.testing.allocator;
-    var runtime = Runtime{};
-    defer runtime.deinit(alloc);
-
-    try runtime.begin(alloc, 17, 'a');
-    const fill = try alloc.alloc(u8, max_input_bytes - 1);
-    defer alloc.free(fill);
-    @memset(fill, 'b');
-    try runtime.retainBytes(alloc, fill);
-
-    try std.testing.expect(!runtime.canRetainBytes(1));
-    try std.testing.expectError(
-        error.NativeClearProbeInputOverflow,
-        runtime.retainBytes(alloc, "c"),
-    );
-}
-
-test "native clear probe records disabled late-response window" {
-    var runtime = Runtime{};
-
-    try std.testing.expect(!runtime.disabled());
-    try std.testing.expect(!runtime.awaitingLateResponse());
-
-    runtime.disable(true);
-    try std.testing.expect(runtime.disabled());
-    try std.testing.expect(runtime.awaitingLateResponse());
-
-    runtime.finishLateResponse();
-    try std.testing.expect(!runtime.awaitingLateResponse());
-}

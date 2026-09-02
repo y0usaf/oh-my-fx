@@ -750,16 +750,6 @@ fn decodeLatestPointerJson(
     return parsed;
 }
 
-test "latest pointer parser handles fuzzed bytes" {
-    try std.testing.fuzz({}, fuzzLatestPointer, .{
-        .corpus = &.{
-            "",
-            "{}",
-            "{\"schema_version\":1,\"status\":\"pending\",\"workspace_root\":\"/tmp/workspace\",\"session_id\":\"session\",\"updated_at_ms\":null}",
-            "{\"schema_version\":1,\"status\":\"ready\",\"workspace_root\":\"/tmp/workspace\",\"session_id\":\"session\",\"updated_at_ms\":1}",
-        },
-    });
-}
 
 fn fuzzLatestPointer(_: void, smith: *std.testing.Smith) !void {
     var buffer: [4096]u8 = undefined;

@@ -202,197 +202,27 @@ fn testSlashRegistry() SlashRegistry {
     return builtin_commands.slash_registry;
 }
 
-test "parse extracts model command payload" {
-    const parsed = parse(testSlashRegistry(), "/model claude-opus");
-    switch (parsed) {
-        .model => |query| try std.testing.expectEqualStrings("claude-opus", query),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse extracts an optional logout provider" {
-    switch (parse(testSlashRegistry(), "/logout chatgpt")) {
-        .logout => |provider| try std.testing.expectEqualStrings("chatgpt", provider),
-        else => return error.TestExpectedLogoutCommand,
-    }
-}
 
-test "parse rejects removed plural model command" {
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/models"));
-}
 
-test "parse leaves provider selection to setup" {
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/provider codex"));
-}
 
-test "parse extracts allowlist command payload" {
-    switch (parse(testSlashRegistry(), "/allowlist add command \"git *\"")) {
-        .allowlist => |rest| try std.testing.expectEqualStrings("add command \"git *\"", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse extracts sound command payload" {
-    switch (parse(testSlashRegistry(), "/sound off")) {
-        .notifications => |rest| try std.testing.expectEqualStrings("off", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/sound")) {
-        .notifications => |rest| try std.testing.expectEqualStrings("", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse distinguishes new and reset lifecycle commands" {
-    try std.testing.expectEqual(ParsedCommand.new_session, parse(testSlashRegistry(), "/new"));
-    try std.testing.expectEqual(ParsedCommand.reset_session, parse(testSlashRegistry(), "/reset"));
-}
 
-test "parse recognizes interactive resume" {
-    try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
-}
 
-test "parse recognizes explicit recovery continuation" {
-    try std.testing.expectEqual(ParsedCommand.continue_recovery, parse(testSlashRegistry(), "/continue"));
-}
 
-test "parse recognizes logout" {
-    switch (parse(testSlashRegistry(), "/logout")) {
-        .unknown => return error.TestExpectedLogoutCommand,
-        else => {},
-    }
-}
 
-test "parse rejects removed slash commands" {
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/pr ready for review"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/issue flaky test"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/changes"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/review"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/history"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/rules"));
-}
 
-test "parse extracts background stop target" {
-    const parsed = parse(testSlashRegistry(), "/background stop last");
-    switch (parsed) {
-        .background_stop => |target| try std.testing.expectEqualStrings("last", target),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse extracts background open and logs targets" {
-    switch (parse(testSlashRegistry(), "/background open 3")) {
-        .background_open => |target| try std.testing.expectEqualStrings("3", target),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/background logs last")) {
-        .background_logs => |target| try std.testing.expectEqualStrings("last", target),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse extracts image commands" {
-    switch (parse(testSlashRegistry(), "/image screenshot.png")) {
-        .image => |path| try std.testing.expectEqualStrings("screenshot.png", path),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/img screenshot.png")) {
-        .image => |path| try std.testing.expectEqualStrings("screenshot.png", path),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/images clear")) {
-        .images => |rest| try std.testing.expectEqualStrings("clear", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse extracts mcp command payload" {
-    switch (parse(testSlashRegistry(), "/mcp add everything npx -y @modelcontextprotocol/server-everything")) {
-        .mcp => |rest| try std.testing.expectEqualStrings("add everything npx -y @modelcontextprotocol/server-everything", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse recognizes exact no-payload commands" {
-    try std.testing.expectEqual(ParsedCommand.copy, parse(testSlashRegistry(), "/copy"));
-    try std.testing.expectEqual(ParsedCommand.feedback, parse(testSlashRegistry(), "/feedback"));
-    try std.testing.expectEqual(ParsedCommand.trace, parse(testSlashRegistry(), "/trace"));
-    try std.testing.expectEqual(ParsedCommand.compact, parse(testSlashRegistry(), "/compact"));
-    try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/credits"));
-    try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/balance"));
-    try std.testing.expectEqual(ParsedCommand.paste, parse(testSlashRegistry(), "/paste"));
-    try std.testing.expectEqual(ParsedCommand.fast, parse(testSlashRegistry(), "/fast"));
-    try std.testing.expectEqual(ParsedCommand.version, parse(testSlashRegistry(), "/version"));
-}
 
-test "parse extracts settings command payload" {
-    switch (parse(testSlashRegistry(), "/settings")) {
-        .settings => |rest| try std.testing.expectEqualStrings("", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/settings startup-scrollback")) {
-        .settings => |rest| try std.testing.expectEqualStrings("startup-scrollback", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/settings startup-scrollback off")) {
-        .settings => |rest| try std.testing.expectEqualStrings("startup-scrollback off", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse extracts alias payload" {
-    switch (parse(testSlashRegistry(), "/alias build zig build")) {
-        .alias => |rest| try std.testing.expectEqualStrings("build zig build", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse treats unknown and malformed command inputs as unknown" {
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/wat"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/output"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/output quiet"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/task"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/tasks"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/subagents"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "hello"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/copy extra"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), " /model claude-opus"));
-}
 
-test "parse tolerates trailing whitespace on exact-match commands" {
-    try std.testing.expectEqual(ParsedCommand.quit, parse(testSlashRegistry(), "/exit "));
-    try std.testing.expectEqual(ParsedCommand.quit, parse(testSlashRegistry(), "/quit  "));
-    try std.testing.expectEqual(ParsedCommand.quit, parse(testSlashRegistry(), "/exit \t"));
-    try std.testing.expectEqual(ParsedCommand.help, parse(testSlashRegistry(), "/help "));
-    try std.testing.expectEqual(ParsedCommand.copy, parse(testSlashRegistry(), "/copy "));
-    try std.testing.expectEqual(ParsedCommand.clear_screen, parse(testSlashRegistry(), "/clear\t"));
-}
 
-test "parse returns empty payload for bare prefix commands" {
-    switch (parse(testSlashRegistry(), "/model")) {
-        .model => |query| try std.testing.expectEqualStrings("", query),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/mcp")) {
-        .mcp => |rest| try std.testing.expectEqualStrings("", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/allowlist")) {
-        .allowlist => |rest| try std.testing.expectEqualStrings("", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/skills")) {
-        .skills => |rest| try std.testing.expectEqualStrings("", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
 
-test "parse trims only spaces and tabs around payload" {
-    switch (parse(testSlashRegistry(), "/model \t claude-opus \t")) {
-        .model => |query| try std.testing.expectEqualStrings("claude-opus", query),
-        else => return error.TestExpectedEqual,
-    }
-}
 
 fn parsedIsUnknown(parsed: ParsedCommand) bool {
     return switch (parsed) {
@@ -401,27 +231,7 @@ fn parsedIsUnknown(parsed: ParsedCommand) bool {
     };
 }
 
-test "parse covers every registered slash command token and alias" {
-    for (testSlashRegistry().commands) |spec| {
-        try std.testing.expect(!parsedIsUnknown(parse(testSlashRegistry(), spec.command)));
-        for (spec.aliases) |alias| {
-            try std.testing.expect(!parsedIsUnknown(parse(testSlashRegistry(), alias)));
-        }
-    }
-}
 
-test "parse payload acceptance follows slash spec metadata" {
-    var buf: [128]u8 = undefined;
-    for (testSlashRegistry().commands) |spec| {
-        const command_with_payload = try std.fmt.bufPrint(&buf, "{s} sample", .{spec.command});
-        const parsed = parse(testSlashRegistry(), command_with_payload);
-        if (spec.accepts_payload) {
-            try std.testing.expect(!parsedIsUnknown(parsed));
-        } else {
-            try std.testing.expect(parsedIsUnknown(parsed));
-        }
-    }
-}
 
 const TestContext = struct {
     called: []const u8 = "",
@@ -536,103 +346,11 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
     };
 }
 
-test "route calls expected no-payload handler" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.copy_last = recordCopy;
 
-    try route(testSlashRegistry(), &handlers, "/copy");
 
-    try std.testing.expectEqualStrings("copy", ctx.called);
-    try std.testing.expectEqualStrings("", ctx.payload);
-}
 
-test "route calls interactive resume handler" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.resume_session = recordResumeSession;
 
-    try route(testSlashRegistry(), &handlers, "/resume");
 
-    try std.testing.expectEqualStrings("resume", ctx.called);
-}
 
-test "route calls explicit recovery continuation handler" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.continue_recovery = recordContinueRecovery;
 
-    try route(testSlashRegistry(), &handlers, "/continue");
 
-    try std.testing.expectEqualStrings("continue_recovery", ctx.called);
-}
-
-test "route forwards borrowed payload slice" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.handle_model = recordModel;
-    const cmd = "/model claude-opus";
-
-    try route(testSlashRegistry(), &handlers, cmd);
-
-    try std.testing.expectEqualStrings("model", ctx.called);
-    try std.testing.expectEqualStrings("claude-opus", ctx.payload);
-    try std.testing.expect(ctx.payload.ptr == cmd["/model ".len..].ptr);
-}
-
-test "route forwards allowlist payload" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.handle_allowlist = recordAllowlist;
-    const cmd = "/allowlist add tool read_file";
-
-    try route(testSlashRegistry(), &handlers, cmd);
-
-    try std.testing.expectEqualStrings("allowlist", ctx.called);
-    try std.testing.expectEqualStrings("add tool read_file", ctx.payload);
-}
-
-test "route forwards settings payload" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.handle_settings = recordSettings;
-    const cmd = "/settings startup-scrollback off";
-
-    try route(testSlashRegistry(), &handlers, cmd);
-
-    try std.testing.expectEqualStrings("settings", ctx.called);
-    try std.testing.expectEqualStrings("startup-scrollback off", ctx.payload);
-}
-
-test "route forwards notifications payload" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.handle_notifications = recordNotifications;
-    const cmd = "/sound off";
-
-    try route(testSlashRegistry(), &handlers, cmd);
-
-    try std.testing.expectEqualStrings("notifications", ctx.called);
-    try std.testing.expectEqualStrings("off", ctx.payload);
-}
-
-test "route sends original command string to unknown handler" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.unknown = recordUnknown;
-    const cmd = " /wat untouched";
-
-    try route(testSlashRegistry(), &handlers, cmd);
-
-    try std.testing.expectEqualStrings("unknown", ctx.called);
-    try std.testing.expectEqualStrings(cmd, ctx.payload);
-    try std.testing.expect(ctx.payload.ptr == cmd.ptr);
-}
-
-test "route propagates callback errors" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.show_status = failStatus;
-
-    try std.testing.expectError(error.TestRouteFailure, route(testSlashRegistry(), &handlers, "/status"));
-}

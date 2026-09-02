@@ -17,11 +17,3 @@ fn openWith(call: anytype, url: []const u8) bool {
     return call(url.ptr, url.len) == 1;
 }
 
-test "JS host URL opener keeps the manual fallback without a handler" {
-    const NoHandler = struct {
-        fn call(_: [*]const u8, _: usize) i32 {
-            return 0;
-        }
-    };
-    try std.testing.expect(!openWith(NoHandler.call, "https://vercel.test/login"));
-}

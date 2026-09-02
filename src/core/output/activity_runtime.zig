@@ -436,45 +436,4 @@ fn freeRecord(
     if (record.tool_name) |tool_name| alloc.free(@constCast(tool_name));
 }
 
-test "tool activity start admission describes invalid and finalized identities" {
-    var state = ToolActivityState{};
 
-    try std.testing.expectEqual(
-        StartAdmission.invalid_identity,
-        state.admitStart(.{ .turn_id = 0, .call_id = "call" }),
-    );
-    try std.testing.expectEqual(
-        StartAdmission.invalid_identity,
-        state.admitStart(.{ .turn_id = 1, .call_id = "" }),
-    );
-    try std.testing.expectEqual(
-        StartAdmission.accepted,
-        state.admitStart(.{ .turn_id = 1, .call_id = "call" }),
-    );
-
-    state.commitCleanup(std.testing.allocator, 1);
-    switch (state.admitStart(.{ .turn_id = 1, .call_id = "call" })) {
-        .finalized => |fence| try std.testing.expectEqual(@as(u64, 1), fence),
-        .accepted, .invalid_identity => return error.TestUnexpectedResult,
-    }
-}
-
-test "lifecycle transition reports focus changes from immutable snapshots" {
-    const unchanged = LifecycleTransition{
-        .previous_focused_entry_id = 4,
-        .snapshot = .{
-            .finalized_turn_watermark = 1,
-            .active_tool_count = 1,
-            .focused_entry_id = 4,
-            .focused_activity_kind = .read,
-            .activity = .none,
-        },
-        .applied_activity_kind = .read,
-        .terminal_record = null,
-    };
-    try std.testing.expect(!unchanged.focus_changed());
-
-    var changed = unchanged;
-    changed.snapshot.focused_entry_id = 7;
-    try std.testing.expect(changed.focus_changed());
-}

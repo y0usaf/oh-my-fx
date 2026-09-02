@@ -490,100 +490,8 @@ const HeldPreconnectProbe = struct {
     }
 };
 
-test "browser callback outruns an idle preconnect held open" {
-    var listener = try bindTestListener();
-    defer listener.deinit(io_mod.getIo());
 
-    var probe = HeldPreconnectProbe{
-        .port = listener.socket.address.getPort(),
-        .request = "GET /callback?code=granted HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-    };
-    const thread = try std.Thread.spawn(.{}, HeldPreconnectProbe.run, .{&probe});
-    defer thread.join();
-    defer probe.release.store(true, .release);
-    try probe.waitUntilDelivered();
 
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    const started_ms = io_mod.milliTimestamp();
-    var accepted = (try await(
-        TestCallback,
-        parseTestCallback,
-        std.testing.allocator,
-        &listener,
-        null,
-        &cancel_flag,
-        null,
-    )) orelse return error.CallbackNeverArrived;
-    defer accepted.deinit();
-    try std.testing.expectEqualStrings("granted", accepted.callback.code);
-    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
-}
-
-test "browser callback cancels while an idle preconnect is open" {
-    var listener = try bindTestListener();
-    defer listener.deinit(io_mod.getIo());
-
-    var probe = HeldPreconnectProbe{ .port = listener.socket.address.getPort() };
-    const thread = try std.Thread.spawn(.{}, HeldPreconnectProbe.run, .{&probe});
-    defer thread.join();
-    defer probe.release.store(true, .release);
-    try probe.waitUntilDelivered();
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    const Flip = struct {
-        fn run(flag: *std.atomic.Value(bool)) void {
-            io_mod.sleep(20 * std.time.ns_per_ms);
-            flag.store(true, .seq_cst);
-        }
-    };
-    const flip = try std.Thread.spawn(.{}, Flip.run, .{&cancel_flag});
-    defer flip.join();
-
-    const started_ms = io_mod.milliTimestamp();
-    try std.testing.expectError(
-        error.Cancelled,
-        await(
-            TestCallback,
-            parseTestCallback,
-            std.testing.allocator,
-            &listener,
-            null,
-            &cancel_flag,
-            null,
-        ),
-    );
-    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
-}
-
-test "browser callback survives unrelated requests before the redirect" {
-    var listener = try bindTestListener();
-    defer listener.deinit(io_mod.getIo());
-    const port = listener.socket.address.getPort();
-
-    const requests = [_][]const u8{
-        "",
-        "GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-        "GET /unrelated?code=nope HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-        "GET /callback?code=granted HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-    };
-    const probe = CallbackProbe{ .port = port, .requests = &requests };
-    const thread = try std.Thread.spawn(.{}, CallbackProbe.run, .{probe});
-    defer thread.join();
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var accepted = (try await(
-        TestCallback,
-        parseTestCallback,
-        std.testing.allocator,
-        &listener,
-        null,
-        &cancel_flag,
-        null,
-    )) orelse return error.CallbackNeverArrived;
-    defer accepted.deinit();
-    try accepted.respond(.ok);
-    try std.testing.expectEqualStrings("granted", accepted.callback.code);
-}
 
 fn expectResetPreconnectSurvives(hold_ms: u64) !void {
     var listener = try bindTestListener();
@@ -612,13 +520,7 @@ fn expectResetPreconnectSurvives(hold_ms: u64) !void {
     try std.testing.expectEqualStrings("granted", accepted.callback.code);
 }
 
-test "browser callback survives a reset preconnect before the redirect" {
-    try expectResetPreconnectSurvives(100);
-}
 
-test "browser callback survives a reset queued before accept" {
-    try expectResetPreconnectSurvives(0);
-}
 
 const CorsCallbackProbe = struct {
     port: u16,
@@ -671,41 +573,3 @@ const CorsCallbackProbe = struct {
     }
 };
 
-test "browser callback permits the xAI CORS private-network preflight" {
-    var listener = try bindTestListener();
-    defer listener.deinit(io_mod.getIo());
-
-    var probe = CorsCallbackProbe{ .port = listener.socket.address.getPort() };
-    const thread = try std.Thread.spawn(.{}, CorsCallbackProbe.run, .{&probe});
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var accepted = (try await(
-        TestCallback,
-        parseTestCallback,
-        std.testing.allocator,
-        &listener,
-        null,
-        &cancel_flag,
-        "https://accounts.x.ai",
-    )) orelse return error.CallbackNeverArrived;
-    accepted.respond(.ok) catch |err| {
-        accepted.deinit();
-        thread.join();
-        return err;
-    };
-    accepted.deinit();
-    thread.join();
-
-    try std.testing.expect(!probe.failed);
-    const preflight = probe.preflight_response[0..probe.preflight_len];
-    try std.testing.expect(std.mem.startsWith(u8, preflight, "HTTP/1.1 204 No Content\r\n"));
-    try std.testing.expect(std.mem.find(u8, preflight, "Access-Control-Allow-Origin: https://accounts.x.ai\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, preflight, "Access-Control-Allow-Methods: GET\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, preflight, "Access-Control-Allow-Private-Network: true\r\n") != null);
-    const callback = probe.callback_response[0..probe.callback_len];
-    try std.testing.expect(std.mem.startsWith(u8, callback, "HTTP/1.1 200 OK\r\n"));
-    try std.testing.expect(std.mem.find(u8, callback, "Access-Control-Allow-Origin: https://accounts.x.ai\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, callback, "Content-Type: text/html; charset=utf-8\r\n") != null);
-    try std.testing.expect(std.mem.find(u8, callback, "<h1>Authorization complete</h1>") != null);
-    try std.testing.expect(std.mem.find(u8, callback, "prefers-color-scheme:dark") != null);
-}

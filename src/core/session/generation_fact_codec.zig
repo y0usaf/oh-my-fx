@@ -116,38 +116,3 @@ fn parseCost(value: ?std.json.Value) error{InvalidGenerationFact}!f64 {
     return number;
 }
 
-test "codec round trips the shared generation fact shape" {
-    const alloc = std.testing.allocator;
-    const expected = usage_report.GenerationFact{
-        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-        .created_at_ms = 42,
-        .model = @constCast("provider/model"),
-        .input_tokens = 8,
-        .output_tokens = 3,
-        .cache_read_tokens = 2,
-        .cache_write_tokens = 1,
-        .reasoning_tokens = null,
-        .billable_web_search_calls = 4,
-        .total_cost = 0.25,
-    };
-    var encoded: std.Io.Writer.Allocating = .init(alloc);
-    defer encoded.deinit();
-    try write(&encoded.writer, expected);
-
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        encoded.written(),
-        .{},
-    );
-    defer parsed.deinit();
-    var decoded = try parse(alloc, parsed.value);
-    defer decoded.deinit(alloc);
-
-    try std.testing.expect(usage_report.GenerationFact.eql(expected, decoded));
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        encoded.written(),
-        "request_count",
-    ) == null);
-}

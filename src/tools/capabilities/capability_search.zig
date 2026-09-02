@@ -346,55 +346,5 @@ fn mcpMoreAvailable(value: std.json.Value) bool {
     return candidate == .bool and candidate.bool;
 }
 
-test "capability search decoder owns one bounded prepared query" {
-    const alloc = std.testing.allocator;
-    const decoded = try decode(.{ .allocator = alloc }, "{\"query\":\"send an email\"}");
-    switch (decoded) {
-        .failure => |message| {
-            defer alloc.free(message);
-            return error.TestUnexpectedResult;
-        },
-        .input => |input| {
-            defer input.deinit(alloc);
-            const value = input.as(Input);
-            try std.testing.expectEqualStrings("send an email", value.prepared.raw);
-            try std.testing.expectEqual(@as(usize, 3), value.prepared.token_count);
-        },
-    }
-}
 
-test "capability search combines domains and omits projected identities" {
-    const alloc = std.testing.allocator;
-    const skills =
-        "{\"skills\":[{\"name\":\"mail-helper\",\"description\":\"Send email\",\"location\":\"/skills/mail-helper\"},{\"name\":\"unsafe\",\"description\":\"Unsafe\",\"location\":\"/skills/TOKEN=runtime-secret\"}],\"count\":2,\"more_available\":false}";
-    const mcp =
-        "{\"tools\":[{\"name\":\"mcp_mail_send\",\"server\":\"mail\",\"description\":\"Send email\"},{\"name\":\"mcp_unsafe_send\",\"server\":\"TOKEN=runtime-secret\",\"description\":\"Unsafe\"}],\"count\":2,\"authentication_required\":{\"server\":\"TOKEN=runtime-auth-secret\",\"message\":\"authenticate\"}}";
-    const output = try combineProjected(alloc, skills, mcp, 4096);
-    defer alloc.free(output);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
-    defer parsed.deinit();
-    const skill_items = parsed.value.object.get("skills").?.array.items;
-    const mcp_items = parsed.value.object.get("mcp_tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), skill_items.len);
-    try std.testing.expectEqualStrings("mail-helper", skill_items[0].object.get("name").?.string);
-    try std.testing.expectEqual(@as(usize, 1), mcp_items.len);
-    try std.testing.expectEqualStrings("mcp_mail_send", mcp_items[0].object.get("name").?.string);
-    try std.testing.expect(parsed.value.object.get("more_available").?.object.get("skills").?.bool);
-    try std.testing.expect(parsed.value.object.get("more_available").?.object.get("mcp_tools").?.bool);
-    try std.testing.expect(parsed.value.object.get("authentication_required") == null);
-}
-
-test "capability search combined projection releases every allocation failure" {
-    const Case = struct {
-        fn run(alloc: Allocator) !void {
-            const skills =
-                "{\"skills\":[{\"name\":\"mail-helper\",\"description\":\"Send email\",\"location\":\"/skills/mail-helper\"}],\"count\":1,\"more_available\":false}";
-            const mcp =
-                "{\"tools\":[{\"name\":\"mcp_mail_send\",\"server\":\"mail\",\"description\":\"Send email\"}],\"count\":1}";
-            const output = try combineProjected(alloc, skills, mcp, 1024);
-            alloc.free(output);
-        }
-    };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
-}

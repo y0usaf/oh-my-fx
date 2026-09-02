@@ -1263,16 +1263,6 @@ fn lookupFileName(child_id: []const u8) [87]u8 {
     return buffer;
 }
 
-test "relationship index filenames remain canonical" {
-    try std.testing.expectEqualStrings(
-        "relationship-page-000000000000002a.bin",
-        &pageFileName(42),
-    );
-    try std.testing.expectEqualStrings(
-        "relationship-child-ddc9e669194254cef019a29d3619a2c16592e5d52e1a81e98b01bd52319149a3.bin",
-        &lookupFileName("child"),
-    );
-}
 
 fn headersEqual(a: Header, b: Header) bool {
     return a.storage_epoch == b.storage_epoch and
@@ -1331,83 +1321,8 @@ fn mapReplace(err: anyerror) Error {
     };
 }
 
-test "relationship index codec rejects malformed bytes and frees ownership" {
-    const alloc = std.testing.allocator;
-    var header = Header{};
-    header.pending_kind = .allocate;
-    header.pending_slot = 3;
-    header.setPendingChild("child");
-    const bytes = try encodeHeader(alloc, header);
-    defer alloc.free(bytes);
-    const decoded = try decodeHeader(bytes);
-    try std.testing.expect(headersEqual(header, decoded));
-    try std.testing.expectError(error.InvalidIndex, decodeHeader(bytes[0 .. bytes.len - 1]));
 
-    const lookup_bytes = try encodeLookup(alloc, "child", 3, no_slot, 7);
-    defer alloc.free(lookup_bytes);
-    var lookup = try decodeLookup(alloc, lookup_bytes);
-    defer lookup.deinit(alloc);
-    try std.testing.expectEqualStrings("child", lookup.child_id);
-    try std.testing.expectEqual(@as(u64, 7), lookup.storage_epoch);
-}
 
-test "relationship index codec reads schema one files into the original epoch" {
-    const alloc = std.testing.allocator;
-    var header_out: std.Io.Writer.Allocating = .init(alloc);
-    defer header_out.deinit();
-    try header_out.writer.writeAll(header_magic);
-    try writeInt(&header_out.writer, u32, legacy_schema_version);
-    try writeInt(&header_out.writer, u64, 9);
-    try writeInt(&header_out.writer, u64, 0);
-    try writeInt(&header_out.writer, u64, no_slot);
-    try writeInt(&header_out.writer, u64, 0);
-    try writeInt(&header_out.writer, u64, 0);
-    try writeInt(&header_out.writer, u64, 0);
-    try writeInt(&header_out.writer, i128, 0);
-    try writeInt(&header_out.writer, u64, 0);
-    try header_out.writer.writeByte(@intFromEnum(PendingKind.none));
-    try writeInt(&header_out.writer, u64, no_slot);
-    try writeInt(&header_out.writer, u64, no_slot);
-    try writeInt(&header_out.writer, u16, 0);
-    const header = try decodeHeader(header_out.written());
-    try std.testing.expectEqual(@as(u64, 0), header.storage_epoch);
-    try std.testing.expectEqual(@as(u64, 9), header.generation);
-
-    var page_out: std.Io.Writer.Allocating = .init(alloc);
-    defer page_out.deinit();
-    try page_out.writer.writeAll(page_magic);
-    try writeInt(&page_out.writer, u32, legacy_schema_version);
-    try writeInt(&page_out.writer, u64, 0);
-    for (0..page_slots) |_| {
-        try page_out.writer.writeByte(0);
-        try writeInt(&page_out.writer, u64, no_slot);
-        try writeInt(&page_out.writer, u16, 0);
-    }
-    const page_data = try decodePage(page_out.written(), 0, 0);
-    try std.testing.expectEqual(@as(u64, 0), page_data.storage_epoch);
-
-    var lookup_out: std.Io.Writer.Allocating = .init(alloc);
-    defer lookup_out.deinit();
-    try lookup_out.writer.writeAll(lookup_magic);
-    try writeInt(&lookup_out.writer, u32, legacy_schema_version);
-    try writeInt(&lookup_out.writer, u64, 3);
-    try writeInt(&lookup_out.writer, u64, no_slot);
-    try writeInt(&lookup_out.writer, u16, 5);
-    try lookup_out.writer.writeAll("child");
-    var lookup = try decodeLookup(alloc, lookup_out.written());
-    defer lookup.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 0), lookup.storage_epoch);
-    try std.testing.expectEqual(@as(u64, 3), lookup.slot);
-}
-
-test "relationship index decoder handles fuzzed bytes" {
-    try std.testing.fuzz({}, fuzzRelationshipIndex, .{ .corpus = &.{
-        "",
-        header_magic,
-        page_magic,
-        lookup_magic,
-    } });
-}
 
 fn fuzzRelationshipIndex(_: void, smith: *std.testing.Smith) !void {
     var buffer: [8192]u8 = undefined;

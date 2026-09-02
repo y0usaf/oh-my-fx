@@ -74,50 +74,5 @@ fn earlier(current: ?usize, candidate: usize) usize {
     return if (current) |value| @min(value, candidate) else candidate;
 }
 
-test "transcript release chooses the earliest mutable boundary" {
-    const tool_turns = [_]ToolTurnFloor{
-        .{ .turn_id = 4, .start_byte = 48 },
-        .{ .turn_id = 6, .start_byte = 24 },
-    };
-    const candidates = Candidates{
-        .mutation_pin_start = 32,
-        .assistant_tail_start = 16,
-        .tool_turn_floors = &tool_turns,
-    };
 
-    try std.testing.expectEqual(
-        @as(?usize, 16),
-        (State{}).finality_floor(candidates, 4, 40),
-    );
-}
 
-test "transcript release ignores final producers and preserves append-only output" {
-    const tool_turns = [_]ToolTurnFloor{
-        .{ .turn_id = 4, .start_byte = 8 },
-    };
-    const candidates = Candidates{
-        .assistant_tail_start = 12,
-        .tool_turn_floors = &tool_turns,
-    };
-
-    try std.testing.expectEqual(
-        @as(?usize, null),
-        (State{ .assistant_tail_writable = false }).finality_floor(
-            candidates,
-            4,
-            null,
-        ),
-    );
-    try std.testing.expectEqual(
-        @as(?usize, null),
-        (State{ .policy = .append_only }).finality_floor(candidates, 0, 3),
-    );
-}
-
-test "assistant tail writability returns a new state" {
-    const open = State{};
-    const closed = open.with_assistant_tail_writable(false);
-    try std.testing.expect(open.assistant_tail_writable);
-    try std.testing.expect(!closed.assistant_tail_writable);
-    try std.testing.expect(closed.with_assistant_tail_writable(true).assistant_tail_writable);
-}

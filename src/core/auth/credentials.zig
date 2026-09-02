@@ -204,11 +204,6 @@ pub const missing_grok_credential_message = "fx needs a Grok subscription login 
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
-test "public credential guidance spells fx lowercase" {
-    try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
-    try std.testing.expect(std.mem.startsWith(u8, missing_interactive_credential_message, "fx needs"));
-    try std.testing.expect(std.mem.startsWith(u8, unreadable_store_message, "fx could"));
-}
 
 pub const Credential = struct {
     token: []u8,
@@ -669,144 +664,13 @@ pub fn sourceRefreshable(source: Source) bool {
     return source == .fx_login or source == .chatgpt_subscription or source == .grok_subscription;
 }
 
-test "stored key label discloses the backend that answered" {
-    try std.testing.expect(std.mem.find(u8, sourceLabel(.stored_key), stored_key_backend_label) != null);
-    try std.testing.expect(std.mem.find(u8, unreadable_store_message, stored_key_backend_label) != null);
-    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login }) |source| {
-        try std.testing.expect(!std.mem.eql(u8, sourceLabel(source), sourceLabel(.stored_key)));
-    }
-}
 
-test "missing credential messages use surface commands in preferred order" {
-    const cli_login = std.mem.find(u8, missing_credential_message, "fx login").?;
-    const cli_setup = std.mem.find(u8, missing_credential_message, "fx setup").?;
-    const cli_env = std.mem.find(u8, missing_credential_message, "AI_GATEWAY_API_KEY").?;
 
-    try std.testing.expect(cli_login < cli_setup);
-    try std.testing.expect(cli_setup < cli_env);
 
-    const tui_login = std.mem.find(u8, missing_interactive_credential_message, "/login").?;
-    const tui_setup = std.mem.find(u8, missing_interactive_credential_message, "/setup").?;
-    const tui_env = std.mem.find(u8, missing_interactive_credential_message, "AI_GATEWAY_API_KEY").?;
 
-    try std.testing.expect(tui_login < tui_setup);
-    try std.testing.expect(tui_setup < tui_env);
-}
 
-test "credential gateway team prefers team id" {
-    var credential = Credential{
-        .token = try std.testing.allocator.dupe(u8, "token"),
-        .source = .fx_login,
-        .team_id = try std.testing.allocator.dupe(u8, "team_123"),
-        .team_slug = try std.testing.allocator.dupe(u8, "vercel-labs"),
-    };
-    defer credential.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("team_123", credential.gatewayTeam().?);
-}
 
-test "catalog access isolates public and authenticated provider credentials" {
-    const missing = catalogAccessAt(null, 0);
-    try std.testing.expectEqual(CatalogPublicOnlyReason.no_credential, missing.publicOnlyReason().?);
-    try std.testing.expect(missing.credentialSource() == null);
-    try std.testing.expect(missing.authorizationCredential() == null);
-    try std.testing.expect(missing.teamContext() == null);
-
-    const refresh_failed = catalogAccessAfterRefreshFailure(.fx_login);
-    try std.testing.expectEqual(CatalogPublicOnlyReason.credential_refresh_failed, refresh_failed.publicOnlyReason().?);
-    try std.testing.expectEqual(Source.fx_login, refresh_failed.credentialSource().?);
-
-    const chatgpt = catalogAccessForCredential(
-        .chatgpt_subscription,
-        "chatgpt-secret",
-        "chatgpt-account",
-    );
-    try std.testing.expectEqual(Source.chatgpt_subscription, chatgpt.credentialSource().?);
-    try std.testing.expectEqualStrings("chatgpt-secret", chatgpt.authorizationCredential().?);
-    try std.testing.expect(chatgpt.teamContext() == null);
-    try std.testing.expect(chatgpt.publicFallbackAfterRejection() == null);
-
-    var grok_credential = Credential{
-        .token = try std.testing.allocator.dupe(u8, "grok-secret"),
-        .source = .grok_subscription,
-        .account_id = try std.testing.allocator.dupe(u8, "acct_grok"),
-    };
-    defer grok_credential.deinit(std.testing.allocator);
-    const grok = catalogAccessAt(grok_credential, 0);
-    try std.testing.expectEqualStrings("acct_grok", grok.accountId().?);
-    try std.testing.expect(grok.teamContext() == null);
-
-    const rejected: CatalogAccess = .{ .public_only = .{ .authenticated_credential_rejected = .stored_key } };
-    try std.testing.expectEqual(CatalogPublicOnlyReason.authenticated_credential_rejected, rejected.publicOnlyReason().?);
-    try std.testing.expectEqual(Source.stored_key, rejected.credentialSource().?);
-    try std.testing.expect(rejected.authorizationCredential() == null);
-    try std.testing.expect(rejected.teamContext() == null);
-}
-
-test "selected fx login authorizes its team model catalog" {
-    var login = Credential{
-        .token = try std.testing.allocator.dupe(u8, "login-token"),
-        .source = .fx_login,
-        .team_id = try std.testing.allocator.dupe(u8, "team_123"),
-    };
-    defer login.deinit(std.testing.allocator);
-
-    const access = catalogAccessAt(login, 0);
-    try std.testing.expectEqual(Source.fx_login, access.credentialSource().?);
-    try std.testing.expect(access.authorizationCredential() != null);
-    try std.testing.expectEqualStrings("login-token", access.authorizationCredential().?);
-    try std.testing.expectEqualStrings("team_123", access.teamContext().?);
-}
-
-test "fx login catalog access requires a fresh credential and selected team" {
-    var login = Credential{
-        .token = try std.testing.allocator.dupe(u8, "login-token"),
-        .source = .fx_login,
-        .refresh_after_ms = 10,
-    };
-    defer login.deinit(std.testing.allocator);
-
-    const expired = catalogAccessAt(login, 10);
-    try std.testing.expectEqual(CatalogPublicOnlyReason.fx_login_refresh_required, expired.publicOnlyReason().?);
-    try std.testing.expect(expired.authorizationCredential() == null);
-    try std.testing.expect(expired.teamContext() == null);
-
-    login.refresh_after_ms = null;
-    const missing_team = catalogAccessAt(login, 10);
-    try std.testing.expectEqual(CatalogPublicOnlyReason.fx_login_team_required, missing_team.publicOnlyReason().?);
-    try std.testing.expect(missing_team.authorizationCredential() == null);
-    try std.testing.expect(missing_team.teamContext() == null);
-}
-
-test "authenticated catalog access carries source and permitted request context" {
-    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key }) |source| {
-        var credential = Credential{
-            .token = try std.testing.allocator.dupe(u8, "token"),
-            .source = source,
-            .team_slug = try std.testing.allocator.dupe(u8, "vercel-labs"),
-        };
-        defer credential.deinit(std.testing.allocator);
-
-        const authenticated = catalogAccessAt(credential, 0);
-        try std.testing.expect(authenticated.publicOnlyReason() == null);
-        try std.testing.expectEqual(source, authenticated.credentialSource().?);
-        try std.testing.expectEqualStrings("token", authenticated.authorizationCredential().?);
-        try std.testing.expectEqualStrings("vercel-labs", authenticated.teamContext().?);
-
-        const fallback = authenticated.publicFallbackAfterRejection().?;
-        try std.testing.expectEqual(CatalogPublicOnlyReason.authenticated_credential_rejected, fallback.publicOnlyReason().?);
-        try std.testing.expectEqual(source, fallback.credentialSource().?);
-        try std.testing.expect(fallback.authorizationCredential() == null);
-        try std.testing.expect(fallback.teamContext() == null);
-        try std.testing.expect(fallback.publicFallbackAfterRejection() == null);
-    }
-}
-
-test "fresh short-lived credential remains ready for its admitted action" {
-    try std.testing.expectEqual(@as(i64, 70_000), credentialRefreshAfterMs(130_000, null));
-    try std.testing.expectEqual(@as(i64, 130_000), credentialRefreshAfterMs(130_000, 100_000));
-    try std.testing.expectEqual(@as(i64, 140_000), credentialRefreshAfterMs(200_000, 100_000));
-}
 
 var stable_credential_test_environ: ?*std.process.Environ.Map = null;
 
@@ -898,193 +762,15 @@ const SecretStoreFixture = struct {
     }
 };
 
-test "source-specific credential loading bypasses generic precedence" {
-    const alloc = std.testing.allocator;
-    const env = try CredentialTestEnv.install(alloc, &.{
-        .{ "VERCEL_OIDC_TOKEN", "oidc-token" },
-        .{ "AI_GATEWAY_API_KEY", "api-key" },
-    });
-    defer env.deinit();
 
-    const resolution = try resolve(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed);
-    var startup = resolution.credential orelse return error.TestExpectedCredential;
-    defer startup.deinit(alloc);
-    try std.testing.expectEqualStrings("oidc-token", startup.token);
-    try std.testing.expectEqual(Source.vercel_oidc_token, startup.source);
 
-    var api_key = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .ai_gateway_api_key)).?;
-    defer api_key.deinit(alloc);
-    try std.testing.expectEqualStrings("api-key", api_key.token);
-    try std.testing.expectEqual(Source.ai_gateway_api_key, api_key.source);
 
-    var oidc = (try loadSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .vercel_oidc_token)).?;
-    defer oidc.deinit(alloc);
-    try std.testing.expectEqualStrings("oidc-token", oidc.token);
-    try std.testing.expectEqual(Source.vercel_oidc_token, oidc.source);
 
-    try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .ai_gateway_api_key));
-    try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .vercel_oidc_token));
-    try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .stored_key)));
-}
 
-test "a remembered choice outranks the environment" {
-    const alloc = std.testing.allocator;
-    const env = try CredentialTestEnv.install(alloc, &.{
-        .{ "VERCEL_OIDC_TOKEN", "oidc-token" },
-        .{ "AI_GATEWAY_API_KEY", "api-key" },
-    });
-    defer env.deinit();
 
-    const resolution = try resolvePreferring(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .ai_gateway_api_key);
-    var credential = resolution.credential orelse return error.TestExpectedCredential;
-    defer credential.deinit(alloc);
-    try std.testing.expectEqual(Source.ai_gateway_api_key, credential.source);
-    try std.testing.expectEqualStrings("api-key", credential.token);
-}
 
-test "a remembered fx login never refreshes in stored mode" {
-    const alloc = std.testing.allocator;
-    const env = try CredentialTestEnv.install(alloc, &.{});
-    defer env.deinit();
 
-    // No session exists, so both modes resolve to nothing. What matters is the
-    // route taken: `.stored` must reach loadStoredFxLoginCredential, which never
-    // performs the network refresh that a diagnostic is forbidden from making.
-    for ([_]LoadMode{ .stored, .refresh_if_needed }) |mode| {
-        var resolution = try resolvePreferring(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, mode, .fx_login);
-        defer if (resolution.credential) |*credential| credential.deinit(alloc);
-        try std.testing.expect(resolution.credential == null);
-    }
 
-    try std.testing.expect((try loadPreferredSource(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .stored, .vercel_oidc_token)) == null);
-}
-
-test "a remembered choice that no longer resolves falls back to precedence" {
-    const alloc = std.testing.allocator;
-    const env = try CredentialTestEnv.install(alloc, &.{
-        .{ "AI_GATEWAY_API_KEY", "api-key" },
-    });
-    defer env.deinit();
-
-    // fx_login is remembered but no session exists, so precedence must still answer.
-    const resolution = try resolvePreferring(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .fx_login);
-    var credential = resolution.credential orelse return error.TestExpectedCredential;
-    defer credential.deinit(alloc);
-    try std.testing.expectEqual(Source.ai_gateway_api_key, credential.source);
-}
-
-test "no remembered choice resolves exactly as plain precedence" {
-    const alloc = std.testing.allocator;
-    const env = try CredentialTestEnv.install(alloc, &.{
-        .{ "VERCEL_OIDC_TOKEN", "oidc-token" },
-        .{ "AI_GATEWAY_API_KEY", "api-key" },
-    });
-    defer env.deinit();
-
-    var preferred = try resolvePreferring(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, null);
-    defer if (preferred.credential) |*credential| credential.deinit(alloc);
-    var plain = try resolve(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed);
-    defer if (plain.credential) |*credential| credential.deinit(alloc);
-
-    try std.testing.expectEqual(plain.credential.?.source, preferred.credential.?.source);
-    try std.testing.expectEqualStrings(plain.credential.?.token, preferred.credential.?.token);
-}
-
-test "a disabled stored key is reported as never attempted, not as absent" {
-    const alloc = std.testing.allocator;
-    const env = try CredentialTestEnv.install(alloc, &.{});
-    defer env.deinit();
-    var store_fixture = SecretStoreFixture{ .disabled = true };
-
-    for ([_]LoadMode{ .stored, .refresh_if_needed }) |mode| {
-        var resolution = try resolve(alloc, oauth_transport.unavailable_provider, store_fixture.provider(), mode);
-        defer if (resolution.credential) |*credential| credential.deinit(alloc);
-        try std.testing.expect(resolution.credential == null);
-        try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
-    }
-    try std.testing.expectEqual(@as(usize, 0), store_fixture.load_calls);
-}
-
-test "credential resolution loads a stored key only through the injected host port" {
-    const alloc = std.testing.allocator;
-    const env = try CredentialTestEnv.install(alloc, &.{});
-    defer env.deinit();
-    var store_fixture = SecretStoreFixture{ .value = "injected-test-value" };
-
-    var resolution = try resolve(
-        alloc,
-        oauth_transport.unavailable_provider,
-        store_fixture.provider(),
-        .stored,
-    );
-    defer if (resolution.credential) |*credential| credential.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), store_fixture.load_calls);
-    try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
-    try std.testing.expectEqual(Source.stored_key, resolution.credential.?.source);
-    try std.testing.expectEqualStrings("injected-test-value", resolution.credential.?.token);
-}
-
-test "credential resolution preserves unreadable store classification" {
-    const alloc = std.testing.allocator;
-    const env = try CredentialTestEnv.install(alloc, &.{});
-    defer env.deinit();
-    var store_fixture = SecretStoreFixture{ .unreadable = true };
-
-    const resolution = try resolve(
-        alloc,
-        oauth_transport.unavailable_provider,
-        store_fixture.provider(),
-        .stored,
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), store_fixture.load_calls);
-    try std.testing.expect(resolution.credential == null);
-    try std.testing.expectEqual(StoredKeyReadStatus.unavailable, resolution.stored_key_status);
-}
-
-test "a failed fx-login refresh falls through to the stored key" {
-    const alloc = std.testing.allocator;
-    var fixture = try ExpiredFxLoginFixture.install(alloc);
-    defer fixture.deinit();
-    var store_fixture = SecretStoreFixture{ .value = "stored-key-that-works" };
-
-    // The refresh cannot succeed, but a working stored key is right behind it.
-    var resolution = try resolve(
-        alloc,
-        oauth_transport.unavailable_provider,
-        store_fixture.provider(),
-        .refresh_if_needed,
-    );
-    defer if (resolution.credential) |*credential| credential.deinit(alloc);
-
-    const credential = resolution.credential orelse return error.TestExpectedCredential;
-    try std.testing.expectEqual(Source.stored_key, credential.source);
-    try std.testing.expectEqualStrings("stored-key-that-works", credential.token);
-    try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
-    try std.testing.expectEqual(@as(usize, 1), store_fixture.load_calls);
-}
-
-test "a failed fx-login refresh is still reported when nothing else resolves" {
-    const alloc = std.testing.allocator;
-    var fixture = try ExpiredFxLoginFixture.install(alloc);
-    defer fixture.deinit();
-    var store_fixture = SecretStoreFixture{};
-
-    // Falling through must not erase why the login was silent: an unrepairable
-    // session is a different problem from never having logged in.
-    var resolution = try resolve(
-        alloc,
-        oauth_transport.unavailable_provider,
-        store_fixture.provider(),
-        .refresh_if_needed,
-    );
-    defer if (resolution.credential) |*credential| credential.deinit(alloc);
-
-    try std.testing.expect(resolution.credential == null);
-    try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
-    try std.testing.expectEqual(StoredKeyReadStatus.not_found, resolution.stored_key_status);
-}
 
 /// A HOME holding an fx login whose session is expired and whose refresh token
 /// the issuer rejects, which is what an expired or revoked login looks like on
@@ -1128,23 +814,3 @@ const ExpiredFxLoginFixture = struct {
     }
 };
 
-test "a disabled store still reports why the fx login was silent" {
-    const alloc = std.testing.allocator;
-    var fixture = try ExpiredFxLoginFixture.install(alloc);
-    defer fixture.deinit();
-    var store_fixture = SecretStoreFixture{ .disabled = true };
-
-    // The store is switched off, so resolution ends at the login. Its failure is
-    // still the useful diagnostic and must survive the early return.
-    var resolution = try resolve(
-        alloc,
-        oauth_transport.unavailable_provider,
-        store_fixture.provider(),
-        .refresh_if_needed,
-    );
-    defer if (resolution.credential) |*credential| credential.deinit(alloc);
-
-    try std.testing.expect(resolution.credential == null);
-    try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
-    try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
-}

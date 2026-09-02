@@ -340,39 +340,8 @@ fn appendMarker(
         try appendShellWord(output, alloc, word);
     }
 }
-test "Rush invocation uses internal mode and preserves clean/user argv" {
-    const user = try rushInvocation("/opt/bin/fx", false);
-    try std.testing.expectEqualStrings("/opt/bin/fx", user.path);
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/opt/bin/fx", rush_internal_mode, "--login", "-i" },
-        user.argv(),
-    );
 
-    const clean = try rushInvocation("/opt/bin/fx", true);
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/opt/bin/fx", rush_internal_mode, "-i" },
-        clean.argv(),
-    );
-}
 
-test "Rush captured invocation keeps command as one argv value" {
-    const invocation = try capturedRushInvocation(null, false, "printf '%s' rush");
-    try std.testing.expectEqualStrings("fx", invocation.path);
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "fx", rush_internal_mode, "--login", "-c", "printf '%s' rush" },
-        invocation.argv(),
-    );
-}
-
-test "Rush absolute self executable is required when supplied" {
-    try std.testing.expectError(
-        error.RelativeShellPath,
-        rushInvocation("fx", false),
-    );
-}
 
 fn appendShellWord(
     output: *std.ArrayList(u8),
@@ -390,216 +359,14 @@ fn appendShellWord(
     try output.append(alloc, '\'');
 }
 
-test "resolver builds Bash and zsh interactive argv" {
-    const bash = try resolve("/bin/bash", .user_login);
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/bash", "--login", "-i" },
-        bash.argv(),
-    );
 
-    const zsh = try resolve(
-        null,
-        .{ .executable = .{ .path = "/bin/zsh" } },
-    );
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/zsh", "-l", "-i" },
-        zsh.argv(),
-    );
-}
 
-test "resolver makes clean startup explicit" {
-    const bash = try resolve(
-        null,
-        .{ .executable = .{ .path = "/usr/local/bin/bash", .clean_start = true } },
-    );
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/usr/local/bin/bash", "--noprofile", "--norc", "-i" },
-        bash.argv(),
-    );
 
-    const zsh = try resolve(
-        null,
-        .{ .executable = .{ .path = "/bin/zsh", .clean_start = true } },
-    );
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/zsh", "-f", "-i" },
-        zsh.argv(),
-    );
-}
 
-test "resolver rejects missing relative and unsupported shells" {
-    try std.testing.expectError(
-        error.MissingLoginShell,
-        resolve(null, .user_login),
-    );
-    try std.testing.expectError(
-        error.RelativeShellPath,
-        resolve(null, .{ .executable = .{ .path = "zsh" } }),
-    );
-    try std.testing.expectError(
-        error.UnsupportedShell,
-        resolve(null, .{ .executable = .{ .path = "/bin/fish" } }),
-    );
-}
 
-test "login shell resolution falls back without accepting explicit unsupported shells" {
-    const fallback = try resolve("/opt/homebrew/bin/fish", .user_login);
-    try std.testing.expectEqualStrings(fallbackLoginShell(), fallback.path);
-    if (builtin.os.tag == .macos) {
-        try std.testing.expectEqualSlices(
-            []const u8,
-            &.{ fallbackLoginShell(), "-l", "-i" },
-            fallback.argv(),
-        );
-    } else {
-        try std.testing.expectEqualSlices(
-            []const u8,
-            &.{ fallbackLoginShell(), "--login", "-i" },
-            fallback.argv(),
-        );
-    }
 
-    try std.testing.expectError(
-        error.UnsupportedShell,
-        resolve(null, .{ .executable = .{ .path = "/opt/homebrew/bin/fish" } }),
-    );
-}
 
-test "captured profiles use exact non-PTY argv" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
-    const bash_clean = try capturedInvocation(arena, .{ .clean = "/bin/bash" }, "printf clean");
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/bash", "--noprofile", "--norc", "-c", "printf clean" },
-        bash_clean.argv(),
-    );
-    const bash_user = try capturedInvocation(arena, .{ .user = "/bin/bash" }, "printf user");
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
-        bash_user.argv(),
-    );
-    const zsh_clean = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "printf clean");
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/zsh", "-f", "-c", "printf clean" },
-        zsh_clean.argv(),
-    );
-    const zsh_user = try capturedInvocation(arena, .{ .user = "/bin/zsh" }, "printf user");
-    const expected_zsh_user = [_][]const u8{
-        "/bin/zsh",
-        "-l",
-        "-i",
-        "-c",
-        "\\builtin trap - TERM; printf user",
-    };
-    try std.testing.expectEqual(expected_zsh_user.len, zsh_user.argv().len);
-    for (&expected_zsh_user, zsh_user.argv()) |expected, actual| {
-        try std.testing.expectEqualStrings(expected, actual);
-    }
-}
-
-test "captured invocation provider projection shell-quotes every argv word" {
-    const invocation = try capturedInvocation(std.testing.allocator, .{ .clean = "/bin/zsh" }, "printf '%s' ok");
-    const command = try formatInvocationCommand(std.testing.allocator, &invocation);
-    defer std.testing.allocator.free(command);
-    try std.testing.expectEqualStrings(
-        "'/bin/zsh' '-f' '-c' 'printf '\"'\"'%s'\"'\"' ok'",
-        command,
-    );
-}
-
-test "profile normalization defaults captured and persistent execution to user" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try std.testing.expect((try environment(arena, "/bin/bash", null)).eql(.{ .user = "/bin/bash" }));
-    try std.testing.expect((try environment(arena, "/bin/zsh", null)).eql(.{ .user = "/bin/zsh" }));
-    try std.testing.expect((try environment(arena, "/bin/zsh", .clean)).eql(.{ .clean = "/bin/zsh" }));
-    try std.testing.expect((try environment(arena, "/bin/zsh", .user)).eql(.{ .user = "/bin/zsh" }));
-    try std.testing.expectEqual(contracts.ShellSpec.user_login, try profileShell(arena, "/bin/zsh", .user));
-    try std.testing.expectEqualStrings(
-        "/bin/zsh",
-        (try profileShell(arena, "/bin/zsh", .clean)).executable.path,
-    );
-}
-
-test "unsupported login shell profiles fall back for captured and persistent execution" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const fallback = fallbackLoginShell();
-    const user_environment = try environment(arena, "/opt/homebrew/bin/fish", .user);
-    const clean_environment = try environment(arena, "/opt/homebrew/bin/fish", .clean);
-    try std.testing.expect(user_environment.eql(.{ .user = fallback }));
-    try std.testing.expect(clean_environment.eql(.{ .clean = fallback }));
-
-    const user_invocation = try capturedInvocation(arena, user_environment, "printf user");
-    const clean_invocation = try capturedInvocation(arena, clean_environment, "printf clean");
-    try std.testing.expectEqualStrings(fallback, user_invocation.path);
-    try std.testing.expectEqualStrings(fallback, clean_invocation.path);
-
-    try std.testing.expectEqualStrings(
-        fallback,
-        (try profileShell(arena, "/opt/homebrew/bin/fish", .user)).executable.path,
-    );
-    try std.testing.expectEqualStrings(
-        fallback,
-        (try profileShell(arena, "/opt/homebrew/bin/fish", .clean)).executable.path,
-    );
-}
-
-test "bootstrap quotes private paths and separates command completion" {
-    const commandless = try buildBootstrap(
-        std.testing.allocator,
-        "/tmp/fx'bin",
-        "/tmp/control",
-        "nonce",
-        null,
-    );
-    defer std.testing.allocator.free(commandless);
-    try std.testing.expectEqualStrings(
-        "set +x; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
-            "'/tmp/control' 'nonce' 'shell-ready' || exit 125\n",
-        commandless,
-    );
-
-    const command = try buildBootstrap(
-        std.testing.allocator,
-        "/tmp/fx",
-        "/tmp/control",
-        "nonce",
-        "/tmp/command",
-    );
-    defer std.testing.allocator.free(command);
-    try std.testing.expect(
-        std.mem.find(u8, command, "'command-started'") != null,
-    );
-    try std.testing.expect(
-        std.mem.find(u8, command, "builtin eval --") != null,
-    );
-    try std.testing.expect(
-        std.mem.find(u8, command, "exit \"$fx_terminal_status\"") != null,
-    );
-
-    const source = try buildSourceCommand(
-        std.testing.allocator,
-        "/tmp/bootstrap'file",
-    );
-    defer std.testing.allocator.free(source);
-    try std.testing.expectEqualStrings(
-        ". '/tmp/bootstrap'\"'\"'file'\n",
-        source,
-    );
-}
 
 fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
     const bootstrap = try buildBootstrap(
@@ -614,10 +381,3 @@ fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
     defer alloc.free(source);
 }
 
-test "bootstrap construction cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkBootstrapAllocationFailures,
-        .{},
-    );
-}

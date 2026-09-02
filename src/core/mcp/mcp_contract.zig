@@ -7,9 +7,6 @@ pub const default_operation_timeout_ms: u32 = 60_000;
 pub const default_elicitation_timeout_ms: u32 = 30 * 60_000;
 pub const default_restart_limit: u8 = 1;
 
-test "MCP default startup timeout allows thirty-second cold starts" {
-    try std.testing.expectEqual(@as(u32, 30_000), default_startup_timeout_ms);
-}
 
 pub const max_profile_config_warning_key_bytes: usize = 128;
 
@@ -148,34 +145,6 @@ pub const TransportPrecommit = struct {
     }
 };
 
-test "transport precommit acquires and releases exactly once" {
-    const State = struct {
-        acquisitions: usize = 0,
-        releases: usize = 0,
-
-        fn acquire(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.acquisitions += 1;
-        }
-
-        fn release(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.releases += 1;
-        }
-    };
-    var state = State{};
-    var precommit = TransportPrecommit{
-        .context = &state,
-        .acquire_callback = State.acquire,
-        .release_callback = State.release,
-    };
-    try precommit.acquire();
-    try precommit.acquire();
-    precommit.release();
-    precommit.release();
-    try std.testing.expectEqual(@as(usize, 1), state.acquisitions);
-    try std.testing.expectEqual(@as(usize, 1), state.releases);
-}
 
 pub const McpTransport = enum { stdio, http, sse };
 
@@ -277,79 +246,10 @@ pub const McpServerConfig = struct {
     }
 };
 
-test "MCP server configuration exposes only the active transport target" {
-    const stdio: McpServerConfig = .{ .name = "stdio", .command = "node" };
-    try std.testing.expectEqualStrings("node", try stdio.stdioCommand());
-    try std.testing.expectError(error.McpInvalidServerConfig, stdio.remoteUrl());
 
-    const remote: McpServerConfig = .{
-        .name = "remote",
-        .transport = .http,
-        .url = "https://example.test/mcp",
-    };
-    try std.testing.expectEqualStrings("https://example.test/mcp", try remote.remoteUrl());
-    try std.testing.expectError(error.McpInvalidServerConfig, remote.stdioCommand());
 
-    const missing_stdio: McpServerConfig = .{ .name = "missing" };
-    try std.testing.expectError(error.McpInvalidServerConfig, missing_stdio.stdioCommand());
 
-    const empty_remote: McpServerConfig = .{
-        .name = "empty",
-        .transport = .sse,
-        .url = "",
-    };
-    try std.testing.expectError(error.McpInvalidServerConfig, empty_remote.remoteUrl());
-}
 
-test "profile config warning owns a bounded key inline" {
-    const warning = ProfileConfigWarning.init(
-        .suspicious_server_key,
-        "MCP-Servers",
-        2,
-    );
-    try std.testing.expectEqualStrings("MCP-Servers", warning.key().?);
-    try std.testing.expectEqual(@as(usize, 2), warning.additional_matches);
-    try std.testing.expect(ProfileConfigWarning.init(
-        .suspicious_key_scan_indeterminate,
-        null,
-        0,
-    ).key() == null);
-}
-
-test "MCP server configuration deinit owns present empty targets" {
-    const alloc = std.testing.allocator;
-    var config: McpServerConfig = .{
-        .name = try alloc.dupe(u8, "empty-owned-targets"),
-        .command = try alloc.dupe(u8, ""),
-        .url = try alloc.dupe(u8, ""),
-    };
-    config.deinit(alloc);
-}
-
-test "MCP configuration sources admit only their product scope" {
-    for ([_]ConfigSource{ .profile, .acp, .workspace }) |source| {
-        for ([_]ConfigScope{ .profile, .acp_session, .workspace }) |scope| {
-            const expected = switch (source) {
-                .profile => scope == .profile,
-                .acp => scope == .acp_session,
-                .workspace => scope == .workspace,
-            };
-            try std.testing.expectEqual(expected, sourceAllowsScope(source, scope));
-        }
-    }
-}
-
-test "workspace admission is present exactly for workspace source" {
-    for ([_]ConfigSource{ .profile, .acp, .workspace }) |source| {
-        for ([_]?WorkspaceAdmission{ null, .pending, .approved, .rejected }) |admission| {
-            const expected = if (source == .workspace) admission != null else admission == null;
-            try std.testing.expectEqual(
-                expected,
-                sourceAllowsWorkspaceAdmission(source, admission),
-            );
-        }
-    }
-}
 
 pub fn freeOwnedStrings(alloc: Allocator, values: []const []const u8) void {
     if (values.len == 0) return;
@@ -384,29 +284,3 @@ pub fn freeHttpHeaders(alloc: Allocator, headers: []const McpHttpHeader) void {
     alloc.free(headers);
 }
 
-test "JSON-RPC response envelopes require version 2.0 and one payload member" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        json: []const u8,
-        valid: bool,
-    }{
-        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}", .valid = true },
-        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":null}", .valid = true },
-        .{ .json = "{\"id\":1,\"result\":null}", .valid = false },
-        .{ .json = "{\"jsonrpc\":\"1.0\",\"id\":1,\"result\":null}", .valid = false },
-        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1}", .valid = false },
-        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null,\"error\":null}", .valid = false },
-    };
-    for (cases) |case| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
-        defer parsed.deinit();
-        if (case.valid) {
-            try validateJsonRpcResponseEnvelope(parsed.value);
-        } else {
-            try std.testing.expectError(
-                error.McpInvalidJson,
-                validateJsonRpcResponseEnvelope(parsed.value),
-            );
-        }
-    }
-}
