@@ -22,4 +22,3 @@ pub fn isToolCall(
     const action = parsed.value.object.get("action") orelse return false;
     return action == .string and std.mem.eql(u8, action.string, "exec");
 }
-

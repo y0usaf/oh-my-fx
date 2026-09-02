@@ -116,7 +116,6 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 
-
 pub const Context = struct {
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
@@ -1141,7 +1140,6 @@ fn visionPathPreparationFailure(
     };
 }
 
-
 fn semanticFailure(output: []const u8) ToolExecutionResult {
     return .{ .status = .failure, .model_output = output };
 }
@@ -1656,7 +1654,6 @@ fn commandProcessPresentation(
     }
     return null;
 }
-
 
 const SubagentProviderState = struct {
     runtime: Context,
@@ -2433,8 +2430,6 @@ fn expectSingleSubagentCreateEffects(
     try std.testing.expectEqual(@as(usize, 0), child.history.len);
 }
 
-
-
 const SubagentAgentLoopExecutor = struct {
     runtime: *TestRuntime,
 
@@ -2446,10 +2441,6 @@ const SubagentAgentLoopExecutor = struct {
         return executeToolCallAuthorized(self.runtime.context(), request);
     }
 };
-
-
-
-
 
 const CancelTestCommandOnOutput = struct {
     flag: *std.atomic.Value(bool),
@@ -2549,9 +2540,6 @@ fn terminalExecCallForTest(arena: Allocator, call: ToolCall) !ToolCall {
     return migrated;
 }
 
-
-
-
 fn unexpectedTestPrompt(
     _: *anyopaque,
     _: Allocator,
@@ -2612,7 +2600,6 @@ const TestAutoReview = struct {
         return .withOverride(self, review);
     }
 };
-
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) != null);
@@ -2814,11 +2801,6 @@ fn setTestHome(home: ?[]const u8) !void {
     io_mod.setEnvironMap(map);
 }
 
-
-
-
-
-
 fn registryOwnedWebFetchCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
@@ -2921,59 +2903,6 @@ fn waitForQuestionBridgeSnapshot(worker: *WorkerRuntime) !worker_runtime.Pending
     return error.TestExpectedEqual;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn fakeWorkspaceNonzero(
     alloc: Allocator,
     command: []const u8,
@@ -3041,13 +2970,6 @@ fn fakeWorkspaceDeadline(
     if (timeout_ms != js_host_workspace.max_timeout_ms) return error.InvalidWorkspaceResult;
     return error.WorkspaceDeadline;
 }
-
-
-
-
-
-
-
 
 const PermissionThreadState = struct {
     decision: ?ToolPermissionDecision = null,
@@ -3215,7 +3137,6 @@ fn waitForPermissionPrompt(worker: *WorkerRuntime, expected: []const u8) !u64 {
     return error.TestExpectedEqual;
 }
 
-
 const McpFixture = struct {
     const CountingContext = struct {
         calls: usize = 0,
@@ -3302,23 +3223,6 @@ const McpFixture = struct {
         return schema(raw_ctx, arena, name, permission_rules, limits, access);
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const vision_test_registry_tools = [_]tool_dispatch.Tool{test_builtin_tools.vision};
 
@@ -3551,7 +3455,6 @@ fn executeVisionPathTargetsForTest(
     });
 }
 
-
 fn visionRequestAllocationCount(args_json: []const u8) !usize {
     var probe = std.testing.FailingAllocator.init(
         std.testing.allocator,
@@ -3736,17 +3639,3 @@ fn expectVisionOutOfMemoryAt(
         failing.failing.freed_bytes,
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-

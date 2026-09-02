@@ -325,15 +325,3 @@ fn surfaceHasInvalidation(
     }
     return false;
 }
-
-
-
-
-
-
-
-
-
-
-
-

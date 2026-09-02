@@ -129,7 +129,3 @@ pub fn appendSpacesToColumn(alloc: Allocator, out: *std.ArrayList(u8), target_co
     if (current >= target_col) return;
     try out.appendNTimes(alloc, ' ', target_col - current);
 }
-
-
-
-

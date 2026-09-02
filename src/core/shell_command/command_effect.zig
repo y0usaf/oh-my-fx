@@ -191,7 +191,6 @@ const PrintfPolicy = struct {
     format_language: PrintfFormatLanguage = .portable_literal_newline_percent_string,
 };
 
-
 const LsSymlinkSemantics = enum {
     platform_default,
 };
@@ -908,7 +907,6 @@ fn ownPlan(
     } };
 }
 
-
 fn expectDirect(command: []const u8, target_os: std.Target.Os.Tag) !Admission {
     const admission = try plan(
         std.testing.allocator,
@@ -1022,20 +1020,3 @@ fn expectNativePrintfEquivalent(command: []const u8, target_os: std.Target.Os.Ta
         return error.TestExpectedEqual;
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

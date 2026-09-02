@@ -743,11 +743,6 @@ fn appendTestMcpServer(runtime: *mcp_runtime.McpRuntime, name: []const u8) !usiz
     return index;
 }
 
-
-
-
-
-
 fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
     var projection = buildTestModelToolProjection(alloc, .{}) catch |err|
         return switch (err) {
@@ -758,6 +753,3 @@ fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
     try expectContainsName(projection.advertised_names, "read_file");
     try std.testing.expectEqualStrings(test_web_search.description, projection.custom_guidance);
 }
-
-
-

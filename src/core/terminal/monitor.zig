@@ -455,12 +455,3 @@ fn test_definition(
         .lifetime = lifetime,
     };
 }
-
-
-
-
-
-
-
-
-

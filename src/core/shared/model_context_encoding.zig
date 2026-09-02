@@ -32,9 +32,3 @@ pub fn writeScalar(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Erro
         index += 1;
     }
 }
-
-
-
-
-
-

@@ -429,20 +429,3 @@ fn expectNoFrame(bytes: []const u8) !void {
     var parser = try Parser.init(bytes);
     try testing.expect((try parser.next()) == null);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

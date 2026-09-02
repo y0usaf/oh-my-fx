@@ -201,7 +201,6 @@ noinline fn failDecodedFrameDynamic(err: anyerror) anyerror!DecodedFrame {
     return err;
 }
 
-
 pub fn decodeFrame(alloc: Allocator, bytes: []const u8) DecodeError!DecodedFrame {
     const header = try Header.decode(bytes);
     const payload_len: usize = header.envelope.payload_len;
@@ -317,13 +316,6 @@ fn testRequestFrame(alloc: Allocator) !void {
     try std.testing.expectEqual(contracts.Action.screen, message.payload.request.action());
 }
 
-
-
-
-
-
-
-
 fn expectProjectedErrorCode(
     capabilities: u64,
     expected: contracts.StructuredErrorCode,
@@ -352,5 +344,3 @@ fn expectProjectedErrorCode(
     };
     try std.testing.expectEqual(expected, failure.code);
 }
-
-

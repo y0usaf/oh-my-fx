@@ -341,8 +341,6 @@ fn appendMarker(
     }
 }
 
-
-
 fn appendShellWord(
     output: *std.ArrayList(u8),
     alloc: Allocator,
@@ -359,15 +357,6 @@ fn appendShellWord(
     try output.append(alloc, '\'');
 }
 
-
-
-
-
-
-
-
-
-
 fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
     const bootstrap = try buildBootstrap(
         alloc,
@@ -380,4 +369,3 @@ fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
     const source = try buildSourceCommand(alloc, "/tmp/bootstrap");
     defer alloc.free(source);
 }
-

@@ -1091,12 +1091,6 @@ fn saturatingIncrement(value: *atomic_value.Value(u64)) void {
     }
 }
 
-
-
-
-
-
-
 const StdioCreateAttempt = struct {
     dispatcher: *stdio_dispatcher.StdioDispatcher,
     cancel: *std.atomic.Value(bool),
@@ -1169,5 +1163,3 @@ fn expectFailedStdioCreateCleanedUp(
     try std.testing.expectEqual(@as(usize, 0), dispatcher.pendingRequestCount());
     try std.testing.expect(!dispatcher.hasNotificationSink());
 }
-
-

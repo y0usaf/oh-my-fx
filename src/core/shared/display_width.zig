@@ -414,35 +414,6 @@ fn findTrieChild(node_index: u32, codepoint: u21) ?u32 {
     return null;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn fuzzDisplayUnitBoundaries(_: void, smith: *std.testing.Smith) !void {
     var buffer: [256]u8 = undefined;
     const len: usize = @intCast(smith.slice(&buffer));

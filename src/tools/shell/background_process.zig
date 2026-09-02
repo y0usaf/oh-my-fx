@@ -641,7 +641,6 @@ fn appendDescendants(
     }
 }
 
-
 const SpawnedBackgroundHandshake = struct {
     child: std.process.Child,
     ready_read: std.Io.File,
@@ -863,14 +862,6 @@ fn expectBlockedWrapperDoesNotExecute(
         else => return err,
     }
 }
-
-
-
-
-
-
-
-
 
 fn absoluteFileExistsForTest(path: []const u8) bool {
     var file = std.Io.Dir.openFileAbsolute(

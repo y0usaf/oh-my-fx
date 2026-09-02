@@ -325,10 +325,6 @@ fn openTestVerifiedDir(dir: std.Io.Dir) !io_mod.VerifiedDir {
     };
 }
 
-
-
-
-
 fn legacyCopyForTest(
     alloc: Allocator,
     snapshot: session_usage.Snapshot,

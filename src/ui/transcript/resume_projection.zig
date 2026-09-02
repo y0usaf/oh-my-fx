@@ -472,14 +472,6 @@ pub const ResumeProjection = struct {
     }
 };
 
-
-
-
-
-
-
-
-
 fn checkResumeProjectionAllocationFailures(alloc: Allocator) !void {
     var source: TranscriptRuntime = .{};
     source.layout = .{
@@ -505,7 +497,6 @@ fn checkResumeProjectionAllocationFailures(alloc: Allocator) !void {
     try projection.finalize();
 }
 
-
 fn checkLiveResumeProjectionAllocationFailures(alloc: Allocator) !void {
     var source: TranscriptRuntime = .{};
     source.layout.cols = 80;
@@ -520,4 +511,3 @@ fn checkLiveResumeProjectionAllocationFailures(alloc: Allocator) !void {
     );
     try projection.finalizeLivePresentation();
 }
-

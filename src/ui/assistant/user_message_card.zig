@@ -384,7 +384,6 @@ fn collectLogicalLinesWithFirstPrefix(
     }
 }
 
-
 fn assertRowStructure(card: []const u8) !void {
     var it = std.mem.splitScalar(u8, card, '\n');
     while (it.next()) |row| {
@@ -405,25 +404,3 @@ fn countRows(card: []const u8) usize {
     }
     return count;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

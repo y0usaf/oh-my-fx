@@ -449,15 +449,3 @@ fn cloneClippedRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayLis
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
-
-
-
-
-
-
-
-
-
-
-
-

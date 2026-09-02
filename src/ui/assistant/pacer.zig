@@ -416,27 +416,3 @@ fn makeBackgroundTurn(alloc: Allocator) !HistoryTurn {
         .expect_url = false,
     } };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

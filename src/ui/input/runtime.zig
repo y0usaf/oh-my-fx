@@ -379,18 +379,6 @@ fn withSubagentInput(
     return typed;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 pub const Runtime = struct {
     terminal_cursor_probe: cursor_probe.Parser = .{},
     terminal_theme_monitor: theme_monitor.Monitor = .{},
@@ -619,66 +607,6 @@ pub const consumeInputEscapeByte = escape_parser.consumeInputEscapeByte;
 pub const consumeInputEscapeByteWithMouse = escape_parser.consumeInputEscapeByteWithMouse;
 pub const controlByteFeatureAction = escape_parser.controlByteFeatureAction;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectEscapeAction(bytes: []const u8, expected: InputEscapeAction) !void {
     var stage: u8 = 1;
     var param: u16 = 0;
@@ -722,27 +650,6 @@ fn expectScanMatchesLayout(runtime: InputRuntime, direction: visual_layout.Direc
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const EscapeParseResult = struct {
     action: ?InputEscapeAction,
     stage: u8,
@@ -765,49 +672,6 @@ fn parseEscapeForTest(bytes: []const u8) EscapeParseResult {
         .param2 = param2,
     };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn appendPastedBlockForTest(runtime: *InputRuntime, alloc: Allocator, id: usize, text: []const u8) !void {
     const line_count = paste_blocks.countLines(text);
@@ -885,7 +749,6 @@ fn readTraceFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 8192);
 }
-
 
 fn checkStructuredKillYankAllocationFailure(
     failing: *std.testing.FailingAllocator,
@@ -1023,32 +886,3 @@ fn checkStructuredKillYankAllocationFailure(
     try std.testing.expectEqual(@as(usize, 1), images.items.len);
     try std.testing.expectEqual(@as(usize, 1), runtime.entities.skill_tokens.items.len);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -225,7 +225,6 @@ pub const Runtime = struct {
     }
 };
 
-
 fn loadProfileSnapshots(
     context: *anyopaque,
     alloc: Allocator,
@@ -253,6 +252,3 @@ fn loadProfileSnapshots(
         },
     ) };
 }
-
-
-

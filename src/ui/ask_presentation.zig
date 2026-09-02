@@ -447,6 +447,3 @@ fn normalizeStartCursor(
     if (col > 1 and row < layout.rows) row += 1;
     return .{ .row = row, .col = 1 };
 }
-
-
-

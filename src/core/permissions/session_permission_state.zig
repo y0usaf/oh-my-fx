@@ -564,14 +564,6 @@ fn containsKey(keys: []const RuleKey, candidate: RuleKey) bool {
     return false;
 }
 
-
-
-
-
-
-
-
-
 fn fixtureIdentity(
     alloc: Allocator,
     fields: []const []const u8,
@@ -606,4 +598,3 @@ fn appendFixtureRule(
         .generation = generation,
     });
 }
-

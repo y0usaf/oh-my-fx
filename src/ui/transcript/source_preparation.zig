@@ -25,7 +25,6 @@ const stripTrailingNewline = transcript_blocks.stripTrailingNewline;
 const tailVisibleBlockKind = transcript_blocks.tailVisibleBlockKind;
 const visualRowsForLine = transcript_blocks.visualRowsForLine;
 
-
 const FinalityNominationKind = enum { mutation_pin, tool_turn, assistant_tail };
 
 const FinalityNomination = struct {
@@ -1082,5 +1081,3 @@ fn frameCommitted(self: anytype) bool {
     }
     return false;
 }
-
-

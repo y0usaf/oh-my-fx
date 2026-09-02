@@ -405,16 +405,3 @@ fn versionLabel(v: []const u8) []const u8 {
     if (v.len > 0 and v[0] != 'v') return v;
     return if (v.len > 1) v[1..] else v;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-

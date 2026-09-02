@@ -74,6 +74,3 @@ fn testProductExe() ?[]const u8 {
     const path = std.mem.sliceTo(path_z, 0);
     return if (path.len == 0) null else path;
 }
-
-
-

@@ -871,8 +871,6 @@ fn formatSkillChunkNotice(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-
-
 fn openTestSkillCandidate(
     alloc: Allocator,
     root: []const u8,
@@ -897,7 +895,6 @@ fn expectSkillResourceRejected(alloc: Allocator, root: []const u8, resource: []c
     return error.TestUnexpectedResult;
 }
 
-
 fn createSkillSymlinkOrSkip(
     dir: std.Io.Dir,
     target_path: []const u8,
@@ -912,7 +909,6 @@ fn createSkillSymlinkOrSkip(
         return err;
     };
 }
-
 
 fn checkSkillErrorFormattingAllocationFailures(alloc: Allocator) !void {
     const missing = try formatMissingSkill(alloc, "workflow", tool_result_limits.default_max_tool_result_bytes);
@@ -985,9 +981,6 @@ fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) == null);
 }
 
-
-
-
 const CandidatePathReplacementHook = struct {
     dir: *std.Io.Dir,
 
@@ -1007,18 +1000,3 @@ const CandidatePathReplacementHook = struct {
         );
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

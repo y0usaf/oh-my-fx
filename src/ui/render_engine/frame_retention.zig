@@ -236,7 +236,3 @@ fn testMovement(alloc: Allocator, previous: *const vt_emulator.Grid) !terminal_d
         previous.rows,
     );
 }
-
-
-
-

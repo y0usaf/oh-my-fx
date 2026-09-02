@@ -473,7 +473,6 @@ fn mapReducerError(err: anyerror) anyerror {
     };
 }
 
-
 fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {
     const prefix = "[{\"type\":\"reasoning\",\"encrypted_content\":\"";
     const suffix = "\"}]";
@@ -520,14 +519,6 @@ fn expectOpenAICodexReplayError(expected: anyerror, messages: []const types.Chat
     }
 }
 
-
-
-
-
-
-
-
-
 fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.ModelCompletion {
     var reader: std.Io.Reader = .fixed(sse_text);
     var cancelled = std.atomic.Value(bool).init(false);
@@ -564,10 +555,3 @@ fn expectOpenAICodexSseError(expected: anyerror, sse_text: []const u8, limits: C
         try std.testing.expectEqual(expected, err);
     }
 }
-
-
-
-
-
-
-

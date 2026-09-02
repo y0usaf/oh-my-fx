@@ -373,11 +373,3 @@ fn freeBackgroundCommand(alloc: Allocator, background: command_contract.Backgrou
     alloc.free(background.log_path);
     if (background.url) |url| alloc.free(url);
 }
-
-
-
-
-
-
-
-

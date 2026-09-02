@@ -20,4 +20,3 @@ pub const Classification = struct {
         self.* = .{ .kind = .binary, .mime_type = &.{}, .declared = false };
     }
 };
-

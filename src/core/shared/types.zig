@@ -77,7 +77,6 @@ pub fn renderContextNoticeBody(alloc: std.mem.Allocator, text: []const u8) ![]u8
     return body.toOwnedSlice();
 }
 
-
 pub const CredentialSource = enum {
     vercel_oidc_token,
     ai_gateway_api_key,
@@ -90,7 +89,6 @@ pub const CredentialSource = enum {
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
     return std.meta.stringToEnum(CredentialSource, text);
 }
-
 
 pub const TurnPresentationOutcome = enum {
     completed,
@@ -505,9 +503,6 @@ pub const RouteRecoveryStatus = struct {
     }
 };
 
-
-
-
 pub const ChatRole = enum {
     system,
     user,
@@ -797,7 +792,6 @@ pub fn isDeferredToolResult(result: PersistedToolResult) bool {
             std.mem.eql(u8, result.output, context_deferred_tool_result_output));
 }
 
-
 pub const ToolResultMemory = struct {
     output_handle: ?[]const u8 = null,
     preview: ?[]const u8 = null,
@@ -1085,8 +1079,6 @@ pub fn validGatewayGenerationId(id: []const u8) bool {
     return true;
 }
 
-
-
 fn fuzzGatewayTimestamp(_: void, smith: *std.testing.Smith) !void {
     var buffer: [128]u8 = undefined;
     const len: usize = @intCast(smith.slice(&buffer));
@@ -1131,9 +1123,6 @@ pub fn classifyProviderCompletion(completion: ModelCompletion) ProviderCompletio
         .other => if (completion.tool_calls.len == 0) .completed else .invalid_completion,
     };
 }
-
-
-
 
 pub const AuthoritativeToolAdmission = union(enum) {
     admitted,
@@ -1188,8 +1177,6 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
 
     return .admitted;
 }
-
-
 
 pub const ConversationLanguage = struct {
     pub const max_len: usize = 24;
@@ -2111,10 +2098,6 @@ pub fn freeToolCall(alloc: std.mem.Allocator, call: ToolCall) void {
     if (call.provider_result) |provider_result| alloc.free(provider_result);
 }
 
-
-
-
-
 pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
     alloc.free(user.text);
     freeImageAttachmentSlice(alloc, user.images);
@@ -2275,10 +2258,3 @@ pub fn dupePermissionRuleSet(alloc: std.mem.Allocator, rules: PermissionRuleSet)
         .rules = try dupePermissionRuleSlice(alloc, rules.rules),
     };
 }
-
-
-
-
-
-
-

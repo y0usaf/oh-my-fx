@@ -73,6 +73,3 @@ pub fn CommandRegistry(comptime Command: type) type {
         }
     };
 }
-
-
-

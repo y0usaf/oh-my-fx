@@ -444,15 +444,7 @@ fn close_new_fds(before: [max_tracked_fd]bool, after: [max_tracked_fd]bool) void
     }
 }
 
-
-
-
-
-
-
-
 extern "c" fn getpgid(pid: std.posix.pid_t) std.posix.pid_t;
-
 
 const ParallelSpawn = struct {
     io: std.Io,
@@ -476,6 +468,3 @@ const ParallelSpawn = struct {
             result.stderr.len == 0;
     }
 };
-
-
-

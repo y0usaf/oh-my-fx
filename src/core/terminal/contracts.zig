@@ -3065,12 +3065,6 @@ fn test_monitor_definition() MonitorDefinition {
     };
 }
 
-
-
-
-
-
-
 fn check_owned_action_request_allocation_failures(alloc: Allocator) !void {
     const monitors = [_]MonitorDefinition{test_monitor_definition()};
     var request = try OwnedActionRequest.init(alloc, .{ .start = .{
@@ -3105,11 +3099,6 @@ fn check_owned_action_request_allocation_failures(alloc: Allocator) !void {
     try request.value.validate();
 }
 
-
-
-
-
-
 fn test_render_cells() [4]RenderCell {
     return .{
         .{
@@ -3130,7 +3119,6 @@ fn test_render_cells() [4]RenderCell {
     };
 }
 
-
 fn check_owned_render_snapshot_allocation_failures(alloc: Allocator) !void {
     const cells = test_render_cells();
     var snapshot = try OwnedRenderSnapshot.init(alloc, .{
@@ -3141,8 +3129,6 @@ fn check_owned_render_snapshot_allocation_failures(alloc: Allocator) !void {
     defer snapshot.deinit(alloc);
     try snapshot.view().validate();
 }
-
-
 
 fn test_session_facts() SessionFacts {
     return .{
@@ -3161,10 +3147,6 @@ fn test_session_facts() SessionFacts {
     };
 }
 
-
-
-
-
 fn check_owned_result_allocation_failures(alloc: Allocator) !void {
     const cells = test_render_cells();
     var result = try OwnedResult.init(alloc, .{ .success = .{ .screen = .{
@@ -3178,7 +3160,6 @@ fn check_owned_result_allocation_failures(alloc: Allocator) !void {
     defer result.deinit(alloc);
     try result.view().validate();
 }
-
 
 fn test_principal() Principal {
     return .{
@@ -3194,13 +3175,3 @@ fn test_principal() Principal {
 fn test_proof() HolderProof {
     return .{ .bytes = [_]u8{1} ** 32 };
 }
-
-
-
-
-
-
-
-
-
-

@@ -187,9 +187,3 @@ pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
-
-
-
-
-
-

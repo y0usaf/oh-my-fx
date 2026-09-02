@@ -1130,7 +1130,6 @@ pub fn pathInside(root: []const u8, candidate: []const u8) bool {
     return candidate.len > root.len and candidate[root.len] == std.fs.path.sep;
 }
 
-
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
@@ -1147,40 +1146,3 @@ fn createTestSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: 
         return err;
     };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

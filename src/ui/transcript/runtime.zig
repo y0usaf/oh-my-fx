@@ -270,7 +270,6 @@ fn nextResizeBottomAnchorPending(
     return next;
 }
 
-
 const MaterializedEndpoint = struct {
     visual_offset: u32 = 0,
     visual_rows: u16 = 0,
@@ -548,27 +547,6 @@ fn traceLifecycleFailure(
     );
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const PendingBuildProbe = struct {
     polls: usize = 0,
     pending_after: ?usize = null,
@@ -579,9 +557,6 @@ const PendingBuildProbe = struct {
         return if (self.pending_after) |limit| self.polls >= limit else false;
     }
 };
-
-
-
 
 fn checkAutoPermissionNoticeAllocationFailures(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{
@@ -619,18 +594,6 @@ fn checkAutoPermissionNoticeAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.transcript.items.len);
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkToolDetailResultReplacementAllocationFailures(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{};
@@ -684,35 +647,12 @@ fn checkToolDetailResultReplacementAllocationFailures(alloc: Allocator) !void {
     );
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 fn entryIndex(runtime: *const TranscriptRuntime, entry_id: u32) ?usize {
     for (runtime.entries.items, 0..) |entry, index| {
         if (entry.id() == entry_id) return index;
     }
     return null;
 }
-
-
-
-
-
-
-
-
-
-
-
 
 pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
     return transcript_blocks.wrapAssistantText(alloc, text, cols);
@@ -4736,7 +4676,6 @@ pub const TranscriptRuntime = struct {
         };
     }
 
-
     fn resolveMaterializedEndpoint(
         target: TransitionTarget,
         source_endpoint_cursor_row: u16,
@@ -7057,7 +6996,6 @@ pub const TranscriptRuntime = struct {
     }
 };
 
-
 fn frameBandsEqual(a: render_engine.paint_plan.FrameBand, b: render_engine.paint_plan.FrameBand) bool {
     return a.top == b.top and a.bottom == b.bottom and a.owner == b.owner;
 }
@@ -7195,12 +7133,6 @@ fn resolveTranscriptRecoveryCommit(
     };
 }
 
-
-
-
-
-
-
 fn acceptedTranscriptRows(
     scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
     committed_terminal_scroll_rows: u16,
@@ -7301,13 +7233,6 @@ fn testFrameCommitResult(
     };
 }
 
-
-
-
-
-
-
-
 fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
     return frameInlineScrollBudgetCapped(
         resize_reflow_rows,
@@ -7315,7 +7240,6 @@ fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
         std.math.maxInt(u32),
     );
 }
-
 
 fn frameInlineScrollBudgetCapped(
     resize_reflow_rows: u16,
@@ -7392,7 +7316,6 @@ fn reflowedRows(
     return total;
 }
 
-
 fn invalidationTestLayout() Layout {
     return .{
         .rows = 24,
@@ -7405,23 +7328,6 @@ fn invalidationTestLayout() Layout {
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn testLayoutWithRows(rows: u16) Layout {
     return .{
         .rows = rows,
@@ -7433,5 +7339,3 @@ fn testLayoutWithRows(rows: u16) Layout {
         .hint_row = rows,
     };
 }
-
-

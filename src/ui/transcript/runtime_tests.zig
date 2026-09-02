@@ -467,11 +467,6 @@ fn preparedVisualOffsetForTest(
     return offset + prepared.selection.partial_skip_rows;
 }
 
-
-
-
-
-
 fn commitPreparedForTest(
     runtime: *TranscriptRuntime,
     alloc: Allocator,
@@ -665,7 +660,6 @@ fn totalVisualRowsForTest(line_rows: []const u16) u32 {
     for (line_rows) |rows| total += rows;
     return total;
 }
-
 
 fn makeSyntheticPreparedRenderable(
     prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
@@ -1440,7 +1434,6 @@ fn enterResizeReflowRecoveryWithAcceptedRows(
     );
 }
 
-
 const RecoveryAttemptOutcome = struct {
     facts: transcript_runtime.TranscriptScrollFacts,
     visual_offset: u32,
@@ -1641,7 +1634,6 @@ fn semanticNoticePaletteB() Styles {
     };
 }
 
-
 fn checkSemanticNoticeAppendAllocationFailures(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(32, 16, 12) };
     defer runtime.deinit(alloc);
@@ -1655,7 +1647,6 @@ fn checkSemanticNoticeAppendAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("allocator", runtime.entries.items[0].semantic_notice.topic);
     try std.testing.expectEqualStrings("owned topic and body", runtime.entries.items[0].semantic_notice.body);
 }
-
 
 fn checkSemanticNoticeReplacementAllocationFailures(alloc: Allocator) !void {
     const base = std.testing.allocator;
@@ -1690,60 +1681,6 @@ fn checkSemanticNoticeReplacementAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("replacement body", runtime.entries.items[0].semantic_notice.body);
     try std.testing.expectEqual(next_entry_id, runtime.next_entry_id);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkPrepareTranscriptSourceAllocationFailures(alloc: Allocator) !void {
     const welcome =
@@ -1803,7 +1740,6 @@ fn checkPrepareTranscriptSourceAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqual(@as(?usize, 3), source.welcome_cut_line);
 }
 
-
 fn checkPreviewPreparationFailureLeavesRuntimeUnchanged(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(24, 10, 6),
@@ -1860,28 +1796,6 @@ fn checkPreviewPreparationFailureLeavesRuntimeUnchanged(alloc: Allocator) !void 
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn removeRawEntriesForTest(
     runtime: *TranscriptRuntime,
     alloc: Allocator,
@@ -1899,50 +1813,6 @@ fn removeRawEntriesForTest(
         } else return error.TestExpectedRawEntry;
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const AssistantStreamFastPathCase = enum {
     opening,
@@ -2067,7 +1937,6 @@ fn checkOrdinaryAssistantStreamAllocationFailures(
     try std.testing.expect(runtime.transcript_band_dirty);
 }
 
-
 fn checkOpeningAssistantStreamAllocationFailures(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(24, 12, 8) };
     defer runtime.deinit(alloc);
@@ -2136,7 +2005,6 @@ fn checkOpeningAssistantStreamAllocationFailures(alloc: Allocator) !void {
     try std.testing.expect(runtime.render_requests.hasReason(.transcript));
     try std.testing.expect(runtime.transcript_band_dirty);
 }
-
 
 fn checkExtendingAssistantStreamAllocationFailures(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(24, 12, 8) };
@@ -2213,11 +2081,6 @@ fn checkExtendingAssistantStreamAllocationFailures(alloc: Allocator) !void {
     try std.testing.expect(runtime.render_requests.hasReason(.transcript));
     try std.testing.expect(runtime.transcript_band_dirty);
 }
-
-
-
-
-
 
 const UserPromptCardAdmissionCase = enum {
     text_with_separator,
@@ -2381,13 +2244,6 @@ fn check_user_prompt_card_admission_success(
     try std.testing.expectEqual(input_images_ptr, input.user.images.ptr);
 }
 
-
-
-
-
-
-
-
 fn checkThemeRetintAllocationFailures(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(48, 12, 8),
@@ -2465,8 +2321,6 @@ fn checkThemeRetintAllocationFailures(alloc: Allocator) !void {
         "\x1b[38;5;238mRETINT ALLOCATION MARKER",
     ) != null);
 }
-
-
 
 fn check_user_prompt_card_admission_allocation_failures(
     alloc: Allocator,
@@ -2574,12 +2428,6 @@ fn check_user_prompt_card_admission_allocation_failures(
     try std.testing.expectEqual(input_images_ptr, input.user.images.ptr);
 }
 
-
-
-
-
-
-
 const RecordedWriteToolDetailFixture = struct {
     entry_id: u32,
     tool_name: []const u8,
@@ -2644,9 +2492,6 @@ fn appendOwnedToolDetail(
     try runtime.tool_details.append(alloc, detail);
 }
 
-
-
-
 const RecordedWriteCommandOutputFixture = struct {
     entry_id: u32,
     turn_id: u64,
@@ -2695,7 +2540,6 @@ fn expectRecordedWriteCommandOutputFixture(
     try std.testing.expectEqual(command_output_content.Stream.stdout, block.lines.items[0].stream);
     try std.testing.expectEqualStrings(fixture.line, block.lines.items[0].text);
 }
-
 
 fn checkRecordedTranscriptWriteAllocationFailures(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{
@@ -2815,8 +2659,6 @@ fn checkRecordedTranscriptWriteAllocationFailures(alloc: Allocator) !void {
     try std.testing.expect(runtime.transcript_band_dirty);
 }
 
-
-
 fn checkContextNoticeAllocationFailures(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(40, 12, 8) };
     defer runtime.deinit(alloc);
@@ -2863,8 +2705,6 @@ fn checkContextNoticeAllocationFailures(alloc: Allocator) !void {
     try std.testing.expect(runtime.transcript_band_dirty);
 }
 
-
-
 const RecordedCommandOutputAtomicFixture = struct {
     lifecycle_id: types.ToolLifecycleId,
     status_entry_id: u32,
@@ -2909,9 +2749,6 @@ fn expectRecordedCommandOutputAnchor(
     try std.testing.expectEqual(entry_id, runtime.full_transcript.anchor_entry_id.?);
     try std.testing.expect(runtime.full_transcript.anchor_pending);
 }
-
-
-
 
 fn checkVisibleRecordedCommandOutputAllocationFailuresImpl(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{
@@ -2987,7 +2824,6 @@ fn checkVisibleRecordedCommandOutputAllocationFailures(alloc: Allocator) !void {
         else => err,
     };
 }
-
 
 fn checkRecordedCommandOutputConsolidationAllocationFailuresImpl(alloc: Allocator) !void {
     var runtime = TranscriptRuntime{
@@ -3103,25 +2939,6 @@ fn checkRecordedCommandOutputConsolidationAllocationFailures(alloc: Allocator) !
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn lifecycleTestRuntime(max_retained_bytes: ?usize) TranscriptRuntime {
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(80, 24, 20),
@@ -3148,8 +2965,6 @@ fn startLifecycle(
     } });
     return runtime.toolActivityRecord(lifecycleId(turn_id, call_id)).?.entry_id;
 }
-
-
 
 fn checkCompactParallelFallbackAllocationFailuresImpl(alloc: Allocator) !void {
     var runtime = lifecycleTestRuntime(null);
@@ -3210,7 +3025,6 @@ fn checkCompactParallelFallbackAllocationFailures(alloc: Allocator) !void {
     };
 }
 
-
 fn prepareTurnFinishedAnchor(runtime: *TranscriptRuntime, alloc: Allocator) !void {
     try runtime.enableShadowVt(alloc);
     _ = try runtime.appendRawTranscriptEntryClassified(
@@ -3230,24 +3044,6 @@ fn prepareTurnFinishedAnchor(runtime: *TranscriptRuntime, alloc: Allocator) !voi
         1,
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn expectRawEntryBytes(
     runtime: *const TranscriptRuntime,
@@ -3351,9 +3147,6 @@ fn checkLifecycleRepositionAllocationFailures(alloc: Allocator) !void {
     };
 }
 
-
-
-
 fn checkLifecycleAllocationFailuresImpl(alloc: Allocator) !void {
     var runtime = lifecycleTestRuntime(64);
     defer runtime.deinit(alloc);
@@ -3402,7 +3195,6 @@ fn checkLifecycleAllocationFailures(alloc: Allocator) !void {
         else => err,
     };
 }
-
 
 fn checkLateTerminalFallbackAllocationFailuresImpl(alloc: Allocator) !void {
     var runtime = lifecycleTestRuntime(null);
@@ -3460,7 +3252,6 @@ fn checkLateTerminalFallbackAllocationFailures(alloc: Allocator) !void {
     };
 }
 
-
 fn checkProvisionalTerminalAllocationFailuresImpl(alloc: Allocator) !void {
     var runtime = lifecycleTestRuntime(null);
     defer runtime.deinit(alloc);
@@ -3509,7 +3300,6 @@ fn checkProvisionalTerminalAllocationFailures(alloc: Allocator) !void {
         else => err,
     };
 }
-
 
 fn checkCommandProcessTerminalAllocationFailuresImpl(alloc: Allocator) !void {
     var runtime = lifecycleTestRuntime(null);
@@ -3566,21 +3356,7 @@ fn checkCommandProcessTerminalAllocationFailures(alloc: Allocator) !void {
     };
 }
 
-
-
 const call_ids = [_][]const u8{ "first", "second" };
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn applyCompletedReadForFinalityTest(
     runtime: *TranscriptRuntime,
@@ -3602,6 +3378,3 @@ fn applyCompletedReadForFinalityTest(
         .outcome = .{ .kind = .completed, .summary = "Read finality fixture" },
     } });
 }
-
-
-

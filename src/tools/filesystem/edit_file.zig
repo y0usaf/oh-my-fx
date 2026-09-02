@@ -166,6 +166,3 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 }
 
 fn noopInputDeinit(_: *anyopaque, _: Allocator) void {}
-
-
-

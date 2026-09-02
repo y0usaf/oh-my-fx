@@ -1434,12 +1434,3 @@ fn verifyEndpointPermissions(host_dir: *io_mod.VerifiedDir) !void {
         return error.PrivateEndpointPermissionsUnsupported;
     }
 }
-
-
-
-
-
-
-
-
-

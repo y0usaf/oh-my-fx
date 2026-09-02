@@ -96,8 +96,6 @@ pub const RedrawMode = enum {
     reanchor_top,
 };
 
-
-
 fn measuredCursorRowDelta(expected_row: u32, actual_row: u16) i32 {
     const expected: i64 = @intCast(expected_row);
     const actual: i64 = actual_row;
@@ -799,18 +797,3 @@ const ProbeOrderingTerminal = struct {
         self.layout_cols_at_request.* = self.shell.layout.cols;
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

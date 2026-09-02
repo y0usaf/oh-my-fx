@@ -316,6 +316,3 @@ const HostStreamReader = struct {
         return count;
     }
 };
-
-
-
