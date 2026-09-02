@@ -122,7 +122,21 @@ pub fn artifactUrl(alloc: Allocator, base_url: []const u8, target: Target, suffi
     if (isLoopbackE2eUpgradeBase(base_url)) {
         return std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz{s}", .{ base_url, target.artifactRef(), platform, suffix });
     }
-    return std.fmt.allocPrint(alloc, "{s}/download/{s}/fx-{s}.tar.gz{s}", .{ base_url, target.artifactRef(), platform, suffix });
+    var owned_tag: ?[]u8 = null;
+    defer if (owned_tag) |tag| alloc.free(tag);
+
+    const release_tag = switch (target) {
+        .stable => |stable| if (std.mem.startsWith(u8, stable.artifact_ref, "omyfx-v"))
+            stable.artifact_ref
+        else blk: {
+            const formatted = try std.fmt.allocPrint(alloc, "omyfx-v{s}", .{stable.version});
+            owned_tag = formatted;
+            break :blk formatted;
+        },
+        .dev => |dev| dev.artifact_ref,
+    };
+
+    return std.fmt.allocPrint(alloc, "{s}/download/{s}/fx-{s}.tar.gz{s}", .{ base_url, release_tag, platform, suffix });
 }
 
 fn fetchTextBounded(
@@ -363,6 +377,19 @@ test "artifact URLs preserve the local test contract and use GitHub release down
     try std.testing.expectEqualStrings(
         "http://127.0.0.1:1234/v1.2.3/fx-" ++ platform ++ ".tar.gz",
         local,
+    );
+}
+
+test "GitHub release artifact URLs do not double the omyfx-v tag prefix" {
+    const alloc = std.testing.allocator;
+    var target = try Target.initStable(alloc, "omyfx-v1.2.3");
+    defer target.deinit(alloc);
+
+    const production = try artifactUrl(alloc, release_base, target, ".sha256");
+    defer alloc.free(production);
+    try std.testing.expectEqualStrings(
+        "https://github.com/y0usaf/oh-my-fx/releases/download/omyfx-v1.2.3/fx-" ++ platform ++ ".tar.gz.sha256",
+        production,
     );
 }
 
