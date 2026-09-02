@@ -387,12 +387,6 @@ pub const Parser = struct {
 
 const header_len = magic.len + 2 + 2 + 8 + 1;
 
-var test_empty_env: std.process.Environ.Map = std.process.Environ.Map.init(std.heap.c_allocator);
-
-fn resetEnvForTest() void {
-    io_mod.setEnvironMap(&test_empty_env);
-}
-
 fn tapePath(alloc: Allocator, dir: std.Io.Dir, name: []const u8) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, dir, ".");
     defer alloc.free(root);

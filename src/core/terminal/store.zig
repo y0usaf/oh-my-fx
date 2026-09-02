@@ -7157,29 +7157,6 @@ fn expect_close_candidate(outcome: CloseCommitOutcome) !void {
     }
 }
 
-fn test_claim(persistence: contracts.StartPersistence) contracts.AuthorityClaim {
-    return .{
-        .principal = persistence.grant.principal,
-        .actor = persistence.grant.actor,
-        .generation = persistence.grant.generation,
-        .proof = persistence.proof,
-    };
-}
-
-fn test_process_owner(
-    alloc: Allocator,
-    process_provider: background_process_provider.Provider,
-) !contracts.ProcessOwner {
-    var pid_buffer: [32]u8 = undefined;
-    const pid = std.c.getpid();
-    const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
-    const token = try process_provider.captureToken(
-        alloc,
-        pid_text,
-    );
-    return contracts.ProcessOwner.init(@intCast(pid), token.view());
-}
-
 fn recovered_session_index(
     sessions: []const DurableSession,
     session_id: []const u8,
@@ -7188,77 +7165,6 @@ fn recovered_session_index(
         if (std.mem.eql(u8, session.record.session_id, session_id)) return index;
     }
     return null;
-}
-
-fn replace_test_authority(
-    alloc: Allocator,
-    session: *DurableSession,
-    authority: AuthorityWire,
-) !void {
-    const bytes = try render_json(alloc, authority);
-    defer alloc.free(bytes);
-    const name = try authority_name(alloc, session.record.session_id);
-    defer alloc.free(name);
-    var entry = try (try session.state_capability()).atomicReplace(
-        alloc,
-        .terminal_state,
-        name,
-        bytes,
-    );
-    entry.deinit(alloc);
-}
-
-fn replace_test_close_transaction(
-    alloc: Allocator,
-    session: *DurableSession,
-    bytes: []const u8,
-) !void {
-    const name = try close_transaction_name(alloc, session.record.session_id);
-    defer alloc.free(name);
-    var entry = try (try session.state_capability()).atomicReplace(
-        alloc,
-        .terminal_state,
-        name,
-        bytes,
-    );
-    entry.deinit(alloc);
-}
-
-fn expect_pending_close_unchanged(
-    alloc: Allocator,
-    profile: *ProfileStore,
-    session_id: []const u8,
-    generation: contracts.AuthorityGeneration,
-    backend_identity: []const u8,
-) !void {
-    var unchanged = try profile.open_existing(
-        "terminal-store-owner",
-        session_id,
-    );
-    defer unchanged.deinit();
-    try std.testing.expectEqual(contracts.Lifecycle.starting, unchanged.record.lifecycle);
-    try std.testing.expect(unchanged.record.authority_revoked);
-    try std.testing.expectEqual(generation, unchanged.record.authority_generation);
-    try std.testing.expectEqualStrings(
-        backend_identity,
-        unchanged.record.backend_identity,
-    );
-    try std.testing.expect(try unchanged.close_cleanup_pending());
-    var authority = try load_authority(
-        alloc,
-        try unchanged.state_capability(),
-        session_id,
-    );
-    defer authority.deinit();
-    try std.testing.expect(authority.value.revoked);
-    try std.testing.expectEqual(generation, authority.value.grant.generation);
-    var replay = try unchanged.replay_events(alloc, 0, 16);
-    defer replay.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), replay.events.len);
-    try std.testing.expectEqual(
-        contracts.HostEvent.authority_revoked,
-        replay.events[0].kind,
-    );
 }
 
 const MonitorCrashCase = enum {

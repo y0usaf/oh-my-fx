@@ -883,19 +883,6 @@ fn dupeOptionalString(
     return try alloc.dupe(u8, value.string);
 }
 
-fn checkCredentialStoreIsolationAllocationFailures(alloc: Allocator) !void {
-    const json =
-        \\{"version":1,"credentials":[
-        \\{},
-        \\{"server_identity":"valid","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret","refresh_token":null,"scope":"","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":456,"authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
-        \\]}
-    ;
-    var store = try parseStore(alloc, json);
-    defer store.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), store.credentials.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.rejected_entries);
-}
-
 var stable_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableTestEnviron() !*const std.process.Environ.Map {

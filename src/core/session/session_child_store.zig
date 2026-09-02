@@ -1276,24 +1276,6 @@ fn makeManagedEntry(
     };
 }
 
-fn openTestSession(
-    alloc: Allocator,
-    tmp: *std.testing.TmpDir,
-) !struct { dir: std.Io.Dir, display_path: []u8 } {
-    try tmp.dir.createDir(
-        io_mod.getIo(),
-        "session",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
-    errdefer alloc.free(display_path);
-    const dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    return .{ .dir = dir, .display_path = display_path };
-}
-
 fn countEntries(dir: std.Io.Dir) !usize {
     var count: usize = 0;
     var iter = dir.iterate();

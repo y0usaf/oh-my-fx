@@ -1741,63 +1741,6 @@ const ConcurrentRequest = struct {
     }
 };
 
-const ReadinessRequest = struct {
-    dispatcher: *StdioDispatcher,
-    readiness: *RequestReadiness,
-    commit_cancel_flag: ?*std.atomic.Value(bool) = null,
-    response: ?[]u8 = null,
-    err: ?anyerror = null,
-
-    fn run(self: *ReadinessRequest) void {
-        const request_id = self.dispatcher.reserveRequestId() catch |err| {
-            self.err = err;
-            return;
-        };
-        self.response = self.dispatcher.request(
-            std.testing.allocator,
-            request_id,
-            "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"subscriptions/listen\"}",
-            4096,
-            .{
-                .timeout_ms = 2_000,
-                .commit_cancel_flag = self.commit_cancel_flag,
-                .purpose = .subscription,
-                .readiness = self.readiness,
-            },
-        ) catch |err| {
-            self.err = err;
-            return;
-        };
-    }
-};
-
-fn createShellDispatcher(script: []const u8) !struct {
-    dispatcher: *StdioDispatcher,
-    pid: std.posix.pid_t,
-} {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return error.SkipZigTest;
-    }
-    const child = try std.process.spawn(io_mod.getIo(), .{
-        .argv = &.{ "sh", "-c", script },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .ignore,
-        .pgid = 0,
-    });
-    const pid = child.id.?;
-    return .{
-        .dispatcher = try StdioDispatcher.create(
-            std.testing.allocator,
-            std.heap.c_allocator,
-            child,
-            1,
-            4096,
-        ),
-        .pid = pid,
-    };
-}
-
 fn expectProcessReaped(pid: std.posix.pid_t) !void {
     for (0..100) |_| {
         std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {

@@ -117,19 +117,3 @@ pub fn Runtime(comptime App: type) type {
         }
     };
 }
-
-const TestFileIndex = struct {
-    ensured_count: usize = 0,
-    refreshed_count: usize = 0,
-    last_additional_count: usize = 0,
-
-    fn ensureScope(self: *TestFileIndex, _: std.mem.Allocator, scope: workspace_access.AccessScope) void {
-        self.ensured_count += 1;
-        self.last_additional_count = scope.additional_directories.len;
-    }
-
-    fn refreshScope(self: *TestFileIndex, _: std.mem.Allocator, scope: workspace_access.AccessScope) void {
-        self.refreshed_count += 1;
-        self.last_additional_count = scope.additional_directories.len;
-    }
-};

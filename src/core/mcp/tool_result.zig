@@ -494,29 +494,3 @@ fn extract_legacy(alloc: Allocator, response: []const u8) !tool_mcp_runtime.Call
         .protocol = .legacy,
     });
 }
-
-fn check_input_required_allocation_failures(alloc: Allocator) !void {
-    var result = try extract(alloc, .{
-        .server_name = "server",
-        .tool_name = "mcp_server_confirm",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"input_required\",\"inputRequests\":{\"confirm\":{\"method\":\"elicitation/create\",\"params\":{\"message\":\"Continue?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"confirmed\":{\"type\":\"boolean\"}}}}}},\"requestState\":{\"opaque\":true}}}",
-        .max_tool_result_bytes = 64 * 1024,
-        .protocol = .modern,
-    });
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.input_required, result.status);
-}
-
-fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
-    var result = try extract(alloc, .{
-        .server_name = "server",
-        .tool_name = "mcp_server_authorize",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32042,\"message\":\"URL elicitation required\",\"data\":{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"legacy-url\"}]}}}",
-        .max_tool_result_bytes = 64 * 1024,
-        .protocol = .legacy,
-        .legacy_wire = .legacy_mcp_2025_11,
-    });
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.input_required, result.status);
-    try std.testing.expect(result.input_required.?.legacy_retry_without_responses);
-}

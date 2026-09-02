@@ -171,14 +171,6 @@ const CommitClaim = struct {
 
 var target_resolution_check_count: usize = 0;
 
-pub fn resetTargetResolutionCheckCountForTest() void {
-    if (builtin.is_test) target_resolution_check_count = 0;
-}
-
-pub fn targetResolutionCheckCountForTest() usize {
-    return if (builtin.is_test) target_resolution_check_count else 0;
-}
-
 pub fn prepare(
     call_alloc: std.mem.Allocator,
     call: types.ToolCall,
@@ -1739,23 +1731,6 @@ fn decodeTestMutationInput(
     };
 }
 
-fn expectTerminalSafe(text: []const u8) !void {
-    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
-    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
-    try std.testing.expect(std.mem.findScalar(u8, text, '\n') == null);
-    try std.testing.expect(std.mem.findScalar(u8, text, '\r') == null);
-}
-
-fn expectNoStageFiles(root: []const u8) !void {
-    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, root, .{ .iterate = true });
-    defer dir.close(std.testing.io);
-    var walker = try dir.walk(std.testing.allocator);
-    defer walker.deinit();
-    while (try walker.next(std.testing.io)) |entry| {
-        try std.testing.expect(std.mem.find(u8, entry.path, ".fx-stage-") == null);
-    }
-}
-
 const TestPreparedMutation = struct {
     input: file_mutation_contract.FileMutationInput,
     policy: PolicyEvaluatedFileTargets,
@@ -1801,19 +1776,6 @@ fn executionAuthorization(
     };
 }
 
-fn expectApplyRejected(
-    result: ApplyResult,
-    reason: ApplyRejectionReason,
-) !ApplyRejection {
-    return switch (result) {
-        .rejected => |rejected| blk: {
-            try std.testing.expectEqual(reason, rejected.reason);
-            break :blk rejected;
-        },
-        .committed => error.UnexpectedCommittedMutation,
-    };
-}
-
 fn readTestFile(
     alloc: Allocator,
     tmp: *std.testing.TmpDir,
@@ -1822,82 +1784,6 @@ fn readTestFile(
     var file = try tmp.dir.openFile(std.testing.io, sub_path, .{});
     defer file.close(std.testing.io);
     return io_mod.readFileToEnd(alloc, &file, max_content_bytes + 1);
-}
-
-const CreatedParentReplacement = enum {
-    none,
-    shallow,
-    deep,
-};
-
-const StageTestState = struct {
-    reached: bool = false,
-    cancel_flag: ?*std.atomic.Value(bool) = null,
-    workspace_root: ?[]const u8 = null,
-    replace_created_parent: CreatedParentReplacement = .none,
-    replace_temp: bool = false,
-    mutate_temp: bool = false,
-    add_blocker: bool = false,
-};
-
-fn mutateAfterStage(
-    ctx: ?*anyopaque,
-    parent: std.Io.Dir,
-    temp_name: []const u8,
-) anyerror!void {
-    const state: *StageTestState = @ptrCast(@alignCast(ctx.?));
-    state.reached = true;
-    if (state.replace_created_parent != .none) {
-        var root = std.Io.Dir.openDirAbsolute(
-            std.testing.io,
-            state.workspace_root.?,
-            .{},
-        ) catch return error.TestControlFailed;
-        defer root.close(std.testing.io);
-        switch (state.replace_created_parent) {
-            .none => unreachable,
-            .shallow => {
-                root.rename("one", root, "one-original", std.testing.io) catch
-                    return error.TestControlFailed;
-                root.createDir(std.testing.io, "one", .default_dir) catch
-                    return error.TestControlFailed;
-            },
-            .deep => {
-                root.rename("one/two", root, "one/two-original", std.testing.io) catch
-                    return error.TestControlFailed;
-                root.createDir(std.testing.io, "one/two", .default_dir) catch
-                    return error.TestControlFailed;
-            },
-        }
-    }
-    if (state.replace_temp) {
-        parent.rename(temp_name, parent, ".removed-stage", std.testing.io) catch return error.TestControlFailed;
-        parent.deleteFile(std.testing.io, ".removed-stage") catch return error.TestControlFailed;
-        var replacement = parent.createFile(std.testing.io, temp_name, .{
-            .truncate = false,
-            .exclusive = true,
-        }) catch return error.TestControlFailed;
-        defer replacement.close(std.testing.io);
-        replacement.writeStreamingAll(std.testing.io, "foreign") catch return error.TestControlFailed;
-    }
-    if (state.mutate_temp) {
-        var staged = parent.openFile(std.testing.io, temp_name, .{
-            .mode = .write_only,
-            .follow_symlinks = false,
-            .resolve_beneath = true,
-        }) catch return error.TestControlFailed;
-        defer staged.close(std.testing.io);
-        staged.writeStreamingAll(std.testing.io, "tampered") catch return error.TestControlFailed;
-        staged.sync(std.testing.io) catch return error.TestControlFailed;
-    }
-    if (state.add_blocker) {
-        var blocker = parent.createFile(std.testing.io, "blocker", .{
-            .truncate = false,
-            .exclusive = true,
-        }) catch return error.TestControlFailed;
-        blocker.close(std.testing.io);
-    }
-    if (state.cancel_flag) |cancel_flag| cancel_flag.store(true, .seq_cst);
 }
 
 const StageChunkTestState = struct {
@@ -1912,26 +1798,6 @@ fn cancelAfterFirstStageChunk(
     const state: *StageChunkTestState = @ptrCast(@alignCast(ctx.?));
     state.chunk_count += 1;
     if (state.chunk_count == 1) state.cancel_flag.store(true, .seq_cst);
-}
-
-fn replaceTargetAfterFinalPreimageRead(
-    _: ?*anyopaque,
-    parent: std.Io.Dir,
-    target_name: []const u8,
-) anyerror!void {
-    parent.rename(
-        target_name,
-        parent,
-        "reviewed-target",
-        std.testing.io,
-    ) catch return error.TestControlFailed;
-    var replacement = parent.createFile(std.testing.io, target_name, .{
-        .truncate = false,
-        .exclusive = true,
-    }) catch return error.TestControlFailed;
-    defer replacement.close(std.testing.io);
-    replacement.writeStreamingAll(std.testing.io, "old") catch
-        return error.TestControlFailed;
 }
 
 const MoveParentTestState = struct {

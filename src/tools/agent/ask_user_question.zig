@@ -235,38 +235,6 @@ fn requesterCancel(_: ?*anyopaque, _: Allocator, _: []const core_types.QuestionB
     return null;
 }
 
-const FakeRequester = struct {
-    called: bool = false,
-    saw_trimmed: bool = false,
-
-    fn request(raw_ctx: ?*anyopaque, alloc: Allocator, entries: []const core_types.QuestionBatchEntry) anyerror!?[][]u8 {
-        const self: *FakeRequester = @ptrCast(@alignCast(raw_ctx.?));
-        self.called = true;
-        if (entries.len == 1 and
-            std.mem.eql(u8, entries[0].question, "Choose?") and
-            entries[0].options.len == 2 and
-            std.mem.eql(u8, entries[0].options[0].label, "Yes") and
-            entries[0].options[0].description != null and
-            std.mem.eql(u8, entries[0].options[0].description.?, "Go ahead") and
-            entries[0].options[1].description == null)
-        {
-            self.saw_trimmed = true;
-        }
-
-        const answers = try alloc.alloc([]u8, entries.len);
-        errdefer alloc.free(answers);
-        var filled: usize = 0;
-        errdefer {
-            var i: usize = 0;
-            while (i < filled) : (i += 1) alloc.free(answers[i]);
-        }
-        while (filled < entries.len) : (filled += 1) {
-            answers[filled] = try alloc.dupe(u8, entries[filled].options[0].label);
-        }
-        return answers;
-    }
-};
-
 const TerminalSafeRequester = struct {
     called: bool = false,
     saw_terminal_safe: bool = false,
@@ -298,15 +266,3 @@ const TerminalSafeRequester = struct {
         return answers;
     }
 };
-
-fn expectRequesterOutput(args_json: []const u8, expected: []const u8) !void {
-    const alloc = std.testing.allocator;
-    var fake = FakeRequester{};
-    const output = try executeWithRequester(alloc, args_json, .{
-        .ctx = &fake,
-        .response_alloc = alloc,
-        .request = FakeRequester.request,
-    });
-    defer alloc.free(output);
-    try std.testing.expectEqualStrings(expected, output);
-}

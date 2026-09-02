@@ -745,18 +745,6 @@ fn resizeModeForSignalPass(old_layout: Layout, new_layout: Layout, pending_repla
     return .replay_viewport;
 }
 
-fn launchTestLayout() Layout {
-    return .{
-        .rows = 24,
-        .cols = 120,
-        .content_bottom = 21,
-        .divider_top_row = 22,
-        .input_row = 23,
-        .divider_bottom_row = 24,
-        .hint_row = 22,
-    };
-}
-
 const InvalidLayoutTerminal = struct {
     fn queryLayout(_: InvalidLayoutTerminal, _: u16) !Layout {
         return error.UnableToReadTerminalSize;

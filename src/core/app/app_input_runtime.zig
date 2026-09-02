@@ -3230,26 +3230,6 @@ fn routingFullTranscriptStyles() transcript_runtime.Styles {
     };
 }
 
-fn armCtrlCExitForTest(input_runtime: *core_input_runtime.Runtime, armed_ms: i64) void {
-    input_runtime.gestures = gesture_state.disarmCtrlCExit(
-        input_runtime.gestures,
-    ).next;
-    input_runtime.gestures = gesture_state.pressCtrlCExit(
-        input_runtime.gestures,
-        armed_ms,
-    ).next;
-}
-
-fn armEscapeClearForTest(input_runtime: *core_input_runtime.Runtime, armed_ms: i64) void {
-    input_runtime.gestures = gesture_state.disarmEscapeClear(
-        input_runtime.gestures,
-    ).next;
-    input_runtime.gestures = gesture_state.pressEscapeClear(
-        input_runtime.gestures,
-        armed_ms,
-    ).next;
-}
-
 const RoutingFakeApp = struct {
     pub const input_byte_limit: usize = 4096;
 
@@ -3716,12 +3696,6 @@ fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     return io_mod.readFileToEnd(alloc, &file, 8192);
 }
 
-fn activateFullTranscriptForRoutingTest(app: *RoutingFakeApp) void {
-    app.terminal.alternate_screen_owner = .full_transcript;
-    app.terminal.alternate_mouse_tracking_active = false;
-    app.shell.full_transcript = .{ .depth = .full, .follow_tail = true };
-}
-
 fn appendRoutingSessionPickerSummary(
     alloc: std.mem.Allocator,
     picker: *app_session_runtime.SessionPicker,
@@ -3748,10 +3722,6 @@ fn appendRoutingSessionPickerSummary(
     });
 }
 
-fn currentQuestionChoiceForRoutingTest(prompt: *const question_prompt.QuestionPrompt) u8 {
-    return prompt.entries.items[prompt.current_index].choice_index;
-}
-
 fn feedRoutingBytes(app: *RoutingFakeApp, bytes: []const u8) !void {
     return feedRoutingBytesWithLimit(app, bytes, RoutingFakeApp.input_byte_limit);
 }
@@ -3764,15 +3734,6 @@ fn feedRoutingBytesWithLimit(app: *RoutingFakeApp, bytes: []const u8, max_input_
         app,
         paste_framing.InputLimits.single(max_input_len),
     );
-}
-
-fn primeComposerHistoryForTest(comptime App: type, app: *App, draft: []const u8) !void {
-    try app.input_runtime.composer_history.installTextEntries(
-        app.alloc,
-        &.{"history entry"},
-    );
-    try app.input_runtime.textReplacementState().replace(app.alloc, draft);
-    try input_completion_runtime.CompletionRuntime(App).navigatePromptHistory(app, -1);
 }
 
 fn openRoutingModelMenu(app: *RoutingFakeApp, model_ids: []const []const u8) !void {
@@ -3791,35 +3752,6 @@ fn openRoutingModelMenu(app: *RoutingFakeApp, model_ids: []const []const u8) !vo
             .capabilities = app.resolvedModelCapabilities(owned_id),
         });
         item_owns_id = true;
-    }
-}
-
-fn openRoutingAuthPicker(app: *RoutingFakeApp) !void {
-    app.auth.source_inventory.insert(.vercel_oidc_token);
-    app.auth.source_inventory.insert(.ai_gateway_api_key);
-    app.auth.openPicker(app.alloc);
-    try std.testing.expect(app.auth.movePicker(1));
-    try std.testing.expectEqual(@as(usize, 4), app.auth.pickerView().choiceCount());
-    try std.testing.expectEqual(@as(usize, 1), app.auth.pickerView().selectedIndex());
-}
-
-const RoutingDecisionKind = enum { question, approval };
-
-fn activateRoutingDecision(app: *RoutingFakeApp, kind: RoutingDecisionKind) !void {
-    switch (kind) {
-        .question => {
-            const options = [_]types.QuestionOption{
-                .{ .label = "Alpha", .description = null },
-                .{ .label = "Beta", .description = null },
-            };
-            const entries = [_]types.QuestionBatchEntry{
-                .{ .question = "Continue?", .options = &options },
-            };
-            try app.question_prompt.syncFrom(app.alloc, &entries);
-        },
-        .approval => try std.testing.expect(try app.approval_prompt.syncRequest(app.alloc, .{
-            .label = "terminal.exec npm test",
-        })),
     }
 }
 
@@ -3843,84 +3775,6 @@ fn seedRoutingDraftForGuard(app: *RoutingFakeApp, kind: RoutingDraftKind) !void 
             .media_type = try app.alloc.dupe(u8, "image/png"),
         }),
     }
-}
-
-fn expectRoutingDraftForGuard(app: *const RoutingFakeApp, kind: RoutingDraftKind) !void {
-    switch (kind) {
-        .text => try std.testing.expectEqualStrings("guarded draft", app.input_runtime.edit_state.input.items),
-        .paste => {
-            try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-            try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.pasted_blocks.items.len);
-            try std.testing.expectEqualStrings("guarded pasted text", app.input_runtime.entities.pasted_blocks.items[0].text);
-        },
-        .image => {
-            try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-            try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
-            try std.testing.expectEqualStrings("/tmp/guarded-image.png", app.pending_images.items[0].path);
-        },
-    }
-}
-
-const routing_file_approval_preview_lines =
-    [_]@import("../output/diff.zig").PreviewLine{
-        .{
-            .op = .deletion,
-            .old_line = 2,
-            .text = "before",
-        },
-        .{
-            .op = .addition,
-            .new_line = 2,
-            .text = "after",
-        },
-    };
-
-fn routingFileApprovalRequest(
-    id: u64,
-) permission_request.PermissionRequest {
-    return .{
-        .id = id,
-        .label = "file_mutation",
-        .file = .{
-            .kind = .edit,
-            .intent = .mutation,
-            .preview = .{
-                .path = "note.txt",
-                .lines = &routing_file_approval_preview_lines,
-                .additions = 1,
-                .deletions = 1,
-                .truncated = false,
-            },
-            .scope = .workspace_files,
-        },
-    };
-}
-
-fn installReadyRoutingFileApproval(app: *RoutingFakeApp) !void {
-    try std.testing.expect(try app.approval_prompt.syncRequest(
-        app.alloc,
-        routingFileApprovalRequest(41),
-    ));
-    app.worker.active_permission_request_id = 41;
-    app.shell.layout.rows = 24;
-    app.shell.layout.cols = 96;
-    app.shell.footer_viewport.has_frame = true;
-    app.shell.footer_viewport.geometry = .{
-        .top = 1,
-        .top_divider = 1,
-        .input_base = 2,
-        .bottom_divider = 13,
-        .hint = 13,
-    };
-    app.approval_screen.recordScreenCommit(41, .{
-        .request_id = 41,
-        .rows = app.shell.layout.rows,
-        .cols = app.shell.layout.cols,
-        .file_identity_visible = true,
-        .all_decision_controls_visible = true,
-        .changed_or_notice_visible = true,
-        .document_scrollable = true,
-    });
 }
 
 const ApprovalOwnershipBinding = struct {
@@ -4337,20 +4191,6 @@ fn realTmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
 }
 
-fn countTestSnapshotFiles(path: []const u8) !usize {
-    var dir = std.Io.Dir.openDirAbsolute(std.testing.io, path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return 0,
-        else => return err,
-    };
-    defer dir.close(std.testing.io);
-    var iterator = dir.iterate();
-    var count: usize = 0;
-    while (try iterator.next(std.testing.io)) |entry| {
-        if (entry.kind == .file or entry.kind == .sym_link) count += 1;
-    }
-    return count;
-}
-
 fn appendOwnedPendingImage(app: *FakeSubmitApp, id: usize, path: []const u8) !void {
     const path_copy = try app.alloc.dupe(u8, path);
     errdefer app.alloc.free(path_copy);
@@ -4404,24 +4244,6 @@ fn runRepeatedImageCommand(alloc: std.mem.Allocator, input: []const u8) !void {
     try Runtime(FakeSubmitApp).submit(&app, 100);
 }
 
-fn checkAcceptedPromptCleanupAcrossAllocationFailures(failing: *std.testing.FailingAllocator) !void {
-    const alloc = failing.allocator();
-    var app = FakeSubmitApp{ .alloc = alloc };
-    defer app.deinit();
-    try app.input_runtime.edit_state.input.appendSlice(alloc, "accepted prompt");
-    app.input_runtime.edit_state.cursor = "accepted prompt".len;
-
-    Runtime(FakeSubmitApp).submit(&app, 100) catch |err| {
-        if (app.queue_accept_count > 0) return error.AcceptedPromptReturnedError;
-        return err;
-    };
-
-    if (app.queue_accept_count > 0) {
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-        try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
-    }
-}
-
 const PromptHistoryBusyLockState = struct {
     now_ms: i64 = 0,
 
@@ -4441,30 +4263,3 @@ const PromptHistoryBusyLockState = struct {
         self.now_ms += @intCast(millis);
     }
 };
-
-fn checkImagePathPasteAllocationFailureIsAtomic(
-    failing: *std.testing.FailingAllocator,
-    path: []const u8,
-) !void {
-    const alloc = failing.allocator();
-    var app = FakeSubmitApp{ .alloc = alloc };
-    defer app.deinit();
-    app.next_image_id_counter = 7;
-
-    Runtime(FakeSubmitApp).handlePastedBytes(
-        &app,
-        path,
-        FakeSubmitApp.input_byte_limit,
-    ) catch |err| {
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.cursor);
-        try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
-        try std.testing.expectEqual(@as(usize, 7), app.next_image_id_counter);
-        return err;
-    };
-
-    try std.testing.expectEqualStrings("[Image #7]", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
-    try std.testing.expectEqual(@as(usize, 7), app.pending_images.items[0].id);
-    try std.testing.expectEqual(@as(usize, 8), app.next_image_id_counter);
-}

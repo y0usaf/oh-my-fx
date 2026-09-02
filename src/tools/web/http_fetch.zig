@@ -1714,26 +1714,6 @@ fn monotonicMillis() i64 {
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
-fn expectResponseError(expected: anyerror, payload: []const u8) !void {
-    var reader: std.Io.Reader = .fixed(payload);
-    var failure_stage: FailureStage = .response_head;
-    try std.testing.expectError(
-        expected,
-        readResponse(std.testing.allocator, &reader, max_body_bytes, .{}, &failure_stage),
-    );
-}
-
-fn expectResponseBody(payload: []const u8, expected_status: u16, expected_body: []const u8) !void {
-    const alloc = std.testing.allocator;
-    var reader: std.Io.Reader = .fixed(payload);
-    var failure_stage: FailureStage = .response_head;
-    var response = try readResponse(alloc, &reader, max_body_bytes, .{}, &failure_stage);
-    defer response.deinit(alloc);
-
-    try std.testing.expectEqual(expected_status, @intFromEnum(response.status));
-    try std.testing.expectEqualStrings(expected_body, response.body);
-}
-
 fn appendRepeatedByte(list: *std.ArrayList(u8), alloc: Allocator, byte: u8, count: usize) !void {
     try list.ensureUnusedCapacity(alloc, count);
     for (0..count) |_| list.appendAssumeCapacity(byte);
@@ -2099,16 +2079,6 @@ const RawResponseConnector = struct {
     }
 };
 
-fn compressFlateForTest(alloc: Allocator, plain: []const u8, container: std.compress.flate.Container) ![]u8 {
-    var output = try std.Io.Writer.Allocating.initCapacity(alloc, 64);
-    defer output.deinit();
-    var scratch: [std.compress.flate.max_window_len]u8 = undefined;
-    var compressor = try std.compress.flate.Compress.init(&output.writer, &scratch, container, .fastest);
-    try compressor.writer.writeAll(plain);
-    try compressor.finish();
-    return output.toOwnedSlice();
-}
-
 fn replaceOwned(alloc: Allocator, slot: *?[]u8, value: []const u8) !void {
     if (slot.*) |old| alloc.free(old);
     slot.* = try alloc.dupe(u8, value);
@@ -2116,47 +2086,6 @@ fn replaceOwned(alloc: Allocator, slot: *?[]u8, value: []const u8) !void {
 
 fn ip(text: []const u8, port: u16) !IpAddress {
     return std.Io.net.IpAddress.parse(text, port);
-}
-
-fn expectAndTraceResponseFailure(
-    reader: *std.Io.Reader,
-    expected_stage: FailureStage,
-    expected_error: anyerror,
-) !void {
-    const alloc = std.testing.allocator;
-    var failure_stage: FailureStage = .response_head;
-    var response = readResponse(alloc, reader, max_body_bytes, .{}, &failure_stage) catch |err| {
-        const root = unwrapReadFailure(err, null, null);
-        try std.testing.expectEqual(expected_stage, failure_stage);
-        try std.testing.expectEqual(expected_error, root);
-        traceFailure(failure_stage, root);
-        return;
-    };
-    response.deinit(alloc);
-    return error.TestExpectedError;
-}
-
-fn expectAndTraceTlsTruncation(
-    transport_reader: *PlainDeadlineReader,
-    boundary_reader: *ScriptedTlsBoundaryReader,
-) !void {
-    const alloc = std.testing.allocator;
-    var failure_stage: FailureStage = .response_head;
-    var response = readResponse(
-        alloc,
-        &boundary_reader.interface,
-        max_body_bytes,
-        .{},
-        &failure_stage,
-    ) catch |err| {
-        const root = unwrapReadFailure(err, boundary_reader.tls_err, transport_reader.err);
-        try std.testing.expectEqual(FailureStage.response_body, failure_stage);
-        try std.testing.expectEqual(error.TlsConnectionTruncated, root);
-        traceFailure(failure_stage, root);
-        return;
-    };
-    response.deinit(alloc);
-    return error.TestExpectedError;
 }
 
 const ScriptedDialer = struct {
@@ -2236,13 +2165,6 @@ const PollSignalStorm = struct {
         }
     }
 };
-
-fn expectSyscallFailure(action: SyscallErrorAction, expected: anyerror) !void {
-    switch (action) {
-        .retry => return error.TestExpectedEqual,
-        .failure => |err| try std.testing.expectEqual(expected, err),
-    }
-}
 
 const InterruptingRead = struct {
     cancel_flag: *std.atomic.Value(bool),

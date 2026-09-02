@@ -1293,38 +1293,6 @@ fn expectFrameRowDefaultBackground(frame: *const footer_viewport.ComposedFooterF
     try expectFrameRowBackground(frame, row_number, width, .default);
 }
 
-fn expectFrameRowTextTrimmed(frame: *const footer_viewport.ComposedFooterFrame, row_number: u16, width: u16, expected: []const u8) !void {
-    for (frame.rows.items) |row| {
-        if (row.row == row_number) {
-            var grid = try vt_emulator.Grid.init(std.testing.allocator, width, 1);
-            defer grid.deinit();
-            try grid.feed(row.text.items);
-
-            var text: std.ArrayList(u8) = .empty;
-            defer text.deinit(std.testing.allocator);
-            try grid.rowTextTrimmed(1, &text);
-            try std.testing.expectEqualStrings(expected, text.items);
-            return;
-        }
-    }
-    return error.TestUnexpectedResult;
-}
-
-fn expectFrameCellForeground(frame: *const footer_viewport.ComposedFooterFrame, row_number: u16, width: u16, col: u16, expected: vt_emulator.Color) !void {
-    for (frame.rows.items) |row| {
-        if (row.row == row_number) {
-            var grid = try vt_emulator.Grid.init(std.testing.allocator, width, 1);
-            defer grid.deinit();
-            try grid.feed(row.text.items);
-
-            const cell = grid.cellAt(1, col) orelse return error.TestUnexpectedResult;
-            try std.testing.expect(cell.style.fg.eql(expected));
-            return;
-        }
-    }
-    return error.TestUnexpectedResult;
-}
-
 fn expectGenericPickerSelectionAtRow(
     kind: input_presentation.PickerKind,
     selection_index: usize,

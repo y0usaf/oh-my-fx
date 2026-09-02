@@ -1911,24 +1911,6 @@ pub const CapabilityPolicy = struct {
     mode: ModePolicy,
 };
 
-pub fn captureHostAuthority(
-    alloc: Allocator,
-    policy: CapabilityPolicy,
-    integration_names: []const []const u8,
-    rules: types.PermissionRuleSet,
-    grants: []const types.PermissionGrant,
-) !authority.HostAuthority {
-    return captureHostAuthorityWithMcpView(
-        alloc,
-        policy,
-        integration_names,
-        rules,
-        grants,
-        .{},
-        null,
-    );
-}
-
 pub fn captureHostAuthorityWithMcpView(
     alloc: Allocator,
     policy: CapabilityPolicy,
@@ -2494,36 +2476,6 @@ fn forkIdentityIssuer(
     std.c._exit(0);
 }
 
-const TestAuthority = struct {
-    root_id: []const u8,
-    tools: []const []const u8 = &.{"subagent"},
-    integrations: []const []const u8 = &.{},
-    rules: types.PermissionRuleSet = .{},
-    grants: []const types.PermissionGrant = &.{},
-
-    fn resolver(self: *TestAuthority) authority.HostResolver {
-        return .{ .context = self, .resolve_fn = resolve };
-    }
-
-    fn resolve(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        root_id: []const u8,
-    ) authority.HostResolveError!authority.HostAuthority {
-        const self: *TestAuthority = @ptrCast(@alignCast(raw.?));
-        if (!std.mem.eql(u8, self.root_id, root_id)) {
-            return error.HostAuthorityUnavailable;
-        }
-        return authority.HostAuthority.capture(
-            alloc,
-            self.tools,
-            self.integrations,
-            self.rules,
-            self.grants,
-        );
-    }
-};
-
 fn forceDurableReplayHorizon(
     alloc: Allocator,
     sessions: *session_store.Store,
@@ -2810,44 +2762,8 @@ const PausedPermissionConfigure = struct {
     }
 };
 
-fn resultChildIdAlloc(alloc: Allocator, result_json: []const u8) ![]u8 {
-    return resultStringAlloc(alloc, result_json, "child_id");
-}
-
 fn resultOperationIdAlloc(alloc: Allocator, result_json: []const u8) ![]u8 {
     return resultStringAlloc(alloc, result_json, "operation_id");
-}
-
-fn createHeldCancellationTestChild(
-    alloc: Allocator,
-    host: *Runtime,
-    root_id: []const u8,
-    invocation_id: []const u8,
-    name: []const u8,
-    prompt: []const u8,
-    cancelled_delivery_enabled: bool,
-) ![]u8 {
-    var create = try domain.validateCommand(alloc, .{ .create = .{
-        .name = name,
-        .mode = .persistent,
-        .prompt = prompt,
-        .notifications = .{
-            .terminal = .{
-                .completed = false,
-                .failed = false,
-                .cancelled = cancelled_delivery_enabled,
-            },
-            .stop_conditions = &.{.terminal},
-        },
-    } });
-    defer create.deinit(alloc);
-    const created = try host.execute(
-        alloc,
-        &create,
-        testOptions(root_id, invocation_id),
-    );
-    defer alloc.free(created);
-    return resultChildIdAlloc(alloc, created);
 }
 
 fn terminalDeliveryCount(

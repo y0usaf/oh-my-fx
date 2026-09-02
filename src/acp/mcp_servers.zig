@@ -371,16 +371,3 @@ fn checkPreparationOwnershipAllocFailures(alloc: Allocator) !void {
     taken.deinit();
     alloc.destroy(taken);
 }
-
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
-    var buffer: [4096]u8 = undefined;
-    const len: usize = @intCast(smith.slice(&buffer));
-    if (parse(std.testing.allocator, buffer[0..len])) |configs| {
-        var owned = configs;
-        owned.deinit(std.testing.allocator);
-    } else |_| {}
-    if (parseResume(std.testing.allocator, buffer[0..len])) |configs| {
-        var owned = configs;
-        owned.deinit(std.testing.allocator);
-    } else |_| {}
-}

@@ -1820,10 +1820,6 @@ const test_root_policy: skill_contract.RootPolicy = .{
     .global_roots = &test_global_roots,
 };
 
-const test_managed_root_policy: skill_contract.RootPolicy = .{
-    .managed_root_source = .global_fx,
-};
-
 fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
     if (std.fs.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
@@ -1831,35 +1827,6 @@ fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []cons
     var file = try tmp.dir.createFile(std.testing.io, sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), content);
-}
-
-fn createTempSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, link_path: []const u8) !void {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
-    if (std.fs.path.dirname(link_path)) |parent| {
-        try tmp.dir.createDirPath(io_mod.getIo(), parent);
-    }
-    tmp.dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
-        if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
-        return err;
-    };
-}
-
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
-
-fn createTempFifoOrSkip(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8) !void {
-    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) {
-        return error.SkipZigTest;
-    }
-    if (std.fs.path.dirname(sub_path)) |parent| {
-        try tmp.dir.createDirPath(io_mod.getIo(), parent);
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const path = try std.fs.path.join(alloc, &.{ root, sub_path });
-    defer alloc.free(path);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
-    if (mkfifo(path_z, 0o600) != 0) return error.SkipZigTest;
 }
 
 fn openFileDescriptorCount() !usize {
@@ -1882,48 +1849,6 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 
     return io_mod.readFileToEnd(alloc, &file, max_bytes);
 }
 
-fn checkContainedLinkedSkillAllocationFailures(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    home_root: []const u8,
-    managed_root: []const u8,
-) !void {
-    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
-    defer discovery.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
-    try std.testing.expect(discovery.skills[0].read_authority != null);
-}
-
-fn checkLoadVisibleSkillsAllocationFailures(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    home_root: []const u8,
-    managed_root: []const u8,
-) !void {
-    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_managed_root_policy);
-    defer discovery.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
-    try std.testing.expectEqual(@as(usize, 1), discovery.diagnostics.len);
-}
-
-fn checkLinkedMetadataAllocationFailures(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    home_root: []const u8,
-    managed_root: []const u8,
-) !void {
-    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
-    defer discovery.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
-    try std.testing.expectEqual(@as(usize, 0), discovery.diagnostics.len);
-
-    var candidate = switch (try openValidatedSkillCandidate(alloc, discovery.skills[0])) {
-        .current => |current| current,
-        .missing, .name_mismatch, .skipped => return error.TestExpectedCurrentSkill,
-    };
-    candidate.deinit();
-}
-
 var stable_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
@@ -1935,37 +1860,3 @@ fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
     stable_test_environ = map;
     return map;
 }
-
-const TestEnviron = struct {
-    alloc: Allocator,
-    map: std.process.Environ.Map,
-
-    fn install(alloc: Allocator) !*TestEnviron {
-        _ = try stableEmptyTestEnviron();
-
-        const self = try alloc.create(TestEnviron);
-        errdefer alloc.destroy(self);
-
-        self.* = .{
-            .alloc = alloc,
-            .map = std.process.Environ.Map.init(alloc),
-        };
-        errdefer self.map.deinit();
-
-        io_mod.setEnvironMap(&self.map);
-        return self;
-    }
-
-    fn put(self: *TestEnviron, key: []const u8, value: []const u8) !void {
-        try self.map.put(key, value);
-    }
-
-    fn deinit(self: *TestEnviron) void {
-        if (stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
-        self.map.deinit();
-        const alloc = self.alloc;
-        alloc.destroy(self);
-    }
-};

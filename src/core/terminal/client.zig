@@ -1058,17 +1058,6 @@ fn testIntent(alloc: Allocator, correlation_id: u64) !Intent {
     };
 }
 
-fn admitTestIntent(runtime: *Runtime, correlation_id: u64) !void {
-    var intent = try testIntent(std.testing.allocator, correlation_id);
-    const zio = io_mod.getIo();
-    runtime.mutex.lockUncancelable(zio);
-    defer runtime.mutex.unlock(zio);
-    runtime.admitIntentLocked(intent) catch |err| {
-        intent.deinit(std.testing.allocator);
-        return err;
-    };
-}
-
 fn checkIntentAllocationFailures(alloc: Allocator) !void {
     var runtime: Runtime = .{};
     var intent = try testIntent(alloc, 1);

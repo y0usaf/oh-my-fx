@@ -340,25 +340,3 @@ const TestApp = struct {
         return self.yolo_acknowledgment_commit_succeeds;
     }
 };
-
-fn expectPersistentModeSelection(mode: types.PermissionMode) !void {
-    var app = TestApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try Runtime(TestApp).selectMode(&app, mode);
-
-    try std.testing.expectEqual(mode, app.permission_engine.mode);
-    try std.testing.expectEqual(@as(?types.PermissionMode, mode), app.worker.synced_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
-    try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
-    try std.testing.expectEqual(@as(?types.PermissionMode, mode), app.last_preference_permission_mode);
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-
-    const snapshot = app.permission_commit_snapshot.?;
-    try std.testing.expectEqual(mode, snapshot.engine_mode);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.engine_grant_count);
-    try std.testing.expectEqual(@as(?types.PermissionMode, mode), snapshot.synced_mode);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.mode_sync_count);
-    try std.testing.expectEqual(@as(?types.PermissionMode, null), snapshot.synced_state_mode);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.state_sync_count);
-}

@@ -324,20 +324,3 @@ fn openTestVerifiedDir(dir: std.Io.Dir) !io_mod.VerifiedDir {
         ),
     };
 }
-
-fn legacyCopyForTest(
-    alloc: Allocator,
-    snapshot: session_usage.Snapshot,
-) !session_usage.Snapshot {
-    var encoded: std.Io.Writer.Allocating = .init(alloc);
-    defer encoded.deinit();
-    try session_usage.writeSnapshot(&encoded.writer, snapshot);
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        encoded.written(),
-        .{},
-    );
-    defer parsed.deinit();
-    return session_usage.parseSnapshotValue(alloc, parsed.value);
-}

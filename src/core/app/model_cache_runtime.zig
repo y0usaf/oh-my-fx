@@ -14,10 +14,6 @@ const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
 else
     struct {};
-const test_gateway_client = if (@import("builtin").is_test)
-    @import("../../gateway/client.zig")
-else
-    struct {};
 
 const Allocator = std.mem.Allocator;
 const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
@@ -838,25 +834,11 @@ const TestEnv = struct {
     }
 };
 
-fn waitForWarmup(runtime: *Runtime) !void {
-    var remaining_ms: u64 = 5000;
-    while (runtime.isLoading() and remaining_ms > 0) : (remaining_ms -= 1) {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-
-    try std.testing.expect(!runtime.isLoading());
-    try std.testing.expect(!runtime.isFailed());
-}
-
 fn modelIdListContains(ids: []const []u8, needle: []const u8) bool {
     for (ids) |id| {
         if (std.mem.eql(u8, id, needle)) return true;
     }
     return false;
-}
-
-fn authenticatedCatalogAccess(credential: []const u8, team_context: ?[]const u8) credentials.CatalogAccess {
-    return credentials.catalogAccessForCredential(.ai_gateway_api_key, credential, team_context);
 }
 
 fn testCatalog(alloc: Allocator, model_id: []const u8) !std.ArrayList(model_catalog.ModelCatalogEntry) {
@@ -869,26 +851,6 @@ fn testCatalog(alloc: Allocator, model_id: []const u8) !std.ArrayList(model_cata
     try entries.append(alloc, .{ .id = id, .model_type = model_type });
     return entries;
 }
-
-const RefreshCatalog = struct {
-    first_failure: ?model_catalog.Failure = null,
-    fallback_model: ?[]const u8 = null,
-    calls: usize = 0,
-
-    fn fetch(raw: ?*anyopaque, alloc: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
-        const self: *RefreshCatalog = @ptrCast(@alignCast(raw.?));
-        self.calls += 1;
-        if (self.calls == 1) {
-            if (self.first_failure) |failure| return .{ .failure = failure };
-        }
-        if (self.fallback_model) |model| return .{ .catalog = try testCatalog(alloc, model) };
-        return .{ .catalog = .empty };
-    }
-
-    fn provider(self: *RefreshCatalog) model_catalog.Provider {
-        return .{ .context = self, .fetch_fn = fetch };
-    }
-};
 
 const AuthChangeCatalog = struct {
     model_id: []const u8 = "",
@@ -912,50 +874,3 @@ const AuthChangeCatalog = struct {
         return .{ .context = self, .fetch_fn = fetch };
     }
 };
-
-const StaleCatalog = struct {
-    started: std.atomic.Value(bool) = .init(false),
-    observed_cancel: std.atomic.Value(bool) = .init(false),
-
-    fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
-        const self: *StaleCatalog = @ptrCast(@alignCast(raw.?));
-        const cancel_flag = input.cancel_flag orelse return .{ .failure = .{ .category = .runtime } };
-        self.started.store(true, .seq_cst);
-        while (!cancel_flag.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
-        self.observed_cancel.store(true, .seq_cst);
-        return .{ .catalog = try testCatalog(alloc, "public/stale") };
-    }
-
-    fn provider(self: *StaleCatalog) model_catalog.Provider {
-        return .{ .context = self, .fetch_fn = fetch };
-    }
-};
-
-fn runRepeatedAuthChangeCycle(iteration: usize) !void {
-    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
-    defer runtime.deinit();
-
-    var stale = StaleCatalog{};
-    runtime.startWarmup(stale.provider(), .{ .public_only = .no_credential });
-    var remaining_ms: u64 = 5000;
-    while (!stale.started.load(.seq_cst) and remaining_ms > 0) : (remaining_ms -= 1) {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    try std.testing.expect(stale.started.load(.seq_cst));
-
-    runtime.reset();
-    try std.testing.expect(stale.observed_cancel.load(.seq_cst));
-
-    const model_id = if (iteration % 2 == 0) "private/repeated-a" else "private/repeated-b";
-    const team = if (iteration % 2 == 0) "team_a" else "team_b";
-    var current = RefreshCatalog{ .fallback_model = model_id };
-    runtime.startWarmup(current.provider(), authenticatedCatalogAccess("current-key", team));
-    try waitForWarmup(&runtime);
-
-    try std.testing.expectEqual(@as(usize, 1), current.calls);
-    try std.testing.expectEqual(model_catalog.AccessLevel.authenticated, runtime.outcome.loaded.?.access.level);
-    var snapshot = (try runtime.snapshotCachedModelIds(std.testing.allocator)).?;
-    defer collections.freeStringList(std.testing.allocator, &snapshot);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.items.len);
-    try std.testing.expectEqualStrings(model_id, snapshot.items[0]);
-}

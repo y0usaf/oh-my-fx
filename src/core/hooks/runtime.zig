@@ -611,20 +611,6 @@ fn testInvocation() definitions.Invocation {
     };
 }
 
-const TestHandler = struct {
-    fn continueTool(_: *anyopaque, _: definitions.PreToolUseInput) definitions.HandlerError!definitions.PreToolUseAction {
-        return .continue_;
-    }
-
-    fn allowStop(_: *anyopaque, _: definitions.StopInput) definitions.HandlerError!definitions.StopAction {
-        return .allow;
-    }
-
-    fn notePostTurnEnd(_: *anyopaque, _: definitions.PostTurnEndInput) definitions.HandlerError!void {}
-
-    fn noteAttentionRequired(_: *anyopaque, _: definitions.AttentionRequiredInput) definitions.HandlerError!void {}
-};
-
 const RewriteCapture = struct {
     order: [4]u8 = undefined,
     count: usize = 0,

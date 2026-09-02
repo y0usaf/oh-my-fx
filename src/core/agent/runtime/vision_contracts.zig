@@ -954,33 +954,3 @@ fn unchanged_pending_transition(
         .disposition = disposition,
     };
 }
-
-fn test_ok_result(image_id: usize) VisionImageResult {
-    return .{
-        .image_id = image_id,
-        .outcome = .{ .ok = .{
-            .summary = @constCast("verified image evidence"),
-            .visible_text = &.{},
-            .details = &.{},
-        } },
-    };
-}
-
-const max_fuzz_input_bytes: usize = 20 * 1024;
-
-fn fuzz_vision_json(_: void, smith: *std.testing.Smith) !void {
-    var buffer: [max_fuzz_input_bytes + 1]u8 = undefined;
-    const len = smith.slice(&buffer);
-    const bytes = buffer[0..len];
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    if (parse_vision_request(arena, bytes)) |request| {
-        request.deinit(arena);
-    } else |_| {}
-    if (parse_vision_provider_result(arena, bytes, max_fuzz_input_bytes)) |result| {
-        result.deinit(arena);
-    } else |_| {}
-}

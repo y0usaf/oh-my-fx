@@ -1028,20 +1028,3 @@ fn terminalEnded(lifecycle: contracts.Lifecycle) bool {
 fn lifecycleReason(lifecycle: contracts.Lifecycle) ReturnReason {
     return if (lifecycle == .exited or lifecycle == .closed) .exited else .lost;
 }
-
-const DirectReturnTestSubagents = struct {
-    fn isViewActive(_: *const DirectReturnTestSubagents) bool {
-        return false;
-    }
-
-    fn activeRenderRequests(_: *DirectReturnTestSubagents) *render_request.RenderRequestState {
-        unreachable;
-    }
-};
-
-const DirectReturnTestApp = struct {
-    terminal: shell_runtime.TerminalState = .{},
-    shell: transcript_runtime.TranscriptRuntime,
-    metrics: types.Metrics = .{},
-    subagents: DirectReturnTestSubagents = .{},
-};

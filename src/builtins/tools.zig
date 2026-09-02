@@ -32,14 +32,6 @@ const skill_search_impl = @import("../tools/skills/skill_search.zig");
 const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
-const test_io_mod = if (std_builtin.is_test)
-    @import("../core/shared/io.zig")
-else
-    struct {};
-const test_session_child_store = if (std_builtin.is_test)
-    @import("../core/session/session_child_store.zig")
-else
-    struct {};
 
 const Allocator = std.mem.Allocator;
 

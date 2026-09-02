@@ -353,16 +353,3 @@ fn eventBoundary(position: CommitPosition) session_projection.EventBoundary {
         .semantic = true,
     };
 }
-
-fn checkRecoveryValidationAllocationFailures(
-    alloc: Allocator,
-    path: []const u8,
-    position: CommitPosition,
-) !void {
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
-    defer file.close(io_mod.getIo());
-    try std.testing.expectEqual(
-        RecoveryValidation.valid,
-        try validateCommitPositionForRecovery(alloc, file, position),
-    );
-}

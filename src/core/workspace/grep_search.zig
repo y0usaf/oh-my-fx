@@ -399,10 +399,6 @@ fn countCandidateList(
     }
 }
 
-pub fn gitGrepArgvForTest() [9][]const u8 {
-    return .{ "git", "--no-optional-locks", "grep", "-n", "-I", "-F", "-z", "-e", "needle" };
-}
-
 const GitGrepMatchesResult = struct {
     candidate_count: usize = 0,
     truncated_reason: ?TruncatedReason = null,
@@ -807,14 +803,6 @@ fn workspaceRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
 }
 
-fn createBrokenSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, link_path: []const u8) !void {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    tmp.dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
-        if (err == error.AccessDenied or std.mem.eql(u8, @errorName(err), "Permission" ++ "Denied")) return error.SkipZigTest;
-        return err;
-    };
-}
-
 fn createSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, link_path: []const u8) !void {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
@@ -829,20 +817,6 @@ fn contentWithPrefix(alloc: Allocator, len: usize, prefix: []const u8) ![]u8 {
     const prefix_len = @min(prefix.len, content.len);
     @memcpy(content[0..prefix_len], prefix[0..prefix_len]);
     return content;
-}
-
-fn readFileToEndForTest(alloc: Allocator, absolute_path: []const u8, max_bytes: usize) ![]u8 {
-    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, absolute_path, .{});
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, max_bytes);
-}
-
-fn readTrace(alloc: Allocator, trace_path: []const u8) ![]u8 {
-    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
-    defer file.close(io_mod.getIo());
-    var read_buf: [1024]u8 = undefined;
-    var reader = file.reader(std.testing.io, &read_buf);
-    return reader.interface.allocRemaining(alloc, std.Io.Limit.limited(4096));
 }
 
 fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !void {

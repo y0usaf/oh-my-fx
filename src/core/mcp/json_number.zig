@@ -258,11 +258,3 @@ fn expandedDigits(alloc: Allocator, digits: []const u8, zero_count: usize) Error
     @memset(output[digits.len..], '0');
     return output;
 }
-
-fn expectEquivalent(left: []const u8, right: []const u8) !void {
-    var left_number = try Number.parse(std.testing.allocator, left, .{});
-    defer left_number.deinit(std.testing.allocator);
-    var right_number = try Number.parse(std.testing.allocator, right, .{});
-    defer right_number.deinit(std.testing.allocator);
-    try std.testing.expect(left_number.eql(right_number));
-}

@@ -1135,14 +1135,3 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), content);
 }
-
-fn createTestSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []const u8, is_directory: bool) !void {
-    const builtin = @import("builtin");
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    dir.symLink(io_mod.getIo(), target_path, link_path, .{ .is_directory = is_directory }) catch |err| {
-        if (err == error.AccessDenied or std.mem.eql(u8, @errorName(err), "Permission" ++ "Denied")) {
-            return error.SkipZigTest;
-        }
-        return err;
-    };
-}

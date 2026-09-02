@@ -1200,58 +1200,6 @@ fn deinitHits(alloc: Allocator, hits: []web_search_contract.Source) void {
     if (hits.len > 0) alloc.free(hits);
 }
 
-fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackendId) !void {
-    const alloc = std.testing.allocator;
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var fake = FakeStream{};
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var response = try executeGatewayWorker(alloc, .{
-        .api_key = "key",
-        .team = "team_123",
-        .model = "provider/model",
-        .retry_count = 1,
-        .chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model",
-        .usage = &usage,
-        .usage_allocator = alloc,
-        .stream_ctx = @ptrCast(&fake),
-        .stream_fn = FakeStream.execute,
-    }, .{
-        .backend = backend,
-        .query = "latest Zig release",
-        .max_results = 1,
-        .cancel_flag = &cancel_flag,
-    }, null, null);
-    defer response.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqualStrings("team_123", fake.team.?);
-    const deadline = fake.deadline orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(std.Io.Clock.awake, deadline.clock);
-    try std.testing.expect(std.Io.Clock.Timestamp.compare(
-        std.Io.Clock.Timestamp.now(std.testing.io, .awake),
-        .lt,
-        deadline,
-    ));
-    try std.testing.expect(fake.saw_inner_prompt);
-    try std.testing.expect(fake.saw_output_bound);
-    try std.testing.expect(fake.saw_required_tool_choice);
-    try std.testing.expect(fake.saw_expected_provider_tool);
-    var usage_snapshot = try usage.snapshot(alloc);
-    defer usage_snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), usage_snapshot.pending.len);
-    if (backend.eql(perplexity_search_backend_id)) {
-        try std.testing.expect(fake.saw_perplexity);
-        try std.testing.expect(!fake.saw_parallel);
-    } else {
-        try std.testing.expect(backend.eql(parallel_search_backend_id));
-        try std.testing.expect(!fake.saw_perplexity);
-        try std.testing.expect(fake.saw_parallel);
-    }
-    try std.testing.expectEqual(@as(usize, 1), response.content[0].search.content.len);
-    try std.testing.expectEqual(@as(u32, 1), response.usage.?.web_search_requests);
-}
-
 const FakeStream = struct {
     calls: usize = 0,
     fail_before_send: bool = false,
@@ -1617,33 +1565,6 @@ const ModelsUrlTestEnv = struct {
         alloc.destroy(self);
     }
 };
-
-fn installLoopbackModelsEnv(alloc: std.mem.Allocator, port: u16) !*ModelsUrlTestEnv {
-    const models_url = try std.fmt.allocPrint(
-        alloc,
-        "http://127.0.0.1:{d}/v1/models",
-        .{port},
-    );
-    defer alloc.free(models_url);
-    return ModelsUrlTestEnv.install(alloc, models_url);
-}
-
-fn expectModelCatalogTeamHeaderOmitted(gateway_team: ?[]const u8) !void {
-    var fixture = try gateway_client.TestModelCatalogFixture.init();
-    defer fixture.deinit();
-    try fixture.start();
-    try std.testing.expect(fixture.waitForAcceptStart(5000));
-
-    const env = try installLoopbackModelsEnv(std.testing.allocator, fixture.port());
-    defer env.deinit();
-
-    var ids = try fetchModelIds(std.testing.allocator, credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", gateway_team), models_path);
-    defer collections.freeStringList(std.testing.allocator, &ids);
-
-    try std.testing.expectEqualStrings("Bearer test-key", fixture.capturedHeaderValue("authorization").?);
-    try std.testing.expect(fixture.capturedHeaderValue(gateway_client.vercel_ai_gateway_team_header) == null);
-    if (fixture.failure()) |err| return err;
-}
 
 fn parseModelIdsForView(
     alloc: std.mem.Allocator,

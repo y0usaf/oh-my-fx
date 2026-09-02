@@ -280,9 +280,3 @@ fn openTestVerifiedDir(dir: std.Io.Dir) !io_mod.VerifiedDir {
         ),
     };
 }
-
-const test_capture = Capture{
-    .terminal_rows = 24,
-    .terminal_cols = 80,
-    .complete = true,
-};

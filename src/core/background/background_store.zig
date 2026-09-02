@@ -810,13 +810,6 @@ fn parseStableId(text: []const u8) !StableBackgroundRecordId {
     return stable_id;
 }
 
-fn initTestStore(alloc: Allocator, root_dir: std.Io.Dir) !Store {
-    try root_dir.createDirPath(io_mod.getIo(), "background");
-    const bg_dir = try io_mod.dirRealpathAlloc(alloc, root_dir, "background");
-    defer alloc.free(bg_dir);
-    return Store.initWithDir(alloc, bg_dir);
-}
-
 fn writeStoreFile(alloc: Allocator, store: Store, name: []const u8, text: []const u8) !void {
     var entry = try store.capability.atomicReplace(
         alloc,
@@ -868,15 +861,4 @@ fn recordJsonWithNumericFields(
         "{{\"schema_version\":1,\"id\":{s},\"started_at_ms\":{s},\"updated_at_ms\":{s},\"pid\":\"100\",\"command\":\"vite\",\"cwd\":\"/tmp\",\"log_path\":\"/tmp/a.log\",\"expect_url\":false,\"server_url\":null,\"exit_code\":{s},\"state\":\"running\"}}",
         .{ id, started_at_ms, updated_at_ms, exit_code },
     );
-}
-
-fn expectParseError(expected: anyerror, json_text: []const u8) !void {
-    const alloc = std.testing.allocator;
-    if (parseRecord(alloc, json_text)) |parsed| {
-        var record = parsed;
-        defer record.deinit(alloc);
-        return error.ExpectedParseFailure;
-    } else |err| {
-        try std.testing.expectEqual(expected, err);
-    }
 }

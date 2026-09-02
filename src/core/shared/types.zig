@@ -1079,12 +1079,6 @@ pub fn validGatewayGenerationId(id: []const u8) bool {
     return true;
 }
 
-fn fuzzGatewayTimestamp(_: void, smith: *std.testing.Smith) !void {
-    var buffer: [128]u8 = undefined;
-    const len: usize = @intCast(smith.slice(&buffer));
-    _ = parseGatewayTimestamp(buffer[0..len]) catch return;
-}
-
 /// Team identifiers reach the gateway as a query value, so reject anything that
 /// would need percent-encoding rather than build a malformed URL. Accepts both
 /// the `team_` id form and the slug form.

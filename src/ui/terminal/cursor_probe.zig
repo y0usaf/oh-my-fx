@@ -513,18 +513,3 @@ fn classifyAnsiCandidate(bytes: []const u8) CandidateStatus {
     if (row == 0 or col == 0) return .invalid;
     return .{ .complete = .{ .row = row, .col = col } };
 }
-
-fn appendForwarded(
-    result: FeedResult,
-    forwarded: *std.ArrayList(u8),
-) !?Position {
-    return switch (result) {
-        .pending => null,
-        .position => |position| position,
-        .late_response => null,
-        .forward => |bytes| blk: {
-            try forwarded.appendSlice(std.testing.allocator, bytes.slice());
-            break :blk null;
-        },
-    };
-}

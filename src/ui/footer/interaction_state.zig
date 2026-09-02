@@ -77,22 +77,3 @@ pub const ApprovalScreenState = struct {
             commit.changed_or_notice_visible;
     }
 };
-
-fn applyApprovalByteForTest(
-    prompt: *ApprovalPrompt,
-    alloc: Allocator,
-    byte: u8,
-    max_len: ?usize,
-) !approval_decision.Event {
-    const action = ui_input.approvalActionFromByte(byte) orelse return .none;
-    const amendment_allowed: ?bool = if (prompt.request) |request|
-        request.amendment_allowed
-    else
-        null;
-    return prompt.decision.apply(
-        alloc,
-        action,
-        amendment_allowed,
-        max_len,
-    );
-}

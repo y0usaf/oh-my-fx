@@ -194,46 +194,6 @@ fn taskSnapshot(
     };
 }
 
-const TestStore = struct {
-    alloc: Allocator,
-    background_dir: []u8,
-    capability: *session_child_store.SessionChildCapability,
-    store: background_store.Store,
-
-    fn init(alloc: Allocator, tmp: std.testing.TmpDir) !TestStore {
-        try tmp.dir.createDirPath(io_mod.getIo(), "background");
-        const background_dir = try io_mod.dirRealpathAlloc(
-            alloc,
-            tmp.dir,
-            "background",
-        );
-        errdefer alloc.free(background_dir);
-        const capability = try alloc.create(
-            session_child_store.SessionChildCapability,
-        );
-        errdefer alloc.destroy(capability);
-        capability.* = try session_child_store.SessionChildCapability.initLegacyBackgroundRoutes(
-            alloc,
-            background_dir,
-            .writable,
-        );
-        errdefer capability.deinit();
-        return .{
-            .alloc = alloc,
-            .background_dir = background_dir,
-            .capability = capability,
-            .store = background_store.Store.initManaged(capability),
-        };
-    }
-
-    fn deinit(self: *TestStore) void {
-        self.capability.deinit();
-        self.alloc.destroy(self.capability);
-        self.alloc.free(self.background_dir);
-        self.* = undefined;
-    }
-};
-
 fn writeAbsoluteFile(path: []const u8, text: []const u8) !void {
     var file = try std.Io.Dir.createFileAbsolute(
         io_mod.getIo(),
@@ -242,16 +202,6 @@ fn writeAbsoluteFile(path: []const u8, text: []const u8) !void {
     );
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
-}
-
-fn tempPath(
-    alloc: Allocator,
-    tmp: std.testing.TmpDir,
-    name: []const u8,
-) ![]u8 {
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, name });
 }
 
 fn testRecord(

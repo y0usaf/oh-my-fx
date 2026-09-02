@@ -558,25 +558,6 @@ pub fn parseResourceMetadata(
     };
 }
 
-pub fn parseAuthorizationMetadata(
-    alloc: Allocator,
-    bytes: []const u8,
-    expected_issuer: []const u8,
-) !AuthorizationMetadata {
-    return switch (try parseAuthorizationMetadataOutcome(
-        alloc,
-        bytes,
-        expected_issuer,
-    )) {
-        .metadata => |metadata| metadata,
-        .issuer_mismatch => |owned_mismatch| {
-            var mismatch = owned_mismatch;
-            mismatch.deinit();
-            return error.AuthorizationMetadataIssuerMismatch;
-        },
-    };
-}
-
 const AuthorizationMetadataOutcome = union(enum) {
     metadata: AuthorizationMetadata,
     issuer_mismatch: IssuerMismatch,
@@ -2148,36 +2129,4 @@ fn freeStrings(alloc: Allocator, values: []const []u8) void {
 fn freeStringList(alloc: Allocator, values: *std.ArrayList([]u8)) void {
     for (values.items) |value| alloc.free(value);
     values.deinit(alloc);
-}
-
-fn fuzzAuthorizationParsers(_: void, smith: *std.testing.Smith) !void {
-    const alloc = std.testing.allocator;
-    var input_buffer: [2048]u8 = undefined;
-    const input_len: usize = @intCast(smith.slice(&input_buffer));
-    const input = input_buffer[0..input_len];
-
-    if (parseChallenge(alloc, input)) |challenge_value| {
-        var challenge = challenge_value;
-        challenge.deinit(alloc);
-    } else |_| {}
-    if (parseAuthorizationRedirect(alloc, input)) |response_value| {
-        var response = response_value;
-        response.deinit(alloc);
-    } else |_| {}
-    if (parseResourceMetadata(
-        alloc,
-        input,
-        "https://api.example.com/mcp",
-    )) |metadata_value| {
-        var metadata = metadata_value;
-        metadata.deinit(alloc);
-    } else |_| {}
-    if (parseAuthorizationMetadata(
-        alloc,
-        input,
-        "https://login.example.com",
-    )) |metadata_value| {
-        var metadata = metadata_value;
-        metadata.deinit(alloc);
-    } else |_| {}
 }
