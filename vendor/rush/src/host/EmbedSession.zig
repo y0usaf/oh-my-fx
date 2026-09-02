@@ -18,11 +18,17 @@ finished: bool = false,
 exit_status: u8 = 0,
 
 pub fn init(allocator: std.mem.Allocator, env: []const [*:0]const u8) !EmbedSession {
+    const pwd = (host.RealHost{}).currentDir(allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    defer if (pwd) |dir| allocator.free(dir);
+
     return .{
         .shell = RushShell.init(allocator, .{}, .{
             .env = env,
             .arg_zero = "omfx",
-            .initial_pwd = "/",
+            .initial_pwd = pwd orelse "/",
         }),
     };
 }
