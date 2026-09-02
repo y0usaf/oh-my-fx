@@ -122,7 +122,21 @@ pub fn artifactUrl(alloc: Allocator, base_url: []const u8, target: Target, suffi
     if (isLoopbackE2eUpgradeBase(base_url)) {
         return std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz{s}", .{ base_url, target.artifactRef(), platform, suffix });
     }
-    return std.fmt.allocPrint(alloc, "{s}/download/{s}/fx-{s}.tar.gz{s}", .{ base_url, target.artifactRef(), platform, suffix });
+    var owned_tag: ?[]u8 = null;
+    defer if (owned_tag) |tag| alloc.free(tag);
+
+    const release_tag = switch (target) {
+        .stable => |stable| if (std.mem.startsWith(u8, stable.artifact_ref, "omyfx-v"))
+            stable.artifact_ref
+        else blk: {
+            const formatted = try std.fmt.allocPrint(alloc, "omyfx-v{s}", .{stable.version});
+            owned_tag = formatted;
+            break :blk formatted;
+        },
+        .dev => |dev| dev.artifact_ref,
+    };
+
+    return std.fmt.allocPrint(alloc, "{s}/download/{s}/fx-{s}.tar.gz{s}", .{ base_url, release_tag, platform, suffix });
 }
 
 fn fetchTextBounded(
@@ -328,6 +342,8 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8) ![]u8 {
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
 }
+
+
 
 
 
