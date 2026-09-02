@@ -86,6 +86,7 @@ jobs:
         run: |
           cp sdk/fx-sdk.js fx-sdk.js
           sha256sum fx-sdk.js > fx-sdk.js.sha256
+          cp zig-out/bin/omfx-term.wasm .
           sha256sum omfx-term.wasm > omfx-term.wasm.sha256
 
       - name: Upload artifact
