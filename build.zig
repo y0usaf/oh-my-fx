@@ -9,7 +9,7 @@ const WasmSurface = enum {
 };
 
 const PgsoArtifact = enum {
-    fx,
+    omfx,
     file_index,
     ui_activity,
     approval_review,
@@ -185,13 +185,13 @@ pub fn build(b: *std.Build) void {
     );
     if (pgso_artifact) |artifact| {
         const selected: *std.Build.Step.Compile = switch (artifact) {
-            .fx => exe,
+            .omfx => exe,
             .file_index => file_index_bench,
             .ui_activity => ui_activity_bench,
             .approval_review => approval_review_bench,
         };
         const output_name = switch (artifact) {
-            .fx => "pgso/fx.bc",
+            .omfx => "pgso/omfx.bc",
             .file_index => "pgso/file-index.bc",
             .ui_activity => "pgso/ui-activity.bc",
             .approval_review => "pgso/approval-review.bc",
