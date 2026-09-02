@@ -138,4 +138,3 @@ fn findWork(queue: []domain.QueuedMessage, work_id: []const u8) ?*domain.QueuedM
     }
     return null;
 }
-

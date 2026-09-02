@@ -187,8 +187,6 @@ fn expectMatchesStd(alloc: std.mem.Allocator, items: []const TestElem) !void {
     try testing.expectEqualSlices(TestElem, expected, actual);
 }
 
-
-
 fn permuteAndCheck(alloc: std.mem.Allocator, items: []TestElem, k: usize) !void {
     if (k <= 1) {
         try expectMatchesStd(alloc, items);
@@ -203,7 +201,3 @@ fn permuteAndCheck(alloc: std.mem.Allocator, items: []TestElem, k: usize) !void 
         }
     }
 }
-
-
-
-

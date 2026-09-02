@@ -890,13 +890,6 @@ fn checkParseGatewayCompletionAllocFailures(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
 }
 
-
-
-
-
-
-
-
 fn promptStringEntryHasCacheControl(body: []const u8, needle: []const u8) !bool {
     const alloc = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -913,32 +906,3 @@ fn promptStringEntryHasCacheControl(body: []const u8, needle: []const u8) !bool 
     }
     return error.TestExpectedPromptMessageMissing;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

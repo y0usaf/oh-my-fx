@@ -490,9 +490,6 @@ const HeldPreconnectProbe = struct {
     }
 };
 
-
-
-
 fn expectResetPreconnectSurvives(hold_ms: u64) !void {
     var listener = try bindTestListener();
     defer listener.deinit(io_mod.getIo());
@@ -519,8 +516,6 @@ fn expectResetPreconnectSurvives(hold_ms: u64) !void {
     defer accepted.deinit();
     try std.testing.expectEqualStrings("granted", accepted.callback.code);
 }
-
-
 
 const CorsCallbackProbe = struct {
     port: u16,
@@ -572,4 +567,3 @@ const CorsCallbackProbe = struct {
         self.failed = true;
     }
 };
-

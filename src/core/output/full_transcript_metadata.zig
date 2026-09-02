@@ -58,4 +58,3 @@ pub fn formatHeader(
         },
     ) catch null;
 }
-

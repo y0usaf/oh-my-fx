@@ -103,6 +103,3 @@ fn unlock(comptime kind: LockKind, lock: anytype, io: std.Io) void {
     if (kind == .rw_shared) return lock.unlockShared(io);
     return lock.unlock(io);
 }
-
-
-

@@ -65,6 +65,3 @@ pub fn contentHash(bytes: []const u8) ContentHash {
     hasher.update(bytes);
     return hasher.finalResult();
 }
-
-
-

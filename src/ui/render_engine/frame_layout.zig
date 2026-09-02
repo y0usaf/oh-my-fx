@@ -521,32 +521,6 @@ fn testFooter(rows: u16) FooterMeasurement {
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn testFooterRows(top: u16, rows: u16) footer_layout.FooterRows {
     return .{
         .top = top,

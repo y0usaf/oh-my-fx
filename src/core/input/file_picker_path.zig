@@ -11,4 +11,3 @@ pub fn isRepresentable(path: []const u8) bool {
     }
     return !needsQuotes(path) or std.mem.findScalar(u8, path, '"') == null;
 }
-

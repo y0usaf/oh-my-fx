@@ -535,24 +535,3 @@ fn has_shell_metachar(value: []const u8) bool {
     }
     return false;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

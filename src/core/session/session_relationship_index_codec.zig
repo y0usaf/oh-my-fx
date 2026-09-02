@@ -310,4 +310,3 @@ fn writeInt(writer: *std.Io.Writer, comptime T: type, value: T) !void {
     std.mem.writeInt(T, &bytes, value, .little);
     try writer.writeAll(&bytes);
 }
-

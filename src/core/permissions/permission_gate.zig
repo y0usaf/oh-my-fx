@@ -143,13 +143,6 @@ const MockContext = struct {
     permission_decider: ?*const fn (*const MockTool, MockInput, MockContext) Decision = null,
 };
 
-
-
-
-
-
-
-
 var injected_permission_error: PermissionDecisionError = error.OutOfMemory;
 
 const RunMockContext = struct {
@@ -168,4 +161,3 @@ fn failRunDecision(
 ) PermissionDecisionError!Decision {
     return injected_permission_error;
 }
-

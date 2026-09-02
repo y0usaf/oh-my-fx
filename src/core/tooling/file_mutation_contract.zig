@@ -342,8 +342,6 @@ fn optionalIdentityEql(a: ?FileIdentity, b: ?FileIdentity) bool {
     return b == null;
 }
 
-
-
 pub const FileTargetPolicyResult = union(enum) {
     target_resolution_failure: FileTargetResolutionFailure,
     policy_denied: struct { target_index: usize },
@@ -403,7 +401,6 @@ pub fn resultIsNoop(tool_name: []const u8, output: []const u8) bool {
         std.mem.startsWith(u8, output, "No changes to ");
 }
 
-
 pub const WriteInput = struct {
     path: []u8,
     content: []u8,
@@ -440,7 +437,6 @@ pub const FileMutationInput = union(Kind) {
         self.* = undefined;
     }
 };
-
 
 pub const Preimage = union(enum) {
     absent,

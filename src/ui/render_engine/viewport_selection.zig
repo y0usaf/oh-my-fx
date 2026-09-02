@@ -158,7 +158,6 @@ pub fn resolveTailOffset(request: TailOffsetRequest) TailOffsetResolution {
     };
 }
 
-
 pub const RowForLineInput = struct {
     selection: ViewportSelection,
     bytes: []const u8,
@@ -484,11 +483,3 @@ fn unusedRowsBudgetForSplit(line_visual_rows: []const u16, welcome_cut_line: usi
     }
     return @intCast(@as(u32, visible_rows) - used);
 }
-
-
-
-
-
-
-
-

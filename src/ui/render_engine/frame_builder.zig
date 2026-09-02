@@ -528,21 +528,3 @@ const PaintCtx = struct {
         _ = try surface.writeAnsiBand(self.row, 1, self.text, self.owner, .same_owner);
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

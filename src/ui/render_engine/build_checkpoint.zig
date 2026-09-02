@@ -48,4 +48,3 @@ pub fn consume(checkpoint: ?*BuildCheckpoint, units: usize) !void {
 pub fn poll(checkpoint: ?*BuildCheckpoint) !void {
     if (checkpoint) |active| try active.poll();
 }
-

@@ -315,9 +315,6 @@ const TestApp = struct {
     }
 };
 
-
-
-
 const ShutdownTestDirectRuntime = struct {
     accepted_pending: bool = true,
     starting_pending: bool = true,
@@ -408,8 +405,3 @@ const ShutdownTestApp = struct {
         }
     }
 };
-
-
-
-
-

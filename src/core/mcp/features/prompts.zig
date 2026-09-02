@@ -533,14 +533,6 @@ fn writeMetadata(writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"io.modelcontextprotocol/related-task\":{\"taskId\":\"fx-test\"}}");
 }
 
-
-
-
-
-
-
-
-
 fn checkPromptCatalogAllocationFailures(alloc: Allocator) !void {
     var page = try parseListPage(
         alloc,
@@ -555,4 +547,3 @@ fn checkPromptCatalogAllocationFailures(alloc: Allocator) !void {
     var catalog = try builder.finish(alloc);
     defer catalog.deinit(alloc);
 }
-

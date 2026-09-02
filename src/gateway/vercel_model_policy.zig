@@ -53,4 +53,3 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     }
     return false;
 }
-

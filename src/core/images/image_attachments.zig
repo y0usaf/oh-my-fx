@@ -76,7 +76,6 @@ pub fn projectOffsetThroughPlaceholderRewrite(
     ) catch null;
 }
 
-
 pub const ExtractedInlineImages = struct {
     text: []u8,
     images: []types.ImageAttachment,
@@ -1922,45 +1921,6 @@ fn appendToken(writer: *std.Io.Writer, raw: []const u8) !void {
     try writer.writeAll(raw);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn testSnapshotDir(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
@@ -2095,35 +2055,3 @@ fn testSha256Hex(bytes: []const u8) [snapshot_digest_hex_len]u8 {
     Sha256.hash(bytes, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

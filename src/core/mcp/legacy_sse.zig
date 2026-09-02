@@ -200,7 +200,6 @@ pub const Parser = struct {
     }
 };
 
-
 fn expectLegacySseDelimiterSplits(payload: []const u8) !void {
     const alloc = std.testing.allocator;
     for (0..payload.len + 1) |split| {
@@ -221,7 +220,6 @@ fn expectLegacySseDelimiterSplits(payload: []const u8) !void {
     }
 }
 
-
 fn checkCompleteEventAllocationFailures(alloc: Allocator) !void {
     var parser = Parser.init(alloc, 1024, 256, 4);
     defer parser.deinit();
@@ -233,9 +231,6 @@ fn checkCompleteEventAllocationFailures(alloc: Allocator) !void {
 
     try parser.feed("event: message\ndata: payload\nid: event-1\n\n", &events);
 }
-
-
-
 
 fn fuzzParser(_: void, smith: *std.testing.Smith) !void {
     const alloc = std.testing.allocator;
@@ -256,4 +251,3 @@ fn fuzzParser(_: void, smith: *std.testing.Smith) !void {
     parser.feed(input[split..], &events) catch return;
     parser.finish() catch return;
 }
-

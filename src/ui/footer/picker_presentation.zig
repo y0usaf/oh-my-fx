@@ -1312,27 +1312,6 @@ const picker_test_slash_specs = [_]command_specs.SlashSpec{
 };
 const picker_test_slash_registry = command_specs.SlashRegistry{ .commands = picker_test_slash_specs[0..] };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectOrderedSubstrings(haystack: []const u8, needles: []const []const u8) !void {
     var offset: usize = 0;
     for (needles) |needle| {
@@ -1340,23 +1319,6 @@ fn expectOrderedSubstrings(haystack: []const u8, needles: []const []const u8) !v
         offset += relative + needle.len;
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn composeAuthPickerTestGrid(
     alloc: Allocator,
@@ -1378,9 +1340,3 @@ fn composeAuthPickerTestGrid(
     try grid.feed(screen.items);
     return grid;
 }
-
-
-
-
-
-

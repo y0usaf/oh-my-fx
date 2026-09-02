@@ -907,12 +907,3 @@ fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
 fn writeStdout(text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
-
-
-
-
-
-
-
-
-

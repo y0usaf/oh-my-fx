@@ -263,4 +263,3 @@ pub fn footerTopRowForExtra(self: anytype, extra: u16) u16 {
         self.cursor_row;
     return @min(after_content, max_top);
 }
-

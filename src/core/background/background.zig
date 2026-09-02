@@ -18,4 +18,3 @@ pub const StopSelection = background_runtime.StopSelection;
 pub const TaskCompletion = background_runtime.TaskCompletion;
 pub const ProcessSupervisor = process_supervisor.ProcessSupervisor;
 pub const Runtime = background_runtime.BackgroundRuntime;
-

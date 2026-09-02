@@ -316,7 +316,6 @@ noinline fn failPromptRunResultDynamic(err: anyerror) anyerror!PromptRunResult {
     return err;
 }
 
-
 /// Resume selector parsed from fx ask --resume.
 const ResumeTarget = session_store.ResumeTarget;
 
@@ -2258,7 +2257,6 @@ inline fn failPermissionOutcome(err: anytype) @TypeOf(err)!command_admission.Per
 noinline fn failPermissionOutcomeDynamic(err: anyerror) anyerror!command_admission.PermissionOutcome {
     return err;
 }
-
 
 fn finishCliPermissionOutcome(
     ctx: *AskContext,
@@ -4537,37 +4535,6 @@ fn testPermissionRuleSetPair(
     return rules;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 var test_previous_sigint_count = std.atomic.Value(usize).init(0);
 fn testPreviousSigintHandler(_: std.posix.SIG) callconv(.c) void {
     _ = test_previous_sigint_count.fetchAdd(1, .seq_cst);
@@ -4712,33 +4679,6 @@ fn sendRequestedSigints(state: *CrossThreadSigintState) void {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const TestAskHome = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
@@ -4803,8 +4743,6 @@ fn testAskDurableState(
         .total_output_tokens = 0,
     };
 }
-
-
 
 fn expectAskContextManagedBorrowOwnership(ctx: *AskContext) !void {
     const background_capability = if (ctx.background.persisted_store) |store|
@@ -4879,7 +4817,6 @@ fn exerciseSavedAskSessionStoreAllocation(
     }
 }
 
-
 fn exerciseCurrentAskStateAllocation(
     ctx: *AskContext,
     writable: *session_store.LoadedWritableSession,
@@ -4892,35 +4829,6 @@ fn exerciseCurrentAskStateAllocation(
     var state = try currentAskState(ctx, writable, io_mod.milliTimestamp());
     defer state.deinit(alloc);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkAskJsonCaptureAllocationFailures(alloc: Allocator) !void {
     var ctx = AskContext.init(alloc, testConfig(), .{
@@ -4964,25 +4872,3 @@ fn checkAskJsonCaptureAllocationFailures(alloc: Allocator) !void {
         result.tool_calls[0].ask_question_text.?,
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

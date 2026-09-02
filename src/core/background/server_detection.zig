@@ -146,6 +146,3 @@ fn scoreUrlCandidate(url: []const u8, line: []const u8) i32 {
 
     return score;
 }
-
-
-

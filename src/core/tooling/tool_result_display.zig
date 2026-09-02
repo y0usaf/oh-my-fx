@@ -14,5 +14,3 @@ pub fn contentForDisplay(body: []const u8) []const u8 {
     if (!std.mem.endsWith(u8, rest, "</content>")) return body;
     return std.mem.trimEnd(u8, rest[0 .. rest.len - "</content>".len], "\r\n");
 }
-
-

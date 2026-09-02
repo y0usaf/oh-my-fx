@@ -79,5 +79,3 @@ fn testLayout() frame_layout.FrameLayout {
         .activity = .{ .thinking = .{ .gap_above_activity = 1 } },
     });
 }
-
-

@@ -353,7 +353,3 @@ const test_snapshot: settings_catalog.Snapshot = .{
     .prompt_history = true,
     .sound_level = "on",
 };
-
-
-
-

@@ -550,26 +550,3 @@ fn longLineText(alloc: Allocator, line_count: usize) ![]u8 {
     }
     return try out.toOwnedSlice(alloc);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

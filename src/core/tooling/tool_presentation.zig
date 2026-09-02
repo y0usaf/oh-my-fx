@@ -545,19 +545,6 @@ const custom_presentation_tool = blk: {
 };
 const custom_presentation_registry = tool_dispatch.Registry{ .tools = &.{custom_presentation_tool} };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectContains(text: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, text, needle) != null);
 }

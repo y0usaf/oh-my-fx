@@ -99,7 +99,6 @@ pub const OpenMode = enum {
 
 pub const CommitPosition = session_replay.CommitPosition;
 
-
 pub const FailedTailDisposition = enum {
     retry_expected_tail,
     rollback_before_adapter_continue,
@@ -545,6 +544,17 @@ pub const LoadedWritableSession = struct {
     migration_source_bytes: ?u64 = null,
     usage_sidecar_reseal_pending: bool = false,
     resume_view_stale: bool = false,
+    /// Bytes of already-appended `recovery_checkpoint_set` frames that a
+    /// newer checkpoint or a clear has superseded in this log generation.
+    /// Only the newest checkpoint reduces into durable state, so superseded
+    /// ones are garbage in the canonical log; they count toward compaction
+    /// dues. Sessions restored from disk start at zero, which only delays
+    /// garbage-triggered compaction; the byte and frame thresholds still apply.
+    superseded_checkpoint_bytes: u64 = 0,
+    /// Encoded size of the newest `recovery_checkpoint_set` frame in this
+    /// generation, or 0 when none is pending. Superseded when a newer
+    /// checkpoint lands or a clear event removes the pending one.
+    newest_checkpoint_frame_bytes: u64 = 0,
     /// Runtime-only provenance installed by subagent resume admission. These
     /// fields are never written into the session event log.
     external_prompt_origin: ExternalPromptOrigin = .root,
@@ -650,6 +660,7 @@ pub const LoadedWritableSession = struct {
             },
             else => try self.prepareCommitLifecycleOpportunistic(alloc, options),
         };
+        const prior_bytes = self.position.through_event_log_bytes;
         _ = appendEventImpl(
             self,
             alloc,
@@ -665,6 +676,7 @@ pub const LoadedWritableSession = struct {
             return err;
         };
         if (!preserves_pristine_start) self.freshly_started = false;
+        updateCheckpointGarbageAccounting(self, event, prior_bytes);
         const lifecycle_published = !cache_deferred and self.publishCommitLifecycle(alloc);
         maintainCanonicalLogAfterCommit(self, alloc, options) catch |err| {
             self.state_replacement_pending = true;
@@ -989,7 +1001,6 @@ pub inline fn failLoadedWritableSession(err: anytype) @TypeOf(err)!LoadedWritabl
 noinline fn failLoadedWritableSessionDynamic(err: anyerror) anyerror!LoadedWritableSession {
     return err;
 }
-
 
 pub const Root = struct {
     sessions: ?io_mod.VerifiedDir,
@@ -3794,6 +3805,8 @@ fn confirmWritableNamespace(
             loaded.generation_base_bytes = position.through_event_log_bytes;
             loaded.checkpoint_seq = null;
             loaded.checkpoint_sha256 = null;
+            loaded.superseded_checkpoint_bytes = 0;
+            loaded.newest_checkpoint_frame_bytes = 0;
         }
         loaded.projection_status = .stale;
     }
@@ -4083,6 +4096,33 @@ fn eventDevice(file: std.Io.File) !u64 {
     };
 }
 
+/// Tracks recovery-checkpoint garbage for compaction accounting. A
+/// `recovery_checkpoint_set` event supersedes any pending one: only the
+/// newest checkpoint reduces into durable state, so the superseded frame's
+/// bytes are unrecoverable dead weight in the canonical log. Clearing the
+/// checkpoint (on commit) makes the newest frame garbage too. Counting these
+/// bytes toward compaction dues keeps pathological recovery loops (each
+/// checkpointing full mid-turn state) from ballooning the log to the old
+/// 128 MiB byte threshold before a rewrite.
+fn updateCheckpointGarbageAccounting(
+    loaded: *LoadedWritableSession,
+    event: session_event.Event,
+    prior_bytes: u64,
+) void {
+    const appended = loaded.position.through_event_log_bytes - prior_bytes;
+    switch (event) {
+        .recovery_checkpoint_set => {
+            loaded.superseded_checkpoint_bytes += loaded.newest_checkpoint_frame_bytes;
+            loaded.newest_checkpoint_frame_bytes = appended;
+        },
+        .recovery_checkpoint_cleared => {
+            loaded.superseded_checkpoint_bytes += loaded.newest_checkpoint_frame_bytes;
+            loaded.newest_checkpoint_frame_bytes = 0;
+        },
+        else => {},
+    }
+}
+
 fn compactCanonicalLogIfDueImpl(
     loaded: *LoadedWritableSession,
     alloc: Allocator,
@@ -4288,6 +4328,8 @@ fn compactCanonicalLog(
     loaded.generation_base_bytes = proposed.through_event_log_bytes;
     loaded.checkpoint_seq = null;
     loaded.checkpoint_sha256 = null;
+    loaded.superseded_checkpoint_bytes = 0;
+    loaded.newest_checkpoint_frame_bytes = 0;
     var live = try openManagedFile(&loaded.log.dir, events_file, .read_only);
     defer live.close(io_mod.getIo());
     const compacted_state = try session_replay.replayBoundary(alloc, live, proposed);
@@ -4616,7 +4658,6 @@ const TempRoot = struct {
     }
 };
 
-
 fn testState(alloc: Allocator, id: []const u8, updated_at_ms: i64) !session_codec.DurableSessionState {
     return .{
         .id = try alloc.dupe(u8, id),
@@ -4813,18 +4854,6 @@ fn capturePublicationBytesForTest(
     return .{ .events = events, .watermark = watermark, .intent = intent };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {
     return .{ .history_turn_committed = .{
         .conversation_language = state.conversation_language,
@@ -4833,43 +4862,3 @@ fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {
         .turn = state.history[state.history.len - 1],
     } };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

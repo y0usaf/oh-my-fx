@@ -36,7 +36,6 @@ pub fn admitChildPermission(
     return child;
 }
 
-
 pub const Error = error{
     OutOfMemory,
     ChildNotAttached,
@@ -130,7 +129,6 @@ pub const HostAuthority = struct {
         self.* = undefined;
     }
 };
-
 
 fn hostGeneration(
     tools: []const []const u8,
@@ -619,4 +617,3 @@ fn checkGrantMergeResolutionAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("bash", merged[1].tool_name);
     try std.testing.expectEqualStrings("custom", merged[2].tool_name);
 }
-

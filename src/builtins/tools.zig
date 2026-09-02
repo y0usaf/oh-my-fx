@@ -1304,8 +1304,6 @@ pub const all = [_]tool_dispatch.Tool{
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
 
-
-
 fn schemaProperty(schema: model_tool_schema.ObjectSchema, name: []const u8) ?model_tool_schema.Property {
     for (schema.properties) |property| {
         if (std.mem.eql(u8, property.name, name)) return property;
@@ -1348,9 +1346,6 @@ fn terminal_action_schema(action: terminal_impl.Action) model_tool_schema.Object
     unreachable;
 }
 
-
-
-
 fn allowTerminalTool(
     _: *const tool_dispatch.Tool,
     _: tool_dispatch.ToolInput,
@@ -1370,8 +1365,6 @@ fn denyTerminalTool(
         .denial_reason = .user_denied,
     };
 }
-
-
 
 pub const advertisement_order = [_][]const u8{
     "read_file",
@@ -1433,12 +1426,3 @@ pub fn toolRequiresApproval(tool_name: []const u8) bool {
 pub fn toolHasPermissionContract(tool_name: []const u8) bool {
     return lookup(tool_name) != null;
 }
-
-
-
-
-
-
-
-
-

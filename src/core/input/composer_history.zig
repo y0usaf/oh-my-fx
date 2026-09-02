@@ -602,7 +602,3 @@ fn replaceActiveComposer(
     active.picker.resetFilePickerIndex();
     active.input_limit_rejection.* = input_limit_rejection.clear();
 }
-
-
-
-

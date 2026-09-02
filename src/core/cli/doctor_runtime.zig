@@ -685,17 +685,8 @@ fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
     };
 }
 
-
-
-
-
-
-
-
 fn writeDoctorFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(std.testing.io, sub_path, .{});
     defer file.close(std.testing.io);
     try file.writeStreamingAll(std.testing.io, text);
 }
-
-

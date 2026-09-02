@@ -779,28 +779,7 @@ const TestApp = struct {
     }
 };
 
-
-
-
-
-
-
-
-
-
-
 fn runWithOuterCleanup(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunOutcome {
     defer appendTestEvent("outer-defer");
     return runWithDeps(App, alloc, args, cfg, deps);
 }
-
-
-
-
-
-
-
-
-
-
-

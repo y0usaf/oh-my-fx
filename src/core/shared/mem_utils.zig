@@ -35,7 +35,3 @@ noinline fn freeErased(
     @memset(bytes, undefined);
     alloc.rawFree(bytes, alignment, ret_addr);
 }
-
-
-
-

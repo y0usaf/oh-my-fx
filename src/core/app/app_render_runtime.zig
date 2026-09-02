@@ -3618,22 +3618,12 @@ fn solveFixedPointForTest(
     );
 }
 
-
-
-
-
-
-
-
-
-
 noinline fn shouldResetPhysicalTerminal(
     child_view_active: bool,
     main_reset_pending: bool,
 ) bool {
     return !child_view_active and main_reset_pending;
 }
-
 
 const CoordinatorFault = enum {
     committed,
@@ -3662,7 +3652,6 @@ const BufferedInputCheckpointTestApp = struct {
     input_runtime: core_input_runtime.Runtime = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
 };
-
 
 const CoordinatorFaultTestApp = struct {
     shell: struct {
@@ -3722,19 +3711,6 @@ const CoordinatorFaultTestApp = struct {
         };
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const CoordinatorTestWorker = struct {
     submitted_permission: ?types.ToolPermissionDecision = null,
@@ -3967,16 +3943,6 @@ fn initCoordinatorProjectionTestApp(
     return app;
 }
 
-
-
-
-
-
-
-
-
-
-
 noinline fn readCoordinatorFrameBytes(alloc: std.mem.Allocator, file: std.Io.File, read_offset: *u64) ![]u8 {
     const total = try file.length(io_mod.getIo());
     const want: usize = @intCast(total - read_offset.*);
@@ -4015,34 +3981,12 @@ noinline fn coordinatorGridOccurrenceCount(grid: vt_emulator.Grid, needle: []con
     return count;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn coordinatorRowHasText(grid: vt_emulator.Grid, row: u16) !bool {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(grid.alloc);
     try grid.rowTextTrimmed(row, &buf);
     return std.mem.trim(u8, buf.items, " \t\r\n").len > 0;
 }
-
 
 const ChildApprovalReconcileBinding = struct {
     child_id: []const u8,
@@ -4086,4 +4030,3 @@ const ChildApprovalReconcileApp = struct {
         self.approval_prompt.deinit(self.alloc);
     }
 };
-

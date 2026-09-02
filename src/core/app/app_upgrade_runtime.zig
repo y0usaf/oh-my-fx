@@ -300,13 +300,3 @@ fn currentExecutablePathForTest(
     @memcpy(executable_buf[0..executable_path.len], executable_path);
     return executable_buf[0..executable_path.len];
 }
-
-
-
-
-
-
-
-
-
-

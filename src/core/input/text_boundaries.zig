@@ -180,12 +180,3 @@ fn isWordCharacterAt(text: []const u8, start: usize) bool {
     const codepoint = display_width.decodeNextRune(text, start).codepoint;
     return isWordCharacter(codepoint);
 }
-
-
-
-
-
-
-
-
-

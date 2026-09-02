@@ -323,7 +323,6 @@ fn promptCardSkillTokensFromDisplaySpans(
     return tokens;
 }
 
-
 var resize_interlock = shell_runtime.ResizeApprovalInterlock{};
 const default_context_registry = context_contract.Registry{ .default_provider = builtin_context.provider };
 const WorkspaceHostRuntime = if (host_target.is_wasm) js_host_workspace.Runtime else struct {};
@@ -3334,15 +3333,6 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "credits");
 }
 
-
-
-
-
-
-
-
-
-
 fn fullEntryConfig() app_entry_runtime.Config {
     return .{
         .version = version,
@@ -3473,16 +3463,3 @@ const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
     handleSigWinchWeb
 else
     handleSigWinchNative;
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -189,7 +189,6 @@ pub fn retainCancelledCommandReplay(
     return if (replay) |value| .{ .output_replay = value } else null;
 }
 
-
 fn hasToolResultForCall(
     result_messages: []const ChatMessage,
     call_id: []const u8,
@@ -487,13 +486,3 @@ pub fn captureCommittedFilePresentation(
 fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {
     return .{ .id = id, .name = name, .arguments_json = args };
 }
-
-
-
-
-
-
-
-
-
-

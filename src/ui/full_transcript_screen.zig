@@ -35,11 +35,6 @@ const PendingInputProbe = struct {
     }
 };
 
-
-
-
-
-
 pub const FullDiffResolver = struct {
     context: *anyopaque,
     full_for_marker: *const fn (context: *anyopaque, id: u32) ?[]const u8,
@@ -208,7 +203,6 @@ const ItemBoundary = struct {
     segment_index: usize,
 };
 
-
 pub const ProjectionMeasurement = struct {
     total_rows: u32,
     anchor_row: ?u32,
@@ -293,52 +287,6 @@ const ProjectionBuilder = struct {
         self.out = .init(self.alloc);
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub fn buildProjection(
     alloc: Allocator,
@@ -1349,7 +1297,6 @@ const PagedLiteralCommandRecord = struct {
         return @max(self.walker.cols -| self.gutterWidth(), 1);
     }
 };
-
 
 const TaggedCommandByte = struct {
     stream: command_output_content.Stream,

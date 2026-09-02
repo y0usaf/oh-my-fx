@@ -177,10 +177,6 @@ fn findModel(
     return null;
 }
 
-
-
-
-
 fn testTotals(tokens: u64) usage_report.Totals {
     return .{
         .total_tokens = tokens,

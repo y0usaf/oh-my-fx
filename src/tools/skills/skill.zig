@@ -200,7 +200,6 @@ fn expectDecodeFailure(args_json: []const u8, expected: []const u8) !void {
     }
 }
 
-
 fn checkDecodeAllocationFailures(alloc: Allocator) !void {
     const decoded = try decode(
         .{ .allocator = alloc },
@@ -214,4 +213,3 @@ fn checkDecodeAllocationFailures(alloc: Allocator) !void {
         },
     }
 }
-

@@ -247,5 +247,3 @@ fn debugUsageFailure(phase: []const u8, err: anyerror) void {
         .{ phase, @errorName(err) },
     );
 }
-
-

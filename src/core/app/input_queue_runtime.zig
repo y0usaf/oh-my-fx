@@ -889,10 +889,6 @@ fn openQueueReviewWithSemanticImageTokens(alloc: std.mem.Allocator) !void {
     try std.testing.expect(try rt.ensureOpen(&app, .manual));
 }
 
-
-
-
-
 fn measureVisibleReviewRowsWithSkillScratch(alloc: std.mem.Allocator) !void {
     var display_spans = [_]worker_runtime.SkillDisplaySpan{.{
         .raw_start = 0,
@@ -918,14 +914,3 @@ fn measureVisibleReviewRowsWithSkillScratch(alloc: std.mem.Allocator) !void {
     });
     try std.testing.expectEqual(@as(u16, 1), measured.card_rows);
 }
-
-
-
-
-
-
-
-
-
-
-

@@ -16,7 +16,6 @@ const command_contract = @import("../execution/command_contract.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const Allocator = std.mem.Allocator;
 
-
 const compact_continuation_preamble = "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n";
 const compact_recent_messages_note = "Recent conversation turns are preserved verbatim.";
 const compact_direct_resume_instruction = "Continue the conversation from where it left off without asking the user to repeat context. Resume directly.";
@@ -810,19 +809,6 @@ fn writeSessionTestImage(
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn history_contains_image_id(history: []const HistoryTurn, id: usize) bool {
     for (history) |turn| {
         for (images_for_history_turn(turn)) |attachment| {
@@ -1608,10 +1594,6 @@ pub fn makeAssistantTurn(alloc: Allocator, user_text: []const u8, assistant_text
     } };
 }
 
-
-
-
-
 /// Projects stored history into request messages while preserving stored turn order.
 pub fn appendHistoryMessages(
     alloc: Allocator,
@@ -2101,7 +2083,6 @@ pub fn formatExecutionReplayContext(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-
 pub fn formatInterruptedHistoryContext(alloc: Allocator, entry: InterruptedHistoryTurn) ![]u8 {
     _ = entry;
     return alloc.dupe(u8, interrupted_turn_context);
@@ -2216,9 +2197,6 @@ fn buildCompactedSummaryTurn(
         .permission_feedback_complete = false,
     };
 }
-
-
-
 
 fn buildCompactedSummaryText(
     alloc: Allocator,
@@ -2729,37 +2707,6 @@ fn isHanCodepoint(codepoint: u21) bool {
         (codepoint >= 0x2B820 and codepoint <= 0x2CEAF);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectCanonicalHistoryFixtureUnchanged(
     canonical: []const HistoryTurn,
     context_history_start: usize,
@@ -2983,7 +2930,6 @@ fn checkPromptHistorySnapshotAllocationFailures(alloc: Allocator) !void {
     );
 }
 
-
 fn checkPromptHistoryMessageProjectionAllocationFailures(
     alloc: Allocator,
     prompt_history: []const HistoryTurn,
@@ -3031,12 +2977,6 @@ fn checkPromptHistoryMessageProjectionAllocationFailures(
     ) != null);
 }
 
-
-
-
-
-
-
 fn checkWorkProvenanceOwnershipFailures(alloc: Allocator) !void {
     var images = [_]ImageAttachment{.{
         .id = 1,
@@ -3050,13 +2990,6 @@ fn checkWorkProvenanceOwnershipFailures(alloc: Allocator) !void {
     });
     freeUserTurn(alloc, copy);
 }
-
-
-
-
-
-
-
 
 fn checkImageCatalogHistoryMergeAllocationFailures(alloc: Allocator) !void {
     const catalog = [_]ImageAttachment{.{
@@ -3077,21 +3010,6 @@ fn checkImageCatalogHistoryMergeAllocationFailures(alloc: Allocator) !void {
     defer core_types.freeImageAttachmentSlice(alloc, merged);
     try std.testing.expectEqual(@as(usize, 2), merged.len);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn deinitMessages(alloc: Allocator, messages: *std.ArrayList(message.Message)) void {
     for (messages.items) |*msg| msg.deinit(alloc);

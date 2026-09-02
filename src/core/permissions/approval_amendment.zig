@@ -215,10 +215,3 @@ pub const State = struct {
         draft.* = .empty;
     }
 };
-
-
-
-
-
-
-

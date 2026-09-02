@@ -109,12 +109,6 @@ pub fn composeQueueReviewHintRow(
     return row;
 }
 
-
-
-
-
-
-
 // Ordered widest-first; every fallback keeps the enter/esc controls so narrow
 // terminals never lose the submit and cancel instructions.
 const freeform_question_hints = [_][]const u8{
@@ -672,7 +666,6 @@ pub fn composeSlashMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) 
     return row;
 }
 
-
 pub fn composeVisibleInputRows(
     alloc: Allocator,
     source: visual_layout.Source,
@@ -944,39 +937,6 @@ fn testRenderContext(input: *const InputRuntime) RenderContext {
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn syncHintTestQuestion(prompt: *question_prompt.QuestionPrompt) !void {
     const opts = [_]types.QuestionOption{
         .{ .label = "Yes", .description = "go ahead" },
@@ -988,6 +948,3 @@ fn syncHintTestQuestion(prompt: *question_prompt.QuestionPrompt) !void {
     };
     try prompt.syncFrom(std.testing.allocator, &entries);
 }
-
-
-

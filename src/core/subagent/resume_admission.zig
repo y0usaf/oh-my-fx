@@ -386,15 +386,6 @@ fn ensureExternalPromptAllowed(
     }
 }
 
-
-
-
-
-
-
-
-
-
 const AuthorityBoundaryFailure = struct {
     fn callback(_: ?*anyopaque, boundary: session_log.Boundary) !void {
         if (boundary == .after_authority_marker_rename) {

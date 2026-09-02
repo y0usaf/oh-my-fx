@@ -507,16 +507,3 @@ fn cloneClippedRow(alloc: Allocator, bytes: []const u8, width: u16) !std.ArrayLi
     try row_text.appendClipped(alloc, &row, bytes, width);
     return row;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-

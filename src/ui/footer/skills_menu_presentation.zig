@@ -464,16 +464,3 @@ fn cloneClippedRow(alloc: Allocator, text: []const u8, width: u16) !std.ArrayLis
 fn visibleSkillCount(projection: SkillsMenuProjection) usize {
     return skill_runtime.skillMenuFilterQueryCount(projection.items, projection.source_filter, projection.query);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-

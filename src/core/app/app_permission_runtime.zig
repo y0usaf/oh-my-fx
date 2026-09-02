@@ -362,12 +362,3 @@ fn expectPersistentModeSelection(mode: types.PermissionMode) !void {
     try std.testing.expectEqual(@as(?types.PermissionMode, null), snapshot.synced_state_mode);
     try std.testing.expectEqual(@as(usize, 0), snapshot.state_sync_count);
 }
-
-
-
-
-
-
-
-
-

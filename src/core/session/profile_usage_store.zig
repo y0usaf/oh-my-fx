@@ -1027,17 +1027,3 @@ fn makeTestFact(
         .total_cost = 0.25,
     };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -22,7 +22,6 @@ const task_helpers = @import("../tasks/task_helpers.zig");
 
 const Allocator = std.mem.Allocator;
 
-
 pub const RuntimeContextSnapshot = process_supervisor.RuntimeContextSnapshot;
 pub const TaskSnapshot = process_supervisor.TaskSnapshot;
 pub const TaskListSnapshot = process_supervisor.TaskListSnapshot;
@@ -2805,13 +2804,6 @@ fn captureProcessTokenForTest(
     );
 }
 
-
-
-
-
-
-
-
 fn expectNoBackgroundLifecycleTracePathLeak(source: []const u8) !void {
     const marker = "debug_trace." ++ "logf(";
     var remaining = source;
@@ -2840,26 +2832,6 @@ fn expectNoBackgroundLifecycleTracePathLeak(source: []const u8) !void {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn waitForAtomicTrue(flag: *std.atomic.Value(bool), timeout_ms: i64) !void {
     const start = io_mod.milliTimestamp();

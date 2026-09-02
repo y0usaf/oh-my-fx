@@ -1387,17 +1387,3 @@ fn readExactRange(
     }
     return bytes;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-

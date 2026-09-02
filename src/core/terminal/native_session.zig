@@ -267,7 +267,6 @@ fn isSupportedForOs(os_tag: std.Target.Os.Tag) bool {
     return host_capabilities.terminalSupportForOs(os_tag).isSupported();
 }
 
-
 pub fn isLauncherModeRaw(raw_args: []const [*:0]const u8) bool {
     return raw_args.len == 2 and
         std.mem.eql(u8, std.mem.sliceTo(raw_args[1], 0), launcher_mode);
@@ -562,7 +561,6 @@ fn launcherStatusToTerm(raw_status: u32) std.process.Child.Term {
     else
         .{ .unknown = raw_status };
 }
-
 
 fn waitLauncherChild(child: *std.process.Child) !std.process.Child.Term {
     const pid = child.id orelse return error.ChildIdentityMissing;
@@ -4856,7 +4854,6 @@ noinline fn failReconstructedGridDynamic(err: anyerror) anyerror!terminal_engine
     return err;
 }
 
-
 fn reconstructEngine(
     alloc: Allocator,
     durable: *terminal_store.DurableSession,
@@ -5614,8 +5611,6 @@ fn processGroupMissing(pid: std.posix.pid_t) bool {
     };
 }
 
-
-
 fn failSignalStageForTest(stage: []const u8) bool {
     const requested = io_mod.getenv("FX_TERMINAL_TEST_FAIL_SIGNAL_STAGE") orelse
         return false;
@@ -5785,7 +5780,6 @@ fn openPty() !Pty {
     );
     return .{ .master = master, .slave = slave };
 }
-
 
 fn resizeFd(fd: std.posix.fd_t, dimensions: contracts.Dimensions) !void {
     var size = std.posix.winsize{
@@ -6280,10 +6274,6 @@ fn keySequence(key: contracts.NamedKey) []const u8 {
     };
 }
 
-
-
-
-
 fn ignoreWorkUpdate(_: ?*anyopaque, _: bool) void {}
 
 const WorkProbe = struct {
@@ -6376,8 +6366,6 @@ fn outputOwnerTestDefinition(
     };
 }
 
-
-
 fn checkSessionInitAllocationFailures(alloc: Allocator) !void {
     var fixture = try TestDurableFixture.init(alloc);
     defer fixture.deinit();
@@ -6401,21 +6389,3 @@ fn checkSessionInitAllocationFailures(alloc: Allocator) !void {
     id_owned = false;
     defer session.deinitUnlaunched();
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

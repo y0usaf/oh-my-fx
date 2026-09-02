@@ -1036,21 +1036,6 @@ fn writeMetadata(writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"io.modelcontextprotocol/related-task\":{\"taskId\":\"fx-test\"}}");
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkResourceCatalogAllocationFailures(alloc: Allocator) !void {
     var builder = ResourceCatalogBuilder.init(alloc, .modern);
     defer builder.deinit(alloc);
@@ -1065,4 +1050,3 @@ fn checkResourceCatalogAllocationFailures(alloc: Allocator) !void {
     var catalog = try builder.finish(alloc);
     defer catalog.deinit(alloc);
 }
-

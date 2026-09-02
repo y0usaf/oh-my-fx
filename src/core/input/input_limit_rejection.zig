@@ -23,5 +23,3 @@ pub fn begin(current: State, owner: text_scalar.Owner) BeginTransition {
 pub fn clear() State {
     return .{};
 }
-
-

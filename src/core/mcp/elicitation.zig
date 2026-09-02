@@ -1700,26 +1700,6 @@ fn stringifyBounded(alloc: Allocator, value: std.json.Value, max_bytes: usize) E
     return out.toOwnedSlice();
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkAllocationFailures(alloc: Allocator) !void {
     var request = try parseRequest(
         alloc,
@@ -1798,4 +1778,3 @@ fn fuzzElicitationJson(_: void, smith: *std.testing.Smith) !void {
         std.testing.allocator.free(response);
     }
 }
-

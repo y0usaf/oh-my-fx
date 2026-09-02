@@ -26,7 +26,6 @@ noinline fn failPreparedQueryDynamic(err: anyerror) anyerror!PreparedQuery {
     return err;
 }
 
-
 pub const Score = struct {
     exact_identity: bool = false,
     strong_hits: usize = 0,
@@ -168,8 +167,3 @@ fn containsCompleteIdentity(raw: []const u8, identities: []const []const u8) boo
 fn isIdentityByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
 }
-
-
-
-
-

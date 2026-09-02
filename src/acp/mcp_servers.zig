@@ -352,13 +352,6 @@ fn parseEnv(alloc: Allocator, env_value: std.json.Value) ParseError![]mcp_contra
     return env;
 }
 
-
-
-
-
-
-
-
 fn checkPreparationOwnershipAllocFailures(alloc: Allocator) !void {
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     runtime.* = mcp_runtime.McpRuntime.init(alloc);
@@ -379,7 +372,6 @@ fn checkPreparationOwnershipAllocFailures(alloc: Allocator) !void {
     alloc.destroy(taken);
 }
 
-
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buffer: [4096]u8 = undefined;
     const len: usize = @intCast(smith.slice(&buffer));
@@ -392,4 +384,3 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         owned.deinit(std.testing.allocator);
     } else |_| {}
 }
-

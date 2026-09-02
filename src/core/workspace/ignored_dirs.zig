@@ -25,6 +25,3 @@ pub fn isIgnoredDirectoryName(name: []const u8) bool {
     }
     return false;
 }
-
-
-

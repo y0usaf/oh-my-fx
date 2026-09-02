@@ -679,7 +679,3 @@ fn imageBlockIndexById(blocks: []const types.ImageAttachment, id: usize) ?usize 
     }
     return null;
 }
-
-
-
-

@@ -510,5 +510,3 @@ pub fn appendReviewContinuationSuffix(
         try within_turn_suffix.append(arena, .{ .role = .user, .content = review_prompt });
     }
 }
-
-

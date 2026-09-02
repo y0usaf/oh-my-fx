@@ -373,10 +373,3 @@ fn skipPickerSpaces(bytes: []const u8, start: usize) usize {
     while (index < bytes.len and (bytes[index] == ' ' or bytes[index] == '\t')) : (index += 1) {}
     return index;
 }
-
-
-
-
-
-
-

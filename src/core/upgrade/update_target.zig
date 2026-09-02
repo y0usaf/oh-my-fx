@@ -200,9 +200,3 @@ fn revisionsEqual(full: []const u8, current: []const u8) bool {
 fn shortRevision(revision: []const u8) []const u8 {
     return revision[0..@min(revision.len, 12)];
 }
-
-
-
-
-
-

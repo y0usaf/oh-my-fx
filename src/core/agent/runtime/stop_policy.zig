@@ -148,4 +148,3 @@ fn isAsciiWordByte(byte: u8) bool {
 fn toolCall(id: []const u8, args: []const u8) ToolCall {
     return .{ .id = id, .name = "terminal", .arguments_json = args };
 }
-

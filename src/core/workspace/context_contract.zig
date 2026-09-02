@@ -593,13 +593,3 @@ fn snapshotEntrypointLayout(alloc: Allocator) ![]u8 {
     try writeEntrypointLayoutSnapshot(&out.writer);
     return try alloc.dupe(u8, out.written());
 }
-
-
-
-
-
-
-
-
-
-

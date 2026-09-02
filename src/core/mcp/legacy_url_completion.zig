@@ -133,4 +133,3 @@ pub fn wireCompletionTargetsWaiter(waiter: *const Waiter, completion: WireComple
     }
     return false;
 }
-

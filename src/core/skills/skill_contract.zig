@@ -536,11 +536,6 @@ pub fn validateManagedSkillName(name: []const u8) !void {
     if (std.mem.findScalar(u8, name, '\\') != null) return error.InvalidSkillName;
 }
 
-
-
-
-
-
 fn expectResolvedDescription(content: []const u8, expected: []const u8) !void {
     const metadata = switch (resolveMetadata(parseSkillFile(content), "fallback")) {
         .valid => |value| value,
@@ -551,18 +546,6 @@ fn expectResolvedDescription(content: []const u8, expected: []const u8) !void {
     metadata.write_description(description);
     try std.testing.expectEqualStrings(expected, description);
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn fuzzParseSkillFile(_: void, smith: *std.testing.Smith) !void {
     var buffer: [4096]u8 = undefined;
@@ -590,4 +573,3 @@ fn expectBorrowedSlice(input: []const u8, borrowed: []const u8) !void {
     try std.testing.expect(borrowed_start >= input_start);
     try std.testing.expect(borrowed_end <= input_end);
 }
-

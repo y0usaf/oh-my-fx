@@ -1939,7 +1939,6 @@ fn entryIdsPreservePrefix(
     return true;
 }
 
-
 fn cloneEntries(
     alloc: Allocator,
     source: []const TranscriptEntry,
@@ -3132,9 +3131,3 @@ pub fn appendCappedWithinCapacity(
     try list.appendSlice(alloc, text);
     return text.len;
 }
-
-
-
-
-
-
