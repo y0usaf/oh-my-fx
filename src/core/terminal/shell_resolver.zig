@@ -104,7 +104,6 @@ pub fn capturedRushInvocation(
     return invocation;
 }
 
-
 pub fn resolve(
     configured_login_shell: ?[]const u8,
     shell: contracts.ShellSpec,
