@@ -8,8 +8,8 @@ const policy = @import("host_policy.zig");
 const io_mod = @import("../shared/io.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
+const process_provider_mod = @import(
+    "../execution/process_provider.zig",
 );
 const ui_projection = @import("ui_projection.zig");
 
@@ -63,6 +63,12 @@ inline fn failCompletion(err: anytype) @TypeOf(err)!Completion {
 
 noinline fn failCompletionDynamic(err: anyerror) anyerror!Completion {
     return err;
+}
+
+test "completion failure writer preserves exact error type and identity" {
+    const failure = failCompletion(error.InvalidHostMessage);
+    try std.testing.expect(@TypeOf(failure) == error{InvalidHostMessage}!Completion);
+    try std.testing.expectError(error.InvalidHostMessage, failure);
 }
 
 const Intent = struct {
@@ -169,8 +175,8 @@ const CompletionSink = struct {
 };
 
 pub const Runtime = struct {
-    process_provider: background_process_provider.Provider =
-        background_process_provider.unavailable_provider,
+    process_provider: process_provider_mod.Provider =
+        process_provider_mod.unavailable_provider,
     mutex: std.Io.Mutex = .init,
     wake: std.Io.Condition = .init,
     queue: Queue = .{},
@@ -198,7 +204,7 @@ pub const Runtime = struct {
     }
 
     pub fn init(
-        process_provider: background_process_provider.Provider,
+        process_provider: process_provider_mod.Provider,
     ) Runtime {
         return .{ .process_provider = process_provider };
     }
@@ -343,7 +349,7 @@ pub const Runtime = struct {
     noinline fn resetDrainedState(self: *Runtime) void {
         // The drain above already nulls every owned slot. Reset only the
         // observable metadata so teardown does not copy the full runtime.
-        self.process_provider = background_process_provider.unavailable_provider;
+        self.process_provider = process_provider_mod.unavailable_provider;
         self.mutex = .init;
         self.wake = .init;
         self.queue.len = 0;
@@ -758,7 +764,7 @@ fn receiveCancellable(
 
 fn connectAndHandshake(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
 ) !Connected {
     return connectAndHandshakeOnce(alloc, process_provider) catch |err| switch (err) {
         error.HostClosedBeforeHandshake => connectAndHandshakeOnce(
@@ -771,7 +777,7 @@ fn connectAndHandshake(
 
 fn connectAndHandshakeOnce(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
 ) !Connected {
     if (!host.isSupported()) return error.TerminalHostUnsupported;
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
@@ -831,7 +837,7 @@ fn connectAndHandshakeOnce(
 
 fn connectOrStart(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     paths: *host.Paths,
 ) !std.Io.net.Stream {
     const started = io_mod.milliTimestamp();
@@ -1058,6 +1064,17 @@ fn testIntent(alloc: Allocator, correlation_id: u64) !Intent {
     };
 }
 
+fn admitTestIntent(runtime: *Runtime, correlation_id: u64) !void {
+    var intent = try testIntent(std.testing.allocator, correlation_id);
+    const zio = io_mod.getIo();
+    runtime.mutex.lockUncancelable(zio);
+    defer runtime.mutex.unlock(zio);
+    runtime.admitIntentLocked(intent) catch |err| {
+        intent.deinit(std.testing.allocator);
+        return err;
+    };
+}
+
 fn checkIntentAllocationFailures(alloc: Allocator) !void {
     var runtime: Runtime = .{};
     var intent = try testIntent(alloc, 1);
@@ -1067,4 +1084,358 @@ fn checkIntentAllocationFailures(alloc: Allocator) !void {
     };
     var rollback = runtime.rollbackAdmissionLocked(intent.correlation_id);
     rollback.deinit(alloc);
+}
+
+test "owned admission survives allocation failure and rollback has one owner" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkIntentAllocationFailures,
+        .{},
+    );
+
+    var runtime: Runtime = .{ .alloc = std.testing.allocator };
+    defer runtime.deinit();
+    var intent = try testIntent(std.testing.allocator, 41);
+    runtime.admitIntentLocked(intent) catch |err| {
+        intent.deinit(std.testing.allocator);
+        return err;
+    };
+    var rollback = runtime.rollbackAdmissionLocked(intent.correlation_id);
+    rollback.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queue.len);
+    try std.testing.expect(!runtime.live_correlations.contains(.{ .value = 41 }));
+}
+
+test "client queue owns admitted requests and reports full without I/O" {
+    var queue: Queue = .{};
+    defer {
+        while (queue.take()) |intent_value| {
+            var intent = intent_value;
+            intent.deinit(std.testing.allocator);
+        }
+    }
+    var next_id: u64 = 1;
+    while (next_id <= policy.queue_capacity) : (next_id += 1) {
+        try queue.admit(try testIntent(std.testing.allocator, next_id), false);
+    }
+    var overflow = try testIntent(std.testing.allocator, next_id);
+    defer overflow.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.QueueFull,
+        queue.admit(overflow, false),
+    );
+}
+
+test "intent queue stays FIFO after dequeue and refill" {
+    var queue: Queue = .{};
+    defer {
+        while (queue.take()) |intent_value| {
+            var intent = intent_value;
+            intent.deinit(std.testing.allocator);
+        }
+    }
+    for (1..4) |id| {
+        try queue.admit(try testIntent(std.testing.allocator, id), false);
+    }
+    var first = queue.take().?;
+    try std.testing.expectEqual(@as(u64, 1), first.correlation_id.value);
+    first.deinit(std.testing.allocator);
+    try queue.admit(try testIntent(std.testing.allocator, 4), false);
+
+    for ([_]u64{ 2, 3, 4 }) |expected| {
+        var intent = queue.take().?;
+        try std.testing.expectEqual(expected, intent.correlation_id.value);
+        intent.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(queue.take() == null);
+}
+
+test "targeted queue cancellation preserves FIFO order" {
+    var queue: Queue = .{};
+    defer {
+        while (queue.take()) |intent_value| {
+            var intent = intent_value;
+            intent.deinit(std.testing.allocator);
+        }
+    }
+    for (1..5) |id| {
+        try queue.admit(try testIntent(std.testing.allocator, id), false);
+    }
+    var cancelled = queue.cancel(.{ .value = 2 }).?;
+    cancelled.deinit(std.testing.allocator);
+
+    for ([_]u64{ 1, 3, 4 }) |expected| {
+        var intent = queue.take().?;
+        try std.testing.expectEqual(expected, intent.correlation_id.value);
+        intent.deinit(std.testing.allocator);
+    }
+}
+
+test "completion sink stays FIFO after dequeue and refill" {
+    var sink: CompletionSink = .{};
+    defer {
+        while (sink.take()) |completion_value| {
+            var completion = completion_value;
+            completion.deinit();
+        }
+    }
+    sink.push(.{ .kind = .response, .correlation_id = .{ .value = 1 } });
+    sink.push(.{ .kind = .cancelled, .correlation_id = .{ .value = 2 } });
+
+    var first = sink.take().?;
+    try std.testing.expectEqual(CompletionKind.response, first.kind);
+    first.deinit();
+    sink.push(.{ .kind = .disconnected, .correlation_id = .{ .value = 3 } });
+
+    for ([_]CompletionKind{ .cancelled, .disconnected }) |expected| {
+        var completion = sink.take().?;
+        try std.testing.expectEqual(expected, completion.kind);
+        completion.deinit();
+    }
+}
+
+test "runtime reserves bounded outcomes until every correlation is consumed" {
+    var runtime: Runtime = .{ .alloc = std.testing.allocator };
+    defer runtime.deinit();
+
+    for (1..policy.outcome_capacity + 1) |id| {
+        try admitTestIntent(&runtime, id);
+        var intent = runtime.queue.take().?;
+        intent.deinit(std.testing.allocator);
+        runtime.pushCompletionLocked(.{
+            .kind = .response,
+            .correlation_id = .{ .value = id },
+        });
+    }
+    try std.testing.expectEqual(
+        @as(usize, policy.outcome_capacity),
+        runtime.completions.correlated_len,
+    );
+    try std.testing.expectError(
+        error.QueueFull,
+        admitTestIntent(&runtime, policy.outcome_capacity + 1),
+    );
+    try std.testing.expectEqual(
+        @as(usize, policy.outcome_capacity),
+        runtime.completions.correlated_len,
+    );
+
+    for (1..policy.outcome_capacity + 1) |id| {
+        var completion = runtime.takeCompletionFor(.{ .value = id }).?;
+        try std.testing.expectEqual(@as(u64, id), completion.correlation_id.?.value);
+        completion.deinit();
+        try std.testing.expect(runtime.takeCompletionFor(.{ .value = id }) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), runtime.completions.correlated_len);
+}
+
+test "runtime rejects duplicate queued and active correlations" {
+    var runtime: Runtime = .{ .alloc = std.testing.allocator };
+    defer runtime.deinit();
+    try admitTestIntent(&runtime, 23);
+    try std.testing.expectError(
+        error.DuplicateCorrelation,
+        admitTestIntent(&runtime, 23),
+    );
+
+    const active_intent = takeIntent(&runtime).?;
+    var worker = RequestWorker{
+        .runtime = &runtime,
+        .intent = active_intent,
+    };
+    const zio = io_mod.getIo();
+    runtime.mutex.lockUncancelable(zio);
+    worker.slot = runtime.registerWorkerLocked(&worker).?;
+    runtime.mutex.unlock(zio);
+    try std.testing.expectError(
+        error.DuplicateCorrelation,
+        admitTestIntent(&runtime, 23),
+    );
+
+    const correlation_id = worker.intent.correlation_id;
+    runtime.finishActive(&worker, .{
+        .kind = .cancelled,
+        .correlation_id = correlation_id,
+    });
+    worker.intent.deinit(std.testing.allocator);
+    try std.testing.expect(runtime.live_correlations.contains(correlation_id));
+    var completion = runtime.takeCompletion().?;
+    completion.deinit();
+    try std.testing.expect(!runtime.live_correlations.contains(correlation_id));
+    try admitTestIntent(&runtime, 23);
+}
+
+test "runtime queued cancellation releases only the target correlation" {
+    var runtime: Runtime = .{ .alloc = std.testing.allocator };
+    defer runtime.deinit();
+    try admitTestIntent(&runtime, 1);
+    try admitTestIntent(&runtime, 2);
+    try admitTestIntent(&runtime, 3);
+
+    try std.testing.expect(runtime.cancel(.{ .value = 2 }));
+    try std.testing.expect(runtime.live_correlations.contains(.{ .value = 1 }));
+    try std.testing.expect(runtime.live_correlations.contains(.{ .value = 2 }));
+    try std.testing.expect(runtime.live_correlations.contains(.{ .value = 3 }));
+    var completion = runtime.takeCompletion().?;
+    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        completion.correlation_id.?.value,
+    );
+    completion.deinit();
+    try std.testing.expect(!runtime.live_correlations.contains(.{ .value = 2 }));
+    try admitTestIntent(&runtime, 2);
+}
+
+test "runtime deinit owns queued and retained correlations" {
+    var runtime: Runtime = .{ .alloc = std.testing.allocator };
+    try admitTestIntent(&runtime, 1);
+    try admitTestIntent(&runtime, 2);
+    var completed = runtime.queue.take().?;
+    completed.deinit(std.testing.allocator);
+    runtime.pushCompletionLocked(.{
+        .kind = .disconnected,
+        .correlation_id = .{ .value = 1 },
+    });
+
+    runtime.deinit();
+    try std.testing.expect(runtime.alloc == null);
+    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(!runtime.stopping);
+    try std.testing.expect(!runtime.stop_requested.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), runtime.queue.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.completions.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.completions.correlated_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.active_count);
+    try std.testing.expectEqual(@as(usize, 0), runtime.projection.rows.items.len);
+    for (runtime.queue.values) |entry| try std.testing.expect(entry == null);
+    for (runtime.completions.values) |entry| try std.testing.expect(entry == null);
+    for (runtime.live_correlations.values) |entry| try std.testing.expect(entry == null);
+    for (runtime.active) |entry| try std.testing.expect(entry == null);
+
+    try std.testing.expectEqual(@as(u64, 1), runtime.nextCorrelationId().value);
+    runtime.deinit();
+    try std.testing.expectEqual(@as(u64, 1), runtime.nextCorrelationId().value);
+}
+
+test "lazy runtime has no allocation or worker before first admission" {
+    var runtime: Runtime = .{};
+    defer runtime.deinit();
+    try std.testing.expect(runtime.alloc == null);
+    try std.testing.expect(runtime.thread == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queue.len);
+}
+
+test "stalled request cancellation emits only the targeted cancel" {
+    if (!host.isSupported()) return error.SkipZigTest;
+    var handles: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(
+        std.c.AF.UNIX,
+        std.c.SOCK.STREAM,
+        0,
+        &handles,
+    ) != 0) return error.SocketPairFailed;
+    var client_stream = std.Io.net.Stream{ .socket = .{
+        .handle = handles[0],
+        .address = undefined,
+    } };
+    defer client_stream.close(io_mod.getIo());
+    var host_stream = std.Io.net.Stream{ .socket = .{
+        .handle = handles[1],
+        .address = undefined,
+    } };
+    defer host_stream.close(io_mod.getIo());
+
+    var runtime: Runtime = .{ .alloc = std.testing.allocator };
+    defer runtime.deinit();
+    var worker = RequestWorker{
+        .runtime = &runtime,
+        .intent = .{
+            .correlation_id = .{ .value = 17 },
+            .request = try contracts.OwnedActionRequest.init(
+                std.testing.allocator,
+                .{ .screen = .{ .session_id = "terminal-1" } },
+            ),
+        },
+    };
+    const zio = io_mod.getIo();
+    runtime.mutex.lockUncancelable(zio);
+    try runtime.live_correlations.add(.{ .value = 17 });
+    worker.slot = runtime.registerWorkerLocked(&worker).?;
+    runtime.mutex.unlock(zio);
+
+    const Exchange = struct {
+        worker: *RequestWorker,
+        stream: std.Io.net.Stream,
+        completion: ?Completion = null,
+        failed: bool = false,
+
+        fn run(self: *@This()) void {
+            self.completion = exchangeConnected(
+                self.worker,
+                std.testing.allocator,
+                &self.worker.intent,
+                .{
+                    .stream = self.stream,
+                    .negotiated = .{
+                        .revision = contracts.current_protocol_revision,
+                        .capabilities = contracts.known_protocol_capabilities,
+                    },
+                },
+            ) catch {
+                self.failed = true;
+                return;
+            };
+        }
+    };
+    var exchange_state = Exchange{
+        .worker = &worker,
+        .stream = client_stream,
+    };
+    const thread = try std.Thread.spawn(.{}, Exchange.run, .{&exchange_state});
+
+    var host_read_buffer: [4096]u8 = undefined;
+    var host_reader = host_stream.reader(io_mod.getIo(), &host_read_buffer);
+    var request = try protocol.readFrame(
+        std.testing.allocator,
+        &host_reader.interface,
+    );
+    defer request.deinit();
+    try std.testing.expectEqual(
+        @as(u64, 17),
+        request.message().envelope.correlation_id.?.value,
+    );
+    try std.testing.expect(runtime.cancel(.{ .value = 17 }));
+    var cancel = try protocol.readFrame(
+        std.testing.allocator,
+        &host_reader.interface,
+    );
+    defer cancel.deinit();
+    try std.testing.expectEqual(
+        @as(u64, 17),
+        cancel.message().envelope.correlation_id.?.value,
+    );
+    switch (cancel.message().payload) {
+        .cancel => {},
+        else => return error.TestExpectedCancel,
+    }
+
+    thread.join();
+    try std.testing.expect(!exchange_state.failed);
+    var completion = exchange_state.completion.?;
+    defer completion.deinit();
+    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
+    runtime.finishActive(&worker, .{
+        .kind = .cancelled,
+        .correlation_id = .{ .value = 17 },
+    });
+    worker.intent.deinit(std.testing.allocator);
+}
+
+test "unsupported client platforms remain structural" {
+    const host_capabilities = @import("../hosts/host.zig");
+    try std.testing.expectEqual(
+        host_capabilities.terminalSupportForOs(builtin.os.tag).isSupported(),
+        host.isSupported(),
+    );
 }

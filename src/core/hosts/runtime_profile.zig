@@ -75,3 +75,37 @@ pub const wasm = Profile{
     .js_host_url_open = true,
     .js_host_workspace = true,
 };
+
+test "apps without a host profile retain native capabilities" {
+    const App = struct {};
+    try std.testing.expect(allows(App, .durable_sessions));
+    try std.testing.expect(!allows(App, .js_host_sessions));
+}
+
+test "host profile capabilities are selected by field" {
+    const App = struct {
+        pub const host_profile = wasm;
+    };
+    try std.testing.expect(!allows(App, .durable_sessions));
+    try std.testing.expect(allows(App, .js_host_config));
+    try std.testing.expect(allows(App, .js_host_sessions));
+}
+
+test "native and wasm profiles select distinct auth host effects" {
+    try std.testing.expect(native.native_auth);
+    try std.testing.expect(native.url_opening);
+    try std.testing.expect(!native.js_host_auth);
+    try std.testing.expect(!native.js_host_url_open);
+
+    try std.testing.expect(!wasm.native_auth);
+    try std.testing.expect(!wasm.url_opening);
+    try std.testing.expect(wasm.js_host_auth);
+    try std.testing.expect(wasm.js_host_url_open);
+}
+
+test "workspace host capability is wasm only without enabling native tools" {
+    try std.testing.expect(@hasField(Profile, "js_host_workspace"));
+    try std.testing.expect(!native.js_host_workspace);
+    try std.testing.expect(wasm.js_host_workspace);
+    try std.testing.expect(!wasm.tools);
+}

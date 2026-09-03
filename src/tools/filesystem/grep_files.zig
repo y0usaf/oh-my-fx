@@ -91,7 +91,11 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 
     const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
     errdefer ctx.allocator.free(owned_pattern);
-    const owned_path = try ctx.allocator.dupe(u8, path_string orelse ".");
+    const effective_path = if (path_string) |path|
+        if (path.len == 0) "." else path
+    else
+        ".";
+    const owned_path = try ctx.allocator.dupe(u8, effective_path);
     errdefer ctx.allocator.free(owned_path);
     const owned_include = if (include_string) |value| try ctx.allocator.dupe(u8, value) else null;
     errdefer if (owned_include) |include| ctx.allocator.free(include);
@@ -799,4 +803,642 @@ fn failingCollectFile(
     _: ?glob_pattern.Pattern,
 ) anyerror!grep_search.Result {
     return error.InjectedScanFailure;
+}
+
+test "grep_files decodes invalid argument shapes as failures" {
+    try expectDecodeFailure("{", "grep_files arguments must be valid JSON");
+    try expectDecodeFailure("[]", "grep_files arguments must be an object");
+    try expectDecodeFailure("{\"path\":\".\"}", "grep_files requires string field \"pattern\"");
+    try expectDecodeFailure("{\"pattern\":1}", "grep_files field \"pattern\" must be a string");
+}
+
+test "grep_files validate preserves active raw pattern and path values" {
+    const alloc = std.testing.allocator;
+    var empty = Input{
+        .pattern = try alloc.dupe(u8, " \t\n "),
+        .path = try alloc.dupe(u8, "   "),
+        .include = null,
+        .case_insensitive = false,
+        .head_limit = output_cap,
+        .offset = 0,
+    };
+    defer empty.deinit(alloc);
+    try std.testing.expect((try validateStackInput(alloc, &empty, "/tmp/workspace")) == null);
+    try std.testing.expectEqualStrings(" \t\n ", empty.pattern);
+    try std.testing.expectEqualStrings("   ", empty.path);
+}
+
+test "grep_files decodes defaults and all fields" {
+    try expectDecodeInput("{\"pattern\":\"needle\"}", "needle", ".", null, false, output_cap, 0);
+    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":\"\"}", "needle", ".", null, false, output_cap, 0);
+    try expectDecodeInput(
+        "{\"pattern\":\"needle\",\"path\":\"src\",\"include\":\"*.zig\",\"case_insensitive\":true,\"head_limit\":5,\"offset\":2}",
+        "needle",
+        "src",
+        "*.zig",
+        true,
+        5,
+        2,
+    );
+    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":1,\"include\":1,\"case_insensitive\":\"yes\"}", "needle", ".", null, false, output_cap, 0);
+}
+
+test "grep_files decodes context_lines above cap as bounded" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, "{\"pattern\":\"needle\",\"context_lines\":99}");
+    switch (decoded) {
+        .failure => |body| {
+            defer alloc.free(body);
+            try std.testing.expect(false);
+        },
+        .input => |erased| {
+            defer erased.deinit(alloc);
+            const input = erased.as(Input);
+            try std.testing.expectEqual(context_lines_cap, input.context_lines);
+        },
+    }
+}
+
+test "grep_files Input ownership duplicates and frees under testing allocator" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, "{\"pattern\":\"needle\",\"path\":\"src\",\"include\":\"*.zig\"}");
+    switch (decoded) {
+        .failure => |body| {
+            defer alloc.free(body);
+            try std.testing.expect(false);
+        },
+        .input => |erased| {
+            const input = erased.as(Input);
+            try std.testing.expectEqualStrings("needle", input.pattern);
+            try std.testing.expectEqualStrings("src", input.path);
+            try std.testing.expectEqualStrings("*.zig", input.include.?);
+            erased.deinit(alloc);
+        },
+    }
+}
+
+test "grep_files reports resolver errors as model-visible failures" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", "missing.txt", null, null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.failure, result.status);
+    try std.testing.expect(std.mem.startsWith(u8, result.body, "Unable to resolve grep search root: missing.txt ("));
+}
+
+test "grep_files reports overlong include patterns before scanning" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "file.txt", "needle\n");
+    defer alloc.free(path);
+    const include = try alloc.alloc(u8, glob_pattern.max_pattern_bytes + 1);
+    defer alloc.free(include);
+    @memset(include, 'a');
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", path, include, null, null, null);
+    defer result.deinit(alloc);
+
+    const expected = try std.fmt.allocPrint(alloc, "grep_files field \"include\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
+    defer alloc.free(expected);
+    try std.testing.expectEqual(.failure, result.status);
+    try std.testing.expectEqualStrings(expected, result.body);
+}
+
+test "grep_files reports stat failures after root resolution" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "file.txt", "needle\n");
+    defer alloc.free(path);
+
+    const body = try grepFilesFailureWithOps(alloc, workspace, path, null, .{ .stat_root = failingStatRoot });
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.startsWith(u8, body, "Unable to stat grep search root: "));
+    try std.testing.expect(std.mem.endsWith(u8, body, "(InjectedStatFailure)"));
+}
+
+test "grep_files access denial returns structured recovery" {
+    const alloc = std.testing.allocator;
+    const root = try std.fmt.allocPrint(alloc, "/tmp/fx-grep-files-access-{d}", .{io_mod.nanoTimestamp()});
+    defer alloc.free(root);
+    defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), root);
+    const workspace = try io_mod.realpathAlloc(alloc, root);
+    defer alloc.free(workspace);
+    const path = try std.fs.path.join(alloc, &.{ workspace, "file.txt" });
+    defer alloc.free(path);
+    {
+        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "needle\n");
+    }
+
+    const body = try grepFilesFailureWithOps(alloc, workspace, path, null, .{ .stat_root = accessDeniedStatRoot });
+    defer alloc.free(body);
+
+    try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body));
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_name\":\"grep_files\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, path) != null);
+    try std.testing.expect(std.mem.find(u8, body, "AccessDenied") != null);
+    try std.testing.expect(std.mem.find(u8, body, "symlink") != null);
+}
+
+test "grep_files reports walk failures for directory roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    const body = try grepFilesFailureWithOps(alloc, workspace, ".", null, .{
+        .stat_root = directoryStatRoot,
+        .collect_directory = failingCollectDirectory,
+    });
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.startsWith(u8, body, "Unable to walk grep search root: "));
+    try std.testing.expect(std.mem.endsWith(u8, body, "(InjectedWalkFailure)"));
+}
+
+test "grep_files reports scan failures for regular-file roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "file.txt", "needle\n");
+    defer alloc.free(path);
+
+    const body = try grepFilesFailureWithOps(alloc, workspace, path, null, .{
+        .stat_root = fileStatRoot,
+        .collect_file = failingCollectFile,
+    });
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.startsWith(u8, body, "Unable to scan grep file root: "));
+    try std.testing.expect(std.mem.endsWith(u8, body, "(InjectedScanFailure)"));
+}
+
+test "grep_files single-file non-text root returns empty matches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "binary.txt", "needle\x00binary\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", path, null, null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("[grep] no matches for needle\n", result.body);
+}
+
+test "grep_files single-file oversized root returns empty matches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const content = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(content);
+    @memset(content, 'n');
+    const path = try writeTempFile(alloc, &tmp, "large.txt", content);
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", path, null, null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("[grep] no matches for needle\n", result.body);
+}
+
+test "grep_files reports non-file non-directory roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "file.txt", "needle\n");
+    defer alloc.free(path);
+
+    const body = try grepFilesFailureWithOps(alloc, workspace, path, null, .{ .stat_root = namedPipeStatRoot });
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.startsWith(u8, body, "Not a regular file or directory: "));
+}
+
+test "grep_files single-file search returns matching lines" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const file_path = try writeTempFile(alloc, &tmp, "single.txt", "one\nneedle here\n");
+    defer alloc.free(file_path);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", file_path, null, null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - single.txt:2: needle here\n", result.body);
+}
+
+test "grep_files single-file include applies to basename" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const file_path = try writeTempFile(alloc, &tmp, "src/single.zig", "needle\n");
+    defer alloc.free(file_path);
+
+    var basename_match = try dispatchGrepFiles(alloc, workspace, "needle", file_path, "*.zig", null, null, null);
+    defer basename_match.deinit(alloc);
+    try std.testing.expectEqual(.success, basename_match.status);
+    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - src/single.zig:1: needle\n", basename_match.body);
+
+    var path_pattern_miss = try dispatchGrepFiles(alloc, workspace, "needle", file_path, "src/*.zig", null, null, null);
+    defer path_pattern_miss.deinit(alloc);
+    try std.testing.expectEqual(.success, path_pattern_miss.status);
+    try std.testing.expectEqualStrings("[grep] no matches for needle\n", path_pattern_miss.body);
+}
+
+test "grep_files walks multiple files without sorting" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const first = try writeTempFile(alloc, &tmp, "src/a.txt", "needle a\n");
+    defer alloc.free(first);
+    const second = try writeTempFile(alloc, &tmp, "src/nested/b.txt", "needle b\n");
+    defer alloc.free(second);
+    const miss = try writeTempFile(alloc, &tmp, "src/c.txt", "other\n");
+    defer alloc.free(miss);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", null, null, null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.startsWith(u8, result.body, "[grep] 2 matches for needle\n"));
+    try std.testing.expect(std.mem.find(u8, result.body, "src/a.txt:1: needle a") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, "src/nested/b.txt:1: needle b") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, "src/c.txt") == null);
+}
+
+test "grep_files finds match beyond former traversal cap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    var i: usize = 0;
+    while (i < 2050) : (i += 1) {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "many/file-{d:0>4}.txt", .{i});
+        const path = try writeTempFile(alloc, &tmp, name, "not here\n");
+        alloc.free(path);
+    }
+    const late = try writeTempFile(alloc, &tmp, "zzzz/match.txt", "needle late\n");
+    defer alloc.free(late);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", null, null, null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "zzzz/match.txt:1: needle late") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, "traversal cap") == null);
+}
+
+test "grep_files include filters walked files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const kept = try writeTempFile(alloc, &tmp, "src/main.zig", "needle in zig\n");
+    defer alloc.free(kept);
+    const skipped = try writeTempFile(alloc, &tmp, "src/notes.txt", "needle in text\n");
+    defer alloc.free(skipped);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", null, "*.zig", null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "src/main.zig:1: needle in zig") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, "notes.txt") == null);
+}
+
+test "grep_files supports ASCII case-insensitive matching" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "case.txt", "Needle Here\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", null, null, true, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - case.txt:1: Needle Here\n", result.body);
+}
+
+test "grep_files paginates matching line output" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "matches.txt", "needle one\nneedle two\nneedle three\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", path, null, null, 1, 1);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings(
+        "[grep] 1 matches for needle (showing 2-2 of 3)\n" ++
+            " - matches.txt:2: needle two\n" ++
+            "... more matches available; use offset 2 to continue\n",
+        result.body,
+    );
+}
+
+test "grep_files context_lines includes nearby lines around emitted matches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "context.txt", "one\ntwo\nneedle here\nfour\nfive\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"path\":\"context.txt\",\"context_lines\":1}");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings(
+        "[grep] 1 matches for needle\n" ++
+            "   context.txt:2- two\n" ++
+            " - context.txt:3: needle here\n" ++
+            "   context.txt:4- four\n",
+        result.body,
+    );
+}
+
+test "grep_files context_lines skips synthetic trailing line after final newline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "trailing.txt", "before\nneedle\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"path\":\"trailing.txt\",\"context_lines\":1}");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings(
+        "[grep] 1 matches for needle\n" ++
+            "   trailing.txt:1- before\n" ++
+            " - trailing.txt:2: needle\n",
+        result.body,
+    );
+}
+
+test "grep_files context_lines skips after-context at EOF without final newline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "no-trailing.txt", "before\nneedle");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"path\":\"no-trailing.txt\",\"context_lines\":1}");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings(
+        "[grep] 1 matches for needle\n" ++
+            "   no-trailing.txt:1- before\n" ++
+            " - no-trailing.txt:2: needle\n",
+        result.body,
+    );
+}
+
+test "grep_files context_lines preserves real blank lines in range" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "blank-context.txt", "before\nneedle\n\nafter\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"path\":\"blank-context.txt\",\"context_lines\":1}");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings(
+        "[grep] 1 matches for needle\n" ++
+            "   blank-context.txt:1- before\n" ++
+            " - blank-context.txt:2: needle\n" ++
+            "   blank-context.txt:3- \n",
+        result.body,
+    );
+}
+
+test "grep_files context_lines follows match pagination" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "paged.txt", "before one\nneedle one\nafter one\nbefore two\nneedle two\nafter two\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"path\":\"paged.txt\",\"head_limit\":1,\"offset\":1,\"context_lines\":1}");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings(
+        "[grep] 1 matches for needle (showing 2-2 of 2)\n" ++
+            "   paged.txt:4- before two\n" ++
+            " - paged.txt:5: needle two\n" ++
+            "   paged.txt:6- after two\n",
+        result.body,
+    );
+}
+
+test "grep_files context_lines does not affect files_with_matches or count modes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "modes.txt", "before\nneedle\nafter\n");
+    defer alloc.free(path);
+
+    var files_result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"path\":\"modes.txt\",\"mode\":\"files_with_matches\",\"context_lines\":1}");
+    defer files_result.deinit(alloc);
+    try std.testing.expectEqual(.success, files_result.status);
+    try std.testing.expectEqualStrings("[grep] 1 files with matches for needle\n - modes.txt\n", files_result.body);
+
+    var count_result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"path\":\"modes.txt\",\"mode\":\"count\",\"context_lines\":1}");
+    defer count_result.deinit(alloc);
+    try std.testing.expectEqual(.success, count_result.status);
+    try std.testing.expectEqualStrings("[grep] count 1 matching lines in 1 files for needle\n", count_result.body);
+}
+
+test "grep_files files_with_matches mode returns unique paginated paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const one = try writeTempFile(alloc, &tmp, "one.txt", "needle first\nneedle second\n");
+    defer alloc.free(one);
+    const two = try writeTempFile(alloc, &tmp, "two.txt", "needle third\n");
+    defer alloc.free(two);
+
+    var result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"mode\":\"files_with_matches\",\"head_limit\":10}");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.startsWith(u8, result.body, "[grep] 2 files with matches for needle\n"));
+    try std.testing.expect(std.mem.find(u8, result.body, " - one.txt\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, " - two.txt\n") != null);
+    try std.testing.expectEqual(@as(usize, 2), countEmittedResultLines(result.body));
+}
+
+test "grep_files formatter uses active pagination cap" {
+    const alloc = std.testing.allocator;
+    const matches = try matchingLines(alloc, 3);
+    defer alloc.free(matches);
+
+    const body = try formatMatches(alloc, alloc, "", "needle", .{ .matches = matches }, 2, 0, 0, 2, 2000);
+    defer alloc.free(body);
+
+    try std.testing.expectEqualStrings(
+        "[grep] 2 matches for needle (showing 1-2 of 3)\n" ++
+            " - many.txt:1: needle\n" ++
+            " - many.txt:2: needle\n" ++
+            "... more matches available; use offset 2 to continue\n",
+        body,
+    );
+}
+
+test "grep_files formatter does not report output truncation for exactly active cap" {
+    const alloc = std.testing.allocator;
+    const matches = try matchingLines(alloc, tool_dispatch.default_max_list_entries);
+    defer alloc.free(matches);
+
+    const body = try formatMatches(alloc, alloc, "", "needle", .{ .matches = matches }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.startsWith(u8, body, "[grep] 100 matches for needle\n"));
+    try std.testing.expectEqual(tool_dispatch.default_max_list_entries, countEmittedResultLines(body));
+    try std.testing.expect(std.mem.find(u8, body, "more matches available") == null);
+}
+
+test "grep_files formatter reports active truncation when cap hides matches" {
+    const alloc = std.testing.allocator;
+    const matches = try matchingLines(alloc, tool_dispatch.default_max_list_entries + 1);
+    defer alloc.free(matches);
+
+    const body = try formatMatches(alloc, alloc, "", "needle", .{ .matches = matches }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.startsWith(u8, body, "[grep] 100 matches for needle (showing 1-100 of 101)\n"));
+    try std.testing.expectEqual(tool_dispatch.default_max_list_entries, countEmittedResultLines(body));
+    try std.testing.expect(std.mem.endsWith(u8, body, "... more matches available; use offset 100 to continue\n"));
+}
+
+test "grep_files formatter reports collection cap separately from output truncation" {
+    const alloc = std.testing.allocator;
+    const matches = try matchingLines(alloc, grep_search.collection_cap);
+    defer alloc.free(matches);
+
+    const body = try formatMatches(alloc, alloc, "", "needle", .{
+        .matches = matches,
+        .truncated_reason = .collection_cap,
+    }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.startsWith(u8, body, "[grep] 100 matches for needle (showing 1-100 of 2000)\n"));
+    try std.testing.expectEqual(tool_dispatch.default_max_list_entries, countEmittedResultLines(body));
+    try std.testing.expect(std.mem.find(u8, body, "... more matches available; use offset 100 to continue\n") != null);
+    try std.testing.expect(std.mem.find(u8, body, "match collection cap reached at 2000 matches") != null);
+}
+
+test "grep_files count mode reports exact matching lines beyond collection cap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    var content: std.Io.Writer.Allocating = .init(alloc);
+    defer content.deinit();
+    var i: usize = 0;
+    while (i < grep_search.collection_cap + 1) : (i += 1) {
+        try content.writer.writeAll("needle\n");
+    }
+    const path = try writeTempFile(alloc, &tmp, "many.txt", content.written());
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"mode\":\"count\"}");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("[grep] count 2001 matching lines in 1 files for needle\n", result.body);
+    try std.testing.expectEqual(@as(usize, 0), countEmittedResultLines(result.body));
+}
+
+test "grep_files formatter reports candidate cap without output truncation wording" {
+    const alloc = std.testing.allocator;
+
+    const body = try formatMatches(alloc, alloc, "", "needle", .{
+        .matches = &.{},
+        .candidate_incomplete = true,
+        .candidate_cap = 2,
+    }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
+    defer alloc.free(body);
+
+    try std.testing.expectEqualStrings("[grep] no matches for needle\n... candidate list may be incomplete; candidate cap 2 reached before all files were discovered\n", body);
+}
+
+test "grep_files classifiers are read-only and reversible" {
+    const input = try std.testing.allocator.create(Input);
+    input.* = .{
+        .pattern = try std.testing.allocator.dupe(u8, "needle"),
+        .path = try std.testing.allocator.dupe(u8, "."),
+        .include = null,
+        .case_insensitive = false,
+        .head_limit = output_cap,
+        .offset = 0,
+    };
+    const erased = tool_dispatch.ToolInput{ .ptr = input, .deinit_fn = inputDeinit };
+    defer erased.deinit(std.testing.allocator);
+
+    try std.testing.expect(readsOnly(erased));
+    try std.testing.expect(!isIrreversible(erased));
 }

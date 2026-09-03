@@ -362,3 +362,48 @@ fn ProviderAdapter(comptime App: type) type {
         }
     };
 }
+
+test "turn-end delivery waits for paced presentation while attention remains immediate" {
+    var state = State{};
+    state.setPreferences(.{
+        .turn_end = true,
+        .attention_required = true,
+    });
+
+    try std.testing.expect(state.enabled(.turn_end));
+    try std.testing.expect(state.enabled(.attention_required));
+    for ([_]hooks.ScopeKind{ .ask, .acp, .subagent }) |scope| {
+        try std.testing.expect(!state.enabledForScope(.turn_end, scope));
+        try std.testing.expect(!state.enabledForScope(.attention_required, scope));
+    }
+    try std.testing.expect(!state.queue(.{ .kind = .turn_end, .cue = .@"error" }, true));
+    try std.testing.expect(state.queue(.{ .kind = .attention_required }, true));
+
+    var ready = state.takeReady(true);
+    try std.testing.expectEqual(@as(usize, 0), ready.turn_end_error);
+    try std.testing.expectEqual(@as(usize, 1), ready.attention_required);
+    try std.testing.expect(state.presentationFinished());
+
+    ready = state.takeReady(false);
+    try std.testing.expectEqual(@as(usize, 1), ready.turn_end_error);
+    try std.testing.expectEqual(@as(usize, 0), ready.turn_end_success);
+    try std.testing.expectEqual(@as(usize, 0), ready.attention_required);
+    try std.testing.expect(!state.presentationFinished());
+}
+
+test "max gate requires both sound on and max selected" {
+    var state = State{};
+    try std.testing.expect(!state.maxEnabled());
+
+    state.setPreferences(.{ .turn_end = true, .attention_required = true, .max = false });
+    try std.testing.expect(!state.maxEnabled());
+    try std.testing.expect(!state.preferences().max);
+
+    state.setPreferences(.{ .turn_end = true, .attention_required = true, .max = true });
+    try std.testing.expect(state.maxEnabled());
+    try std.testing.expect(state.preferences().max);
+
+    // Sound off suppresses max even if the flag lingers.
+    state.setPreferences(.{ .turn_end = false, .attention_required = false, .max = true });
+    try std.testing.expect(!state.maxEnabled());
+}

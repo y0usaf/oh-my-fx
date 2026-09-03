@@ -755,4 +755,33 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+test "scenario ladder preserves requested independent scale minima" {
+    const transcript_config = scenarioConfig(.transcript);
+    try std.testing.expect(transcript_config.transcript_lines >= 50_000);
+    try std.testing.expect(transcript_config.diff_lines < 50_000);
 
+    const diff_config = scenarioConfig(.diff);
+    try std.testing.expect(diff_config.diff_lines >= 50_000);
+    try std.testing.expect(diff_config.transcript_lines < 50_000);
+
+    const combined_config = scenarioConfig(.combined);
+    try std.testing.expect(combined_config.transcript_lines >= 50_000);
+    try std.testing.expect(combined_config.diff_lines >= 50_000);
+
+    const payload_config = scenarioConfig(.payload);
+    try std.testing.expect(payload_config.large_payloads);
+    try std.testing.expect(payload_config.small_result_records >= 1_000);
+}
+
+test "edge fixture reaches transcript and diff sentinels through the final VT grid" {
+    var fixture = try Fixture.init(std.testing.allocator, .edge);
+    defer fixture.deinit(std.testing.allocator);
+    try runCycle(
+        std.testing.io,
+        std.testing.allocator,
+        null,
+        &fixture,
+        0,
+        true,
+    );
+}

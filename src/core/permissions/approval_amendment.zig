@@ -215,3 +215,204 @@ pub const State = struct {
         draft.* = .empty;
     }
 };
+
+test "approval amendment keeps separate drafts and discards them together" {
+    const alloc = std.testing.allocator;
+    var amendment = State{};
+    defer amendment.deinit(alloc);
+
+    amendment.begin(0);
+    try amendment.insert(alloc, 'r');
+    try amendment.insert(alloc, 'e');
+    try std.testing.expectEqualStrings("re", amendment.draftForChoice(0));
+
+    amendment.begin(2);
+    try amendment.insert(alloc, 'n');
+    try amendment.insert(alloc, 'o');
+    try std.testing.expectEqualStrings("re", amendment.draftForChoice(0));
+    try std.testing.expectEqualStrings("no", amendment.draftForChoice(2));
+
+    amendment.discard(alloc, "test");
+    try std.testing.expect(amendment.activeChoice() == null);
+    try std.testing.expectEqualStrings("", amendment.draftForChoice(0));
+    try std.testing.expectEqualStrings("", amendment.draftForChoice(2));
+}
+
+test "approval amendment edits both choices identically and clamps at draft bounds" {
+    const alloc = std.testing.allocator;
+    var amendment = State{};
+    defer amendment.deinit(alloc);
+
+    try amendment.insert(alloc, 'x');
+    amendment.backspace();
+    amendment.cursorLeft();
+    amendment.cursorRight();
+    try std.testing.expectEqualStrings("", amendment.draftForChoice(0));
+    try std.testing.expectEqualStrings("", amendment.draftForChoice(2));
+
+    amendment.begin(1);
+    try std.testing.expect(amendment.activeChoice() == null);
+
+    for ([_]u8{ 0, 2 }) |choice| {
+        amendment.begin(choice);
+        try amendment.insert(alloc, 'a');
+        try amendment.insert(alloc, 'c');
+        amendment.cursorLeft();
+        try amendment.insert(alloc, 'b');
+        amendment.cursorRight();
+        amendment.backspace();
+        amendment.cursorLeft();
+        amendment.cursorLeft();
+        amendment.cursorLeft();
+        amendment.backspace();
+        amendment.cursorRight();
+        try std.testing.expectEqualStrings("ab", amendment.draftForChoice(choice));
+        try std.testing.expectEqual(@as(usize, 1), amendment.cursorForChoice(choice));
+    }
+    try std.testing.expectEqualStrings("ab", amendment.draftForChoice(0));
+    try std.testing.expectEqual(@as(usize, 1), amendment.cursorForChoice(0));
+}
+
+test "approval amendment edits terminal characters and navigation keys" {
+    const alloc = std.testing.allocator;
+    var amendment = State{};
+    defer amendment.deinit(alloc);
+
+    amendment.begin(0);
+    try amendment.insertSlice(alloc, "A🙂B");
+    amendment.cursorLeft();
+    amendment.cursorLeft();
+    try std.testing.expectEqual(@as(usize, 1), amendment.cursorForChoice(0));
+    amendment.cursorRight();
+    try std.testing.expectEqual(@as(usize, 5), amendment.cursorForChoice(0));
+    amendment.backspace();
+    try std.testing.expectEqualStrings("AB", amendment.draftForChoice(0));
+    try std.testing.expectEqual(@as(usize, 1), amendment.cursorForChoice(0));
+
+    amendment.discard(alloc, "test_reset");
+    amendment.begin(2);
+    try amendment.insertSlice(alloc, "alpha beta 👨‍👩‍👧‍👦");
+    amendment.cursorWordLeft();
+    try std.testing.expectEqual(@as(usize, "alpha beta ".len), amendment.cursorForChoice(2));
+    amendment.deleteNext();
+    try std.testing.expectEqualStrings("alpha beta ", amendment.draftForChoice(2));
+    amendment.cursorHome();
+    try std.testing.expectEqual(@as(usize, 0), amendment.cursorForChoice(2));
+    amendment.cursorWordRight();
+    try std.testing.expectEqual(@as(usize, "alpha".len), amendment.cursorForChoice(2));
+    amendment.cursorEnd();
+    try std.testing.expectEqual(amendment.draftForChoice(2).len, amendment.cursorForChoice(2));
+}
+
+test "approval amendment applies word and logical line deletions to either draft" {
+    const alloc = std.testing.allocator;
+    var amendment = State{};
+    defer amendment.deinit(alloc);
+
+    for ([_]u8{ 0, 2 }) |choice| {
+        amendment.begin(choice);
+        try amendment.insertSlice(alloc, "alpha beta");
+        amendment.deleteWhitespaceDelimitedWordLeft();
+        try std.testing.expectEqualStrings("alpha ", amendment.draftForChoice(choice));
+        try std.testing.expectEqual(@as(usize, 6), amendment.cursorForChoice(choice));
+
+        amendment.deleteWordLeft();
+        try std.testing.expectEqualStrings("", amendment.draftForChoice(choice));
+        try std.testing.expectEqual(@as(usize, 0), amendment.cursorForChoice(choice));
+
+        try amendment.insertSlice(alloc, "one two\nthree four");
+        amendment.cursorHome();
+        amendment.deleteWordRight();
+        try std.testing.expectEqualStrings("two\nthree four", amendment.draftForChoice(choice));
+
+        amendment.cursorEnd();
+        amendment.cursorWordLeft();
+        amendment.deleteToLineStart();
+        try std.testing.expectEqualStrings("two\nfour", amendment.draftForChoice(choice));
+        try std.testing.expectEqual(@as(usize, "two\n".len), amendment.cursorForChoice(choice));
+
+        amendment.deleteToLineEnd();
+        try std.testing.expectEqualStrings("two\n", amendment.draftForChoice(choice));
+    }
+
+    amendment.discard(alloc, "test_reset");
+    amendment.begin(0);
+    try amendment.insertSlice(alloc, "alpha\nbeta");
+    amendment.cursorHome();
+    amendment.cursorWordRight();
+    amendment.deleteToLineEnd();
+    try std.testing.expectEqualStrings("alphabeta", amendment.draftForChoice(0));
+    try std.testing.expectEqual(@as(usize, "alpha".len), amendment.cursorForChoice(0));
+}
+
+test "approval amendment deletion keeps terminal characters intact" {
+    const alloc = std.testing.allocator;
+    var amendment = State{};
+    defer amendment.deinit(alloc);
+
+    amendment.begin(0);
+    try amendment.insertSlice(alloc, "one e\u{301}lan 🙂");
+    amendment.deleteWordLeft();
+    try std.testing.expectEqualStrings("one e\u{301}lan ", amendment.draftForChoice(0));
+    amendment.deleteWordLeft();
+    try std.testing.expectEqualStrings("one ", amendment.draftForChoice(0));
+}
+
+test "approval amendment traces discarded drafts with their reason" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "approval-feedback.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "permission");
+
+    var amendment = State{};
+    defer amendment.deinit(alloc);
+    amendment.begin(0);
+    try amendment.insert(alloc, 'y');
+    amendment.begin(2);
+    try amendment.insert(alloc, 'n');
+    amendment.discard(alloc, "cancelled");
+
+    debug_trace.shutdown();
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "approval feedback discarded reason=cancelled choice=yes bytes=1") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "approval feedback discarded reason=cancelled choice=no bytes=1") != null);
+}
+
+test "approval amendment traces the unselected draft after submission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "approval-feedback-accepted.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "permission");
+
+    var amendment = State{};
+    defer amendment.deinit(alloc);
+    amendment.begin(0);
+    try amendment.insert(alloc, 'y');
+    amendment.begin(2);
+    try amendment.insert(alloc, 'n');
+    amendment.discardAfterSubmission(alloc, 0);
+
+    debug_trace.shutdown();
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "approval feedback discarded reason=accepted_submission_unselected choice=no bytes=1") != null);
+}

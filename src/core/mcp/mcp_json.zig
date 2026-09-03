@@ -34,3 +34,31 @@ pub fn write_compact(writer: *std.Io.Writer, json: []const u8) !void {
         }
     }
 }
+
+test "compact JSON escapes raw control bytes inside strings" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    try write_compact(&out.writer, "{\"k\": \"a\nb\"}");
+    try std.testing.expectEqualStrings("{\"k\":\"a\\u000ab\"}", out.written());
+}
+
+test "compact JSON escapes a raw control byte after a backslash" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    try write_compact(&out.writer, "{\"k\":\"a\\\nb\"}");
+    try std.testing.expect(std.mem.findScalar(u8, out.written(), '\n') == null);
+    try std.testing.expectEqualStrings("{\"k\":\"a\\\\u000ab\"}", out.written());
+}
+
+test "compact JSON preserves escaped quotes and backslashes" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    try write_compact(&out.writer, "{\"k\": \"say \\\"hi now\\\"\", \"p\": \"x\\\\\", \"q\": 1}");
+    try std.testing.expectEqualStrings("{\"k\":\"say \\\"hi now\\\"\",\"p\":\"x\\\\\",\"q\":1}", out.written());
+}

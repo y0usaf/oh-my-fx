@@ -319,6 +319,18 @@ pub fn resetForTest() void {
     next_subagent_id.store(1, .seq_cst);
 }
 
+pub fn configureForTest(alloc: Allocator, path: []const u8) !void {
+    const owned = try alloc.dupe(u8, path);
+    defer alloc.free(owned);
+    try configure(.{ .file_path = owned });
+}
+
+pub fn configureForTestWithScopes(alloc: Allocator, path: []const u8, scope_filter: []const u8) !void {
+    const owned = try alloc.dupe(u8, path);
+    defer alloc.free(owned);
+    try configure(.{ .file_path = owned, .scope_filter = scope_filter });
+}
+
 pub fn configure(options: Options) !void {
     const zio = io_mod.getIo();
     state_mutex.lockUncancelable(zio);
@@ -504,4 +516,217 @@ fn readFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(zio, path, .{});
     defer file.close(zio);
     return io_mod.readFileToEnd(alloc, &file, 8192);
+}
+
+test "isTruthy parses accepted and rejected values" {
+    try std.testing.expect(isTruthy("1"));
+    try std.testing.expect(isTruthy("true"));
+    try std.testing.expect(isTruthy("YES"));
+    try std.testing.expect(isTruthy("on"));
+    try std.testing.expect(!isTruthy("0"));
+    try std.testing.expect(!isTruthy(""));
+    try std.testing.expect(!isTruthy(" \t\r\n"));
+    try std.testing.expect(!isTruthy(null));
+}
+
+test "home default log path uses fx logs directory" {
+    const alloc = std.testing.allocator;
+    const path = try defaultLogPathForHome(alloc, "/tmp/fake-home");
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/logs/trace.log", path);
+}
+
+test "fallback default log path uses tmp trace path" {
+    const alloc = std.testing.allocator;
+    const path = try fallbackLogPathForMillis(alloc, 12345);
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("/tmp/fx-trace-12345.log", path);
+}
+
+test "trace logger writes configured file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try tmpPath(alloc, root, "trace.log");
+    defer alloc.free(path);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, path);
+    logf("test", "hello {d}", .{42});
+
+    const trace = try readFileForTest(alloc, path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "[test] hello 42") != null);
+}
+
+test "trace logger filters scopes and writes structured events" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try tmpPath(alloc, root, "scoped-trace.log");
+    defer alloc.free(path);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTestWithScopes(alloc, path, "agent, tool");
+    logf("agent", "human line", .{});
+    logf("worker", "filtered line", .{});
+    eventf("tool", "execution_start", .{ .turn_id = 7, .step_id = 11 }, "name={s}", .{"read_file"});
+
+    const trace = try readFileForTest(alloc, path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "[agent] human line") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "[worker] filtered line") == null);
+    try std.testing.expect(std.mem.find(u8, trace, "[tool] event=execution_start turn_id=7 step_id=11 name=read_file") != null);
+}
+
+test "trace id generators reset for tests" {
+    resetForTest();
+    try std.testing.expectEqual(@as(u64, 1), nextTurnId());
+    try std.testing.expectEqual(@as(u64, 2), nextTurnId());
+    try std.testing.expectEqual(@as(u64, 1), nextStepId());
+    resetForTest();
+    try std.testing.expectEqual(@as(u64, 1), nextTurnId());
+}
+
+test "redactedJsonPreview reports shape without values" {
+    const alloc = std.testing.allocator;
+    const preview_text = try redactedJsonPreview(alloc, "{\"path\":\"secret.txt\",\"content\":\"very secret\",\"nested\":{\"token\":\"abc\"}}");
+    defer alloc.free(preview_text);
+
+    try std.testing.expect(std.mem.find(u8, preview_text, "\"path\":<string_bytes=") != null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "\"content\":<string_bytes=") != null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "secret.txt") == null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "very secret") == null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "abc") == null);
+}
+
+test "keylessJsonPreview reports shape without keys or values" {
+    const alloc = std.testing.allocator;
+    const preview_text = try keylessJsonPreview(alloc, "{\"FX_DYNAMIC_PATH\":\"secret.txt\",\"FX_DYNAMIC_CONTENT\":\"very secret\",\"nested\":{\"FX_DYNAMIC_TOKEN\":\"abc\"}}");
+    defer alloc.free(preview_text);
+
+    try std.testing.expect(std.mem.find(u8, preview_text, "<object_fields=3 values=[") != null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "FX_DYNAMIC_PATH") == null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "FX_DYNAMIC_CONTENT") == null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "FX_DYNAMIC_TOKEN") == null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "secret.txt") == null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "very secret") == null);
+    try std.testing.expect(std.mem.find(u8, preview_text, "abc") == null);
+}
+
+test "preview trims and keeps first line" {
+    try std.testing.expectEqualStrings("first", preview(" \t\nfirst\nsecond\n ", 128));
+}
+
+test "preview trims trailing carriage return for CRLF input" {
+    try std.testing.expectEqualStrings("first", preview("first\r\nsecond", 128));
+}
+
+test "preview clamps by byte length" {
+    try std.testing.expectEqualStrings("abcd", preview("abcdef", 4));
+}
+
+test "preview returns borrowed slice" {
+    const input: []const u8 = "  borrowed  ";
+    const result = preview(input, 128);
+    const input_start = @intFromPtr(input.ptr);
+    const input_end = input_start + input.len;
+    const result_start = @intFromPtr(result.ptr);
+    try std.testing.expect(result_start >= input_start);
+    try std.testing.expect(result_start < input_end);
+}
+
+test "terminalPreview strips common terminal controls" {
+    var buf: [64]u8 = undefined;
+    const result = terminalPreview(buf[0..], "hi \x1b[31mred\x1b[0m \x1b]8;;https://example.com\x07link\x1b]8;;\x07\nnext");
+    try std.testing.expectEqualStrings("hi red link", result);
+}
+
+test "trace lines encode every non-ASCII and control byte" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeTerminalSafeTraceLine(
+        &out.writer,
+        "server=bad\n\x1b]0;owned\x07\xff",
+    );
+    try std.testing.expectEqualStrings(
+        "server=bad\\x0a\\x1b]0;owned\\x07\\xff",
+        out.written(),
+    );
+}
+
+test "resolveLogPath resolves absolute and relative paths" {
+    const alloc = std.testing.allocator;
+    const absolute = try resolveLogPath(alloc, "/tmp/workspace", " \t/tmp/fx-absolute-trace.log\n");
+    defer alloc.free(absolute);
+    try std.testing.expectEqualStrings("/tmp/fx-absolute-trace.log", absolute);
+
+    const relative = try resolveLogPath(alloc, "/tmp/workspace", "logs/trace.log");
+    defer alloc.free(relative);
+    const expected = try std.fs.path.join(alloc, &.{ "/tmp/workspace", "logs/trace.log" });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, relative);
+}
+
+test "resolveLogPath rejects empty trace paths" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidTracePath, resolveLogPath(alloc, "/tmp/workspace", ""));
+    try std.testing.expectError(error.InvalidTracePath, resolveLogPath(alloc, "/tmp/workspace", " \t\r\n"));
+}
+
+test "configure is first config wins" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const first_path = try tmpPath(alloc, root, "first.log");
+    defer alloc.free(first_path);
+    const second_path = try tmpPath(alloc, root, "second.log");
+    defer alloc.free(second_path);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, first_path);
+    try configure(.{ .file_path = second_path });
+    logf("test", "first sink only", .{});
+
+    const first_trace = try readFileForTest(alloc, first_path);
+    defer alloc.free(first_trace);
+    try std.testing.expect(std.mem.find(u8, first_trace, "first sink only") != null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(std.testing.io, second_path, .{}));
+}
+
+test "configure enables stderr-only tracing" {
+    resetForTest();
+    defer resetForTest();
+    try configure(.{ .stderr_enabled = true });
+    try std.testing.expect(isEnabled());
+}
+
+test "shutdown clears state and allows reconfigure" {
+    resetForTest();
+    defer resetForTest();
+    try configure(.{ .stderr_enabled = true });
+    try std.testing.expect(isEnabled());
+    shutdown();
+    try std.testing.expect(!isEnabled());
+    try configure(.{ .stderr_enabled = true });
+    try std.testing.expect(isEnabled());
+}
+
+test "configureFromEnv leaves tracing disabled without env" {
+    resetForTest();
+    defer resetForTest();
+    try std.testing.expect(io_mod.getenv("FX_TRACE_LOG") == null);
+    try std.testing.expect(io_mod.getenv("FX_TRACE") == null);
+    try std.testing.expect(io_mod.getenv("FX_TRACE_STDERR") == null);
+    configureFromEnv(std.testing.allocator, "/tmp/workspace");
+    try std.testing.expect(!isEnabled());
 }

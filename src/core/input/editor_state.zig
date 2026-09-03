@@ -243,3 +243,123 @@ pub fn deleteRange(
     }
     return true;
 }
+
+test "editor state owns selection and Unicode cursor transitions" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.setText(alloc, "Ae\u{301}B");
+    try std.testing.expect(state.moveCharacterLeft());
+    try std.testing.expectEqual(@as(usize, 4), state.cursor);
+    try std.testing.expect(state.moveCharacterLeft());
+    try std.testing.expectEqual(@as(usize, 1), state.cursor);
+
+    try std.testing.expect(state.beginSelection(1));
+    try std.testing.expect(state.extendSelection(4));
+    try std.testing.expectEqualStrings("e\u{301}", state.selectedText().?);
+    try std.testing.expect(state.collapseSelection(.end));
+    try std.testing.expectEqual(@as(usize, 4), state.cursor);
+    try std.testing.expect(state.selectionRange() == null);
+}
+
+test "collapsing an empty selection clears its transient anchor" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.setText(alloc, "abc");
+    _ = state.beginSelection(0);
+    try std.testing.expect(!state.collapseSelection(.start));
+    try std.testing.expectEqual(@as(?usize, null), state.selection_anchor);
+
+    _ = state.beginSelection(state.input.items.len);
+    try std.testing.expect(!state.collapseSelection(.end));
+    try std.testing.expectEqual(@as(?usize, null), state.selection_anchor);
+}
+
+test "selection extension keeps a fixed anchor while crossing it" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.setText(alloc, "abcd");
+
+    _ = state.setCursor(2);
+    try std.testing.expect(state.moveCursorTo(1, true));
+    try std.testing.expectEqual(@as(?usize, 2), state.selection_anchor);
+    try std.testing.expect(state.moveCursorTo(3, true));
+    try std.testing.expectEqual(@as(?usize, 2), state.selection_anchor);
+    try std.testing.expectEqual(
+        SelectionRange{ .start = 2, .end = 3 },
+        state.selectionRange().?,
+    );
+
+    try std.testing.expect(state.moveCursorTo(0, false));
+    try std.testing.expectEqual(@as(?usize, null), state.selection_anchor);
+    try std.testing.expect(state.selectAll());
+    try std.testing.expectEqual(SelectionRange{ .start = 0, .end = 4 }, state.selectionRange().?);
+}
+
+test "editor state moves across logical lines" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.setText(alloc, "alpha beta\ngamma");
+    try std.testing.expect(state.moveLineStart());
+    try std.testing.expectEqual(@as(usize, 11), state.cursor);
+    try std.testing.expect(state.moveHome());
+    try std.testing.expectEqual(@as(usize, 0), state.cursor);
+    try std.testing.expect(state.moveLineEnd());
+    try std.testing.expectEqual(@as(usize, 10), state.cursor);
+}
+
+test "editor state insertion and deletion keep cursor and selection consistent" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.setText(alloc, "alpha beta");
+    try state.input.ensureUnusedCapacity(alloc, 1);
+    _ = state.setCursor(5);
+    state.insertSliceAssumeCapacity("!");
+    try std.testing.expectEqualStrings("alpha! beta", state.input.items);
+    try std.testing.expectEqual(@as(usize, 6), state.cursor);
+
+    _ = state.beginSelection(5);
+    _ = state.extendSelection(7);
+    try std.testing.expect(state.deleteTextRange(5, 7));
+    try std.testing.expectEqualStrings("alphabeta", state.input.items);
+    try std.testing.expectEqual(@as(usize, 5), state.cursor);
+    try std.testing.expectEqual(@as(?usize, 5), state.selection_anchor);
+    state.finishSelection();
+    try std.testing.expect(state.selectionRange() == null);
+}
+
+test "bounded edit admission handles inserts and replacements" {
+    try std.testing.expect(canInsert(4095, 1, 4096));
+    try std.testing.expect(!canInsert(4095, 2, 4096));
+    try std.testing.expect(!canInsert(5000, 0, 4096));
+    try std.testing.expect(canReplace(4094, 8, 10, 4096));
+    try std.testing.expect(!canReplace(4094, 8, 11, 4096));
+}
+
+test "range deletion clamps offsets and preserves cursor position" {
+    const alloc = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(alloc);
+    try buffer.appendSlice(alloc, "alpha beta");
+
+    var cursor: usize = buffer.items.len;
+    try std.testing.expect(deleteRange(&buffer, &cursor, 5, 6));
+    try std.testing.expectEqualStrings("alphabeta", buffer.items);
+    try std.testing.expectEqual(@as(usize, 9), cursor);
+
+    cursor = 3;
+    try std.testing.expect(deleteRange(&buffer, &cursor, 1, 5));
+    try std.testing.expectEqualStrings("abeta", buffer.items);
+    try std.testing.expectEqual(@as(usize, 1), cursor);
+
+    try std.testing.expect(!deleteRange(&buffer, &cursor, 99, 100));
+    try std.testing.expectEqualStrings("abeta", buffer.items);
+}

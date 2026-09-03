@@ -18,13 +18,13 @@ fn setRecvTimeout(conn: *std.http.Client.Connection) void {
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 }
 
-pub const release_base = "https://github.com/y0usaf/oh-my-fx/releases";
+pub const cdn_base = "https://github.com/y0usaf/oh-my-fx/releases";
 
-pub fn resolveReleaseBase() []const u8 {
+pub fn resolveCdnBase() []const u8 {
     if (io_mod.getenv("FX_E2E_UPGRADE_BASE_URL")) |url| {
         if (isLoopbackE2eUpgradeBase(url)) return url;
     }
-    return release_base;
+    return cdn_base;
 }
 
 fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
@@ -341,4 +341,98 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+}
+
+test "platform string is valid" {
+    try std.testing.expect(platform.len > 0);
+    try std.testing.expect(std.mem.find(u8, platform, "-") != null);
+}
+
+test "E2E upgrade base accepts only explicit IPv4 loopback origins" {
+    try std.testing.expect(isLoopbackE2eUpgradeBase("http://127.0.0.1:1234"));
+    try std.testing.expect(!isLoopbackE2eUpgradeBase("https://127.0.0.1:1234"));
+    try std.testing.expect(!isLoopbackE2eUpgradeBase("http://127.0.0.1"));
+    try std.testing.expect(!isLoopbackE2eUpgradeBase("http://127.0.0.1:80@example.com"));
+    try std.testing.expect(!isLoopbackE2eUpgradeBase("http://localhost:1234"));
+}
+
+test "production upgrades use O MyFX GitHub releases" {
+    try std.testing.expectEqualStrings("https://github.com/y0usaf/oh-my-fx/releases", resolveCdnBase());
+}
+
+test "artifact URLs preserve the local test contract and use GitHub release downloads" {
+    const alloc = std.testing.allocator;
+    var target = try Target.initStable(alloc, "v1.2.3");
+    defer target.deinit(alloc);
+
+    const production = try artifactUrl(alloc, cdn_base, target, ".sha256");
+    defer alloc.free(production);
+    try std.testing.expectEqualStrings(
+        "https://github.com/y0usaf/oh-my-fx/releases/download/omyfx-v1.2.3/fx-" ++ platform ++ ".tar.gz.sha256",
+        production,
+    );
+
+    const local = try artifactUrl(alloc, "http://127.0.0.1:1234", target, "");
+    defer alloc.free(local);
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:1234/v1.2.3/fx-" ++ platform ++ ".tar.gz",
+        local,
+    );
+}
+
+test "GitHub release artifact URLs do not double the omyfx-v tag prefix" {
+    const alloc = std.testing.allocator;
+    var target = try Target.initStable(alloc, "omyfx-v1.2.3");
+    defer target.deinit(alloc);
+
+    const production = try artifactUrl(alloc, cdn_base, target, ".sha256");
+    defer alloc.free(production);
+    try std.testing.expectEqualStrings(
+        "https://github.com/y0usaf/oh-my-fx/releases/download/omyfx-v1.2.3/fx-" ++ platform ++ ".tar.gz.sha256",
+        production,
+    );
+}
+
+test "extractChecksumHex parses sha256sum format" {
+    const with_filename = "abc123def456  fx-macos-aarch64.tar.gz\n";
+    const hex = extractChecksumHex(with_filename).?;
+    try std.testing.expectEqualStrings("abc123def456", hex);
+}
+
+test "extractChecksumHex parses raw hex" {
+    const raw = "a" ** 64 ++ "\n";
+    const hex = extractChecksumHex(raw).?;
+    try std.testing.expectEqual(@as(usize, 64), hex.len);
+    try std.testing.expectEqualStrings("a" ** 64, hex);
+}
+
+test "extractChecksumHex rejects short raw checksum" {
+    try std.testing.expect(extractChecksumHex("abcd\n") == null);
+}
+
+test "bytesToHex renders lowercase sha256 digest" {
+    const bytes = [_]u8{0x0f} ** 32;
+    const hex = bytesToHex(&bytes);
+    try std.testing.expectEqualStrings("0f" ** 32, &hex);
+}
+
+test "replaceBinary moves replacement over target path" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(tmp.dir, "fx-old", "old");
+    try writeTempFile(tmp.dir, "fx-new", "new");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const new_path = try std.fs.path.join(alloc, &.{ root, "fx-new" });
+    defer alloc.free(new_path);
+    const target_path = try std.fs.path.join(alloc, &.{ root, "fx-old" });
+    defer alloc.free(target_path);
+
+    try replaceBinary(new_path, target_path);
+
+    const replaced = try readAbsoluteFile(alloc, target_path);
+    defer alloc.free(replaced);
+    try std.testing.expectEqualStrings("new", replaced);
 }

@@ -375,3 +375,198 @@ fn freeArtifactRef(alloc: Allocator, ref: CacheSnapshot.OwnedArtifactRef) void {
     alloc.free(ref.handle);
     alloc.free(ref.display_path);
 }
+
+const MutableClock = struct {
+    now_ms: i64,
+
+    fn now(raw: *anyopaque) i64 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.now_ms;
+    }
+};
+
+fn testRuntime(clock: *MutableClock, max_converted_bytes: usize, max_entries: usize, max_metadata_bytes: usize) Runtime {
+    return Runtime.init(.{
+        .allocator = std.testing.allocator,
+        .clock = .{ .ctx = @ptrCast(clock), .now_fn = MutableClock.now },
+        .max_converted_bytes = max_converted_bytes,
+        .max_entries = max_entries,
+        .max_metadata_bytes = max_metadata_bytes,
+    });
+}
+
+test "web_fetch cache expires at fifteen minutes and evicts by converted bytes" {
+    const alloc = std.testing.allocator;
+    var clock = MutableClock{ .now_ms = 1000 };
+    var runtime = testRuntime(&clock, 10, 8, 4096);
+    defer runtime.deinit(alloc);
+
+    try runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/a",
+        .final_url = "https://example.com/a",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "12345",
+    });
+    try runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/b",
+        .final_url = "https://example.com/b",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "67890",
+    });
+    try runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/c",
+        .final_url = "https://example.com/c",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "abcde",
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.entryCount());
+    try std.testing.expect((try runtime.lookup(alloc, "https://example.com/a", null)) == null);
+
+    var hit = (try runtime.lookup(alloc, "https://example.com/c", null)) orelse return error.TestExpectedEqual;
+    defer hit.deinit(alloc);
+    try std.testing.expect(hit.cache_hit);
+
+    clock.now_ms += ttl_ms + 1;
+    try std.testing.expect((try runtime.lookup(alloc, "https://example.com/c", null)) == null);
+}
+
+test "web_fetch cache snapshots remain valid after post lookup eviction" {
+    const alloc = std.testing.allocator;
+    var clock = MutableClock{ .now_ms = 1 };
+    var runtime = testRuntime(&clock, 6, 8, 4096);
+    defer runtime.deinit(alloc);
+
+    try runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/a",
+        .final_url = "https://example.com/a",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "abc",
+    });
+    var snapshot = (try runtime.lookup(alloc, "https://example.com/a", null)) orelse return error.TestExpectedEqual;
+    defer snapshot.deinit(alloc);
+
+    try runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/b",
+        .final_url = "https://example.com/b",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "defghi",
+    });
+
+    try std.testing.expect((try runtime.lookup(alloc, "https://example.com/a", null)) == null);
+    try std.testing.expectEqualStrings("abc", snapshot.converted_content);
+}
+
+test "web_fetch cache caps entry count and metadata weight" {
+    const alloc = std.testing.allocator;
+    var clock = MutableClock{ .now_ms = 1 };
+    var runtime = testRuntime(&clock, 1024, 2, 120);
+    defer runtime.deinit(alloc);
+
+    try runtime.insert(alloc, .{ .submitted_url = "https://example.com/a", .final_url = "https://example.com/a", .status = .ok, .mime_type = "text/plain", .content_kind = .text });
+    try runtime.insert(alloc, .{ .submitted_url = "https://example.com/b", .final_url = "https://example.com/b", .status = .ok, .mime_type = "text/plain", .content_kind = .text });
+    try runtime.insert(alloc, .{ .submitted_url = "https://example.com/c", .final_url = "https://example.com/c", .status = .ok, .mime_type = "text/plain", .content_kind = .text });
+
+    try std.testing.expect(runtime.entryCount() <= 2);
+    try std.testing.expect(runtime.metadataBytes() <= 120);
+}
+
+test "web_fetch durable artifact cache refs are scoped to artifact store identity" {
+    const alloc = std.testing.allocator;
+    var clock = MutableClock{ .now_ms = 1 };
+    var runtime = testRuntime(&clock, 1024, 8, 4096);
+    defer runtime.deinit(alloc);
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    const session_a = try io_mod.dirRealpathAlloc(alloc, tmp_a.dir, ".");
+    defer alloc.free(session_a);
+    const session_b = try io_mod.dirRealpathAlloc(alloc, tmp_b.dir, ".");
+    defer alloc.free(session_b);
+    var store_a = try web_fetch_artifacts.Store.init(alloc, session_a);
+    defer store_a.deinit();
+    var store_b = try web_fetch_artifacts.Store.init(alloc, session_b);
+    defer store_b.deinit();
+    var artifact = try store_a.write(alloc, "application/pdf", "pdf");
+    defer artifact.deinit(alloc);
+
+    try runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/report.pdf",
+        .final_url = "https://example.com/report.pdf",
+        .status = .ok,
+        .mime_type = "application/pdf",
+        .content_kind = .binary,
+        .artifact_ref = .{
+            .store_id = store_a.id(),
+            .handle = artifact.handle,
+            .display_path = artifact.display_path,
+            .byte_count = artifact.byte_count,
+        },
+    });
+
+    var hit = (try runtime.lookup(alloc, "https://example.com/report.pdf", &store_a)) orelse return error.TestExpectedEqual;
+    defer hit.deinit(alloc);
+    try std.testing.expectEqualStrings(store_a.id(), hit.artifact_ref.?.store_id);
+
+    try std.testing.expect((try runtime.lookup(alloc, "https://example.com/report.pdf", &store_b)) == null);
+    try std.testing.expect((try runtime.lookup(alloc, "https://example.com/report.pdf", &store_a)) == null);
+}
+
+test "web_fetch cache eviction preserves returned durable artifact" {
+    const alloc = std.testing.allocator;
+    var clock = MutableClock{ .now_ms = 1 };
+    var runtime = testRuntime(&clock, 1024, 1, 4096);
+    defer runtime.deinit(alloc);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(session_dir);
+    var store = try web_fetch_artifacts.Store.init(alloc, session_dir);
+    defer store.deinit();
+    var artifact = try store.write(alloc, "application/pdf", "pdf bytes");
+    defer artifact.deinit(alloc);
+
+    try runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/report.pdf",
+        .final_url = "https://example.com/report.pdf",
+        .status = .ok,
+        .mime_type = "application/pdf",
+        .content_kind = .binary,
+        .artifact_ref = .{
+            .store_id = store.id(),
+            .handle = artifact.handle,
+            .display_path = artifact.display_path,
+            .byte_count = artifact.byte_count,
+        },
+    });
+    try runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/next",
+        .final_url = "https://example.com/next",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "next",
+    });
+
+    try std.testing.expect((try runtime.lookup(alloc, "https://example.com/report.pdf", &store)) == null);
+    try std.testing.expect(try store.contains(artifact.handle));
+}
+
+test "web_fetch cache lock is not held across target http" {
+    var clock = MutableClock{ .now_ms = 1 };
+    var runtime = testRuntime(&clock, 1024, 8, 4096);
+    defer runtime.deinit(std.testing.allocator);
+
+    try std.testing.expect(!runtime.lockHeldForTest());
+}

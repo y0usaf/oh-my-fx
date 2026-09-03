@@ -17,6 +17,7 @@ const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
+const capability_retrieval = @import("../tooling/capability_retrieval.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const legacy_http_sse = @import("legacy_http_sse.zig");
 const legacy_streamable_http = @import("legacy_streamable_http.zig");
@@ -726,28 +727,21 @@ fn fetchResources(self: *McpRuntime, server: *McpServer, deadline: std.Io.Clock.
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        try reauthorizeOperation(
+        var exchange = try request_feature_catalog_page(
             self,
+            server,
+            .resources,
+            cursor,
+            deadline,
+            cancel_flag,
             access,
-            .{ .feature_server = server.config.name },
         );
-        const request_id = try nextFeatureRequestId(server);
-        const request = try resources_feature.buildListRequest(self.alloc, request_id, serverFeatureProtocol(server), cursor, writeModernRequestMetadata);
-        defer self.alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = self,
-            .target = .{ .feature_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        var response = try sendFeatureRequest(self, server, request_id, request, deadline, cancel_flag, access, &precommit, null);
-        const received_at_ms = clockMillis();
-        defer response.deinit(self.alloc);
-        try acceptPageIdentity(&producing_identity, response.auth_identity);
-        var page = try resources_feature.parseResourcePage(self.alloc, response.body, serverFeatureProtocol(server), .{});
+        defer exchange.response.deinit(self.alloc);
+        try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
+        var page = try resources_feature.parseResourcePage(self.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
         defer page.deinit(self.alloc);
         try replaceOwnedCursor(self.alloc, &cursor, page.next_cursor);
-        try builder.appendPage(self.alloc, &page, received_at_ms, .{});
+        try builder.appendPage(self.alloc, &page, exchange.received_at_ms, .{});
         if (cursor == null) return .{ .catalog = try builder.finish(self.alloc), .auth_identity = producing_identity };
     }
 }
@@ -759,28 +753,21 @@ fn fetchResourceTemplates(self: *McpRuntime, server: *McpServer, deadline: std.I
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        try reauthorizeOperation(
+        var exchange = try request_feature_catalog_page(
             self,
+            server,
+            .resource_templates,
+            cursor,
+            deadline,
+            cancel_flag,
             access,
-            .{ .feature_server = server.config.name },
         );
-        const request_id = try nextFeatureRequestId(server);
-        const request = try resources_feature.buildTemplatesListRequest(self.alloc, request_id, serverFeatureProtocol(server), cursor, writeModernRequestMetadata);
-        defer self.alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = self,
-            .target = .{ .feature_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        var response = try sendFeatureRequest(self, server, request_id, request, deadline, cancel_flag, access, &precommit, null);
-        const received_at_ms = clockMillis();
-        defer response.deinit(self.alloc);
-        try acceptPageIdentity(&producing_identity, response.auth_identity);
-        var page = try resources_feature.parseTemplatePage(self.alloc, response.body, serverFeatureProtocol(server), .{});
+        defer exchange.response.deinit(self.alloc);
+        try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
+        var page = try resources_feature.parseTemplatePage(self.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
         defer page.deinit(self.alloc);
         try replaceOwnedCursor(self.alloc, &cursor, page.next_cursor);
-        try builder.appendPage(self.alloc, &page, received_at_ms, .{});
+        try builder.appendPage(self.alloc, &page, exchange.received_at_ms, .{});
         if (cursor == null) return .{ .catalog = try builder.finish(self.alloc), .auth_identity = producing_identity };
     }
 }
@@ -792,28 +779,21 @@ fn fetchPrompts(self: *McpRuntime, server: *McpServer, deadline: std.Io.Clock.Ti
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        try reauthorizeOperation(
+        var exchange = try request_feature_catalog_page(
             self,
+            server,
+            .prompts,
+            cursor,
+            deadline,
+            cancel_flag,
             access,
-            .{ .feature_server = server.config.name },
         );
-        const request_id = try nextFeatureRequestId(server);
-        const request = try prompts_feature.buildListRequest(self.alloc, request_id, serverFeatureProtocol(server), cursor, writeModernRequestMetadata);
-        defer self.alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = self,
-            .target = .{ .feature_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        var response = try sendFeatureRequest(self, server, request_id, request, deadline, cancel_flag, access, &precommit, null);
-        const received_at_ms = clockMillis();
-        defer response.deinit(self.alloc);
-        try acceptPageIdentity(&producing_identity, response.auth_identity);
-        var page = try prompts_feature.parseListPage(self.alloc, response.body, serverFeatureProtocol(server), .{});
+        defer exchange.response.deinit(self.alloc);
+        try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
+        var page = try prompts_feature.parseListPage(self.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
         defer page.deinit(self.alloc);
         try replaceOwnedCursor(self.alloc, &cursor, page.next_cursor);
-        try builder.appendPage(self.alloc, &page, received_at_ms, .{});
+        try builder.appendPage(self.alloc, &page, exchange.received_at_ms, .{});
         if (cursor == null) return .{ .catalog = try builder.finish(self.alloc), .auth_identity = producing_identity };
     }
 }
@@ -859,6 +839,73 @@ const FeatureResponse = struct {
         self.* = undefined;
     }
 };
+
+const FeatureCatalogPageResponse = struct {
+    response: FeatureResponse,
+    received_at_ms: u64,
+};
+
+fn request_feature_catalog_page(
+    self: *McpRuntime,
+    server: *McpServer,
+    kind: FeatureCatalogKind,
+    cursor: ?[]const u8,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: ?*std.atomic.Value(bool),
+    access: tool_mcp_runtime.Access,
+) !FeatureCatalogPageResponse {
+    try reauthorizeOperation(
+        self,
+        access,
+        .{ .feature_server = server.config.name },
+    );
+    const request_id = try nextFeatureRequestId(server);
+    const protocol = serverFeatureProtocol(server);
+    const request = switch (kind) {
+        .resources => try resources_feature.buildListRequest(
+            self.alloc,
+            request_id,
+            protocol,
+            cursor,
+            writeModernRequestMetadata,
+        ),
+        .resource_templates => try resources_feature.buildTemplatesListRequest(
+            self.alloc,
+            request_id,
+            protocol,
+            cursor,
+            writeModernRequestMetadata,
+        ),
+        .prompts => try prompts_feature.buildListRequest(
+            self.alloc,
+            request_id,
+            protocol,
+            cursor,
+            writeModernRequestMetadata,
+        ),
+    };
+    defer self.alloc.free(request);
+    var guard = ServerAccessPrecommit{
+        .runtime = self,
+        .target = .{ .feature_server = server.config.name },
+        .access = access,
+    };
+    var precommit = guard.transport();
+    return .{
+        .response = try sendFeatureRequest(
+            self,
+            server,
+            request_id,
+            request,
+            deadline,
+            cancel_flag,
+            access,
+            &precommit,
+            null,
+        ),
+        .received_at_ms = clockMillis(),
+    };
+}
 
 const LegacyElicitationSpec = struct {
     responder: ?tool_mcp_runtime.InputResponder,
@@ -5511,6 +5558,7 @@ pub const McpRuntime = struct {
                 .client_secret = client_secret,
                 .client_metadata_url = auth_config.client_metadata_url,
                 .scopes = auth_config.scopes,
+                .callback_port = auth_config.callback_port,
             },
             .previous_scope = source.previous_scope,
             .open_ctx = open_ctx,
@@ -5833,8 +5881,12 @@ pub const McpRuntime = struct {
         self: *McpRuntime,
         cancel_flag: ?*std.atomic.Value(bool),
         access: *const OperationAccessGuard,
+        server_filter: ?[]const u8,
     ) void {
         for (0..self.servers.items.len) |index| {
+            if (server_filter) |name| {
+                if (!std.mem.eql(u8, self.servers.items[index].config.name, name)) continue;
+            }
             if (!access.allows(.{ .tool_server = self.servers.items[index].config.name })) {
                 continue;
             }
@@ -6161,8 +6213,14 @@ pub const McpRuntime = struct {
         const prepared_query = try lexical_relevance.prepare(query);
         return self.searchToolsPrepared(
             alloc,
-            &prepared_query,
-            limit,
+            .{
+                .query = &prepared_query,
+                .kind = .mcp,
+                .limit = @min(
+                    if (limit == 0) default_mcp_search_limit else limit,
+                    max_mcp_search_limit,
+                ),
+            },
             permission_rules,
             limits,
             access,
@@ -6172,8 +6230,7 @@ pub const McpRuntime = struct {
     pub fn searchToolsPrepared(
         self: *McpRuntime,
         alloc: Allocator,
-        query: *const lexical_relevance.PreparedQuery,
-        limit: usize,
+        request: capability_retrieval.Request,
         permission_rules: types.PermissionRuleSet,
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
@@ -6190,26 +6247,54 @@ pub const McpRuntime = struct {
             self.generation,
         );
         defer operation_access.deinit();
-        self.refreshAllToolCatalogs(null, &operation_access);
+        self.refreshAllToolCatalogs(null, &operation_access, request.server);
         try operation_access.refresh();
         var result = result: {
             self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
             defer self.catalog_mutex.unlockShared(io_mod.getIo());
-            const capped_limit = @min(if (limit == 0) default_mcp_search_limit else limit, max_mcp_search_limit);
-            var match_storage: [max_mcp_search_limit]ToolSearchMatch = undefined;
-            var match_count: usize = 0;
             var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
             defer auth_witnesses.deinit(alloc);
-            var more_available = false;
             if (try renderAuthenticationRequired(
                 alloc,
                 self.servers.items,
                 &operation_access,
-                query.raw,
+                request.server orelse request.query.raw,
             )) |output| {
                 break :result tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
             }
+            var candidate_capacity: usize = 0;
+            var server_configured = request.server == null;
             for (self.servers.items) |*server| {
+                if (request.server) |name| {
+                    if (!std.mem.eql(u8, server.config.name, name)) continue;
+                    server_configured = true;
+                }
+                candidate_capacity = try std.math.add(
+                    usize,
+                    candidate_capacity,
+                    server.tool_catalog.tools.items.len,
+                );
+            }
+            if (!server_configured) {
+                break :result tool_mcp_runtime.SearchResult{
+                    .model_output = try alloc.dupe(
+                        u8,
+                        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_not_found\"}",
+                    ),
+                };
+            }
+            const candidate_storage = try alloc.alloc(ToolSearchMatch, candidate_capacity);
+            defer alloc.free(candidate_storage);
+            const documents = try alloc.alloc(capability_retrieval.Document, candidate_capacity);
+            defer alloc.free(documents);
+            var identity_scratch_state = std.heap.ArenaAllocator.init(alloc);
+            defer identity_scratch_state.deinit();
+            const identity_scratch = identity_scratch_state.allocator();
+            var candidate_count: usize = 0;
+            for (self.servers.items) |*server| {
+                if (request.server) |name| {
+                    if (!std.mem.eql(u8, server.config.name, name)) continue;
+                }
                 if (server.state != .ready) continue;
                 if (!serverCatalogAvailable(server)) continue;
                 if (!operation_access.allows(.{ .tool_server = server.config.name })) continue;
@@ -6220,6 +6305,11 @@ pub const McpRuntime = struct {
                 for (server.tool_catalog.tools.items) |*tool| {
                     if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
+                    if (!try tool_result_limits.modelProjectionPreservesText(identity_scratch, server.config.name) or
+                        !try tool_result_limits.modelProjectionPreservesText(identity_scratch, tool.prefixed_name))
+                    {
+                        continue;
+                    }
                     const searchable_description = tool.description[0..context_limits.utf8PrefixLength(
                         tool.description,
                         mcp_tool_description_search_bytes,
@@ -6228,60 +6318,41 @@ pub const McpRuntime = struct {
                         tool.input_schema_json,
                         mcp_tool_schema_search_bytes,
                     )];
-                    const exact_identities = [_][]const u8{
-                        tool.original_name,
-                        tool.prefixed_name,
-                    };
-                    const strong_fields = [_][]const u8{
-                        server.config.name,
-                        tool.original_name,
-                        tool.prefixed_name,
-                        "mcp",
-                    };
-                    const weak_fields = [_][]const u8{
-                        searchable_description,
-                        searchable_schema,
-                        searchable_instructions,
-                    };
-                    const candidate_score = lexical_relevance.score(
-                        query,
-                        &exact_identities,
-                        &strong_fields,
-                        &weak_fields,
-                    ) orelse continue;
-                    const candidate = ToolSearchMatch{
+                    candidate_storage[candidate_count] = .{
                         .server = server,
                         .tool = tool,
-                        .score = candidate_score,
                     };
-
-                    var insertion_index = match_count;
-                    while (insertion_index > 0 and
-                        lexical_relevance.order(candidate.score, match_storage[insertion_index - 1].score) == .gt)
-                    {
-                        insertion_index -= 1;
-                    }
-
-                    if (match_count < capped_limit) {
-                        var move_index = match_count;
-                        while (move_index > insertion_index) : (move_index -= 1) {
-                            match_storage[move_index] = match_storage[move_index - 1];
-                        }
-                        match_storage[insertion_index] = candidate;
-                        match_count += 1;
-                    } else {
-                        more_available = true;
-                        if (insertion_index < capped_limit) {
-                            var move_index = capped_limit - 1;
-                            while (move_index > insertion_index) : (move_index -= 1) {
-                                match_storage[move_index] = match_storage[move_index - 1];
-                            }
-                            match_storage[insertion_index] = candidate;
-                        }
-                    }
+                    documents[candidate_count] = .{
+                        .identities = .{ tool.original_name, tool.prefixed_name },
+                        .stable_key = tool.prefixed_name,
+                        .primary = .{
+                            server.config.name,
+                            tool.original_name,
+                            tool.prefixed_name,
+                            tool.title orelse "",
+                        },
+                        .primary_extra = tool.tags,
+                        .secondary = .{
+                            searchable_description,
+                            searchable_schema,
+                            searchable_instructions,
+                        },
+                    };
+                    candidate_count += 1;
                 }
             }
-            const matches = match_storage[0..match_count];
+            var page = try capability_retrieval.retrieve(
+                alloc,
+                request,
+                .mcp,
+                documents[0..candidate_count],
+            );
+            defer page.deinit(alloc);
+            const matches = try alloc.alloc(ToolSearchMatch, page.matches.len);
+            defer alloc.free(matches);
+            for (page.matches, 0..) |match, index| {
+                matches[index] = candidate_storage[match.document_index];
+            }
             for (matches) |match| {
                 const generation = catalogAuthWitness(match.server) orelse continue;
                 var witnessed = false;
@@ -6297,15 +6368,18 @@ pub const McpRuntime = struct {
                 });
             }
 
+            const full_cursor = try page.cursorAfter(alloc, matches.len);
+            defer if (full_cursor) |cursor| alloc.free(cursor);
             const full = try renderSearchResult(
                 alloc,
                 matches,
                 matches.len,
+                page.total_matches,
+                full_cursor,
                 limits.mcp_description_bytes,
                 limits.mcp_search_result_bytes,
                 0,
                 false,
-                more_available,
             );
             const observed_bytes = full.len;
             const effective_bytes = limits.mcp_search_result_bytes.effectiveBytes();
@@ -6321,15 +6395,18 @@ pub const McpRuntime = struct {
             var selected_count = matches.len;
             var model_output: ?[]u8 = null;
             while (true) {
+                const candidate_cursor = try page.cursorAfter(alloc, selected_count);
+                defer if (candidate_cursor) |cursor| alloc.free(cursor);
                 const candidate = try renderSearchResult(
                     alloc,
                     matches,
                     selected_count,
+                    page.total_matches,
+                    candidate_cursor,
                     limits.mcp_description_bytes,
                     limits.mcp_search_result_bytes,
                     observed_bytes,
                     true,
-                    more_available,
                 );
                 if (candidate.len <= effective_bytes) {
                     model_output = candidate;
@@ -8592,6 +8669,63 @@ fn replaceOwnedCursor(
     cursor.* = replacement;
 }
 
+const ToolCatalogPages = struct {
+    const CursorReplacement = enum {
+        preserve_until_owned,
+        release_before_alloc,
+    };
+
+    builder: tools_feature.CatalogBuilder,
+    cursor: ?[]u8 = null,
+
+    fn init(alloc: Allocator, protocol: tools_feature.Protocol) ToolCatalogPages {
+        return .{
+            .builder = tools_feature.CatalogBuilder.init(alloc, protocol),
+        };
+    }
+
+    fn deinit(self: *ToolCatalogPages, alloc: Allocator) void {
+        self.builder.deinit(alloc);
+        if (self.cursor) |value| alloc.free(value);
+        self.* = undefined;
+    }
+
+    fn append_response(
+        self: *ToolCatalogPages,
+        alloc: Allocator,
+        response: []const u8,
+        received_at_ms: u64,
+        cursor_replacement: CursorReplacement,
+    ) !bool {
+        var page = try tools_feature.parseListPage(
+            alloc,
+            response,
+            self.builder.protocol,
+            .{},
+        );
+        defer page.deinit(alloc);
+        switch (cursor_replacement) {
+            .preserve_until_owned => try replaceOwnedCursor(alloc, &self.cursor, page.next_cursor),
+            .release_before_alloc => {
+                if (self.cursor) |value| {
+                    alloc.free(value);
+                    self.cursor = null;
+                }
+                self.cursor = if (page.next_cursor) |value|
+                    try alloc.dupe(u8, value)
+                else
+                    null;
+            },
+        }
+        try self.builder.appendPage(alloc, &page, received_at_ms, .{});
+        return self.cursor == null;
+    }
+
+    fn finish(self: *ToolCatalogPages, alloc: Allocator) !tools_feature.Catalog {
+        return self.builder.finish(alloc);
+    }
+};
+
 fn fetchStdioToolCatalog(
     self: *McpRuntime,
     server: *McpServer,
@@ -8599,56 +8733,17 @@ fn fetchStdioToolCatalog(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !tools_feature.Catalog {
-    const alloc = self.alloc;
     const dispatcher = server.dispatcher orelse return error.McpConnectionClosed;
-    var builder = tools_feature.CatalogBuilder.init(
-        alloc,
-        featureProtocol(server.stdio_protocol),
+    const fetched = try fetch_tool_catalog_pages(
+        self.alloc,
+        self,
+        server,
+        .{ .stdio = dispatcher },
+        deadline,
+        cancel_flag,
+        access,
     );
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
-    while (true) {
-        try reauthorizeOperation(
-            self,
-            access,
-            .{ .tool_server = server.config.name },
-        );
-        const request_id = try dispatcher.reserveRequestId();
-        const request = try buildToolsListRequest(alloc, request_id, server.stdio_protocol, cursor);
-        defer alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = self,
-            .target = .{ .tool_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        const response = try dispatcher.request(
-            alloc,
-            request_id,
-            request,
-            mcp_discovery_response_frame_cap_bytes,
-            .{
-                .timeout_ms = server.config.operation_timeout_ms,
-                .deadline = deadline,
-                .cancel_flag = cancel_flag,
-                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-                .precommit = &precommit,
-            },
-        );
-        const received_at_ms = clockMillis();
-        defer alloc.free(response);
-        var page = try tools_feature.parseListPage(
-            alloc,
-            response,
-            featureProtocol(server.stdio_protocol),
-            .{},
-        );
-        defer page.deinit(alloc);
-        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) return builder.finish(alloc);
-    }
+    return fetched.catalog;
 }
 
 const HttpRequestIds = union(enum) {
@@ -8667,6 +8762,169 @@ const HttpRequestIds = union(enum) {
         };
     }
 };
+
+const ToolCatalogTransport = union(enum) {
+    stdio: *stdio_dispatcher.StdioDispatcher,
+    modern_http: *HttpRequestIds,
+    legacy_http: *legacy_streamable_http.Client,
+    legacy_sse: *legacy_http_sse.Client,
+
+    fn protocol(self: ToolCatalogTransport, server: *const McpServer) StdioProtocol {
+        return switch (self) {
+            .stdio => server.stdio_protocol,
+            .modern_http => .modern,
+            .legacy_http, .legacy_sse => .legacy,
+        };
+    }
+
+    fn next_request_id(self: *ToolCatalogTransport, server: *McpServer) !u64 {
+        return switch (self.*) {
+            .stdio => |dispatcher| dispatcher.reserveRequestId(),
+            .modern_http => |request_ids| request_ids.next(),
+            .legacy_http, .legacy_sse => reserveHttpRequestId(server),
+        };
+    }
+
+    fn request_page(
+        self: ToolCatalogTransport,
+        alloc: Allocator,
+        runtime: *McpRuntime,
+        server: *McpServer,
+        request_id: u64,
+        request: []const u8,
+        deadline: std.Io.Clock.Timestamp,
+        cancel_flag: ?*std.atomic.Value(bool),
+        access: tool_mcp_runtime.Access,
+        precommit: *mcp_contract.TransportPrecommit,
+    ) !FeatureResponse {
+        return switch (self) {
+            .stdio => |dispatcher| .{ .body = try dispatcher.request(
+                alloc,
+                request_id,
+                request,
+                mcp_discovery_response_frame_cap_bytes,
+                .{
+                    .timeout_ms = server.config.operation_timeout_ms,
+                    .deadline = deadline,
+                    .cancel_flag = cancel_flag,
+                    .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                    .precommit = precommit,
+                },
+            ) },
+            .modern_http => {
+                var auth_identity: feature_cache.Digest = undefined;
+                const response = try authenticatedPost(alloc, alloc, server, .{
+                    .url = try server.config.remoteUrl(),
+                    .request_body = request,
+                    .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
+                    .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
+                    .precommit = precommit,
+                    .control = .{
+                        .deadline = deadline,
+                        .cancel_flag = cancel_flag,
+                        .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                    },
+                }, .{
+                    .runtime = runtime,
+                    .access = access,
+                    .target = .{ .tool_server = server.config.name },
+                }, .safe, &auth_identity);
+                if (response.www_authenticate) |value| alloc.free(value);
+                return .{
+                    .body = response.body,
+                    .auth_identity = auth_identity,
+                };
+            },
+            .legacy_http => |client| .{ .body = try client.request(alloc, .{
+                .request_id = request_id,
+                .request_body = request,
+                .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
+                .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
+                .precommit = precommit,
+                .control = .{
+                    .deadline = deadline,
+                    .cancel_flag = cancel_flag,
+                    .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                },
+            }) },
+            .legacy_sse => |client| .{ .body = try client.request(
+                alloc,
+                request_id,
+                request,
+                mcp_discovery_response_frame_cap_bytes,
+                .{
+                    .deadline = deadline,
+                    .cancel_flag = cancel_flag,
+                    .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                    .precommit = precommit,
+                },
+            ) },
+        };
+    }
+};
+
+fn fetch_tool_catalog_pages(
+    alloc: Allocator,
+    runtime: *McpRuntime,
+    server: *McpServer,
+    initial_transport: ToolCatalogTransport,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: ?*std.atomic.Value(bool),
+    access: tool_mcp_runtime.Access,
+) !FetchedToolCatalog {
+    var transport = initial_transport;
+    const protocol = transport.protocol(server);
+    var pages = ToolCatalogPages.init(alloc, featureProtocol(protocol));
+    defer pages.deinit(alloc);
+    var producing_identity: ?feature_cache.Digest = null;
+    while (true) {
+        try reauthorizeOperation(
+            runtime,
+            access,
+            .{ .tool_server = server.config.name },
+        );
+        const request_id = try transport.next_request_id(server);
+        const request = try buildToolsListRequest(alloc, request_id, protocol, pages.cursor);
+        defer alloc.free(request);
+        var guard = ServerAccessPrecommit{
+            .runtime = runtime,
+            .target = .{ .tool_server = server.config.name },
+            .access = access,
+        };
+        var precommit = guard.transport();
+        var response = try transport.request_page(
+            alloc,
+            runtime,
+            server,
+            request_id,
+            request,
+            deadline,
+            cancel_flag,
+            access,
+            &precommit,
+        );
+        const received_at_ms = clockMillis();
+        defer response.deinit(alloc);
+        if (response.auth_identity) |page_identity| {
+            if (producing_identity) |identity| {
+                if (!std.mem.eql(u8, &identity, &page_identity)) {
+                    return error.McpAuthIdentityChangedDuringPagination;
+                }
+            } else {
+                producing_identity = page_identity;
+            }
+        }
+        if (try pages.append_response(
+            alloc,
+            response.body,
+            received_at_ms,
+            .preserve_until_owned,
+        )) return .{
+            .catalog = try pages.finish(alloc),
+            .auth_identity = producing_identity,
+        };
+    }
+}
 
 fn fetchModernHttpToolCatalogWithIds(
     alloc: Allocator,
@@ -8714,61 +8972,15 @@ fn fetchModernHttpToolCatalogAttempt(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !FetchedToolCatalog {
-    var builder = tools_feature.CatalogBuilder.init(alloc, .modern);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
-    var producing_identity: ?feature_cache.Digest = null;
-    while (true) {
-        try reauthorizeOperation(
-            runtime,
-            access,
-            .{ .tool_server = server.config.name },
-        );
-        const request_id = try request_ids.next();
-        const request = try buildToolsListRequest(alloc, request_id, .modern, cursor);
-        defer alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = runtime,
-            .target = .{ .tool_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        var page_identity: feature_cache.Digest = undefined;
-        var response = try authenticatedPost(alloc, alloc, server, .{
-            .url = try server.config.remoteUrl(),
-            .request_body = request,
-            .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
-            .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
-            .precommit = &precommit,
-            .control = .{
-                .deadline = deadline,
-                .cancel_flag = cancel_flag,
-                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-            },
-        }, .{
-            .runtime = runtime,
-            .access = access,
-            .target = .{ .tool_server = server.config.name },
-        }, .safe, &page_identity);
-        const received_at_ms = clockMillis();
-        defer response.deinit(alloc);
-        if (producing_identity) |identity| {
-            if (!std.mem.eql(u8, &identity, &page_identity)) {
-                return error.McpAuthIdentityChangedDuringPagination;
-            }
-        } else {
-            producing_identity = page_identity;
-        }
-        var page = try tools_feature.parseListPage(alloc, response.body, .modern, .{});
-        defer page.deinit(alloc);
-        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) return .{
-            .catalog = try builder.finish(alloc),
-            .auth_identity = producing_identity,
-        };
-    }
+    return fetch_tool_catalog_pages(
+        alloc,
+        runtime,
+        server,
+        .{ .modern_http = request_ids },
+        deadline,
+        cancel_flag,
+        access,
+    );
 }
 
 fn fetchModernHttpToolCatalog(
@@ -8798,45 +9010,16 @@ fn fetchLegacyHttpToolCatalog(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !tools_feature.Catalog {
-    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
-    while (true) {
-        try reauthorizeOperation(
-            server.runtime.?,
-            access,
-            .{ .tool_server = server.config.name },
-        );
-        const request_id = try reserveHttpRequestId(server);
-        const request = try buildToolsListRequest(alloc, request_id, .legacy, cursor);
-        defer alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = server.runtime.?,
-            .target = .{ .tool_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        const response = try client.request(alloc, .{
-            .request_id = request_id,
-            .request_body = request,
-            .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
-            .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
-            .precommit = &precommit,
-            .control = .{
-                .deadline = deadline,
-                .cancel_flag = cancel_flag,
-                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-            },
-        });
-        const received_at_ms = clockMillis();
-        defer alloc.free(response);
-        var page = try tools_feature.parseListPage(alloc, response, .legacy, .{});
-        defer page.deinit(alloc);
-        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) return builder.finish(alloc);
-    }
+    const fetched = try fetch_tool_catalog_pages(
+        alloc,
+        server.runtime.?,
+        server,
+        .{ .legacy_http = client },
+        deadline,
+        cancel_flag,
+        access,
+    );
+    return fetched.catalog;
 }
 
 fn fetchLegacySseToolCatalog(
@@ -8847,45 +9030,16 @@ fn fetchLegacySseToolCatalog(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !tools_feature.Catalog {
-    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
-    while (true) {
-        try reauthorizeOperation(
-            server.runtime.?,
-            access,
-            .{ .tool_server = server.config.name },
-        );
-        const request_id = try reserveHttpRequestId(server);
-        const request = try buildToolsListRequest(alloc, request_id, .legacy, cursor);
-        defer alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = server.runtime.?,
-            .target = .{ .tool_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        const response = try client.request(
-            alloc,
-            request_id,
-            request,
-            mcp_discovery_response_frame_cap_bytes,
-            .{
-                .deadline = deadline,
-                .cancel_flag = cancel_flag,
-                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-                .precommit = &precommit,
-            },
-        );
-        const received_at_ms = clockMillis();
-        defer alloc.free(response);
-        var page = try tools_feature.parseListPage(alloc, response, .legacy, .{});
-        defer page.deinit(alloc);
-        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) return builder.finish(alloc);
-    }
+    const fetched = try fetch_tool_catalog_pages(
+        alloc,
+        server.runtime.?,
+        server,
+        .{ .legacy_sse = client },
+        deadline,
+        cancel_flag,
+        access,
+    );
+    return fetched.catalog;
 }
 
 fn renderAuthenticationRequired(
@@ -8977,6 +9131,837 @@ fn loadStoredCredentials(
         server.auth_credentials != null,
         .release,
     );
+}
+
+test "operation deadline includes waiting for the connection lease" {
+    const io = std.testing.io;
+    var connection_lock: std.Io.RwLock = .init;
+    connection_lock.lockUncancelable(io);
+    defer connection_lock.unlock(io);
+
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(10),
+    });
+    try std.testing.expectError(
+        error.McpRequestTimedOut,
+        lockRwSharedUntil(&connection_lock, deadline, null),
+    );
+}
+
+test "MRTR tool snapshots bind server schemas and both generations" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.servers.deinit(alloc);
+
+    var server = McpServer{
+        .config = .{ .name = "fixture" },
+        .state = .ready,
+        .connection_generation = 7,
+        .catalog_generation = 11,
+    };
+    const cache_key = feature_cache.buildCacheKey(.{
+        .server_identity = "fixture",
+        .protocol_version = modern_protocol_version,
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .public,
+        .auth_identity = feature_cache.authIdentity(&.{}),
+    });
+    server.tool_catalog.metadata = .{
+        .key = cache_key,
+        .connection_generation = 7,
+        .catalog_generation = 11,
+        .fetched_at_ms = 1,
+        .expires_at_ms = 2,
+        .scope = .public,
+        .content_digest = feature_cache.authIdentity(&.{}),
+    };
+    try server.tool_catalog.tools.append(alloc, .{
+        .original_name = @constCast("echo"),
+        .prefixed_name = @constCast("mcp_fixture_echo"),
+        .description = @constCast("Echo"),
+        .input_schema_json = @constCast("{\"type\":\"object\"}"),
+        .tags = &.{},
+    });
+    try runtime.servers.append(alloc, server);
+    defer runtime.servers.items[0].tool_catalog.tools.deinit(alloc);
+
+    var snapshot = ToolCallSnapshot{
+        .server_name = @constCast("fixture"),
+        .original_name = @constCast("echo"),
+        .prefixed_name = @constCast("mcp_fixture_echo"),
+        .input_schema_json = @constCast("{\"type\":\"object\"}"),
+        .output_schema_json = null,
+        .cache_key = cache_key,
+        .connection_generation = 7,
+        .catalog_generation = 11,
+        .stdio_generation = null,
+    };
+    try std.testing.expect(runtime.serverForSnapshotLocked(&snapshot) != null);
+
+    runtime.servers.items[0].catalog_generation += 1;
+    try std.testing.expect(runtime.serverForSnapshotLocked(&snapshot) == null);
+    runtime.servers.items[0].catalog_generation = 11;
+    runtime.servers.items[0].connection_generation += 1;
+    try std.testing.expect(runtime.serverForSnapshotLocked(&snapshot) == null);
+    runtime.servers.items[0].connection_generation = 8;
+    runtime.servers.items[0].catalog_generation = 12;
+    try std.testing.expect(refreshSnapshotGenerationsIfIdentityMatches(
+        &runtime.servers.items[0],
+        &snapshot,
+        13,
+    ));
+    try std.testing.expectEqual(@as(u64, 8), snapshot.connection_generation);
+    try std.testing.expectEqual(@as(u64, 12), snapshot.catalog_generation);
+    try std.testing.expectEqual(@as(?u64, 13), snapshot.stdio_generation);
+    const other_cache_key = feature_cache.buildCacheKey(.{
+        .server_identity = "other-fixture",
+        .protocol_version = modern_protocol_version,
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .public,
+        .auth_identity = feature_cache.authIdentity(&.{}),
+    });
+    runtime.servers.items[0].tool_catalog.metadata.?.key = other_cache_key;
+    try std.testing.expect(runtime.serverForSnapshotLocked(&snapshot) == null);
+    try std.testing.expect(!refreshSnapshotGenerationsIfIdentityMatches(
+        &runtime.servers.items[0],
+        &snapshot,
+        14,
+    ));
+    runtime.servers.items[0].tool_catalog.metadata.?.key = cache_key;
+    runtime.servers.items[0].tool_catalog.tools.items[0].input_schema_json = @constCast(
+        "{\"type\":\"object\",\"additionalProperties\":false}",
+    );
+    try std.testing.expect(!refreshSnapshotGenerationsIfIdentityMatches(
+        &runtime.servers.items[0],
+        &snapshot,
+        14,
+    ));
+    try std.testing.expect(runtime.serverForSnapshotLocked(&snapshot) == null);
+}
+
+test "private catalog visibility is bound to the producing auth generation" {
+    var server = McpServer{ .config = .{ .name = "fixture" } };
+    server.tool_catalog.metadata = .{
+        .key = feature_cache.buildCacheKey(.{
+            .server_identity = "fixture",
+            .protocol_version = modern_protocol_version,
+            .capability = .tools_list,
+            .normalized_arguments = "{}",
+            .scope = .private,
+            .auth_identity = feature_cache.authIdentity(&.{}),
+        }),
+        .connection_generation = 1,
+        .catalog_generation = 1,
+        .fetched_at_ms = 1,
+        .expires_at_ms = 2,
+        .scope = .private,
+        .content_digest = feature_cache.authIdentity(&.{}),
+    };
+    server.tool_catalog.auth_generation = 3;
+    server.auth_generation.store(3, .release);
+    try std.testing.expect(serverCatalogAvailable(&server));
+    server.auth_generation.store(4, .release);
+    try std.testing.expect(!serverCatalogAvailable(&server));
+
+    server.tool_catalog.metadata.?.scope = .public;
+    try std.testing.expect(serverCatalogAvailable(&server));
+}
+
+test "interactive authentication publishes only to its live auth generation" {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    var caller_cancelled = std.atomic.Value(bool).init(false);
+    var server = McpServer{
+        .config = .{ .name = "fixture" },
+        .auth_generation = .init(7),
+    };
+    const cancellation = operation_control.CancellationSources{
+        .caller = &caller_cancelled,
+        .runtime = &runtime.retiring,
+    };
+
+    try McpRuntime.validateInteractiveAuthPublication(&server, 7, cancellation);
+    caller_cancelled.store(true, .release);
+    try std.testing.expectError(
+        error.Cancelled,
+        McpRuntime.validateInteractiveAuthPublication(&server, 7, cancellation),
+    );
+    caller_cancelled.store(false, .release);
+    server.auth_generation.store(8, .release);
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        McpRuntime.validateInteractiveAuthPublication(&server, 7, cancellation),
+    );
+    runtime.retiring.store(true, .release);
+    try std.testing.expectError(
+        error.Cancelled,
+        McpRuntime.validateInteractiveAuthPublication(&server, 8, cancellation),
+    );
+}
+
+test "a newer pending challenge invalidates interactive authentication publication" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    var server = McpServer{
+        .config = .{ .name = "fixture" },
+        .auth_generation = .init(7),
+    };
+    defer if (server.pending_auth_challenge) |*challenge| challenge.deinit(alloc);
+    const interactive_generation = server.auth_generation.load(.acquire);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+
+    try storePendingChallenge(
+        alloc,
+        &server,
+        .{
+            .scope = @constCast("files:write"),
+            .insufficient_scope = true,
+        },
+        .{ .deadline = deadline },
+    );
+
+    try std.testing.expectEqual(@as(u64, 8), server.auth_generation.load(.acquire));
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        McpRuntime.validateInteractiveAuthPublication(
+            &server,
+            interactive_generation,
+            .{ .runtime = &runtime.retiring },
+        ),
+    );
+    try std.testing.expect(server.pending_auth_challenge != null);
+    try std.testing.expectEqualStrings(
+        "files:write",
+        server.pending_auth_challenge.?.scope.?,
+    );
+}
+
+test "pending authentication challenge overrides stored credential health" {
+    const server = McpServer{
+        .config = .{ .name = "fixture" },
+        .auth_credentials_present = .init(true),
+        .auth_challenge_present = .init(true),
+    };
+    try std.testing.expectEqual(
+        health.AuthenticationState.required,
+        serverAuthenticationState(&server),
+    );
+}
+
+test "logout detachment fences auth publication until rollback" {
+    var server = McpServer{
+        .config = .{ .name = "fixture" },
+        .auth_credentials = .{
+            .endpoint = @constCast("https://mcp.example/rpc"),
+            .resource = @constCast("https://mcp.example/rpc"),
+            .issuer = @constCast("https://issuer.example"),
+            .client_id = @constCast("client"),
+            .access_token = @constCast("access"),
+            .refresh_token = @constCast("refresh"),
+            .scope = @constCast("tools.read"),
+            .token_type = @constCast("Bearer"),
+            .token_endpoint_auth_method = @constCast("none"),
+            .expires_at_ms = 0,
+            .authorization_endpoint = @constCast("https://issuer.example/authorize"),
+            .token_endpoint = @constCast("https://issuer.example/token"),
+        },
+        .pending_auth_challenge = .{
+            .scope = @constCast("tools.write"),
+            .insufficient_scope = true,
+        },
+        .auth_generation = .init(7),
+        .auth_credentials_present = .init(true),
+        .auth_challenge_present = .init(true),
+    };
+
+    var detached = McpRuntime.detachAuthForLogout(&server);
+    try std.testing.expectEqual(@as(u64, 7), server.auth_generation.load(.acquire));
+    try std.testing.expect(server.auth_logout_in_progress.load(.acquire));
+    try std.testing.expect(server.auth_credentials == null);
+    try std.testing.expect(!server.auth_credentials_present.load(.acquire));
+    try std.testing.expect(server.pending_auth_challenge == null);
+    try std.testing.expect(!server.auth_challenge_present.load(.acquire));
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        buildResolvedHeaders(std.testing.allocator, &server),
+    );
+
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    try std.testing.expect(!try refreshSharedCredentials(
+        std.testing.allocator,
+        &server,
+        .{ .deadline = deadline },
+    ));
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        storePendingChallenge(
+            std.testing.allocator,
+            &server,
+            .{ .scope = @constCast("tools.admin") },
+            .{ .deadline = deadline },
+        ),
+    );
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        authorizeForChallenge(
+            std.testing.allocator,
+            &server,
+            .{},
+            .{ .deadline = deadline },
+        ),
+    );
+
+    detached.restore(&server);
+    try std.testing.expect(!server.auth_logout_in_progress.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 7), server.auth_generation.load(.acquire));
+    try std.testing.expect(server.auth_credentials_present.load(.acquire));
+    try std.testing.expect(server.auth_challenge_present.load(.acquire));
+    server.auth_credentials = null;
+    server.pending_auth_challenge = null;
+}
+
+test "private feature catalog visibility is bound to each producing auth generation" {
+    var server = McpServer{ .config = .{ .name = "fixture" } };
+    const metadata = feature_cache.SnapshotMetadata{
+        .key = feature_cache.buildCacheKey(.{
+            .server_identity = "fixture",
+            .protocol_version = modern_protocol_version,
+            .capability = .resources_list,
+            .normalized_arguments = "{}",
+            .scope = .private,
+            .auth_identity = feature_cache.authIdentity(&.{}),
+        }),
+        .connection_generation = 1,
+        .catalog_generation = 1,
+        .fetched_at_ms = 1,
+        .expires_at_ms = 2,
+        .scope = .private,
+        .content_digest = feature_cache.authIdentity(&.{}),
+    };
+    server.resource_catalog.metadata = metadata;
+    server.resource_catalog.auth_generation = 3;
+    server.resource_catalog.available = true;
+    server.resource_template_catalog.metadata = metadata;
+    server.resource_template_catalog.auth_generation = 3;
+    server.resource_template_catalog.available = true;
+    server.prompt_catalog.metadata = metadata;
+    server.prompt_catalog.auth_generation = 3;
+    server.prompt_catalog.available = true;
+    server.auth_generation.store(3, .release);
+
+    inline for ([_]FeatureCatalogKind{ .resources, .resource_templates, .prompts }) |kind| {
+        try std.testing.expect(featureCatalogAvailable(&server, kind));
+        try std.testing.expectEqual(@as(?u64, 3), featureCatalogAuthWitness(&server, kind));
+    }
+    server.auth_generation.store(4, .release);
+    inline for ([_]FeatureCatalogKind{ .resources, .resource_templates, .prompts }) |kind| {
+        try std.testing.expect(!featureCatalogAvailable(&server, kind));
+        try std.testing.expectError(
+            error.McpFeatureCatalogChanged,
+            validateFeatureCatalogAuthWitness(&server, featureCatalogAuthWitness(&server, kind)),
+        );
+    }
+
+    server.resource_catalog.metadata.?.scope = .public;
+    server.resource_template_catalog.metadata.?.scope = .public;
+    server.prompt_catalog.metadata.?.scope = .public;
+    inline for ([_]FeatureCatalogKind{ .resources, .resource_templates, .prompts }) |kind| {
+        try std.testing.expect(featureCatalogAvailable(&server, kind));
+        try std.testing.expectEqual(@as(?u64, null), featureCatalogAuthWitness(&server, kind));
+    }
+}
+
+test "feature catalog digests cover resource size and every feature icon field" {
+    var resources_without = [_]resources_feature.Descriptor{.{
+        .uri = @constCast("memory://one"),
+        .name = @constCast("one"),
+    }};
+    var resources_with_size = resources_without;
+    resources_with_size[0].size = 7;
+    var resources_with_icons = resources_without;
+    resources_with_icons[0].icons_json = @constCast("[{\"src\":\"memory://icon\"}]");
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &digestResources(&resources_without),
+        &digestResources(&resources_with_size),
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &digestResources(&resources_without),
+        &digestResources(&resources_with_icons),
+    ));
+
+    var templates_without = [_]resources_feature.Template{.{
+        .uri_template = @constCast("memory:///{id}"),
+        .name = @constCast("one"),
+    }};
+    var templates_with_icons = templates_without;
+    templates_with_icons[0].icons_json = @constCast("[{\"src\":\"memory://icon\"}]");
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &digestResourceTemplates(&templates_without),
+        &digestResourceTemplates(&templates_with_icons),
+    ));
+
+    var no_arguments: [0]prompts_feature.Argument = .{};
+    var prompts_without = [_]prompts_feature.Prompt{.{
+        .name = @constCast("review"),
+        .arguments = &no_arguments,
+    }};
+    var prompts_with_icons = prompts_without;
+    prompts_with_icons[0].icons_json = @constCast("[{\"src\":\"memory://icon\"}]");
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &digestPrompts(&prompts_without),
+        &digestPrompts(&prompts_with_icons),
+    ));
+
+    const first = digestResources(&resources_with_icons);
+    const equivalent = digestResources(&resources_with_icons);
+    try std.testing.expectEqualSlices(u8, &first, &equivalent);
+}
+
+test "operation deadline includes waiting for the shared catalog" {
+    const io = std.testing.io;
+    var catalog_lock: std.Io.RwLock = .init;
+    catalog_lock.lockUncancelable(io);
+    defer catalog_lock.unlock(io);
+
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(10),
+    });
+    try std.testing.expectError(
+        error.McpRequestTimedOut,
+        lockRwSharedUntil(&catalog_lock, deadline, null),
+    );
+}
+
+test "authentication waits observe operation cancellation before state changes" {
+    const alloc = std.testing.allocator;
+    var server = McpServer{ .config = .{ .name = "fixture" } };
+    server.auth_lock.lockUncancelable(std.testing.io);
+    defer server.auth_lock.unlock(std.testing.io);
+    var cancel = std.atomic.Value(bool).init(true);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+
+    try std.testing.expectError(
+        error.Cancelled,
+        storePendingChallenge(
+            alloc,
+            &server,
+            .{},
+            .{
+                .deadline = deadline,
+                .cancel_flag = &cancel,
+            },
+        ),
+    );
+    try std.testing.expect(server.pending_auth_challenge == null);
+}
+
+test "runtime-wide recovery serialization observes the operation deadline" {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    runtime.recovery_mutex.lockUncancelable(std.testing.io);
+    defer runtime.recovery_mutex.unlock(std.testing.io);
+
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(10),
+    });
+    try std.testing.expectError(
+        error.McpRequestTimedOut,
+        lockMutexUntil(&runtime.recovery_mutex, deadline, null),
+    );
+}
+
+test "guarded stdio subscription startup releases catalog locks before transport commit" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "sh", "-c", "while IFS= read -r request; do :; done" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const dispatcher = try stdio_dispatcher.StdioDispatcher.create(
+        std.testing.allocator,
+        std.heap.c_allocator,
+        child,
+        1,
+        4096,
+    );
+    defer dispatcher.deinit();
+
+    var runtime = McpRuntime.init(std.testing.allocator);
+    var server = McpServer{
+        .config = .{
+            .name = "fixture",
+            .startup_timeout_ms = 2_000,
+        },
+        .runtime = &runtime,
+        .dispatcher = dispatcher,
+        .connection_generation = 1,
+        .stdio_protocol = .modern,
+        .tools_list_changed = true,
+    };
+    defer if (server.tool_subscription) |subscription| subscription.stopAndDestroy();
+
+    const Attempt = struct {
+        server: *McpServer,
+        cancel: *std.atomic.Value(bool),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            startToolSubscriptionGuarded(
+                std.testing.allocator,
+                self.server,
+                std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+                    .clock = .awake,
+                    .raw = .fromSeconds(2),
+                }),
+                self.cancel,
+            ) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var attempt = Attempt{ .server = &server, .cancel = &cancel };
+    dispatcher.write_mutex.lockUncancelable(std.testing.io);
+    var write_locked = true;
+    defer if (write_locked) dispatcher.write_mutex.unlock(std.testing.io);
+    const thread = try std.Thread.spawn(.{}, Attempt.run, .{&attempt});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    const registered_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    while (dispatcher.pendingRequestCount() == 0) {
+        if (!std.Io.Clock.Timestamp.compare(
+            std.Io.Clock.Timestamp.now(std.testing.io, .awake),
+            .lt,
+            registered_deadline,
+        )) return error.McpSubscriptionNotRegistered;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    const lock_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(250),
+    });
+    try lockRwUntil(&runtime.catalog_mutex, lock_deadline, null);
+    runtime.catalog_mutex.unlock(std.testing.io);
+    try lockMutexUntil(&server.catalog_commit_lock, lock_deadline, null);
+    server.catalog_commit_lock.unlock(std.testing.io);
+
+    cancel.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(error.Cancelled, attempt.err.?);
+    try std.testing.expect(server.tool_subscription == null);
+    try std.testing.expectEqual(@as(usize, 0), dispatcher.pendingRequestCount());
+    try std.testing.expect(!dispatcher.hasNotificationSink());
+
+    dispatcher.write_mutex.unlock(std.testing.io);
+    write_locked = false;
+}
+
+test "runtime shutdown releases catalog locks before subscription cancellation write" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    var runtime_live = true;
+    defer if (runtime_live) runtime.deinit();
+    {
+        const name = try alloc.dupe(u8, "fixture");
+        errdefer alloc.free(name);
+        const command = try alloc.dupe(u8, "fixture");
+        errdefer alloc.free(command);
+        try runtime.addServer(.{
+            .name = name,
+            .command = command,
+            .startup_timeout_ms = 2_000,
+        });
+    }
+
+    const child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "sh", "-c", "while IFS= read -r request; do :; done" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const child_pid = child.id orelse return error.McpProcessNotStarted;
+    const dispatcher = try stdio_dispatcher.StdioDispatcher.create(
+        alloc,
+        std.heap.c_allocator,
+        child,
+        1,
+        4096,
+    );
+    const server = &runtime.servers.items[0];
+    server.dispatcher = dispatcher;
+    server.connection_generation = 1;
+    server.stdio_protocol = .modern;
+    server.tools_list_changed = true;
+    try startToolSubscriptionGuarded(
+        alloc,
+        server,
+        std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+            .clock = .awake,
+            .raw = .fromSeconds(2),
+        }),
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), dispatcher.pendingRequestCount());
+    try std.testing.expect(dispatcher.hasNotificationSink());
+
+    const Attempt = struct {
+        runtime: *McpRuntime,
+        finished: *std.atomic.Value(bool),
+
+        fn run(self: @This()) void {
+            self.runtime.deinit();
+            self.finished.store(true, .release);
+        }
+    };
+
+    dispatcher.write_mutex.lockUncancelable(std.testing.io);
+    var write_locked = true;
+    var finished = std.atomic.Value(bool).init(false);
+    var thread: std.Thread = undefined;
+    var spawned = false;
+    var joined = false;
+    defer {
+        if (write_locked) dispatcher.write_mutex.unlock(std.testing.io);
+        if (spawned) {
+            if (!joined) thread.join();
+            runtime_live = false;
+        }
+    }
+    thread = try std.Thread.spawn(.{}, Attempt.run, .{Attempt{
+        .runtime = &runtime,
+        .finished = &finished,
+    }});
+    spawned = true;
+
+    const cancellation_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    while (dispatcher.pendingRequestCount() != 0) {
+        if (!std.Io.Clock.Timestamp.compare(
+            std.Io.Clock.Timestamp.now(std.testing.io, .awake),
+            .lt,
+            cancellation_deadline,
+        )) return error.McpSubscriptionCancellationNotObserved;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(dispatcher.hasNotificationSink());
+    try std.testing.expect(!finished.load(.acquire));
+
+    const lock_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(250),
+    });
+    try lockRwUntil(&runtime.catalog_mutex, lock_deadline, null);
+    runtime.catalog_mutex.unlock(std.testing.io);
+    try lockMutexUntil(&server.catalog_commit_lock, lock_deadline, null);
+    server.catalog_commit_lock.unlock(std.testing.io);
+
+    dispatcher.write_mutex.unlock(std.testing.io);
+    write_locked = false;
+    thread.join();
+    joined = true;
+    try std.testing.expect(finished.load(.acquire));
+    try expectTestProcessExited(child_pid);
+}
+
+test "tool authentication can update credentials without replay authorization" {
+    try std.testing.expectEqual(
+        AuthRejectionAction.authorize_without_retry,
+        authRejectionAction(true, .never, 0),
+    );
+    try std.testing.expectEqual(
+        AuthRejectionAction.authorize_and_retry,
+        authRejectionAction(true, .safe, 0),
+    );
+    try std.testing.expectEqual(
+        AuthRejectionAction.require_interactive,
+        authRejectionAction(false, .never, 0),
+    );
+}
+
+test "legacy credential reconnect compares the complete auth identity" {
+    const current = feature_cache.authIdentity(&.{
+        .{ .name = "Authorization", .value = "Bearer current-token" },
+    });
+    const same = feature_cache.authIdentity(&.{
+        .{ .name = "Authorization", .value = "Bearer current-token" },
+    });
+    const stale = feature_cache.authIdentity(&.{
+        .{ .name = "Authorization", .value = "Bearer stale-token" },
+    });
+    try std.testing.expect(!authIdentitiesDiffer(current, same));
+    try std.testing.expect(authIdentitiesDiffer(current, stale));
+}
+
+test "recovery cancellation interrupts the catalog wait before state changes" {
+    const RecoveryWait = struct {
+        runtime: *McpRuntime,
+        server: *McpServer,
+        cancel: *std.atomic.Value(bool),
+        started: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+                .clock = .awake,
+                .raw = .fromSeconds(2),
+            });
+            self.runtime.recoverServer(self.server, 1, deadline, self.cancel, null) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+
+    var runtime = McpRuntime.init(std.testing.allocator);
+    var server = McpServer{ .config = .{ .name = "fixture" } };
+    var cancel = std.atomic.Value(bool).init(false);
+    runtime.catalog_mutex.lockUncancelable(std.testing.io);
+    defer runtime.catalog_mutex.unlock(std.testing.io);
+
+    var wait = RecoveryWait{
+        .runtime = &runtime,
+        .server = &server,
+        .cancel = &cancel,
+    };
+    const thread = try std.Thread.spawn(.{}, RecoveryWait.run, .{&wait});
+    while (!wait.started.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+    io_mod.sleep(10 * std.time.ns_per_ms);
+    cancel.store(true, .release);
+    thread.join();
+
+    try std.testing.expectEqual(error.Cancelled, wait.err.?);
+    try std.testing.expectEqual(@as(u8, 0), server.restart_attempts);
+    try std.testing.expectEqual(@as(u64, 0), server.last_recovery_generation);
+    try std.testing.expect(server.dispatcher == null);
+}
+
+test "scoped stdio recovery rejects revoked authority before state changes" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "fixture"),
+        .command = try alloc.dupe(u8, "/definitely/not/an/fx-mcp-fixture"),
+    });
+    const server = &runtime.servers.items[0];
+    server.state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        server,
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+    var captured = try runtime.snapshotAccessView(alloc, "child", "parent", .{}, true);
+    defer captured.deinit(alloc);
+    var revoked = try captured.clone(alloc);
+    defer revoked.deinit(alloc);
+    revoked.servers[0].auth_generation += 1;
+
+    const LiveProvider = struct {
+        view: *const access_policy.View,
+
+        fn resolve(raw: *anyopaque, provider_alloc: Allocator) !tool_mcp_runtime.ResolvedLiveView {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const view = try self.view.clone(provider_alloc);
+            return .{
+                .authority_generation = access_policy.authorityGeneration(view),
+                .view = view,
+            };
+        }
+    };
+    var provider = LiveProvider{ .view = &revoked };
+    const access = tool_mcp_runtime.Access{ .scoped = .{
+        .captured = &captured,
+        .admission_authority_generation = access_policy.authorityGeneration(captured),
+        .live = .{
+            .context = @ptrCast(&provider),
+            .resolve_fn = LiveProvider.resolve,
+        },
+    } };
+    var guard = ServerAccessPrecommit{
+        .runtime = &runtime,
+        .target = .{ .tool = "mcp_fixture_echo" },
+        .access = access,
+    };
+    var precommit = guard.transport();
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.recoverServer(server, 1, deadline, null, &precommit),
+    );
+    try std.testing.expectEqual(@as(u8, 0), server.restart_attempts);
+    try std.testing.expectEqual(@as(u64, 0), server.last_recovery_generation);
+    try std.testing.expect(server.dispatcher == null);
+}
+
+test "failed recovery leaves its remaining generation budget reachable" {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    var server = McpServer{ .config = .{
+        .name = "fixture",
+        .command = "/definitely/not/an/fx-mcp-fixture",
+        .restart_limit = 2,
+    } };
+    defer if (server.last_error) |message| std.testing.allocator.free(message);
+
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    runtime.recoverServer(&server, 1, deadline, null, null) catch {};
+
+    try std.testing.expectEqual(@as(u8, 1), server.restart_attempts);
+    try std.testing.expectEqual(@as(u64, 0), server.last_recovery_generation);
+    try std.testing.expect(server.dispatcher == null);
+
+    runtime.recoverServer(&server, 1, deadline, null, null) catch {};
+    try std.testing.expectEqual(@as(u8, 2), server.restart_attempts);
+    try std.testing.expectEqual(@as(u64, 0), server.last_recovery_generation);
+
+    try std.testing.expectError(
+        error.McpRestartLimitReached,
+        runtime.recoverServer(&server, 1, deadline, null, null),
+    );
+    try std.testing.expectEqual(@as(u64, 1), server.last_recovery_generation);
 }
 
 const StdioCallOutcome = struct {
@@ -9176,6 +10161,64 @@ fn connectionAttemptControl(
     );
     attempt.use_startup_timeout = false;
     return attempt;
+}
+
+test "discovery startup timeout selection preserves each configured value" {
+    const Case = struct {
+        configured_ms: u32,
+        expected_ms: i64,
+    };
+    const cases = [_]Case{
+        .{ .configured_ms = 5_000, .expected_ms = 5_000 },
+        .{ .configured_ms = 30_000, .expected_ms = 30_000 },
+        .{ .configured_ms = 60_000, .expected_ms = 60_000 },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected_ms,
+            startupTimeout(case.configured_ms, null).toMilliseconds(),
+        );
+    }
+
+    const per_server = [_]u32{ 250, 2_000, 60_000 };
+    for (per_server) |configured_ms| {
+        try std.testing.expectEqual(
+            @as(i64, configured_ms),
+            startupTimeout(configured_ms, null).toMilliseconds(),
+        );
+    }
+}
+
+test "discovery startup deadline passes sixty seconds through without waiting" {
+    const now = std.Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = .{ .nanoseconds = 123 * std.time.ns_per_ms },
+    };
+    const deadline = startupDeadline(now, 60_000, null);
+    try std.testing.expectEqual(
+        @as(i64, 60_000),
+        now.durationTo(deadline).raw.toMilliseconds(),
+    );
+}
+
+test "discovery timeout override stays private and deadline addition saturates" {
+    try std.testing.expectEqual(
+        @as(i64, 60_000),
+        startupTimeout(60_000, null).toMilliseconds(),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 2_000),
+        startupTimeout(60_000, .fromSeconds(2)).toMilliseconds(),
+    );
+
+    const near_max = std.Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = .{ .nanoseconds = std.math.maxInt(i96) - 1 },
+    };
+    try std.testing.expectEqual(
+        std.math.maxInt(i96),
+        startupDeadline(near_max, 1, null).raw.nanoseconds,
+    );
 }
 
 fn connectServerForDiscovery(
@@ -9636,13 +10679,11 @@ fn discoverServerTools(
     control: ConnectionControl,
 ) !void {
     const dispatcher = server.dispatcher orelse return error.McpConnectionClosed;
-    var builder = tools_feature.CatalogBuilder.init(alloc, featureProtocol(protocol));
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
+    var pages = ToolCatalogPages.init(alloc, featureProtocol(protocol));
+    defer pages.deinit(alloc);
     while (true) {
         const request_id = try dispatcher.reserveRequestId();
-        const tools_request = try buildToolsListRequest(alloc, request_id, protocol, cursor);
+        const tools_request = try buildToolsListRequest(alloc, request_id, protocol, pages.cursor);
         defer alloc.free(tools_request);
         const tools_response = dispatcher.request(
             alloc,
@@ -9665,14 +10706,14 @@ fn discoverServerTools(
         };
         const received_at_ms = clockMillis();
         defer alloc.free(tools_response);
-        var page = try tools_feature.parseListPage(alloc, tools_response, featureProtocol(protocol), .{});
-        defer page.deinit(alloc);
-        if (cursor) |value| alloc.free(value);
-        cursor = if (page.next_cursor) |value| try alloc.dupe(u8, value) else null;
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) break;
+        if (try pages.append_response(
+            alloc,
+            tools_response,
+            received_at_ms,
+            .release_before_alloc,
+        )) break;
     }
-    var catalog = try builder.finish(alloc);
+    var catalog = try pages.finish(alloc);
     defer catalog.deinit(alloc);
     try storeProtocolTools(alloc, server, tool_registry, catalog, used_tool_names, protocol, null);
     try startToolSubscription(alloc, server, control);
@@ -9847,6 +10888,51 @@ fn sanitizeServerInstructionsAlloc(alloc: Allocator, text: []const u8) ![]u8 {
     const masked = try text_utils.maskSecrets(arena, safe);
     const trimmed = std.mem.trim(u8, masked, " \t\r\n");
     return try alloc.dupe(u8, trimmed);
+}
+
+fn parseAndStoreTools(
+    alloc: Allocator,
+    server: *McpServer,
+    tool_registry: tool_dispatch.Registry,
+    response: []const u8,
+    used_tool_names: *std.StringHashMap(void),
+) !void {
+    return parseAndStoreToolsForProtocol(alloc, server, tool_registry, response, used_tool_names, .legacy);
+}
+
+fn parseAndStoreToolsForProtocol(
+    alloc: Allocator,
+    server: *McpServer,
+    tool_registry: tool_dispatch.Registry,
+    response: []const u8,
+    used_tool_names: *std.StringHashMap(void),
+    protocol: StdioProtocol,
+) !void {
+    const received_at_ms = clockMillis();
+    var page = tools_feature.parseListPage(
+        alloc,
+        response,
+        featureProtocol(protocol),
+        .{},
+    ) catch |err| {
+        server.setFailed(alloc, @errorName(err));
+        return err;
+    };
+    defer page.deinit(alloc);
+    var builder = tools_feature.CatalogBuilder.init(alloc, featureProtocol(protocol));
+    defer builder.deinit(alloc);
+    try builder.appendPage(alloc, &page, received_at_ms, .{});
+    var catalog = try builder.finish(alloc);
+    defer catalog.deinit(alloc);
+    try storeProtocolTools(
+        alloc,
+        server,
+        tool_registry,
+        catalog,
+        used_tool_names,
+        protocol,
+        null,
+    );
 }
 
 fn storeProtocolTools(
@@ -10742,18 +11828,18 @@ fn buildToolSchemaJsonWithLimitMarker(
 const ToolSearchMatch = struct {
     server: *McpServer,
     tool: *const McpTool,
-    score: lexical_relevance.Score,
 };
 
 fn renderSearchResult(
     alloc: Allocator,
     matches: []const ToolSearchMatch,
     selected_count: usize,
+    total_matches: usize,
+    next_cursor: ?[]const u8,
     description_limit: context_limits.Resolved,
     result_limit: context_limits.Resolved,
     observed_bytes: usize,
     limit_triggered: bool,
-    more_available: bool,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -10762,8 +11848,11 @@ fn renderSearchResult(
         if (index > 0) try out.writer.writeByte(',');
         try writeToolMetadataJson(alloc, &out.writer, match, description_limit);
     }
-    try out.writer.print("],\"count\":{d}", .{selected_count});
-    if (more_available) try out.writer.writeAll(",\"more_available\":true");
+    try out.writer.print(
+        "],\"count\":{d},\"total_matches\":{d},\"more_available\":{s},\"next_cursor\":",
+        .{ selected_count, total_matches, if (next_cursor != null) "true" else "false" },
+    );
+    try std.json.Stringify.value(next_cursor, .{}, &out.writer);
     if (limit_triggered) {
         try out.writer.print(
             ",\"context_limit\":{{\"name\":\"mcp_search_result_bytes\",\"action\":\"omitted\",\"omitted_count\":{d},\"observed_bytes\":{d},\"effective_bytes\":{d},\"source\":",
@@ -11836,15 +12925,13 @@ fn connectServerLegacyHttp(
         return err;
     };
 
-    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
+    var pages = ToolCatalogPages.init(alloc, .legacy);
+    defer pages.deinit(alloc);
     while (true) {
         const tools_id = next_request_id.*;
         next_request_id.* = std.math.add(u64, tools_id, 1) catch
             return error.McpRequestIdExhausted;
-        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, cursor);
+        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, pages.cursor);
         defer alloc.free(tools_request);
         const tools_response = initialized.client.request(alloc, .{
             .request_id = tools_id,
@@ -11873,14 +12960,14 @@ fn connectServerLegacyHttp(
         };
         const received_at_ms = clockMillis();
         defer alloc.free(tools_response);
-        var page = try tools_feature.parseListPage(alloc, tools_response, .legacy, .{});
-        defer page.deinit(alloc);
-        if (cursor) |value| alloc.free(value);
-        cursor = if (page.next_cursor) |value| try alloc.dupe(u8, value) else null;
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) break;
+        if (try pages.append_response(
+            alloc,
+            tools_response,
+            received_at_ms,
+            .release_before_alloc,
+        )) break;
     }
-    var catalog = try builder.finish(alloc);
+    var catalog = try pages.finish(alloc);
     defer catalog.deinit(alloc);
     try storeProtocolTools(alloc, server, tool_registry, catalog, used_tool_names, .legacy, null);
 
@@ -13250,15 +14337,13 @@ fn connectServerSse(
         return err;
     };
 
-    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
+    var pages = ToolCatalogPages.init(alloc, .legacy);
+    defer pages.deinit(alloc);
     while (true) {
         const tools_id = next_request_id;
         next_request_id = std.math.add(u64, tools_id, 1) catch
             return error.McpRequestIdExhausted;
-        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, cursor);
+        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, pages.cursor);
         defer alloc.free(tools_request);
         const tools_response = client.request(
             alloc,
@@ -13287,14 +14372,14 @@ fn connectServerSse(
         };
         const received_at_ms = clockMillis();
         defer alloc.free(tools_response);
-        var page = try tools_feature.parseListPage(alloc, tools_response, .legacy, .{});
-        defer page.deinit(alloc);
-        if (cursor) |value| alloc.free(value);
-        cursor = if (page.next_cursor) |value| try alloc.dupe(u8, value) else null;
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) break;
+        if (try pages.append_response(
+            alloc,
+            tools_response,
+            received_at_ms,
+            .release_before_alloc,
+        )) break;
     }
-    var catalog = try builder.finish(alloc);
+    var catalog = try pages.finish(alloc);
     defer catalog.deinit(alloc);
     try storeProtocolTools(alloc, server, tool_registry, catalog, used_tool_names, .legacy, null);
 
@@ -13518,6 +14603,1922 @@ fn candidateWithSuffix(alloc: Allocator, base: []const u8, suffix_index: ?usize)
     return alloc.dupe(u8, base[0..@min(base.len, max_name_len)]);
 }
 
+fn checkAllocateToolNameCollisionAllocFailures(alloc: Allocator) !void {
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    try used.put("mcp_a_b_c", {});
+
+    const name = allocateToolName(alloc, .{}, &used, "a b", "c") catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer alloc.free(name);
+
+    try std.testing.expectEqualStrings("mcp_a_b_c_2", name);
+}
+
+test "legacy URL waiter records every matching completion and ignores stale identities" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    const ids = [_][]const u8{ "one", "two" };
+    var completed = [_]bool{ false, false };
+    var waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .connection_generation = 1,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 4,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try runtime.registerLegacyUrlWaiter(&waiter);
+    defer runtime.unregisterLegacyUrlWaiter(&waiter);
+
+    runtime.recordLegacyUrlCompletion(.{
+        .server_name = "server",
+        .elicitation_id = "one",
+        .connection_generation = 9,
+        .client_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = 5,
+    });
+    try std.testing.expectEqualSlices(bool, &.{ false, false }, &completed);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.pending,
+        waiter.signal.status.load(.acquire),
+    );
+
+    runtime.recordLegacyUrlCompletion(.{
+        .server_name = "server",
+        .elicitation_id = "one",
+        .connection_generation = 1,
+        .client_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = 5,
+    });
+    runtime.recordLegacyUrlCompletion(.{
+        .server_name = "server",
+        .elicitation_id = "one",
+        .connection_generation = 1,
+        .client_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = 5,
+    });
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &completed);
+    try std.testing.expect(!waiter.signal.wake.load(.acquire));
+
+    runtime.recordLegacyUrlCompletionFromWire(.{
+        .server_name = "server",
+        .elicitation_id = "two",
+        .connection_generation = 1,
+        .client_generation = 2,
+        .auth_generation = 5,
+    });
+    try std.testing.expectEqualSlices(bool, &.{ true, true }, &completed);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.completed,
+        waiter.signal.status.load(.acquire),
+    );
+    try std.testing.expect(waiter.signal.wake.load(.acquire));
+}
+
+test "legacy completion routing keeps recovered connection identities distinct" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.servers.append(alloc, .{
+        .config = .{ .name = try alloc.dupe(u8, "server") },
+        .runtime = &runtime,
+        .state = .ready,
+        .connection_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = .init(5),
+    });
+    const ids = [_][]const u8{"same-id"};
+    var completed = [_]bool{false};
+    var waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 4,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try runtime.registerLegacyUrlWaiter(&waiter);
+    defer runtime.unregisterLegacyUrlWaiter(&waiter);
+    const Capture = struct {
+        accepted: usize = 0,
+        consumed: usize = 0,
+        published: usize = 0,
+
+        fn accept(
+            raw: *anyopaque,
+            _: tool_mcp_runtime.InputOrigin,
+            _: []const u8,
+        ) tool_mcp_runtime.LegacyUrlAcceptTransition {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.accepted += 1;
+            return .awaiting_completion;
+        }
+
+        fn consume(
+            raw: *anyopaque,
+            _: tool_mcp_runtime.LegacyUrlCompletion,
+        ) tool_mcp_runtime.LegacyUrlConsumeTransition {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.consumed += 1;
+            return .{ .consumed = @constCast("publication") };
+        }
+
+        fn publish(raw: *anyopaque, id: []u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(std.mem.eql(u8, id, "publication"));
+            self.published += 1;
+        }
+    };
+    var capture = Capture{};
+    runtime.setLegacyUrlCompletionSink(.{
+        .context = @ptrCast(&capture),
+        .accept = Capture.accept,
+        .consume = Capture.consume,
+        .publish = Capture.publish,
+    });
+    waiter.binding.runtime_generation = runtime.legacy_url_runtime_generation;
+    const stale_origin = tool_mcp_runtime.InputOrigin{
+        .wire = .legacy_mcp_2025_11,
+        .server_name = "server",
+        .operation = .{ .tools_call = "authorize" },
+        .runtime_generation = runtime.legacy_url_runtime_generation,
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 3,
+        .request_generation = 4,
+        .auth_generation = 5,
+        .deadline_ms = std.math.maxInt(i64),
+    };
+    try std.testing.expect(runtime.acceptLegacyUrlCompletion(
+        stale_origin,
+        "same-id",
+        runtime.legacy_url_completion_sink.?,
+    ) == null);
+    try std.testing.expectEqual(@as(usize, 0), capture.accepted);
+    var current_origin = stale_origin;
+    current_origin.connection_generation = 2;
+    current_origin.client_generation = 2;
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlAcceptStatus.awaiting_completion,
+        runtime.acceptLegacyUrlCompletion(
+            current_origin,
+            "same-id",
+            runtime.legacy_url_completion_sink.?,
+        ).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.accepted);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"same-id\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+    routeLegacyCompletionNotification(&runtime, .{
+        .server_name = "server",
+        .connection_generation = 1,
+        .client_generation = 1,
+        .auth_generation = 5,
+    }, parsed.value);
+    try std.testing.expect(!completed[0]);
+    try std.testing.expectEqual(@as(usize, 0), capture.consumed);
+    try std.testing.expectEqual(@as(usize, 0), capture.published);
+
+    routeLegacyCompletionNotification(&runtime, .{
+        .server_name = "server",
+        .connection_generation = 2,
+        .client_generation = 2,
+        .auth_generation = 5,
+    }, parsed.value);
+    try std.testing.expect(completed[0]);
+    try std.testing.expectEqual(@as(usize, 1), capture.consumed);
+    try std.testing.expectEqual(@as(usize, 1), capture.published);
+}
+
+test "legacy URL completions require an established unique candidate before replay" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.servers.append(alloc, .{
+        .config = .{ .name = try alloc.dupe(u8, "server") },
+        .runtime = &runtime,
+        .state = .ready,
+        .connection_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = .init(5),
+    });
+    const Capture = struct {
+        alloc: Allocator,
+        available: bool = false,
+        consumed: usize = 0,
+        published: usize = 0,
+
+        fn accept(
+            _: *anyopaque,
+            _: tool_mcp_runtime.InputOrigin,
+            _: []const u8,
+        ) tool_mcp_runtime.LegacyUrlAcceptTransition {
+            return .missing;
+        }
+
+        fn consume(
+            raw: *anyopaque,
+            _: tool_mcp_runtime.LegacyUrlCompletion,
+        ) tool_mcp_runtime.LegacyUrlConsumeTransition {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.available) return .missing;
+            self.consumed += 1;
+            return .{ .consumed = self.alloc.dupe(u8, "acp-early") catch null };
+        }
+
+        fn publish(raw: *anyopaque, id: []u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.alloc.free(id);
+            self.published += 1;
+        }
+    };
+    var capture = Capture{ .alloc = alloc };
+    runtime.setLegacyUrlCompletionSink(.{
+        .context = @ptrCast(&capture),
+        .accept = Capture.accept,
+        .consume = Capture.consume,
+        .publish = Capture.publish,
+    });
+    const source = tool_subscription.NotificationSource{
+        .server_name = "server",
+        .connection_generation = 2,
+        .client_generation = 2,
+        .auth_generation = 5,
+    };
+    var direct = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"direct\"}}",
+        .{},
+    );
+    defer direct.deinit();
+
+    // A valid-looking completion is still unknown until the corresponding
+    // request or URL-required response establishes its id.
+    routeLegacyCompletionNotification(&runtime, source, direct.value);
+    try std.testing.expectEqual(@as(usize, 0), runtime.early_legacy_url_completions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.legacy_url_completion_candidates.items.len);
+
+    // HTTP response and notification streams can race. A bounded operation
+    // window retains the frame only until the exact response candidate arrives.
+    const window_generation = try runtime.beginLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+    );
+    defer runtime.endLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+        window_generation,
+    );
+    routeLegacyCompletionNotification(&runtime, source, direct.value);
+    try std.testing.expectEqual(@as(usize, 1), runtime.early_legacy_url_completions.items.len);
+    const direct_ids = [_][]const u8{"direct"};
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        runtime.legacy_url_runtime_generation,
+        window_generation,
+        &direct_ids,
+    );
+    try std.testing.expectEqual(@as(usize, 0), runtime.early_legacy_url_completions.items.len);
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.early,
+        runtime.legacy_url_completion_candidates.items[0].status,
+    );
+
+    capture.available = true;
+    runtime.reconcileLegacyUrlCompletion(.{
+        .wire = .legacy_mcp_2025_11,
+        .server_name = "server",
+        .operation = .{ .tools_call = "authorize" },
+        .runtime_generation = runtime.legacy_url_runtime_generation,
+        .connection_generation = 2,
+        .client_generation = 2,
+        .catalog_generation = 3,
+        .request_generation = 1,
+        .auth_generation = 5,
+        .deadline_ms = std.math.maxInt(i64),
+    }, "direct", runtime.legacy_url_completion_sink.?);
+    try std.testing.expectEqual(@as(usize, 1), capture.consumed);
+    try std.testing.expectEqual(@as(usize, 1), capture.published);
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.handled,
+        runtime.legacy_url_completion_candidates.items[0].status,
+    );
+
+    // Late duplicates cannot create replayable state, and the server-context
+    // uniqueness rule prevents the id from being issued again.
+    routeLegacyCompletionNotification(&runtime, source, direct.value);
+    try std.testing.expectEqual(@as(usize, 0), runtime.early_legacy_url_completions.items.len);
+    try std.testing.expectError(
+        error.McpDuplicateElicitationId,
+        runtime.registerLegacyUrlCompletionCandidates(
+            source,
+            runtime.legacy_url_runtime_generation,
+            window_generation,
+            &direct_ids,
+        ),
+    );
+
+    capture.available = false;
+    var expired = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"expired\"}}",
+        .{},
+    );
+    defer expired.deinit();
+    routeLegacyCompletionNotification(&runtime, source, expired.value);
+    try std.testing.expectEqual(@as(usize, 1), runtime.early_legacy_url_completions.items.len);
+    runtime.early_legacy_url_completions.items[0].deadline_ms = awakeMillis() - 1;
+    const expired_ids = [_][]const u8{"expired"};
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        runtime.legacy_url_runtime_generation,
+        window_generation,
+        &expired_ids,
+    );
+    try std.testing.expectEqual(@as(usize, 0), runtime.early_legacy_url_completions.items.len);
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.issued,
+        runtime.legacy_url_completion_candidates.items[1].status,
+    );
+
+    var url_required = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"url-required\"}}",
+        .{},
+    );
+    defer url_required.deinit();
+    routeLegacyCompletionNotification(&runtime, source, url_required.value);
+    try std.testing.expectEqual(@as(usize, 1), runtime.early_legacy_url_completions.items.len);
+
+    const ids = [_][]const u8{"url-required"};
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        runtime.legacy_url_runtime_generation,
+        window_generation,
+        &ids,
+    );
+    var completed = [_]bool{false};
+    var waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .runtime_generation = runtime.legacy_url_runtime_generation,
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 1,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try runtime.registerCurrentLegacyUrlWaiter(&waiter);
+    defer runtime.unregisterLegacyUrlWaiter(&waiter);
+    try std.testing.expect(completed[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.completed,
+        waiter.signal.status.load(.acquire),
+    );
+    try std.testing.expect(!runtime.earlyLegacyUrlCompletionRecordedLocked(.{
+        .wire = .legacy_mcp_2025_11,
+        .server_name = "server",
+        .operation = .{ .tools_call = "authorize" },
+        .runtime_generation = runtime.legacy_url_runtime_generation,
+        .connection_generation = 2,
+        .client_generation = 2,
+        .catalog_generation = 3,
+        .request_generation = 1,
+        .auth_generation = 5,
+        .deadline_ms = std.math.maxInt(i64),
+    }, "url-required"));
+
+    // Candidate tombstones are never evicted by transient early-frame pressure.
+    var id_buffer: [64]u8 = undefined;
+    var candidate_index: usize = runtime.legacy_url_completion_candidates.items.len;
+    while (candidate_index < max_legacy_url_completion_candidates) : (candidate_index += 1) {
+        const id = try std.fmt.bufPrint(&id_buffer, "candidate-{d}", .{candidate_index});
+        const candidate_ids = [_][]const u8{id};
+        try runtime.registerLegacyUrlCompletionCandidates(
+            source,
+            runtime.legacy_url_runtime_generation,
+            window_generation,
+            &candidate_ids,
+        );
+    }
+    var unknown_index: usize = 0;
+    while (unknown_index <= max_early_legacy_url_completions_per_window) : (unknown_index += 1) {
+        const id = try std.fmt.bufPrint(&id_buffer, "unknown-{d}", .{unknown_index});
+        var frame = std.Io.Writer.Allocating.init(alloc);
+        defer frame.deinit();
+        try frame.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":");
+        try std.json.Stringify.value(id, .{}, &frame.writer);
+        try frame.writer.writeAll("}}");
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, frame.writer.buffered(), .{});
+        defer parsed.deinit();
+        routeLegacyCompletionNotification(&runtime, source, parsed.value);
+    }
+    try std.testing.expectEqual(
+        max_early_legacy_url_completions_per_window,
+        runtime.early_legacy_url_completions.items.len,
+    );
+    try std.testing.expectEqual(
+        max_legacy_url_completion_candidates,
+        runtime.legacy_url_completion_candidates.items.len,
+    );
+    try std.testing.expectError(
+        error.McpDuplicateElicitationId,
+        runtime.registerLegacyUrlCompletionCandidates(
+            source,
+            runtime.legacy_url_runtime_generation,
+            window_generation,
+            &direct_ids,
+        ),
+    );
+}
+
+test "legacy URL provisional completions cannot cross concurrent operation windows" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.servers.append(alloc, .{
+        .config = .{ .name = try alloc.dupe(u8, "server") },
+        .runtime = &runtime,
+        .state = .ready,
+        .connection_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = .init(5),
+    });
+    const source = tool_subscription.NotificationSource{
+        .server_name = "server",
+        .connection_generation = 2,
+        .client_generation = 2,
+        .auth_generation = 5,
+    };
+    const first_window = try runtime.beginLegacyUrlCompletionWindow(source, 0);
+    var first_active = true;
+    defer if (first_active) runtime.endLegacyUrlCompletionWindow(source, 0, first_window);
+
+    var completion = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"cross-window\"}}",
+        .{},
+    );
+    defer completion.deinit();
+    routeLegacyCompletionNotification(&runtime, source, completion.value);
+    try std.testing.expectEqual(@as(usize, 1), runtime.early_legacy_url_completions.items.len);
+    var provisional_buffer: [64]u8 = undefined;
+    var provisional_index: usize = 1;
+    while (provisional_index < max_early_legacy_url_completions_per_window) : (provisional_index += 1) {
+        const id = try std.fmt.bufPrint(&provisional_buffer, "first-window-{d}", .{provisional_index});
+        var frame = std.Io.Writer.Allocating.init(alloc);
+        defer frame.deinit();
+        try frame.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":");
+        try std.json.Stringify.value(id, .{}, &frame.writer);
+        try frame.writer.writeAll("}}");
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, frame.writer.buffered(), .{});
+        defer parsed.deinit();
+        routeLegacyCompletionNotification(&runtime, source, parsed.value);
+    }
+    try std.testing.expectEqual(
+        max_early_legacy_url_completions_per_window,
+        runtime.early_legacy_url_completions.items.len,
+    );
+
+    const second_window = try runtime.beginLegacyUrlCompletionWindow(source, 0);
+    var second_active = true;
+    defer if (second_active) runtime.endLegacyUrlCompletionWindow(source, 0, second_window);
+    const ids = [_][]const u8{"cross-window"};
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        0,
+        second_window,
+        &ids,
+    );
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.issued,
+        runtime.legacy_url_completion_candidates.items[0].status,
+    );
+    try std.testing.expectEqual(
+        max_early_legacy_url_completions_per_window,
+        runtime.early_legacy_url_completions.items.len,
+    );
+
+    var second_completion = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"second-window\"}}",
+        .{},
+    );
+    defer second_completion.deinit();
+    routeLegacyCompletionNotification(&runtime, source, second_completion.value);
+    try std.testing.expectEqual(
+        max_early_legacy_url_completions_per_window + 1,
+        runtime.early_legacy_url_completions.items.len,
+    );
+    const second_ids = [_][]const u8{"second-window"};
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        0,
+        second_window,
+        &second_ids,
+    );
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.early,
+        runtime.legacy_url_completion_candidates.items[1].status,
+    );
+    try std.testing.expectEqual(
+        max_early_legacy_url_completions_per_window,
+        runtime.early_legacy_url_completions.items.len,
+    );
+
+    runtime.endLegacyUrlCompletionWindow(source, 0, second_window);
+    second_active = false;
+    try std.testing.expectEqual(
+        max_early_legacy_url_completions_per_window,
+        runtime.early_legacy_url_completions.items.len,
+    );
+    runtime.endLegacyUrlCompletionWindow(source, 0, first_window);
+    first_active = false;
+    try std.testing.expectEqual(@as(usize, 0), runtime.early_legacy_url_completions.items.len);
+    runtime.cancelLegacyUrlWaitersForServer("server", 2);
+    try std.testing.expectEqual(@as(usize, 0), runtime.legacy_url_completion_candidates.items.len);
+}
+
+test "cancelled legacy URL waiter cannot be revived by a matching wire completion" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    const ids = [_][]const u8{"same-id"};
+    var completed = [_]bool{false};
+    var waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .connection_generation = 2,
+            .client_generation = 20,
+            .catalog_generation = 3,
+            .request_generation = 4,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try runtime.registerLegacyUrlWaiter(&waiter);
+    defer runtime.unregisterLegacyUrlWaiter(&waiter);
+    waiter.signal.status.store(.cancelled, .release);
+
+    runtime.recordLegacyUrlCompletionFromWire(.{
+        .server_name = "server",
+        .elicitation_id = "same-id",
+        .connection_generation = 2,
+        .client_generation = 20,
+        .auth_generation = 5,
+    });
+
+    try std.testing.expect(!completed[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.cancelled,
+        waiter.signal.status.load(.acquire),
+    );
+    try std.testing.expect(!runtime.legacyUrlCompletionRecorded(.{
+        .wire = .legacy_mcp_2025_11,
+        .server_name = "server",
+        .operation = .{ .tools_call = "authorize" },
+        .connection_generation = 2,
+        .client_generation = 20,
+        .catalog_generation = 3,
+        .request_generation = 4,
+        .auth_generation = 5,
+        .deadline_ms = std.math.maxInt(i64),
+    }, "same-id"));
+}
+
+test "late completion after cancellation cannot satisfy same-id reuse" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.servers.append(alloc, .{
+        .config = .{ .name = try alloc.dupe(u8, "server") },
+        .runtime = &runtime,
+        .state = .ready,
+        .connection_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = .init(5),
+    });
+    const source = tool_subscription.NotificationSource{
+        .server_name = "server",
+        .connection_generation = 2,
+        .client_generation = 2,
+        .auth_generation = 5,
+    };
+    const window = try runtime.beginLegacyUrlCompletionWindow(source, 0);
+    var window_active = true;
+    defer if (window_active) runtime.endLegacyUrlCompletionWindow(source, 0, window);
+    const ids = [_][]const u8{"cancelled-id"};
+    try runtime.registerLegacyUrlCompletionCandidates(source, 0, window, &ids);
+    var completed = [_]bool{false};
+    var waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 1,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try runtime.registerCurrentLegacyUrlWaiter(&waiter);
+    waiter.signal.status.store(.cancelled, .release);
+    runtime.unregisterLegacyUrlWaiter(&waiter);
+
+    var late = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"cancelled-id\"}}",
+        .{},
+    );
+    defer late.deinit();
+    routeLegacyCompletionNotification(&runtime, source, late.value);
+    try std.testing.expect(!completed[0]);
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.early,
+        runtime.legacy_url_completion_candidates.items[0].status,
+    );
+
+    runtime.endLegacyUrlCompletionWindow(source, 0, window);
+    window_active = false;
+    const next_window = try runtime.beginLegacyUrlCompletionWindow(source, 0);
+    defer runtime.endLegacyUrlCompletionWindow(source, 0, next_window);
+    try std.testing.expectError(
+        error.McpDuplicateElicitationId,
+        runtime.registerLegacyUrlCompletionCandidates(source, 0, next_window, &ids),
+    );
+}
+
+test "legacy URL waiter registration is serialized with auth invalidation" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.servers.append(alloc, .{
+        .config = .{ .name = try alloc.dupe(u8, "server") },
+        .runtime = &runtime,
+        .state = .ready,
+        .connection_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = .init(5),
+    });
+    const ids = [_][]const u8{"same-id"};
+    var completed = [_]bool{false};
+    var waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 4,
+            .auth_generation = 4,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try std.testing.expectError(
+        error.Cancelled,
+        runtime.registerCurrentLegacyUrlWaiter(&waiter),
+    );
+
+    waiter.binding.auth_generation = 5;
+    try runtime.registerCurrentLegacyUrlWaiter(&waiter);
+    advanceAuthGeneration(&runtime.servers.items[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.cancelled,
+        waiter.signal.status.load(.acquire),
+    );
+    try std.testing.expect(waiter.signal.wake.load(.acquire));
+    runtime.unregisterLegacyUrlWaiter(&waiter);
+}
+
+test "logout rollback preserves active legacy completion authority" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.servers.append(alloc, .{
+        .config = .{ .name = try alloc.dupe(u8, "server") },
+        .runtime = &runtime,
+        .state = .ready,
+        .connection_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = .init(5),
+    });
+    const ids = [_][]const u8{"rollback-id"};
+    const source = tool_subscription.NotificationSource{
+        .server_name = "server",
+        .connection_generation = 2,
+        .client_generation = 2,
+        .auth_generation = 5,
+    };
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        runtime.legacy_url_runtime_generation,
+        null,
+        &ids,
+    );
+    var completed = [_]bool{false};
+    var waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .runtime_generation = runtime.legacy_url_runtime_generation,
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 4,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try runtime.registerCurrentLegacyUrlWaiter(&waiter);
+    defer runtime.unregisterLegacyUrlWaiter(&waiter);
+
+    var detached = McpRuntime.detachAuthForLogout(&runtime.servers.items[0]);
+    defer detached.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(u64, 5),
+        runtime.servers.items[0].auth_generation.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.pending,
+        waiter.signal.status.load(.acquire),
+    );
+    var notification = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"rollback-id\"}}",
+        .{},
+    );
+    defer notification.deinit();
+    routeLegacyCompletionNotification(&runtime, source, notification.value);
+    try std.testing.expect(!completed[0]);
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.logout_fenced,
+        runtime.legacy_url_completion_candidates.items[0].status,
+    );
+
+    runtime.restoreAuthAfterLogout(&runtime.servers.items[0], &detached);
+    try std.testing.expect(completed[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.completed,
+        waiter.signal.status.load(.acquire),
+    );
+
+    const committed_ids = [_][]const u8{"committed-id"};
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        runtime.legacy_url_runtime_generation,
+        null,
+        &committed_ids,
+    );
+    var committed = [_]bool{false};
+    var committed_waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .runtime_generation = runtime.legacy_url_runtime_generation,
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 6,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &committed_ids,
+        .completed = &committed,
+    };
+    try runtime.registerCurrentLegacyUrlWaiter(&committed_waiter);
+    defer runtime.unregisterLegacyUrlWaiter(&committed_waiter);
+    var committed_detached = McpRuntime.detachAuthForLogout(&runtime.servers.items[0]);
+    defer committed_detached.deinit(alloc);
+    var committed_notification = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"committed-id\"}}",
+        .{},
+    );
+    defer committed_notification.deinit();
+    routeLegacyCompletionNotification(&runtime, source, committed_notification.value);
+    try std.testing.expect(!committed[0]);
+    advanceAuthGeneration(&runtime.servers.items[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.cancelled,
+        committed_waiter.signal.status.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        runtime.legacy_url_completion_candidates.items.len,
+    );
+    runtime.servers.items[0].auth_logout_in_progress.store(false, .release);
+}
+
+test "logout rollback preserves early legacy completion authority" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.servers.append(alloc, .{
+        .config = .{ .name = try alloc.dupe(u8, "server") },
+        .runtime = &runtime,
+        .state = .ready,
+        .connection_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = .init(5),
+    });
+    const source = tool_subscription.NotificationSource{
+        .server_name = "server",
+        .connection_generation = 2,
+        .client_generation = 2,
+        .auth_generation = 5,
+    };
+    const ids = [_][]const u8{"early-rollback-id"};
+    const window = try runtime.beginLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+    );
+    var window_active = true;
+    defer if (window_active) runtime.endLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+        window,
+    );
+
+    var detached = McpRuntime.detachAuthForLogout(&runtime.servers.items[0]);
+    defer detached.deinit(alloc);
+    var notification = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"early-rollback-id\"}}",
+        .{},
+    );
+    defer notification.deinit();
+    routeLegacyCompletionNotification(&runtime, source, notification.value);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        runtime.early_legacy_url_completions.items.len,
+    );
+    try std.testing.expect(runtime.early_legacy_url_completions.items[0].logout_fenced);
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        runtime.legacy_url_runtime_generation,
+        window,
+        &ids,
+    );
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.logout_fenced,
+        runtime.legacy_url_completion_candidates.items[0].status,
+    );
+
+    var completed = [_]bool{false};
+    var waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .runtime_generation = runtime.legacy_url_runtime_generation,
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 4,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try runtime.registerCurrentLegacyUrlWaiter(&waiter);
+    defer runtime.unregisterLegacyUrlWaiter(&waiter);
+    try std.testing.expect(!completed[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.pending,
+        waiter.signal.status.load(.acquire),
+    );
+
+    runtime.restoreAuthAfterLogout(&runtime.servers.items[0], &detached);
+    try std.testing.expect(completed[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.completed,
+        waiter.signal.status.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.handled,
+        runtime.legacy_url_completion_candidates.items[0].status,
+    );
+    runtime.endLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+        window,
+    );
+    window_active = false;
+
+    const pre_fence_ids = [_][]const u8{"pre-fence-rollback-id"};
+    const pre_fence_window = try runtime.beginLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+    );
+    var pre_fence_window_active = true;
+    defer if (pre_fence_window_active) runtime.endLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+        pre_fence_window,
+    );
+    var pre_fence_notification = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"pre-fence-rollback-id\"}}",
+        .{},
+    );
+    defer pre_fence_notification.deinit();
+    routeLegacyCompletionNotification(&runtime, source, pre_fence_notification.value);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        runtime.early_legacy_url_completions.items.len,
+    );
+    try std.testing.expect(!runtime.early_legacy_url_completions.items[0].logout_fenced);
+
+    var pre_fence_detached = McpRuntime.detachAuthForLogout(&runtime.servers.items[0]);
+    defer pre_fence_detached.deinit(alloc);
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        runtime.legacy_url_runtime_generation,
+        pre_fence_window,
+        &pre_fence_ids,
+    );
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.early,
+        runtime.legacy_url_completion_candidates.items[1].status,
+    );
+    var pre_fence_completed = [_]bool{false};
+    var pre_fence_waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .runtime_generation = runtime.legacy_url_runtime_generation,
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 5,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &pre_fence_ids,
+        .completed = &pre_fence_completed,
+    };
+    try runtime.registerCurrentLegacyUrlWaiter(&pre_fence_waiter);
+    defer runtime.unregisterLegacyUrlWaiter(&pre_fence_waiter);
+    try std.testing.expectEqual(
+        LegacyUrlCompletionCandidate.Status.logout_fenced,
+        runtime.legacy_url_completion_candidates.items[1].status,
+    );
+    try std.testing.expect(!pre_fence_completed[0]);
+    runtime.restoreAuthAfterLogout(
+        &runtime.servers.items[0],
+        &pre_fence_detached,
+    );
+    try std.testing.expect(pre_fence_completed[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.completed,
+        pre_fence_waiter.signal.status.load(.acquire),
+    );
+    runtime.endLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+        pre_fence_window,
+    );
+    pre_fence_window_active = false;
+
+    const committed_ids = [_][]const u8{"early-committed-id"};
+    const committed_window = try runtime.beginLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+    );
+    defer runtime.endLegacyUrlCompletionWindow(
+        source,
+        runtime.legacy_url_runtime_generation,
+        committed_window,
+    );
+    var committed_detached = McpRuntime.detachAuthForLogout(&runtime.servers.items[0]);
+    defer committed_detached.deinit(alloc);
+    var committed_notification = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"early-committed-id\"}}",
+        .{},
+    );
+    defer committed_notification.deinit();
+    routeLegacyCompletionNotification(&runtime, source, committed_notification.value);
+    try runtime.registerLegacyUrlCompletionCandidates(
+        source,
+        runtime.legacy_url_runtime_generation,
+        committed_window,
+        &committed_ids,
+    );
+    var committed = [_]bool{false};
+    var committed_waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .runtime_generation = runtime.legacy_url_runtime_generation,
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 6,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &committed_ids,
+        .completed = &committed,
+    };
+    try runtime.registerCurrentLegacyUrlWaiter(&committed_waiter);
+    defer runtime.unregisterLegacyUrlWaiter(&committed_waiter);
+    try std.testing.expect(!committed[0]);
+    advanceAuthGeneration(&runtime.servers.items[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.cancelled,
+        committed_waiter.signal.status.load(.acquire),
+    );
+    try std.testing.expect(!committed[0]);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        runtime.legacy_url_completion_candidates.items.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        runtime.early_legacy_url_completions.items.len,
+    );
+    runtime.servers.items[0].auth_logout_in_progress.store(false, .release);
+}
+
+test "logout releases completion arbitration before draining active legacy HTTP" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    const client = try alloc.create(legacy_streamable_http.Client);
+    client.* = .{
+        .owner_allocator = alloc,
+        .url = "",
+        .static_headers = &.{},
+        .version = .v2025_11_25,
+        .session_id = null,
+    };
+    try runtime.servers.append(alloc, .{
+        .config = .{ .name = try alloc.dupe(u8, "server") },
+        .runtime = &runtime,
+        .legacy_http = client,
+        .state = .ready,
+        .connection_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = .init(5),
+    });
+    try std.testing.expect(client.acquireUse());
+    var lease_active = true;
+
+    const ids = [_][]const u8{"same-id"};
+    var completed = [_]bool{false};
+    var waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .connection_generation = 2,
+            .client_generation = 2,
+            .catalog_generation = 3,
+            .request_generation = 4,
+            .auth_generation = 5,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try runtime.registerCurrentLegacyUrlWaiter(&waiter);
+    var waiter_registered = true;
+
+    const Logout = struct {
+        runtime: *McpRuntime,
+        server: *McpServer,
+        detached: *std.atomic.Value(bool),
+        finished: *std.atomic.Value(bool),
+
+        fn run(self: @This()) void {
+            var transport = self.runtime.detachTransportForLogout(self.server);
+            self.detached.store(true, .release);
+            transport.deinit(false);
+            self.finished.store(true, .release);
+        }
+    };
+    var detached = std.atomic.Value(bool).init(false);
+    var finished = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Logout.run, .{Logout{
+        .runtime = &runtime,
+        .server = &runtime.servers.items[0],
+        .detached = &detached,
+        .finished = &finished,
+    }});
+    var joined = false;
+    defer {
+        if (waiter_registered) runtime.unregisterLegacyUrlWaiter(&waiter);
+        if (lease_active) client.releaseUse();
+        if (!joined) thread.join();
+    }
+
+    const detach_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    while (!detached.load(.acquire)) {
+        if (!std.Io.Clock.Timestamp.compare(
+            std.Io.Clock.Timestamp.now(std.testing.io, .awake),
+            .lt,
+            detach_deadline,
+        )) return error.McpLogoutTransportDetachTimedOut;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(!finished.load(.acquire));
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.cancelled,
+        waiter.signal.status.load(.acquire),
+    );
+
+    const Capture = struct {
+        accepted: usize = 0,
+
+        fn accept(
+            raw: *anyopaque,
+            _: tool_mcp_runtime.InputOrigin,
+            _: []const u8,
+        ) tool_mcp_runtime.LegacyUrlAcceptTransition {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.accepted += 1;
+            return .awaiting_completion;
+        }
+
+        fn consume(
+            _: *anyopaque,
+            _: tool_mcp_runtime.LegacyUrlCompletion,
+        ) tool_mcp_runtime.LegacyUrlConsumeTransition {
+            return .missing;
+        }
+
+        fn publish(_: *anyopaque, _: []u8) void {}
+    };
+    var capture = Capture{};
+    try std.testing.expect(runtime.acceptLegacyUrlCompletion(.{
+        .wire = .legacy_mcp_2025_11,
+        .server_name = "server",
+        .operation = .{ .tools_call = "authorize" },
+        .connection_generation = 2,
+        .client_generation = 2,
+        .catalog_generation = 3,
+        .request_generation = 4,
+        .auth_generation = 5,
+        .deadline_ms = std.math.maxInt(i64),
+    }, "acp-id", .{
+        .context = @ptrCast(&capture),
+        .accept = Capture.accept,
+        .consume = Capture.consume,
+        .publish = Capture.publish,
+    }) == null);
+    try std.testing.expectEqual(@as(usize, 0), capture.accepted);
+
+    runtime.unregisterLegacyUrlWaiter(&waiter);
+    waiter_registered = false;
+    client.releaseUse();
+    lease_active = false;
+    thread.join();
+    joined = true;
+    try std.testing.expect(finished.load(.acquire));
+}
+
+test "legacy completion passthrough snapshots a recovery candidate" {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var server = McpServer{
+        .config = .{ .name = "server" },
+        .runtime = &runtime,
+        .connection_generation = 7,
+        .catalog_generation = 8,
+        .auth_generation = .init(9),
+    };
+    const passthrough = legacyCompletionPassthrough(&server, 70);
+    server.connection_generation = 17;
+    server.catalog_generation = 18;
+    server.auth_generation.store(19, .release);
+
+    try std.testing.expect(passthrough.context == @as(*anyopaque, @ptrCast(&runtime)));
+    try std.testing.expectEqual(@as(u64, 7), passthrough.source.connection_generation);
+    try std.testing.expectEqual(@as(u64, 70), passthrough.source.client_generation);
+    try std.testing.expectEqual(@as(u64, 9), passthrough.source.auth_generation);
+}
+
+test "legacy direct elicitation origin preserves its client generation" {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var server = McpServer{
+        .config = .{ .name = "server" },
+        .runtime = &runtime,
+    };
+    const context = LegacyElicitationContext{
+        .server = &server,
+        .transport = undefined,
+        .wire = .legacy_mcp_2025_11,
+        .responder = null,
+        .capabilities = .{},
+        .operation = .{ .tools_call = "authorize" },
+        .deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+            .clock = .awake,
+            .raw = .fromSeconds(1),
+        }),
+        .cancel_flag = null,
+        .connection_generation = 7,
+        .client_generation = 70,
+        .catalog_generation = 8,
+        .auth_generation = 9,
+    };
+    const origin = context.inputOrigin();
+    try std.testing.expectEqual(@as(u64, 7), origin.connection_generation);
+    try std.testing.expectEqual(@as(u64, 70), origin.client_generation);
+}
+
+test "direct legacy terminal retains only completed tool outcomes" {
+    try std.testing.expectEqual(
+        tool_mcp_runtime.ContinuationTerminal.completed,
+        terminalOutcomeForCallStatus(.success),
+    );
+    try std.testing.expectEqual(
+        tool_mcp_runtime.ContinuationTerminal.completed,
+        terminalOutcomeForCallStatus(.tool_failure),
+    );
+    try std.testing.expectEqual(
+        tool_mcp_runtime.ContinuationTerminal.abandoned,
+        terminalOutcomeForCallStatus(.protocol_failure),
+    );
+    try std.testing.expectEqual(
+        tool_mcp_runtime.ContinuationTerminal.abandoned,
+        terminalOutcomeForCallStatus(.input_required),
+    );
+}
+
+test "legacy URL waiter publication is allocator-safe and retirement wakes it" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failed_runtime = McpRuntime.init(failing.allocator());
+    defer failed_runtime.deinit();
+    const ids = [_][]const u8{"one"};
+    var completed = [_]bool{false};
+    var failed_waiter = LegacyUrlWaiter{
+        .binding = .{
+            .server_name = "server",
+            .scope = .{ .operation = .{ .tools_call = "authorize" } },
+            .connection_generation = 1,
+            .client_generation = 1,
+            .catalog_generation = 1,
+            .request_generation = 1,
+            .auth_generation = 1,
+            .deadline_ms = std.math.maxInt(i64),
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failed_runtime.registerLegacyUrlWaiter(&failed_waiter),
+    );
+    try std.testing.expectEqual(@as(usize, 0), failed_runtime.legacy_url_waiters.items.len);
+
+    var runtime = McpRuntime.init(std.testing.allocator);
+    var waiter = failed_waiter;
+    try runtime.registerLegacyUrlWaiter(&waiter);
+    runtime.retireAndWait();
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.cancelled,
+        waiter.signal.status.load(.acquire),
+    );
+    try std.testing.expect(waiter.signal.wake.load(.acquire));
+    runtime.unregisterLegacyUrlWaiter(&waiter);
+    runtime.deinit();
+}
+
+test "runtime retirement cancels a committed stdio tool call before waiting for its lease" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\while IFS= read -r line; do
+        \\  id=${line#*'"id":'}
+        \\  id=${id%%,*}
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}}'
+        \\      ;;
+        \\    *'"method":"tools/list"'*)
+        \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}\n' "$id"
+        \\      ;;
+        \\    *'"method":"tools/call"'*)
+        \\      ;;
+        \\    *'"method":"notifications/cancelled"'*)
+        \\      exit 0
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    var config = try shellMcpConfigForTest(alloc, "retire", shell_server);
+    config.operation_timeout_ms = 60_000;
+    try runtime.addServer(config);
+    runtime.connectAll(.{});
+    try std.testing.expect(runtime.hasTool("mcp_retire_echo"));
+
+    const Call = struct {
+        runtime: *McpRuntime,
+        caller_cancel: *std.atomic.Value(bool),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            if (!self.runtime.acquireUse()) {
+                self.err = error.McpRuntimeUnavailable;
+                return;
+            }
+            defer self.runtime.releaseUse();
+            const result = self.runtime.callToolByNameWithOptions(
+                std.testing.allocator,
+                "mcp_retire_echo",
+                "{}",
+                tool_result_limits.default_max_tool_result_bytes,
+                .{ .cancel_flag = self.caller_cancel },
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+            if (result) |value| {
+                var owned = value;
+                owned.deinit(std.testing.allocator);
+            }
+        }
+    };
+
+    var caller_cancel = std.atomic.Value(bool).init(false);
+    var call = Call{ .runtime = &runtime, .caller_cancel = &caller_cancel };
+    const call_thread = try std.Thread.spawn(.{}, Call.run, .{&call});
+    var joined = false;
+    defer if (!joined) {
+        caller_cancel.store(true, .release);
+        call_thread.join();
+    };
+
+    const dispatcher = runtime.servers.items[0].dispatcher.?;
+    const committed_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    while (dispatcher.pendingRequestCount() == 0) {
+        if (!std.Io.Clock.Timestamp.compare(
+            std.Io.Clock.Timestamp.now(std.testing.io, .awake),
+            .lt,
+            committed_deadline,
+        )) return error.McpToolCallNotCommitted;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    const started_ms = io_mod.milliTimestamp();
+    runtime.retireAndWait();
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    call_thread.join();
+    joined = true;
+
+    try std.testing.expectEqual(error.Cancelled, call.err.?);
+    try std.testing.expect(!caller_cancel.load(.acquire));
+    try std.testing.expect(elapsed_ms < 1_000);
+    try std.testing.expectEqual(@as(usize, 0), dispatcher.pendingRequestCount());
+}
+
+test "McpRuntime listServersAndTools with no servers" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    const listing = try runtime.listServersAndTools(alloc);
+    defer alloc.free(listing);
+    try std.testing.expectEqualStrings("No MCP servers configured.\n", listing);
+}
+
+test "MCP oversized frame result is structured and bounded" {
+    const alloc = std.testing.allocator;
+    const cap_bytes = mcpResponseFrameCap(1024);
+
+    const result = try tool_result.frame_too_large_result(
+        alloc,
+        "filesystem",
+        "mcp_filesystem_dump",
+        cap_bytes,
+    );
+    defer alloc.free(result);
+
+    try std.testing.expect(result.len <= 1024);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("filesystem", parsed.value.object.get("server").?.string);
+    try std.testing.expectEqualStrings("mcp_filesystem_dump", parsed.value.object.get("tool").?.string);
+    const err = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("response_frame_too_large", err.get("kind").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(cap_bytes)), err.get("cap_bytes").?.integer);
+}
+
+test "oversized MCP frame handling preserves a structured bounded result" {
+    const alloc = std.testing.allocator;
+    const cap_bytes = mcpResponseFrameCap(1024);
+
+    var server = McpServer{ .config = .{ .name = try alloc.dupe(u8, "filesystem"), .command = try alloc.dupe(u8, "cmd") } };
+    defer server.deinit(alloc);
+    server.setReady(alloc);
+
+    const result = try handleMcpResponseFrameTooLarge(alloc, &server, "mcp_filesystem_dump", cap_bytes);
+    defer alloc.free(result.model_output);
+
+    try std.testing.expect(std.mem.find(u8, result.model_output, "\"kind\":\"response_frame_too_large\"") != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "\"server\":\"filesystem\"") != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "\"tool\":\"mcp_filesystem_dump\"") != null);
+}
+
+test "modern response classification requires complete resultType and preserves protocol errors" {
+    const alloc = std.testing.allocator;
+
+    var complete = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[]}}",
+        .{},
+    );
+    defer complete.deinit();
+    switch (try classifyResponsePayload(complete.value, .modern)) {
+        .complete => |result| try std.testing.expect(result.object.get("tools") != null),
+        .protocol_error => return error.TestUnexpectedResult,
+    }
+
+    var legacy = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}",
+        .{},
+    );
+    defer legacy.deinit();
+    switch (try classifyResponsePayload(legacy.value, .legacy)) {
+        .complete => {},
+        .protocol_error => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.McpMissingResultType, classifyResponsePayload(legacy.value, .modern));
+
+    var input_required = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"input_required\"}}",
+        .{},
+    );
+    defer input_required.deinit();
+    try std.testing.expectError(error.McpUnsupportedResultType, classifyResponsePayload(input_required.value, .modern));
+
+    var unsupported = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2026-07-28\"],\"requested\":\"1900-01-01\"}}}",
+        .{},
+    );
+    defer unsupported.deinit();
+    switch (try classifyResponsePayload(unsupported.value, .modern)) {
+        .complete => return error.TestUnexpectedResult,
+        .protocol_error => |protocol_error| {
+            try std.testing.expectEqual(unsupported_protocol_version_code, protocol_error.code);
+            try std.testing.expectEqualStrings("Unsupported protocol version", protocol_error.message);
+            const data = protocol_error.data orelse return error.TestExpectedEqual;
+            try std.testing.expectEqualStrings("1900-01-01", data.object.get("requested").?.string);
+            try std.testing.expectEqualStrings(modern_protocol_version, data.object.get("supported").?.array.items[0].string);
+        },
+    }
+}
+
+test "response payload classification rejects malformed envelopes" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"id\":1,\"result\":{\"resultType\":\"complete\"}}",
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"result\":{\"resultType\":\"complete\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\"},\"error\":{\"code\":-1,\"message\":\"ambiguous\"}}",
+    }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(
+            error.McpInvalidJson,
+            classifyResponsePayload(parsed.value, .modern),
+        );
+    }
+}
+
+test "legacy stdio initialization transitions are bounded and monotonic" {
+    const cases = [_]struct {
+        offered: LegacyStdioVersion,
+        observation: LegacyInitializeObservation,
+        expected: LegacyInitializeTransition,
+    }{
+        .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
+        .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2024_11_05 }, .expected = .{ .accept = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .accepted = .v2025_03_26 }, .expected = .{ .accept = .v2025_03_26 } },
+        .{ .offered = .v2025_11_25, .observation = .connection_closed, .expected = .{ .retry = .v2025_06_18 } },
+        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2024_11_05, .observation = .connection_closed, .expected = .fail },
+        .{ .offered = .v2025_11_25, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_06_18 } },
+        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2024_11_05, .observation = .{ .unsupported = null }, .expected = .fail },
+        .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2024_11_05 }, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2025_11_25 }, .expected = .fail },
+        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = .v2025_11_25 }, .expected = .fail },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            decideLegacyInitializeTransition(case.offered, case.observation),
+        );
+    }
+}
+
+test "legacy stdio initialization accepts supported counters and rejects unknown versions" {
+    const alloc = std.testing.allocator;
+
+    var countered = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy\",\"version\":\"1\"}}}",
+        .{},
+    );
+    defer countered.deinit();
+    try std.testing.expectEqual(
+        LegacyInitializeObservation{ .accepted = .v2024_11_05 },
+        try classifyLegacyInitializeResponse(countered.value, .v2025_11_25),
+    );
+
+    var unsupported = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32602,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2024-11-05\"],\"requested\":\"2025-11-25\"}}}",
+        .{},
+    );
+    defer unsupported.deinit();
+    try std.testing.expectEqual(
+        LegacyInitializeObservation{ .unsupported = .v2024_11_05 },
+        try classifyLegacyInitializeResponse(unsupported.value, .v2025_11_25),
+    );
+
+    var unrelated_invalid_params = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32602,\"message\":\"Invalid client capabilities\"}}",
+        .{},
+    );
+    defer unrelated_invalid_params.deinit();
+    try std.testing.expectError(
+        error.McpInitFailed,
+        classifyLegacyInitializeResponse(unrelated_invalid_params.value, .v2025_11_25),
+    );
+
+    var unknown = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":\"2030-01-01\",\"capabilities\":{},\"serverInfo\":{\"name\":\"future\",\"version\":\"1\"}}}",
+        .{},
+    );
+    defer unknown.deinit();
+    try std.testing.expectError(
+        error.McpUnsupportedProtocolVersion,
+        classifyLegacyInitializeResponse(unknown.value, .v2025_11_25),
+    );
+}
+
+test "discovery classification separates modern negotiation from legacy fallback" {
+    const alloc = std.testing.allocator;
+
+    var modern = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"tools\":{}}}}",
+        .{},
+    );
+    defer modern.deinit();
+    try std.testing.expectEqual(DiscoveryOutcome.modern, try classifyDiscoveryResponse(modern.value));
+
+    var legacy_error = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}",
+        .{},
+    );
+    defer legacy_error.deinit();
+    switch (try classifyDiscoveryResponse(legacy_error.value)) {
+        .legacy_fallback => |version| try std.testing.expectEqual(LegacyStdioVersion.v2025_11_25, version),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var invalid_params = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32602,\"message\":\"Missing modern request metadata\"}}",
+        .{},
+    );
+    defer invalid_params.deinit();
+    switch (try classifyDiscoveryResponse(invalid_params.value)) {
+        .legacy_fallback => |version| try std.testing.expectEqual(
+            LegacyStdioVersion.v2025_11_25,
+            version,
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var legacy_supported = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2024-11-05\"],\"requested\":\"2026-07-28\"}}}",
+        .{},
+    );
+    defer legacy_supported.deinit();
+    switch (try classifyDiscoveryResponse(legacy_supported.value)) {
+        .legacy_fallback => |version| try std.testing.expectEqual(LegacyStdioVersion.v2024_11_05, version),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var unsupported = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2025-11-25\"],\"requested\":\"2026-07-28\"}}}",
+        .{},
+    );
+    defer unsupported.deinit();
+    switch (try classifyDiscoveryResponse(unsupported.value)) {
+        .legacy_fallback => |version| try std.testing.expectEqual(LegacyStdioVersion.v2025_11_25, version),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_unsupported = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2024-11-05\",1],\"requested\":\"2026-07-28\"}}}",
+        .{},
+    );
+    defer malformed_unsupported.deinit();
+    switch (try classifyDiscoveryResponse(malformed_unsupported.value)) {
+        .modern_protocol_error => |protocol_error| {
+            try std.testing.expectEqual(unsupported_protocol_version_code, protocol_error.code);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var mismatched_request = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2024-11-05\"],\"requested\":\"2025-11-25\"}}}",
+        .{},
+    );
+    defer mismatched_request.deinit();
+    switch (try classifyDiscoveryResponse(mismatched_request.value)) {
+        .modern_protocol_error => |protocol_error| {
+            try std.testing.expectEqual(unsupported_protocol_version_code, protocol_error.code);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var missing_capability = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32021,\"message\":\"Missing required client capability\",\"data\":{\"capability\":\"roots\"}}}",
+        .{},
+    );
+    defer missing_capability.deinit();
+    switch (try classifyDiscoveryResponse(missing_capability.value)) {
+        .modern_protocol_error => |protocol_error| {
+            try std.testing.expectEqual(missing_required_client_capability_code, protocol_error.code);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var no_mutual_version = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2025-11-25\"],\"capabilities\":{}}}",
+        .{},
+    );
+    defer no_mutual_version.deinit();
+    switch (try classifyDiscoveryResponse(no_mutual_version.value)) {
+        .legacy_fallback => |version| try std.testing.expectEqual(LegacyStdioVersion.v2025_11_25, version),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var missing_result_type = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{}}}",
+        .{},
+    );
+    defer missing_result_type.deinit();
+    try std.testing.expectError(error.McpMissingResultType, classifyDiscoveryResponse(missing_result_type.value));
+
+    var unmarked_result = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}",
+        .{},
+    );
+    defer unmarked_result.deinit();
+    try std.testing.expectError(error.McpMissingResultType, classifyDiscoveryResponse(unmarked_result.value));
+}
+
+test "legacy initialize advertises elicitation only for negotiated supported modes" {
+    const alloc = std.testing.allocator;
+    const current = try buildLegacyInitializeRequest(
+        alloc,
+        1,
+        "2025-11-25",
+        .legacy_mcp_2025_11,
+        .{ .form = true, .url = true },
+    );
+    defer alloc.free(current);
+    try std.testing.expect(std.mem.find(u8, current, "\"elicitation\":{\"form\":{},\"url\":{}}") != null);
+
+    const form_only = try buildLegacyInitializeRequest(
+        alloc,
+        2,
+        "2025-06-18",
+        .legacy_mcp_2025_06,
+        .{ .form = true, .url = true },
+    );
+    defer alloc.free(form_only);
+    try std.testing.expect(std.mem.find(u8, form_only, "\"elicitation\":{}") != null);
+    try std.testing.expect(std.mem.find(u8, form_only, "\"url\"") == null);
+
+    const old = try buildLegacyInitializeRequest(
+        alloc,
+        3,
+        "2024-11-05",
+        null,
+        .{ .form = true, .url = true },
+    );
+    defer alloc.free(old);
+    try std.testing.expect(std.mem.find(u8, old, "\"elicitation\"") == null);
+}
+
+test "modern request builders share required request metadata" {
+    const alloc = std.testing.allocator;
+    const metadata = try std.fmt.allocPrint(
+        alloc,
+        "\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"{s}\",\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"fx\",\"version\":\"{s}\"}},\"io.modelcontextprotocol/clientCapabilities\":{{}}}}",
+        .{ modern_protocol_version, build_options.app_version },
+    );
+    defer alloc.free(metadata);
+
+    const discover = try buildDiscoverRequest(alloc, 0);
+    defer alloc.free(discover);
+    const expected_discover = try std.fmt.allocPrint(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\",\"params\":{{{s}}}}}",
+        .{metadata},
+    );
+    defer alloc.free(expected_discover);
+    try std.testing.expectEqualStrings(expected_discover, discover);
+
+    const list = try buildToolsListRequest(alloc, 1, .modern, null);
+    defer alloc.free(list);
+    const expected_list = try std.fmt.allocPrint(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{{s}}}}}",
+        .{metadata},
+    );
+    defer alloc.free(expected_list);
+    try std.testing.expectEqualStrings(expected_list, list);
+
+    const call = try buildToolCallRequestForProtocol(alloc, 2, "echo", "{\"text\":\"hi\"}", .modern, null, null, .{});
+    defer alloc.free(call);
+    const expected_call = try std.fmt.allocPrint(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{{s},\"name\":\"echo\",\"arguments\":{{\"text\":\"hi\"}}}}}}",
+        .{metadata},
+    );
+    defer alloc.free(expected_call);
+    try std.testing.expectEqualStrings(expected_call, call);
+
+    const modern_progress = try buildToolCallRequestForProtocol(
+        alloc,
+        3,
+        "echo",
+        "{}",
+        .modern,
+        3,
+        null,
+        .{},
+    );
+    defer alloc.free(modern_progress);
+    try std.testing.expect(
+        std.mem.find(u8, modern_progress, "\"progressToken\":3") != null,
+    );
+
+    const legacy_call = try buildToolCallRequestForProtocol(
+        alloc,
+        4,
+        "echo",
+        "{}",
+        .legacy,
+        null,
+        null,
+        .{},
+    );
+    defer alloc.free(legacy_call);
+    try std.testing.expect(
+        std.mem.find(u8, legacy_call, "\"_meta\"") == null,
+    );
+}
+
+fn shellMcpConfigForTest(alloc: Allocator, name: []const u8, script: []const u8) !McpServerConfig {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const command = try alloc.dupe(u8, "sh");
+    errdefer alloc.free(command);
+    const args = try alloc.alloc([]const u8, 2);
+    errdefer alloc.free(args);
+    args[0] = try alloc.dupe(u8, "-c");
+    errdefer alloc.free(args[0]);
+    args[1] = try alloc.dupe(u8, script);
+    errdefer alloc.free(args[1]);
+    return .{
+        .name = owned_name,
+        .command = command,
+        .args = args,
+    };
+}
+
+fn shellMcpConfigWithModeForTest(
+    alloc: Allocator,
+    name: []const u8,
+    script: []const u8,
+    mode: []const u8,
+) !McpServerConfig {
+    var config = try shellMcpConfigForTest(alloc, name, script);
+    errdefer config.deinit(alloc);
+    const args = try alloc.alloc([]const u8, 3);
+    errdefer alloc.free(args);
+    args[0] = config.args[0];
+    args[1] = config.args[1];
+    args[2] = try alloc.dupe(u8, mode);
+    errdefer alloc.free(args[2]);
+    alloc.free(config.args);
+    config.args = args;
+    return config;
+}
+
 const resource_resolution_shell_server =
     \\mode=$0
     \\while IFS= read -r line; do
@@ -13562,6 +16563,1582 @@ const resource_resolution_shell_server =
     \\done
 ;
 
+fn acceptResourceInputForTest(
+    context: *anyopaque,
+    alloc: Allocator,
+    origin: tool_mcp_runtime.InputOrigin,
+    required: tool_mcp_runtime.InputRequired,
+) anyerror![]const u8 {
+    const calls: *usize = @ptrCast(@alignCast(context));
+    calls.* += 1;
+    if (std.mem.find(u8, required.input_requests_json, "confirm") == null or
+        required.request_state_json == null)
+    {
+        return error.TestUnexpectedResult;
+    }
+    if (!std.mem.eql(u8, origin.server_name, "mrtr-cache") or
+        origin.operation != .resources_read)
+    {
+        return error.TestUnexpectedResult;
+    }
+    return alloc.dupe(u8, "{\"confirm\":{\"action\":\"accept\",\"content\":{\"confirmed\":true}}}");
+}
+
+fn expectResourceText(result: ResourceReadResult, expected: []const u8) !void {
+    try std.testing.expectEqual(@as(usize, 1), result.contents.len);
+    switch (result.contents[0].data) {
+        .text => |text| try std.testing.expectEqualStrings(expected, text),
+        .blob => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectTestProcessExited(pid: std.posix.pid_t) !void {
+    for (0..200) |_| {
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => {},
+        };
+        if (builtin.os.tag == .linux and testProcessIsZombie(pid)) return;
+        io_mod.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.TestProcessStillRunning;
+}
+
+fn testProcessIsZombie(pid: std.posix.pid_t) bool {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/status", .{pid}) catch return false;
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return false;
+    defer file.close(io_mod.getIo());
+
+    var reader_buf: [512]u8 = undefined;
+    var status_buf: [512]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &reader_buf);
+    const read_len = reader.interface.readSliceShort(&status_buf) catch return false;
+    return std.mem.find(u8, status_buf[0..read_len], "\nState:\tZ") != null;
+}
+
+test "connectServer completes NDJSON handshake against a real stdio server" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\trap '' TERM
+        \\sleep 60 &
+        \\grandchild=$!
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}'
+        \\      ;;
+        \\    *'"method":"initialize"'*)
+        \\      printf '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"shell","version":"0"},"instructions":"%s"}}\n' "$grandchild"
+        \\      ;;
+        \\    *'"method":"notifications/initialized"'*)
+        \\      ;;
+        \\    *'"method":"tools/list"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var server = McpServer{ .config = try shellMcpConfigForTest(alloc, "ndjson", shell_server) };
+    defer server.deinit(alloc);
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    try connectServer(alloc, &server, .{}, &used, .{});
+
+    try std.testing.expectEqual(ServerState.ready, server.state);
+    try std.testing.expectEqual(StdioProtocol.legacy, server.stdio_protocol);
+    try std.testing.expectEqual(@as(usize, 1), server.tool_catalog.tools.items.len);
+    try std.testing.expectEqualStrings("echo", server.tool_catalog.tools.items[0].original_name);
+    try std.testing.expectEqualStrings("mcp_ndjson_echo", server.tool_catalog.tools.items[0].prefixed_name);
+    const grandchild_pid = try std.fmt.parseInt(std.posix.pid_t, server.instructions.?, 10);
+
+    server.disconnect();
+    try expectTestProcessExited(grandchild_pid);
+}
+
+test "connectServer discovers and calls a modern NDJSON tool" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*)
+        \\      exit 2
+        \\      ;;
+        \\    *'"method":"server/discover"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*'"io.modelcontextprotocol/clientCapabilities":{}'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"Use echo.","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-identity"}}}}'
+        \\      ;;
+        \\    *'"method":"tools/list"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","ttlMs":60000,"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
+        \\      ;;
+        \\    *'"method":"tools/call"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"modern echo"}]}}'
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigForTest(alloc, "modern", shell_server));
+    runtime.connectAll(.{});
+
+    const server = &runtime.servers.items[0];
+    try std.testing.expectEqual(ServerState.ready, server.state);
+    try std.testing.expectEqual(StdioProtocol.modern, server.stdio_protocol);
+    try std.testing.expectEqualStrings("Use echo.", server.instructions.?);
+    try std.testing.expectEqualStrings("modern-identity", server.negotiated_server_name.?);
+    try std.testing.expectEqual(@as(?[]u8, null), server.negotiated_server_version);
+    const listing = try runtime.listServersAndTools(alloc);
+    defer alloc.free(listing);
+    try std.testing.expect(std.mem.find(
+        u8,
+        listing,
+        "negotiated_name=modern-identity negotiated_version=unavailable protocol=2026-07-28",
+    ) != null);
+
+    const result = (try runtime.callToolByName(
+        alloc,
+        "mcp_modern_echo",
+        "{\"text\":\"hi\"}",
+        tool_result_limits.default_max_tool_result_bytes,
+    )).?;
+    defer alloc.free(result.model_output);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "modern echo") != null);
+
+    server.disconnect();
+}
+
+test "server identity projection preserves independently optional modern fields" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        json: []const u8,
+        name: ?[]const u8,
+        version: ?[]const u8,
+    }{
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"modern-meta\",\"version\":\"2.0.0\"}}}}",
+            .name = "modern-meta",
+            .version = "2.0.0",
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"AWSKnowledgeMCP\",\"version\":\"\"}}}}",
+            .name = "AWSKnowledgeMCP",
+            .version = null,
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"name-only\"}}}",
+            .name = "name-only",
+            .version = null,
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"version\":\"1.2.3\"}}}",
+            .name = null,
+            .version = "1.2.3",
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            .name = null,
+            .version = null,
+        },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        const identity = try parseServerIdentity(parsed.value);
+        if (case.name) |expected| {
+            try std.testing.expectEqualStrings(expected, identity.name.?);
+        } else {
+            try std.testing.expect(identity.name == null);
+        }
+        if (case.version) |expected| {
+            try std.testing.expectEqualStrings(expected, identity.version.?);
+        } else {
+            try std.testing.expect(identity.version == null);
+        }
+    }
+
+    var invalid = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":1}}}",
+        .{},
+    );
+    defer invalid.deinit();
+    try std.testing.expectError(
+        error.McpInvalidResult,
+        parseServerIdentity(invalid.value),
+    );
+}
+
+test "modern MCP calls delegate unsupported schema assertions to the server" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}}'
+        \\      ;;
+        \\    *'"method":"tools/list"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","ttlMs":60000,"tools":[{"name":"local","inputSchema":{"type":"object","properties":{"email":{"type":"string"}},"required":["email"]}},{"name":"provider_pattern","inputSchema":{"type":"object","properties":{"email":{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)[A-Za-z0-9_+.-]+@[A-Za-z0-9.-]+$"}},"required":["email"]},"outputSchema":{"type":"object","properties":{"email":{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)[A-Za-z0-9_+.-]+@[A-Za-z0-9.-]+$"}},"required":["email"]}}]}}'
+        \\      ;;
+        \\    *'"method":"tools/call"'*'"email":"person@example.com"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"accepted"}],"structuredContent":{"email":"person@example.com"}}}'
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigForTest(alloc, "provider", shell_server));
+    runtime.connectAll(.{});
+
+    const server = &runtime.servers.items[0];
+    try std.testing.expectEqual(ServerState.ready, server.state);
+    try std.testing.expectEqual(@as(usize, 2), server.tool_catalog.tools.items.len);
+    const valid = try runtime.validateToolArgumentsByName(
+        alloc,
+        "mcp_provider_provider_pattern",
+        \\{"email":"person@example.com"}
+        ,
+    );
+    switch (valid) {
+        .valid => |generation| try std.testing.expectEqual(runtime.generation, generation),
+        .invalid, .not_available => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(
+        error.McpInvalidToolArguments,
+        runtime.callToolByName(
+            alloc,
+            "mcp_provider_local",
+            "{}",
+            tool_result_limits.default_max_tool_result_bytes,
+        ),
+    );
+
+    const result = (try runtime.callToolByName(
+        alloc,
+        "mcp_provider_provider_pattern",
+        \\{"email":"person@example.com"}
+    ,
+        tool_result_limits.default_max_tool_result_bytes,
+    )).?;
+    defer alloc.free(result.model_output);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "accepted") != null);
+
+    server.disconnect();
+}
+
+test "concrete resource reads do not require the template catalog" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigWithModeForTest(
+        alloc,
+        "exact-resource",
+        resource_resolution_shell_server,
+        "exact",
+    ));
+    runtime.connectAll(.{});
+    try std.testing.expectEqual(ServerState.ready, runtime.servers.items[0].state);
+
+    var result = try runtime.readResource(alloc, "exact-resource", "memory://exact", .{});
+    defer result.deinit(alloc);
+    try expectResourceText(result, "exact-resource");
+}
+
+test "invalid resource template pagination propagates before resource read" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigWithModeForTest(
+        alloc,
+        "invalid-template-pages",
+        resource_resolution_shell_server,
+        "invalid",
+    ));
+    runtime.connectAll(.{});
+    try std.testing.expectEqual(ServerState.ready, runtime.servers.items[0].state);
+    try std.testing.expectError(
+        error.DuplicateCursor,
+        runtime.readResource(alloc, "invalid-template-pages", "memory://missing", .{}),
+    );
+}
+
+test "resource template discovery cancellation is not converted to not found" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigWithModeForTest(
+        alloc,
+        "cancel-template-pages",
+        resource_resolution_shell_server,
+        "cancel",
+    ));
+    runtime.connectAll(.{});
+    try std.testing.expectEqual(ServerState.ready, runtime.servers.items[0].state);
+    var resources = try runtime.listResources(alloc, "cancel-template-pages", false, null, .unrestricted);
+    resources.deinit(alloc);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Flip = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+    const cancel_thread = try std.Thread.spawn(.{}, Flip.run, .{&cancel_flag});
+    defer cancel_thread.join();
+    try std.testing.expectError(
+        error.Cancelled,
+        runtime.readResource(
+            alloc,
+            "cancel-template-pages",
+            "memory://missing",
+            .{ .cancel_flag = &cancel_flag },
+        ),
+    );
+}
+
+test "missing resource returns not found without a resource read request" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigWithModeForTest(
+        alloc,
+        "missing-resource",
+        resource_resolution_shell_server,
+        "missing",
+    ));
+    runtime.connectAll(.{});
+    try std.testing.expectEqual(ServerState.ready, runtime.servers.items[0].state);
+    try std.testing.expectError(
+        error.McpResourceNotFound,
+        runtime.readResource(alloc, "missing-resource", "memory://missing", .{}),
+    );
+}
+
+fn resourceTemplateSnapshotServerForTest(
+    templates: []resources_feature.Template,
+) McpServer {
+    const digest = feature_cache.authIdentity(&.{});
+    const template_metadata = feature_cache.SnapshotMetadata{
+        .key = feature_cache.buildCacheKey(.{
+            .server_identity = "allocation-fixture",
+            .protocol_version = modern_protocol_version,
+            .capability = .resource_templates_list,
+            .normalized_arguments = "{}",
+            .scope = .public,
+            .auth_identity = digest,
+        }),
+        .connection_generation = 0,
+        .catalog_generation = 1,
+        .fetched_at_ms = 1,
+        .expires_at_ms = std.math.maxInt(u64),
+        .scope = .public,
+        .content_digest = digest,
+    };
+    return .{
+        .config = .{ .name = "allocation-fixture" },
+        .resource_catalog = .{
+            .catalog = .{
+                .items = &.{},
+                .fetched_at_ms = 1,
+                .expires_at_ms = std.math.maxInt(u64),
+                .cache_scope = .public,
+            },
+            .metadata = feature_cache.SnapshotMetadata{
+                .key = feature_cache.buildCacheKey(.{
+                    .server_identity = "allocation-fixture",
+                    .protocol_version = modern_protocol_version,
+                    .capability = .resources_list,
+                    .normalized_arguments = "{}",
+                    .scope = .public,
+                    .auth_identity = digest,
+                }),
+                .connection_generation = 0,
+                .catalog_generation = 1,
+                .fetched_at_ms = 1,
+                .expires_at_ms = std.math.maxInt(u64),
+                .scope = .public,
+                .content_digest = digest,
+            },
+            .available = true,
+        },
+        .resource_template_catalog = .{
+            .catalog = .{
+                .items = templates,
+                .fetched_at_ms = 1,
+                .expires_at_ms = std.math.maxInt(u64),
+                .cache_scope = .public,
+            },
+            .metadata = template_metadata,
+            .available = true,
+        },
+    };
+}
+
+fn resourceReadPublicationServerForTest(
+    descriptors: []resources_feature.Descriptor,
+) McpServer {
+    const digest = feature_cache.authIdentity(&.{});
+    const metadata = feature_cache.SnapshotMetadata{
+        .key = feature_cache.buildCacheKey(.{
+            .server_identity = "resource-read-publication",
+            .protocol_version = modern_protocol_version,
+            .capability = .resources_list,
+            .normalized_arguments = "{}",
+            .scope = .public,
+            .auth_identity = digest,
+        }),
+        .connection_generation = 1,
+        .catalog_generation = 1,
+        .fetched_at_ms = 1,
+        .expires_at_ms = std.math.maxInt(u64),
+        .scope = .public,
+        .content_digest = digest,
+    };
+    return .{
+        .config = .{ .name = "resource-read-publication" },
+        .connection_generation = 1,
+        .stdio_protocol = .modern,
+        .negotiated_protocol_version = modern_protocol_version,
+        .resource_catalog = .{
+            .catalog = .{
+                .items = descriptors,
+                .fetched_at_ms = 1,
+                .expires_at_ms = std.math.maxInt(u64),
+                .cache_scope = .public,
+            },
+            .metadata = metadata,
+            .available = true,
+        },
+    };
+}
+
+fn resourceReadPublicationSnapshotForTest(
+    server: *const McpServer,
+) FeatureIdentitySnapshot {
+    return .{
+        .server_name = @constCast(server.config.name),
+        .identity = @constCast("memory://owned"),
+        .kind = .resource,
+        .cache_key = server.resource_catalog.metadata.?.key,
+        .connection_generation = server.connection_generation,
+        .catalog_generation = server.resource_catalog.metadata.?.catalog_generation,
+    };
+}
+
+fn fetchedResourceReadForTest(
+    alloc: Allocator,
+    cache_eligible: bool,
+) !FetchedResourceRead {
+    const contents = try alloc.alloc(resources_feature.ResourceContent, 1);
+    errdefer alloc.free(contents);
+    const uri = try alloc.dupe(u8, "memory://owned");
+    errdefer alloc.free(uri);
+    const text = try alloc.dupe(u8, "owned contents");
+    contents[0] = .{ .uri = uri, .data = .{ .text = text } };
+    return .{
+        .result = .{
+            .contents = contents,
+            .cache = .{ .ttl_ms = 60_000, .ttl_present = true, .scope = .public },
+            .cache_eligible = cache_eligible,
+        },
+        .auth_identity = null,
+        .received_at_ms = 1,
+    };
+}
+
+fn deinitResourceReadCacheForTest(server: *McpServer, alloc: Allocator) void {
+    for (server.resource_read_cache.items) |*entry| entry.deinit(alloc);
+    server.resource_read_cache.deinit(alloc);
+    server.resource_read_cache = .empty;
+}
+
+fn checkResourceReadFinishAllocationFailures(
+    alloc: Allocator,
+    cache_eligible: bool,
+) !void {
+    var descriptors = [_]resources_feature.Descriptor{.{
+        .uri = @constCast("memory://owned"),
+        .name = @constCast("owned"),
+    }};
+    var server = resourceReadPublicationServerForTest(&descriptors);
+    defer deinitResourceReadCacheForTest(&server, alloc);
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    const snapshot = resourceReadPublicationSnapshotForTest(&server);
+    const fetched = try fetchedResourceReadForTest(alloc, cache_eligible);
+    var result = try finishFetchedResourceRead(
+        &runtime,
+        alloc,
+        &server,
+        &snapshot,
+        "memory://owned",
+        fetched,
+        std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+            .clock = .awake,
+            .raw = .fromSeconds(1),
+        }),
+        null,
+        .unrestricted,
+    );
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, @intFromBool(cache_eligible)),
+        server.resource_read_cache.items.len,
+    );
+    try expectResourceText(result, "owned contents");
+}
+
+test "resource read cache publication OOM releases fetched contents" {
+    var descriptors = [_]resources_feature.Descriptor{.{
+        .uri = @constCast("memory://owned"),
+        .name = @constCast("owned"),
+    }};
+    var server = resourceReadPublicationServerForTest(&descriptors);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var runtime = McpRuntime.init(failing.allocator());
+    defer runtime.deinit();
+    const snapshot = resourceReadPublicationSnapshotForTest(&server);
+    const fetched = try fetchedResourceReadForTest(std.testing.allocator, true);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        finishFetchedResourceRead(
+            &runtime,
+            std.testing.allocator,
+            &server,
+            &snapshot,
+            "memory://owned",
+            fetched,
+            std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+                .clock = .awake,
+                .raw = .fromSeconds(1),
+            }),
+            null,
+            .unrestricted,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), server.resource_read_cache.items.len);
+}
+
+test "resource read publication cancellation and deadline release fetched contents" {
+    var descriptors = [_]resources_feature.Descriptor{.{
+        .uri = @constCast("memory://owned"),
+        .name = @constCast("owned"),
+    }};
+    var server = resourceReadPublicationServerForTest(&descriptors);
+    defer deinitResourceReadCacheForTest(&server, std.testing.allocator);
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const snapshot = resourceReadPublicationSnapshotForTest(&server);
+    var cancel = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        finishFetchedResourceRead(
+            &runtime,
+            std.testing.allocator,
+            &server,
+            &snapshot,
+            "memory://owned",
+            try fetchedResourceReadForTest(std.testing.allocator, true),
+            std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+                .clock = .awake,
+                .raw = .fromSeconds(1),
+            }),
+            &cancel,
+            .unrestricted,
+        ),
+    );
+    cancel.store(false, .release);
+    try std.testing.expectError(
+        error.McpRequestTimedOut,
+        finishFetchedResourceRead(
+            &runtime,
+            std.testing.allocator,
+            &server,
+            &snapshot,
+            "memory://owned",
+            try fetchedResourceReadForTest(std.testing.allocator, true),
+            std.Io.Clock.Timestamp.now(std.testing.io, .awake),
+            null,
+            .unrestricted,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), server.resource_read_cache.items.len);
+}
+
+test "cached resource read finalization releases every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkResourceReadFinishAllocationFailures,
+        .{true},
+    );
+}
+
+test "uncached resource read finalization releases every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkResourceReadFinishAllocationFailures,
+        .{false},
+    );
+}
+
+fn checkResourceSnapshotWithTemplatesAllocationFailures(alloc: Allocator) !void {
+    var templates = [_]resources_feature.Template{.{
+        .uri_template = @constCast("memory://{value}"),
+        .name = @constCast("value"),
+    }};
+    var server = resourceTemplateSnapshotServerForTest(&templates);
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    var snapshot = try snapshotResourceIdentityWithTemplates(
+        &runtime,
+        alloc,
+        &server,
+        "memory://accepted",
+        deadline,
+        null,
+    );
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("memory://accepted", snapshot.requested_uri.?);
+}
+
+test "resource template matching bounds catalog work and releases the catalog lock" {
+    const malicious_template = "memory://{value}" ++ ("a" ** 2047) ++ "b";
+    const requested_uri = "memory://" ++ ("a" ** 4096);
+    var templates = [_]resources_feature.Template{.{
+        .uri_template = @constCast(malicious_template),
+        .name = @constCast("bounded"),
+    }};
+    var server = resourceTemplateSnapshotServerForTest(&templates);
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    try std.testing.expectError(
+        error.McpResourceTemplateMatchLimitExceeded,
+        snapshotResourceIdentityWithTemplates(
+            &runtime,
+            std.testing.allocator,
+            &server,
+            requested_uri,
+            deadline,
+            null,
+        ),
+    );
+
+    try lockRwUntil(&runtime.catalog_mutex, deadline, null);
+    runtime.catalog_mutex.unlock(io_mod.getIo());
+}
+
+test "resource template matching propagates operation control and releases the catalog lock" {
+    var templates = [_]resources_feature.Template{.{
+        .uri_template = @constCast("memory://{value}"),
+        .name = @constCast("value"),
+    }};
+    var server = resourceTemplateSnapshotServerForTest(&templates);
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const future_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    var cancel_flag = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        snapshotResourceIdentityWithTemplates(
+            &runtime,
+            std.testing.allocator,
+            &server,
+            "memory://accepted",
+            future_deadline,
+            &cancel_flag,
+        ),
+    );
+    try lockRwUntil(&runtime.catalog_mutex, future_deadline, null);
+    runtime.catalog_mutex.unlock(io_mod.getIo());
+
+    const expired_deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try std.testing.expectError(
+        error.McpRequestTimedOut,
+        snapshotResourceIdentityWithTemplates(
+            &runtime,
+            std.testing.allocator,
+            &server,
+            "memory://accepted",
+            expired_deadline,
+            null,
+        ),
+    );
+    try lockRwUntil(&runtime.catalog_mutex, future_deadline, null);
+    runtime.catalog_mutex.unlock(io_mod.getIo());
+}
+
+test "resource template snapshot allocation failures propagate and clean up" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkResourceSnapshotWithTemplatesAllocationFailures,
+        .{},
+    );
+}
+
+test "MRTR-derived resource reads are never reused from the URI cache" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\read_count=0
+        \\while IFS= read -r line; do
+        \\  id=${line#*'"id":'}
+        \\  id=${id%%,*}
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{}}}}'
+        \\      ;;
+        \\    *'"method":"tools/list"'*)
+        \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"tools":[]}}\n' "$id"
+        \\      ;;
+        \\    *'"method":"resources/list"'*)
+        \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"resources":[{"uri":"memory://mrtr","name":"mrtr"}]}}\n' "$id"
+        \\      ;;
+        \\    *'"method":"resources/templates/list"'*)
+        \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"resourceTemplates":[]}}\n' "$id"
+        \\      ;;
+        \\    *'"method":"resources/read"'*)
+        \\      read_count=$((read_count + 1))
+        \\      case "$line" in
+        \\        *'"inputResponses"'*)
+        \\          printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"contents":[{"uri":"memory://mrtr","text":"completed-%s"}]}}\n' "$id" "$read_count"
+        \\          ;;
+        \\        *)
+        \\          printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"input_required","inputRequests":{"confirm":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}}}}}},"requestState":{"round":%s}}}\n' "$id" "$read_count"
+        \\          ;;
+        \\      esac
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigForTest(alloc, "mrtr-cache", shell_server));
+    runtime.connectAll(.{});
+    try std.testing.expectEqual(ServerState.ready, runtime.servers.items[0].state);
+
+    var responder_calls: usize = 0;
+    const responder = tool_mcp_runtime.InputResponder{
+        .context = &responder_calls,
+        .capabilities = .{ .form = true },
+        .callback = acceptResourceInputForTest,
+    };
+    var first = try runtime.readResource(
+        alloc,
+        "mrtr-cache",
+        "memory://mrtr",
+        .{ .input_responder = responder },
+    );
+    defer first.deinit(alloc);
+    try expectResourceText(first, "completed-2");
+
+    var second = try runtime.readResource(
+        alloc,
+        "mrtr-cache",
+        "memory://mrtr",
+        .{ .input_responder = responder },
+    );
+    defer second.deinit(alloc);
+    try expectResourceText(second, "completed-4");
+    try std.testing.expectEqual(@as(usize, 2), responder_calls);
+}
+
+test "stale resource cache never masks input-required or cancellation" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\mrtr_reads=0
+        \\cancel_reads=0
+        \\while IFS= read -r line; do
+        \\  id=${line#*'"id":'}
+        \\  id=${id%%,*}
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{}}}}'
+        \\      ;;
+        \\    *'"method":"tools/list"'*)
+        \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"tools":[]}}\n' "$id"
+        \\      ;;
+        \\    *'"method":"resources/list"'*)
+        \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"resources":[{"uri":"memory://mrtr-stale","name":"mrtr"},{"uri":"memory://cancel-stale","name":"cancel"}]}}\n' "$id"
+        \\      ;;
+        \\    *'"method":"resources/templates/list"'*)
+        \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"resourceTemplates":[]}}\n' "$id"
+        \\      ;;
+        \\    *'"method":"resources/read"'*'memory://mrtr-stale'*)
+        \\      mrtr_reads=$((mrtr_reads + 1))
+        \\      if [ "$mrtr_reads" -eq 1 ]; then
+        \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":0,"contents":[{"uri":"memory://mrtr-stale","text":"stale-mrtr"}]}}\n' "$id"
+        \\      else
+        \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"input_required","inputRequests":{"confirm":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}}}}}},"requestState":"mrtr-stale"}}\n' "$id"
+        \\      fi
+        \\      ;;
+        \\    *'"method":"resources/read"'*'memory://cancel-stale'*)
+        \\      cancel_reads=$((cancel_reads + 1))
+        \\      if [ "$cancel_reads" -eq 1 ]; then
+        \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":0,"contents":[{"uri":"memory://cancel-stale","text":"stale-cancel"}]}}\n' "$id"
+        \\      else
+        \\        sleep 1
+        \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":60000,"contents":[{"uri":"memory://cancel-stale","text":"late"}]}}\n' "$id"
+        \\      fi
+        \\      ;;
+        \\    *'"method":"notifications/cancelled"'*)
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigForTest(alloc, "stale-controls", shell_server));
+    runtime.connectAll(.{});
+    try std.testing.expectEqual(ServerState.ready, runtime.servers.items[0].state);
+
+    var initial_mrtr = try runtime.readResource(
+        alloc,
+        "stale-controls",
+        "memory://mrtr-stale",
+        .{},
+    );
+    defer initial_mrtr.deinit(alloc);
+    try expectResourceText(initial_mrtr, "stale-mrtr");
+    try std.testing.expectError(
+        error.McpInputRequired,
+        runtime.readResource(alloc, "stale-controls", "memory://mrtr-stale", .{}),
+    );
+
+    var initial_cancel = try runtime.readResource(
+        alloc,
+        "stale-controls",
+        "memory://cancel-stale",
+        .{},
+    );
+    defer initial_cancel.deinit(alloc);
+    try expectResourceText(initial_cancel, "stale-cancel");
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Flip = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+    const cancel_thread = try std.Thread.spawn(.{}, Flip.run, .{&cancel_flag});
+    defer cancel_thread.join();
+    try std.testing.expectError(
+        error.Cancelled,
+        runtime.readResource(
+            alloc,
+            "stale-controls",
+            "memory://cancel-stale",
+            .{ .cancel_flag = &cancel_flag },
+        ),
+    );
+}
+
+test "modern stdio tool discovery consumes every page and publishes deterministic order" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}}'
+        \\      ;;
+        \\    *'"method":"tools/list"'*'"cursor":"page-2"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"alpha","title":"Alpha","inputSchema":{"type":"object"}}]}}'
+        \\      ;;
+        \\    *'"method":"tools/list"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","nextCursor":"page-2","tools":[{"name":"zeta","title":"Zeta","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"annotations":{"readOnlyHint":true},"icons":[{"src":"data:image/png;base64,AA=="}],"_meta":{"vendor":"fixture"}}]}}'
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigForTest(alloc, "pages", shell_server));
+    runtime.connectAll(.{});
+
+    const server = &runtime.servers.items[0];
+    try std.testing.expectEqual(ServerState.ready, server.state);
+    try std.testing.expectEqual(@as(usize, 2), server.tool_catalog.tools.items.len);
+    try std.testing.expectEqualStrings("alpha", server.tool_catalog.tools.items[0].original_name);
+    try std.testing.expectEqualStrings("zeta", server.tool_catalog.tools.items[1].original_name);
+    try std.testing.expectEqualStrings("Zeta", server.tool_catalog.tools.items[1].title.?);
+    try std.testing.expect(server.tool_catalog.tools.items[1].output_schema_json != null);
+    try std.testing.expect(server.tool_catalog.tools.items[1].annotations_json != null);
+    try std.testing.expect(server.tool_catalog.tools.items[1].icons_json != null);
+    try std.testing.expect(server.tool_catalog.tools.items[1].metadata_json != null);
+
+    server.disconnect();
+}
+
+test "delayed modern discovery response does not fall back to legacy" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*)
+        \\      exit 2
+        \\      ;;
+        \\    *'"method":"server/discover"'*)
+        \\      sleep 2
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}}'
+        \\      ;;
+        \\    *'"method":"tools/list"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[]}}'
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigForTest(alloc, "delayed-modern", shell_server));
+    runtime.connectAll(.{});
+
+    const server = &runtime.servers.items[0];
+    try std.testing.expectEqual(ServerState.ready, server.state);
+    try std.testing.expectEqual(StdioProtocol.modern, server.stdio_protocol);
+
+    server.disconnect();
+}
+
+test "unsupported modern version falls back when legacy is mutually supported" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2024-11-05"],"requested":"2026-07-28"}}}'
+        \\      ;;
+        \\    *'"method":"initialize"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"legacy","version":"0"}}}'
+        \\      ;;
+        \\    *'"method":"notifications/initialized"'*)
+        \\      ;;
+        \\    *'"method":"tools/list"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}'
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigForTest(alloc, "mutual-version", shell_server));
+    runtime.connectAll(.{});
+
+    const server = &runtime.servers.items[0];
+    try std.testing.expectEqual(ServerState.ready, server.state);
+    try std.testing.expectEqual(StdioProtocol.legacy, server.stdio_protocol);
+
+    server.disconnect();
+}
+
+test "stdio discovery negotiates declared 2025-11 legacy elicitation" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25"],"requested":"2026-07-28"}}}'
+        \\      ;;
+        \\    *'"method":"initialize"'*'"protocolVersion":"2025-11-25"'*'"elicitation":{"form":{},"url":{}}'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}'
+        \\      ;;
+        \\    *'"method":"notifications/initialized"'*)
+        \\      ;;
+        \\    *'"method":"tools/list"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}'
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.initWithElicitation(alloc, .{ .form = true, .url = true });
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigForTest(alloc, "no-mutual-version", shell_server));
+    runtime.connectAll(.{});
+
+    const server = &runtime.servers.items[0];
+    try std.testing.expectEqual(ServerState.ready, server.state);
+    try std.testing.expectEqualStrings(legacy_2025_11_protocol_version, server.negotiated_protocol_version);
+    try std.testing.expectEqual(StdioProtocol.legacy, server.stdio_protocol);
+}
+
+test "malformed modern discovery response does not fall back to legacy" {
+    const alloc = std.testing.allocator;
+    const shell_server =
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"server/discover"'*)
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}}'
+        \\      ;;
+        \\    *'"method":"initialize"'*)
+        \\      exit 2
+        \\      ;;
+        \\    *)
+        \\      exit 3
+        \\      ;;
+        \\  esac
+        \\done
+    ;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(try shellMcpConfigForTest(alloc, "malformed-modern", shell_server));
+    runtime.connectAll(.{});
+
+    const server = &runtime.servers.items[0];
+    try std.testing.expectEqual(ServerState.failed, server.state);
+    try std.testing.expectEqualStrings("McpMissingResultType", server.last_error.?);
+}
+
+test "McpRuntime cancels blocked stdio discovery without exposing partial state" {
+    const alloc = std.testing.allocator;
+
+    const args = try alloc.alloc([]const u8, 1);
+    args[0] = try alloc.dupe(u8, "{}");
+
+    var runtime = McpRuntime.init(alloc);
+    var runtime_deinitialized = false;
+    defer if (!runtime_deinitialized) runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "pending"),
+        .command = try alloc.dupe(u8, "awk"),
+        .args = args,
+    });
+
+    runtime.startDiscovery(.{});
+    try io_mod.getIo().sleep(.fromMilliseconds(25), .awake);
+    try std.testing.expect(runtime.isDiscovering());
+    try std.testing.expect(!runtime.hasTool("mcp_pending_echo"));
+
+    const listing = try runtime.listServersAndTools(alloc);
+    defer alloc.free(listing);
+    try std.testing.expect(std.mem.find(u8, listing, "state=connecting") != null);
+    try std.testing.expect(std.mem.find(u8, listing, "command") == null);
+
+    var results = try runtime.searchTools(alloc, "echo", 5, .{}, .{}, .unrestricted);
+    defer results.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[],\"count\":0,\"state\":\"discovering\",\"retryable\":true}",
+        results.model_output,
+    );
+
+    const started_ms = io_mod.milliTimestamp();
+    runtime.deinit();
+    runtime_deinitialized = true;
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1000);
+}
+
+test "caller cancellation interrupts blocked candidate connection" {
+    const Connector = struct {
+        runtime: *McpRuntime,
+        cancel: *std.atomic.Value(bool),
+        started: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.runtime.connectAllCancellable(.{}, self.cancel);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const args = try alloc.alloc([]const u8, 1);
+    args[0] = try alloc.dupe(u8, "{}");
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "candidate"),
+        .command = try alloc.dupe(u8, "awk"),
+        .args = args,
+        .startup_timeout_ms = 60_000,
+    });
+    var cancel = std.atomic.Value(bool).init(false);
+    var connector = Connector{ .runtime = &runtime, .cancel = &cancel };
+    const thread = try std.Thread.spawn(.{}, Connector.run, .{&connector});
+    while (!connector.started.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+    io_mod.sleep(25 * std.time.ns_per_ms);
+    const started_ms = io_mod.milliTimestamp();
+    cancel.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[0].state);
+    try std.testing.expect(runtime.servers.items[0].last_error == null);
+}
+
+test "MCP health terminal-encodes external identity and omits secret-bearing configuration" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "unsafe\x1b[31m-name"),
+        .transport = .http,
+        .url = try alloc.dupe(u8, "https://user:secret@example.test/mcp?token=hidden"),
+        .headers = try alloc.dupe(mcp_contract.McpHttpHeader, &.{.{
+            .name = try alloc.dupe(u8, "Authorization"),
+            .value = try alloc.dupe(u8, "Bearer hidden"),
+        }}),
+        .enabled = false,
+    });
+    const output = try runtime.listServersAndTools(alloc);
+    defer alloc.free(output);
+    try std.testing.expect(std.mem.find(u8, output, "\\x1b") != null);
+    for ([_][]const u8{ "secret", "token", "Authorization", "Bearer", "example.test" }) |forbidden| {
+        try std.testing.expect(std.mem.find(u8, output, forbidden) == null);
+    }
+}
+
+test "MCP health snapshot cleans up every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkHealthSnapshotAllocationFailures,
+        .{},
+    );
+}
+
+test "model catalog reports deferred ask servers without connecting and counts only visible tools" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "required"),
+        .transport = .http,
+        .url = try alloc.dupe(u8, "https://required.example/mcp"),
+        .required = true,
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "optional"),
+        .transport = .http,
+        .url = try alloc.dupe(u8, "https://optional.example/mcp"),
+    });
+    runtime.discovery_state.store(.complete, .seq_cst);
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"one","inputSchema":{"type":"object"}},{"name":"two","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+
+    var denied_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("mcp_required_two"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var before = try runtime.snapshotModelCatalog(
+        alloc,
+        .{ .rules = &denied_rules },
+        true,
+    );
+    defer before.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), before.servers.len);
+    try std.testing.expectEqual(model_catalog.Availability.ready, before.servers[0].availability);
+    try std.testing.expectEqual(@as(?usize, 1), before.servers[0].tool_count);
+    try std.testing.expectEqual(model_catalog.Availability.available_on_demand, before.servers[1].availability);
+    try std.testing.expectEqual(@as(?usize, null), before.servers[1].tool_count);
+    try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[1].state);
+    try std.testing.expectEqual(DiscoveryState.idle, runtime.deferred_discovery_state.load(.acquire));
+
+    runtime.servers.items[1].state = .ready;
+    try parseAndStoreTools(alloc, &runtime.servers.items[1], .{}, response, &used);
+    runtime.deferred_discovery_state.store(.complete, .release);
+    var after = try runtime.snapshotModelCatalog(alloc, .{}, true);
+    defer after.deinit(alloc);
+
+    try std.testing.expectEqual(model_catalog.Availability.ready, after.servers[1].availability);
+    try std.testing.expectEqual(@as(?usize, 2), after.servers[1].tool_count);
+}
+
+fn checkModelCatalogSnapshotAllocationFailures(alloc: Allocator) !void {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try std.testing.allocator.dupe(u8, "one"),
+        .command = try std.testing.allocator.dupe(u8, "fixture"),
+        .enabled = false,
+    });
+    try runtime.addServer(.{
+        .name = try std.testing.allocator.dupe(u8, "two"),
+        .command = try std.testing.allocator.dupe(u8, "fixture"),
+        .enabled = false,
+    });
+    runtime.discovery_state.store(.complete, .release);
+    for (runtime.servers.items) |*server| server.state = .disabled;
+
+    var snapshot = try runtime.snapshotModelCatalog(alloc, .{}, false);
+    snapshot.deinit(alloc);
+}
+
+test "model catalog snapshot cleans up every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkModelCatalogSnapshotAllocationFailures,
+        .{},
+    );
+}
+
+fn checkHealthSnapshotAllocationFailures(alloc: Allocator) !void {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try std.testing.allocator.dupe(u8, "server"),
+        .command = try std.testing.allocator.dupe(u8, "fixture"),
+        .enabled = false,
+    });
+    var snapshot = try runtime.snapshotHealth(alloc, 42);
+    defer snapshot.deinit(alloc);
+}
+
+test "MCP health reads only lock-free state during discovery" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "active"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "disabled"),
+        .command = try alloc.dupe(u8, "fixture"),
+        .enabled = false,
+        .required = true,
+    });
+
+    const active = &runtime.servers.items[0];
+    active.state = .ready;
+    active.negotiated_server_name = try alloc.dupe(u8, "published-name");
+    active.negotiated_server_version = try alloc.dupe(u8, "1.0.0");
+    active.negotiated_protocol_version = "2025-06-18";
+    active.catalog_generation = 7;
+    active.restart_attempts = 3;
+    active.last_successful_discovery_ms = 41;
+    active.auth_credentials_present.store(true, .release);
+    runtime.servers.items[1].state = .ready;
+
+    var idle = try runtime.snapshotHealth(alloc, 40);
+    try std.testing.expectEqual(health.ConnectionState.disconnected, idle.servers[0].connection);
+    try std.testing.expectEqual(@as(?[]u8, null), idle.servers[0].negotiated_name);
+    idle.deinit(alloc);
+
+    runtime.discovery_state.store(.loading, .seq_cst);
+
+    var loading = try runtime.snapshotHealth(alloc, 42);
+    defer loading.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), loading.servers.len);
+    const loading_active = loading.servers[0];
+    try std.testing.expectEqual(health.ConnectionState.connecting, loading_active.connection);
+    try std.testing.expectEqual(health.AuthenticationState.authenticated, loading_active.authentication);
+    try std.testing.expectEqual(@as(?[]u8, null), loading_active.negotiated_name);
+    try std.testing.expectEqual(@as(?[]u8, null), loading_active.negotiated_version);
+    try std.testing.expectEqual(@as(?[]u8, null), loading_active.protocol_version);
+    try std.testing.expectEqual(health.CapabilityCounts{}, loading_active.counts);
+    try std.testing.expectEqual(health.CacheFreshness.unavailable, loading_active.cache_freshness);
+    try std.testing.expectEqual(health.SubscriptionState.unavailable, loading_active.subscription);
+    try std.testing.expectEqual(@as(u64, 0), loading_active.catalog_generation);
+    try std.testing.expectEqual(@as(u8, 0), loading_active.retry_attempt);
+    try std.testing.expectEqual(@as(?u64, null), loading_active.retry_in_ms);
+    try std.testing.expectEqual(@as(?u64, null), loading_active.last_successful_discovery_ms);
+    try std.testing.expectEqual(@as(?[]u8, null), loading_active.failure);
+    try std.testing.expectEqual(health.ConnectionState.disabled, loading.servers[1].connection);
+    try std.testing.expectEqualStrings(
+        "Enable this required server or mark it optional.",
+        loading.servers[1].failure.?,
+    );
+
+    const SnapshotAttempt = struct {
+        runtime: *McpRuntime,
+        entered: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.entered.store(true, .release);
+            var snapshot = self.runtime.snapshotHealth(std.heap.page_allocator, 42) catch |err| {
+                self.err = err;
+                self.finished.store(true, .release);
+                return;
+            };
+            snapshot.deinit(std.heap.page_allocator);
+            self.finished.store(true, .release);
+        }
+    };
+    runtime.catalog_mutex.lockUncancelable(std.testing.io);
+    active.status_lock.lockUncancelable(std.testing.io);
+    var locks_held = true;
+    defer if (locks_held) {
+        active.status_lock.unlock(std.testing.io);
+        runtime.catalog_mutex.unlock(std.testing.io);
+    };
+    var attempt = SnapshotAttempt{ .runtime = &runtime };
+    const thread = try std.Thread.spawn(.{}, SnapshotAttempt.run, .{&attempt});
+    const entered_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(5),
+    });
+    while (!attempt.entered.load(.acquire) and std.Io.Clock.Timestamp.compare(
+        std.Io.Clock.Timestamp.now(std.testing.io, .awake),
+        .lt,
+        entered_deadline,
+    )) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    const entered = attempt.entered.load(.acquire);
+    const completion_deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(5),
+    });
+    while (entered and !attempt.finished.load(.acquire) and std.Io.Clock.Timestamp.compare(
+        std.Io.Clock.Timestamp.now(std.testing.io, .awake),
+        .lt,
+        completion_deadline,
+    )) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    const finished_while_locked = attempt.finished.load(.acquire);
+    active.status_lock.unlock(std.testing.io);
+    runtime.catalog_mutex.unlock(std.testing.io);
+    locks_held = false;
+    thread.join();
+    try std.testing.expect(entered);
+    try std.testing.expect(attempt.err == null);
+    try std.testing.expect(finished_while_locked);
+
+    runtime.discovery_state.store(.complete, .seq_cst);
+    var published = try runtime.snapshotHealth(alloc, 43);
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(health.ConnectionState.failed, published.servers[0].connection);
+    try std.testing.expectEqual(health.AuthenticationState.authenticated, published.servers[0].authentication);
+    try std.testing.expectEqualStrings("published-name", published.servers[0].negotiated_name.?);
+    try std.testing.expectEqualStrings("1.0.0", published.servers[0].negotiated_version.?);
+    try std.testing.expectEqualStrings("2025-06-18", published.servers[0].protocol_version.?);
+    try std.testing.expectEqual(@as(u64, 7), published.servers[0].catalog_generation);
+    try std.testing.expectEqual(@as(?u64, 41), published.servers[0].last_successful_discovery_ms);
+}
+
+test "McpRuntime async discovery publishes tool names only after the full pass" {
+    const alloc = std.testing.allocator;
+
+    const ready_server =
+        \\/"method":"server\/discover"/ { print "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}"; fflush(); next }
+        \\/"method":"initialize"/ { print "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"awk\",\"version\":\"0\"}}}"; fflush(); next }
+        \\/"method":"tools\/list"/ { print "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo text\",\"inputSchema\":{\"type\":\"object\"}}]}}"; fflush() }
+    ;
+    const ready_args = try alloc.alloc([]const u8, 1);
+    ready_args[0] = try alloc.dupe(u8, ready_server);
+    const pending_args = try alloc.alloc([]const u8, 1);
+    pending_args[0] = try alloc.dupe(u8, "{}");
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "ready"),
+        .command = try alloc.dupe(u8, "awk"),
+        .args = ready_args,
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "pending"),
+        .command = try alloc.dupe(u8, "awk"),
+        .args = pending_args,
+    });
+
+    runtime.startDiscoveryWithServerTimeout(.{}, .fromSeconds(2));
+    const ready_deadline_ms = io_mod.milliTimestamp() + 5_000;
+    var ready_published = false;
+    while (runtime.isDiscovering() and
+        io_mod.milliTimestamp() < ready_deadline_ms)
+    {
+        runtime.servers.items[0].status_lock.lockUncancelable(io_mod.getIo());
+        ready_published = runtime.servers.items[0].state == .ready;
+        runtime.servers.items[0].status_lock.unlock(io_mod.getIo());
+        if (ready_published) break;
+        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
+    }
+
+    try std.testing.expect(ready_published);
+    try std.testing.expect(runtime.isDiscovering());
+    try std.testing.expect(!runtime.hasTool("mcp_ready_echo"));
+    const pending_names = try runtime.snapshotToolNames(alloc, .{});
+    defer alloc.free(pending_names);
+    try std.testing.expectEqual(@as(usize, 0), pending_names.len);
+
+    const completion_deadline_ms = io_mod.milliTimestamp() + 5_000;
+    while (runtime.isDiscovering() and
+        io_mod.milliTimestamp() < completion_deadline_ms)
+    {
+        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
+    }
+    try std.testing.expect(!runtime.isDiscovering());
+    try std.testing.expect(runtime.hasTool("mcp_ready_echo"));
+    const names = try runtime.snapshotToolNames(alloc, .{});
+    defer {
+        for (names) |name| alloc.free(name);
+        alloc.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("mcp_ready_echo", names[0]);
+}
+
+test "McpRuntime continues discovery after one server times out" {
+    const alloc = std.testing.allocator;
+
+    const pending_args = try alloc.alloc([]const u8, 1);
+    pending_args[0] = try alloc.dupe(u8, "{}");
+
+    const ready_server =
+        \\/"method":"server\/discover"/ { print "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}"; fflush(); next }
+        \\/"method":"initialize"/ { print "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"awk\",\"version\":\"0\"}}}"; fflush(); next }
+        \\/"method":"tools\/list"/ { print "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo text\",\"inputSchema\":{\"type\":\"object\"}}]}}"; fflush() }
+    ;
+    const ready_args = try alloc.alloc([]const u8, 1);
+    ready_args[0] = try alloc.dupe(u8, ready_server);
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "pending"),
+        .command = try alloc.dupe(u8, "awk"),
+        .args = pending_args,
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "ready"),
+        .command = try alloc.dupe(u8, "awk"),
+        .args = ready_args,
+    });
+
+    runtime.startDiscoveryWithServerTimeout(.{}, .fromSeconds(2));
+    const deadline_ms = io_mod.milliTimestamp() + 5_000;
+    while (runtime.isDiscovering() and io_mod.milliTimestamp() < deadline_ms) {
+        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
+    }
+
+    try std.testing.expect(!runtime.isDiscovering());
+    try std.testing.expectEqual(ServerState.failed, runtime.servers.items[0].state);
+    try std.testing.expectEqualStrings("McpConnectionTimedOut", runtime.servers.items[0].last_error.?);
+    try std.testing.expectEqual(ServerState.ready, runtime.servers.items[1].state);
+    try std.testing.expect(runtime.hasTool("mcp_ready_echo"));
+}
+
+test "tool name allocation sanitizes truncates and deconflicts" {
+    const alloc = std.testing.allocator;
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    const first = try allocateToolName(alloc, .{}, &used, "fs", "read");
+    defer alloc.free(first);
+    try used.put(first, {});
+    try std.testing.expectEqualStrings("mcp_fs_read", first);
+
+    const sanitized = try allocateToolName(alloc, .{}, &used, "git-hub", "read/file");
+    defer alloc.free(sanitized);
+    try used.put(sanitized, {});
+    try std.testing.expectEqualStrings("mcp_git-hub_read_file", sanitized);
+
+    const empty_segments = try allocateToolName(alloc, .{}, &used, "", "");
+    defer alloc.free(empty_segments);
+    try used.put(empty_segments, {});
+    try std.testing.expectEqualStrings("mcp_server_tool", empty_segments);
+
+    const slash = try allocateToolName(alloc, .{}, &used, "a/b", "c");
+    defer alloc.free(slash);
+    try used.put(slash, {});
+    try std.testing.expectEqualStrings("mcp_a_b_c", slash);
+
+    const space_collision = try allocateToolName(alloc, .{}, &used, "a b", "c");
+    defer alloc.free(space_collision);
+    try used.put(space_collision, {});
+    try std.testing.expectEqualStrings("mcp_a_b_c_2", space_collision);
+
+    const long_server = [_]u8{'s'} ** 70;
+    const long_first = try allocateToolName(alloc, .{}, &used, long_server[0..], "tool");
+    defer alloc.free(long_first);
+    try used.put(long_first, {});
+    try std.testing.expectEqual(@as(usize, 64), long_first.len);
+    try std.testing.expectEqualStrings("mcp_" ++ ("s" ** 60), long_first);
+
+    const long_second = try allocateToolName(alloc, .{}, &used, long_server[0..], "tool");
+    defer alloc.free(long_second);
+    try used.put(long_second, {});
+    try std.testing.expectEqual(@as(usize, 64), long_second.len);
+    try std.testing.expectEqualStrings("mcp_" ++ ("s" ** 58) ++ "_2", long_second);
+}
+
+test "MCP tool name allocation reserves registered tool names" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    const registry = tool_dispatch.Registry{ .tools = &.{builtin_tools.mcp_select_tool} };
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    const select_name = try allocateToolName(alloc, registry, &used, "select", "tool");
+    defer alloc.free(select_name);
+
+    try std.testing.expectEqualStrings("mcp_select_tool_2", select_name);
+}
+
+test "MCP tool name allocation leaves non-conflicting dynamic names unchanged" {
+    const alloc = std.testing.allocator;
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    const name = try allocateToolName(alloc, .{}, &used, "github", "create_issue");
+    defer alloc.free(name);
+
+    try std.testing.expectEqualStrings("mcp_github_create_issue", name);
+}
+
+test "tool name allocation collision path cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocateToolNameCollisionAllocFailures, .{});
+}
+
 fn checkToolSnapshotBuildAllocationFailures(alloc: Allocator) !void {
     var used = std.StringHashMap(void).init(alloc);
     defer used.deinit();
@@ -13590,4 +18167,1291 @@ fn checkToolSnapshotBuildAllocationFailures(alloc: Allocator) !void {
         else => return err,
     };
     defer snapshot.deinit(alloc);
+}
+
+fn checkCursorReplacementAllocationFailures(alloc: Allocator) !void {
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| alloc.free(value);
+    cursor = try alloc.dupe(u8, "first");
+    try replaceOwnedCursor(alloc, &cursor, "second");
+    try std.testing.expectEqualStrings("second", cursor.?);
+}
+
+test "cursor replacement preserves the previous owner on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkCursorReplacementAllocationFailures,
+        .{},
+    );
+}
+
+fn checkServerDiagnosticSnapshotAllocationFailures(alloc: Allocator) !void {
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.servers.deinit(alloc);
+    var server = McpServer{
+        .config = .{ .name = "fixture", .command = "fixture-command" },
+        .state = .failed,
+    };
+    server.last_error = try alloc.dupe(u8, "fixture-error");
+    defer alloc.free(server.last_error.?);
+    try runtime.servers.append(alloc, server);
+
+    var snapshot = try runtime.snapshotServerDiagnostics(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.items.len);
+    try std.testing.expectEqualStrings("fixture", snapshot.items[0].name);
+    try std.testing.expectEqualStrings("fixture-error", snapshot.items[0].last_error.?);
+}
+
+test "server diagnostic snapshots release every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkServerDiagnosticSnapshotAllocationFailures,
+        .{},
+    );
+}
+
+test "whole tool snapshot construction releases every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkToolSnapshotBuildAllocationFailures,
+        .{},
+    );
+}
+
+test "tool name deconfliction is whole-runtime" {
+    const alloc = std.testing.allocator;
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    var server_one = McpServer{ .config = .{ .name = try alloc.dupe(u8, "same"), .command = try alloc.dupe(u8, "cmd") } };
+    defer server_one.deinit(alloc);
+    var server_two = McpServer{ .config = .{ .name = try alloc.dupe(u8, "same"), .command = try alloc.dupe(u8, "cmd") } };
+    defer server_two.deinit(alloc);
+
+    const tools_response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read","description":"Read","inputSchema":{"type":"object","properties":{}}}]}}
+    ;
+
+    try parseAndStoreTools(alloc, &server_one, .{}, tools_response, &used);
+    try parseAndStoreTools(alloc, &server_two, .{}, tools_response, &used);
+
+    try std.testing.expectEqualStrings("mcp_same_read", server_one.tool_catalog.tools.items[0].prefixed_name);
+    try std.testing.expectEqualStrings("mcp_same_read_2", server_two.tool_catalog.tools.items[0].prefixed_name);
+}
+
+test "parseAndStoreTools duplicates original_name for owned cleanup" {
+    const alloc = std.testing.allocator;
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    var server = McpServer{ .config = .{ .name = try alloc.dupe(u8, "fs"), .command = try alloc.dupe(u8, "cmd") } };
+    defer server.deinit(alloc);
+
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read","inputSchema":{"type":"object","properties":{}}}]}}
+    ;
+    try parseAndStoreTools(alloc, &server, .{}, response, &used);
+
+    try std.testing.expectEqual(@as(usize, 1), server.tool_catalog.tools.items.len);
+    try std.testing.expectEqualStrings("read", server.tool_catalog.tools.items[0].original_name);
+}
+
+test "MCP tool catalog retains only tool-owned search data" {
+    try std.testing.expect(!@hasField(McpTool, "server_name"));
+    try std.testing.expect(!@hasField(McpTool, "server_instructions"));
+    try std.testing.expect(!@hasField(McpTool, "search_text"));
+    try std.testing.expectEqual(@as(usize, 160), @sizeOf(McpTool));
+}
+
+test "MCP search matches each retained source field" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "git-hub"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.servers.items[0].state = .ready;
+    runtime.servers.items[0].instructions = try alloc.dupe(u8, "workflow guide");
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create ticket","inputSchema":{"type":"object","properties":{"repository_slug":{"type":"string"}}}}]}}
+    ,
+        &used,
+    );
+
+    const cases = [_][]const u8{
+        "mcp",
+        "GIT-HUB",
+        "create_issue",
+        "ticket repository_slug",
+        "workflow ticket",
+        "git-hub repository_slug",
+    };
+    const expected_output =
+        "{\"tools\":[{\"name\":\"mcp_git-hub_create_issue\",\"server\":\"git-hub\",\"description\":\"Create ticket\",\"purpose\":\"Create ticket\",\"usage\":[\"mcp\",\"git-hub\",\"create_issue\"]}],\"count\":1,\"total_matches\":1,\"more_available\":false,\"next_cursor\":null}";
+    for (cases) |query| {
+        var result = try runtime.searchTools(alloc, query, 5, .{}, .{}, .unrestricted);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings(expected_output, result.model_output);
+        try std.testing.expect(result.notice == null);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+        defer parsed.deinit();
+        const tools = parsed.value.object.get("tools").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), tools.len);
+        const usage = tools[0].object.get("usage").?.array.items;
+        try std.testing.expectEqual(@as(usize, 3), usage.len);
+        try std.testing.expectEqualStrings("mcp", usage[0].string);
+        try std.testing.expectEqualStrings("git-hub", usage[1].string);
+        try std.testing.expectEqualStrings("create_issue", usage[2].string);
+    }
+
+    var missing = try runtime.searchTools(
+        alloc,
+        "missing-token",
+        5,
+        .{},
+        .{},
+        .unrestricted,
+    );
+    defer missing.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null}",
+        missing.model_output,
+    );
+    try std.testing.expect(missing.notice == null);
+}
+
+test "MCP search bounds untrusted description and schema fields" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "bounded"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"probe","description":"initial","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+
+    const description = "zearly123 " ++ ("x" ** mcp_tool_description_search_bytes) ++ " zlate987";
+    const schema =
+        "{\"type\":\"object\",\"properties\":{\"zearly456\":{\"type\":\"string\"},\"padding\":{\"description\":\"" ++
+        ("x" ** mcp_tool_schema_search_bytes) ++
+        "zlate654\"}}}";
+    const tool = &runtime.servers.items[0].tool_catalog.tools.items[0];
+    alloc.free(tool.description);
+    tool.description = try alloc.dupe(u8, description);
+    alloc.free(tool.input_schema_json);
+    tool.input_schema_json = try alloc.dupe(u8, schema);
+
+    const cases = [_]struct {
+        query: []const u8,
+        expected_match: bool,
+    }{
+        .{ .query = "zearly123 zearly456", .expected_match = true },
+        .{ .query = "zlate987 zearly456", .expected_match = false },
+        .{ .query = "zearly123 zlate654", .expected_match = false },
+        .{ .query = "zlate987 zlate654", .expected_match = false },
+    };
+    for (cases) |case| {
+        var result = try runtime.searchTools(alloc, case.query, 5, .{}, .{}, .unrestricted);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(
+            case.expected_match,
+            std.mem.find(u8, result.model_output, "mcp_bounded_probe") != null,
+        );
+    }
+}
+
+test "MCP search releases request-scoped ranking allocations" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "github"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create issue","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+
+    var counting = std.testing.FailingAllocator.init(alloc, .{});
+    const search_alloc = counting.allocator();
+    var result = try runtime.searchTools(
+        search_alloc,
+        "github issue",
+        max_mcp_search_limit,
+        .{},
+        .{},
+        .unrestricted,
+    );
+    defer result.deinit(search_alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[{\"name\":\"mcp_github_create_issue\",\"server\":\"github\",\"description\":\"Create issue\",\"purpose\":\"Create issue\",\"usage\":[\"mcp\",\"github\",\"create_issue\"]}],\"count\":1,\"total_matches\":1,\"more_available\":false,\"next_cursor\":null}",
+        result.model_output,
+    );
+    try std.testing.expect(counting.allocations > 0);
+}
+
+test "MCP search keeps the globally strongest matches across servers" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "first"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "linear"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    for (runtime.servers.items) |*server| server.state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"launch","description":"Deploy Linear infrastructure","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[1],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Deploy Linear data","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+
+    var result = try runtime.searchTools(alloc, "linear deploy", 1, .{}, .{}, .unrestricted);
+    defer result.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "mcp_linear_echo",
+        parsed.value.object.get("tools").?.array.items[0].object.get("name").?.string,
+    );
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("total_matches").?.integer);
+    try std.testing.expect(parsed.value.object.get("more_available").?.bool);
+    try std.testing.expect(parsed.value.object.get("next_cursor").? == .string);
+}
+
+test "MCP search applies exact server scope before ranking" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "datadog"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "grafana"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    for (runtime.servers.items) |*server| server.state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"list_monitors","description":"List service monitors","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+    try parseAndStoreTools(alloc, &runtime.servers.items[1], .{}, response, &used);
+
+    const inventory = try lexical_relevance.prepare("");
+    var scoped = try runtime.searchToolsPrepared(
+        alloc,
+        .{
+            .query = &inventory,
+            .kind = .mcp,
+            .server = "datadog",
+            .limit = 20,
+        },
+        .{},
+        .{},
+        .unrestricted,
+    );
+    defer scoped.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, scoped.model_output, "mcp_datadog_list_monitors") != null);
+    try std.testing.expect(std.mem.find(u8, scoped.model_output, "mcp_grafana_list_monitors") == null);
+
+    var missing = try runtime.searchToolsPrepared(
+        alloc,
+        .{
+            .query = &inventory,
+            .kind = .mcp,
+            .server = "missing",
+            .limit = 20,
+        },
+        .{},
+        .{},
+        .unrestricted,
+    );
+    defer missing.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, missing.model_output, "\"state\":\"server_not_found\"") != null);
+}
+
+test "MCP search preserves exact identities and scopes authentication guidance" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "linear"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "slack"),
+        .command = try alloc.dupe(u8, "cmd"),
+        .bearer_token_env = try alloc.dupe(u8, "SLACK_TOKEN"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "a/b"),
+        .command = try alloc.dupe(u8, "cmd"),
+        .bearer_token_env = try alloc.dupe(u8, "PUNCTUATED_TOKEN"),
+    });
+    runtime.servers.items[0].state = .ready;
+    runtime.servers.items[1].state = .failed;
+    runtime.servers.items[2].state = .failed;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo Linear data","inputSchema":{"type":"object"}},{"name":"read/file","description":"Read a Linear file","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+
+    const cases = [_]struct {
+        query: []const u8,
+        expected_tool: []const u8,
+    }{
+        .{ .query = "Please use MCP_LINEAR_ECHO for this request", .expected_tool = "mcp_linear_echo" },
+        .{ .query = "Please use read/file for this request", .expected_tool = "mcp_linear_read_file" },
+    };
+    for (cases) |case| {
+        var result = try runtime.searchTools(alloc, case.query, 5, .{}, .{}, .unrestricted);
+        defer result.deinit(alloc);
+        try std.testing.expect(std.mem.find(u8, result.model_output, case.expected_tool) != null);
+        try std.testing.expect(std.mem.find(u8, result.model_output, "authentication_required") == null);
+    }
+
+    var partial = try runtime.searchTools(alloc, "mcp_linear_echoes", 5, .{}, .{}, .unrestricted);
+    defer partial.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, partial.model_output, "authentication_required") == null);
+
+    var noisy = try runtime.searchTools(alloc, "linear issue", 5, .{}, .{}, .unrestricted);
+    defer noisy.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, noisy.model_output, "mcp_linear_echo") != null);
+
+    var auth_collision = try runtime.searchTools(alloc, "slack data", 5, .{}, .{}, .unrestricted);
+    defer auth_collision.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, auth_collision.model_output, "\"server\":\"slack\"") != null);
+    try std.testing.expect(std.mem.find(u8, auth_collision.model_output, "mcp_linear_echo") == null);
+
+    var targeted = try runtime.searchTools(alloc, "authenticate slack now", 5, .{}, .{}, .unrestricted);
+    defer targeted.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, targeted.model_output, "\"server\":\"slack\"") != null);
+    try std.testing.expect(std.mem.find(u8, targeted.model_output, "SLACK_TOKEN") != null);
+
+    var punctuated = try runtime.searchTools(alloc, "authenticate a/b now", 5, .{}, .{}, .unrestricted);
+    defer punctuated.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, punctuated.model_output, "\"server\":\"a/b\"") != null);
+
+    var adjacent = try runtime.searchTools(alloc, "authenticate xa/by now", 5, .{}, .{}, .unrestricted);
+    defer adjacent.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, adjacent.model_output, "authentication_required") == null);
+}
+
+test "MCP search returns metadata without advertising every executable schema" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "github"), .command = try alloc.dupe(u8, "cmd") });
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create an issue in a GitHub repository","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"Repository name"},"title":{"type":"string"}},"required":["repo","title"]}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+
+    var results = try runtime.searchTools(alloc, "github issue", 5, .{}, .{}, .unrestricted);
+    defer results.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, results.model_output, "\"name\":\"mcp_github_create_issue\"") != null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "\"server\":\"github\"") != null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "\"description\"") != null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "\"purpose\"") != null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "\"usage\"") != null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "inputSchema") == null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "Repository name") == null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "server_instructions") == null);
+}
+
+test "MCP search reports an authorized match beyond the count cap" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "chrome"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.discovery_state.store(.complete, .seq_cst);
+    runtime.servers.items[0].state = .ready;
+
+    var response: std.Io.Writer.Allocating = .init(alloc);
+    defer response.deinit();
+    try response.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[");
+    for (0..21) |index| {
+        if (index > 0) try response.writer.writeByte(',');
+        try response.writer.print(
+            "{{\"name\":\"item{d:0>2}\",\"description\":\"Chrome item {d}\",\"inputSchema\":{{\"type\":\"object\"}}}}",
+            .{ index, index },
+        );
+    }
+    try response.writer.writeAll("]}}");
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        response.written(),
+        &used,
+    );
+
+    var broad = try runtime.searchTools(alloc, "chrome", 20, .{}, .{}, .unrestricted);
+    defer broad.deinit(alloc);
+    var broad_json = try std.json.parseFromSlice(std.json.Value, alloc, broad.model_output, .{});
+    defer broad_json.deinit();
+    try std.testing.expectEqual(@as(i64, 20), broad_json.value.object.get("count").?.integer);
+    try std.testing.expect(broad_json.value.object.get("more_available").?.bool);
+    try std.testing.expect(broad_json.value.object.get("next_cursor").? == .string);
+
+    var targeted = try runtime.searchTools(alloc, "item00", 20, .{}, .{}, .unrestricted);
+    defer targeted.deinit(alloc);
+    var targeted_json = try std.json.parseFromSlice(std.json.Value, alloc, targeted.model_output, .{});
+    defer targeted_json.deinit();
+    try std.testing.expect(!targeted_json.value.object.get("more_available").?.bool);
+    try std.testing.expect(targeted_json.value.object.get("next_cursor").? == .null);
+}
+
+test "scoped MCP cached tool and feature operations reject authority revoked after admission" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "fixture"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    runtime.servers.items[0].state = .ready;
+    runtime.servers.items[0].capabilities = .{
+        .resources = true,
+        .resources_subscribe = true,
+        .prompts = true,
+        .completion = true,
+    };
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        response,
+        &used,
+    );
+
+    var captured = try runtime.snapshotAccessView(
+        alloc,
+        "child",
+        "parent",
+        .{},
+        true,
+    );
+    defer captured.deinit(alloc);
+    var live = try captured.clone(alloc);
+    defer live.deinit(alloc);
+    for (live.tools) |*tool| tool.deinit(alloc);
+    alloc.free(live.tools);
+    live.tools = try alloc.alloc(access_policy.ToolIdentity, 0);
+
+    const LiveProvider = struct {
+        view: *const access_policy.View,
+
+        fn resolve(raw: *anyopaque, provider_alloc: Allocator) !tool_mcp_runtime.ResolvedLiveView {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const view = try self.view.clone(provider_alloc);
+            return .{
+                .authority_generation = access_policy.authorityGeneration(view),
+                .view = view,
+            };
+        }
+    };
+    var provider = LiveProvider{ .view = &live };
+    const access = tool_mcp_runtime.Access{ .scoped = .{
+        .captured = &captured,
+        .admission_authority_generation = access_policy.authorityGeneration(captured),
+        .live = .{
+            .context = @ptrCast(&provider),
+            .resolve_fn = LiveProvider.resolve,
+        },
+    } };
+
+    try std.testing.expect(!runtime.hasToolWithAccess("mcp_fixture_echo", access));
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.validateToolArgumentsByNameWithAccess(
+            alloc,
+            "mcp_fixture_echo",
+            "{}",
+            access,
+        ),
+    );
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.toolSchemaJsonByNameWithAccess(
+            alloc,
+            "mcp_fixture_echo",
+            .{},
+            .{},
+            access,
+        ),
+    );
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.callToolByNameWithOptions(
+            alloc,
+            "mcp_fixture_echo",
+            "{}",
+            1024,
+            .{ .access = access },
+        ),
+    );
+
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.searchTools(alloc, "echo", 5, .{}, .{}, access),
+    );
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.listResources(alloc, "fixture", false, null, access),
+    );
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.listResources(alloc, "fixture", true, null, access),
+    );
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.readResource(
+            alloc,
+            "fixture",
+            "memory://cached",
+            .{ .access = access },
+        ),
+    );
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.listPrompts(alloc, "fixture", null, access),
+    );
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.getPrompt(
+            alloc,
+            "fixture",
+            "cached",
+            "{}",
+            .{ .access = access },
+        ),
+    );
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.completePromptArgument(
+            alloc,
+            "fixture",
+            "cached",
+            .{ .name = "argument", .value = "" },
+            &.{},
+            null,
+            access,
+        ),
+    );
+}
+
+test "MCP tool call rejects mismatched expected runtime generation before lookup" {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    try std.testing.expectError(
+        error.McpAuthorityChanged,
+        runtime.callToolByNameWithOptions(
+            std.testing.allocator,
+            "mcp_fixture_echo",
+            "{}",
+            1024,
+            .{ .expected_runtime_generation = runtime.generation + 1 },
+        ),
+    );
+}
+
+test "MCP access snapshot excludes servers whose tools are denied" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "allowed"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "denied"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    for (runtime.servers.items) |*server| server.state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+    try parseAndStoreTools(alloc, &runtime.servers.items[1], .{}, response, &used);
+
+    var denied_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("mcp_denied_echo"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var view = try runtime.snapshotAccessView(
+        alloc,
+        "child",
+        "parent",
+        .{ .rules = &denied_rules },
+        true,
+    );
+    defer view.deinit(alloc);
+
+    try std.testing.expect(view.server("allowed") != null);
+    try std.testing.expect(view.tool("mcp_allowed_echo") != null);
+    try std.testing.expect(view.server("denied") == null);
+    try std.testing.expect(view.tool("mcp_denied_echo") == null);
+    try std.testing.expectEqual(
+        access_policy.Decision.reject_server,
+        access_policy.authorize(view, view, .{ .feature_server = "denied" }),
+    );
+}
+
+test "MCP access snapshot admits feature-only servers independently of tools" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "features"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    const server = &runtime.servers.items[0];
+    server.state = .ready;
+    server.capabilities = .{
+        .resources = true,
+        .prompts = true,
+        .completion = true,
+    };
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        server,
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+    ,
+        &used,
+    );
+
+    var admitted = try runtime.snapshotAccessView(
+        alloc,
+        "child",
+        "parent",
+        .{},
+        true,
+    );
+    defer admitted.deinit(alloc);
+    try std.testing.expect(admitted.server("features") != null);
+    try std.testing.expectEqual(@as(usize, 0), admitted.tools.len);
+    try std.testing.expectEqual(
+        access_policy.Decision.allow,
+        access_policy.authorize(admitted, admitted, .{ .feature_server = "features" }),
+    );
+    try std.testing.expectEqual(
+        access_policy.Decision.reject_tool,
+        access_policy.authorize(admitted, admitted, .{ .tool_server = "features" }),
+    );
+
+    server.tool_catalog.available = false;
+    var independent = try runtime.snapshotAccessView(
+        alloc,
+        "child",
+        "parent",
+        .{},
+        true,
+    );
+    defer independent.deinit(alloc);
+    try std.testing.expect(independent.server("features") != null);
+    try std.testing.expectEqual(@as(usize, 0), independent.tools.len);
+
+    var hidden = try runtime.snapshotAccessView(
+        alloc,
+        "child",
+        "parent",
+        .{},
+        false,
+    );
+    defer hidden.deinit(alloc);
+    try std.testing.expect(hidden.server("features") == null);
+    try std.testing.expectEqual(@as(usize, 0), hidden.tools.len);
+}
+
+test "MCP access snapshot releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkAccessSnapshotAllocationFailures,
+        .{},
+    );
+}
+
+fn checkAccessSnapshotAllocationFailures(alloc: Allocator) !void {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try std.testing.allocator.dupe(u8, "fixture"),
+        .command = try std.testing.allocator.dupe(u8, "cmd"),
+    });
+    runtime.servers.items[0].state = .ready;
+    var used = std.StringHashMap(void).init(std.testing.allocator);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(
+        std.testing.allocator,
+        &runtime.servers.items[0],
+        .{},
+        response,
+        &used,
+    );
+    var view = try runtime.snapshotAccessView(alloc, "child", "parent", .{}, true);
+    defer view.deinit(alloc);
+}
+
+test "MCP transport precommit rejects MCP view and full authority changes" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "fixture"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+
+    var captured = try runtime.snapshotAccessView(alloc, "child", "parent", .{}, true);
+    defer captured.deinit(alloc);
+    var live = try captured.clone(alloc);
+    defer live.deinit(alloc);
+    const LiveProvider = struct {
+        view: *const access_policy.View,
+        action_authority_generation: u64,
+
+        fn resolve(raw: *anyopaque, provider_alloc: Allocator) !tool_mcp_runtime.ResolvedLiveView {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const view = try self.view.clone(provider_alloc);
+            return .{
+                .authority_generation = access_policy.authorityGeneration(view),
+                .action_authority_generation = self.action_authority_generation,
+                .view = view,
+            };
+        }
+    };
+    var provider = LiveProvider{
+        .view = &live,
+        .action_authority_generation = 41,
+    };
+    const access = tool_mcp_runtime.Access{ .scoped = .{
+        .captured = &captured,
+        .admission_authority_generation = access_policy.authorityGeneration(captured),
+        .live = .{
+            .context = @ptrCast(&provider),
+            .resolve_fn = LiveProvider.resolve,
+        },
+        .action_authority_generation = 41,
+    } };
+
+    var operation = try OperationAccessGuard.init(alloc, access, runtime.generation);
+    defer operation.deinit();
+    try operation.authorize(.{ .tool = "mcp_fixture_echo" });
+
+    live.servers[0].auth_generation += 1;
+    var final_guard = ServerAccessPrecommit{
+        .runtime = &runtime,
+        .target = .{ .tool_server = "fixture" },
+        .access = access,
+    };
+    var precommit = final_guard.transport();
+    try std.testing.expectError(error.McpAuthorityChanged, precommit.acquire());
+    try std.testing.expect(!precommit.acquired);
+
+    live.servers[0].auth_generation -= 1;
+    provider.action_authority_generation = 42;
+    var action_guard = ServerAccessPrecommit{
+        .runtime = &runtime,
+        .target = .{ .tool_server = "fixture" },
+        .access = access,
+    };
+    var action_precommit = action_guard.transport();
+    try std.testing.expectError(error.McpAuthorityChanged, action_precommit.acquire());
+    try std.testing.expect(!action_precommit.acquired);
+}
+
+test "scoped MCP authentication rendering excludes denied servers" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "allowed"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "denied"),
+        .command = try alloc.dupe(u8, "cmd"),
+        .bearer_token_env = try alloc.dupe(u8, "DENIED_SECRET_ENV"),
+    });
+    for (runtime.servers.items) |*server| server.state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+    try parseAndStoreTools(alloc, &runtime.servers.items[1], .{}, response, &used);
+    var denied_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("mcp_denied_echo"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var captured = try runtime.snapshotAccessView(
+        alloc,
+        "child",
+        "parent",
+        .{ .rules = &denied_rules },
+        true,
+    );
+    defer captured.deinit(alloc);
+    runtime.servers.items[1].state = .failed;
+
+    const LiveProvider = struct {
+        view: *const access_policy.View,
+
+        fn resolve(raw: *anyopaque, provider_alloc: Allocator) !tool_mcp_runtime.ResolvedLiveView {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const view = try self.view.clone(provider_alloc);
+            return .{
+                .authority_generation = access_policy.authorityGeneration(view),
+                .view = view,
+            };
+        }
+    };
+    var provider = LiveProvider{ .view = &captured };
+    const access = tool_mcp_runtime.Access{ .scoped = .{
+        .captured = &captured,
+        .admission_authority_generation = access_policy.authorityGeneration(captured),
+        .live = .{
+            .context = @ptrCast(&provider),
+            .resolve_fn = LiveProvider.resolve,
+        },
+    } };
+    var scoped = try OperationAccessGuard.init(alloc, access, runtime.generation);
+    defer scoped.deinit();
+    try std.testing.expect(try renderAuthenticationRequired(
+        alloc,
+        runtime.servers.items,
+        &scoped,
+        "denied",
+    ) == null);
+
+    var root = try OperationAccessGuard.init(alloc, .unrestricted, runtime.generation);
+    defer root.deinit();
+    const rendered = (try renderAuthenticationRequired(
+        alloc,
+        runtime.servers.items,
+        &root,
+        "denied",
+    )).?;
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "denied") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "DENIED_SECRET_ENV") != null);
+}
+
+test "MCP server instructions are captured from initialize and exposed only when present" {
+    const alloc = std.testing.allocator;
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    var server = McpServer{ .config = .{ .name = try alloc.dupe(u8, "github"), .command = try alloc.dupe(u8, "cmd") } };
+    defer server.deinit(alloc);
+
+    const init_response =
+        \\{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","instructions":"Use this server only for GitHub issue workflows. TOKEN=github_pat_1234567890abcdef"}}
+    ;
+    try parseAndStoreServerInstructions(alloc, &server, init_response);
+    try std.testing.expect(server.instructions != null);
+    try std.testing.expect(std.mem.find(u8, server.instructions.?, "GitHub issue workflows") != null);
+    try std.testing.expect(std.mem.find(u8, server.instructions.?, "github_pat_1234567890abcdef") == null);
+
+    const tools_response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create issue","inputSchema":{"type":"object","properties":{}}},{"name":"close_issue","description":"Close issue","inputSchema":{"type":"object","properties":{}}}]}}
+    ;
+    try parseAndStoreTools(alloc, &server, .{}, tools_response, &used);
+    try std.testing.expectEqual(@as(usize, 2), server.tool_catalog.tools.items.len);
+    server.state = .ready;
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.servers.append(alloc, server);
+    server = .{ .config = .{ .name = try alloc.dupe(u8, "moved"), .command = try alloc.dupe(u8, "moved") } };
+
+    var results = try runtime.searchTools(alloc, "github issue", 5, .{}, .{}, .unrestricted);
+    defer results.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "server_instructions") == null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "GitHub issue workflows") == null);
+
+    var instruction_results = try runtime.searchTools(alloc, "issue workflows", 5, .{}, .{}, .unrestricted);
+    defer instruction_results.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, instruction_results.model_output, "mcp_github_create_issue") != null);
+    try std.testing.expect(std.mem.find(u8, instruction_results.model_output, "mcp_github_close_issue") != null);
+
+    var schema_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_github_create_issue", .{}, .{})) orelse return error.TestExpectedEqual;
+    defer schema_result.deinit(alloc);
+    const schema = switch (schema_result) {
+        .selected => |payload| payload.model_output,
+        .rejected => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(std.mem.find(u8, schema, "Server instructions:") != null);
+}
+
+test "MCP exact selection returns one executable schema by prefixed name" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "fs"), .command = try alloc.dupe(u8, "cmd") });
+    runtime.servers.items[0].state = .ready;
+    runtime.servers.items[0].instructions = try alloc.dupe(u8, ("i" ** 1500) ++ "instruction tail");
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read","description":"Read a file","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+
+    var schema_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_fs_read", .{}, .{})) orelse return error.TestExpectedEqual;
+    defer schema_result.deinit(alloc);
+    const schema = switch (schema_result) {
+        .selected => |payload| payload.model_output,
+        .rejected => return error.TestExpectedEqual,
+    };
+
+    try std.testing.expect(std.mem.find(u8, schema, "\"name\":\"mcp_fs_read\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema, "\"inputSchema\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema, "instruction tail") != null);
+    try std.testing.expect(std.mem.find(u8, schema, model_tool_schema.truncation_marker) == null);
+    try std.testing.expect((try runtime.toolSchemaJsonByName(alloc, "mcp_missing", .{}, .{})) == null);
+}
+
+test "MCP selection truncates instructions and rejects an oversized schema atomically" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "docs"), .command = try alloc.dupe(u8, "cmd") });
+    runtime.servers.items[0].state = .ready;
+    runtime.servers.items[0].instructions = try alloc.dupe(u8, "first line\nsecond line\nthird line");
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"lookup","description":"Lookup docs","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"An exact query that must stay intact"}},"required":["query"]}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+
+    var limits = context_limits.Values{};
+    limits.mcp_server_instructions_bytes = .{ .value = .{ .bytes = 11 }, .source = .user_workspace };
+    var schema_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_docs_lookup", .{}, limits)) orelse return error.TestExpectedEqual;
+    defer schema_result.deinit(alloc);
+    const schema = switch (schema_result) {
+        .selected => |payload| payload.model_output,
+        .rejected => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(std.mem.find(u8, schema, "first line&#x0a;") != null);
+    try std.testing.expect(std.mem.find(u8, schema, "second line") == null);
+    try std.testing.expect(std.mem.find(u8, schema, "mcp_server_instructions_bytes") != null);
+    try std.testing.expect(std.mem.find(u8, schema, "An exact query that must stay intact") != null);
+
+    limits.mcp_selected_schema_bytes = .{ .value = .{ .bytes = schema.len - 1 }, .source = .command_line };
+    var rejected_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_docs_lookup", .{}, limits)) orelse return error.TestExpectedEqual;
+    defer rejected_result.deinit(alloc);
+    const rejected = switch (rejected_result) {
+        .rejected => |payload| payload.model_output,
+        .selected => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(std.mem.find(u8, rejected, "context_limit_rejection") != null);
+    try std.testing.expect(std.mem.find(u8, rejected, "inputSchema") == null);
+    try std.testing.expect(std.mem.find(u8, rejected, "source\":\"command line") != null);
+    try std.testing.expect(try std.json.validate(alloc, rejected));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rejected, .{});
+    defer parsed.deinit();
+    const rejection = parsed.value.object.get("context_limit_rejection") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("rejected", rejection.object.get("action").?.string);
+}
+
+test "MCP metadata caps encoded descriptions and preserves ready-server tool order" {
+    const alloc = std.testing.allocator;
+    const bounded = try boundedEncodedScalar(alloc, "<x", 4);
+    defer alloc.free(bounded.text);
+    try std.testing.expectEqual(@as(usize, 5), bounded.observed_bytes);
+    try std.testing.expectEqualStrings("&lt;", bounded.text);
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "alpha"), .command = try alloc.dupe(u8, "cmd") });
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "beta"), .command = try alloc.dupe(u8, "cmd") });
+    runtime.servers.items[0].state = .ready;
+    runtime.servers.items[1].state = .ready;
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response_a =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"one","description":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputSchema":{"type":"object","properties":{"secret":{"type":"string"}}}},{"name":"two","description":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","inputSchema":{"type":"object"}}]}}
+    ;
+    const response_b =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"three","description":"cccccccccccccccccccccccccccccccccccccccc","inputSchema":{"type":"object"}},{"name":"four","description":"dddddddddddddddddddddddddddddddddddddddd","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response_a, &used);
+    try parseAndStoreTools(alloc, &runtime.servers.items[1], .{}, response_b, &used);
+
+    var limits = context_limits.Values{};
+    limits.mcp_description_bytes = .{ .value = .{ .bytes = 12 }, .source = .user_global };
+    limits.mcp_search_result_bytes = .{ .value = .{ .bytes = 1024 }, .source = .command_line };
+    var results = try runtime.searchTools(alloc, "", 10, .{}, limits, .unrestricted);
+    defer results.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, results.model_output, .{});
+    defer parsed.deinit();
+
+    const expected = [_][]const u8{ "mcp_alpha_one", "mcp_alpha_two", "mcp_beta_three", "mcp_beta_four" };
+    const tools = parsed.value.object.get("tools").?.array.items;
+    try std.testing.expect(tools.len > 0 and tools.len < expected.len);
+    for (tools, 0..) |tool, index| {
+        try std.testing.expectEqualStrings(expected[index], tool.object.get("name").?.string);
+        try std.testing.expect(tool.object.get("inputSchema") == null);
+        try std.testing.expect(tool.object.get("context_limit") != null);
+    }
+    try std.testing.expectEqual(@as(i64, @intCast(expected.len - tools.len)), parsed.value.object.get("context_limit").?.object.get("omitted_count").?.integer);
+    try std.testing.expect(results.notice != null);
+    for (expected[tools.len..]) |name| try std.testing.expect(std.mem.find(u8, results.notice.?, name) != null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "omitted_names") == null);
+    try std.testing.expect(std.mem.find(u8, results.model_output, "secret") == null);
+
+    limits.mcp_search_result_bytes = .{ .value = .{ .bytes = 10 }, .source = .command_line };
+    var tiny = try runtime.searchTools(alloc, "", 10, .{}, limits, .unrestricted);
+    defer tiny.deinit(alloc);
+    var tiny_parsed = try std.json.parseFromSlice(std.json.Value, alloc, tiny.model_output, .{});
+    defer tiny_parsed.deinit();
+    try std.testing.expect(tiny.model_output.len > limits.mcp_search_result_bytes.effectiveBytes());
+    try std.testing.expectEqual(@as(i64, expected.len), tiny_parsed.value.object.get("context_limit").?.object.get("omitted_count").?.integer);
+    try std.testing.expect(tiny.notice != null);
+}
+
+test "runtime rejects source and workspace admission mismatches before installation" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    var missing: McpServerConfig = .{
+        .name = try alloc.dupe(u8, "missing"),
+        .source = .workspace,
+        .scope = .workspace,
+        .command = try alloc.dupe(u8, "cmd"),
+    };
+    try std.testing.expectError(error.McpConfigAdmissionMismatch, runtime.addServer(missing));
+    missing.deinit(alloc);
+
+    var synthetic: McpServerConfig = .{
+        .name = try alloc.dupe(u8, "synthetic"),
+        .source = .profile,
+        .scope = .profile,
+        .command = try alloc.dupe(u8, "cmd"),
+        .workspace_admission = .approved,
+    };
+    try std.testing.expectError(error.McpConfigAdmissionMismatch, runtime.addServer(synthetic));
+    synthetic.deinit(alloc);
+}
+
+test "interactive authentication requires approved workspace admission" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    for ([_]mcp_contract.WorkspaceAdmission{ .pending, .rejected, .approved }) |admission| {
+        const name = @tagName(admission);
+        try runtime.addServer(.{
+            .name = try alloc.dupe(u8, name),
+            .source = .workspace,
+            .scope = .workspace,
+            .transport = .http,
+            .url = try alloc.dupe(u8, "https://example.test/mcp"),
+            .workspace_admission = admission,
+        });
+    }
+
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.validateAuthenticationServer("pending"),
+    );
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.validateAuthenticationServer("rejected"),
+    );
+    try runtime.validateAuthenticationServer("approved");
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.listResources(
+            alloc,
+            "pending",
+            false,
+            null,
+            .unrestricted,
+        ),
+    );
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.listPrompts(
+            alloc,
+            "rejected",
+            null,
+            .unrestricted,
+        ),
+    );
+}
+
+test "tool schema uses prefixed name and call request uses raw name" {
+    const alloc = std.testing.allocator;
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+
+    var server = McpServer{ .config = .{ .name = try alloc.dupe(u8, "a/b"), .command = try alloc.dupe(u8, "cmd") } };
+    defer server.deinit(alloc);
+
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read/file","description":"Read","inputSchema":{"type":"object","properties":{}}}]}}
+    ;
+    try parseAndStoreTools(alloc, &server, .{}, response, &used);
+
+    const tool = server.tool_catalog.tools.items[0];
+    try std.testing.expectEqualStrings("read/file", tool.original_name);
+    try std.testing.expectEqualStrings("mcp_a_b_read_file", tool.prefixed_name);
+    const schema = try buildToolSchemaJsonWithLimitMarker(
+        alloc,
+        tool,
+        null,
+        false,
+        0,
+        (context_limits.Values{}).mcp_server_instructions_bytes,
+    );
+    defer alloc.free(schema);
+    try std.testing.expect(std.mem.find(u8, schema, "\"name\":\"mcp_a_b_read_file\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema, "read/file") == null);
+
+    const request = try buildToolCallRequest(alloc, 9, tool.original_name, "{\"path\":\"/tmp/a\"}");
+    defer alloc.free(request);
+    try std.testing.expect(std.mem.find(u8, request, "\"name\":\"read/file\"") != null);
+    try std.testing.expect(std.mem.find(u8, request, "\"arguments\":{\"path\":\"/tmp/a\"}") != null);
+}
+
+test "tool call request preserves raw name and already-compact arguments" {
+    const alloc = std.testing.allocator;
+    const request = try buildToolCallRequest(alloc, 42, "raw/tool", "{\"x\":1,\"nested\":{\"ok\":true}}");
+    defer alloc.free(request);
+
+    try std.testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{\"name\":\"raw/tool\",\"arguments\":{\"x\":1,\"nested\":{\"ok\":true}}}}",
+        request,
+    );
+}
+
+test "tool call request compacts pretty-printed arguments into a single line" {
+    const alloc = std.testing.allocator;
+    const pretty =
+        \\{
+        \\  "path": "/tmp/a",
+        \\  "note": "line one\nline two"
+        \\}
+    ;
+    const request = try buildToolCallRequest(alloc, 7, "raw/tool", pretty);
+    defer alloc.free(request);
+
+    // The frame must not contain any raw newline; the escaped "\n" inside the
+    // string value must be preserved.
+    try std.testing.expect(std.mem.find(u8, request, "\n") == null);
+    try std.testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"raw/tool\",\"arguments\":{\"path\":\"/tmp/a\",\"note\":\"line one\\nline two\"}}}",
+        request,
+    );
 }

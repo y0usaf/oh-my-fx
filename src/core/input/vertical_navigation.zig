@@ -79,3 +79,81 @@ pub const State = struct {
         }
     }
 };
+
+test "vertical navigation applies a legal target and clears selection" {
+    const alloc = std.testing.allocator;
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "abcdef");
+    _ = edit.beginSelection(1);
+    _ = edit.extendSelection(4);
+
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var state: State = .{};
+
+    try std.testing.expect(state.applyTarget(&edit, &entities, 5, 3));
+    try std.testing.expectEqual(@as(usize, 5), edit.cursor);
+    try std.testing.expect(edit.selectionRange() == null);
+    try std.testing.expectEqual(@as(?usize, 3), state.preferredColumn());
+}
+
+test "vertical navigation reset decisions preserve the editor" {
+    const alloc = std.testing.allocator;
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "abcdef");
+    _ = edit.beginSelection(1);
+    _ = edit.extendSelection(4);
+
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var state: State = .{ .preferred_column = 4 };
+
+    try std.testing.expect(!state.applyTarget(&edit, &entities, null, 0));
+    try std.testing.expectEqual(@as(usize, 4), edit.cursor);
+    try std.testing.expectEqual(
+        editor_state.SelectionRange{ .start = 1, .end = 4 },
+        edit.selectionRange().?,
+    );
+    try std.testing.expectEqual(@as(?usize, null), state.preferredColumn());
+}
+
+test "vertical navigation rejects targets inside registered entities" {
+    const alloc = std.testing.allocator;
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "[Image #1]");
+    _ = edit.setCursor(0);
+
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    try entities.image_tokens.append(alloc, .{
+        .id = 1,
+        .span = .{ .raw_start = 0, .raw_end = edit.input.items.len },
+    });
+    var state: State = .{ .preferred_column = 2 };
+
+    try std.testing.expect(!state.applyTarget(&edit, &entities, 3, 3));
+    try std.testing.expectEqual(@as(usize, 0), edit.cursor);
+    try std.testing.expectEqual(@as(?usize, null), state.preferredColumn());
+}
+
+test "vertical navigation extends from the original cursor when requested" {
+    const alloc = std.testing.allocator;
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "abcdef");
+    _ = edit.setCursor(2);
+
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var state: State = .{};
+
+    try std.testing.expect(state.applyTargetWithSelection(&edit, &entities, 5, 3, true));
+    try std.testing.expectEqual(
+        editor_state.SelectionRange{ .start = 2, .end = 5 },
+        edit.selectionRange().?,
+    );
+    try std.testing.expectEqual(@as(?usize, 3), state.preferredColumn());
+}

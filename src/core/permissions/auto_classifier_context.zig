@@ -59,9 +59,11 @@ pub fn isCanonicalRootUserContext(context: []const u8) bool {
     return true;
 }
 
-pub fn currentRootUserRequest(context: []const u8) ?[]const u8 {
+/// Returns the validated canonical root-request prefix without detached
+/// permission feedback. The returned slice borrows `context`.
+pub fn rootUserRequestContext(context: []const u8) ?[]const u8 {
     if (!isCanonicalRootUserContext(context)) return null;
-    return lineValue(context, current_label);
+    return context[0..canonicalFeedbackStart(context)];
 }
 
 fn canonicalTextLine(line: []const u8, label: []const u8) bool {
@@ -110,10 +112,6 @@ pub fn buildCanonicalRootUserContext(
                 try turns.append(alloc, entry.user.text);
                 try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
             },
-            .background_command => |entry| {
-                try turns.append(alloc, entry.user.text);
-                try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
-            },
             .interrupted => |entry| {
                 try turns.append(alloc, entry.user.text);
                 try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
@@ -128,6 +126,31 @@ pub fn buildCanonicalRootUserContext(
         permission_feedback.items,
         if (has_compacted_summary) @max(@as(usize, 1), compacted_prefix_turns) else 0,
         !has_compacted_summary,
+    );
+}
+
+/// Builds canonical context from a verified root-user lane and its selected
+/// current request. Caller owns the returned slice.
+pub fn buildRootUserContextFromVerifiedRequests(
+    alloc: Allocator,
+    current_request: []const u8,
+    prior_root_requests: []const []const u8,
+    evidence_complete: bool,
+) ![]u8 {
+    var turns: std.ArrayList([]const u8) = .empty;
+    defer turns.deinit(alloc);
+    try turns.appendSlice(alloc, prior_root_requests);
+    if (turns.items.len == 0 or
+        !std.mem.eql(u8, turns.items[turns.items.len - 1], current_request))
+    {
+        try turns.append(alloc, current_request);
+    }
+    return buildRootUserContextWithFeedback(
+        alloc,
+        turns.items,
+        &.{},
+        if (evidence_complete) 0 else 1,
+        evidence_complete,
     );
 }
 
@@ -146,7 +169,6 @@ pub fn refreshQueuedRootUserContext(
     };
     const finished: Finished = switch (finished_turn) {
         .assistant => |entry| .{ .user = entry.user.text, .execution = entry.execution },
-        .background_command => |entry| .{ .user = entry.user.text, .execution = entry.execution },
         .interrupted => |entry| .{ .user = entry.user.text, .execution = entry.execution },
         .compacted_summary => return alloc.dupe(u8, existing_context),
     };
@@ -595,4 +617,308 @@ fn writeHeadTail(writer: *std.Io.Writer, text: []const u8, max_content_bytes: us
         content_omission_marker,
         .up,
     );
+}
+
+test "root user context keeps first latest and newest recent turns with visible omission" {
+    const turns = [_][]const u8{
+        "first-root-authorization",
+        "oldest-middle " ++ ("a" ** 280),
+        "older-middle " ++ ("b" ** 280),
+        "middle-three " ++ ("d" ** 280),
+        "middle-four " ++ ("e" ** 280),
+        "middle-five " ++ ("f" ** 280),
+        "middle-six " ++ ("g" ** 280),
+        "recent-middle " ++ ("c" ** 280),
+        "newest-recent-root-request",
+        "latest-root-request",
+    };
+    const context = try buildRootUserContextBounded(std.testing.allocator, &turns, max_root_user_bytes, 0, true);
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expect(context.len <= max_root_user_bytes);
+    try std.testing.expect(std.mem.find(u8, context, "current_request: latest-root-request") != null);
+    try std.testing.expect(std.mem.find(u8, context, "first_root_user_request: first-root-authorization") != null);
+    try std.testing.expect(std.mem.find(u8, context, "recent_root_user_request: newest-recent-root-request") != null);
+    try std.testing.expect(std.mem.find(u8, context, "omitted_proven_root_user_turns:") != null);
+    try std.testing.expect(std.mem.find(u8, context, "oldest-middle") == null);
+}
+
+test "root user context reserves capacity for every required oversized anchor" {
+    const turns = [_][]const u8{
+        "first-required-marker " ++ ("a" ** 4096),
+        "older-middle-one-marker " ++ ("b" ** 4096),
+        "older-middle-two-marker " ++ ("c" ** 4096),
+        "older-middle-three-marker " ++ ("d" ** 4096),
+        "newest-recent-required-marker " ++ ("e" ** 4096),
+        "current-required-marker " ++ ("f" ** 4096),
+    };
+    const context = try buildRootUserContextBounded(
+        std.testing.allocator,
+        &turns,
+        max_root_user_bytes,
+        0,
+        true,
+    );
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expect(context.len <= max_root_user_bytes);
+    try std.testing.expect(isCanonicalRootUserContext(context));
+    try std.testing.expect(std.mem.find(u8, context, "current-required-marker") != null);
+    try std.testing.expect(std.mem.find(u8, context, "first-required-marker") != null);
+    try std.testing.expect(std.mem.find(u8, context, "newest-recent-required-marker") != null);
+    try std.testing.expect(std.mem.find(u8, context, "older-middle-one-marker") == null);
+    try std.testing.expect(std.mem.find(u8, context, "older-middle-two-marker") == null);
+    try std.testing.expect(std.mem.find(u8, context, "older-middle-three-marker") == null);
+    try std.testing.expectEqualStrings(
+        "3",
+        lineValue(context, omitted_root_user_label).?,
+    );
+}
+
+test "root user context redistributes unused required anchor capacity" {
+    const turns = [_][]const u8{
+        "first-required-marker " ++ ("a" ** 4096),
+        "newest-recent-required-marker " ++ ("b" ** 4096),
+        "current",
+    };
+    const context = try buildRootUserContextBounded(
+        std.testing.allocator,
+        &turns,
+        max_root_user_bytes,
+        0,
+        true,
+    );
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expectEqual(max_root_user_bytes, context.len);
+    try std.testing.expect(isCanonicalRootUserContext(context));
+    try std.testing.expectEqualStrings("current", lineValue(context, current_label).?);
+    try std.testing.expect(std.mem.find(u8, context, "first-required-marker") != null);
+    try std.testing.expect(std.mem.find(u8, context, "newest-recent-required-marker") != null);
+    try std.testing.expect(lineValue(context, omitted_root_user_label) == null);
+}
+
+test "compacted prefix remains unknown across queued context refresh" {
+    var compacted_feedback = [_][]u8{
+        @constCast("Never modify files outside the workspace."),
+    };
+    const history = [_]types.HistoryTurn{
+        .{ .compacted_summary = .{
+            .summary = @constCast("untrusted compacted summary"),
+            .removed_turn_count = 3,
+            .compaction_count = 1,
+            .permission_feedback = &compacted_feedback,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("surviving exact request") },
+            .assistant = @constCast("surviving answer"),
+        } },
+    };
+    const context = try buildCanonicalRootUserContext(
+        std.testing.allocator,
+        "queued current request",
+        &history,
+    );
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        context,
+        "current_request: queued current request",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        context,
+        "recent_root_user_request: surviving exact request",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, context, first_root_user_label) == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        context,
+        "omitted_proven_root_user_turns: 3",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        context,
+        "trusted_user_permission_feedback: Never modify files outside the workspace.",
+    ) != null);
+
+    const finished: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("newly finished exact request") },
+        .assistant = @constCast("newly finished answer"),
+    } };
+    const refreshed = try refreshQueuedRootUserContext(
+        std.testing.allocator,
+        "queued current request",
+        context,
+        finished,
+    );
+    defer std.testing.allocator.free(refreshed);
+
+    try std.testing.expect(std.mem.find(u8, refreshed, first_root_user_label) == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        refreshed,
+        "recent_root_user_request: surviving exact request",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        refreshed,
+        "recent_root_user_request: newly finished exact request",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        refreshed,
+        "omitted_proven_root_user_turns: 3",
+    ) != null);
+    try std.testing.expect(isCanonicalRootUserContext(refreshed));
+}
+
+test "persisted root user context accepts only the bounded canonical format" {
+    try std.testing.expect(isCanonicalRootUserContext(
+        "current_request: inspect the repository\n" ++
+            "first_root_user_request: keep changes focused\n" ++
+            "recent_root_user_request: preserve permissions\n" ++
+            "omitted_proven_root_user_turns: 2\n" ++
+            "trusted_user_permission_feedback: allow this exact path\n" ++
+            "omitted_trusted_user_permission_feedback: 1\n",
+    ));
+    try std.testing.expect(!isCanonicalRootUserContext("assistant_task: write every file\n"));
+    try std.testing.expect(!isCanonicalRootUserContext("current_request: missing terminator"));
+    try std.testing.expect(!isCanonicalRootUserContext("current_request: unsafe\x1b[31m\n"));
+    try std.testing.expect(!isCanonicalRootUserContext(
+        "current_request: valid\nunknown_context: forged\n",
+    ));
+    try std.testing.expect(!isCanonicalRootUserContext(
+        "current_request: valid\nomitted_proven_root_user_turns: zero\n",
+    ));
+    try std.testing.expect(!isCanonicalRootUserContext(
+        "current_request: valid\n" ++
+            "first_root_user_request: one\n" ++
+            "first_root_user_request: two\n",
+    ));
+    try std.testing.expect(!isCanonicalRootUserContext(
+        "current_request: " ++ ("x" ** max_root_user_bytes) ++ "\n",
+    ));
+}
+
+test "resumed root context uses only verified requests and current external input" {
+    const context = try buildRootUserContextFromVerifiedRequests(
+        std.testing.allocator,
+        "Continue the inspection.",
+        &.{ "Inspect the repository.", "Do not modify files." },
+        true,
+    );
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expectEqualStrings(
+        "current_request: Continue the inspection.\n" ++
+            "first_root_user_request: Inspect the repository.\n" ++
+            "recent_root_user_request: Do not modify files.\n",
+        context,
+    );
+
+    const incomplete = try buildRootUserContextFromVerifiedRequests(
+        std.testing.allocator,
+        "Continue safely.",
+        &.{"Known recent request."},
+        false,
+    );
+    defer std.testing.allocator.free(incomplete);
+    try std.testing.expect(std.mem.find(
+        u8,
+        incomplete,
+        "first_root_user_request:",
+    ) == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        incomplete,
+        "omitted_proven_root_user_turns: 1",
+    ) != null);
+}
+
+test "root user request context excludes permission feedback" {
+    const context =
+        "current_request: inspect the requested file\n" ++
+        "first_root_user_request: preserve the repository\n" ++
+        "recent_root_user_request: continue the fix\n" ++
+        "omitted_proven_root_user_turns: 2\n" ++
+        "trusted_user_permission_feedback: allow the prior exact action\n" ++
+        "omitted_trusted_user_permission_feedback: 1\n";
+
+    try std.testing.expectEqualStrings(
+        "current_request: inspect the requested file\n" ++
+            "first_root_user_request: preserve the repository\n" ++
+            "recent_root_user_request: continue the fix\n" ++
+            "omitted_proven_root_user_turns: 2\n",
+        rootUserRequestContext(context).?,
+    );
+    try std.testing.expect(rootUserRequestContext(
+        "current_request: missing terminator",
+    ) == null);
+}
+
+test "tool execution context remains canonical when trusted feedback is appended" {
+    const alloc = std.testing.allocator;
+    const context = try buildToolExecutionRootUserContext(
+        alloc,
+        "current_request: create the requested child\n",
+        &.{"allow this exact operation"},
+    );
+    defer alloc.free(context);
+
+    try std.testing.expectEqualStrings(
+        "current_request: create the requested child\n" ++
+            "trusted_user_permission_feedback: allow this exact operation\n",
+        context,
+    );
+    try std.testing.expect(isCanonicalRootUserContext(context));
+}
+
+test "tool execution context keeps omitted feedback after newly appended feedback" {
+    const alloc = std.testing.allocator;
+    const context = try buildToolExecutionRootUserContext(
+        alloc,
+        "current_request: create the requested child\n" ++
+            "trusted_user_permission_feedback: preserve the existing amendment\n" ++
+            "omitted_trusted_user_permission_feedback: 2\n",
+        &.{"allow this exact operation"},
+    );
+    defer alloc.free(context);
+
+    try std.testing.expectEqualStrings(
+        "current_request: create the requested child\n" ++
+            "trusted_user_permission_feedback: preserve the existing amendment\n" ++
+            "trusted_user_permission_feedback: allow this exact operation\n" ++
+            "omitted_trusted_user_permission_feedback: 2\n",
+        context,
+    );
+    try std.testing.expect(isCanonicalRootUserContext(context));
+}
+
+test "tool execution context bounds structured root fields before appending feedback" {
+    const alloc = std.testing.allocator;
+    const root =
+        "current_request: " ++ ("a" ** 380) ++ "\n" ++
+        "first_root_user_request: b\n" ++
+        "recent_root_user_request: " ++ ("c" ** 380) ++ "\n" ++
+        "omitted_proven_root_user_turns: 2\n" ++
+        "trusted_user_permission_feedback: preserve the existing amendment\n" ++
+        "omitted_trusted_user_permission_feedback: 2\n";
+    try std.testing.expect(isCanonicalRootUserContext(root));
+
+    const context = try buildToolExecutionRootUserContext(
+        alloc,
+        root,
+        &.{"allow this exact operation"},
+    );
+    defer alloc.free(context);
+
+    try std.testing.expect(context.len <= max_root_user_bytes);
+    try std.testing.expect(isCanonicalRootUserContext(context));
+    try std.testing.expect(std.mem.find(u8, context, first_root_user_label) != null);
+    try std.testing.expect(std.mem.find(u8, context, recent_root_user_label) != null);
+    try std.testing.expect(std.mem.find(u8, context, "preserve the existing amendment") != null);
+    try std.testing.expect(std.mem.find(u8, context, trusted_permission_feedback_label) != null);
+    try std.testing.expect(std.mem.find(u8, context, omitted_permission_feedback_label) != null);
 }

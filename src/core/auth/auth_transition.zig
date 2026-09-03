@@ -75,3 +75,162 @@ pub fn signInCompletion(
             .{ .activate_source = .grok_subscription },
     };
 }
+
+pub const CredentialAuthorityFacts = struct {
+    provider: model_provider.ProviderId,
+    source: credentials.Source,
+    account_id: ?[]const u8,
+    team: ?[]const u8,
+};
+
+pub const CredentialChange = enum {
+    none,
+    secret_only,
+    authority,
+};
+
+pub fn decideCredentialChange(
+    current: CredentialAuthorityFacts,
+    candidate: CredentialAuthorityFacts,
+    secret_changed: bool,
+) CredentialChange {
+    if (current.provider != candidate.provider or
+        current.source != candidate.source or
+        !optionalBytesEqual(current.account_id, candidate.account_id) or
+        !optionalBytesEqual(current.team, candidate.team))
+    {
+        return .authority;
+    }
+    return if (secret_changed) .secret_only else .none;
+}
+
+pub const AuthReplayFacts = struct {
+    authentication_rejected: bool,
+    refreshable: bool,
+    delivery_safe: bool,
+    already_replayed: bool,
+};
+
+pub const AuthReplayDecision = enum {
+    fail,
+    refresh_and_replay,
+};
+
+pub fn decideAuthReplay(facts: AuthReplayFacts) AuthReplayDecision {
+    if (!facts.authentication_rejected or
+        !facts.refreshable or
+        !facts.delivery_safe or
+        facts.already_replayed)
+    {
+        return .fail;
+    }
+    return .refresh_and_replay;
+}
+
+fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+test "provider switch and logout decisions are pure and provider keyed" {
+    try std.testing.expectEqual(ProviderSwitchDecision.no_change, decideProviderSwitch(.{
+        .current = .codex,
+        .target = .codex,
+        .target_credential_ready = true,
+        .intent = .manual,
+        .stream_active = false,
+        .queued_prompts = 0,
+    }));
+    try std.testing.expectEqual(ProviderSwitchDecision.busy, decideProviderSwitch(.{
+        .current = .gateway,
+        .target = .grok,
+        .target_credential_ready = true,
+        .intent = .manual,
+        .stream_active = true,
+        .queued_prompts = 0,
+    }));
+
+    var inventory: std.EnumSet(credentials.Source) = .empty;
+    inventory.insert(.chatgpt_subscription);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, decideLogoutProvider(.{
+        .requested = null,
+        .selected = .gateway,
+        .active_source = null,
+        .available_sources = inventory,
+    }));
+    try std.testing.expectEqual(model_provider.ProviderId.grok, decideLogoutProvider(.{
+        .requested = .grok,
+        .selected = .codex,
+        .active_source = .chatgpt_subscription,
+        .available_sources = inventory,
+    }));
+}
+
+test "sign in completion selects routing or credential activation without effects" {
+    try std.testing.expectEqual(
+        SignInCompletionAction{ .switch_provider = .codex },
+        signInCompletion(.codex, true),
+    );
+    try std.testing.expectEqual(
+        SignInCompletionAction{ .activate_source = .grok_subscription },
+        signInCompletion(.grok, false),
+    );
+    try std.testing.expectEqual(SignInCompletionAction.vercel, signInCompletion(.gateway, true));
+}
+
+test "credential change distinguishes secret rotation from authority replacement" {
+    const stable = CredentialAuthorityFacts{
+        .provider = .gateway,
+        .source = .fx_login,
+        .account_id = null,
+        .team = "team_1",
+    };
+    try std.testing.expectEqual(
+        CredentialChange.none,
+        decideCredentialChange(stable, stable, false),
+    );
+    try std.testing.expectEqual(
+        CredentialChange.secret_only,
+        decideCredentialChange(stable, stable, true),
+    );
+    try std.testing.expectEqual(
+        CredentialChange.authority,
+        decideCredentialChange(stable, .{
+            .provider = .gateway,
+            .source = .fx_login,
+            .account_id = null,
+            .team = "team_2",
+        }, true),
+    );
+    try std.testing.expectEqual(
+        CredentialChange.authority,
+        decideCredentialChange(.{
+            .provider = .codex,
+            .source = .chatgpt_subscription,
+            .account_id = "acct_1",
+            .team = null,
+        }, .{
+            .provider = .codex,
+            .source = .chatgpt_subscription,
+            .account_id = "acct_2",
+            .team = null,
+        }, true),
+    );
+}
+
+test "auth replay is one delivery-safe refresh outside semantic policy" {
+    const eligible = AuthReplayFacts{
+        .authentication_rejected = true,
+        .refreshable = true,
+        .delivery_safe = true,
+        .already_replayed = false,
+    };
+    try std.testing.expectEqual(AuthReplayDecision.refresh_and_replay, decideAuthReplay(eligible));
+
+    var blocked = eligible;
+    blocked.already_replayed = true;
+    try std.testing.expectEqual(AuthReplayDecision.fail, decideAuthReplay(blocked));
+    blocked = eligible;
+    blocked.delivery_safe = false;
+    try std.testing.expectEqual(AuthReplayDecision.fail, decideAuthReplay(blocked));
+}

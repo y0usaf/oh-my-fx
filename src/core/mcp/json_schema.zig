@@ -1414,3 +1414,776 @@ fn keywordContainsSchemas(dialect: Dialect, keyword: []const u8) bool {
         std.mem.eql(u8, keyword, "not") or
         (dialect == .draft_2020_12 and std.mem.eql(u8, keyword, "contentSchema"));
 }
+
+fn expectValidation(schema: []const u8, instance: []const u8, expected_valid: bool) !void {
+    const result = try validateText(std.testing.allocator, schema, instance, .{});
+    try std.testing.expectEqual(expected_valid, result == .valid);
+}
+
+fn fuzzJsonSchema(_: void, smith: *std.testing.Smith) !void {
+    var schema_buffer: [1024]u8 = undefined;
+    const schema_len = smith.sliceWeightedBytes(&schema_buffer, &.{
+        .rangeAtMost(u8, 0x20, 0x7e, 8),
+        .rangeAtMost(u8, 0x00, 0xff, 1),
+        .value(u8, '{', 4),
+        .value(u8, '}', 4),
+        .value(u8, '[', 3),
+        .value(u8, ']', 3),
+        .value(u8, '"', 4),
+        .value(u8, ':', 3),
+        .value(u8, ',', 3),
+    });
+    var instance_buffer: [1024]u8 = undefined;
+    const instance_len = smith.sliceWeightedBytes(&instance_buffer, &.{
+        .rangeAtMost(u8, 0x20, 0x7e, 8),
+        .rangeAtMost(u8, 0x00, 0xff, 1),
+        .value(u8, '{', 4),
+        .value(u8, '}', 4),
+        .value(u8, '[', 3),
+        .value(u8, ']', 3),
+        .value(u8, '"', 4),
+        .value(u8, ':', 3),
+        .value(u8, ',', 3),
+    });
+    _ = validateText(
+        std.testing.allocator,
+        schema_buffer[0..schema_len],
+        instance_buffer[0..instance_len],
+        .{
+            .max_schema_bytes = schema_buffer.len,
+            .max_instance_bytes = instance_buffer.len,
+            .max_depth = 16,
+            .max_nodes = 256,
+            .max_steps = 2048,
+            .max_ref_hops = 32,
+            .max_container_entries = 128,
+        },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+}
+
+test "fuzz JSON Schema parser and evaluator stay bounded" {
+    try std.testing.fuzz({}, fuzzJsonSchema, .{
+        .corpus = &.{
+            "{}{}",
+            "true[]",
+            "{\"type\":\"object\"}{\"a\":1}",
+            "{\"$ref\":\"#/$defs/x\",\"$defs\":{\"x\":true}}null",
+        },
+    });
+}
+
+fn checkValidationAllocationFailures(alloc: Allocator) !void {
+    const result = try validateText(
+        alloc,
+        \\{"type":"object","patternProperties":{"^v":{"$ref":"#/$defs/positive"}},"unevaluatedProperties":false,"$defs":{"positive":{"type":"integer","minimum":1}},"required":["value"]}
+    ,
+        \\{"value":2}
+    ,
+        .{},
+    );
+    try std.testing.expect(result == .valid);
+}
+
+fn checkDraft7AllocationFailures(alloc: Allocator) !void {
+    const result = try validateText(
+        alloc,
+        \\{"$schema":"http://json-schema.org/draft-07/schema#","definitions":{"positive":{"type":"integer","minimum":1}},"items":[{"$ref":"#/definitions/positive"}],"additionalItems":false}
+    ,
+        "[2]",
+        .{},
+    );
+    try std.testing.expect(result == .valid);
+}
+
+test "JSON Schema validation releases every allocation failure path" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkValidationAllocationFailures,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkDraft7AllocationFailures,
+        .{},
+    );
+}
+
+test "JSON Schema rejects invalid array keyword shapes" {
+    const alloc = std.testing.allocator;
+    const invalid = [_][]const u8{
+        \\{"required":["value","value"]}
+        ,
+        \\{"dependentRequired":{"value":["other","other"]}}
+        ,
+        \\{"allOf":[]}
+        ,
+        \\{"anyOf":[]}
+        ,
+        \\{"oneOf":[]}
+        ,
+    };
+    for (invalid) |schema| {
+        try std.testing.expectError(error.InvalidSchema, validateSchemaText(alloc, schema, .{}));
+    }
+    _ = try validateSchemaText(
+        alloc,
+        \\{"prefixItems":[]}
+    ,
+        .{},
+    );
+}
+
+test "JSON Schema rejects rounded programmatic floats" {
+    var schema = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"type":"number"}
+    ,
+        .{ .parse_numbers = false },
+    );
+    defer schema.deinit();
+    try std.testing.expectError(
+        error.InvalidJson,
+        validateValue(
+            std.testing.allocator,
+            schema.value,
+            .{ .float = 9_007_199_254_740_992.0 },
+            .{},
+        ),
+    );
+}
+
+test "JSON Schema 2020-12 validates core applicator and validation corpus cases" {
+    // Representative cases are derived from the pinned JSON Schema Test Suite
+    // draft2020-12 core, applicator, and validation groups at
+    // be54236db6e8e6bb2e098ed16fb4c61e73f5a9ac.
+    try expectValidation(
+        \\{"type":"object","properties":{"count":{"type":"integer","minimum":1}},"required":["count"],"additionalProperties":false}
+    ,
+        \\{"count":2}
+    , true);
+    try expectValidation(
+        \\{"type":"object","properties":{"count":{"type":"integer","minimum":1}},"required":["count"],"additionalProperties":false}
+    ,
+        \\{"count":0}
+    , false);
+    try expectValidation(
+        \\{"oneOf":[{"type":"integer"},{"type":"number"}]}
+    , "1", false);
+    try expectValidation(
+        \\{"if":{"properties":{"kind":{"const":"a"}}},"then":{"required":["a"]},"else":{"required":["b"]}}
+    ,
+        \\{"kind":"a","a":1}
+    , true);
+    try expectValidation(
+        \\{"prefixItems":[{"type":"string"}],"items":{"type":"integer"},"contains":{"minimum":5},"minContains":1}
+    ,
+        \\["x",2,6]
+    , true);
+
+    const Case = struct {
+        schema: []const u8,
+        instance: []const u8,
+        valid: bool,
+    };
+    const cases = [_]Case{
+        .{ .schema = "true", .instance = "null", .valid = true },
+        .{ .schema = "false", .instance = "null", .valid = false },
+        .{ .schema = "{\"type\":[\"string\",\"null\"]}", .instance = "null", .valid = true },
+        .{ .schema = "{\"enum\":[1,\"x\",null]}", .instance = "\"y\"", .valid = false },
+        .{ .schema = "{\"const\":{\"a\":[1,2]}}", .instance = "{\"a\":[1,2]}", .valid = true },
+        .{ .schema = "{\"multipleOf\":0.25}", .instance = "1.5", .valid = true },
+        .{ .schema = "{\"multipleOf\":0.25}", .instance = "1.6", .valid = false },
+        .{ .schema = "{\"minimum\":2,\"maximum\":4}", .instance = "5", .valid = false },
+        .{ .schema = "{\"exclusiveMinimum\":2,\"exclusiveMaximum\":4}", .instance = "2", .valid = false },
+        .{ .schema = "{\"minLength\":2,\"maxLength\":2}", .instance = "\"éa\"", .valid = true },
+        .{ .schema = "{\"pattern\":\"^\\\\p{Letter}+$\"}", .instance = "\"π\"", .valid = true },
+        .{ .schema = "{\"pattern\":\"^[a-z]+$\"}", .instance = "\"123\"", .valid = false },
+        .{ .schema = "{\"minItems\":2,\"maxItems\":3}", .instance = "[1]", .valid = false },
+        .{ .schema = "{\"uniqueItems\":true}", .instance = "[{\"a\":1},{\"a\":1.0}]", .valid = false },
+        .{ .schema = "{\"contains\":{\"type\":\"integer\"},\"minContains\":2,\"maxContains\":2}", .instance = "[1,2,\"x\"]", .valid = true },
+        .{ .schema = "{\"prefixItems\":[{\"type\":\"string\"}],\"items\":false}", .instance = "[\"x\",2]", .valid = false },
+        .{ .schema = "{\"minProperties\":2,\"maxProperties\":2}", .instance = "{\"a\":1}", .valid = false },
+        .{ .schema = "{\"required\":[\"a\",\"b\"]}", .instance = "{\"a\":1}", .valid = false },
+        .{ .schema = "{\"properties\":{\"a\":{\"type\":\"integer\"}}}", .instance = "{\"a\":\"x\"}", .valid = false },
+        .{ .schema = "{\"properties\":{\"a\":true},\"additionalProperties\":false}", .instance = "{\"a\":1,\"b\":2}", .valid = false },
+        .{ .schema = "{\"patternProperties\":{\"^x\":{\"type\":\"integer\"}},\"additionalProperties\":false}", .instance = "{\"x-value\":1}", .valid = true },
+        .{ .schema = "{\"propertyNames\":{\"minLength\":2}}", .instance = "{\"a\":1}", .valid = false },
+        .{ .schema = "{\"dependentRequired\":{\"card\":[\"billing\"]}}", .instance = "{\"card\":1}", .valid = false },
+        .{ .schema = "{\"dependentSchemas\":{\"card\":{\"required\":[\"billing\"]}}}", .instance = "{\"card\":1,\"billing\":2}", .valid = true },
+        .{ .schema = "{\"allOf\":[{\"type\":\"integer\"},{\"minimum\":2}]}", .instance = "1", .valid = false },
+        .{ .schema = "{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}", .instance = "true", .valid = false },
+        .{ .schema = "{\"not\":{\"type\":\"integer\"}}", .instance = "\"x\"", .valid = true },
+        .{ .schema = "{\"allOf\":[{\"properties\":{\"known\":true}}],\"unevaluatedProperties\":false}", .instance = "{\"known\":1}", .valid = true },
+        .{ .schema = "{\"prefixItems\":[true],\"unevaluatedItems\":false}", .instance = "[1,2]", .valid = false },
+        .{ .schema = "{\"format\":\"email\",\"contentEncoding\":\"base64\"}", .instance = "\"not asserted\"", .valid = true },
+    };
+    for (cases) |case| try expectValidation(case.schema, case.instance, case.valid);
+}
+
+test "JSON Schema patterns use ECMAScript whitespace semantics in both dialects" {
+    const non_space_schema = "{\"pattern\":\"^\\\\S+$\"}";
+    const whitespace_instances = [_][]const u8{
+        "\"\\u00A0\"",
+        "\"\\uFEFF\"",
+        "\"\\u2003\"",
+        "\"\\u2028\"",
+        "\"\\u2029\"",
+    };
+    for (whitespace_instances) |instance| {
+        try expectValidation(non_space_schema, instance, false);
+    }
+    try expectValidation(non_space_schema, "\"plain\"", true);
+    try expectValidation(
+        "{\"patternProperties\":{\"^\\\\s$\":{\"type\":\"integer\"}},\"additionalProperties\":false}",
+        "{\"\\u2003\":1}",
+        true,
+    );
+    try expectValidation(
+        "{\"patternProperties\":{\"^\\\\s$\":{\"type\":\"integer\"}},\"additionalProperties\":false}",
+        "{\"\\u2029\":\"invalid\"}",
+        false,
+    );
+    try expectValidation(
+        "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"pattern\":\"^\\\\S+$\"}",
+        "\"\\u00A0\"",
+        false,
+    );
+    try expectValidation(
+        "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"patternProperties\":{\"^\\\\s$\":{\"type\":\"integer\"}},\"additionalProperties\":false}",
+        "{\"\\uFEFF\":1}",
+        true,
+    );
+}
+
+test "JSON Schema compares every JSON number exactly" {
+    try expectValidation(
+        "{\"const\":9007199254740992}",
+        "9007199254740993",
+        false,
+    );
+    try expectValidation(
+        "{\"enum\":[9007199254740993]}",
+        "9.007199254740993e15",
+        true,
+    );
+    try expectValidation(
+        "{\"minimum\":9007199254740993}",
+        "9007199254740992",
+        false,
+    );
+    try expectValidation(
+        "{\"type\":\"integer\"}",
+        "9007199254740993.000",
+        true,
+    );
+    try expectValidation(
+        "{\"type\":\"integer\"}",
+        "1e-1",
+        false,
+    );
+    try expectValidation(
+        "{\"const\":0}",
+        "-0.0e999",
+        true,
+    );
+    try expectValidation(
+        "{\"uniqueItems\":true}",
+        "[9007199254740992,9007199254740993]",
+        true,
+    );
+    try expectValidation(
+        "{\"uniqueItems\":true}",
+        "[0,-0.0]",
+        false,
+    );
+    try expectValidation(
+        "{\"multipleOf\":0.000000000000000000000000000001}",
+        "0.123456789012345678901234567890",
+        true,
+    );
+    try expectValidation(
+        "{\"multipleOf\":0.000000000000000000000000000003}",
+        "0.123456789012345678901234567890",
+        true,
+    );
+    try expectValidation(
+        "{\"multipleOf\":0.000000000000000000000000000004}",
+        "0.123456789012345678901234567890",
+        false,
+    );
+    try expectValidation(
+        "{\"const\":0.12345678901234567890123456789}",
+        "12345678901234567890123456789e-29",
+        true,
+    );
+}
+
+test "JSON Schema resolves local pointer anchor and dynamic references without I/O" {
+    try expectValidation(
+        \\{"$defs":{"positive":{"$anchor":"positive","type":"integer","minimum":1}},"properties":{"a":{"$ref":"#/$defs/positive"},"b":{"$ref":"#positive"}}}
+    ,
+        \\{"a":2,"b":3}
+    , true);
+    try expectValidation(
+        \\{"$defs":{"node":{"$dynamicAnchor":"node","type":"object","properties":{"value":{"type":"integer"},"child":{"$dynamicRef":"#node"}}}},"$ref":"#/$defs/node"}
+    ,
+        \\{"value":1,"child":{"value":2}}
+    , true);
+    try expectValidation(
+        \\{"$id":"https://test.example/typical/root","$ref":"list","$defs":{"items":{"$dynamicAnchor":"items","type":"string"},"list":{"$id":"list","type":"array","items":{"$dynamicRef":"#items"},"$defs":{"bookend":{"$dynamicAnchor":"items"}}}}}
+    ,
+        \\["foo","bar"]
+    , true);
+    try expectValidation(
+        \\{"$id":"https://test.example/typical/root","$ref":"list","$defs":{"items":{"$dynamicAnchor":"items","type":"string"},"list":{"$id":"list","type":"array","items":{"$dynamicRef":"#items"},"$defs":{"bookend":{"$dynamicAnchor":"items"}}}}}
+    ,
+        \\["foo",42]
+    , false);
+    try expectValidation(
+        \\{"$id":"https://test.example/relative/root","$dynamicAnchor":"meta","properties":{"foo":{"const":"pass"}},"$ref":"extended","$defs":{"extended":{"$id":"extended","$dynamicAnchor":"meta","properties":{"bar":{"$ref":"bar"}}},"bar":{"$id":"bar","properties":{"baz":{"$dynamicRef":"extended#meta"}}}}}
+    ,
+        \\{"foo":"pass","bar":{"baz":{"foo":"pass"}}}
+    , true);
+    try expectValidation(
+        \\{"$id":"https://test.example/relative/root","$dynamicAnchor":"meta","properties":{"foo":{"const":"pass"}},"$ref":"extended","$defs":{"extended":{"$id":"extended","$dynamicAnchor":"meta","properties":{"bar":{"$ref":"bar"}}},"bar":{"$id":"bar","properties":{"baz":{"$dynamicRef":"extended#meta"}}}}}
+    ,
+        \\{"foo":"pass","bar":{"baz":{"foo":"fail"}}}
+    , false);
+}
+
+test "JSON Schema selects only declared supported dialects" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { schema: []const u8, dialect: Dialect }{
+        .{ .schema = "{}", .dialect = .draft_2020_12 },
+        .{ .schema = "true", .dialect = .draft_2020_12 },
+        .{ .schema = "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\"}", .dialect = .draft_2020_12 },
+        .{ .schema = "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema#\"}", .dialect = .draft_2020_12 },
+        .{ .schema = "{\"$schema\":\"http://json-schema.org/draft-07/schema\"}", .dialect = .draft_7 },
+        .{ .schema = "{\"$schema\":\"http://json-schema.org/draft-07/schema#\"}", .dialect = .draft_7 },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.schema, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.dialect, try detectDialect(parsed.value));
+    }
+    try std.testing.expectError(
+        error.UnsupportedDialect,
+        validateSchemaText(alloc, "{\"$schema\":\"https://json-schema.org/draft/2019-09/schema\"}", .{}),
+    );
+    try std.testing.expectError(
+        error.UnsupportedDialect,
+        validateSchemaText(alloc, "{\"$schema\":\"https://json-schema.org/draft-07/schema\"}", .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidSchema,
+        validateSchemaText(alloc, "{\"$schema\":7}", .{}),
+    );
+}
+
+test "JSON Schema Draft 7 validates legacy applicators references and ref siblings" {
+    const prefix = "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",";
+    try expectValidation(
+        prefix ++ "\"definitions\":{\"positive\":{\"type\":\"integer\",\"minimum\":1}},\"properties\":{\"value\":{\"$ref\":\"#/definitions/positive\"}}}",
+        "{\"value\":2}",
+        true,
+    );
+    try expectValidation(
+        prefix ++ "\"items\":[{\"type\":\"integer\"},{\"type\":\"string\"}],\"additionalItems\":false}",
+        "[1,\"x\",true]",
+        false,
+    );
+    try expectValidation(
+        prefix ++ "\"dependencies\":{\"card\":[\"billing\"],\"billing\":{\"required\":[\"address\"]}}}",
+        "{\"card\":1,\"billing\":2,\"address\":3}",
+        true,
+    );
+    try expectValidation(
+        prefix ++ "\"$id\":\"https://example.test/root\",\"definitions\":{\"number\":{\"$id\":\"#number\",\"type\":\"number\"}},\"properties\":{\"value\":{\"$ref\":\"#number\"}}}",
+        "{\"value\":1}",
+        true,
+    );
+    try expectValidation(
+        prefix ++ "\"definitions\":{\"array\":{\"type\":\"array\"}},\"$ref\":\"#/definitions/array\",\"maxItems\":1}",
+        "[1,2]",
+        true,
+    );
+}
+
+test "JSON Schema treats other-dialect keywords as annotations" {
+    const alloc = std.testing.allocator;
+    const schemas = [_][]const u8{
+        "{\"definitions\":{}}",
+        "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"prefixItems\":[]}",
+        "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"deprecated\":true}",
+    };
+    for (schemas) |schema| {
+        try std.testing.expectEqual(
+            SchemaAssessment.locally_evaluable,
+            try validateSchemaText(alloc, schema, .{}),
+        );
+    }
+}
+
+test "JSON Schema treats unknown keywords as annotations" {
+    const schema =
+        \\{"type":"string","futureKeyword":{"type":7}}
+    ;
+    const assessment = try validateSchemaText(std.testing.allocator, schema, .{});
+    try std.testing.expect(assessment == .locally_evaluable);
+
+    const result = try validateText(std.testing.allocator, schema, "7", .{});
+    try std.testing.expectEqual(Result{ .invalid = .type }, result);
+}
+
+test "JSON Schema ignores vocabulary support declarations in ordinary schemas" {
+    const schema =
+        \\{"$vocabulary":{"https://example.test/required":true},"type":"string"}
+    ;
+    const assessment = try validateSchemaText(std.testing.allocator, schema, .{});
+    try std.testing.expect(assessment == .locally_evaluable);
+
+    const result = try validateText(std.testing.allocator, schema, "7", .{});
+    try std.testing.expectEqual(Result{ .invalid = .type }, result);
+
+    try std.testing.expectError(
+        error.InvalidSchema,
+        validateSchemaText(std.testing.allocator, "{\"$vocabulary\":[]}", .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidSchema,
+        validateSchemaText(
+            std.testing.allocator,
+            "{\"$vocabulary\":{\"https://example.test/invalid\":1}}",
+            .{},
+        ),
+    );
+}
+
+test "JSON Schema rejects external references and malformed referenced schemas" {
+    try std.testing.expectError(
+        error.ExternalReference,
+        validateSchemaText(std.testing.allocator,
+            \\{"$ref":"https://example.com/schema"}
+        , .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidSchema,
+        validateSchemaText(std.testing.allocator,
+            \\{"title":"not a schema","$ref":"#/title"}
+        , .{}),
+    );
+}
+
+test "JSON Schema delegates provider patterns outside the local evaluator" {
+    const schema =
+        \\{"type":"object","properties":{"contact":{"type":"object","properties":{"email":{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)[A-Za-z0-9_+.-]+@[A-Za-z0-9.-]+$"}}}}}
+    ;
+    const schema_assessment = try validateSchemaText(std.testing.allocator, schema, .{});
+    try std.testing.expect(schema_assessment == .server_authoritative);
+
+    const instance_assessment = try validateText(
+        std.testing.allocator,
+        schema,
+        \\{"contact":{"email":"person@example.com"}}
+    ,
+        .{},
+    );
+    try std.testing.expect(instance_assessment == .server_authoritative);
+}
+
+test "JSON Schema delegates patternProperties outside the local evaluator" {
+    const schema =
+        \\{"type":"object","patternProperties":{"^(?!secret$).*":{"type":"string"}}}
+    ;
+    const schema_assessment = try validateSchemaText(std.testing.allocator, schema, .{});
+    try std.testing.expect(schema_assessment == .server_authoritative);
+
+    const instance_assessment = try validateText(
+        std.testing.allocator,
+        schema,
+        \\{"public":"value"}
+    ,
+        .{},
+    );
+    try std.testing.expect(instance_assessment == .server_authoritative);
+}
+
+test "JSON Schema hard errors dominate delegated patterns regardless of order" {
+    const malformed_siblings = [_][]const u8{
+        \\{"pattern":"(?=a)","minLength":"invalid"}
+        ,
+        \\{"minLength":"invalid","pattern":"(?=a)"}
+        ,
+        \\{"patternProperties":{"(?=a)":true},"required":7}
+        ,
+        \\{"required":7,"patternProperties":{"(?=a)":true}}
+        ,
+        \\{"properties":{"delegated":{"pattern":"(?=a)"},"malformed":{"required":7}}}
+        ,
+        \\{"properties":{"malformed":{"required":7},"delegated":{"pattern":"(?=a)"}}}
+        ,
+    };
+    for (malformed_siblings) |schema| {
+        try std.testing.expectError(
+            error.InvalidSchema,
+            validateSchemaText(std.testing.allocator, schema, .{}),
+        );
+        try std.testing.expectError(
+            error.InvalidSchema,
+            validateText(std.testing.allocator, schema, "{}", .{}),
+        );
+    }
+
+    const external_references = [_][]const u8{
+        \\{"pattern":"(?=a)","$ref":"https://example.test/schema"}
+        ,
+        \\{"$ref":"https://example.test/schema","pattern":"(?=a)"}
+        ,
+    };
+    for (external_references) |schema| {
+        try std.testing.expectError(
+            error.ExternalReference,
+            validateSchemaText(std.testing.allocator, schema, .{}),
+        );
+        try std.testing.expectError(
+            error.ExternalReference,
+            validateText(std.testing.allocator, schema, "{}", .{}),
+        );
+    }
+
+    const referenced_malformed_schema =
+        \\{"pattern":"(?=a)","$ref":"#/default","default":{"type":7}}
+    ;
+    try std.testing.expectError(
+        error.InvalidSchema,
+        validateSchemaText(std.testing.allocator, referenced_malformed_schema, .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidSchema,
+        validateText(std.testing.allocator, referenced_malformed_schema, "{}", .{}),
+    );
+}
+
+test "JSON Schema rejects malformed schemas reached through annotation references" {
+    const schemas = [_][]const u8{
+        \\{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","default":{"type":7},"$ref":"#/default"}
+        ,
+        \\{"default":{"type":7},"$ref":"#/default"}
+        ,
+        \\{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","default":{"$ref":"#/examples/0"},"examples":[{"type":7}],"$ref":"#/default"}
+        ,
+        \\{"default":{"$ref":"#/examples/0"},"examples":[{"type":7}],"$ref":"#/default"}
+        ,
+    };
+    for (schemas) |schema| {
+        try std.testing.expectError(
+            error.InvalidSchema,
+            validateSchemaText(std.testing.allocator, schema, .{}),
+        );
+        try std.testing.expectError(
+            error.InvalidSchema,
+            validateText(std.testing.allocator, schema, "{}", .{}),
+        );
+    }
+}
+
+test "JSON Schema publication preserves recursive annotation references" {
+    _ = try validateSchemaText(
+        std.testing.allocator,
+        \\{"default":{"$ref":"#/default"},"$ref":"#/default"}
+    ,
+        .{},
+    );
+    _ = try validateSchemaText(
+        std.testing.allocator,
+        \\{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","default":{"$ref":"#/default"},"$ref":"#/default"}
+    ,
+        .{},
+    );
+}
+
+test "JSON Schema delegates pattern grammar the local evaluator cannot classify" {
+    const delegated = [_][]const u8{
+        "{\"pattern\":\"[\\\\s-a]\"}",
+        "{\"pattern\":\"[\\\\w-a]\"}",
+        "{\"pattern\":\"(a)\\\\1\"}",
+        "{\"pattern\":\"^*\"}",
+        "{\"pattern\":\"$+\"}",
+    };
+    for (delegated) |schema| {
+        try std.testing.expectEqual(
+            SchemaAssessment.server_authoritative,
+            try validateSchemaText(std.testing.allocator, schema, .{}),
+        );
+    }
+    try std.testing.expectEqual(
+        SchemaAssessment.locally_evaluable,
+        try validateSchemaText(std.testing.allocator, "{\"pattern\":\"[\\\\s-]\"}", .{}),
+    );
+    try std.testing.expectEqual(
+        SchemaAssessment.locally_evaluable,
+        try validateSchemaText(std.testing.allocator, "{\"pattern\":\"(^)?\"}", .{}),
+    );
+}
+
+test "JSON Schema keeps invalid UTF-8 pattern inputs hard" {
+    const invalid_utf8 = [_]u8{0xff};
+    try std.testing.expectError(
+        error.InvalidSchema,
+        assessPattern(std.testing.allocator, &invalid_utf8, .{}),
+    );
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "true", .{});
+    defer parsed.deinit();
+    var resolver = try schema_resolver.Resolver.init(
+        std.testing.allocator,
+        parsed.value,
+        .draft_2020_12,
+        resolverLimits(.{}),
+    );
+    defer resolver.deinit();
+    var ctx = ValidationContext{
+        .alloc = std.testing.allocator,
+        .dialect = .draft_2020_12,
+        .resolver = &resolver,
+        .limits = .{},
+    };
+    defer ctx.dynamic_scope.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.InvalidSchema,
+        ctx.matchesPattern("a", &invalid_utf8),
+    );
+}
+
+test "JSON Schema rejects identifiers reached through annotation pointers without aborting" {
+    const schemas = [_][]const u8{
+        \\{"$ref":"#/default","default":{"$id":"child","type":"string"}}
+        ,
+        \\{"$dynamicRef":"#/const","const":{"$id":"child","type":"string"}}
+        ,
+        \\{"$ref":"#/examples/0","examples":[{"$id":"child","type":"string"}]}
+        ,
+        \\{"$dynamicRef":"#/enum/0","enum":[{"$id":"child","type":"string"}]}
+        ,
+    };
+    for (schemas) |schema| {
+        try std.testing.expectError(
+            error.InvalidSchema,
+            validateText(std.testing.allocator, schema, "\"value\"", .{}),
+        );
+    }
+}
+
+test "JSON Schema bounds recursive references and container work" {
+    try std.testing.expectError(
+        error.InstanceLimitExceeded,
+        validateText(
+            std.testing.allocator,
+            \\{"$defs":{"loop":{"$ref":"#/$defs/loop"}},"$ref":"#/$defs/loop"}
+        ,
+            "null",
+            .{ .max_ref_hops = 4 },
+        ),
+    );
+    try std.testing.expectError(
+        error.InstanceLimitExceeded,
+        validateText(
+            std.testing.allocator,
+            \\{"$schema":"http://json-schema.org/draft-07/schema#","definitions":{"loop":{"$ref":"#/definitions/loop"}},"$ref":"#/definitions/loop"}
+        ,
+            "null",
+            .{ .max_ref_hops = 4 },
+        ),
+    );
+    try std.testing.expectError(
+        error.SchemaLimitExceeded,
+        validateSchemaText(
+            std.testing.allocator,
+            \\{"$defs":{"a":true,"b":true}}
+        ,
+            .{ .max_nodes = 2 },
+        ),
+    );
+    try std.testing.expectError(
+        error.SchemaLimitExceeded,
+        validateSchemaText(
+            std.testing.allocator,
+            \\{"pattern":"a{1025}"}
+        ,
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.SchemaLimitExceeded,
+        validateText(
+            std.testing.allocator,
+            \\{"pattern":"a{1025}"}
+        ,
+            "\"a\"",
+            .{},
+        ),
+    );
+    const runtime_pattern =
+        \\{"pattern":"(a|aa)*b"}
+    ;
+    try std.testing.expectEqual(
+        SchemaAssessment.locally_evaluable,
+        try validateSchemaText(
+            std.testing.allocator,
+            runtime_pattern,
+            .{ .max_pattern_steps = 64 },
+        ),
+    );
+    try std.testing.expectError(
+        error.InstanceLimitExceeded,
+        validateText(
+            std.testing.allocator,
+            runtime_pattern,
+            "\"aaaaaaaaaaaaaaaa\"",
+            .{ .max_pattern_steps = 64 },
+        ),
+    );
+    try std.testing.expectError(
+        error.InstanceLimitExceeded,
+        validateText(
+            std.testing.allocator,
+            "true",
+            "[[[0]]]",
+            .{ .max_depth = 2 },
+        ),
+    );
+    _ = try validateSchemaText(
+        std.testing.allocator,
+        \\{"pattern":"a{2}"}
+    ,
+        .{ .max_pattern_repeat = 2 },
+    );
+    try std.testing.expectError(
+        error.SchemaLimitExceeded,
+        validateSchemaText(
+            std.testing.allocator,
+            \\{"pattern":"a{3}"}
+        ,
+            .{ .max_pattern_repeat = 2 },
+        ),
+    );
+    _ = try validateSchemaText(
+        std.testing.allocator,
+        \\{"required":["a","b"]}
+    ,
+        .{ .max_container_entries = 2 },
+    );
+    try std.testing.expectError(
+        error.SchemaLimitExceeded,
+        validateSchemaText(
+            std.testing.allocator,
+            \\{"required":["a","b","c"]}
+        ,
+            .{ .max_container_entries = 2 },
+        ),
+    );
+}

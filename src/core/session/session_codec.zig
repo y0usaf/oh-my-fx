@@ -126,6 +126,10 @@ pub const DurableSessionState = struct {
     /// Last ordinary history commit correlated to durable subagent work. This
     /// control-only marker is not included in model history.
     last_subagent_work_id: ?[]u8 = null,
+    /// True only for a parent-owned subagent session. This durable identity
+    /// keeps the session private even if owner sidecar publication is
+    /// interrupted immediately after creation.
+    subagent_child: bool = false,
     /// Null only for sessions written before durable usage accounting.
     usage: ?session_usage.Snapshot = null,
     /// Active control state. It is never projected into model history and a
@@ -192,6 +196,7 @@ pub const DurableSessionState = struct {
             .total_output_tokens = self.total_output_tokens,
             .permission_state = permission_state,
             .last_subagent_work_id = last_subagent_work_id,
+            .subagent_child = self.subagent_child,
             .usage = usage,
             .recovery_checkpoint = recovery_checkpoint,
         };
@@ -311,30 +316,6 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeExecutionMemory(writer, entry.execution);
             try writer.writeByte('}');
         },
-        .background_command => |entry| {
-            const extended = entry.assistant != null or hasDurableExecutionMemory(entry.execution);
-            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
-            try writeUserTurn(writer, entry.user);
-            try writer.writeAll(",\"log_path\":");
-            try writeDurableBytes(writer, entry.log_path);
-            try writer.print(",\"expect_url\":{s},\"url\":", .{
-                if (entry.expect_url) "true" else "false",
-            });
-            try writeOptionalDurableBytes(writer, entry.url);
-            try writer.writeAll(",\"background_record_id\":");
-            if (entry.background_record_id) |record_id| {
-                try writeHexString(writer, &record_id);
-            } else {
-                try writer.writeAll("null");
-            }
-            if (extended) {
-                try writer.writeAll(",\"assistant\":");
-                try writeOptionalDurableBytes(writer, entry.assistant);
-                try writer.writeAll(",\"execution\":");
-                try writeExecutionMemory(writer, entry.execution);
-            }
-            try writer.writeByte('}');
-        },
         .interrupted => |entry| {
             try writer.writeAll("{\"kind\":\"interrupted\",\"user\":");
             try writeUserTurn(writer, entry.user);
@@ -365,6 +346,29 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte('}');
         },
     }
+}
+
+fn formatLegacyBackgroundAssistant(
+    alloc: Allocator,
+    assistant: ?[]const u8,
+    log_path: []const u8,
+    url: ?[]const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    if (assistant) |text| {
+        if (text.len != 0) {
+            try out.writer.writeAll(text);
+            if (!std.mem.endsWith(u8, text, "\n")) try out.writer.writeByte('\n');
+        }
+    }
+    try out.writer.writeAll(
+        "[Historical command record: fx no longer owns or controls this process",
+    );
+    if (log_path.len != 0) try out.writer.print("; former log={s}", .{log_path});
+    if (url) |value| try out.writer.print("; recorded url={s}", .{value});
+    try out.writer.writeAll("]");
+    return out.toOwnedSlice();
 }
 
 pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
@@ -444,29 +448,32 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         const object = shape.object;
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
-        const assistant = if (shape.extended)
+        const legacy_assistant = if (shape.extended)
             try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat)
         else
             null;
-        errdefer if (assistant) |owned| alloc.free(owned);
+        defer if (legacy_assistant) |owned| alloc.free(owned);
         const execution = if (shape.extended)
             try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
         else
             session.ExecutionMemory{};
         errdefer session.freeExecutionMemory(alloc, execution);
         const log_path = try parseRequiredDurableBytes(alloc, object, "log_path");
-        errdefer alloc.free(log_path);
+        defer alloc.free(log_path);
         const url = try parseOptionalDurableBytes(alloc, object.get("url") orelse return error.InvalidSessionFormat);
-        errdefer if (url) |owned| alloc.free(owned);
-        const background_record_id = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
-        return .{ .background_command = .{
+        defer if (url) |owned| alloc.free(owned);
+        _ = try requireBool(object, "expect_url");
+        _ = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
+        const assistant = try formatLegacyBackgroundAssistant(
+            alloc,
+            legacy_assistant,
+            log_path,
+            url,
+        );
+        return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
-            .log_path = log_path,
-            .expect_url = try requireBool(object, "expect_url"),
-            .url = url,
-            .background_record_id = background_record_id,
         } };
     }
     if (std.mem.eql(u8, kind, "interrupted")) {
@@ -645,6 +652,9 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     if (state.last_subagent_work_id) |id| {
         try writer.writeAll(",\"last_subagent_work_id\":");
         try writeJsonString(writer, id);
+    }
+    if (state.subagent_child) {
+        try writer.writeAll(",\"subagent_child\":true");
     }
     if (state.recovery_checkpoint) |checkpoint| {
         try writer.writeAll(",\"recovery_checkpoint\":");
@@ -873,13 +883,15 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
     errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
+    var subagent_child = false;
+    var subagent_child_seen = false;
     var recovery_checkpoint: ?RecoveryCheckpoint = null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     while (try json_reader.peekNextTokenType() != .object_end) {
         const key = try readStringOwned(&json_reader, alloc, 64);
         defer alloc.free(key);
         if (std.mem.eql(u8, key, "context_history_start")) {
-            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
             }
             const raw = try readU64(&json_reader, alloc);
@@ -887,7 +899,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 return error.InvalidSessionFormat;
             context_seen = true;
         } else if (std.mem.eql(u8, key, "permission_state")) {
-            if (permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
             }
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -900,7 +912,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             permission_state = try parsePermissionState(alloc, value);
             permission_state_seen = true;
         } else if (std.mem.eql(u8, key, "usage")) {
-            if (usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             const parse_limit = @min(
                 limits.max_value_bytes,
                 session_usage.max_snapshot_bytes,
@@ -916,8 +928,13 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             usage = try session_usage.parseSnapshotValue(alloc, value);
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
-            if (last_subagent_work_id != null or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             last_subagent_work_id = try readStringOwned(&json_reader, alloc, 128);
+        } else if (std.mem.eql(u8, key, "subagent_child")) {
+            if (subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            subagent_child = try readBool(&json_reader);
+            if (!subagent_child) return error.InvalidDurableField;
+            subagent_child_seen = true;
         } else if (std.mem.eql(u8, key, "recovery_checkpoint")) {
             if (recovery_checkpoint != null) return error.InvalidSessionFormat;
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -955,6 +972,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .total_output_tokens = total_output_tokens,
         .permission_state = permission_state,
         .last_subagent_work_id = last_subagent_work_id,
+        .subagent_child = subagent_child,
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
     };
@@ -1043,7 +1061,7 @@ fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
     errdefer alloc.free(model);
     const credential_source = if (object.get("credential_source")) |source| switch (source) {
         .null => null,
-        .string => |text| types.parseCredentialSource(text) orelse return error.InvalidDurableField,
+        .string => |text| types.parseRuntimeCredentialSource(text) orelse return error.InvalidDurableField,
         else => return error.InvalidDurableField,
     } else return error.InvalidSessionFormat;
     const credential_identity = if (object.get("credential_identity")) |identity| switch (identity) {
@@ -1103,7 +1121,7 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":5,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":7,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1124,6 +1142,15 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
     for (execution.files, 0..) |file, i| {
         if (i > 0) try writer.writeByte(',');
         try writeFileEvidence(writer, file);
+    }
+    try writer.writeAll("],\"steering\":[");
+    for (execution.steering, 0..) |steering, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"text\":");
+        try writeDurableBytes(writer, steering.text);
+        try writer.writeAll(",\"assistant_prefix\":");
+        try writeOptionalDurableBytes(writer, steering.assistant_prefix);
+        try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
     }
     try writer.writeAll("],\"turn_summary\":");
     if (execution.turn_summary) |summary| {
@@ -1476,17 +1503,14 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
 
 fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.ExecutionMemory {
     const source = try requireObject(value);
-    const has_turn_summary = source.get("turn_summary") != null;
-    const object = if (has_turn_summary)
-        try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" })
-    else
-        try exactObject(value, &.{ "schema_version", "tool_steps", "files" });
-    const schema_version = try requireU64(object, "schema_version");
-    if (schema_version < 1 or schema_version > 5 or
-        (schema_version == 5) != has_turn_summary)
-    {
-        return error.InvalidSessionFormat;
-    }
+    const schema_version = try requireU64(source, "schema_version");
+    const object = switch (schema_version) {
+        1...4 => try exactObject(value, &.{ "schema_version", "tool_steps", "files" }),
+        5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
+        6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        7 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        else => return error.InvalidSessionFormat,
+    };
     const tool_steps = try parseToolSteps(
         alloc,
         object.get("tool_steps") orelse return error.InvalidSessionFormat,
@@ -1494,15 +1518,81 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
     );
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
     const files = try parseFiles(alloc, object.get("files") orelse return error.InvalidSessionFormat);
-    const turn_summary = if (has_turn_summary)
+    errdefer types.freeFileEvidenceSlice(alloc, files);
+    const steering: []types.PersistedSteering = if (schema_version >= 6)
+        try parsePersistedSteering(
+            alloc,
+            object.get("steering") orelse return error.InvalidSessionFormat,
+            schema_version,
+            tool_steps.len,
+        )
+    else
+        &.{};
+    errdefer types.freePersistedSteering(alloc, steering);
+    const turn_summary = if (schema_version >= 5)
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
         null;
     return .{
         .tool_steps = tool_steps,
         .files = files,
+        .steering = steering,
         .turn_summary = turn_summary,
     };
+}
+
+fn parsePersistedSteering(
+    alloc: Allocator,
+    value: std.json.Value,
+    schema_version: u64,
+    tool_step_count: usize,
+) ![]types.PersistedSteering {
+    if (value != .array) return error.InvalidSessionFormat;
+    if (value.array.items.len == 0) return &.{};
+    const steering = try alloc.alloc(types.PersistedSteering, value.array.items.len);
+    errdefer alloc.free(steering);
+    var parsed_count: usize = 0;
+    errdefer for (steering[0..parsed_count]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    var prior_tool_step_count: usize = 0;
+    for (value.array.items, 0..) |item, index| {
+        const parsed = if (schema_version == 6)
+            types.PersistedSteering{
+                .text = try parseDurableBytes(alloc, item),
+                .after_tool_step_count = tool_step_count,
+            }
+        else blk: {
+            const object = try exactObject(item, &.{ "text", "assistant_prefix", "after_tool_step_count" });
+            const after_tool_step_count = try requireUsize(object, "after_tool_step_count");
+            if (after_tool_step_count > tool_step_count or
+                (index > 0 and after_tool_step_count < prior_tool_step_count))
+            {
+                return error.InvalidSessionFormat;
+            }
+            const text = try parseDurableBytes(
+                alloc,
+                object.get("text") orelse return error.InvalidSessionFormat,
+            );
+            const assistant_prefix = parseOptionalDurableBytes(
+                alloc,
+                object.get("assistant_prefix") orelse return error.InvalidSessionFormat,
+            ) catch |err| {
+                alloc.free(text);
+                return err;
+            };
+            break :blk types.PersistedSteering{
+                .text = text,
+                .assistant_prefix = assistant_prefix,
+                .after_tool_step_count = after_tool_step_count,
+            };
+        };
+        steering[index] = parsed;
+        parsed_count += 1;
+        prior_tool_step_count = parsed.after_tool_step_count;
+    }
+    return steering;
 }
 
 fn parseOptionalTurnSummary(value: std.json.Value) !?types.TurnSummary {
@@ -1751,7 +1841,7 @@ fn parseToolResult(
         1 => .{ .object = try exactObject(value, v1_keys), .extended = false },
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
-        4, 5 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        4, 5, 6, 7 => .{ .object = try exactObject(value, v4_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -2142,7 +2232,7 @@ noinline fn parseOptionalDurableBytes(alloc: Allocator, value: std.json.Value) !
     };
 }
 
-fn parseOptionalIdentifier(value: std.json.Value) !?types.StableBackgroundRecordId {
+fn parseOptionalIdentifier(value: std.json.Value) !?[16]u8 {
     return switch (value) {
         .null => null,
         .string => |hex| try parseHexIdentifier(hex),
@@ -2150,9 +2240,9 @@ fn parseOptionalIdentifier(value: std.json.Value) !?types.StableBackgroundRecord
     };
 }
 
-fn parseHexIdentifier(hex: []const u8) !types.StableBackgroundRecordId {
+fn parseHexIdentifier(hex: []const u8) ![16]u8 {
     if (hex.len != 32) return error.InvalidSessionFormat;
-    var result: types.StableBackgroundRecordId = undefined;
+    var result: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&result, hex) catch return error.InvalidSessionFormat;
     const canonical = std.fmt.bytesToHex(result, .lower);
     if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidSessionFormat;
@@ -2443,4 +2533,1487 @@ fn parseOptionalU32(value: std.json.Value) !?u32 {
     };
     if (number > std.math.maxInt(u32)) return error.InvalidSessionFormat;
     return @intCast(number);
+}
+
+test "durable byte fields use canonical string or padded base64 representation" {
+    const alloc = std.testing.allocator;
+
+    var utf8_out: std.Io.Writer.Allocating = .init(alloc);
+    defer utf8_out.deinit();
+    try writeDurableBytes(&utf8_out.writer, "hello\nworld");
+    try std.testing.expectEqualStrings("\"hello\\nworld\"", utf8_out.written());
+
+    const invalid = [_]u8{ 0xff, 0x00 };
+    var binary_out: std.Io.Writer.Allocating = .init(alloc);
+    defer binary_out.deinit();
+    try writeDurableBytes(&binary_out.writer, &invalid);
+    try std.testing.expectEqualStrings("{\"encoding\":\"base64\",\"data\":\"/wA=\"}", binary_out.written());
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, binary_out.written(), .{});
+    defer parsed.deinit();
+    const decoded = try parseDurableBytes(alloc, parsed.value);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(u8, &invalid, decoded);
+
+    const invalid_values = [_][]const u8{
+        "{\"encoding\":\"base64\",\"data\":\"/wA\"}",
+        "{\"encoding\":\"base64\",\"data\":\"***=\"}",
+        "{\"encoding\":\"base64\",\"data\":\"aGk=\"}",
+        "{\"data\":\"/wA=\",\"encoding\":\"base64\"}",
+        "{\"encoding\":\"base64\",\"data\":\"/wA=\",\"extra\":true}",
+    };
+    for (invalid_values) |json_text| {
+        var bad = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
+        defer bad.deinit();
+        try std.testing.expectError(error.InvalidDurableBytes, parseDurableBytes(alloc, bad.value));
+    }
+}
+
+test "durable state round trips live history while discarding legacy authority" {
+    const alloc = std.testing.allocator;
+    const invalid_a = [_]u8{ 'a', 0xff };
+    const invalid_b = [_]u8{ 0xfe, 'b', 0x00 };
+    const invalid_c = [_]u8{ 'c', 0xf8 };
+    const exact_arguments = " \n{\"number\":1e+02}\t";
+    var images = [_]session.ImageAttachment{.{
+        .id = 7,
+        .path = @constCast(invalid_a[0..]),
+        .media_type = @constCast(invalid_b[0..]),
+        .snapshot_path = @constCast(invalid_c[0..]),
+        .snapshot_sha256 = @constCast(invalid_a[0..]),
+    }};
+    var tool_calls = [_]session.ToolCall{.{
+        .id = invalid_a[0..],
+        .name = invalid_b[0..],
+        .arguments_json = @constCast(exact_arguments),
+        .provider_result = invalid_a[0..],
+    }};
+    var tool_results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast(invalid_a[0..]),
+        .tool_name = @constCast(invalid_b[0..]),
+        .status = .failure,
+        .output = @constCast(invalid_c[0..]),
+        .output_handle = @constCast(invalid_a[0..]),
+        .preview = @constCast(invalid_b[0..]),
+        .output_bytes = 99,
+        .stored_output_bytes = 42,
+        .truncated = true,
+        .provider_native = true,
+        .created_at_ms = 123,
+    }};
+    var tool_steps = [_]session.ToolExecutionStep{.{
+        .assistant = @constCast(invalid_c[0..]),
+        .tool_calls = tool_calls[0..],
+        .tool_results = tool_results[0..],
+    }};
+    var files = [_]session.FileEvidence{.{
+        .path = @constCast(invalid_a[0..]),
+        .new_path = @constCast(invalid_b[0..]),
+        .tool_call_id = @constCast(invalid_c[0..]),
+        .tool_name = @constCast(invalid_a[0..]),
+        .action = .rename,
+        .status = .failure,
+        .model_view_covers_full_file = true,
+        .stale = true,
+    }};
+    var completed_tool_names = [_][]u8{
+        @constCast(invalid_a[0..]),
+        @constCast(invalid_b[0..]),
+    };
+    const history = [_]session.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{
+                .text = @constCast(invalid_a[0..]),
+                .images = images[0..],
+                .work_id = @constCast("work-assistant"),
+            },
+            .assistant = @constCast(invalid_b[0..]),
+            .execution = .{
+                .tool_steps = tool_steps[0..],
+                .files = files[0..],
+            },
+        } },
+        .{ .assistant = .{
+            .user = .{
+                .text = @constCast(invalid_b[0..]),
+                .work_id = @constCast("work-background"),
+            },
+            .assistant = @constCast(invalid_a[0..]),
+            .execution = .{
+                .tool_steps = tool_steps[0..],
+                .files = files[0..],
+            },
+        } },
+        .{ .interrupted = .{
+            .user = .{
+                .text = @constCast(invalid_c[0..]),
+                .work_id = @constCast("work-interrupted"),
+            },
+            .assistant = @constCast(invalid_a[0..]),
+            .tool_call = tool_calls[0],
+            .completed_tool_names = completed_tool_names[0..],
+            .execution = .{
+                .tool_steps = tool_steps[0..],
+                .files = files[0..],
+            },
+        } },
+        .{ .compacted_summary = .{
+            .summary = @constCast(invalid_b[0..]),
+            .removed_turn_count = 3,
+            .compaction_count = 2,
+            .root_user_messages = completed_tool_names[0..],
+        } },
+    };
+    var usage_runtime = session_usage.Usage.initFresh();
+    defer usage_runtime.deinit(alloc);
+    const usage_sequence = try usage_runtime.reserveInvocation();
+    try usage_runtime.finishObservedInvocation(
+        alloc,
+        usage_sequence,
+        25,
+        .observed_generation,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    var usage = try usage_runtime.snapshot(alloc);
+    defer usage.deinit(alloc);
+    const state = DurableSessionState{
+        .id = @constCast("1700000000000-42-session"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 100,
+        .updated_at_ms = 90,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = @constCast("openai/gpt-test"),
+            .effort = types.ReasoningEffort.literal("future-tier"),
+            .fast_mode = true,
+        },
+        .history = @constCast(history[0..]),
+        .context_history_start = 3,
+        .total_input_tokens = 1234,
+        .total_output_tokens = 567,
+        .last_subagent_work_id = @constCast("work-17"),
+        .subagent_child = true,
+        .usage = usage,
+    };
+
+    var first: std.Io.Writer.Allocating = .init(alloc);
+    defer first.deinit();
+    const first_summary = try encodeState(state, &first.writer);
+    try std.testing.expectEqual(@as(u64, first.written().len), first_summary.encoded_bytes);
+    try std.testing.expect(first.written().len > 0);
+    try std.testing.expect(first.written()[first.written().len - 1] != '\n');
+
+    var second: std.Io.Writer.Allocating = .init(alloc);
+    defer second.deinit();
+    _ = try encodeState(state, &second.writer);
+    try std.testing.expectEqualStrings(first.written(), second.written());
+
+    var source = std.Io.Reader.fixed(first.written());
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+    try expectStateEqual(state, decoded);
+}
+
+test "durable state repairs duplicate-key execution and interrupted tool arguments" {
+    const alloc = std.testing.allocator;
+    const duplicate_arguments = "{\"depth\":1,\"depth\":2}";
+
+    var calls = [_]session.ToolCall{.{
+        .id = "call_bad",
+        .name = "read_file",
+        .arguments_json = duplicate_arguments,
+    }};
+    var results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_bad"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("stale success"),
+        .output_bytes = 13,
+        .stored_output_bytes = 13,
+        .truncated = false,
+        .provider_native = false,
+        .created_at_ms = 1,
+    }};
+    var steps = [_]session.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    const history = [_]session.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("inspect") },
+            .assistant = @constCast("failed"),
+            .execution = .{ .tool_steps = steps[0..] },
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("continue") },
+            .tool_call = .{
+                .id = "call_interrupted",
+                .name = "glob_files",
+                .arguments_json = duplicate_arguments,
+            },
+        } },
+    };
+    const state = DurableSessionState{
+        .id = @constCast("session-1"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = @constCast("openai/gpt-test"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = @constCast(history[0..]),
+        .total_input_tokens = 3,
+        .total_output_tokens = 4,
+    };
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+
+    var source = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+
+    const decoded_step = decoded.history[0].assistant.execution.tool_steps[0];
+    try std.testing.expectEqualStrings("{}", decoded_step.tool_calls[0].arguments_json);
+    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, decoded_step.tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(session.PersistedToolStatus.failure, decoded_step.tool_results[0].status);
+    try std.testing.expect(std.mem.find(u8, decoded_step.tool_results[0].output, "tool_execution_failed") != null);
+    try std.testing.expect(std.mem.find(u8, decoded_step.tool_results[0].output, duplicate_arguments) == null);
+
+    const interrupted = decoded.history[1].interrupted.tool_call.?;
+    try std.testing.expectEqualStrings("{}", interrupted.arguments_json);
+    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, interrupted.argument_integrity);
+}
+
+test "current history decode rejects ambiguous malformed tool result pairings" {
+    var duplicate_calls = [_]session.ToolCall{
+        .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
+        .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
+    };
+    var one_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "read_file")};
+    try expectMalformedPairRejected(duplicate_calls[0..], one_result[0..]);
+
+    var missing_call = [_]session.ToolCall{
+        .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
+    };
+    var no_results = [_]session.PersistedToolResult{};
+    try expectMalformedPairRejected(missing_call[0..], no_results[0..]);
+
+    var multiple_call = [_]session.ToolCall{
+        .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
+    };
+    var multiple_results = [_]session.PersistedToolResult{
+        persistedResultForTest("call_bad", "read_file"),
+        persistedResultForTest("call_bad", "read_file"),
+    };
+    try expectMalformedPairRejected(multiple_call[0..], multiple_results[0..]);
+
+    var mismatched_call = [_]session.ToolCall{
+        .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
+    };
+    var mismatched_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "glob_files")};
+    try expectMalformedPairRejected(mismatched_call[0..], mismatched_result[0..]);
+}
+
+test "current history duplicate-key repair preserves allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkCurrentToolArgumentRepairAllocationFailures,
+        .{},
+    );
+}
+
+test "legacy durable state defaults context history start to zero" {
+    const alloc = std.testing.allocator;
+    const legacy =
+        "{\"id\":\"legacy\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\"," ++
+        "\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\"," ++
+        "\"preferences\":{\"model\":\"model\",\"effort\":\"auto\",\"fast_mode\":false}," ++
+        "\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";
+    var source = std.Io.Reader.fixed(legacy);
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), decoded.context_history_start);
+
+    const invalid =
+        "{\"id\":\"invalid\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\"," ++
+        "\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\"," ++
+        "\"preferences\":{\"model\":\"model\",\"effort\":\"auto\",\"fast_mode\":false}," ++
+        "\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0,\"context_history_start\":1}";
+    var invalid_source = std.Io.Reader.fixed(invalid);
+    try std.testing.expectError(
+        error.InvalidDurableField,
+        decodeState(alloc, &invalid_source, .{}),
+    );
+}
+
+test "per-turn work provenance is strict and ordinary state omits it" {
+    const alloc = std.testing.allocator;
+    const ordinary =
+        "{\"id\":\"session\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[{\"kind\":\"assistant\",\"user\":{\"text\":\"hello\",\"images\":[]},\"assistant\":\"world\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}],\"total_input_tokens\":0,\"total_output_tokens\":0}";
+    var ordinary_source = std.Io.Reader.fixed(ordinary);
+    var state = try decodeState(alloc, &ordinary_source, .{});
+    defer state.deinit(alloc);
+    try std.testing.expect(state.history[0].assistant.user.work_id == null);
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "work_id") == null);
+
+    const invalid = [_][]const u8{
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"hello\",\"images\":[],\"work_id\":\"\"},\"assistant\":\"world\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"hello\",\"images\":[],\"work_id\":null},\"assistant\":\"world\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"hello\",\"images\":[],\"work_id\":\"bad\\u0000id\"},\"assistant\":\"world\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}",
+    };
+    for (invalid) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidSessionFormat,
+            parseHistoryTurn(alloc, parsed.value),
+        );
+    }
+
+    var too_long: [session.max_work_id_bytes + 1]u8 = undefined;
+    @memset(&too_long, 'x');
+    state.history[0].assistant.user.work_id = &too_long;
+    try std.testing.expectError(error.InvalidDurableField, validateState(state));
+    state.history[0].assistant.user.work_id = null;
+}
+
+test "durable session IDs accept safe opaque basenames" {
+    const valid_ids = [_][]const u8{
+        "session.v3",
+        ".hidden-session",
+        "session..branch",
+    };
+    for (valid_ids) |id| try validateSessionId(id);
+
+    var max_id: [255]u8 = undefined;
+    @memset(&max_id, 'a');
+    try validateSessionId(&max_id);
+
+    const state = DurableSessionState{
+        .id = max_id[0..],
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = @constCast("model"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+
+    var source = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(std.testing.allocator, &source, .{});
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &max_id, decoded.id);
+}
+
+test "durable session IDs reject unsafe basenames" {
+    const invalid_ids = [_][]const u8{
+        "",
+        ".",
+        "..",
+        "path/session",
+        "path\\session",
+        "session:name",
+        "session name",
+    };
+    for (invalid_ids) |id| {
+        try std.testing.expectError(error.InvalidDurableField, validateSessionId(id));
+    }
+
+    const unsupported = [_]u8{ 0xff, 'a' };
+    try std.testing.expectError(error.InvalidDurableField, validateSessionId(&unsupported));
+
+    var too_long: [256]u8 = undefined;
+    @memset(&too_long, 'a');
+    try std.testing.expectError(error.InvalidDurableField, validateSessionId(&too_long));
+}
+
+test "durable state rejects invalid metadata fields before returning" {
+    const alloc = std.testing.allocator;
+    const invalid_documents = [_][]const u8{
+        "{\"id\":\"../bad\",\"origin_workspace_root\":\"/tmp/a\",\"workspace_root\":\"/tmp/a\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"m\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}",
+        "{\"id\":\"good\",\"origin_workspace_root\":\"relative\",\"workspace_root\":\"/tmp/a\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"m\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}",
+        "{\"id\":\"good\",\"origin_workspace_root\":\"/tmp/a\",\"workspace_root\":\"/tmp/a\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\" en \",\"preferences\":{\"model\":\"m\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}",
+        "{\"id\":\"good\",\"origin_workspace_root\":\"/tmp/a\",\"workspace_root\":\"/tmp/a\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"m\",\"effort\":\"not valid\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}",
+        "{\"id\":\"good\",\"origin_workspace_root\":\"/tmp/a\",\"workspace_root\":\"/tmp/a\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\" m\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}",
+    };
+
+    for (invalid_documents) |document| {
+        var source = std.Io.Reader.fixed(document);
+        try std.testing.expectError(error.InvalidDurableField, decodeState(alloc, &source, .{}));
+    }
+}
+
+test "execution memory codec preserves feedback and reads v1 results without it" {
+    const alloc = std.testing.allocator;
+    var feedback = [_][]u8{@constCast("read it after writing")};
+    const presentation_lines = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .addition, .new_line = 1, .text = "persisted line" },
+        .{ .kind = .notice, .text = "… 118 lines omitted" },
+    };
+    var calls = [_]session.ToolCall{.{
+        .id = @constCast("call_feedback"),
+        .name = @constCast("write_file"),
+        .arguments_json = @constCast("{\"path\":\"note.txt\"}"),
+    }};
+    var results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_feedback"),
+        .tool_name = @constCast("write_file"),
+        .status = .success,
+        .output = @constCast("wrote note.txt"),
+        .output_bytes = 15,
+        .stored_output_bytes = 15,
+        .permission_feedback = feedback[0..],
+        .committed_file_presentation = .{
+            .path = "note.txt",
+            .kind = .added,
+            .lines = presentation_lines[0..],
+            .additions = 120,
+            .deletions = 0,
+            .truncated = true,
+            .after_content = "persisted line\n",
+            .lifecycle_id = .{
+                .turn_id = 9,
+                .call_id = "call_feedback",
+            },
+        },
+        .command_output_replay = .{ .available = .{
+            .handle = "fx-command-replay-private.bin",
+            .framed_bytes = 321,
+        } },
+        .command_process_presentation = .{ .exit_code = 7 },
+    }};
+    var steps = [_]session.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast("focus on persistence"),
+        .assistant_prefix = @constCast("partial assistant"),
+        .after_tool_step_count = 1,
+    }};
+    const turn: session.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("write a note") },
+        .assistant = @constCast("done"),
+        .execution = .{
+            .tool_steps = steps[0..],
+            .steering = steering[0..],
+            .turn_summary = .{
+                .started_at_ms = 100,
+                .completed_at_ms = 250,
+                .thinking_duration_ms = 40,
+                .turn_duration_ms = 150,
+                .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+            },
+        },
+    } };
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeHistoryTurn(&encoded.writer, turn);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":7") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"text\":\"focus on persistence\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"assistant_prefix\":\"partial assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"after_tool_step_count\":1") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"permission_feedback\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"committed_file_presentation\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"command_output_replay\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "fx-command-replay-private.bin") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    const decoded = try parseHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, decoded);
+    const decoded_result = decoded.assistant.execution.tool_steps[0].tool_results[0];
+    try std.testing.expectEqual(
+        turn.assistant.execution.turn_summary,
+        decoded.assistant.execution.turn_summary,
+    );
+    try std.testing.expectEqual(@as(usize, 1), decoded.assistant.execution.steering.len);
+    try std.testing.expectEqualStrings(
+        "focus on persistence",
+        decoded.assistant.execution.steering[0].text,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        decoded.assistant.execution.steering[0].after_tool_step_count,
+    );
+    try std.testing.expectEqualStrings(
+        "partial assistant",
+        decoded.assistant.execution.steering[0].assistant_prefix.?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), decoded_result.permission_feedback.len);
+    try std.testing.expectEqualStrings("read it after writing", decoded_result.permission_feedback[0]);
+    const presentation = decoded_result.committed_file_presentation orelse return error.TestExpectedPresentation;
+    try std.testing.expectEqualStrings("note.txt", presentation.path);
+    try std.testing.expectEqual(types.CommittedFilePresentationKind.added, presentation.kind);
+    try std.testing.expectEqual(@as(usize, 2), presentation.lines.len);
+    try std.testing.expectEqual(types.CommittedFilePresentationLineKind.notice, presentation.lines[1].kind);
+    try std.testing.expectEqualStrings("… 118 lines omitted", presentation.lines[1].text);
+    try std.testing.expectEqual(@as(usize, 120), presentation.additions);
+    try std.testing.expectEqualStrings("persisted line\n", presentation.after_content.?);
+    try std.testing.expectEqual(@as(u64, 9), presentation.lifecycle_id.?.turn_id);
+    try std.testing.expectEqualStrings("call_feedback", presentation.lifecycle_id.?.call_id);
+    const replay = decoded_result.command_output_replay orelse return error.TestExpectedReplay;
+    const descriptor = switch (replay) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    try std.testing.expectEqualStrings("fx-command-replay-private.bin", descriptor.handle);
+    try std.testing.expectEqual(@as(usize, 321), descriptor.framed_bytes);
+    try std.testing.expectEqual(
+        types.CommandProcessPresentation{ .exit_code = 7 },
+        decoded_result.command_process_presentation.?,
+    );
+
+    const v1 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"write a note\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":1,\"tool_steps\":[{\"assistant\":null,\"tool_calls\":[{\"id\":\"call_feedback\",\"name\":\"write_file\",\"arguments_json\":\"{\\\"path\\\":\\\"note.txt\\\"}\",\"provider_result\":null}],\"tool_results\":[{\"tool_call_id\":\"call_feedback\",\"tool_name\":\"write_file\",\"status\":\"success\",\"output\":\"wrote note.txt\",\"output_handle\":null,\"preview\":null,\"output_bytes\":15,\"stored_output_bytes\":15,\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}]}],\"files\":[]}}";
+    var v1_parsed = try std.json.parseFromSlice(std.json.Value, alloc, v1, .{});
+    defer v1_parsed.deinit();
+    const v1_decoded = try parseHistoryTurn(alloc, v1_parsed.value);
+    defer session.freeHistoryTurn(alloc, v1_decoded);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        v1_decoded.assistant.execution.tool_steps[0].tool_results[0].permission_feedback.len,
+    );
+    try std.testing.expect(v1_decoded.assistant.execution.tool_steps[0].tool_results[0].command_output_replay == null);
+    try std.testing.expect(v1_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
+
+    const v2 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"write a note\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":2,\"tool_steps\":[{\"assistant\":null,\"tool_calls\":[{\"id\":\"call_feedback\",\"name\":\"write_file\",\"arguments_json\":\"{\\\"path\\\":\\\"note.txt\\\"}\",\"provider_result\":null}],\"tool_results\":[{\"tool_call_id\":\"call_feedback\",\"tool_name\":\"write_file\",\"status\":\"success\",\"output\":\"wrote note.txt\",\"output_handle\":null,\"preview\":null,\"output_bytes\":15,\"stored_output_bytes\":15,\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1,\"permission_feedback\":[]}]}],\"files\":[]}}";
+    var v2_parsed = try std.json.parseFromSlice(std.json.Value, alloc, v2, .{});
+    defer v2_parsed.deinit();
+    const v2_decoded = try parseHistoryTurn(alloc, v2_parsed.value);
+    defer session.freeHistoryTurn(alloc, v2_decoded);
+    try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation == null);
+    try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_output_replay == null);
+    try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
+
+    const v5 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":5,\"tool_steps\":[],\"files\":[],\"turn_summary\":null}}";
+    var v5_parsed = try std.json.parseFromSlice(std.json.Value, alloc, v5, .{});
+    defer v5_parsed.deinit();
+    const v5_decoded = try parseHistoryTurn(alloc, v5_parsed.value);
+    defer session.freeHistoryTurn(alloc, v5_decoded);
+    try std.testing.expectEqual(@as(usize, 0), v5_decoded.assistant.execution.steering.len);
+
+    const v6 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":6,\"tool_steps\":[],\"files\":[],\"steering\":[\"legacy steer\"],\"turn_summary\":null}}";
+    var v6_parsed = try std.json.parseFromSlice(std.json.Value, alloc, v6, .{});
+    defer v6_parsed.deinit();
+    const v6_decoded = try parseHistoryTurn(alloc, v6_parsed.value);
+    defer session.freeHistoryTurn(alloc, v6_decoded);
+    try std.testing.expectEqualStrings("legacy steer", v6_decoded.assistant.execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), v6_decoded.assistant.execution.steering[0].after_tool_step_count);
+
+    const invalid_v7 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":7,\"tool_steps\":[],\"files\":[],\"steering\":[{\"text\":\"invalid\",\"assistant_prefix\":null,\"after_tool_step_count\":1}],\"turn_summary\":null}}";
+    var invalid_v7_parsed = try std.json.parseFromSlice(std.json.Value, alloc, invalid_v7, .{});
+    defer invalid_v7_parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseHistoryTurn(alloc, invalid_v7_parsed.value),
+    );
+}
+
+fn checkV7SteeringAllocationFailures(alloc: Allocator) !void {
+    const json =
+        "[{\"text\":\"first\",\"assistant_prefix\":\"prefix one\",\"after_tool_step_count\":0}," ++
+        "{\"text\":\"second\",\"assistant_prefix\":\"prefix two\",\"after_tool_step_count\":1}]";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const steering = try parsePersistedSteering(alloc, parsed.value, 7, 1);
+    defer types.freePersistedSteering(alloc, steering);
+    try std.testing.expectEqual(@as(usize, 2), steering.len);
+}
+
+test "v7 steering cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkV7SteeringAllocationFailures,
+        .{},
+    );
+}
+
+test "private codec preserves summary-only interrupted turns" {
+    const alloc = std.testing.allocator;
+    const summary = types.TurnSummary{
+        .started_at_ms = 100,
+        .completed_at_ms = 250,
+        .thinking_duration_ms = 40,
+        .turn_duration_ms = 150,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    };
+
+    const turns = [_]session.HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("inspect repository") },
+        .execution = .{ .turn_summary = summary },
+    } }};
+
+    for (turns) |turn| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseHistoryTurn(alloc, parsed.value);
+        defer session.freeHistoryTurn(alloc, decoded);
+        try std.testing.expectEqual(summary, types.historyTurnSummary(decoded).?);
+    }
+}
+
+test "command process presentation codec preserves every terminal cause" {
+    const alloc = std.testing.allocator;
+    const cases = [_]types.CommandProcessPresentation{
+        .{ .exit_code = 7 },
+        .{ .signal = 9 },
+        .timed_out,
+        .output_capture_failed,
+    };
+    for (cases) |case| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeOptionalCommandProcessPresentation(&encoded.writer, case);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(
+            case,
+            (try parseOptionalCommandProcessPresentation(parsed.value)).?,
+        );
+    }
+}
+
+test "terminal action presentation codec preserves return and failure causes" {
+    const alloc = std.testing.allocator;
+    const cases = [_]types.TerminalActionPresentation{
+        .{ .returned = .started },
+        .{ .returned = .condition_met },
+        .{ .returned = .safety_ceiling },
+        .{ .returned = .cancelled },
+        .{ .returned = .{ .exited = 7 } },
+        .{ .returned = .{ .signal = 9 } },
+        .{ .failed = .session_not_found },
+        .{ .failed = .capacity_exceeded },
+    };
+    for (cases) |case| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeOptionalTerminalActionPresentation(&encoded.writer, case);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(
+            case,
+            (try parseOptionalTerminalActionPresentation(parsed.value)).?,
+        );
+    }
+}
+
+test "durable history rejects unknown fields instead of silently dropping bytes" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"kind\":\"compacted_summary\",\"summary\":\"kept\",\"removed_turn_count\":1,\"compaction_count\":1,\"future_bytes\":\"lost\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseHistoryTurn(alloc, parsed.value),
+    );
+}
+
+test "legacy compacted authority absence remains incomplete across durable reload" {
+    const alloc = std.testing.allocator;
+    var legacy_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"kind\":\"compacted_summary\",\"summary\":\"legacy\",\"removed_turn_count\":2,\"compaction_count\":1}",
+        .{},
+    );
+    defer legacy_parsed.deinit();
+    const legacy = try parseHistoryTurn(alloc, legacy_parsed.value);
+    defer session.freeHistoryTurn(alloc, legacy);
+    try std.testing.expect(!legacy.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!legacy.compacted_summary.permission_feedback_complete);
+
+    var known_messages = [_][]u8{@constCast("newer exact request")};
+    const incomplete: session.HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("legacy plus newer context"),
+        .removed_turn_count = 3,
+        .compaction_count = 2,
+        .root_user_messages = &known_messages,
+        .root_user_messages_complete = false,
+        .permission_feedback = &known_messages,
+        .permission_feedback_complete = false,
+    } };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeHistoryTurn(&encoded.writer, incomplete);
+    var reloaded_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        encoded.written(),
+        .{},
+    );
+    defer reloaded_parsed.deinit();
+    const reloaded = try parseHistoryTurn(alloc, reloaded_parsed.value);
+    defer session.freeHistoryTurn(alloc, reloaded);
+    try std.testing.expect(!reloaded.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!reloaded.compacted_summary.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), reloaded.compacted_summary.root_user_messages.len);
+
+    var first_generation_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"kind\":\"compacted_summary\",\"summary\":\"first generation\",\"removed_turn_count\":2,\"compaction_count\":1,\"root_user_messages\":[\"original request\"]}",
+        .{},
+    );
+    defer first_generation_parsed.deinit();
+    const first_generation = try parseHistoryTurn(alloc, first_generation_parsed.value);
+    defer session.freeHistoryTurn(alloc, first_generation);
+    try std.testing.expect(first_generation.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!first_generation.compacted_summary.permission_feedback_complete);
+    try std.testing.expectEqualStrings(
+        "original request",
+        first_generation.compacted_summary.root_user_messages[0],
+    );
+}
+
+fn persistedResultForTest(call_id: []const u8, tool_name: []const u8) session.PersistedToolResult {
+    return .{
+        .tool_call_id = @constCast(call_id),
+        .tool_name = @constCast(tool_name),
+        .status = .success,
+        .output = @constCast("stale"),
+        .output_bytes = 5,
+        .stored_output_bytes = 5,
+        .truncated = false,
+        .provider_native = false,
+        .created_at_ms = 1,
+    };
+}
+
+fn expectMalformedPairRejected(
+    calls: []session.ToolCall,
+    results: []session.PersistedToolResult,
+) !void {
+    var steps = [_]session.ToolExecutionStep{.{
+        .tool_calls = calls,
+        .tool_results = results,
+    }};
+    const turn: session.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("inspect") },
+        .assistant = @constCast("failed"),
+        .execution = .{ .tool_steps = steps[0..] },
+    } };
+
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    try writeHistoryTurn(&encoded.writer, turn);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseHistoryTurn(std.testing.allocator, parsed.value),
+    );
+}
+
+fn checkCurrentToolArgumentRepairAllocationFailures(alloc: Allocator) !void {
+    var feedback = [_][]u8{@constCast("read the repaired file")};
+    var calls = [_]session.ToolCall{.{
+        .id = @constCast("call_bad"),
+        .name = @constCast("read_file"),
+        .arguments_json = @constCast("{\"depth\":1,\"depth\":2}"),
+    }};
+    var results = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "read_file")};
+    results[0].permission_feedback = feedback[0..];
+    var steps = [_]session.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    const turn: session.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("inspect") },
+        .assistant = @constCast("failed"),
+        .execution = .{ .tool_steps = steps[0..] },
+    } };
+
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    try writeHistoryTurn(&encoded.writer, turn);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        encoded.written(),
+        .{},
+    );
+    defer parsed.deinit();
+
+    const decoded = try parseHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, decoded);
+    const step = decoded.assistant.execution.tool_steps[0];
+    try std.testing.expectEqualStrings("{}", step.tool_calls[0].arguments_json);
+    try std.testing.expectEqual(session.PersistedToolStatus.failure, step.tool_results[0].status);
+    try std.testing.expectEqual(@as(usize, 1), step.tool_results[0].permission_feedback.len);
+}
+
+test "durable specialized history accepts only legacy or complete extended shapes" {
+    const alloc = std.testing.allocator;
+    const empty_execution = "{\"schema_version\":1,\"tool_steps\":[],\"files\":[]}";
+    const cases = [_]struct {
+        json: []const u8,
+        expected: enum { background_legacy, background_extended, interrupted_legacy, interrupted_extended },
+    }{
+        .{
+            .json = "{\"kind\":\"background_command\",\"user\":{\"text\":\"run\",\"images\":[]},\"log_path\":\"/tmp/log\",\"expect_url\":false,\"url\":null,\"background_record_id\":null}",
+            .expected = .background_legacy,
+        },
+        .{
+            .json = "{\"kind\":\"background_command\",\"user\":{\"text\":\"run\",\"images\":[]},\"log_path\":\"/tmp/log\",\"expect_url\":false,\"url\":null,\"background_record_id\":null,\"assistant\":\"candidate\",\"execution\":" ++ empty_execution ++ "}",
+            .expected = .background_extended,
+        },
+        .{
+            .json = "{\"kind\":\"interrupted\",\"user\":{\"text\":\"stop\",\"images\":[]},\"assistant\":null,\"tool_call\":null,\"completed_tool_names\":[]}",
+            .expected = .interrupted_legacy,
+        },
+        .{
+            .json = "{\"kind\":\"interrupted\",\"user\":{\"text\":\"stop\",\"images\":[]},\"assistant\":\"candidate\",\"tool_call\":null,\"completed_tool_names\":[],\"execution\":" ++ empty_execution ++ "}",
+            .expected = .interrupted_extended,
+        },
+    };
+
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        const turn = try parseHistoryTurn(alloc, parsed.value);
+        defer session.freeHistoryTurn(alloc, turn);
+        switch (case.expected) {
+            .background_legacy => {
+                try std.testing.expect(turn == .assistant);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "no longer owns") != null);
+                try std.testing.expect(turn.assistant.execution.isEmpty());
+            },
+            .background_extended => {
+                try std.testing.expect(turn == .assistant);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "candidate") != null);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "no longer owns") != null);
+                try std.testing.expect(turn.assistant.execution.isEmpty());
+            },
+            .interrupted_legacy => try std.testing.expect(turn.interrupted.execution.isEmpty()),
+            .interrupted_extended => {
+                try std.testing.expectEqualStrings("candidate", turn.interrupted.assistant.?);
+                try std.testing.expect(turn.interrupted.execution.isEmpty());
+            },
+        }
+    }
+
+    const invalid = [_][]const u8{
+        "{\"kind\":\"background_command\",\"user\":{\"text\":\"run\",\"images\":[]},\"log_path\":\"/tmp/log\",\"expect_url\":false,\"url\":null,\"background_record_id\":null,\"assistant\":\"partial\"}",
+        "{\"kind\":\"background_command\",\"user\":{\"text\":\"run\",\"images\":[]},\"log_path\":\"/tmp/log\",\"expect_url\":false,\"url\":null,\"background_record_id\":null,\"assistant\":\"candidate\",\"execution\":" ++ empty_execution ++ ",\"future\":true}",
+        "{\"kind\":\"interrupted\",\"user\":{\"text\":\"stop\",\"images\":[]},\"assistant\":null,\"tool_call\":null,\"completed_tool_names\":[],\"future\":true}",
+    };
+    for (invalid) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurn(alloc, parsed.value));
+    }
+
+    const migrated = session.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("run") },
+        .assistant = @constCast("historical command"),
+    } };
+    var legacy_encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer legacy_encoded.deinit();
+    try writeHistoryTurn(&legacy_encoded.writer, migrated);
+    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"kind\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "background_command") == null);
+}
+
+test "interrupted command presentation is strict and round trips" {
+    const alloc = std.testing.allocator;
+    const turn: session.HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = @constCast("stop") },
+        .tool_call = .{
+            .id = "call-command",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"slow\"}",
+        },
+        .cancelled_command = .{
+            .output_replay = .{ .available = .{
+                .handle = "fx-command-replay.bin",
+                .framed_bytes = 42,
+            } },
+            .command_artifact_handle = "fx-command.log",
+        },
+    } };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeHistoryTurn(&encoded.writer, turn);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    const decoded = try parseHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, decoded);
+    const presentation = decoded.interrupted.cancelled_command.?;
+    const descriptor = switch (presentation.output_replay.?) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    try std.testing.expectEqualStrings("fx-command-replay.bin", descriptor.handle);
+    try std.testing.expectEqual(@as(usize, 42), descriptor.framed_bytes);
+    try std.testing.expectEqualStrings("fx-command.log", presentation.command_artifact_handle.?);
+    try std.testing.expectEqual(types.InterruptedTerminalReason.cancelled, decoded.interrupted.terminal_reason);
+
+    const failed_turn: session.HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = @constCast("stream") },
+        .assistant = @constCast("partial"),
+        .terminal_reason = .failed,
+    } };
+    var failed_encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer failed_encoded.deinit();
+    try writeHistoryTurn(&failed_encoded.writer, failed_turn);
+    try std.testing.expect(std.mem.find(u8, failed_encoded.written(), "\"terminal_reason\":\"failed\"") != null);
+    var failed_parsed = try std.json.parseFromSlice(std.json.Value, alloc, failed_encoded.written(), .{});
+    defer failed_parsed.deinit();
+    const failed_decoded = try parseHistoryTurn(alloc, failed_parsed.value);
+    defer session.freeHistoryTurn(alloc, failed_decoded);
+    try std.testing.expectEqual(types.InterruptedTerminalReason.failed, failed_decoded.interrupted.terminal_reason);
+
+    const zero_output =
+        "{\"kind\":\"interrupted\",\"user\":{\"text\":\"stop\",\"images\":[]}," ++
+        "\"assistant\":null,\"tool_call\":{\"id\":\"call\",\"name\":\"run_command\"," ++
+        "\"arguments_json\":\"{}\",\"provider_result\":null},\"completed_tool_names\":[]," ++
+        "\"cancelled_command\":{\"output_replay\":null,\"command_artifact_handle\":null}}";
+    var zero_parsed = try std.json.parseFromSlice(std.json.Value, alloc, zero_output, .{});
+    defer zero_parsed.deinit();
+    const zero_turn = try parseHistoryTurn(alloc, zero_parsed.value);
+    defer session.freeHistoryTurn(alloc, zero_turn);
+    try std.testing.expect(zero_turn.interrupted.cancelled_command != null);
+    try std.testing.expectEqual(types.InterruptedTerminalReason.cancelled, zero_turn.interrupted.terminal_reason);
+
+    const invalid = [_][]const u8{
+        "{\"kind\":\"interrupted\",\"user\":{\"text\":\"stop\",\"images\":[]},\"assistant\":null,\"tool_call\":null,\"completed_tool_names\":[],\"cancelled_command\":{\"output_replay\":null,\"command_artifact_handle\":null}}",
+        "{\"kind\":\"interrupted\",\"user\":{\"text\":\"stop\",\"images\":[]},\"assistant\":null,\"tool_call\":{\"id\":\"call\",\"name\":\"read_file\",\"arguments_json\":\"{}\",\"provider_result\":null},\"completed_tool_names\":[],\"cancelled_command\":{\"output_replay\":null,\"command_artifact_handle\":null}}",
+        "{\"kind\":\"interrupted\",\"user\":{\"text\":\"stop\",\"images\":[]},\"assistant\":null,\"tool_call\":{\"id\":\"call\",\"name\":\"run_command\",\"arguments_json\":\"{}\",\"provider_result\":null},\"completed_tool_names\":[],\"cancelled_command\":{\"output_replay\":null,\"command_artifact_handle\":null,\"future\":true}}",
+        "{\"kind\":\"interrupted\",\"user\":{\"text\":\"stop\",\"images\":[]},\"assistant\":null,\"tool_call\":{\"id\":\"call\",\"name\":\"run_command\",\"arguments_json\":\"{}\",\"provider_result\":null},\"completed_tool_names\":[],\"terminal_reason\":\"failed\",\"cancelled_command\":{\"output_replay\":null,\"command_artifact_handle\":null}}",
+        "{\"kind\":\"interrupted\",\"user\":{\"text\":\"stop\",\"images\":[]},\"assistant\":null,\"tool_call\":null,\"completed_tool_names\":[],\"terminal_reason\":\"future\"}",
+    };
+    for (invalid) |json| {
+        var invalid_parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer invalid_parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidSessionFormat,
+            parseHistoryTurn(alloc, invalid_parsed.value),
+        );
+    }
+}
+
+fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) !void {
+    try std.testing.expectEqualStrings(expected.id, actual.id);
+    try std.testing.expectEqualStrings(expected.origin_workspace_root, actual.origin_workspace_root);
+    try std.testing.expectEqualStrings(expected.workspace_root, actual.workspace_root);
+    try std.testing.expectEqual(expected.created_at_ms, actual.created_at_ms);
+    try std.testing.expectEqual(expected.updated_at_ms, actual.updated_at_ms);
+    try std.testing.expectEqualStrings(expected.conversation_language.view(), actual.conversation_language.view());
+    try std.testing.expectEqualStrings(expected.preferences.model, actual.preferences.model);
+    try std.testing.expectEqual(expected.preferences.provider, actual.preferences.provider);
+    try std.testing.expectEqual(expected.preferences.effort, actual.preferences.effort);
+    try std.testing.expectEqual(expected.preferences.fast_mode, actual.preferences.fast_mode);
+    try std.testing.expectEqual(expected.context_history_start, actual.context_history_start);
+    try std.testing.expectEqual(expected.total_input_tokens, actual.total_input_tokens);
+    try std.testing.expectEqual(expected.total_output_tokens, actual.total_output_tokens);
+    try std.testing.expectEqual(expected.subagent_child, actual.subagent_child);
+    try expectPermissionStateEqual(expected.permission_state, actual.permission_state);
+    try std.testing.expectEqual(expected.last_subagent_work_id != null, actual.last_subagent_work_id != null);
+    if (expected.last_subagent_work_id) |work_id| {
+        try std.testing.expectEqualStrings(work_id, actual.last_subagent_work_id.?);
+    }
+    try std.testing.expectEqual(expected.usage != null, actual.usage != null);
+    if (expected.usage) |expected_usage| {
+        var expected_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer expected_json.deinit();
+        try session_usage.writeSnapshot(&expected_json.writer, expected_usage);
+        var actual_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer actual_json.deinit();
+        try session_usage.writeSnapshot(&actual_json.writer, actual.usage.?);
+        try std.testing.expectEqualStrings(expected_json.written(), actual_json.written());
+    }
+    try std.testing.expectEqual(expected.history.len, actual.history.len);
+    for (expected.history, actual.history) |expected_turn, actual_turn| {
+        try expectHistoryTurnEqual(expected_turn, actual_turn);
+    }
+}
+
+fn expectPermissionStateEqual(
+    expected: session_permission_state.State,
+    actual: session_permission_state.State,
+) !void {
+    try std.testing.expectEqual(expected.version, actual.version);
+    try std.testing.expectEqual(expected.next_generation, actual.next_generation);
+    try std.testing.expectEqual(expected.rules.items.len, actual.rules.items.len);
+    for (expected.rules.items, actual.rules.items) |expected_rule, actual_rule| {
+        try std.testing.expectEqual(expected_rule.id, actual_rule.id);
+        try std.testing.expectEqual(expected_rule.key.kind, actual_rule.key.kind);
+        try std.testing.expectEqualSlices(u8, &expected_rule.key.digest, &actual_rule.key.digest);
+        try std.testing.expectEqualSlices(u8, expected_rule.key.canonical, actual_rule.key.canonical);
+        try std.testing.expectEqualStrings(expected_rule.display_identity, actual_rule.display_identity);
+        try std.testing.expectEqual(expected_rule.decision, actual_rule.decision);
+        try std.testing.expectEqual(expected_rule.generation, actual_rule.generation);
+    }
+}
+
+fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.HistoryTurn) !void {
+    try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .compacted_summary => |entry| {
+            try std.testing.expectEqualSlices(u8, entry.summary, actual.compacted_summary.summary);
+            try std.testing.expectEqual(entry.removed_turn_count, actual.compacted_summary.removed_turn_count);
+            try std.testing.expectEqual(entry.compaction_count, actual.compacted_summary.compaction_count);
+            try std.testing.expect(!actual.compacted_summary.root_user_messages_complete);
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                actual.compacted_summary.root_user_messages.len,
+            );
+            try std.testing.expect(!actual.compacted_summary.permission_feedback_complete);
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                actual.compacted_summary.permission_feedback.len,
+            );
+        },
+        .assistant => |entry| {
+            const got = actual.assistant;
+            try expectUserTurnEqual(entry.user, got.user);
+            try std.testing.expectEqualSlices(u8, entry.assistant, got.assistant);
+            try expectExecutionMemoryEqual(entry.execution, got.execution);
+        },
+        .interrupted => |entry| {
+            const got = actual.interrupted;
+            try expectUserTurnEqual(entry.user, got.user);
+            try expectOptionalBytesEqual(entry.assistant, got.assistant);
+            try std.testing.expectEqual(entry.tool_call != null, got.tool_call != null);
+            if (entry.tool_call) |call| try expectToolCallEqual(call, got.tool_call.?);
+            try std.testing.expectEqual(entry.completed_tool_names.len, got.completed_tool_names.len);
+            for (entry.completed_tool_names, got.completed_tool_names) |name, got_name| {
+                try std.testing.expectEqualSlices(u8, name, got_name);
+            }
+            try expectExecutionMemoryEqual(entry.execution, got.execution);
+            try std.testing.expectEqualDeep(entry.cancelled_command, got.cancelled_command);
+            try std.testing.expectEqual(entry.terminal_reason, got.terminal_reason);
+        },
+    }
+}
+
+fn expectExecutionMemoryEqual(expected: session.ExecutionMemory, actual: session.ExecutionMemory) !void {
+    try std.testing.expectEqual(expected.turn_summary, actual.turn_summary);
+    try std.testing.expectEqual(expected.steering.len, actual.steering.len);
+    for (expected.steering, actual.steering) |steering, got_steering| {
+        try std.testing.expectEqualSlices(u8, steering.text, got_steering.text);
+        try expectOptionalBytesEqual(steering.assistant_prefix, got_steering.assistant_prefix);
+        try std.testing.expectEqual(steering.after_tool_step_count, got_steering.after_tool_step_count);
+    }
+    try std.testing.expectEqual(expected.tool_steps.len, actual.tool_steps.len);
+    for (expected.tool_steps, actual.tool_steps) |step, got_step| {
+        try expectOptionalBytesEqual(step.assistant, got_step.assistant);
+        try std.testing.expectEqual(step.tool_calls.len, got_step.tool_calls.len);
+        for (step.tool_calls, got_step.tool_calls) |call, got_call| try expectToolCallEqual(call, got_call);
+        try std.testing.expectEqual(step.tool_results.len, got_step.tool_results.len);
+        for (step.tool_results, got_step.tool_results) |result, got_result| {
+            try std.testing.expectEqualSlices(u8, result.tool_call_id, got_result.tool_call_id);
+            try std.testing.expectEqualSlices(u8, result.tool_name, got_result.tool_name);
+            try std.testing.expectEqual(result.status, got_result.status);
+            try std.testing.expectEqualSlices(u8, result.output, got_result.output);
+            try expectOptionalBytesEqual(result.output_handle, got_result.output_handle);
+            try expectOptionalBytesEqual(result.preview, got_result.preview);
+            try std.testing.expectEqual(result.output_bytes, got_result.output_bytes);
+            try std.testing.expectEqual(result.stored_output_bytes, got_result.stored_output_bytes);
+            try std.testing.expectEqual(result.truncated, got_result.truncated);
+            try std.testing.expectEqual(result.provider_native, got_result.provider_native);
+            try std.testing.expectEqual(result.created_at_ms, got_result.created_at_ms);
+        }
+    }
+    try std.testing.expectEqual(expected.files.len, actual.files.len);
+    for (expected.files, actual.files) |file, got_file| {
+        try std.testing.expectEqualSlices(u8, file.path, got_file.path);
+        try expectOptionalBytesEqual(file.new_path, got_file.new_path);
+        try std.testing.expectEqualSlices(u8, file.tool_call_id, got_file.tool_call_id);
+        try std.testing.expectEqualSlices(u8, file.tool_name, got_file.tool_name);
+        try std.testing.expectEqual(file.action, got_file.action);
+        try std.testing.expectEqual(file.status, got_file.status);
+        try std.testing.expectEqual(file.model_view_covers_full_file, got_file.model_view_covers_full_file);
+        try std.testing.expectEqual(file.stale, got_file.stale);
+    }
+}
+
+fn expectUserTurnEqual(expected: session.UserTurn, actual: session.UserTurn) !void {
+    try std.testing.expectEqualSlices(u8, expected.text, actual.text);
+    try expectOptionalBytesEqual(expected.work_id, actual.work_id);
+    try std.testing.expectEqual(expected.images.len, actual.images.len);
+    for (expected.images, actual.images) |image, got| {
+        try std.testing.expectEqual(image.id, got.id);
+        try std.testing.expectEqualSlices(u8, image.path, got.path);
+        try std.testing.expectEqualSlices(u8, image.media_type, got.media_type);
+        try expectOptionalBytesEqual(image.snapshot_path, got.snapshot_path);
+        try expectOptionalBytesEqual(image.snapshot_sha256, got.snapshot_sha256);
+    }
+}
+
+fn expectToolCallEqual(expected: session.ToolCall, actual: session.ToolCall) !void {
+    try std.testing.expectEqualSlices(u8, expected.id, actual.id);
+    try std.testing.expectEqualSlices(u8, expected.name, actual.name);
+    try std.testing.expectEqualSlices(u8, expected.arguments_json, actual.arguments_json);
+    try expectOptionalBytesEqual(expected.provider_result, actual.provider_result);
+}
+
+fn expectOptionalBytesEqual(expected: anytype, actual: @TypeOf(expected)) !void {
+    try std.testing.expectEqual(expected != null, actual != null);
+    if (expected) |bytes| try std.testing.expectEqualSlices(u8, bytes, actual.?);
+}
+
+test "durable image snapshots serialize as session-relative locators" {
+    const alloc = std.testing.allocator;
+    var images = [_]session.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/Users/private/source.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/fx/sessions/session-id/images/image-1-deadbeef.bin"),
+        .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+    }};
+    const turn: session.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("[Image #1]"), .images = &images },
+        .assistant = @constCast("done"),
+    } };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+
+    try writeHistoryTurn(&encoded.writer, turn);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        encoded.written(),
+        "/tmp/fx/sessions/session-id/images",
+    ) == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        encoded.written(),
+        "\"snapshot_path\":\"images/image-1-deadbeef.bin\"",
+    ) != null);
+}
+
+test "codec structural helpers enforce exact objects and required strings" {
+    const alloc = std.testing.allocator;
+
+    var unknown_key = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"known\":\"value\",\"unexpected\":true}",
+        .{},
+    );
+    defer unknown_key.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        exactObject(unknown_key.value, &.{"known"}),
+    );
+
+    var non_string = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"known\":1}",
+        .{},
+    );
+    defer non_string.deinit();
+    const non_string_object = try exactObject(non_string.value, &.{"known"});
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        requireString(non_string_object, "known"),
+    );
+
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"known\":\"value\"}",
+        .{},
+    );
+    defer valid.deinit();
+    const valid_object = try exactObject(valid.value, &.{"known"});
+    try std.testing.expectEqualStrings("value", try requireString(valid_object, "known"));
+}
+
+test "recovery checkpoint round trips while legacy state stays absent" {
+    const alloc = std.testing.allocator;
+    const checkpoint = RecoveryCheckpoint{
+        .turn_id = 42,
+        .user = .{ .text = @constCast("keep working") },
+        .assistant_source = @constCast("partial answer"),
+        .cause = .response_interrupted,
+        .action = .continuing_response,
+        .tool_state = .confirmed,
+        .authority = .{
+            .provider = .codex,
+            .model = @constCast("gpt-5.4-mini"),
+            .credential_source = .chatgpt_subscription,
+            .credential_identity = credential_authority.derive(
+                .chatgpt_subscription,
+                "acct_1",
+            ),
+        },
+        .requested_fast_mode = true,
+        .fast_mode = true,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 4,
+        .outstanding_reservation = true,
+    };
+    const state = DurableSessionState{
+        .id = @constCast("session-recovery"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .provider = .codex,
+            .model = @constCast("gpt-5.4-mini"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .recovery_checkpoint = checkpoint,
+    };
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    var source = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+
+    const restored = decoded.recovery_checkpoint.?;
+    try std.testing.expectEqual(@as(u64, 42), restored.turn_id);
+    try std.testing.expectEqualStrings("keep working", restored.user.text);
+    try std.testing.expectEqualStrings("partial answer", restored.assistant_source);
+    try std.testing.expectEqual(types.ModelRecoveryCause.response_interrupted, restored.cause);
+    try std.testing.expectEqual(types.ModelRecoveryAction.continuing_response, restored.action);
+    try std.testing.expectEqual(RecoveryToolState.confirmed, restored.tool_state);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, restored.authority.provider);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", restored.authority.model);
+    try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, restored.authority.credential_source.?);
+    try std.testing.expect(restored.authority.credential_identity != null);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, decoded.preferences.provider);
+    try std.testing.expect(restored.requested_fast_mode);
+    try std.testing.expect(restored.fast_mode);
+    try std.testing.expectEqual(@as(usize, 4), restored.consumed_provider_attempts);
+    try std.testing.expect(restored.outstanding_reservation);
+
+    const legacy =
+        "{\"id\":\"legacy\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"openai/gpt-test\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";
+    var legacy_source = std.Io.Reader.fixed(legacy);
+    var legacy_state = try decodeState(alloc, &legacy_source, .{});
+    defer legacy_state.deinit(alloc);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, legacy_state.preferences.provider);
+    try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
+}
+
+test "session permission state round trips while legacy state stays empty" {
+    const alloc = std.testing.allocator;
+    const key = try session_permission_state.RuleKey.init(
+        .command,
+        "command\x00/workspace\x00git status",
+    );
+    var empty_permission_state: session_permission_state.State = .{};
+    defer empty_permission_state.deinit(alloc);
+    var applied = try session_permission_state.apply(
+        alloc,
+        empty_permission_state,
+        .{ .set = .{
+            .key = key,
+            .display_identity = "git status in /workspace",
+            .decision = .deny,
+            .expected_generation = null,
+        } },
+    );
+    var permission_state = applied.takeApplied() orelse
+        return error.TestExpectedAppliedState;
+    defer permission_state.deinit(alloc);
+
+    const state = DurableSessionState{
+        .id = @constCast("session-permission-state"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = @constCast("openai/gpt-test"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .permission_state = permission_state,
+    };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    var source = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(
+        session_permission_state.StateDecision.deny,
+        session_permission_state.decide(decoded.permission_state, key),
+    );
+
+    const legacy =
+        "{\"id\":\"legacy-permission-state\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"openai/gpt-test\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";
+    var legacy_source = std.Io.Reader.fixed(legacy);
+    var legacy_state = try decodeState(alloc, &legacy_source, .{});
+    defer legacy_state.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), legacy_state.permission_state.rules.items.len);
+}
+
+test "recovery checkpoint rejects an outstanding attempt beyond its budget" {
+    const invalid = DurableSessionState{
+        .id = @constCast("session-recovery"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = @constCast("openai/gpt-test"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .recovery_checkpoint = .{
+            .turn_id = 1,
+            .user = .{ .text = @constCast("prompt") },
+            .assistant_source = @constCast(""),
+            .cause = .network_interrupted,
+            .action = .retrying_request,
+            .authority = .{ .provider = .gateway, .model = @constCast("openai/gpt-test") },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 1,
+            .consumed_provider_attempts = 1,
+            .outstanding_reservation = true,
+        },
+    };
+    try std.testing.expectError(error.InvalidDurableField, validateState(invalid));
+}
+
+test "permission state schema two round trips before activation" {
+    const alloc = std.testing.allocator;
+    var state: session_permission_state.State = .{
+        .version = session_permission_state.schema_version,
+        .next_generation = 2,
+    };
+    defer state.deinit(alloc);
+    const key = try session_permission_state.commandKeyV2(
+        alloc,
+        "git status",
+        "/workspace",
+        "foreground",
+        "macos",
+    );
+    try state.rules.append(alloc, .{
+        .id = .{ .value = 1 },
+        .key = key,
+        .display_identity = try alloc.dupe(u8, "git status"),
+        .decision = .deny,
+        .generation = 1,
+    });
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writePermissionState(&encoded.writer, state);
+    var json = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        encoded.written(),
+        .{},
+    );
+    defer json.deinit();
+    var decoded = try parsePermissionState(alloc, json.value);
+    defer decoded.deinit(alloc);
+
+    try std.testing.expectEqual(session_permission_state.schema_version, decoded.version);
+    try std.testing.expectEqual(@as(usize, 1), decoded.rules.items.len);
+    try std.testing.expectEqual(session_permission_state.StateDecision.deny, session_permission_state.decide(decoded, key));
+}
+
+test "durable session optional fields handle fuzzed ownership paths" {
+    try std.testing.fuzz({}, fuzzDurableSessionOptionalFields, .{ .corpus = &.{
+        "{\"id\":\"session\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}",
+        "{\"id\":\"session\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0,\"context_history_start\":0,\"last_subagent_work_id\":\"work\"}",
+        "{\"id\":\"session\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":1,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0,\"last_subagent_work_id\":\"work\",\"context_history_start\":0}",
+        "",
+        "{}",
+        "{\"last_subagent_work_id\":null}",
+        "{\"usage\":null,\"last_subagent_work_id\":\"work\"}",
+        "{\"last_subagent_work_id\":\"work\",\"usage\":null}",
+    } });
+}
+
+test "per-turn work provenance parser handles fuzzed ownership paths" {
+    try std.testing.fuzz({}, fuzzWorkProvenanceHistoryTurn, .{ .corpus = &.{
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[],\"work_id\":\"work-1\"},\"assistant\":\"reply\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"reply\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}}",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[],\"work_id\":\"\"}}",
+        "",
+        "{}",
+    } });
+}
+
+fn fuzzWorkProvenanceHistoryTurn(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        buffer[0..len],
+        .{ .allocate = .alloc_always },
+    ) catch return;
+    defer parsed.deinit();
+    const turn = parseHistoryTurn(std.testing.allocator, parsed.value) catch return;
+    session.freeHistoryTurn(std.testing.allocator, turn);
+}
+
+fn fuzzDurableSessionOptionalFields(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [8192]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var source = std.Io.Reader.fixed(buffer[0..len]);
+    var state = decodeState(std.testing.allocator, &source, .{
+        .max_history_turns = 8,
+        .max_value_bytes = buffer.len,
+    }) catch return;
+    state.deinit(std.testing.allocator);
 }

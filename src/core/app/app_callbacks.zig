@@ -5,6 +5,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const secret = @import("../auth/secret.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -20,13 +21,12 @@ const file_mutation = @import("../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_usage = @import("../session/session_usage.zig");
-const parent_delivery_projector = @import("../subagent/parent_delivery_projector.zig");
-const task_helpers = @import("../tasks/task_helpers.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -79,6 +79,190 @@ fn preparedDiffPayloadWithFullAllocator(
     );
 }
 
+test "prepared preview formatter preserves context and informative elision" {
+    const preview: diff_mod.FileChangePreview = .{
+        .path = "note.txt",
+        .lines = &.{
+            .{
+                .op = .context,
+                .old_line = 1,
+                .new_line = 1,
+                .text = "alpha",
+            },
+            .{
+                .op = .deletion,
+                .old_line = 2,
+                .text = "before",
+            },
+            .{
+                .op = .addition,
+                .new_line = 2,
+                .text = "after",
+            },
+            .{
+                .op = .elision,
+                .text = "⋯ +2 -1 omitted",
+            },
+        },
+        .additions = 3,
+        .deletions = 2,
+        .truncated = true,
+    };
+    const formatted = try diff_mod.formatFileChangePreview(
+        std.testing.allocator,
+        preview,
+        .{
+            .added_fg = "",
+            .removed_fg = "",
+            .context_fg = "",
+            .reset = "",
+        },
+    );
+    defer std.testing.allocator.free(formatted);
+
+    try std.testing.expect(std.mem.find(u8, formatted, "alpha") != null);
+    try std.testing.expect(
+        std.mem.find(u8, formatted, "⋯ +2 -1 omitted") != null,
+    );
+}
+
+test "prepared diff payload keeps compact elision and retains the complete approved review" {
+    const alloc = std.testing.allocator;
+    var after: std.ArrayList(u8) = .empty;
+    defer after.deinit(alloc);
+    for (1..121) |line_number| {
+        var line: [32]u8 = undefined;
+        try after.appendSlice(
+            alloc,
+            try std.fmt.bufPrint(&line, "full-review-{d:0>3}\n", .{line_number}),
+        );
+    }
+
+    const preview_lines = [_]diff_mod.PreviewLine{
+        .{ .op = .addition, .new_line = 1, .text = "full-review-001" },
+        .{ .op = .elision, .text = "⋯ +118 omitted" },
+        .{ .op = .addition, .new_line = 120, .text = "full-review-120" },
+    };
+    const handoff = file_mutation.CommittedFileHandoff.init(
+        .{
+            .path = "full-review.txt",
+            .lines = &preview_lines,
+            .additions = 120,
+            .deletions = 0,
+            .truncated = true,
+        },
+        .{
+            .kind = .write,
+            .raw_path = "/tmp/full-review.txt",
+            .previous_content = null,
+            .committed_at_ms = 0,
+        },
+    );
+    var enriched_handoff = handoff;
+    enriched_handoff.full_view = .{
+        .after_content = after.items,
+        .lifecycle_id = .{ .turn_id = 39, .call_id = "full-review" },
+    };
+
+    const payload = try preparedDiffPayload(alloc, enriched_handoff);
+    defer diff_mod.freeDiffEntryPayload(alloc, payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload.preview, "⋯ +118 omitted") != null);
+    const full = payload.full orelse return error.TestExpectedFullDiff;
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "full-review-001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "full-review-120") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "⋯ +118 omitted") == null);
+}
+
+test "prepared diff payload keeps compact output when full formatting is unavailable" {
+    const handoff = testCommittedFileHandoff();
+    var enriched_handoff = handoff;
+    enriched_handoff.full_view = .{
+        .after_content = "after\n",
+        .lifecycle_id = .{ .turn_id = 40, .call_id = "full-format-fallback" },
+    };
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    const payload = try preparedDiffPayloadWithFullAllocator(
+        std.testing.allocator,
+        failing.allocator(),
+        enriched_handoff,
+    );
+    defer diff_mod.freeDiffEntryPayload(std.testing.allocator, payload);
+
+    try std.testing.expect(payload.full == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload.preview, "after") != null);
+}
+
+test "full diff formatter renders unchanged review elisions" {
+    const before =
+        "same-01\n" ++
+        "same-02\n" ++
+        "same-03\n" ++
+        "same-04\n" ++
+        "same-05\n" ++
+        "same-06\n" ++
+        "same-07\n" ++
+        "same-08\n" ++
+        "same-09\n" ++
+        "same-10\n" ++
+        "old\n";
+    const after =
+        "same-01\n" ++
+        "same-02\n" ++
+        "same-03\n" ++
+        "same-04\n" ++
+        "same-05\n" ++
+        "same-06\n" ++
+        "same-07\n" ++
+        "same-08\n" ++
+        "same-09\n" ++
+        "same-10\n" ++
+        "new\n";
+    const preview_lines = [_]diff_mod.PreviewLine{
+        .{ .op = .deletion, .old_line = 11, .text = "old" },
+        .{ .op = .addition, .new_line = 11, .text = "new" },
+    };
+    var handoff = file_mutation.CommittedFileHandoff.init(
+        .{
+            .path = "elision.txt",
+            .lines = &preview_lines,
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+        },
+        .{
+            .kind = .edit,
+            .raw_path = "/tmp/elision.txt",
+            .previous_content = before,
+            .committed_at_ms = 0,
+        },
+    );
+    handoff.full_view = .{
+        .after_content = after,
+        .lifecycle_id = .{ .turn_id = 41, .call_id = "context-elision" },
+    };
+
+    const snapshot = handoff.full_view orelse return error.TestExpectedFullDiff;
+    const full = (try diff_mod.formatFileChangeFullDiff(
+        std.testing.allocator,
+        handoff.tracker.previous_content,
+        .{
+            .after_content = snapshot.after_content,
+            .lifecycle_id = snapshot.lifecycle_id,
+        },
+        .{},
+    )) orelse
+        return error.TestExpectedFullDiff;
+    defer full.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "5 unchanged lines ⋯") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "new") != null);
+}
+
 pub fn Bindings(comptime App: type) type {
     return struct {
         pub fn agentRuntimeDeps(app: *App) agent_runtime.AgentRuntimeDeps {
@@ -88,6 +272,15 @@ pub fn Bindings(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
+                .compaction_route = if (comptime @hasDecl(App, "compactionRoute"))
+                    app.compactionRoute()
+                else if (comptime @hasDecl(App, "providerSet") and @hasField(App, "auth"))
+                    app.providerSet().compactionRoute(
+                        provider_runtime.provider(app),
+                        app.auth.credentialSource(),
+                    )
+                else
+                    .{ .unavailable = .missing_policy },
                 .cooperative_transport_pulse = if (comptime @hasDecl(App, "cooperativeTransportPulse")) .{
                     .ctx = @ptrCast(app),
                     .run = cooperativeTransportPulse,
@@ -100,9 +293,7 @@ pub fn Bindings(comptime App: type) type {
                 else
                     null,
                 .finalize_turn = agentFinalizeTurn,
-                .take_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteering")) agentTakeSteering else null,
-                .prepare_parent_turn_context = agentPrepareParentTurnContext,
-                .acknowledge_parent_turn_context = agentAcknowledgeParentTurnContext,
+                .take_steering_boundary = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteeringBoundary")) agentTakeSteeringBoundary else null,
                 .append_runtime_context = agentAppendRuntimeContext,
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
@@ -120,6 +311,7 @@ pub fn Bindings(comptime App: type) type {
                 .execute_tool_call = agentExecuteToolCall,
                 .publish_committed_file_handoff = agentPublishCommittedFileHandoff,
                 .propagate_history_turn = agentPropagateHistoryTurn,
+                .commit_context_compaction = .{ .commit = agentCommitContextCompaction },
                 .recovery_checkpoint = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.writable != null)
                         .{
@@ -196,13 +388,26 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return auth_runtime.refreshCredentialTokenForAccount(
+            var refreshed = (try auth_runtime.refreshCredentialForAccount(
                 app.auth.oauthTransport(),
-                alloc,
+                std.heap.c_allocator,
                 source,
                 mode,
                 expected_account_id,
-            );
+            )) orelse return null;
+            var owns_refreshed = true;
+            defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
+            if (app.auth.preparedCredentialChange(refreshed) == .authority) {
+                return error.CredentialAuthorityChanged;
+            }
+
+            const worker_token = try alloc.dupe(u8, refreshed.token);
+            errdefer secret.zeroAndFree(alloc, worker_token);
+            try app_worker_runtime.Runtime(App).pushOwnedEvent(app, .{
+                .credential_refreshed = refreshed,
+            });
+            owns_refreshed = false;
+            return worker_token;
         }
 
         pub fn modelCapabilityResolver(app: *App) model_capabilities.Resolver {
@@ -234,9 +439,11 @@ pub fn Bindings(comptime App: type) type {
                 .drain_assistant_text = workerBridgeDrainAssistantText,
                 .open_model_picker = workerBridgeOpenModelPicker,
                 .semantic_notice = workerBridgeSemanticNotice,
+                .credential_refreshed = workerBridgeCredentialRefreshed,
                 .command_output = workerBridgeCommandOutput,
                 .command_output_complete = workerBridgeCommandOutputComplete,
                 .diff_block = workerBridgeDiffBlock,
+                .context_compaction = workerBridgeContextCompaction,
                 .append_history_turn = workerBridgeAppendHistoryTurn,
                 .session_grant = workerBridgeSessionGrant,
                 .error_text = workerBridgeErrorText,
@@ -291,6 +498,87 @@ pub fn Bindings(comptime App: type) type {
                 try app.shell.applyToolLifecyclePreservingNormalBufferAnchor(alloc, event)
             else
                 try app.shell.applyToolLifecycle(alloc, event);
+            if (comptime @hasField(App, "workspace_root")) switch (event) {
+                .authoritative_started => |started| if (started.arguments_json) |arguments_json| {
+                    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| {
+                        debug_trace.logf(
+                            "ui_activity",
+                            "command metadata parse failed turn_id={d} err={s}",
+                            .{ started.id.turn_id, @errorName(err) },
+                        );
+                        return .{
+                            .previous_focused_entry_id = previous_focused_entry_id,
+                            .snapshot = worker_tool_lifecycle_snapshot(raw_ctx),
+                            .applied_activity_kind = applied_activity_kind,
+                            .terminal_record = null,
+                        };
+                    };
+                    defer parsed.deinit();
+                    if (parsed.value == .object) {
+                        if (parsed.value.object.get("command")) |command_value| {
+                            if (command_value == .string) {
+                                const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
+                                    if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
+                                else
+                                    app.workspace_root;
+                                const display = tool_presentation.formatRunCommandDetailBounded(
+                                    alloc,
+                                    command_value.string,
+                                    workspace_root,
+                                    tool_presentation.max_run_command_reflow_bytes,
+                                ) catch |err| blk: {
+                                    debug_trace.logf(
+                                        "ui_activity",
+                                        "command display unavailable turn_id={d} err={s}",
+                                        .{ started.id.turn_id, @errorName(err) },
+                                    );
+                                    break :blk null;
+                                };
+                                defer if (display) |bytes| alloc.free(bytes);
+                                if (display == null) debug_trace.logf(
+                                    "ui_activity",
+                                    "command display withheld turn_id={d}",
+                                    .{started.id.turn_id},
+                                );
+                                const action_label = tool_presentation.runCommandCompletedActionLabel(
+                                    alloc,
+                                    app.toolRegistry(),
+                                    .{
+                                        .id = started.id.call_id,
+                                        .name = started.tool_name,
+                                        .arguments_json = arguments_json,
+                                    },
+                                ) catch |err| blk: {
+                                    debug_trace.logf(
+                                        "ui_activity",
+                                        "command action label unavailable turn_id={d} err={s}",
+                                        .{ started.id.turn_id, @errorName(err) },
+                                    );
+                                    break :blk null;
+                                };
+                                if (action_label == null) debug_trace.logf(
+                                    "ui_activity",
+                                    "command action label withheld turn_id={d}",
+                                    .{started.id.turn_id},
+                                );
+                                if (display != null and action_label != null) {
+                                    app.shell.setToolCommandMetadata(
+                                        alloc,
+                                        started.id,
+                                        display.?,
+                                        action_label.?,
+                                    ) catch |err| debug_trace.logf(
+                                        "ui_activity",
+                                        "command metadata unavailable turn_id={d} err={s}",
+                                        .{ started.id.turn_id, @errorName(err) },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            };
             return .{
                 .previous_focused_entry_id = previous_focused_entry_id,
                 .snapshot = worker_tool_lifecycle_snapshot(raw_ctx),
@@ -348,20 +636,6 @@ pub fn Bindings(comptime App: type) type {
             agentReportInnerToolUsage(ctx, tool_name, usage);
         }
 
-        pub fn onBackgroundUrlReady(ctx: *anyopaque, task_id: u64, url: []const u8) void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const notice = task_helpers.backgroundServerReadyNotice(std.heap.c_allocator, task_id, url, app.session.languageSnapshot()) catch return;
-            defer std.heap.c_allocator.free(notice.body);
-            app_worker_runtime.Runtime(App).pushSemanticNotice(app, notice) catch {};
-        }
-
-        pub fn onTaskCompletion(ctx: *anyopaque, completion: task_helpers.TaskCompletion) void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const notice = task_helpers.backgroundCompletionNotice(std.heap.c_allocator, completion, app.session.languageSnapshot()) catch return;
-            defer std.heap.c_allocator.free(notice.body);
-            app_worker_runtime.Runtime(App).pushSemanticNotice(app, notice) catch {};
-        }
-
         fn agentAppendRuntimeContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.appendRuntimeContextMessage(arena, messages);
@@ -380,15 +654,35 @@ pub fn Bindings(comptime App: type) type {
             });
         }
 
-        fn agentTakeSteering(ctx: *anyopaque, arena: std.mem.Allocator, turn_id: u64) ![]const []const u8 {
+        fn agentTakeSteeringBoundary(
+            ctx: *anyopaque,
+            arena: std.mem.Allocator,
+            turn_id: u64,
+            kind: worker_runtime.SteeringBoundaryKind,
+        ) !worker_runtime.SteeringBoundaryResult {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const owned = try app.worker.takeSteering(std.heap.c_allocator, turn_id);
+            const result = try app.worker.takeSteeringBoundary(
+                std.heap.c_allocator,
+                turn_id,
+                kind,
+            );
+            return switch (result) {
+                .continue_turn => |owned| .{
+                    .continue_turn = try copyOwnedSteering(arena, owned),
+                },
+                .none => .none,
+                .handoff => .handoff,
+                .interrupt => .interrupt,
+            };
+        }
+
+        fn copyOwnedSteering(arena: std.mem.Allocator, owned: [][]u8) ![][]u8 {
             if (owned.len == 0) return &.{};
             defer {
                 for (owned) |text| std.heap.c_allocator.free(text);
                 std.heap.c_allocator.free(owned);
             }
-            const result = try arena.alloc([]const u8, owned.len);
+            const result = try arena.alloc([]u8, owned.len);
             for (owned, result) |text, *dest| dest.* = try arena.dupe(u8, text);
             return result;
         }
@@ -397,45 +691,6 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
                 try app.appendStaticContextMessage(arena, messages);
-            }
-        }
-
-        fn agentPrepareParentTurnContext(
-            ctx: *anyopaque,
-            arena: Allocator,
-        ) !?agent_runtime.PreparedParentTurnContext {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasField(App, "session_persistence")) {
-                const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return null;
-                const session_id = app_session_runtime.Runtime(App).activeSessionId(app) orelse return null;
-                return parent_delivery_projector.prepare(
-                    arena,
-                    host.sessions,
-                    session_id,
-                    host.manager.options.child_store,
-                );
-            }
-            return null;
-        }
-
-        fn agentAcknowledgeParentTurnContext(
-            ctx: *anyopaque,
-            arena: Allocator,
-            acknowledgements: []const agent_runtime.ParentTurnDeliveryAck,
-        ) void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasField(App, "session_persistence")) {
-                const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return;
-                const retirement_ready = parent_delivery_projector
-                    .acknowledgeWithRetirementSignal(
-                    arena,
-                    host.sessions,
-                    host.manager.options.child_store,
-                    acknowledgements,
-                );
-                if (retirement_ready) {
-                    host.requestRetirementSweep(io_mod.milliTimestamp());
-                }
             }
         }
 
@@ -534,7 +789,7 @@ pub fn Bindings(comptime App: type) type {
                 .name = call.name,
                 .arguments_json = call.arguments_json,
                 .model_output = model_output,
-                .ok = false,
+                .outcome = .rejected,
                 .started_at_ms = io_mod.milliTimestamp(),
             });
         }
@@ -627,6 +882,19 @@ pub fn Bindings(comptime App: type) type {
         fn agentPropagateHistoryTurn(ctx: *anyopaque, turn: HistoryTurn) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_worker_runtime.Runtime(App).propagateHistoryTurn(app, turn, app.session.max_history_turns);
+        }
+
+        fn agentCommitContextCompaction(
+            ctx: *anyopaque,
+            summary: types.CompactedSummaryHistoryTurn,
+        ) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const turn = types.HistoryTurn{ .compacted_summary = summary };
+            try app_worker_runtime.Runtime(App).commitContextCompaction(
+                app,
+                turn,
+                app.session.max_history_turns,
+            );
         }
 
         fn agentSetRecoveryCheckpoint(
@@ -754,11 +1022,20 @@ pub fn Bindings(comptime App: type) type {
             else
                 try gateway_error_format.formatHttpErrorMessage(std.heap.c_allocator, status, detail);
             defer std.heap.c_allocator.free(message);
-            const label = if (auth_failure != null)
+            const label = if (auth_failure) |failure|
                 try std.fmt.allocPrint(
                     std.heap.c_allocator,
-                    "⚠ {s} · Run /setup to choose another source.",
-                    .{message},
+                    "⚠ {s} · {s}",
+                    .{
+                        message,
+                        switch (failure.source) {
+                            .fx_login => "Run /login to repair this source.",
+                            .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
+                            .grok_subscription => "Reconnect Grok through /login to repair this source.",
+                            .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
+                            .host_managed => credentials.host_managed_auth_message,
+                        },
+                    },
                 )
             else
                 try std.fmt.allocPrint(std.heap.c_allocator, "⚠ {s}", .{message});
@@ -838,7 +1115,8 @@ pub fn Bindings(comptime App: type) type {
         }
 
         fn agentReportInnerToolUsage(ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void {
-            if (!std.mem.eql(u8, tool_name, "web_search")) return;
+            if (!std.mem.eql(u8, tool_name, "web_search") and
+                !tool_presentation.isProviderSearchAlias(tool_name)) return;
             const app: *App = @ptrCast(@alignCast(ctx));
             app.total_web_search_requests +|= @as(u64, usage.web_search_requests);
         }
@@ -927,6 +1205,20 @@ pub fn Bindings(comptime App: type) type {
             try app.writeDomainNotice(notice, true);
         }
 
+        fn workerBridgeCredentialRefreshed(
+            ctx: *anyopaque,
+            credential: credentials.Credential,
+        ) !void {
+            if (comptime !@hasField(App, "auth")) return;
+            const app: *App = @ptrCast(@alignCast(ctx));
+            var owned = try credential.clone(app.alloc);
+            defer owned.deinit(app.alloc);
+            if (app.auth.preparedCredentialChange(owned) == .authority) {
+                return error.CredentialAuthorityChanged;
+            }
+            _ = app.auth.adoptPreparedCredential(app.alloc, &owned);
+        }
+
         fn workerBridgeCommandOutput(
             ctx: *anyopaque,
             lifecycle_id: ?types.ToolLifecycleId,
@@ -953,6 +1245,11 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeDiffBlock(ctx: *anyopaque, payload: diff_mod.DiffEntryPayload) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.registerAndEmitDiffBlock(payload);
+        }
+
+        fn workerBridgeContextCompaction(ctx: *anyopaque, turn: types.HistoryTurn) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).appendHistoryTurn(app, turn);
         }
 
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !void {
@@ -1564,6 +1861,245 @@ const NoOverridePersistentApp = struct {
     }
 };
 
+const CredentialRefreshApp = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    auth: auth_runtime.Runtime = .{},
+
+    fn deinit(self: *CredentialRefreshApp) void {
+        self.auth.deinit(self.alloc);
+    }
+};
+
+test "worker credential publication adopts secret rotation on the app owner" {
+    const alloc = std.testing.allocator;
+    var app: CredentialRefreshApp = .{};
+    defer app.deinit();
+    var initial = credentials.Credential{
+        .token = try alloc.dupe(u8, "stale-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .refresh_after_ms = 10,
+    };
+    defer initial.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &initial);
+
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .refresh_after_ms = std.math.maxInt(i64),
+    };
+    defer refreshed.deinit(alloc);
+    try Bindings(CredentialRefreshApp).workerBridgeCredentialRefreshed(&app, refreshed);
+
+    try std.testing.expectEqualStrings("fresh-token", app.auth.apiKey().?);
+    try std.testing.expectEqualStrings("team_123", app.auth.gatewayTeam().?);
+}
+
+test "agent deps forward app callbacks through core types" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    try std.testing.expect(deps.prepare_parent_turn_context == null);
+    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
+    try deps.push_text(deps.ctx, .{ .assistant_rendered = "hello" });
+    try deps.finalize_turn(deps.ctx, 9, .completed, .length_limited);
+    try deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = .{
+        .summary = @constCast("summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } });
+    try deps.propagate_grant(deps.ctx, "read_file", "/tmp/a");
+    const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{ .turn = .{
+        .compacted_summary = .{
+            .summary = @constCast("finished"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        },
+    } });
+    try deps.push_event(deps.ctx, .{ .finish_prompt = finished });
+
+    try std.testing.expectEqual(@as(usize, 3), app.worker.events.items.len);
+    try std.testing.expectEqualStrings("hello", app.worker.events.items[0].assistant_presentation.text);
+    try std.testing.expect(app.worker.events.items[1] == .tool_lifecycle);
+    try std.testing.expectEqual(
+        @as(u64, 9),
+        app.worker.events.items[1].tool_lifecycle.turn_finished.turn_id,
+    );
+    try std.testing.expectEqual(
+        types.TurnPresentationOutcome.completed,
+        app.worker.events.items[1].tool_lifecycle.turn_finished.outcome,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.worker.propagated_history_turns);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.propagated_grants);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.active_snapshot_transfers);
+
+    const validation = try (deps.validate_tool_call orelse return error.TestExpectedEqual)(deps.ctx, std.testing.allocator, .{
+        .id = "fetch",
+        .name = "web_fetch",
+        .arguments_json = "{\"url\":1}",
+    });
+    defer std.testing.allocator.free(validation.failure);
+    try std.testing.expectEqualStrings("invalid web_fetch", validation.failure);
+
+    const formatted = try deps.format_tool_execution_error(deps.ctx, std.testing.allocator, "tool", error.Boom);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings("tool:Boom", formatted);
+}
+
+test "agent deps use request-time model capability resolution when available" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    const capabilities = try deps.resolve_model_capabilities(
+        deps.ctx,
+        std.testing.allocator,
+        "provider/new-reasoning-model",
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), app.capability_request_count);
+    try std.testing.expect(model_capabilities.reasoningEffortSupported(capabilities, types.ReasoningEffort.literal("future-tier")));
+}
+
+test "agent deps record rejected tool calls in feedback diagnostics" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    const record = deps.record_tool_call_rejected orelse return error.TestExpectedEqual;
+    try record(deps.ctx, std.testing.allocator, .{
+        .id = "denied",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"touch /tmp/denied\"}",
+    }, "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}", null);
+
+    var buf: [1]diagnostics.ToolCallMetric = undefined;
+    const n = diagnostics.snapshotToolCalls(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(diagnostics.ToolCallOutcome.rejected, buf[0].outcome);
+    try std.testing.expectEqualStrings("run_command", buf[0].name());
+    try std.testing.expect(std.mem.find(u8, buf[0].args(), "touch /tmp/denied") != null);
+    try std.testing.expect(std.mem.find(u8, buf[0].result(), "tool_permission_denied") != null);
+    try std.testing.expectEqual(@as(u64, 0), buf[0].subagent_id);
+}
+
+test "app semantic presentation sink retains payload ownership only after successful queueing" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const sink = Bindings(FakeApp).semanticPresentationSink(&app);
+
+    const table = try assistant_presentation.parseTablePayload(
+        std.heap.c_allocator,
+        "| Name | Count |\n|------|------:|\n| api | 7 |\n",
+    );
+    const table_source_cell = table.rows[1].cells[0].ptr;
+    try sink.table(sink.ctx, table);
+
+    const code = try std.heap.c_allocator.dupe(u8, "const ready = true;\n");
+    const code_source_ptr = code.ptr;
+    try sink.code_block(sink.ctx, .{
+        .language = try std.heap.c_allocator.dupe(u8, "zig"),
+        .code = code,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), app.worker.events.items.len);
+    try std.testing.expect(app.worker.events.items[0] == .assistant_presentation);
+    try std.testing.expect(app.worker.events.items[0].assistant_presentation == .table);
+    try std.testing.expectEqualStrings("api", app.worker.events.items[0].assistant_presentation.table.rows[1].cells[0]);
+    try std.testing.expect(app.worker.events.items[0].assistant_presentation.table.rows[1].cells[0].ptr != table_source_cell);
+    try std.testing.expect(app.worker.events.items[1] == .assistant_presentation);
+    try std.testing.expect(app.worker.events.items[1].assistant_presentation == .code_block);
+    try std.testing.expectEqualStrings("const ready = true;\n", app.worker.events.items[1].assistant_presentation.code_block.code);
+    try std.testing.expect(app.worker.events.items[1].assistant_presentation.code_block.code.ptr != code_source_ptr);
+
+    app.worker.fail_semantic_push = true;
+    const failed_table = try assistant_presentation.parseTablePayload(
+        std.heap.c_allocator,
+        "| Name | Count |\n|------|------:|\n| api | 7 |\n",
+    );
+    try std.testing.expectError(
+        error.TestSemanticPresentationPublicationFailure,
+        sink.table(sink.ctx, failed_table),
+    );
+    var retained = failed_table;
+    retained.deinit(std.heap.c_allocator);
+}
+
+test "interactive stream adapter queues byte-identical rendered spans" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+
+    const spans = [_][]const u8{
+        "\x1b[1mbold\x1b[22m and \x1b[3mitalic\x1b[23m\n",
+        "\x1b]8;id=fx-1;https://example.com\x1b\\docs\x1b]8;;\x1b\\\n",
+        "\x1b[2m\xe2\x94\x82 \x1b[22mconst x = **literal**;\n",
+    };
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    for (spans) |span| try deps.push_text(deps.ctx, .{ .assistant_rendered = span });
+
+    try std.testing.expectEqual(spans.len, app.worker.events.items.len);
+    for (spans, app.worker.events.items) |expected, event| {
+        try std.testing.expect(event == .assistant_presentation);
+        try std.testing.expect(event.assistant_presentation == .text);
+        try std.testing.expectEqualStrings(expected, event.assistant_presentation.text);
+    }
+    try std.testing.expectEqual(@as(usize, 0), app.pacer.enqueue_count);
+    try std.testing.expectEqual(@as(usize, 0), app.pacer.text.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.pacer.flush_count);
+}
+
+test "inner search tokens do not replace outer context counters" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    (deps.report_usage orelse return error.TestExpectedEqual)(deps.ctx, .{
+        .input_tokens = 100,
+        .output_tokens = 20,
+    });
+    const report = deps.report_inner_tool_usage orelse return error.TestExpectedEqual;
+    const search_names = [_][]const u8{
+        "web_search",
+        "exa_search",
+        "parallel_search",
+        "perplexity_search",
+    };
+    for (search_names) |name| {
+        report(deps.ctx, name, .{
+            .input_tokens = 999,
+            .output_tokens = 888,
+            .web_search_requests = 1,
+        });
+    }
+    report(deps.ctx, "provider_tool", .{ .web_search_requests = 7 });
+
+    try std.testing.expectEqual(@as(u64, 100), app.total_input_tokens);
+    try std.testing.expectEqual(@as(u64, 20), app.total_output_tokens);
+    try std.testing.expectEqual(@as(u64, 4), app.total_web_search_requests);
+}
+
+test "agent diff block callback enqueues worker event without direct transcript mutation" {
+    const c_alloc = std.heap.c_allocator;
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    try deps.push_diff_block(deps.ctx, .{
+        .preview = try c_alloc.dupe(u8, "diff preview"),
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), app.diff_register_count);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+    try std.testing.expect(app.worker.events.items[0] == .diff_block);
+    try std.testing.expectEqualStrings("diff preview", app.worker.events.items[0].diff_block.preview);
+}
+
 const committed_preview_lines = [_]diff_mod.PreviewLine{
     .{
         .op = .deletion,
@@ -1592,5 +2128,337 @@ fn testCommittedFileHandoff() file_mutation.CommittedFileHandoff {
             .previous_content = "before\n",
             .committed_at_ms = 42,
         },
+    );
+}
+
+test "committed file handoff publishes prepared diff and cloned tracker state" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    const handoff = testCommittedFileHandoff();
+    const report = deps.publish_committed_file_handoff(deps.ctx, handoff);
+
+    try std.testing.expectEqual(
+        agent_runtime.SecondarySinkOutcome.published,
+        report.diff,
+    );
+    try std.testing.expectEqual(
+        agent_runtime.SecondarySinkOutcome.published,
+        report.tracker,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+    try std.testing.expect(app.worker.events.items[0] == .diff_block);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.worker.events.items[0].diff_block.preview,
+        "after",
+    ) != null);
+    try std.testing.expectEqual(@as(u32, 1), app.worker.events.items[0].diff_block.additions);
+    try std.testing.expectEqual(@as(u32, 1), app.worker.events.items[0].diff_block.deletions);
+    try std.testing.expectEqual(@as(usize, 1), app.change_tracker.stack.items.len);
+    const tracked = app.change_tracker.stack.items[0];
+    try std.testing.expectEqualStrings(handoff.tracker.raw_path, tracked.path);
+    try std.testing.expect(tracked.path.ptr != handoff.tracker.raw_path.ptr);
+    try std.testing.expectEqualStrings(
+        handoff.tracker.previous_content.?,
+        tracked.previous_content.?,
+    );
+    try std.testing.expect(
+        tracked.previous_content.?.ptr != handoff.tracker.previous_content.?.ptr,
+    );
+}
+
+test "command output callback drops cancelled late chunks without mutating queued output" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const lifecycle_id = types.ToolLifecycleId{ .turn_id = 11, .call_id = "command-output-callback" };
+    try Bindings(FakeApp).onCommandOutputChunk(&app, lifecycle_id, .stdout, "visible-one");
+    try Bindings(FakeApp).onCommandOutputChunk(&app, lifecycle_id, .stderr, "visible-two");
+    try std.testing.expectEqual(@as(usize, 2), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(u64, 11), app.worker.events.items[0].command_output.lifecycle_id.?.turn_id);
+    try std.testing.expectEqualStrings(
+        "command-output-callback",
+        app.worker.events.items[0].command_output.lifecycle_id.?.call_id,
+    );
+    try std.testing.expectEqual(command_output_content.Stream.stdout, app.worker.events.items[0].command_output.stream);
+    try std.testing.expectEqualStrings("visible-one", app.worker.events.items[0].command_output.text);
+    try std.testing.expectEqual(command_output_content.Stream.stderr, app.worker.events.items[1].command_output.stream);
+    try std.testing.expectEqualStrings("visible-two", app.worker.events.items[1].command_output.text);
+
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    try Bindings(FakeApp).onCommandOutputChunk(&app, lifecycle_id, .stdout, "late-one");
+    try Bindings(FakeApp).onCommandOutputChunk(&app, lifecycle_id, .stderr, "late-two");
+
+    try std.testing.expectEqual(@as(usize, 2), app.worker.events.items.len);
+    try std.testing.expectEqualStrings("visible-one", app.worker.events.items[0].command_output.text);
+    try std.testing.expectEqualStrings("visible-two", app.worker.events.items[1].command_output.text);
+}
+
+test "command output callback returns queue handoff failure" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.fail_command_output_push = true;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Bindings(FakeApp).onCommandOutputChunk(&app, null, .stdout, "not-queued"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+}
+
+test "web progress callback keeps typed lifecycle facts during cancellation" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.active_turn_id = 41;
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+
+    Bindings(FakeApp).onWebSearchProgress(&app, "search_call", .{
+        .results_received = .{
+            .query = "current news",
+            .result_count = 3,
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+    const lifecycle = app.worker.events.items[0].tool_lifecycle;
+    try std.testing.expect(lifecycle == .progress);
+    try std.testing.expectEqual(@as(u64, 41), lifecycle.progress.id.turn_id);
+    try std.testing.expectEqualStrings("search_call", lifecycle.progress.id.call_id);
+    try std.testing.expect(std.mem.find(
+        u8,
+        lifecycle.progress.text,
+        "Found 3 results",
+    ) != null);
+
+    app.worker.active_turn_id = 0;
+    Bindings(FakeApp).onWebSearchProgress(&app, "unowned", .{
+        .query_started = "ignored",
+    });
+    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+}
+
+test "MCP progress callback publishes the owning tool lifecycle" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    const lifecycle_id = types.ToolLifecycleId{
+        .turn_id = 42,
+        .call_id = "mcp-progress",
+    };
+
+    Bindings(FakeApp).onMcpProgress(&app, lifecycle_id, "MCP fixture halfway");
+
+    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+    const lifecycle = app.worker.events.items[0].tool_lifecycle;
+    try std.testing.expect(lifecycle == .progress);
+    try std.testing.expectEqual(@as(u64, 42), lifecycle.progress.id.turn_id);
+    try std.testing.expectEqualStrings("mcp-progress", lifecycle.progress.id.call_id);
+    try std.testing.expect(std.mem.find(
+        u8,
+        lifecycle.progress.text,
+        "● MCP fixture halfway",
+    ) != null);
+}
+
+test "agent context and system notices share semantic transport with distinct fields" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    try deps.push_context_notice.?(
+        deps.ctx,
+        "[context] first warning\n[context] second warning",
+    );
+    try deps.push_system_notice(deps.ctx, "ordinary-system");
+    try deps.push_interactive_notice.?(deps.ctx, .{
+        .topic = "background",
+        .tone = .information,
+        .body = "Command #1 started. Log: /tmp/run.log",
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), app.worker.events.items.len);
+    try std.testing.expect(app.worker.events.items[0] == .semantic_notice);
+    const context = app.worker.events.items[0].semantic_notice;
+    try std.testing.expectEqualStrings("context", context.topic);
+    try std.testing.expectEqual(types.NoticeTone.warning, context.tone);
+    try std.testing.expectEqualStrings("first warning\nsecond warning", context.body);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, context.visibility);
+    try std.testing.expect(app.worker.events.items[1] == .semantic_notice);
+    const ordinary = app.worker.events.items[1].semantic_notice;
+    try std.testing.expectEqualStrings("system", ordinary.topic);
+    try std.testing.expectEqual(types.NoticeTone.neutral, ordinary.tone);
+    try std.testing.expectEqualStrings("ordinary-system", ordinary.body);
+    try std.testing.expectEqual(types.NoticeVisibility.compact_and_full, ordinary.visibility);
+    const interactive = app.worker.events.items[2].semantic_notice;
+    try std.testing.expectEqualStrings("background", interactive.topic);
+    try std.testing.expectEqual(types.NoticeTone.information, interactive.tone);
+    try std.testing.expectEqualStrings("Command #1 started. Log: /tmp/run.log", interactive.body);
+}
+
+test "worker bridge deps forward UI operations" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).workerEventHandlers(&app);
+    const prompt = types.UserTurn{ .text = @constCast("prompt"), .images = &.{} };
+    const lifecycle_id = types.ToolLifecycleId{ .turn_id = 7, .call_id = "command-7" };
+    app.terminal.alternate_screen_owner = .active;
+    const lifecycle_transition = try deps.tool_lifecycle.apply(
+        app.alloc,
+        .{ .authoritative_started = .{
+            .id = .{ .turn_id = 8, .call_id = "read-8" },
+            .reconciles_provisional_call_id = null,
+            .tool_name = "read_file",
+            .activity_kind = .read,
+        } },
+    );
+    try std.testing.expectEqual(
+        types.ToolActivityKind.read,
+        lifecycle_transition.applied_activity_kind.?,
+    );
+    try std.testing.expect(lifecycle_transition.focus_changed());
+    try std.testing.expectEqual(@as(usize, 1), app.shell.preserved_anchor_apply_count);
+    try std.testing.expectEqual(@as(usize, 1), deps.tool_lifecycle.snapshot().active_tool_count);
+    const terminal_transition = try deps.tool_lifecycle.apply(
+        app.alloc,
+        .{ .terminal = .{
+            .id = .{ .turn_id = 8, .call_id = "read-8" },
+            .outcome = .{ .kind = .completed, .summary = "Read file" },
+        } },
+    );
+    try std.testing.expectEqualStrings(
+        "read_file",
+        terminal_transition.terminal_record.?.tool_name.?,
+    );
+    try std.testing.expectEqual(@as(usize, 0), terminal_transition.snapshot.active_tool_count);
+    try deps.tool_lifecycle.finish_batch(app.alloc);
+    try deps.write_user_prompt(deps.ctx, prompt);
+    try deps.append_text(deps.ctx, "assistant");
+    try deps.semantic_notice(deps.ctx, .{
+        .topic = "context",
+        .tone = .warning,
+        .body = "context-warning",
+        .visibility = .full_only,
+    });
+    try std.testing.expectEqualStrings("context", app.last_notice_topic.items);
+    try std.testing.expectEqual(types.NoticeTone.warning, app.last_notice_tone);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, app.last_notice_visibility);
+    try std.testing.expect(app.last_notice_record);
+    try deps.command_output(deps.ctx, lifecycle_id, .stdout, "cmd");
+    try deps.command_output_complete(deps.ctx, lifecycle_id);
+    try deps.diff_block(deps.ctx, .{
+        .preview = try std.heap.c_allocator.dupe(u8, "diff preview"),
+    });
+    try deps.append_history_turn(deps.ctx, .{ .turn = .{ .compacted_summary = .{
+        .summary = @constCast("summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } }, .summary = .{
+        .thinking_duration_ms = 15_000,
+        .turn_duration_ms = 130_000,
+        .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
+    } });
+    try deps.session_grant(deps.ctx, .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a") });
+    try deps.error_text(deps.ctx, .{
+        .topic = "system",
+        .tone = .@"error",
+        .body = "err",
+    });
+    try std.testing.expectEqualStrings("system", app.last_notice_topic.items);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_notice_tone);
+
+    try std.testing.expectEqual(@as(usize, 1), app.user_prompt_count);
+    try std.testing.expectEqualStrings("assistant", app.pacer.text.items);
+    try std.testing.expectEqual(@as(usize, 1), app.command_output_count);
+    try std.testing.expectEqual(@as(usize, 1), app.command_output_complete_count);
+    try std.testing.expectEqual(@as(u64, 7), app.last_command_output_lifecycle_turn_id.?);
+    try std.testing.expectEqualStrings("command-7", app.last_command_output_lifecycle_call_id);
+    try std.testing.expectEqual(@as(u64, 7), app.last_command_output_complete_lifecycle_turn_id.?);
+    try std.testing.expectEqualStrings("command-7", app.last_command_output_complete_lifecycle_call_id);
+    try std.testing.expectEqual(@as(usize, 1), app.diff_register_count);
+    try std.testing.expectEqual(@as(usize, 1), app.history_append_count);
+    try std.testing.expectEqual(@as(usize, 1), app.summary_append_count);
+    try std.testing.expectEqual(@as(u64, 5_000), app.last_summary.?.token_progress.output_tokens);
+    try std.testing.expectEqual(@as(usize, 1), app.grant_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "err") != null);
+    try std.testing.expectEqualStrings("system", app.last_notice_topic.items);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_notice_tone);
+    try std.testing.expectEqual(types.NoticeVisibility.compact_and_full, app.last_notice_visibility);
+}
+
+test "worker bridge binds model picker callback to current completion selection" {
+    const current_model = "anthropic/claude-opus-4.8";
+    const completions = [_][]const u8{
+        "provider/model-0",
+        current_model,
+    };
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.model_completion_values = &completions;
+    try app.selected_model.appendSlice(app.alloc, current_model);
+    const deps = Bindings(FakeApp).workerEventHandlers(&app);
+
+    try deps.open_model_picker(deps.ctx);
+
+    try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
+    var projected: [32][]const u8 = undefined;
+    const projected_count = input_completion_runtime.CompletionRuntime(FakeApp).modelPickerCompletions(&app, "", &projected);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        input_completion_runtime.CompletionRuntime(FakeApp).modelPickerIndex(&app, projected[0..projected_count]),
+    );
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "workerBridgeAppendText enqueues text without producer-owned gap mutation" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).workerEventHandlers(&app);
+    try deps.append_text(deps.ctx, "hello");
+
+    try std.testing.expectEqualStrings("hello", app.pacer.text.items);
+}
+
+test "worker bridge exposes assistant text drain separately from semantic notice" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).workerEventHandlers(&app);
+    try deps.append_text(deps.ctx, "partial output");
+    try std.testing.expectEqual(
+        app_worker_runtime.AssistantTextDrainResult.drained,
+        try deps.drain_assistant_text(deps.ctx),
+    );
+    try deps.semantic_notice(deps.ctx, .{
+        .topic = "system",
+        .tone = .neutral,
+        .body = "notice",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), app.pacer.flush_count);
+    try std.testing.expectEqual(@as(usize, 0), app.pacer.text.items.len);
+}
+
+test "worker bridge history append fallback updates runtime history" {
+    const alloc = std.testing.allocator;
+    var app = NoOverridePersistentApp{ .alloc = alloc };
+    defer app.deinit();
+
+    const deps = Bindings(NoOverridePersistentApp).workerEventHandlers(&app);
+    const turn = try session_runtime.makeAssistantTurn(alloc, "persist me", "saved");
+    defer session_runtime.freeHistoryTurn(alloc, turn);
+
+    try deps.append_history_turn(deps.ctx, .{ .turn = turn });
+
+    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+    try std.testing.expectEqualStrings(
+        "persist me",
+        app.session.agent.history.items[0].assistant.user.text,
+    );
+    try std.testing.expectEqualStrings(
+        "saved",
+        app.session.agent.history.items[0].assistant.assistant,
     );
 }

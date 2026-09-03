@@ -55,3 +55,15 @@ pub fn find(id: model_provider.ProviderId) *const Entry {
 pub fn label(id: model_provider.ProviderId) []const u8 {
     return find(id).route_name;
 }
+
+test "auth provider catalog uses the model provider identity and explicit aliases" {
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("vercel").?);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("gateway").?);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, parse("codex").?);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, parse("grok").?);
+    try std.testing.expect(parse("openai-codex") == null);
+    try std.testing.expect(parse("chatgpt") == null);
+    try std.testing.expect(parse("unknown") == null);
+    try std.testing.expect(find(.codex).subscription);
+    try std.testing.expect(find(.grok).subscription);
+}

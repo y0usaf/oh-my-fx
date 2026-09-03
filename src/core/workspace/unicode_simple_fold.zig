@@ -1658,3 +1658,28 @@ fn reference_fold(codepoint: u21) u21 {
     }
     return codepoint;
 }
+
+test "Unicode simple fold matches the reference for every codepoint" {
+    var value: u32 = 0;
+    while (value <= 0x10FFFF) : (value += 1) {
+        const codepoint: u21 = @intCast(value);
+        try std.testing.expectEqual(reference_fold(codepoint), fold(codepoint));
+    }
+}
+
+test "Unicode simple fold runtime data stays within budget" {
+    try std.testing.expect(runtime_mapping_bytes <= 1_840);
+}
+
+test "Unicode simple fold covers representative C and S mappings" {
+    try std.testing.expectEqual(@as(u21, 'a'), fold('A'));
+    try std.testing.expectEqual(@as(u21, 0x00E4), fold(0x00C4));
+    try std.testing.expectEqual(@as(u21, 0x03C3), fold(0x03A3));
+    try std.testing.expectEqual(@as(u21, 0x03C3), fold(0x03C2));
+    try std.testing.expectEqual(@as(u21, 'k'), fold(0x212A));
+}
+
+test "Unicode simple fold excludes full and Turkic mappings" {
+    try std.testing.expectEqual(@as(u21, 0x00DF), fold(0x00DF));
+    try std.testing.expectEqual(@as(u21, 0x0130), fold(0x0130));
+}

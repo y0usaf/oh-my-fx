@@ -399,6 +399,10 @@ fn countCandidateList(
     }
 }
 
+pub fn gitGrepArgvForTest() [9][]const u8 {
+    return .{ "git", "--no-optional-locks", "grep", "-n", "-I", "-F", "-z", "-e", "needle" };
+}
+
 const GitGrepMatchesResult = struct {
     candidate_count: usize = 0,
     truncated_reason: ?TruncatedReason = null,
@@ -803,6 +807,14 @@ fn workspaceRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
 }
 
+fn createBrokenSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, link_path: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    tmp.dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
+        if (err == error.AccessDenied or std.mem.eql(u8, @errorName(err), "Permission" ++ "Denied")) return error.SkipZigTest;
+        return err;
+    };
+}
+
 fn createSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, link_path: []const u8) !void {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
@@ -817,6 +829,20 @@ fn contentWithPrefix(alloc: Allocator, len: usize, prefix: []const u8) ![]u8 {
     const prefix_len = @min(prefix.len, content.len);
     @memcpy(content[0..prefix_len], prefix[0..prefix_len]);
     return content;
+}
+
+fn readFileToEndForTest(alloc: Allocator, absolute_path: []const u8, max_bytes: usize) ![]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, absolute_path, .{});
+    defer file.close(io_mod.getIo());
+    return io_mod.readFileToEnd(alloc, &file, max_bytes);
+}
+
+fn readTrace(alloc: Allocator, trace_path: []const u8) ![]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer file.close(io_mod.getIo());
+    var read_buf: [1024]u8 = undefined;
+    var reader = file.reader(std.testing.io, &read_buf);
+    return reader.interface.allocRemaining(alloc, std.Io.Limit.limited(4096));
 }
 
 fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !void {
@@ -838,4 +864,506 @@ fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !v
         .exited => |code| if (code != 0) return error.SkipZigTest,
         else => return error.SkipZigTest,
     }
+}
+
+test "grep search git grep argv uses literal fixed-string flags" {
+    const argv = gitGrepArgvForTest();
+
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
+    try std.testing.expectEqualStrings("grep", argv[2]);
+    try std.testing.expectEqualStrings("-n", argv[3]);
+    try std.testing.expectEqualStrings("-I", argv[4]);
+    try std.testing.expectEqualStrings("-F", argv[5]);
+    try std.testing.expectEqualStrings("-z", argv[6]);
+    try std.testing.expectEqualStrings("-e", argv[7]);
+}
+
+test "grep search preserves explicitly requested ignored directory roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const ignored = try writeTempFile(alloc, &tmp, "node_modules/pkg/ignored.txt", "needle ignored\n");
+    defer alloc.free(ignored);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, try io_mod.dirRealpathAlloc(arena_state.allocator(), tmp.dir, "node_modules/pkg"), "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "node_modules/pkg/ignored.txt"));
+    try std.testing.expectEqualStrings("needle ignored", result.matches[0].line);
+}
+
+test "grep search preserves explicitly requested ignored file roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const ignored = try writeTempFile(alloc, &tmp, "node_modules/pkg/ignored.txt", "needle ignored\n");
+    defer alloc.free(ignored);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectRegularFileRoot(arena_state.allocator(), workspace, ignored, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "node_modules/pkg/ignored.txt"));
+    try std.testing.expectEqualStrings("needle ignored", result.matches[0].line);
+}
+
+test "grep search does not ignore workspace because ignored name is outside workspace" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeTempFile(alloc, &tmp, "build/workspace/src/file.txt", "needle kept\n");
+    defer alloc.free(path);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "build/workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "src/file.txt"));
+}
+
+test "grep search falls back to Zig scanner outside git repositories" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const file_path = try writeTempFile(alloc, &tmp, "src/main.zig", "needle fallback\n");
+    defer alloc.free(file_path);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "src/main.zig"));
+    try std.testing.expectEqualStrings("needle fallback", result.matches[0].line);
+}
+
+test "grep search scans untracked files after git grep tracked backend" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    try runGitForTest(alloc, workspace, &.{"init"});
+    const tracked = try writeTempFile(alloc, &tmp, "tracked.txt", "no match\n");
+    defer alloc.free(tracked);
+    try runGitForTest(alloc, workspace, &.{ "add", "tracked.txt" });
+    const untracked = try writeTempFile(alloc, &tmp, "untracked.txt", "needle untracked\n");
+    defer alloc.free(untracked);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "untracked.txt"));
+    try std.testing.expectEqualStrings("needle untracked", result.matches[0].line);
+}
+
+test "grep search git grep backend skips files with unsafe bytes outside matched line" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    try runGitForTest(alloc, workspace, &.{"init"});
+    const unsafe = try writeTempFile(alloc, &tmp, "unsafe.txt", "needle safe\ninvalid \xff bytes\n");
+    defer alloc.free(unsafe);
+    try runGitForTest(alloc, workspace, &.{ "add", "unsafe.txt" });
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 0), result.matches.len);
+}
+
+test "grep search logs skipped non-model-safe files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const binary = try writeTempFile(alloc, &tmp, "binary.txt", "needle\x00binary\n");
+    defer alloc.free(binary);
+    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectRegularFileRoot(arena_state.allocator(), workspace, binary, "needle", false, null);
+    try std.testing.expectEqual(@as(usize, 0), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "grep_files skipped non-text file path=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "binary.txt") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "reason=contains_nul") != null);
+}
+
+test "grep search logs skipped per-file scan errors during directory traversal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const good = try writeTempFile(alloc, &tmp, "good.txt", "needle good\n");
+    defer alloc.free(good);
+    try createBrokenSymlinkOrSkip(&tmp, "missing-target.txt", "broken.txt");
+    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var pattern = try glob_pattern.Pattern.compile(alloc, "*.txt");
+    defer pattern.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, pattern);
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "grep_files scan skipped path=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "broken.txt") != null);
+}
+
+test "grep search directory traversal skips external symlink targets with trace" {
+    const alloc = std.testing.allocator;
+    var workspace_tmp = std.testing.tmpDir(.{});
+    defer workspace_tmp.cleanup();
+    var external_tmp = std.testing.tmpDir(.{});
+    defer external_tmp.cleanup();
+
+    const workspace = try workspaceRoot(alloc, workspace_tmp);
+    defer alloc.free(workspace);
+    const internal_target = try writeTempFile(alloc, &workspace_tmp, "target/internal.txt", "needle internal\n");
+    defer alloc.free(internal_target);
+    const external_target = try writeTempFile(alloc, &external_tmp, "outside.txt", "needle external\n");
+    defer alloc.free(external_target);
+    try workspace_tmp.dir.createDirPath(io_mod.getIo(), "links");
+    try createSymlinkOrSkip(&workspace_tmp, "../target/internal.txt", "links/internal.txt");
+    try createSymlinkOrSkip(&workspace_tmp, external_target, "links/external.txt");
+
+    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const links_root = try io_mod.dirRealpathAlloc(arena_state.allocator(), workspace_tmp.dir, "links");
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, links_root, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "links/internal.txt"));
+    try std.testing.expectEqualStrings("needle internal", result.matches[0].line);
+
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "grep_files skipped external symlink target path=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "links/external.txt") != null);
+    try std.testing.expect(std.mem.find(u8, trace, external_target) != null);
+}
+
+test "grep search file-byte cap uses one-byte sentinel limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const exact_content = try contentWithPrefix(alloc, file_byte_cap, "needle\n");
+    defer alloc.free(exact_content);
+    const exact = try writeTempFile(alloc, &tmp, "exact.txt", exact_content);
+    defer alloc.free(exact);
+    const over_content = try contentWithPrefix(alloc, file_byte_cap + 1, "needle\n");
+    defer alloc.free(over_content);
+    const over = try writeTempFile(alloc, &tmp, "over.txt", over_content);
+    defer alloc.free(over);
+
+    const exact_at_cap_limit = readFileToEndForTest(alloc, exact, file_byte_cap);
+    if (exact_at_cap_limit) |bytes| {
+        defer alloc.free(bytes);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.StreamTooLong, err);
+    }
+
+    const exact_read = try readFileToEndForTest(alloc, exact, file_byte_cap + 1);
+    defer alloc.free(exact_read);
+    try std.testing.expectEqual(file_byte_cap, exact_read.len);
+
+    const over_read = readFileToEndForTest(alloc, over, file_byte_cap + 1);
+    if (over_read) |bytes| {
+        defer alloc.free(bytes);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.StreamTooLong, err);
+    }
+}
+
+test "grep search scans files exactly at byte cap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const content = try contentWithPrefix(alloc, file_byte_cap, "needle\n");
+    defer alloc.free(content);
+    const exact = try writeTempFile(alloc, &tmp, "exact.txt", content);
+    defer alloc.free(exact);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectRegularFileRoot(arena_state.allocator(), workspace, exact, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "exact.txt"));
+    try std.testing.expectEqual(@as(usize, 1), result.matches[0].line_number);
+    try std.testing.expectEqualStrings("needle", result.matches[0].line);
+}
+
+test "grep search retained allocations scale with matches not scanned bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    const nonmatching_content = try contentWithPrefix(alloc, 12 * 1024, "not here\n");
+    defer alloc.free(nonmatching_content);
+
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "large/file-{d}.txt", .{i});
+        const path = try writeTempFile(alloc, &tmp, name, nonmatching_content);
+        alloc.free(path);
+    }
+    const matching = try writeTempFile(alloc, &tmp, "large/match.txt", "needle kept\n");
+    defer alloc.free(matching);
+
+    var retained_buf: [8 * 1024]u8 = undefined;
+    var retained_fba = std.heap.FixedBufferAllocator.init(&retained_buf);
+    const result = try collectDirectoryMatches(retained_fba.allocator(), workspace, workspace, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "large/match.txt"));
+    try std.testing.expectEqualStrings("needle kept", result.matches[0].line);
+}
+
+test "grep search logs oversized files and continues directory traversal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const good = try writeTempFile(alloc, &tmp, "good.txt", "needle good\n");
+    defer alloc.free(good);
+    const content = try contentWithPrefix(alloc, file_byte_cap + 1, "needle hidden\n");
+    defer alloc.free(content);
+    const large = try writeTempFile(alloc, &tmp, "large.txt", content);
+    defer alloc.free(large);
+    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "good.txt"));
+
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "grep_files skipped oversized file path=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "large.txt") != null);
+}
+
+test "grep search skips oversized regular-file roots with trace" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const content = try contentWithPrefix(alloc, file_byte_cap + 1, "needle hidden\n");
+    defer alloc.free(content);
+    const large = try writeTempFile(alloc, &tmp, "large.txt", content);
+    defer alloc.free(large);
+    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectRegularFileRoot(arena_state.allocator(), workspace, large, "needle", false, null);
+    try std.testing.expectEqual(@as(usize, 0), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "grep_files skipped oversized file path=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "large.txt") != null);
+}
+
+test "grep search finds match beyond former traversal cap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    var i: usize = 0;
+    while (i < 2050) : (i += 1) {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "many/file-{d:0>4}.txt", .{i});
+        const path = try writeTempFile(alloc, &tmp, name, "not here\n");
+        alloc.free(path);
+    }
+    const late = try writeTempFile(alloc, &tmp, "zzzz/match.txt", "needle late\n");
+    defer alloc.free(late);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "zzzz/match.txt"));
+}
+
+test "grep_files path narrowing applies before candidate cap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const outside = try writeTempFile(alloc, &tmp, "aaa/outside.txt", "needle outside\n");
+    defer alloc.free(outside);
+    const target = try writeTempFile(alloc, &tmp, "src/core/target.txt", "needle target\n");
+    defer alloc.free(target);
+    const narrowed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src/core");
+    defer alloc.free(narrowed_root);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatchesWithOptions(
+        arena_state.allocator(),
+        workspace,
+        narrowed_root,
+        "needle",
+        false,
+        ignored_dirs.ignored_directory_names,
+        null,
+        .{
+            .candidate_cap = 1,
+            .force_fallback = true,
+        },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), result.candidate_count);
+    try std.testing.expect(!result.candidate_incomplete);
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "src/core/target.txt"));
+    try std.testing.expectEqualStrings("needle target", result.matches[0].line);
+}
+
+test "grep search collection cap saturation reports metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    var content: std.Io.Writer.Allocating = .init(alloc);
+    defer content.deinit();
+    var i: usize = 0;
+    while (i < collection_cap + 1) : (i += 1) {
+        try content.writer.writeAll("needle\n");
+    }
+    const path = try writeTempFile(alloc, &tmp, "many.txt", content.written());
+    defer alloc.free(path);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectRegularFileRoot(arena_state.allocator(), workspace, path, "needle", false, null);
+
+    try std.testing.expectEqual(collection_cap, result.matches.len);
+    try std.testing.expectEqual(TruncatedReason.collection_cap, result.truncated_reason.?);
+}
+
+test "grep search collection cap takes precedence at traversal boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "file-{d:0>4}.txt", .{i});
+        const path = try writeTempFile(alloc, &tmp, name, "not here\n");
+        alloc.free(path);
+    }
+
+    var content: std.Io.Writer.Allocating = .init(alloc);
+    defer content.deinit();
+    i = 0;
+    while (i < collection_cap + 1) : (i += 1) {
+        try content.writer.writeAll("needle\n");
+    }
+    const match_path = try writeTempFile(alloc, &tmp, "zzzz/many.txt", content.written());
+    defer alloc.free(match_path);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+
+    try std.testing.expectEqual(collection_cap, result.matches.len);
+    try std.testing.expectEqual(TruncatedReason.collection_cap, result.truncated_reason.?);
+}
+
+test "grep search does not import tool dispatch layer" {
+    const alloc = std.testing.allocator;
+    var file = try std.Io.Dir.cwd().openFile(io_mod.getIo(), "src/core/workspace/grep_search.zig", .{});
+    defer file.close(io_mod.getIo());
+    const source = try io_mod.readFileToEnd(alloc, &file, 128 * 1024);
+    defer alloc.free(source);
+
+    const forbidden = "tool_" ++ "dispatch.zig";
+    try std.testing.expect(std.mem.find(u8, source, forbidden) == null);
 }

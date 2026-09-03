@@ -88,6 +88,31 @@ pub const TeamSelection = struct {
         return session.team_id orelse session.team_slug;
     }
 
+    /// Returns an owned candidate for authenticated Gateway validation without
+    /// changing the durable session. The caller must deinitialize the result.
+    pub fn validationCredential(
+        self: *const TeamSelection,
+        alloc: Allocator,
+        selected_index: usize,
+    ) !credentials.Credential {
+        const session = self.session orelse return LoginError.NoSession;
+        if (selected_index >= self.teams.items.len) return LoginError.InvalidTeamSelection;
+        const selected = self.teams.items[selected_index];
+
+        const token = try alloc.dupe(u8, session.access_token);
+        errdefer secret.zeroAndFree(alloc, token);
+        const team_id = try alloc.dupe(u8, selected.id);
+        errdefer alloc.free(team_id);
+        const team_slug = try alloc.dupe(u8, selected.slug);
+        errdefer alloc.free(team_slug);
+        return .{
+            .token = token,
+            .source = .fx_login,
+            .team_id = team_id,
+            .team_slug = team_slug,
+        };
+    }
+
     pub fn select(self: *const TeamSelection, alloc: Allocator, selected_index: usize) !SelectedTeam {
         const session = self.session orelse return LoginError.NoSession;
         if (selected_index >= self.teams.items.len) return LoginError.InvalidTeamSelection;
@@ -118,6 +143,42 @@ pub const TeamSelection = struct {
         };
     }
 };
+
+pub const TeamValidationResult = enum {
+    accepted,
+    rejected,
+};
+
+pub const TeamValidator = struct {
+    context: ?*anyopaque = null,
+    validate_fn: *const fn (
+        ?*anyopaque,
+        credentials.Credential,
+    ) std.mem.Allocator.Error!TeamValidationResult,
+
+    pub fn validate(
+        self: TeamValidator,
+        credential: credentials.Credential,
+    ) std.mem.Allocator.Error!TeamValidationResult {
+        return self.validate_fn(self.context, credential);
+    }
+};
+
+/// Validates the proposed token/team authority before the existing selection
+/// mutation acquires its lock and commits durable state.
+pub fn validateAndSelectTeam(
+    alloc: Allocator,
+    selection: *const TeamSelection,
+    selected_index: usize,
+    validator: TeamValidator,
+) !SelectedTeam {
+    var candidate = try selection.validationCredential(alloc, selected_index);
+    defer candidate.deinit(alloc);
+    if (try validator.validate(candidate) != .accepted) {
+        return error.TeamValidationFailed;
+    }
+    return selection.select(alloc, selected_index);
+}
 
 pub const SignInState = enum {
     idle,
@@ -596,8 +657,6 @@ pub fn runLogin(
     defer session.deinit(alloc);
 
     try oauth_session.saveNewSession(alloc, session);
-    try writeStdout("Signed in to Vercel.\n");
-    try writeStdout("AI Gateway access may still require billing or API setup for the selected account.\n");
 }
 
 fn take_login_session(
@@ -647,6 +706,7 @@ fn take_login_session(
 pub fn runTeams(
     alloc: Allocator,
     transport: oauth_transport.Provider,
+    validator: TeamValidator,
 ) !void {
     var selection = try loadTeamSelection(alloc, transport);
     defer selection.deinit(alloc);
@@ -654,7 +714,7 @@ pub fn runTeams(
     const selected_index = (try selectTeam(alloc, selection.teams.items, selection.currentTeam())) orelse
         return LoginError.NoTeams;
     const selected = selection.teams.items[selected_index];
-    var changed_team = try selection.select(alloc, selected_index);
+    var changed_team = try validateAndSelectTeam(alloc, &selection, selected_index, validator);
     defer changed_team.deinit(alloc);
     try writeStdoutFmt("Selected Vercel team: {s} ({s}).\n", .{ selected.name, selected.slug });
 }
@@ -705,9 +765,12 @@ pub fn logout(
             return LogoutError.SessionDeleteFailed;
         }) orelse return .{};
         defer mutation.deinit();
-        session = mutation.load(alloc) catch load: {
-            session_load_failed = true;
-            break :load null;
+        session = mutation.load(alloc) catch |err| switch (err) {
+            error.InvalidAuthSession => null,
+            else => load: {
+                session_load_failed = true;
+                break :load null;
+            },
         };
         break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
             .local_cleanup_failed = true,
@@ -1358,9 +1421,131 @@ fn check_parse_teams_allocation_failures(alloc: Allocator) !void {
     defer freeTeams(alloc, &teams);
 }
 
+fn check_take_login_session_allocation_failures(alloc: Allocator) !void {
+    var token = oauth.TokenSet{
+        .access_token = &.{},
+        .expires_in = 3600,
+        .scope = &.{},
+        .token_type = &.{},
+    };
+    defer token.deinit(alloc);
+    token.access_token = try alloc.dupe(u8, "access");
+    token.refresh_token = try alloc.dupe(u8, "refresh");
+    token.scope = try alloc.dupe(u8, oauth.default_scope);
+    token.token_type = try alloc.dupe(u8, "Bearer");
+
+    var team_id = [_]u8{'i'};
+    var team_slug = [_]u8{'s'};
+    var team_name = [_]u8{'n'};
+    const team = Team{
+        .id = &team_id,
+        .slug = &team_slug,
+        .name = &team_name,
+    };
+    var session = try take_login_session(
+        alloc,
+        "https://vercel.com",
+        "client",
+        &token,
+        &team,
+        1_000,
+    );
+    defer session.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), token.access_token.len);
+    try std.testing.expect(token.refresh_token == null);
+}
+
 fn freeTeams(alloc: Allocator, teams: *std.ArrayList(Team)) void {
     for (teams.items) |*team| team.deinit(alloc);
     teams.deinit(alloc);
+}
+
+test "team parsing cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_parse_teams_allocation_failures, .{});
+}
+
+test "single team selection does not allocate" {
+    var id = [_]u8{'i'};
+    var slug = [_]u8{'s'};
+    var name = [_]u8{'n'};
+    const teams = [_]Team{.{
+        .id = &id,
+        .slug = &slug,
+        .name = &name,
+    }};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expect((try selectTeam(failing.allocator(), &teams, null)) != null);
+}
+
+test "team selection stages an owned validation credential before commit" {
+    const alloc = std.testing.allocator;
+    var selection = TeamSelection{ .session = .{
+        .issuer = try alloc.dupe(u8, "https://vercel.com"),
+        .client_id = try alloc.dupe(u8, "client"),
+        .access_token = try alloc.dupe(u8, "access-token"),
+        .refresh_token = try alloc.dupe(u8, "refresh-token"),
+        .expires_at_ms = 100_000,
+        .scope = try alloc.dupe(u8, "openid offline_access"),
+        .token_type = try alloc.dupe(u8, "Bearer"),
+        .team_id = try alloc.dupe(u8, "team_old"),
+        .team_slug = try alloc.dupe(u8, "old-team"),
+    } };
+    defer selection.deinit(alloc);
+    try selection.teams.append(alloc, .{
+        .id = try alloc.dupe(u8, "team_new"),
+        .slug = try alloc.dupe(u8, "new-team"),
+        .name = try alloc.dupe(u8, "New Team"),
+    });
+
+    var candidate = try selection.validationCredential(alloc, 0);
+    defer candidate.deinit(alloc);
+
+    try std.testing.expectEqual(credentials.Source.fx_login, candidate.source);
+    try std.testing.expectEqualStrings("access-token", candidate.token);
+    try std.testing.expectEqualStrings("team_new", candidate.team_id.?);
+    try std.testing.expectEqualStrings("new-team", candidate.team_slug.?);
+    try std.testing.expectEqualStrings("team_old", selection.currentTeam().?);
+}
+
+test "team validation failure prevents the durable selection commit" {
+    const alloc = std.testing.allocator;
+    var selection = TeamSelection{ .session = .{
+        .issuer = try alloc.dupe(u8, "https://vercel.com"),
+        .client_id = try alloc.dupe(u8, "client"),
+        .access_token = try alloc.dupe(u8, "access-token"),
+        .refresh_token = try alloc.dupe(u8, "refresh-token"),
+        .expires_at_ms = 100_000,
+        .scope = try alloc.dupe(u8, "openid offline_access"),
+        .token_type = try alloc.dupe(u8, "Bearer"),
+        .team_id = try alloc.dupe(u8, "team_old"),
+        .team_slug = try alloc.dupe(u8, "old-team"),
+    } };
+    defer selection.deinit(alloc);
+    try selection.teams.append(alloc, .{
+        .id = try alloc.dupe(u8, "team_new"),
+        .slug = try alloc.dupe(u8, "new-team"),
+        .name = try alloc.dupe(u8, "New Team"),
+    });
+
+    const Reject = struct {
+        fn validate(
+            _: ?*anyopaque,
+            _: credentials.Credential,
+        ) std.mem.Allocator.Error!TeamValidationResult {
+            return .rejected;
+        }
+    };
+    try std.testing.expectError(
+        error.TeamValidationFailed,
+        validateAndSelectTeam(alloc, &selection, 0, .{ .validate_fn = Reject.validate }),
+    );
+    try std.testing.expectEqualStrings("team_old", selection.currentTeam().?);
+}
+
+test "login session transfer cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_take_login_session_allocation_failures, .{});
 }
 
 fn readLine(alloc: Allocator) ![]u8 {
@@ -1380,6 +1565,116 @@ fn writeStdoutFmt(comptime fmt: []const u8, args: anytype) !void {
     try writeStdout(text);
 }
 
+test "login flow parses teams" {
+    var teams = try parseTeams(
+        std.testing.allocator,
+        "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"vercel-labs\",\"name\":\"Vercel Labs\"},{\"id\":\"team_2\",\"slug\":\"personal\"}]}",
+    );
+    defer freeTeams(std.testing.allocator, &teams);
+    try std.testing.expectEqual(@as(usize, 2), teams.items.len);
+    try std.testing.expectEqualStrings("team_1", teams.items[0].id);
+    try std.testing.expectEqualStrings("Vercel Labs", teams.items[0].name);
+    try std.testing.expectEqualStrings("personal", teams.items[1].name);
+}
+
+const ScriptedPollResult = enum {
+    pending,
+    slow_down,
+    success,
+};
+
+const LoginPollTestState = struct {
+    alloc: Allocator,
+    results: []const ScriptedPollResult,
+    poll_index: usize = 0,
+    sleep_calls: std.ArrayList(u64) = .empty,
+    wait_calls: std.ArrayList(u64) = .empty,
+    enter_on_wait: ?usize = null,
+    open_count: usize = 0,
+    opened_url: ?[]const u8 = null,
+    open_available: bool = true,
+    open_error: bool = false,
+    now_ms: i64 = 0,
+
+    fn init(alloc: Allocator, results: []const ScriptedPollResult) LoginPollTestState {
+        return .{ .alloc = alloc, .results = results };
+    }
+
+    fn deinit(self: *LoginPollTestState) void {
+        self.sleep_calls.deinit(self.alloc);
+        self.wait_calls.deinit(self.alloc);
+    }
+
+    fn deps(self: *LoginPollTestState) LoginPollDeps {
+        return .{
+            .ctx = self,
+            .now_ms = testNowMs,
+            .poll_device_token = testPollDeviceToken,
+            .sleep_ms = testSleepMs,
+            .wait_for_enter = testWaitForEnter,
+            .url_opener = .{
+                .context = self,
+                .open_fn = testOpenBrowser,
+            },
+        };
+    }
+
+    fn testNowMs(raw: ?*anyopaque) i64 {
+        const self = testState(raw);
+        return self.now_ms;
+    }
+
+    fn testPollDeviceToken(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        _: oauth_transport.Provider,
+        _: oauth.Metadata,
+        _: []const u8,
+        _: []const u8,
+        _: *std.atomic.Value(bool),
+        _: std.Io.Clock.Timestamp,
+    ) !oauth.PollResult {
+        const self = testState(raw);
+        if (self.poll_index >= self.results.len) return error.TestUnexpectedDevicePoll;
+        const result = self.results[self.poll_index];
+        self.poll_index += 1;
+        return switch (result) {
+            .pending => .pending,
+            .slow_down => .slow_down,
+            .success => .{ .success = try testTokenSet(alloc) },
+        };
+    }
+
+    fn testSleepMs(raw: ?*anyopaque, ms: u64) void {
+        const self = testState(raw);
+        self.sleep_calls.append(self.alloc, ms) catch unreachable;
+        self.now_ms += @intCast(ms);
+    }
+
+    fn testWaitForEnter(raw: ?*anyopaque, timeout_ms: u64) bool {
+        const self = testState(raw);
+        self.wait_calls.append(self.alloc, timeout_ms) catch unreachable;
+        self.now_ms += @intCast(timeout_ms);
+        return if (self.enter_on_wait) |index| self.wait_calls.items.len == index else false;
+    }
+
+    fn testOpenBrowser(
+        raw: ?*anyopaque,
+        _: Allocator,
+        url: []const u8,
+    ) host.UrlOpenError!bool {
+        const self = testState(raw);
+        self.open_count += 1;
+        self.opened_url = url;
+        if (self.open_error) return error.OutOfMemory;
+        return self.open_available;
+    }
+
+    fn testState(raw: ?*anyopaque) *LoginPollTestState {
+        return @ptrCast(@alignCast(raw.?));
+    }
+};
+
 fn testMetadata() oauth.Metadata {
     return .{
         .issuer = @constCast("https://vercel.test"),
@@ -1395,6 +1690,166 @@ fn testDevice() oauth.DeviceAuthorization {
         .verification_uri = @constCast("https://vercel.test/oauth/device"),
         .expires_in = 60,
         .interval = 1,
+    };
+}
+
+fn testTokenSet(alloc: Allocator) !oauth.TokenSet {
+    return .{
+        .access_token = try alloc.dupe(u8, "access"),
+        .refresh_token = try alloc.dupe(u8, "refresh"),
+        .expires_in = 3600,
+        .scope = try alloc.dupe(u8, oauth.default_scope),
+        .token_type = try alloc.dupe(u8, "Bearer"),
+    };
+}
+
+const SignInTestPollMode = enum {
+    pending_then_wait,
+    in_flight,
+    success,
+};
+
+const SignInTestState = struct {
+    mode: SignInTestPollMode,
+    poll_started: std.atomic.Value(bool) = .init(false),
+    poll_count: std.atomic.Value(usize) = .init(0),
+    complete_count: std.atomic.Value(usize) = .init(0),
+    save_count: std.atomic.Value(usize) = .init(0),
+
+    fn deps(self: *@This()) SignInRuntimeDeps {
+        return .{
+            .ctx = self,
+            .poll = .{
+                .ctx = self,
+                .poll_device_token = poll,
+            },
+            .complete = complete,
+            .save = save,
+        };
+    }
+
+    fn poll(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        _: oauth_transport.Provider,
+        _: oauth.Metadata,
+        _: []const u8,
+        _: []const u8,
+        cancel_flag: *std.atomic.Value(bool),
+        _: std.Io.Clock.Timestamp,
+    ) !oauth.PollResult {
+        const self = state(raw);
+        _ = self.poll_count.fetchAdd(1, .seq_cst);
+        self.poll_started.store(true, .seq_cst);
+        return switch (self.mode) {
+            .pending_then_wait => .pending,
+            .in_flight => {
+                while (!cancel_flag.load(.seq_cst)) blockingSleep(1);
+                return error.Cancelled;
+            },
+            .success => .{ .success = try testTokenSet(alloc) },
+        };
+    }
+
+    fn complete(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        issuer_url: []const u8,
+        client_id: []const u8,
+        token: *oauth.TokenSet,
+    ) !SignInCompletion {
+        const self = state(raw);
+        _ = self.complete_count.fetchAdd(1, .seq_cst);
+        return .{ .vercel = .{
+            .session = try take_login_session(
+                alloc,
+                issuer_url,
+                client_id,
+                token,
+                null,
+                0,
+            ),
+        } };
+    }
+
+    fn save(raw: ?*anyopaque, _: Allocator, _: SignInCompletion) !void {
+        const self = state(raw);
+        _ = self.save_count.fetchAdd(1, .seq_cst);
+    }
+
+    fn state(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+};
+
+const CooperativeSignInTestState = struct {
+    poll: LoginPollTestState,
+    complete_count: usize = 0,
+    save_count: usize = 0,
+    fail_save: bool = false,
+
+    fn init(alloc: Allocator, results: []const ScriptedPollResult) @This() {
+        return .{ .poll = LoginPollTestState.init(alloc, results) };
+    }
+
+    fn deinit(self: *@This()) void {
+        self.poll.deinit();
+    }
+
+    fn deps(self: *@This()) SignInRuntimeDeps {
+        return .{
+            .ctx = self,
+            .poll = self.poll.deps(),
+            .complete = complete,
+            .save = save,
+        };
+    }
+
+    fn complete(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        issuer_url: []const u8,
+        client_id: []const u8,
+        token: *oauth.TokenSet,
+    ) !SignInCompletion {
+        const self = state(raw);
+        self.complete_count += 1;
+        return .{ .vercel = .{ .session = try take_login_session(
+            alloc,
+            issuer_url,
+            client_id,
+            token,
+            null,
+            0,
+        ) } };
+    }
+
+    fn save(raw: ?*anyopaque, _: Allocator, _: SignInCompletion) !void {
+        const self = state(raw);
+        self.save_count += 1;
+        if (self.fail_save) return error.TestStoreCommitFailed;
+    }
+
+    fn state(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+};
+
+fn makeTestPreparedLogin(alloc: Allocator) !PreparedLogin {
+    var metadata = try oauth.parseMetadata(
+        alloc,
+        "{\"issuer\":\"https://vercel.test\",\"device_authorization_endpoint\":\"https://vercel.test/device\",\"token_endpoint\":\"https://vercel.test/token\"}",
+    );
+    errdefer metadata.deinit(alloc);
+    var device = try oauth.parseDeviceAuthorization(
+        alloc,
+        "{\"device_code\":\"device\",\"user_code\":\"USER-CODE\",\"verification_uri\":\"https://vercel.test/oauth/device\",\"verification_uri_complete\":\"https://vercel.test/oauth/device?code=USER-CODE\",\"expires_in\":60,\"interval\":1}",
+    );
+    errdefer device.deinit(alloc);
+    return .{
+        .metadata = metadata,
+        .device = device,
+        .client_id = try alloc.dupe(u8, "client"),
     };
 }
 
@@ -1424,6 +1879,30 @@ fn waitForSignInTransition(
         blockingSleep(1);
     }
     return runtime.pollTransition(alloc);
+}
+
+test "sign-in runtime releases an owned provider context exactly once" {
+    const Cleanup = struct {
+        fn run(raw: ?*anyopaque, _: Allocator) void {
+            const count: *usize = @ptrCast(@alignCast(raw.?));
+            count.* += 1;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var cleanup_count: usize = 0;
+    var runtime: SignInRuntime = .{};
+    try std.testing.expect(try runtime.startPreparedCooperative(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        .{
+            .ctx = &cleanup_count,
+            .deinit_ctx = Cleanup.run,
+        },
+    ));
+    try std.testing.expect(runtime.cancel(alloc));
+    runtime.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cleanup_count);
 }
 
 const WithholdingTokenFixture = struct {
@@ -1523,4 +2002,439 @@ fn makeLoopbackPreparedLogin(alloc: Allocator, token_endpoint: []const u8) !Prep
 
 fn elapsedAwakeMs(started: std.Io.Clock.Timestamp) i64 {
     return started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+}
+
+test "cooperative sign-in polls once per pulse and shares pending and slow_down timing" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = CooperativeSignInTestState.init(alloc, &.{ .pending, .slow_down, .success });
+    defer state.deinit();
+    try std.testing.expect(try runtime.startPreparedCooperative(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        state.deps(),
+    ));
+
+    runtime.pulseCooperative(alloc);
+    try std.testing.expectEqual(@as(usize, 1), state.poll.poll_index);
+    try std.testing.expectEqual(@as(i64, 1000), runtime.poll_state.?.next_poll_at_ms);
+    runtime.pulseCooperative(alloc);
+    try std.testing.expectEqual(@as(usize, 1), state.poll.poll_index);
+
+    state.poll.now_ms = 1000;
+    runtime.pulseCooperative(alloc);
+    try std.testing.expectEqual(@as(usize, 2), state.poll.poll_index);
+    try std.testing.expectEqual(@as(u64, 6000), runtime.poll_state.?.interval_ms);
+    try std.testing.expectEqual(@as(i64, 7000), runtime.poll_state.?.next_poll_at_ms);
+    state.poll.now_ms = 6999;
+    runtime.pulseCooperative(alloc);
+    try std.testing.expectEqual(@as(usize, 2), state.poll.poll_index);
+
+    state.poll.now_ms = 7000;
+    runtime.pulseCooperative(alloc);
+    var transition = runtime.pollTransition(alloc);
+    switch (transition) {
+        .succeeded => |*selection| selection.deinit(alloc),
+        else => return error.TestExpectedSuccessfulSignIn,
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.complete_count);
+    try std.testing.expectEqual(@as(usize, 1), state.save_count);
+}
+
+test "cooperative sign-in cancellation publishes no session" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = CooperativeSignInTestState.init(alloc, &.{.pending});
+    defer state.deinit();
+    try std.testing.expect(try runtime.startPreparedCooperative(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        state.deps(),
+    ));
+    runtime.pulseCooperative(alloc);
+
+    try std.testing.expect(runtime.cancel(alloc));
+    try std.testing.expectEqual(SignInTransition.cancelled, runtime.pollTransition(alloc));
+    try std.testing.expectEqual(@as(usize, 0), state.complete_count);
+    try std.testing.expectEqual(@as(usize, 0), state.save_count);
+}
+
+test "cooperative sign-in reports device-code expiry without another poll" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = CooperativeSignInTestState.init(alloc, &.{.success});
+    defer state.deinit();
+    var prepared = try makeTestPreparedLogin(alloc);
+    prepared.device.expires_in = 1;
+    try std.testing.expect(try runtime.startPreparedCooperative(alloc, prepared, state.deps()));
+    state.poll.now_ms = 1000;
+    runtime.pulseCooperative(alloc);
+
+    switch (runtime.pollTransition(alloc)) {
+        .failed => |err| try std.testing.expectEqual(LoginError.LoginTimedOut, err),
+        else => return error.TestExpectedExpiredSignIn,
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.poll.poll_index);
+    try std.testing.expectEqual(@as(usize, 0), state.save_count);
+}
+
+test "cooperative sign-in store failure is traced and becomes a recoverable transition" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "sign-in-store-failure.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "auth");
+
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = CooperativeSignInTestState.init(alloc, &.{.success});
+    defer state.deinit();
+    state.fail_save = true;
+    try std.testing.expect(try runtime.startPreparedCooperative(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        state.deps(),
+    ));
+    runtime.pulseCooperative(alloc);
+
+    switch (runtime.pollTransition(alloc)) {
+        .failed => |err| try std.testing.expectEqual(error.TestStoreCommitFailed, err),
+        else => return error.TestExpectedStoreFailure,
+    }
+    debug_trace.shutdown();
+    var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer trace_file.close(std.testing.io);
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "sign-in session save failed err=TestStoreCommitFailed") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "access") == null);
+    try std.testing.expect(std.mem.find(u8, trace, "refresh") == null);
+}
+
+test "VT-8(b) cancelling sign-in during the inter-poll wait publishes and saves nothing" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = SignInTestState{ .mode = .pending_then_wait };
+
+    try std.testing.expect(try runtime.startPrepared(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        state.deps(),
+    ));
+    try std.testing.expect(waitForAtomic(&state.poll_started, 500));
+    try std.testing.expect(runtime.cancel(alloc));
+
+    try std.testing.expectEqual(SignInTransition.cancelled, runtime.pollTransition(alloc));
+    try std.testing.expectEqual(@as(usize, 0), state.complete_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), state.save_count.load(.seq_cst));
+    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(runtime.flow == null);
+}
+
+test "VT-8(b) cancelling sign-in during an in-flight poll publishes and saves nothing" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = SignInTestState{ .mode = .in_flight };
+
+    try std.testing.expect(try runtime.startPrepared(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        state.deps(),
+    ));
+    try std.testing.expect(waitForAtomic(&state.poll_started, 500));
+    try std.testing.expect(runtime.cancel(alloc));
+
+    try std.testing.expectEqual(SignInTransition.cancelled, runtime.pollTransition(alloc));
+    try std.testing.expectEqual(@as(usize, 0), state.complete_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), state.save_count.load(.seq_cst));
+    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(runtime.flow == null);
+}
+
+test "VT-8(c) cancelled sign-in is reaped before a second flow completes" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = SignInTestState{ .mode = .in_flight };
+
+    try std.testing.expect(try runtime.startPrepared(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        state.deps(),
+    ));
+    try std.testing.expect(waitForAtomic(&state.poll_started, 500));
+    try std.testing.expect(runtime.cancel(alloc));
+    try std.testing.expectEqual(SignInTransition.cancelled, runtime.pollTransition(alloc));
+    try std.testing.expect(runtime.thread == null);
+
+    state.mode = .success;
+    state.poll_started.store(false, .seq_cst);
+    try std.testing.expect(try runtime.startPrepared(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        state.deps(),
+    ));
+    const transition = waitForSignInTransition(&runtime, alloc, 500);
+    switch (transition) {
+        .succeeded => |completed| {
+            var selection = completed;
+            defer selection.deinit(alloc);
+        },
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.complete_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), state.save_count.load(.seq_cst));
+    try std.testing.expect(runtime.thread == null);
+}
+
+test "VT-8(d) sign-in deinit cancels and joins a live worker" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    var state = SignInTestState{ .mode = .in_flight };
+
+    try std.testing.expect(try runtime.startPrepared(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        state.deps(),
+    ));
+    try std.testing.expect(waitForAtomic(&state.poll_started, 500));
+    runtime.deinit(alloc);
+
+    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(runtime.flow == null);
+    try std.testing.expectEqual(SignInState.idle, runtime.state);
+    try std.testing.expectEqual(@as(usize, 0), state.complete_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), state.save_count.load(.seq_cst));
+}
+
+test "VT-8(e) withheld token HTTP poll has bounded timeout cancel restart and deinit" {
+    const alloc = std.testing.allocator;
+
+    var timeout_fixture = try WithholdingTokenFixture.init();
+    defer timeout_fixture.deinit();
+    try timeout_fixture.start();
+    const timeout_endpoint = try timeout_fixture.tokenEndpoint(alloc);
+    defer alloc.free(timeout_endpoint);
+    var timeout_runtime: SignInRuntime = .{};
+    defer timeout_runtime.deinit(alloc);
+    const timeout_started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expect(try timeout_runtime.startPrepared(
+        alloc,
+        try makeLoopbackPreparedLogin(alloc, timeout_endpoint),
+        .{
+            .oauth_transport = test_builtin_gateway.oauth_transport_provider,
+            .poll = .{ .request_timeout_ms = 40 },
+        },
+    ));
+    const timeout_transition = waitForSignInTransition(&timeout_runtime, alloc, 1000);
+    switch (timeout_transition) {
+        .failed => |err| try std.testing.expect(err == error.Timeout),
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expect(waitForAtomic(&timeout_fixture.accepted, 500));
+    try std.testing.expect(elapsedAwakeMs(timeout_started) < 500);
+    timeout_fixture.deinit();
+    if (timeout_fixture.failure) |err| return err;
+
+    var cancel_fixture = try WithholdingTokenFixture.init();
+    defer cancel_fixture.deinit();
+    try cancel_fixture.start();
+    const cancel_endpoint = try cancel_fixture.tokenEndpoint(alloc);
+    defer alloc.free(cancel_endpoint);
+    var cancel_runtime: SignInRuntime = .{};
+    defer cancel_runtime.deinit(alloc);
+    try std.testing.expect(try cancel_runtime.startPrepared(
+        alloc,
+        try makeLoopbackPreparedLogin(alloc, cancel_endpoint),
+        .{
+            .oauth_transport = test_builtin_gateway.oauth_transport_provider,
+            .poll = .{ .request_timeout_ms = 1000 },
+        },
+    ));
+    try std.testing.expect(waitForAtomic(&cancel_fixture.accepted, 500));
+    const cancel_started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expect(cancel_runtime.cancel(alloc));
+    try std.testing.expect(elapsedAwakeMs(cancel_started) < 500);
+    try std.testing.expectEqual(SignInTransition.cancelled, cancel_runtime.pollTransition(alloc));
+
+    var restart_state = SignInTestState{ .mode = .success };
+    try std.testing.expect(try cancel_runtime.startPrepared(
+        alloc,
+        try makeTestPreparedLogin(alloc),
+        restart_state.deps(),
+    ));
+    const restart_transition = waitForSignInTransition(&cancel_runtime, alloc, 500);
+    switch (restart_transition) {
+        .succeeded => |completed| {
+            var selection = completed;
+            defer selection.deinit(alloc);
+        },
+        else => try std.testing.expect(false),
+    }
+    cancel_fixture.deinit();
+    if (cancel_fixture.failure) |err| return err;
+
+    var deinit_fixture = try WithholdingTokenFixture.init();
+    defer deinit_fixture.deinit();
+    try deinit_fixture.start();
+    const deinit_endpoint = try deinit_fixture.tokenEndpoint(alloc);
+    defer alloc.free(deinit_endpoint);
+    var deinit_runtime: SignInRuntime = .{};
+    try std.testing.expect(try deinit_runtime.startPrepared(
+        alloc,
+        try makeLoopbackPreparedLogin(alloc, deinit_endpoint),
+        .{
+            .oauth_transport = test_builtin_gateway.oauth_transport_provider,
+            .poll = .{ .request_timeout_ms = 1000 },
+        },
+    ));
+    try std.testing.expect(waitForAtomic(&deinit_fixture.accepted, 500));
+    const deinit_started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    deinit_runtime.deinit(alloc);
+    try std.testing.expect(elapsedAwakeMs(deinit_started) < 500);
+    try std.testing.expect(deinit_runtime.thread == null);
+    try std.testing.expect(deinit_runtime.flow == null);
+    deinit_fixture.deinit();
+    if (deinit_fixture.failure) |err| return err;
+}
+
+test "login polling starts before waiting for browser input" {
+    const alloc = std.testing.allocator;
+    var state = LoginPollTestState.init(alloc, &.{.success});
+    defer state.deinit();
+    var prompt = BrowserOpenPrompt{ .url = "https://vercel.test/oauth/device", .enabled = true };
+
+    var token = try pollForTokenWithDeps(alloc, oauth_transport.unavailable_provider, testMetadata(), "client", testDevice(), &prompt, state.deps());
+    defer token.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), state.poll_index);
+    try std.testing.expectEqual(@as(usize, 0), state.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.sleep_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.open_count);
+}
+
+test "login polling opens browser once when enter arrives while waiting" {
+    const alloc = std.testing.allocator;
+    var state = LoginPollTestState.init(alloc, &.{ .pending, .pending, .success });
+    state.enter_on_wait = 1;
+    defer state.deinit();
+    var prompt = BrowserOpenPrompt{ .url = "https://vercel.test/oauth/device", .enabled = true };
+
+    var token = try pollForTokenWithDeps(alloc, oauth_transport.unavailable_provider, testMetadata(), "client", testDevice(), &prompt, state.deps());
+    defer token.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), state.poll_index);
+    try std.testing.expectEqual(@as(usize, 1), state.open_count);
+    try std.testing.expectEqualStrings("https://vercel.test/oauth/device", state.opened_url.?);
+    try std.testing.expectEqual(@as(usize, 1), state.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 19), state.sleep_calls.items.len);
+    for (state.sleep_calls.items) |sleep_ms| {
+        try std.testing.expectEqual(@as(u64, 100), sleep_ms);
+    }
+}
+
+test "login polling continues when the URL opener is unavailable" {
+    const alloc = std.testing.allocator;
+    var state = LoginPollTestState.init(alloc, &.{ .pending, .pending, .success });
+    state.enter_on_wait = 1;
+    state.open_available = false;
+    defer state.deinit();
+    var prompt = BrowserOpenPrompt{ .url = "https://vercel.test/oauth/device", .enabled = true };
+
+    var token = try pollForTokenWithDeps(alloc, oauth_transport.unavailable_provider, testMetadata(), "client", testDevice(), &prompt, state.deps());
+    defer token.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), state.poll_index);
+    try std.testing.expectEqual(@as(usize, 1), state.open_count);
+    try std.testing.expect(prompt.opened);
+}
+
+test "login polling continues when the URL opener fails" {
+    const alloc = std.testing.allocator;
+    var state = LoginPollTestState.init(alloc, &.{ .pending, .pending, .success });
+    state.enter_on_wait = 1;
+    state.open_error = true;
+    defer state.deinit();
+    var prompt = BrowserOpenPrompt{ .url = "https://vercel.test/oauth/device", .enabled = true };
+
+    var token = try pollForTokenWithDeps(alloc, oauth_transport.unavailable_provider, testMetadata(), "client", testDevice(), &prompt, state.deps());
+    defer token.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), state.poll_index);
+    try std.testing.expectEqual(@as(usize, 1), state.open_count);
+    try std.testing.expect(prompt.opened);
+}
+
+test "login polling slow_down increases the next interval" {
+    const alloc = std.testing.allocator;
+    var state = LoginPollTestState.init(alloc, &.{ .slow_down, .success });
+    defer state.deinit();
+    var prompt = BrowserOpenPrompt{ .url = "https://vercel.test/oauth/device" };
+
+    var token = try pollForTokenWithDeps(alloc, oauth_transport.unavailable_provider, testMetadata(), "client", testDevice(), &prompt, state.deps());
+    defer token.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), state.poll_index);
+    try std.testing.expectEqual(@as(usize, 60), state.sleep_calls.items.len);
+    for (state.sleep_calls.items) |sleep_ms| {
+        try std.testing.expectEqual(@as(u64, 100), sleep_ms);
+    }
+}
+
+test "login polling disabled browser prompt still polls immediately" {
+    const alloc = std.testing.allocator;
+    var state = LoginPollTestState.init(alloc, &.{ .pending, .success });
+    state.enter_on_wait = 1;
+    defer state.deinit();
+    var prompt = BrowserOpenPrompt{ .url = "https://vercel.test/oauth/device", .enabled = false };
+
+    var token = try pollForTokenWithDeps(alloc, oauth_transport.unavailable_provider, testMetadata(), "client", testDevice(), &prompt, state.deps());
+    defer token.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), state.poll_index);
+    try std.testing.expectEqual(@as(usize, 0), state.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.open_count);
+    try std.testing.expectEqual(@as(usize, 10), state.sleep_calls.items.len);
+    for (state.sleep_calls.items) |sleep_ms| {
+        try std.testing.expectEqual(@as(u64, 100), sleep_ms);
+    }
+}
+
+test "login polling rejects invalid provider timing values" {
+    const alloc = std.testing.allocator;
+    var state = LoginPollTestState.init(alloc, &.{});
+    defer state.deinit();
+    var prompt = BrowserOpenPrompt{ .url = "https://vercel.test/oauth/device" };
+
+    var device = testDevice();
+    device.expires_in = -1;
+    try std.testing.expectError(
+        oauth.OAuthError.InvalidOAuthResponse,
+        pollForTokenWithDeps(alloc, oauth_transport.unavailable_provider, testMetadata(), "client", device, &prompt, state.deps()),
+    );
+
+    device = testDevice();
+    device.interval = @intCast(max_poll_interval_ms / std.time.ms_per_s + 1);
+    try std.testing.expectError(
+        oauth.OAuthError.InvalidOAuthResponse,
+        pollForTokenWithDeps(alloc, oauth_transport.unavailable_provider, testMetadata(), "client", device, &prompt, state.deps()),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.poll_index);
+}
+
+test "login browser opener respects environment tty and platform gates" {
+    try std.testing.expect(!browserOpenEnabled(true, true, host.nativeForOs(.macos)));
+    try std.testing.expect(!browserOpenEnabled(false, false, host.nativeForOs(.macos)));
+    try std.testing.expect(!browserOpenEnabled(false, true, host.nativeForOs(.linux)));
+    try std.testing.expect(browserOpenEnabled(false, true, host.nativeForOs(.macos)));
 }

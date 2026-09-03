@@ -55,6 +55,8 @@ pub const ToolDetailRecord = struct {
     captured_command: bool = false,
     activity_kind: ?types.ToolActivityKind = null,
     arguments_json: ?[]u8 = null,
+    command_display: ?[]u8 = null,
+    command_action_label: ?[]u8 = null,
     result: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
@@ -75,6 +77,8 @@ pub const ToolDetailRecord = struct {
     pub fn deinit(self: *ToolDetailRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.tool_name);
         if (self.arguments_json) |value| alloc.free(value);
+        if (self.command_display) |value| alloc.free(value);
+        if (self.command_action_label) |value| alloc.free(value);
         if (self.result) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);
@@ -1708,6 +1712,106 @@ pub fn renderEntriesForFullPresentationInterruptible(
     try out.writer.splatByteAll('\n', sequence.finalNewlineCount());
 }
 
+test "auto permission notice contributes content only to full presentation" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendSemanticNoticeTestEntry(&entries, alloc, 1, .{
+        .topic = "system",
+        .tone = .information,
+        .body = "Auto agent approved this request: Running command.",
+        .visibility = .full_only,
+    });
+    const entry = entries.items[0];
+
+    const compact = try renderEntryToBlockForPresentation(
+        alloc,
+        entry,
+        80,
+        .{},
+        .compact,
+    );
+    defer compact.deinit(alloc);
+    try std.testing.expectEqual(TranscriptBlockKind.system_notice, compact.kind);
+    try std.testing.expectEqual(@as(usize, 0), compact.bytes.len);
+
+    const full = try renderEntryToBlockForPresentation(
+        alloc,
+        entry,
+        80,
+        .{},
+        .full,
+    );
+    defer full.deinit(alloc);
+    try std.testing.expectEqual(TranscriptBlockKind.system_notice, full.kind);
+    try std.testing.expectEqualStrings(
+        "● System: Auto agent approved this request: Running command.",
+        full.bytes,
+    );
+}
+
+test "full presentation composition keeps normal block gaps around detail" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try entries.append(alloc, .{ .assistant_turn = .{ .id = 1, .segments = .{} } });
+    try entries.append(alloc, .{ .raw_bytes = .{
+        .id = 2,
+        .bytes = try alloc.dupe(u8, "● Ran a deliberately long command that reaches FULL_STATUS_TAIL\n"),
+        .class = .tool_status,
+    } });
+    try entries.append(alloc, .{ .assistant_turn = .{ .id = 3, .segments = .{} } });
+    try entries.items[0].assistant_turn.segments.text.appendSlice(alloc, "Before");
+    try entries.items[2].assistant_turn.segments.text.appendSlice(alloc, "After");
+
+    const Context = struct {
+        fn skip(_: *anyopaque, _: TranscriptEntry, _: usize) bool {
+            return false;
+        }
+
+        fn before(_: *anyopaque, _: u32, _: *std.Io.Writer.Allocating) !void {}
+
+        fn override_kind(_: *anyopaque, _: TranscriptEntry) ?TranscriptBlockKind {
+            return null;
+        }
+
+        fn append_override(_: *anyopaque, _: TranscriptEntry, _: *std.Io.Writer.Allocating) !bool {
+            unreachable;
+        }
+
+        fn append_detail(_: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) !FullDetailAppend {
+            if (entry_id != 2) return .{};
+            try out.writer.writeAll("\n  input\n  FULL_DETAIL\n");
+            return .{ .attached = true, .ends_with_newline = true };
+        }
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var context: u8 = 0;
+    const sink = FullPresentationSink{
+        .context = &context,
+        .skip_entry = Context.skip,
+        .override_kind = Context.override_kind,
+        .append_override = Context.append_override,
+        .before_entry = Context.before,
+        .append_detail = Context.append_detail,
+    };
+    try renderEntriesForFullPresentationInterruptible(
+        alloc,
+        entries.items,
+        24,
+        .{},
+        &sink,
+        &out,
+        null,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "  Before\n\n● Ran") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "FULL_STATUS_TAIL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "  FULL_DETAIL\n\n  After") != null);
+}
+
 fn renderedBlockHasContent(block: RenderedBlock) bool {
     return block.bytes.len > 0;
 }
@@ -2053,6 +2157,34 @@ pub fn renderEntriesWithProjectionToBytes(
     })).bytes;
 }
 
+test "compact projection overrides its first entry and hides later entries" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "FIRST_TOOL", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "SECOND_TOOL", .class = .tool_status } },
+    };
+    const actions = [_]EntryRenderAction{
+        .{ .override = .{
+            .kind = .tool_status,
+            .bytes = "● 2 tool calls · 1 read · 1 edit",
+        } },
+        .hide,
+    };
+
+    const rendered = try renderEntriesWithProjectionToBytes(
+        alloc,
+        &entries,
+        80,
+        .{},
+        &actions,
+    );
+    defer alloc.free(rendered);
+
+    try std.testing.expectEqualStrings("● 2 tool calls · 1 read · 1 edit", rendered);
+    try std.testing.expectEqualStrings("FIRST_TOOL", entries[0].raw_bytes.bytes);
+    try std.testing.expectEqualStrings("SECOND_TOOL", entries[1].raw_bytes.bytes);
+}
+
 pub fn renderedEntryStartLine(
     alloc: Allocator,
     entries: []const TranscriptEntry,
@@ -2223,6 +2355,25 @@ pub fn renderEntriesForPreparationInterruptible(
         .folded_summary_indices = summary_indices,
         .line_provenance = owned_provenance,
     };
+}
+
+test "interruptible compact preparation checks inside one oversized assistant entry" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{.{ .assistant_turn = .{ .id = 1, .segments = .{} } }};
+    defer entries[0].assistant_turn.segments.deinit(alloc);
+    try entries[0].assistant_turn.segments.text.appendNTimes(alloc, 'x', 16 * 1024);
+
+    const Probe = struct {
+        fn pending(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var context: u8 = 0;
+    var checkpoint = build_checkpoint.BuildCheckpoint.init(&context, Probe.pending);
+    try std.testing.expectError(
+        error.InputPending,
+        renderEntriesForPreparationInterruptible(alloc, &entries, 80, .{}, .{}, &checkpoint),
+    );
 }
 
 const BoundarySplit = struct {
@@ -2420,6 +2571,60 @@ pub fn footerBoundaryGapRowsForTail(kind: ?TranscriptBlockKind) u16 {
     };
 }
 
+test "footer boundary gap applies to response-like and notice tail blocks" {
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.assistant_turn));
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.turn_summary));
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.tool_status));
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.subagent_status));
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.system_notice));
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.error_notice));
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.cancel_notice));
+    try std.testing.expectEqual(@as(u16, 0), footerBoundaryGapRowsForTail(.user_turn));
+    try std.testing.expectEqual(@as(u16, 0), footerBoundaryGapRowsForTail(.welcome));
+    try std.testing.expectEqual(@as(u16, 0), footerBoundaryGapRowsForTail(null));
+}
+
+test "compact tail policy ignores hidden context notices" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "assistant response");
+    try appendSemanticNoticeTestEntry(&entries, alloc, 2, .{
+        .topic = "context",
+        .tone = .warning,
+        .body = "trailing warning",
+        .visibility = .full_only,
+    });
+
+    try std.testing.expectEqual(@as(?TranscriptBlockKind, .system_notice), tailVisibleBlockKind(entries.items));
+    try std.testing.expectEqual(@as(?TranscriptBlockKind, .assistant_turn), compactTailVisibleBlockKind(entries.items));
+    try std.testing.expectEqual(@as(?TranscriptBlockKind, .assistant_turn), compactTailVisibleBlockKindWithoutEntry(entries.items, 2));
+
+    var only_context: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&only_context, alloc);
+    try appendSemanticNoticeTestEntry(&only_context, alloc, 3, .{
+        .topic = "context",
+        .tone = .warning,
+        .body = "only warning",
+        .visibility = .full_only,
+    });
+    try std.testing.expectEqual(@as(?TranscriptBlockKind, null), compactTailVisibleBlockKind(only_context.items));
+
+    var grouped_command: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&grouped_command, alloc);
+    try appendRawTestEntry(&grouped_command, alloc, 4, "● Ran command\n", .tool_status);
+    try appendRawTestEntry(&grouped_command, alloc, 5, "command output\n", .command_output);
+    try std.testing.expectEqual(
+        @as(?TranscriptBlockKind, .tool_status),
+        compactTailVisibleBlockKindForProjection(
+            grouped_command.items,
+            null,
+            &.{ .keep, .hide },
+        ),
+    );
+}
+
 fn appendBlockSeparator(out: *std.ArrayList(u8), alloc: Allocator, gap_rows: u16) !void {
     try out.appendNTimes(alloc, '\n', 1 + gap_rows);
 }
@@ -2453,9 +2658,1778 @@ pub fn transcriptLineCount(text: []const u8) usize {
     return total;
 }
 
+fn deinitTestEntries(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator) void {
+    for (entries.items) |*entry| entry.deinit(alloc);
+    entries.deinit(alloc);
+}
+
+fn appendRawTestEntry(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator, id: u32, text: []const u8, class: RawEntryClass) !void {
+    const bytes = try alloc.dupe(u8, text);
+    errdefer alloc.free(bytes);
+    try entries.append(alloc, .{ .raw_bytes = .{ .id = id, .bytes = bytes, .class = class } });
+}
+
+fn appendAssistantTestEntry(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator, id: u32, text: []const u8) !void {
+    var segments: AssistantTurnSegments = .{};
+    errdefer segments.deinit(alloc);
+    try segments.text.appendSlice(alloc, text);
+    try entries.append(alloc, .{ .assistant_turn = .{ .id = id, .segments = segments } });
+}
+
+fn appendSemanticNoticeTestEntry(
+    entries: *std.ArrayList(TranscriptEntry),
+    alloc: Allocator,
+    id: u32,
+    notice: types.SemanticNotice,
+) !void {
+    const owned = try types.dupeSemanticNotice(alloc, notice);
+    errdefer types.freeSemanticNotice(alloc, owned);
+    try entries.append(alloc, .{ .semantic_notice = .{
+        .id = id,
+        .topic = owned.topic,
+        .tone = owned.tone,
+        .body = owned.body,
+        .visibility = owned.visibility,
+    } });
+}
+
 fn appendWithoutAsciiWhitespace(out: *std.ArrayList(u8), alloc: Allocator, text: []const u8) !void {
     for (text) |byte| switch (byte) {
         ' ', '\t', '\r', '\n' => {},
         else => try out.append(alloc, byte),
     };
+}
+
+test "semantic notice renders every tone and resets before following content" {
+    const alloc = std.testing.allocator;
+    const styles: Styles = .{
+        .system_notice_text_style = "\x1b[37m",
+        .reset_style = "\x1b[0m",
+        .notice_information_style = "\x1b[36m",
+        .notice_success_style = "\x1b[32m",
+        .notice_warning_style = "\x1b[33m",
+        .notice_error_style = "\x1b[31m",
+        .notice_cancelled_style = "\x1b[90m",
+    };
+    const tones = [_]types.NoticeTone{ .information, .success, .warning, .@"error", .cancelled };
+    const label_styles = [_][]const u8{ "\x1b[36m", "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[90m" };
+
+    for (tones, label_styles) |tone, label_style| {
+        const rendered = try renderSemanticNotice(alloc, .{
+            .topic = "topic",
+            .tone = tone,
+            .body = "body",
+        }, styles, 80);
+        defer alloc.free(rendered);
+
+        const expected = try std.fmt.allocPrint(
+            alloc,
+            "{s}● Topic:\x1b[0m\x1b[37m body\x1b[0m",
+            .{label_style},
+        );
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, rendered);
+        try std.testing.expect(std.mem.find(u8, rendered, "[Topic]") == null);
+
+        var feed: std.ArrayList(u8) = .empty;
+        defer feed.deinit(alloc);
+        try feed.appendSlice(alloc, rendered);
+        try feed.append(alloc, 'Z');
+        var grid = try vt_emulator.Grid.init(alloc, 40, 2);
+        defer grid.deinit();
+        try grid.feed(feed.items);
+        const following = grid.cellAt(1, 14).?;
+        try std.testing.expectEqual(@as(u21, 'Z'), following.codepoint);
+        try std.testing.expect(following.style.fg.eql(.default));
+        try std.testing.expect(following.style.bg.eql(.default));
+    }
+}
+
+test "semantic notice keeps an OSC 8 target hidden and clickable" {
+    const alloc = std.testing.allocator;
+    const url = "https://fx.sh/feedback";
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "\x1b]8;;{s}\x1b\\Open feedback form\x1b]8;;\x1b\\.",
+        .{url},
+    );
+    defer alloc.free(body);
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "feedback",
+        .tone = .neutral,
+        .body = body,
+    }, .{}, 120);
+    defer alloc.free(rendered);
+
+    var grid = try vt_emulator.Grid.init(alloc, 120, 2);
+    defer grid.deinit();
+    try grid.feed(rendered);
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    try grid.rowTextTrimmed(1, &row);
+    try std.testing.expectEqualStrings("● Feedback: Open feedback form.", row.items);
+
+    const link_cell = grid.cellAt(1, 13).?;
+    try std.testing.expectEqual(@as(u21, 'O'), link_cell.codepoint);
+    try std.testing.expect(link_cell.style.hyperlink_id != 0);
+    try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(link_cell.style.hyperlink_id).?);
+    try std.testing.expectEqual(@as(u32, 0), grid.cellAt(1, 31).?.style.hyperlink_id);
+
+    var narrow_grid = try vt_emulator.Grid.init(alloc, 9, 16);
+    defer narrow_grid.deinit();
+    const narrow = try renderSemanticNotice(alloc, .{
+        .topic = "feedback",
+        .tone = .neutral,
+        .body = body,
+    }, .{}, 9);
+    defer alloc.free(narrow);
+    try narrow_grid.feed(narrow);
+
+    var linked_text: std.ArrayList(u8) = .empty;
+    defer linked_text.deinit(alloc);
+    for (1..narrow_grid.rows + 1) |row_index| {
+        for (1..narrow_grid.cols + 1) |col_index| {
+            const cell = narrow_grid.cellAt(@intCast(row_index), @intCast(col_index)).?;
+            if (cell.style.hyperlink_id == 0) continue;
+            try std.testing.expect(col_index > 2);
+            try std.testing.expectEqualStrings(url, narrow_grid.hyperlinkUrl(cell.style.hyperlink_id).?);
+            try linked_text.append(alloc, @intCast(cell.codepoint));
+        }
+    }
+    try std.testing.expectEqualStrings("Openfeedback form", linked_text.items);
+    try std.testing.expectEqual(@as(u32, 0), narrow_grid.current_style.hyperlink_id);
+}
+
+test "background semantic notices render one topic for launch and failure" {
+    const alloc = std.testing.allocator;
+    const launch = try renderSemanticNotice(alloc, .{
+        .topic = "background",
+        .tone = .information,
+        .body = "Command #1 started. Log: /tmp/run.log",
+    }, .{}, 80);
+    defer alloc.free(launch);
+    try std.testing.expectEqualStrings(
+        "● Background: Command #1 started. Log: /tmp/run.log",
+        launch,
+    );
+
+    const failure = try renderSemanticNotice(alloc, .{
+        .topic = "background",
+        .tone = .@"error",
+        .body = "Command #1 failed (exit 1).",
+    }, .{}, 80);
+    defer alloc.free(failure);
+    try std.testing.expectEqualStrings(
+        "● Background: Command #1 failed (exit 1).",
+        failure,
+    );
+
+    for ([_][]const u8{ launch, failure }) |rendered| {
+        try std.testing.expect(std.mem.find(u8, rendered, "System: Background") == null);
+        try std.testing.expect(std.mem.find(u8, rendered, "Background: Background") == null);
+    }
+}
+
+test "semantic notice wraps words paths UTF-8 and explicit newlines without truncation" {
+    const alloc = std.testing.allocator;
+    const body = "alpha beta/gamma/delta\n東京🙂 final-token";
+    var logical: std.ArrayList(u8) = .empty;
+    defer logical.deinit(alloc);
+    try appendWithoutAsciiWhitespace(&logical, alloc, "● System: ");
+    try appendWithoutAsciiWhitespace(&logical, alloc, body);
+
+    for ([_]u16{ 0, 1, 2, 3, 6, 12, 18 }) |cols| {
+        const rendered = try renderSemanticNotice(alloc, .{
+            .topic = "system",
+            .tone = .information,
+            .body = body,
+        }, .{}, cols);
+        defer alloc.free(rendered);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(rendered));
+
+        var normalized: std.ArrayList(u8) = .empty;
+        defer normalized.deinit(alloc);
+        try appendWithoutAsciiWhitespace(&normalized, alloc, rendered);
+        try std.testing.expectEqualStrings(logical.items, normalized.items);
+
+        var lines = std.mem.splitScalar(u8, rendered, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= @max(cols, 2));
+        }
+    }
+
+    const path = try renderSemanticNotice(alloc, .{
+        .topic = "x",
+        .tone = .information,
+        .body = "alpha/beta/gamma",
+    }, .{}, 11);
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("● X: alpha/\n  beta/\n  gamma", path);
+
+    const words = try renderSemanticNotice(alloc, .{
+        .topic = "x",
+        .tone = .information,
+        .body = "one two\nthree",
+    }, .{}, 9);
+    defer alloc.free(words);
+    try std.testing.expectEqualStrings("● X: one\n  two\n  three", words);
+}
+
+test "semantic notices are independent blocks with exact neighboring and footer gaps" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 1, "before", .unknown_raw);
+    try appendSemanticNoticeTestEntry(&entries, alloc, 2, .{
+        .topic = "one",
+        .tone = .information,
+        .body = "first",
+    });
+    try appendSemanticNoticeTestEntry(&entries, alloc, 3, .{
+        .topic = "two",
+        .tone = .success,
+        .body = "second",
+    });
+    try appendRawTestEntry(&entries, alloc, 4, "after", .unknown_raw);
+
+    const rendered = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(
+        "before\n\n● One: first\n\n● Two: second\n\nafter",
+        rendered,
+    );
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.system_notice));
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.error_notice));
+    try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.cancel_notice));
+}
+
+test "semantic notice visibility tail classification and provenance remain semantic" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendSemanticNoticeTestEntry(&entries, alloc, 41, .{
+        .topic = "hidden",
+        .tone = .@"error",
+        .body = "full only",
+        .visibility = .full_only,
+    });
+
+    try std.testing.expectEqual(@as(?TranscriptBlockKind, .error_notice), tailVisibleBlockKind(entries.items));
+    try std.testing.expectEqual(@as(?TranscriptBlockKind, null), compactTailVisibleBlockKind(entries.items));
+    const compact = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(compact);
+    try std.testing.expectEqualStrings("", compact);
+
+    entries.items[0].semantic_notice.visibility = .compact_and_full;
+    var prepared = try renderEntriesForPreparation(
+        alloc,
+        entries.items,
+        80,
+        .{},
+        .{ .capture_provenance = true },
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqualStrings("● Hidden: full only", prepared.bytes);
+    try std.testing.expectEqual(@as(usize, 1), prepared.line_provenance.len);
+    try std.testing.expectEqualDeep(
+        LineProvenance{ .entry = .{ .entry_id = 41, .entry_class = .error_notice } },
+        prepared.line_provenance[0],
+    );
+}
+
+test "notice palette changes leave non-system rendering unchanged" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, "assistant response wraps normally");
+    try appendRawTestEntry(&entries, alloc, 2, "raw tool output", .tool_status);
+
+    const first = try renderEntriesToBytes(alloc, entries.items, 18, .{
+        .notice_information_style = "\x1b[36m",
+        .notice_success_style = "\x1b[32m",
+        .notice_warning_style = "\x1b[33m",
+        .notice_error_style = "\x1b[31m",
+        .notice_cancelled_style = "\x1b[90m",
+    });
+    defer alloc.free(first);
+    const second = try renderEntriesToBytes(alloc, entries.items, 18, .{
+        .notice_information_style = "\x1b[34m",
+        .notice_success_style = "\x1b[92m",
+        .notice_warning_style = "\x1b[93m",
+        .notice_error_style = "\x1b[91m",
+        .notice_cancelled_style = "\x1b[2m",
+    });
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings(first, second);
+}
+
+test "renderCodeBlockForTranscript dims solid horizontal rules without side rails" {
+    const alloc = std.testing.allocator;
+
+    const labeled_language = try alloc.dupe(u8, "zig");
+    defer alloc.free(labeled_language);
+    const labeled_code = try alloc.dupe(u8, "x");
+    defer alloc.free(labeled_code);
+    const labeled = try renderCodeBlockForTranscript(alloc, .{
+        .language = labeled_language,
+        .code = labeled_code,
+    }, 80);
+    defer alloc.free(labeled);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m─ zig ─\x1b[22m\n" ++
+            "x\n" ++
+            "\x1b[2m───────\x1b[22m\n",
+        labeled,
+    );
+
+    const unlabeled_language = try alloc.dupe(u8, "");
+    defer alloc.free(unlabeled_language);
+    const unlabeled_code = try alloc.dupe(u8, "x");
+    defer alloc.free(unlabeled_code);
+    const unlabeled = try renderCodeBlockForTranscript(alloc, .{
+        .language = unlabeled_language,
+        .code = unlabeled_code,
+    }, 80);
+    defer alloc.free(unlabeled);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m──────\x1b[22m\n" ++
+            "x\n" ++
+            "\x1b[2m──────\x1b[22m\n",
+        unlabeled,
+    );
+
+    const truncated_language = try alloc.dupe(u8, "typescript");
+    defer alloc.free(truncated_language);
+    const truncated_code = try alloc.dupe(u8, "x");
+    defer alloc.free(truncated_code);
+    const truncated = try renderCodeBlockForTranscript(alloc, .{
+        .language = truncated_language,
+        .code = truncated_code,
+    }, 8);
+    defer alloc.free(truncated);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m─ type ─\x1b[22m\n" ++
+            "x\n" ++
+            "\x1b[2m────────\x1b[22m\n",
+        truncated,
+    );
+
+    const wide_rune_language = try alloc.dupe(u8, "\xe6\xbc\xa2");
+    defer alloc.free(wide_rune_language);
+    const wide_rune_code = try alloc.dupe(u8, "x");
+    defer alloc.free(wide_rune_code);
+    const wide_rune = try renderCodeBlockForTranscript(alloc, .{
+        .language = wide_rune_language,
+        .code = wide_rune_code,
+    }, 6);
+    defer alloc.free(wide_rune);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m─ 漢 ─\x1b[22m\n" ++
+            "x\n" ++
+            "\x1b[2m──────\x1b[22m\n",
+        wide_rune,
+    );
+}
+
+test "renderCodeBlockForTranscript bounds highlighted rows across every supported width" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "Zig");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, "  const value = \"ready\"; // comment \xe6\xbc\xa2");
+    defer alloc.free(code);
+    const block = assistant_presentation.CodeBlockPayload{
+        .language = language,
+        .code = code,
+    };
+
+    for (1..81) |cols| {
+        const rendered = try renderCodeBlockForTranscript(alloc, block, @intCast(cols));
+        defer alloc.free(rendered);
+        var lines = std.mem.splitScalar(u8, rendered, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+    }
+}
+
+test "renderCodeBlockForTranscript highlights registered profiles without styling unknown labels" {
+    const alloc = std.testing.allocator;
+
+    const zig_language = try alloc.dupe(u8, "Zig");
+    defer alloc.free(zig_language);
+    const zig_code = try alloc.dupe(u8, "const value = 1;");
+    defer alloc.free(zig_code);
+    const highlighted = try renderCodeBlockForTranscript(alloc, .{
+        .language = zig_language,
+        .code = zig_code,
+    }, 80);
+    defer alloc.free(highlighted);
+    try std.testing.expect(std.mem.indexOf(u8, highlighted, "\x1b[38;5;252mconst\x1b[39m") != null);
+
+    const python_language = try alloc.dupe(u8, "python");
+    defer alloc.free(python_language);
+    const python_code = try alloc.dupe(u8, "def ready():\n    return True");
+    defer alloc.free(python_code);
+    const python = try renderCodeBlockForTranscript(alloc, .{
+        .language = python_language,
+        .code = python_code,
+    }, 80);
+    defer alloc.free(python);
+    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[2m─ python ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[38;5;252mdef\x1b[39m") != null);
+
+    const unknown_language = try alloc.dupe(u8, "brainfuck");
+    defer alloc.free(unknown_language);
+    const unknown_code = try alloc.dupe(u8, "+++[>+++<-]");
+    defer alloc.free(unknown_code);
+    const raw = try renderCodeBlockForTranscript(alloc, .{
+        .language = unknown_language,
+        .code = unknown_code,
+    }, 80);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\x1b[38;5;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "+++[>+++<-]") != null);
+}
+
+test "semantic code blocks use the light syntax palette when requested" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "zig");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, "const value = \"ready\"; // comment");
+    defer alloc.free(code);
+    const entry = TranscriptEntry{ .assistant_code_block = .{
+        .id = 1,
+        .block = .{
+            .language = language,
+            .code = code,
+        },
+    } };
+
+    const rendered = try renderEntryToBlock(alloc, entry, 80, .{
+        .code_highlight_theme = .light,
+    });
+    defer rendered.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;238mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;243m// comment\x1b[39m") != null);
+}
+
+test "renderCodeBlockForTranscript infers registered high-confidence code blocks" {
+    const alloc = std.testing.allocator;
+    const unlabeled_language = try alloc.dupe(u8, "");
+    defer alloc.free(unlabeled_language);
+    const code = try alloc.dupe(u8, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);");
+    defer alloc.free(code);
+
+    const unlabeled = try renderCodeBlockForTranscript(alloc, .{
+        .language = unlabeled_language,
+        .code = code,
+    }, 100);
+    defer alloc.free(unlabeled);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[2m─ ts ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mawait\x1b[39m") != null);
+
+    const json_language = try alloc.dupe(u8, "");
+    defer alloc.free(json_language);
+    const json_code = try alloc.dupe(u8, "{\"ready\": true}");
+    defer alloc.free(json_code);
+    const json = try renderCodeBlockForTranscript(alloc, .{
+        .language = json_language,
+        .code = json_code,
+    }, 100);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[2m─ json ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[38;5;250m\"ready\"\x1b[39m") != null);
+
+    const ambiguous_language = try alloc.dupe(u8, "");
+    defer alloc.free(ambiguous_language);
+    const ambiguous_code = try alloc.dupe(u8, "const value = 1;");
+    defer alloc.free(ambiguous_code);
+    const ambiguous = try renderCodeBlockForTranscript(alloc, .{
+        .language = ambiguous_language,
+        .code = ambiguous_code,
+    }, 100);
+    defer alloc.free(ambiguous);
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "\x1b[2mts\x1b[22m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "\x1b[38;5;") == null);
+
+    const explicit_unknown_language = try alloc.dupe(u8, "brainfuck");
+    defer alloc.free(explicit_unknown_language);
+    const explicit_unknown_code = try alloc.dupe(u8, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);");
+    defer alloc.free(explicit_unknown_code);
+    const explicit_unknown = try renderCodeBlockForTranscript(alloc, .{
+        .language = explicit_unknown_language,
+        .code = explicit_unknown_code,
+    }, 100);
+    defer alloc.free(explicit_unknown);
+    try std.testing.expect(std.mem.indexOf(u8, explicit_unknown, "\x1b[2m─ brainfuck ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explicit_unknown, "\x1b[38;5;") == null);
+}
+
+test "renderCodeBlockForTranscript contains CJK fallback color in ruled and unboxed rows" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "zig");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, " //abcdefghijklmnop\xe6\xbc\xa2");
+    defer alloc.free(code);
+    const block = assistant_presentation.CodeBlockPayload{
+        .language = language,
+        .code = code,
+    };
+
+    const ruled = try renderCodeBlockForTranscript(alloc, block, 6);
+    defer alloc.free(ruled);
+    var ruled_grid = try vt_emulator.Grid.init(alloc, 6, 24);
+    defer ruled_grid.deinit();
+    try ruled_grid.feed(ruled);
+    try ruled_grid.feed("z");
+
+    var ruled_wide_rune: ?vt_emulator.Cell = null;
+    var row: u16 = 1;
+    while (row <= 24) : (row += 1) {
+        var col: u16 = 1;
+        while (col <= 6) : (col += 1) {
+            const cell = ruled_grid.cellAt(row, col).?;
+            if (cell.codepoint == '\u{6f22}') ruled_wide_rune = cell;
+            if (cell.codepoint == '\u{2508}' or cell.codepoint == ' ') {
+                try std.testing.expect(cell.style.fg.eql(.default));
+            }
+            if (cell.codepoint == 'z') try std.testing.expect(cell.style.fg.eql(.default));
+        }
+    }
+    try std.testing.expect(ruled_wide_rune != null);
+    try std.testing.expect(ruled_wide_rune.?.style.fg.eql(.{ .indexed = 245 }));
+
+    const unboxed = try renderCodeBlockForTranscript(alloc, block, 1);
+    defer alloc.free(unboxed);
+    var unboxed_grid = try vt_emulator.Grid.init(alloc, 1, 24);
+    defer unboxed_grid.deinit();
+    try unboxed_grid.feed(unboxed);
+    try unboxed_grid.feed("z");
+
+    var unboxed_fallback: ?vt_emulator.Cell = null;
+    row = 1;
+    while (row <= 24) : (row += 1) {
+        const cell = unboxed_grid.cellAt(row, 1).?;
+        if (cell.codepoint == '?') unboxed_fallback = cell;
+        if (cell.codepoint == 'z') try std.testing.expect(cell.style.fg.eql(.default));
+    }
+    try std.testing.expect(unboxed_fallback != null);
+    try std.testing.expect(unboxed_fallback.?.style.fg.eql(.{ .indexed = 245 }));
+}
+
+fn appendUserTestEntry(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator, id: u32, text: []const u8) !void {
+    const text_dup = try alloc.dupe(u8, text);
+    errdefer alloc.free(text_dup);
+    const images = try alloc.alloc(types.ImageAttachment, 0);
+    errdefer alloc.free(images);
+    try entries.append(alloc, .{ .user_turn = .{ .id = id, .turn = .{ .text = text_dup, .images = images } } });
+}
+
+test "leading welcome boundary remains available after a user turn" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 1, "welcome", .welcome);
+    try appendUserTestEntry(&entries, alloc, 2, "hello");
+
+    try std.testing.expectEqual(@as(?usize, null), try leadingWelcomeCutLine(alloc, entries.items, 80, .{}));
+    const boundary = (try leadingWelcomeBoundary(alloc, entries.items, 80, .{})).?;
+    try std.testing.expectEqual(@as(usize, 2), boundary.full_cut_line);
+    try std.testing.expectEqual(@as(usize, 0), boundary.tail_replay_line);
+}
+
+test "renderEntriesToBytes keeps narrow definition bodies within terminal width" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, "\x1b[2m  \x1b[22malphabet");
+
+    var cols: u16 = 1;
+    while (cols <= 5) : (cols += 1) {
+        const out = try renderEntriesToBytes(alloc, entries.items, cols, .{});
+        defer alloc.free(out);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) > 0);
+        }
+    }
+
+    entries.items[0].deinit(alloc);
+    entries.items.len = 0;
+    try appendAssistantTestEntry(&entries, alloc, 1, "\x1b[2m  \x1b[22m\xe6\xbc\xa2\xe5\xad\x97abcdef");
+
+    cols = 2;
+    while (cols <= 5) : (cols += 1) {
+        const out = try renderEntriesToBytes(alloc, entries.items, cols, .{});
+        defer alloc.free(out);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) > 0);
+        }
+    }
+}
+
+test "tool status preview uses deterministic narrow markers" {
+    const alloc = std.testing.allocator;
+
+    const one = try formatToolStatusPreview(alloc, "abcdefg", 1);
+    defer alloc.free(one);
+    try std.testing.expectEqualStrings("a\n.", one);
+
+    const two = try formatToolStatusPreview(alloc, "abcdefg", 2);
+    defer alloc.free(two);
+    try std.testing.expectEqualStrings("ab\n..", two);
+
+    const three = try formatToolStatusPreview(alloc, "abcdefg", 3);
+    defer alloc.free(three);
+    try std.testing.expectEqualStrings("abc\n...", three);
+}
+
+test "tool status preview skips plain status that already fits in two rows" {
+    try std.testing.expect(!toolStatusNeedsPreview("● Reading progress\n", 80));
+    try std.testing.expect(!toolStatusNeedsPreview("first line\nsecond line", 80));
+}
+
+test "tool status preview wraps words and indents ordinary continuations" {
+    const alloc = std.testing.allocator;
+    const out = try formatToolStatusPreview(
+        alloc,
+        "● Ran command with readable words that extend past line two",
+        24,
+    );
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings(
+        "● Ran command with\n  readable words that...",
+        out,
+    );
+}
+
+test "tool status preview keeps a long unbroken value beside its label" {
+    const alloc = std.testing.allocator;
+    const out = try formatToolStatusPreview(
+        alloc,
+        "● Searched INTENTIONALLY_LONG_SEARCH_QUERY_TO_VERIFY_SECOND_LINE_CONTINUATION_INDENTATION_AND_ELLIPSIS",
+        24,
+    );
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings(
+        "● Searched INTENTIONALLY\n  _LONG_SEARCH_QUERY_...",
+        out,
+    );
+}
+
+test "tool status preview reasserts ANSI before standalone continuations" {
+    const alloc = std.testing.allocator;
+    const Fixture = struct {
+        source: []const u8,
+        marker_color: u8,
+    };
+    const fixtures = [_]Fixture{
+        .{ .source = "\x1b[38;5;243m●\x1b[0m\x1b[1m Running\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 243 },
+        .{ .source = "\x1b[38;5;252m■\x1b[0m\x1b[1m\x1b[38;5;255m Cancelled\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
+        .{ .source = "\x1b[38;5;252m●\x1b[0m\x1b[1m Ran\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
+    };
+
+    for (fixtures) |fixture| {
+        const out = try formatToolStatusPreview(alloc, fixture.source, 24);
+        defer alloc.free(out);
+
+        const newline = std.mem.findScalar(u8, out, '\n') orelse return error.TestExpectedNewline;
+        const continuation = out[newline + 1 ..];
+        try std.testing.expect(std.mem.startsWith(u8, continuation, "\x1b[0m"));
+
+        var first_row = try vt_emulator.Grid.init(alloc, 24, 1);
+        defer first_row.deinit();
+        try first_row.feed(out[0..newline]);
+        try std.testing.expect(first_row.cellAt(1, 1).?.style.fg.eql(.{ .indexed = fixture.marker_color }));
+
+        var continuation_row = try vt_emulator.Grid.init(alloc, 24, 1);
+        defer continuation_row.deinit();
+        try continuation_row.feed(continuation);
+        var command_col: u16 = 1;
+        while (continuation_row.cellAt(1, command_col).?.codepoint == ' ') : (command_col += 1) {}
+        try std.testing.expect(continuation_row.cellAt(1, command_col).?.style.fg.eql(.{ .indexed = 245 }));
+    }
+}
+
+test "full tool status reasserts ANSI before wrapped command continuations" {
+    const alloc = std.testing.allocator;
+    const source = "\x1b[38;5;252m●\x1b[0m\x1b[1m Ran\x1b[0m \x1b[38;5;245m" ++
+        "printf command words that extend across several physical rows\x1b[0m";
+    const out = try formatFullToolStatus(alloc, source, 24);
+    defer alloc.free(out);
+
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    _ = lines.next() orelse return error.TestExpectedFirstToolStatusRow;
+    var continuation_rows: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        continuation_rows += 1;
+
+        var grid = try vt_emulator.Grid.init(alloc, 24, 1);
+        defer grid.deinit();
+        try grid.feed(line);
+
+        var command_col: u16 = 1;
+        while (grid.cellAt(1, command_col).?.codepoint == ' ') : (command_col += 1) {}
+        try std.testing.expect(grid.cellAt(1, command_col).?.style.fg.eql(.{ .indexed = 245 }));
+    }
+    try std.testing.expect(continuation_rows >= 2);
+}
+
+test "tool status preview honors explicit newlines and terminal width" {
+    const alloc = std.testing.allocator;
+    const out = try formatToolStatusPreview(
+        alloc,
+        "first command\nsecond command with a very long tail",
+        24,
+    );
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings("first command\n  second command with...", out);
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    var line_count: usize = 0;
+    while (lines.next()) |line| {
+        line_count += 1;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 24);
+    }
+    try std.testing.expectEqual(@as(usize, 2), line_count);
+}
+
+test "tool status rendering retains full source and provenance" {
+    const alloc = std.testing.allocator;
+    const source = "● Failed\x1b[0m \x1b[38;5;245mcommand with readable words that extend past line two\x1b[0m\n";
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 11, source, .tool_status);
+
+    var prepared = try renderEntriesForPreparation(
+        alloc,
+        entries.items,
+        24,
+        .{},
+        .{ .capture_provenance = true },
+    );
+    defer prepared.deinit(alloc);
+
+    try std.testing.expect(std.mem.endsWith(u8, prepared.bytes, "...\x1b[0m"));
+    try std.testing.expectEqual(@as(usize, 2), prepared.line_provenance.len);
+    for (prepared.line_provenance) |provenance| {
+        try std.testing.expectEqualDeep(
+            LineProvenance{ .entry = .{
+                .entry_id = 11,
+                .entry_class = .tool_status,
+            } },
+            provenance,
+        );
+    }
+    try std.testing.expectEqualStrings(source, entries.items[0].raw_bytes.bytes);
+}
+
+test "tool status preview reflows the same source after resize" {
+    const alloc = std.testing.allocator;
+    const source = "● Failed sh -c 'printf OBSERVER_TOOL_STATUS >&2; exit 17' # this command is intentionally verbose so the failed status must wrap and truncate at the terminal boundary\n";
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 11, source, .tool_status);
+
+    const wide = try renderEntriesToBytes(alloc, entries.items, 200, .{});
+    defer alloc.free(wide);
+    try std.testing.expectEqualStrings(source, wide);
+
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(narrow);
+    try std.testing.expect(std.mem.endsWith(u8, narrow, "..."));
+    try std.testing.expectEqual(@as(usize, 2), renderedHardLineCount(narrow));
+    var lines = std.mem.splitScalar(u8, narrow, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 80);
+    }
+    try std.testing.expectEqualStrings(source, entries.items[0].raw_bytes.bytes);
+}
+
+test "compact diff blocks reflow styled rows inside their gutters" {
+    const alloc = std.testing.allocator;
+    const source =
+        "\x1b]9050;17\x07" ++
+        "\x1b[38;5;245m  │ 2   CONTEXT_ROW_MARKER with a deliberately long value that must wrap inside the gutter\x1b[0m\n" ++
+        "\x1b[38;5;252m  │ \x1b[38;5;203m3 -\x1b[38;5;252m REMOVED_ROW_MARKER with a deliberately long value that must wrap inside the gutter\x1b[0m\n" ++
+        "\x1b[38;5;252m  │ \x1b[38;5;77m3 +\x1b[38;5;252m MUTATION_NEW_MARKER with a deliberately long replacement value that must wrap correctly in the diff preview\x1b[0m\n" ++
+        "\x1b]9051;17\x07";
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 17, source, .diff_block);
+
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 48, .{});
+    defer alloc.free(narrow);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;245m  │     ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;203m\x1b[38;5;252m  │     ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;77m\x1b[38;5;252m  │     ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "CONTEXT_ROW_MARKER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "REMOVED_ROW_MARKER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "MUTATION_NEW_MARKER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b]9050;17\x07") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b]9051;17\x07") != null);
+    var lines = std.mem.splitScalar(u8, narrow, '\n');
+    while (lines.next()) |line| {
+        if (display_width.visibleWidthIgnoringAnsi(line) == 0) continue;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 48);
+    }
+    try std.testing.expectEqualStrings(source, entries.items[0].raw_bytes.bytes);
+}
+
+test "diff block reflow preserves fitting malformed and unicode rows" {
+    const alloc = std.testing.allocator;
+    const fitting = "\x1b[38;5;252m  │ \x1b[38;5;203m1 -\x1b[38;5;252m short λ value\x1b[0m\n";
+    const wide = try reflowDiffBlock(alloc, fitting, 80);
+    defer alloc.free(wide);
+    try std.testing.expectEqualStrings(fitting, wide);
+
+    const malformed = "\x1b[38;5;252m  │ not-a-diff-row that remains byte-identical\x1b[0m\n";
+    const unchanged = try reflowDiffBlock(alloc, malformed, 16);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings(malformed, unchanged);
+
+    const unicode = "\x1b[38;5;252m  │ \x1b[38;5;77m2 +\x1b[38;5;252m 😀😀😀😀UNICODE_TAIL\x1b[0m\n";
+    const narrow = try reflowDiffBlock(alloc, unicode, 16);
+    defer alloc.free(narrow);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "  │     UNICODE_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "TAIL") != null);
+    var lines = std.mem.splitScalar(u8, narrow, '\n');
+    while (lines.next()) |line| {
+        if (display_width.visibleWidthIgnoringAnsi(line) == 0) continue;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 16);
+    }
+}
+
+test "renderEntriesToBytes normalizes raw byte entry tails and inserts block gaps" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "first\n\n", .unknown_raw);
+    try appendRawTestEntry(&entries, alloc, 2, "second\n", .unknown_raw);
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("first\n\nsecond\n", out);
+}
+
+test "compact presentation hides context notices while full presentation retains them" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendSemanticNoticeTestEntry(&entries, alloc, 1, .{
+        .topic = "context",
+        .tone = .warning,
+        .body = "first warning",
+        .visibility = .full_only,
+    });
+    try appendSemanticNoticeTestEntry(&entries, alloc, 2, .{
+        .topic = "system",
+        .tone = .information,
+        .body = "ordinary system notice",
+    });
+    try appendSemanticNoticeTestEntry(&entries, alloc, 3, .{
+        .topic = "context",
+        .tone = .warning,
+        .body = "second warning",
+        .visibility = .full_only,
+    });
+    try appendSemanticNoticeTestEntry(&entries, alloc, 4, .{
+        .topic = "system",
+        .tone = .@"error",
+        .body = "ordinary error notice",
+    });
+
+    const compact = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(compact);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "Context:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary system notice") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary error notice") != null);
+
+    const first_full = try renderEntryToBlockForPresentation(alloc, entries.items[0], 80, .{}, .full);
+    defer first_full.deinit(alloc);
+    const second_full = try renderEntryToBlockForPresentation(alloc, entries.items[2], 80, .{}, .full);
+    defer second_full.deinit(alloc);
+    try std.testing.expectEqualStrings("● Context: first warning", first_full.bytes);
+    try std.testing.expectEqualStrings("● Context: second warning", second_full.bytes);
+    try std.testing.expectEqual(TranscriptEntryClass.context_notice, entryClassForEntry(entries.items[0]));
+}
+
+test "rendered entry start line follows identity after raw block normalization" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "first\n\n", .unknown_raw);
+    try appendRawTestEntry(
+        &entries,
+        alloc,
+        2,
+        "● Running command\x1b[0m\n",
+        .tool_status,
+    );
+
+    try std.testing.expectEqual(
+        @as(?usize, 2),
+        try renderedEntryStartLine(alloc, entries.items, 2, 80, .{}),
+    );
+
+    const flow = try renderEntriesToFlowBytesForEntry(alloc, entries.items, 80, .{}, 2);
+    defer alloc.free(flow.bytes);
+    try std.testing.expectEqual(@as(?usize, 2), flow.target_entry_start_line);
+    try std.testing.expectEqualStrings(
+        "first\n\n● Running command\x1b[0m",
+        flow.bytes,
+    );
+}
+
+test "turn summary renders as response-like transcript tail" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "assistant text");
+    try appendRawTestEntry(&entries, alloc, 2, "\x1b[38;5;245m  2m 10s (15k tokens)\x1b[0m\n", .turn_summary);
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("  assistant text\n\n\x1b[38;5;245m  2m 10s (15k tokens)\x1b[0m\n", out);
+    try std.testing.expectEqual(@as(?TranscriptBlockKind, .turn_summary), tailVisibleBlockKind(entries.items));
+}
+
+test "renderEntriesToBytes trims trailing raw gap tail for a single block" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "hello\n\n", .unknown_raw);
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings("hello\n\n", out);
+}
+
+test "renderEntriesToBytes keeps final single raw newline cursor-only" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "hello\n", .unknown_raw);
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings("hello\n", out);
+}
+
+test "renderEntriesToFlowBytes separates final boundary blank row from content" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "assistant text\n\n", .unknown_raw);
+
+    const flow = try renderEntriesToFlowBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(flow.bytes);
+
+    try std.testing.expectEqualStrings("assistant text", flow.bytes);
+    try std.testing.expectEqual(@as(u16, 1), flow.trailing_boundary_blank_rows);
+}
+
+test "renderEntriesToFlowBytes separates assistant final boundary blank row from content" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "assistant text\n\n");
+
+    const flow = try renderEntriesToFlowBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(flow.bytes);
+
+    try std.testing.expectEqualStrings("  assistant text", flow.bytes);
+    try std.testing.expectEqual(@as(u16, 1), flow.trailing_boundary_blank_rows);
+}
+
+test "renderEntriesToFlowBytes separates whitespace ansi tail as boundary row" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "assistant text\n  \x1b[0m");
+
+    const flow = try renderEntriesToFlowBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(flow.bytes);
+
+    try std.testing.expectEqualStrings("  assistant text", flow.bytes);
+    try std.testing.expectEqual(@as(u16, 1), flow.trailing_boundary_blank_rows);
+}
+
+test "renderEntriesToBytes separates tool status and assistant text" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "tests passed\n", .tool_status);
+    try appendAssistantTestEntry(&entries, alloc, 2, "next answer");
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings("tests passed\n\n  next answer", out);
+}
+
+test "renderEntriesToBytes indents assistant prose without moving tool status" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "● tool status\n", .tool_status);
+    try appendAssistantTestEntry(&entries, alloc, 2, "assistant response");
+
+    const normal = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(normal);
+    try std.testing.expectEqualStrings("● tool status\n\n  assistant response", normal);
+
+    var narrow_entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&narrow_entries, alloc);
+    try appendAssistantTestEntry(&narrow_entries, alloc, 3, "ab");
+    const narrow = try renderEntriesToBytes(alloc, narrow_entries.items, 2, .{});
+    defer alloc.free(narrow);
+    try std.testing.expectEqualStrings(" a\n b", narrow);
+}
+
+test "renderEntriesToBytes keeps the assistant gutter outside bold prose" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "\x1b[1mabcdef\x1b[22m");
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 5, .{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "  \x1b[1mabc\x1b[0m\n  \x1b[1mdef\x1b[22m",
+        out,
+    );
+}
+
+test "renderEntriesToBytes keeps the assistant gutter outside light inline code" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "\x1b[38;5;247mabcdef\x1b[39m");
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 5, .{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "  \x1b[38;5;247mabc\x1b[0m\n  \x1b[38;5;247mdef\x1b[39m",
+        out,
+    );
+}
+
+test "renderEntriesToBytes preserves Setext heading styles through narrow wrapping" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(
+        &entries,
+        alloc,
+        1,
+        "\x1b[1m\x1b[4mSetext H1 heading that wraps across narrow terminal rows\x1b[24m\x1b[22m\n" ++
+            "\x1b[1mSetext H2 heading that also wraps across narrow terminal rows\x1b[22m",
+    );
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 18, .{});
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.startsWith(u8, out, "  \x1b[1m\x1b[4m"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[24m\x1b[22m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[1mSetext H2") != null);
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(std.mem.startsWith(u8, line, "  "));
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 18);
+    }
+}
+
+test "renderEntriesToBytes keeps the assistant gutter outside bold prose after a hard newline" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "\x1b[1mfirst\nsecond\x1b[22m");
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 20, .{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "  \x1b[1mfirst\x1b[0m\n  \x1b[1msecond\x1b[22m",
+        out,
+    );
+}
+
+test "renderEntriesToBytes keeps the assistant gutter outside an OSC 8 link" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(
+        &entries,
+        alloc,
+        1,
+        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4mabcdef\x1b[24m\x1b]8;;\x1b\\",
+    );
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 5, .{});
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "  \x1b[4m\x1b]8;id=fx-1;https://example.com\x1b\\abc"));
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[0m\x1b]8;;\x1b\\\n  \x1b[4m\x1b]8;id=fx-1") != null);
+}
+
+test "renderEntriesToBytes reflows an inline image label at narrow widths" {
+    const alloc = std.testing.allocator;
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    try processor.push(
+        alloc,
+        "![architecture diagram with a deliberately long label](https://example.com/diagram.png) trailing prose\n",
+        &source,
+    );
+
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, source.items);
+
+    for ([_]u16{ 1, 2, 3, 32, 120 }) |cols| {
+        const out = try renderEntriesToBytes(alloc, entries.items, cols, .{});
+        defer alloc.free(out);
+
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, out, "▧") != null);
+        if (cols >= 32) try std.testing.expect(std.mem.indexOf(u8, out, "trailing prose") != null);
+    }
+}
+
+test "renderEntriesToBytes keeps narrow CJK and emoji prose within the gutter" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "\xe6\xbc\xa2\xf0\x9f\x98\x80\n");
+
+    for (1..6) |width| {
+        const cols: u16 = @intCast(width);
+        const out = try renderEntriesToBytes(alloc, entries.items, cols, .{});
+        defer alloc.free(out);
+
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+        const gutter_tail = if (cols >= 3) "\n  " else "\n ";
+        try std.testing.expect(!std.mem.endsWith(u8, out, gutter_tail));
+        if (cols <= 3) {
+            try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "?"));
+            try std.testing.expect(std.mem.find(u8, out, "\xe6\xbc\xa2") == null);
+            try std.testing.expect(std.mem.find(u8, out, "\xf0\x9f\x98\x80") == null);
+        }
+    }
+}
+
+test "renderEntriesToBytes normalizes leading assistant newline after tool status" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "inspected\n", .tool_status);
+    try appendAssistantTestEntry(&entries, alloc, 2, "\nassistant paragraph");
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings("inspected\n\n  assistant paragraph", out);
+}
+
+test "renderEntriesToBytes keeps adjacent command output chunks contiguous" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "one\n", .command_output);
+    try appendRawTestEntry(&entries, alloc, 2, "two\n", .command_output);
+    try appendAssistantTestEntry(&entries, alloc, 3, "assistant after command");
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings("one\ntwo\n\n  assistant after command", out);
+}
+
+test "renderEntriesToFlowBytes preserves internal command output and assistant gaps" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "one\n", .command_output);
+    try appendRawTestEntry(&entries, alloc, 2, "two\n", .command_output);
+    try appendAssistantTestEntry(&entries, alloc, 3, "assistant after command");
+
+    const flow = try renderEntriesToFlowBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(flow.bytes);
+
+    try std.testing.expectEqualStrings("one\ntwo\n\n  assistant after command", flow.bytes);
+    try std.testing.expectEqual(@as(u16, 0), flow.trailing_boundary_blank_rows);
+}
+
+test "preparation provenance preserves entry identity and block separators" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 11, "tool status\n", .tool_status);
+    try appendAssistantTestEntry(&entries, alloc, 12, "assistant response");
+
+    var prepared = try renderEntriesForPreparation(
+        alloc,
+        entries.items,
+        80,
+        .{},
+        .{ .capture_provenance = true },
+    );
+    defer prepared.deinit(alloc);
+
+    try std.testing.expectEqualStrings("tool status\n\n  assistant response", prepared.bytes);
+    try std.testing.expectEqual(@as(usize, 3), prepared.line_provenance.len);
+    try std.testing.expectEqualDeep(
+        LineProvenance{ .entry = .{
+            .entry_id = 11,
+            .entry_class = .tool_status,
+        } },
+        prepared.line_provenance[0],
+    );
+    try std.testing.expectEqual(LineProvenance.block_separator, prepared.line_provenance[1]);
+    try std.testing.expectEqualDeep(
+        LineProvenance{ .entry = .{
+            .entry_id = 12,
+            .entry_class = .assistant_turn,
+        } },
+        prepared.line_provenance[2],
+    );
+}
+
+test "renderEntriesToBytes keeps adjacent subagent statuses contiguous" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendRawTestEntry(&entries, alloc, 1, "\x1b[2m  │ subagent started\n\x1b[0m", .subagent_status);
+    try appendRawTestEntry(&entries, alloc, 2, "\x1b[2m  │ subagent | 1 tools | Reading file\n\x1b[0m", .subagent_status);
+    try appendRawTestEntry(&entries, alloc, 3, "\x1b[2m  │ subagent done | summary\n\x1b[0m", .subagent_status);
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings(
+        "\x1b[2m  │ subagent started\x1b[0m\n\x1b[2m  │ subagent | 1 tools | Reading file\x1b[0m\n\x1b[2m  │ subagent done | summary\x1b[0m\n",
+        out,
+    );
+}
+
+test "renderEntriesToBytes reflows assistant_turn at paint-time cols" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "abcdefghij");
+
+    const wide = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(wide);
+    try std.testing.expectEqualStrings("  abcdefghij", wide);
+
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 5, .{});
+    defer alloc.free(narrow);
+    try std.testing.expectEqualStrings("  abc\n  def\n  ghi\n  j", narrow);
+}
+
+test "renderEntriesToBytes reflows parser-rendered lists at paint-time cols" {
+    const alloc = std.testing.allocator;
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    try processor.push(
+        alloc,
+        "- first-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop\n" ++
+            "1. second-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop\n" ++
+            "  - third-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop\n",
+        &source,
+    );
+    try processor.flush(alloc, &source);
+
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, source.items);
+
+    const wide = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(wide);
+    try std.testing.expect(std.mem.find(u8, wide, "first-abcdefghijklmnopqrstuvwxyz") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "second-abcdefghijklmnopqrstuvwxyz") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "third-abcdefghijklmnopqrstuvwxyz") != null);
+
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 20, .{});
+    defer alloc.free(narrow);
+    const first = std.mem.indexOf(u8, narrow, "first-").?;
+    const second = std.mem.indexOf(u8, narrow, "second-").?;
+    const third = std.mem.indexOf(u8, narrow, "third-").?;
+    try std.testing.expect(first < second and second < third);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
+
+    var lines = std.mem.splitScalar(u8, narrow, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 20);
+    }
+}
+
+test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols" {
+    const alloc = std.testing.allocator;
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    try processor.push(
+        alloc,
+        "- [ ] first-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop\n" ++
+            "1. [x] completed-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop\n" ++
+            "  - [X] nested-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop\n",
+        &source,
+    );
+    try processor.flush(alloc, &source);
+
+    try std.testing.expect(std.mem.find(u8, source.items, "[ ]") == null);
+    try std.testing.expect(std.mem.find(u8, source.items, "[x]") == null);
+    try std.testing.expect(std.mem.find(u8, source.items, "[X]") == null);
+    try std.testing.expect(std.mem.find(u8, source.items, "\x1b[38;5;252m\xe2\x9c\x93\x1b[39m completed-") != null);
+
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, source.items);
+
+    const wide = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(wide);
+    try std.testing.expect(std.mem.find(u8, wide, "first-abcdefghijklmnopqrstuvwxyz") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "completed-abcdefghijklmnopqrstuvwxyz") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "nested-abcdefghijklmnopqrstuvwxyz") != null);
+
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 20, .{});
+    defer alloc.free(narrow);
+    const first = std.mem.indexOf(u8, narrow, "first-").?;
+    const completed = std.mem.indexOf(u8, narrow, "completed-").?;
+    const nested = std.mem.indexOf(u8, narrow, "nested-").?;
+    try std.testing.expect(first < completed and completed < nested);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
+
+    var lines = std.mem.splitScalar(u8, narrow, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 20);
+    }
+}
+
+test "renderEntriesToBytes avoids singleton intermediate task continuations" {
+    const alloc = std.testing.allocator;
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    try processor.push(
+        alloc,
+        "  - [ ] nested observer task that wraps across a narrow terminal without losing its continuation indentation\n",
+        &source,
+    );
+    try processor.flush(alloc, &source);
+
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, source.items);
+
+    const rendered = try renderEntriesToBytes(alloc, entries.items, 32, .{});
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "\n      its continuation\n      indentation") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "\n      its\n      continuation indentation") == null);
+
+    var lines = std.mem.splitScalar(u8, rendered, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 32);
+    }
+}
+
+test "renderEntriesToBytes indents semantic table and code rows" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    const table = try assistant_presentation.parseTablePayload(
+        alloc,
+        "| Name | Status |\n" ++
+            "|------|--------|\n" ++
+            "| api | Complete |\n",
+    );
+    try entries.append(alloc, .{ .assistant_table = .{ .id = 1, .table = table } });
+    try entries.append(alloc, .{ .assistant_code_block = .{
+        .id = 2,
+        .block = .{
+            .language = try alloc.dupe(u8, "zig"),
+            .code = try alloc.dupe(u8, "const value = 1;"),
+        },
+    } });
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "  ┌"));
+    try std.testing.expect(std.mem.find(u8, out, "\n  │") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\n\n  \x1b[2m─ zig") != null);
+
+    for (1..6) |width| {
+        const cols: u16 = @intCast(width);
+        const narrow = try renderEntriesToBytes(alloc, entries.items, cols, .{});
+        defer alloc.free(narrow);
+        var lines = std.mem.splitScalar(u8, narrow, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+        const gutter_tail = if (cols >= 3) "\n  " else "\n ";
+        try std.testing.expect(!std.mem.endsWith(u8, narrow, gutter_tail));
+    }
+}
+
+test "semantic thematic rule fills assistant content width and keeps provenance" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try entries.append(alloc, .{ .assistant_thematic_rule = .{ .id = 7 } });
+
+    const zero = try renderEntriesToBytes(alloc, entries.items, 0, .{});
+    defer alloc.free(zero);
+    try std.testing.expectEqual(@as(usize, 0), zero.len);
+
+    for ([_]u16{ 1, 2, 3, 48, 120 }) |cols| {
+        const out = try renderEntriesToBytes(alloc, entries.items, cols, .{});
+        defer alloc.free(out);
+
+        try std.testing.expectEqual(@as(usize, 1), renderedHardLineCount(out));
+        try std.testing.expectEqual(cols, display_width.visibleWidthIgnoringAnsi(out));
+        try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[22m"));
+        try std.testing.expectEqual(@as(usize, cols - assistant_wrap.gutterWidth(cols)), std.mem.count(u8, out, "\xe2\x94\x80"));
+    }
+
+    var prepared = try renderEntriesForPreparation(
+        alloc,
+        entries.items,
+        48,
+        .{},
+        .{ .capture_provenance = true },
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), prepared.line_provenance.len);
+    try std.testing.expectEqualDeep(
+        LineProvenance{ .entry = .{
+            .entry_id = 7,
+            .entry_class = .assistant_thematic_rule,
+        } },
+        prepared.line_provenance[0],
+    );
+}
+
+test "semantic table renderer frees rendered output when row prefixing fails" {
+    const base = std.testing.allocator;
+
+    var table_entry = TranscriptEntry{ .assistant_table = .{
+        .id = 1,
+        .table = try assistant_presentation.parseTablePayload(
+            base,
+            "| Name | Status |\n" ++
+                "|------|--------|\n" ++
+                "| api | Complete |\n",
+        ),
+    } };
+    defer table_entry.deinit(base);
+
+    var reached_success = false;
+    for (0..128) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = fail_index });
+        const alloc = failing.allocator();
+        if (renderEntryToBlock(alloc, table_entry, 80, .{})) |block| {
+            block.deinit(alloc);
+            reached_success = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    try std.testing.expect(reached_success);
+}
+
+fn checkCodeBlockRenderAllocationFailures(alloc: Allocator) !void {
+    const base = std.testing.allocator;
+    var entry = TranscriptEntry{ .assistant_code_block = .{
+        .id = 1,
+        .block = .{
+            .language = try base.dupe(u8, "zig"),
+            .code = try base.dupe(u8, "const value = \"ready\"; // highlighted\n"),
+        },
+    } };
+    defer entry.deinit(base);
+
+    const block = try renderEntryToBlock(alloc, entry, 80, .{});
+    defer block.deinit(alloc);
+}
+
+test "renderEntryToBlock frees all highlighted code allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkCodeBlockRenderAllocationFailures,
+        .{},
+    );
+}
+
+test "renderEntriesToBytes keeps a semantic table as its own assistant entry" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "Before table.\n");
+    const table = try assistant_presentation.parseTablePayload(
+        alloc,
+        "| Name | Count |\n" ++
+            "|------|------:|\n" ++
+            "| api | 7 |\n",
+    );
+    try entries.append(alloc, .{ .assistant_table = .{ .id = 2, .table = table } });
+    try appendAssistantTestEntry(&entries, alloc, 3, "After table.\n");
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.find(u8, out, "Name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Before table.").? < std.mem.indexOf(u8, out, "Name").?);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Name").? < std.mem.indexOf(u8, out, "After table.").?);
+}
+
+test "renderTableForTranscript reasserts bold after an inline strong header span" {
+    const alloc = std.testing.allocator;
+    var table = try assistant_presentation.parseTablePayload(
+        alloc,
+        "| prefix __strong__ suffix |\n" ++
+            "|------|\n" ++
+            "| value |\n",
+    );
+    defer table.deinit(alloc);
+
+    const out = try renderTableForTranscript(alloc, table, 80);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\x1b[1mprefix \x1b[1mstrong\x1b[22m\x1b[1m suffix\x1b[22m",
+    ) != null);
+}
+
+test "Unicode display units remain atomic in three-column vertical tables" {
+    const alloc = std.testing.allocator;
+    const sequences = [_][]const u8{
+        "\u{2600}\u{FE0F}",
+        "\u{231A}\u{FE0E}",
+        "\u{1F44D}\u{1F3FD}",
+        "\u{1F1FA}\u{1F1F8}",
+        "#\u{FE0F}\u{20E3}",
+        "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+        "\u{1F469}\u{200D}\u{1F4BB}",
+    };
+
+    for (sequences) |sequence| {
+        const source = try std.fmt.allocPrint(alloc, "| S |\n|---|\n| {s} |\n", .{sequence});
+        defer alloc.free(source);
+        var table = try assistant_presentation.parseTablePayload(alloc, source);
+        defer table.deinit(alloc);
+
+        const out = try renderTableForTranscript(alloc, table, 3);
+        defer alloc.free(out);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+        try std.testing.expect(std.mem.find(u8, out, sequence) == null);
+        try std.testing.expect(std.mem.find(u8, out, "?") != null);
+
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 3);
+        }
+    }
+}
+
+test "renderEntriesToBytes keeps semantic code as its own assistant entry" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendAssistantTestEntry(&entries, alloc, 1, "Before code.\n");
+    const block = assistant_presentation.CodeBlockPayload{
+        .language = try alloc.dupe(u8, "zig"),
+        .code = try alloc.dupe(u8, "  const value = 1;\n"),
+    };
+    try entries.append(alloc, .{ .assistant_code_block = .{ .id = 2, .block = block } });
+    try appendAssistantTestEntry(&entries, alloc, 3, "After code.\n");
+
+    const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Before code.").? < std.mem.indexOf(u8, out, "const").?);
+    try std.testing.expect(std.mem.indexOf(u8, out, "const").? < std.mem.indexOf(u8, out, "After code.").?);
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[2m─ zig ─") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[2mzig\x1b[22m\n─") == null);
+
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 6, .{});
+    defer alloc.free(narrow);
+    try std.testing.expect(std.mem.find(u8, narrow, "┌") == null);
+    var lines = std.mem.splitScalar(u8, narrow, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 6);
+    }
+}
+
+test "renderEntriesToBytes rebuilds user card at paint-time cols" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try appendUserTestEntry(&entries, alloc, 1, "this is a long user prompt that should wrap at narrow widths but not at a wide width");
+
+    const wide = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(wide);
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 30, .{});
+    defer alloc.free(narrow);
+
+    try std.testing.expect(narrow.len > wide.len);
+    try std.testing.expect(std.mem.startsWith(u8, wide, user_message_card.promptMarkerStyle()));
+    try std.testing.expect(std.mem.find(u8, wide, "┃") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "this is") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "this is") != null);
+}
+
+test "renderEntriesToBytes preserves selected skill token spans through user card reflow" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    const text = "raw $review then $review after";
+    const text_dup = try alloc.dupe(u8, text);
+    var handed_off = false;
+    errdefer if (!handed_off) alloc.free(text_dup);
+    const images = try alloc.alloc(types.ImageAttachment, 0);
+    errdefer if (!handed_off) alloc.free(images);
+    const skill_tokens = try alloc.alloc(input_visual_layout.SkillTokenSpan, 1);
+    errdefer if (!handed_off) alloc.free(skill_tokens);
+    const token_name = try alloc.dupe(u8, "review");
+    errdefer if (!handed_off) alloc.free(token_name);
+    const token_path = try alloc.dupe(u8, "/tmp/review");
+    errdefer if (!handed_off) alloc.free(token_path);
+    skill_tokens[0] = .{
+        .raw_start = "raw $review then ".len,
+        .raw_end = "raw $review then $review".len,
+        .name = token_name,
+        .path = token_path,
+    };
+    try entries.append(alloc, .{ .user_turn = .{
+        .id = 1,
+        .turn = .{ .text = text_dup, .images = images },
+        .skill_tokens = skill_tokens,
+    } });
+    handed_off = true;
+
+    const wide = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(wide);
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 24, .{});
+    defer alloc.free(narrow);
+
+    try std.testing.expect(std.mem.find(u8, wide, "$review then ") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "\x1b[38;5;252mreview") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "$review then $review") == null);
+    try std.testing.expect(std.mem.find(u8, narrow, "$review") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b[38;5;252mreview") != null);
+}
+
+test "renderEntriesToBytes keeps current user rails scoped through reflow" {
+    const alloc = std.testing.allocator;
+    user_message_card.setStyle(false, null);
+    user_message_card.setStyle(false, .{ .r = 20, .g = 80, .b = 140 });
+    defer user_message_card.setStyle(false, null);
+
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendUserTestEntry(&entries, alloc, 1, "this submitted prompt should wrap at narrow widths");
+    try appendRawTestEntry(&entries, alloc, 2, "Z", .unknown_raw);
+
+    for ([_]u16{ 80, 30 }) |cols| {
+        const out = try renderEntriesToBytes(alloc, entries.items, cols, .{});
+        defer alloc.free(out);
+        var grid = try vt_emulator.Grid.init(alloc, cols, 12);
+        defer grid.deinit();
+        try grid.feed(out);
+
+        var prompt_found = false;
+        var following_entry_found = false;
+        var row: u16 = 1;
+        while (row <= grid.rows) : (row += 1) {
+            var col: u16 = 1;
+            while (col <= grid.cols) : (col += 1) {
+                const cell = grid.cellAt(row, col).?;
+                if (cell.codepoint == '┃') {
+                    prompt_found = true;
+                    try std.testing.expect(cell.style.bg.eql(.default));
+                    try std.testing.expect(cell.style.fg.eql(.{ .indexed = 255 }));
+                }
+                if (cell.codepoint == 'Z') {
+                    following_entry_found = true;
+                    try std.testing.expect(cell.style.bg.eql(.default));
+                    try std.testing.expect(cell.style.fg.eql(.default));
+                }
+            }
+        }
+        try std.testing.expect(prompt_found);
+        try std.testing.expect(following_entry_found);
+    }
+}
+
+test "current compact rendering reflows user prompts without card background" {
+    const alloc = std.testing.allocator;
+    user_message_card.setStyle(false, .{ .r = 20, .g = 80, .b = 140 });
+    defer user_message_card.setStyle(false, null);
+
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendUserTestEntry(&entries, alloc, 1, "minimal prompt");
+
+    const out = try renderEntriesWithOverridesToBytes(alloc, entries.items, 80, .{}, &.{});
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[38;5;255m┃\x1b[0m \x1b[1mminimal prompt"));
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[48;") == null);
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[K") == null);
 }

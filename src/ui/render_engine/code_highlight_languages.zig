@@ -372,3 +372,82 @@ fn containsWordIgnoreCase(source: []const u8, word: []const u8) bool {
 fn isWordByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
+
+test "TypeScript assertions infer the canonical TypeScript label" {
+    const source =
+        "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);";
+
+    try std.testing.expectEqualStrings("ts", infer(std.testing.allocator, source).?.label);
+    try std.testing.expect(infer(std.testing.allocator, "const value = 1;") == null);
+    try std.testing.expect(infer(std.testing.allocator, "const value = {} as cleanupSignal;") == null);
+}
+
+test "supported code fence labels resolve case insensitively" {
+    const cases = [_]struct { label: []const u8, profile: []const u8 }{
+        .{ .label = "Zig", .profile = "zig" },
+        .{ .label = "js", .profile = "ts" },
+        .{ .label = "JSX", .profile = "ts" },
+        .{ .label = "javascript", .profile = "ts" },
+        .{ .label = "TS", .profile = "ts" },
+        .{ .label = "tsx", .profile = "ts" },
+        .{ .label = "TypeScript", .profile = "ts" },
+        .{ .label = "JSON", .profile = "json" },
+        .{ .label = "sh", .profile = "sh" },
+        .{ .label = "BASH", .profile = "sh" },
+        .{ .label = "zsh", .profile = "sh" },
+        .{ .label = "Shell", .profile = "sh" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label);
+    try std.testing.expect(resolve("") == null);
+    try std.testing.expect(resolve("text") == null);
+}
+
+test "expanded code fence labels resolve through the language registry" {
+    const cases = [_]struct { label: []const u8, profile: []const u8 }{
+        .{ .label = "python", .profile = "python" },         .{ .label = "py", .profile = "python" },
+        .{ .label = "yaml", .profile = "yaml" },             .{ .label = "yml", .profile = "yaml" },
+        .{ .label = "toml", .profile = "toml" },             .{ .label = "sql", .profile = "sql" },
+        .{ .label = "dockerfile", .profile = "dockerfile" }, .{ .label = "rust", .profile = "rust" },
+        .{ .label = "rs", .profile = "rust" },               .{ .label = "go", .profile = "go" },
+        .{ .label = "c", .profile = "c" },                   .{ .label = "cpp", .profile = "cpp" },
+        .{ .label = "c++", .profile = "cpp" },               .{ .label = "csharp", .profile = "csharp" },
+        .{ .label = "cs", .profile = "csharp" },             .{ .label = "java", .profile = "java" },
+        .{ .label = "kotlin", .profile = "kotlin" },         .{ .label = "php", .profile = "php" },
+        .{ .label = "ruby", .profile = "ruby" },             .{ .label = "swift", .profile = "swift" },
+        .{ .label = "powershell", .profile = "powershell" }, .{ .label = "ps1", .profile = "powershell" },
+        .{ .label = "lua", .profile = "lua" },               .{ .label = "html", .profile = "html" },
+        .{ .label = "xml", .profile = "xml" },               .{ .label = "css", .profile = "css" },
+        .{ .label = "hcl", .profile = "hcl" },               .{ .label = "terraform", .profile = "hcl" },
+        .{ .label = "tf", .profile = "hcl" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label);
+}
+
+test "high-confidence source shapes infer registered profiles" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { source: []const u8, profile: []const u8 }{
+        .{ .source = "{\"ready\": true}", .profile = "json" },
+        .{ .source = "#!/usr/bin/env bash\necho ready", .profile = "sh" },
+        .{ .source = "def render(value):\n    return value", .profile = "python" },
+        .{ .source = "SELECT id FROM users", .profile = "sql" },
+        .{ .source = "FROM alpine:3.20\nRUN echo ready", .profile = "dockerfile" },
+        .{ .source = "package main\nfunc main() {}", .profile = "go" },
+        .{ .source = "fn main() { println!(\"ready\"); }", .profile = "rust" },
+    };
+
+    for (cases) |case| try std.testing.expectEqualStrings(case.profile, infer(alloc, case.source).?.label);
+    try std.testing.expect(infer(alloc, "const value = 1;") == null);
+    try std.testing.expect(infer(alloc, "title: ready") == null);
+}
+
+test "aliases do not collide across profiles" {
+    for (profiles, 0..) |profile, profile_index| {
+        for (profile.aliases) |alias| {
+            for (profiles[profile_index + 1 ..]) |other| {
+                for (other.aliases) |other_alias| {
+                    try std.testing.expect(!std.ascii.eqlIgnoreCase(alias, other_alias));
+                }
+            }
+        }
+    }
+}

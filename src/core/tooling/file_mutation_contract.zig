@@ -342,6 +342,99 @@ fn optionalIdentityEql(a: ?FileIdentity, b: ?FileIdentity) bool {
     return b == null;
 }
 
+test "policy target proof validation accepts and rejects owned target shapes" {
+    const canonical = if (std.fs.path.sep == '\\')
+        "C:\\workspace\\parent\\note.txt"
+    else
+        "/workspace/parent/note.txt";
+    const anchor_end = if (std.fs.path.sep == '\\')
+        "C:\\workspace".len
+    else
+        "/workspace".len;
+    const parent_start = anchor_end + 1;
+    const parent_end = parent_start + "parent".len;
+    const target_start = parent_end + 1;
+    const target_end = target_start + "note.txt".len;
+
+    const anchor_identity: FileIdentity = .{
+        .device = 1,
+        .inode = 10,
+        .kind = .directory,
+    };
+    const parent_identity: FileIdentity = .{
+        .device = 1,
+        .inode = 11,
+        .kind = .directory,
+    };
+    const target_identity: FileIdentity = .{
+        .device = 1,
+        .inode = 12,
+        .kind = .file,
+    };
+    const components = [_]PathSpan{
+        .{ .start = parent_start, .end = parent_end },
+        .{ .start = target_start, .end = target_end },
+    };
+    const traversal = [_]TraversalDirectory{
+        .{
+            .component_index = 0,
+            .path_end = parent_end,
+            .state = .{ .existing = parent_identity },
+        },
+    };
+    const items = [_]EvaluatedPermissionTarget{
+        .{
+            .kind = .target,
+            .disposition = .target_entry,
+            .path_end = canonical.len,
+            .expected_identity = target_identity,
+            .rule = .allow,
+            .session_grant_allowed = false,
+        },
+        .{
+            .kind = .parent,
+            .disposition = .existing_parent,
+            .path_end = parent_end,
+            .expected_identity = parent_identity,
+            .rule = .allow,
+            .session_grant_allowed = false,
+        },
+    };
+    const policy: PolicyEvaluatedFileTargets = .{
+        .canonical_target_path = canonical,
+        .anchor = .{
+            .scope = .workspace,
+            .path_end = anchor_end,
+            .identity = anchor_identity,
+            .relative_components = &components,
+        },
+        .traversal_directories = &traversal,
+        .items = &items,
+        .prompt_required = false,
+    };
+
+    try std.testing.expect(policy.proofValid());
+
+    var corrupted_components = components;
+    corrupted_components[0].start = anchor_end;
+    var corrupted_policy = policy;
+    corrupted_policy.anchor.relative_components = &corrupted_components;
+    try std.testing.expect(!corrupted_policy.proofValid());
+
+    const unused_items = [_]EvaluatedPermissionTarget{
+        items[0],
+        items[1],
+        items[0],
+    };
+    var unused_item_policy = policy;
+    unused_item_policy.items = &unused_items;
+    try std.testing.expect(!unused_item_policy.proofValid());
+}
+
+test "file target proof charge rejects arithmetic overflow" {
+    try std.testing.expect(proofCharge(std.math.maxInt(usize), 1, 0, 0) == null);
+}
+
 pub const FileTargetPolicyResult = union(enum) {
     target_resolution_failure: FileTargetResolutionFailure,
     policy_denied: struct { target_index: usize },
@@ -401,6 +494,13 @@ pub fn resultIsNoop(tool_name: []const u8, output: []const u8) bool {
         std.mem.startsWith(u8, output, "No changes to ");
 }
 
+test "persisted result no-op requires a file mutation tool and canonical output" {
+    try std.testing.expect(resultIsNoop("write_file", "No changes to note.txt"));
+    try std.testing.expect(resultIsNoop("edit_file", "No changes to note.txt"));
+    try std.testing.expect(!resultIsNoop("read_file", "No changes to note.txt"));
+    try std.testing.expect(!resultIsNoop("write_file", "Wrote note.txt"));
+}
+
 pub const WriteInput = struct {
     path: []u8,
     content: []u8,
@@ -437,6 +537,36 @@ pub const FileMutationInput = union(Kind) {
         self.* = undefined;
     }
 };
+
+test "file mutation input owns write and edit fields" {
+    const write_path = "note.txt";
+    const write_content = "hello\n";
+    var write_input: FileMutationInput = .{ .write = .{
+        .path = try std.testing.allocator.dupe(u8, write_path),
+        .content = try std.testing.allocator.dupe(u8, write_content),
+    } };
+    try std.testing.expectEqualStrings(write_path, write_input.path());
+    try std.testing.expectEqualStrings(write_content, write_input.write.content);
+    try std.testing.expect(write_input.write.path.ptr != write_path.ptr);
+    try std.testing.expect(write_input.write.content.ptr != write_content.ptr);
+    write_input.deinit(std.testing.allocator);
+
+    const edit_path = "note.txt";
+    const old_string = "hello";
+    const new_string = "goodbye";
+    var edit_input: FileMutationInput = .{ .edit = .{
+        .path = try std.testing.allocator.dupe(u8, edit_path),
+        .old_string = try std.testing.allocator.dupe(u8, old_string),
+        .new_string = try std.testing.allocator.dupe(u8, new_string),
+    } };
+    try std.testing.expectEqualStrings(edit_path, edit_input.path());
+    try std.testing.expectEqualStrings(old_string, edit_input.edit.old_string);
+    try std.testing.expectEqualStrings(new_string, edit_input.edit.new_string);
+    try std.testing.expect(edit_input.edit.path.ptr != edit_path.ptr);
+    try std.testing.expect(edit_input.edit.old_string.ptr != old_string.ptr);
+    try std.testing.expect(edit_input.edit.new_string.ptr != new_string.ptr);
+    edit_input.deinit(std.testing.allocator);
+}
 
 pub const Preimage = union(enum) {
     absent,

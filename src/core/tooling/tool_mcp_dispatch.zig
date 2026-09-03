@@ -1,21 +1,9 @@
 const std = @import("std");
-const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 
 const Allocator = std.mem.Allocator;
-
-const SearchInput = struct {
-    query: []u8,
-    prepared: lexical_relevance.PreparedQuery,
-    limit: usize,
-
-    fn deinit(self: *SearchInput, alloc: Allocator) void {
-        alloc.free(self.query);
-        self.* = undefined;
-    }
-};
 
 const SelectInput = struct {
     name: []u8,
@@ -25,60 +13,6 @@ const SelectInput = struct {
         self.* = .{ .name = &.{} };
     }
 };
-
-pub fn decodeSearch(
-    ctx: tool_dispatch.DispatchContext,
-    args_json: []const u8,
-) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return .{ .failure = try ctx.allocator.dupe(u8, "Invalid mcp_search_tools arguments.") };
-    };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "Invalid mcp_search_tools arguments.") };
-    }
-    const query_value = parsed.value.object.get("query") orelse {
-        return .{ .failure = try ctx.allocator.dupe(u8, "mcp_search_tools requires a string query.") };
-    };
-    if (query_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "mcp_search_tools requires a string query.") };
-    }
-
-    const raw_limit = if (parsed.value.object.get("limit")) |value|
-        if (value == .integer) value.integer else 0
-    else
-        0;
-    const limit = if (raw_limit <= 0)
-        0
-    else
-        std.math.cast(usize, raw_limit) orelse std.math.maxInt(usize);
-
-    if (query_value.string.len > lexical_relevance.max_query_bytes) {
-        return .{ .failure = try ctx.allocator.dupe(
-            u8,
-            "mcp_search_tools query must not exceed 4096 bytes.",
-        ) };
-    }
-
-    const query = try ctx.allocator.dupe(u8, query_value.string);
-    errdefer ctx.allocator.free(query);
-    const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
-        error.QueryTooLong => unreachable,
-        error.TooManyTokens => {
-            const message = try ctx.allocator.dupe(
-                u8,
-                "mcp_search_tools query must not exceed 64 tokens.",
-            );
-            ctx.allocator.free(query);
-            return .{ .failure = message };
-        },
-    };
-    const input = try ctx.allocator.create(SearchInput);
-    errdefer ctx.allocator.destroy(input);
-    input.* = .{ .query = query, .prepared = prepared, .limit = limit };
-    return .{ .input = .{ .ptr = input, .deinit_fn = searchInputDeinit } };
-}
 
 pub fn decodeSelect(
     ctx: tool_dispatch.DispatchContext,
@@ -112,42 +46,6 @@ pub fn validate(
     _: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!?[]u8 {
     return null;
-}
-
-pub fn callSearch(
-    ctx: tool_dispatch.DispatchContext,
-    erased: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const runtime_context = ctx.mcp_ctx orelse return semanticFailure(
-        ctx,
-        "No MCP runtime is available.",
-    );
-    const search_tools = ctx.mcp_search_tools orelse return semanticFailure(
-        ctx,
-        "No MCP runtime is available.",
-    );
-    const input = erased.as(SearchInput);
-    const result = search_tools(
-        runtime_context,
-        ctx.allocator,
-        &input.prepared,
-        input.limit,
-        ctx.mcp_permission_rules,
-        ctx.context_limits,
-        ctx.mcp_access,
-    ) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = try tool_result_errors.formatToolExecutionErrorJson(
-            ctx.allocator,
-            "mcp_search_tools",
-            err,
-        ) };
-    };
-    if (result.notice) |notice| {
-        defer ctx.allocator.free(notice);
-        try tool_dispatch.reportContextNotice(ctx, notice);
-    }
-    return .{ .success = result.model_output };
 }
 
 pub fn callSelect(
@@ -215,12 +113,6 @@ pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
 
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
-}
-
-fn searchInputDeinit(ptr: *anyopaque, alloc: Allocator) void {
-    const input: *SearchInput = @ptrCast(@alignCast(ptr));
-    input.deinit(alloc);
-    alloc.destroy(input);
 }
 
 fn selectInputDeinit(ptr: *anyopaque, alloc: Allocator) void {

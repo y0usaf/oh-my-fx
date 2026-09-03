@@ -15,7 +15,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FX_BIN="${REPO_ROOT}/zig-out/bin/omfx"
+FX_BIN="${REPO_ROOT}/zig-out/bin/fx"
 RESULTS_DIR="${REPO_ROOT}/benchmarks/results"
 SESSION_FIXTURE_ROOT="${TMPDIR:-/tmp}/fx-session-list-benchmark-$$"
 SESSION_FIXTURE_HOME="${SESSION_FIXTURE_ROOT}/home"
@@ -150,21 +150,6 @@ HOME="$SESSION_FIXTURE_HOME" hyperfine \
   --export-json "${RESULTS_DIR}/sessions.json" \
   --command-name "fx sessions --json" \
   "$FX_BIN sessions --json"
-
-echo ""
-
-# Benchmark 5: fx background --json (file I/O path)
-echo "--- fx background --json ---"
-(
-  cd "$SESSION_FIXTURE_WORKSPACE"
-  HOME="$SESSION_FIXTURE_HOME" hyperfine \
-    "${SHELL_OPTS[@]}" \
-    --runs "$RUNS" \
-    --warmup "$WARMUP" \
-    --export-json "${RESULTS_DIR}/background.json" \
-    --command-name "fx background --json" \
-    "$FX_BIN background --json"
-)
 
 echo ""
 

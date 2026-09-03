@@ -324,3 +324,369 @@ fn openTestVerifiedDir(dir: std.Io.Dir) !io_mod.VerifiedDir {
         ),
     };
 }
+
+test "usage sidecar restores rich fields only for its bound session and projection" {
+    const alloc = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var verified = try openTestVerifiedDir(temp.dir);
+    defer verified.close();
+
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    const sequence = try usage.reserveInvocation();
+    try usage.finishObservedInvocation(
+        alloc,
+        sequence,
+        5,
+        .observed_generation,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    try usage.applyGeneration(alloc, .{
+        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .model = "provider/model",
+        .total_cost = 0.01,
+        .input_tokens = 10,
+        .output_tokens = 4,
+        .cache_read_tokens = 2,
+        .cache_write_tokens = 1,
+        .reasoning_tokens = 3,
+        .billable_web_search_calls = 0,
+    });
+    var rich = try usage.snapshot(alloc);
+    defer rich.deinit(alloc);
+    try write(alloc, &verified, "session-one", rich);
+
+    var legacy_bytes: std.Io.Writer.Allocating = .init(alloc);
+    defer legacy_bytes.deinit();
+    try session_usage.writeSnapshot(&legacy_bytes.writer, rich);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        legacy_bytes.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    var durable = try session_usage.parseSnapshotValue(alloc, parsed.value);
+    defer durable.deinit(alloc);
+
+    try std.testing.expectEqual(
+        RestoreOutcome.restored,
+        try restoreIfMatching(
+            alloc,
+            &verified,
+            "session-one",
+            20,
+            &durable,
+        ),
+    );
+    try std.testing.expectEqual(@as(?u64, 1), durable.request_count);
+    try std.testing.expectEqual(@as(?u64, 3), durable.reasoning_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), durable.models[0].request_count);
+
+    try std.testing.expectEqual(
+        RestoreOutcome.invalid,
+        try restoreIfMatching(
+            alloc,
+            &verified,
+            "session-two",
+            21,
+            &durable,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), durable.incidents.len);
+    try std.testing.expectEqual(@as(i64, 21), durable.incidents[0].occurred_at_ms);
+
+    var stale = try legacyCopyForTest(alloc, rich);
+    defer stale.deinit(alloc);
+    stale.next_sequence += 1;
+    stale.settled_through_sequence += 1;
+    try std.testing.expectEqual(
+        RestoreOutcome.mismatched,
+        try restoreIfMatching(
+            alloc,
+            &verified,
+            "session-one",
+            22,
+            &stale,
+        ),
+    );
+    try std.testing.expect(stale.request_count == null);
+    try std.testing.expectEqual(@as(usize, 1), stale.incidents.len);
+    try std.testing.expectEqual(@as(i64, 22), stale.incidents[0].occurred_at_ms);
+
+    var changed = try legacyCopyForTest(alloc, rich);
+    defer changed.deinit(alloc);
+    changed.total_cost += 0.01;
+    changed.models[0].total_cost += 0.01;
+    try std.testing.expectEqual(
+        RestoreOutcome.mismatched,
+        try restoreIfMatching(
+            alloc,
+            &verified,
+            "session-one",
+            23,
+            &changed,
+        ),
+    );
+    try std.testing.expect(changed.request_count == null);
+    try std.testing.expectEqual(@as(usize, 1), changed.incidents.len);
+    try std.testing.expectEqual(@as(i64, 23), changed.incidents[0].occurred_at_ms);
+}
+
+test "non-billing rollback changes keep canonical values and rich metrics" {
+    const alloc = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var verified = try openTestVerifiedDir(temp.dir);
+    defer verified.close();
+
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    const sequence = try usage.reserveInvocation();
+    try usage.finishObservedInvocation(
+        alloc,
+        sequence,
+        5,
+        .observed_generation,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    try usage.applyGeneration(alloc, .{
+        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .model = "provider/model",
+        .total_cost = 0.01,
+        .input_tokens = 10,
+        .output_tokens = 4,
+        .cache_read_tokens = 2,
+        .cache_write_tokens = 1,
+        .reasoning_tokens = 3,
+        .billable_web_search_calls = 0,
+    });
+    var rich = try usage.snapshot(alloc);
+    defer rich.deinit(alloc);
+    try write(alloc, &verified, "session-one", rich);
+
+    var durable = try legacyCopyForTest(alloc, rich);
+    defer durable.deinit(alloc);
+    durable.wall_duration_ms += 50;
+    durable.lines_added = 7;
+    durable.lines_removed = 2;
+
+    try std.testing.expectEqual(
+        RestoreOutcome.restored,
+        try restoreIfMatching(
+            alloc,
+            &verified,
+            "session-one",
+            20,
+            &durable,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, rich.wall_duration_ms + 50), durable.wall_duration_ms);
+    try std.testing.expectEqual(@as(u64, 7), durable.lines_added);
+    try std.testing.expectEqual(@as(u64, 2), durable.lines_removed);
+    try std.testing.expectEqual(@as(?u64, 1), durable.request_count);
+    try std.testing.expectEqual(@as(?u64, 3), durable.reasoning_tokens);
+    try std.testing.expectEqual(@as(usize, 0), durable.incidents.len);
+}
+
+test "missing and corrupt usage sidecars retain canonical usage with one fixed gap" {
+    const alloc = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var verified = try openTestVerifiedDir(temp.dir);
+    defer verified.close();
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    const sequence = try usage.reserveInvocation();
+    usage.finishInvocation(sequence, 1, .unbilled);
+    var rich = try usage.snapshot(alloc);
+    defer rich.deinit(alloc);
+
+    var missing = try legacyCopyForTest(alloc, rich);
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(
+        RestoreOutcome.missing,
+        try restoreIfMatching(
+            alloc,
+            &verified,
+            "session-one",
+            30,
+            &missing,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), missing.incidents.len);
+    try std.testing.expectEqual(@as(i64, 30), missing.incidents[0].occurred_at_ms);
+    try std.testing.expectEqual(
+        RestoreOutcome.missing,
+        try restoreIfMatching(
+            alloc,
+            &verified,
+            "session-one",
+            30,
+            &missing,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), missing.incidents.len);
+
+    try io_mod.durableReplaceVerified(
+        alloc,
+        &verified,
+        sidecar_file,
+        "{bad",
+    );
+    var corrupt = try legacyCopyForTest(alloc, rich);
+    defer corrupt.deinit(alloc);
+    try std.testing.expectEqual(
+        RestoreOutcome.invalid,
+        try restoreIfMatching(
+            alloc,
+            &verified,
+            "session-one",
+            31,
+            &corrupt,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), corrupt.incidents.len);
+    try std.testing.expectEqual(@as(i64, 31), corrupt.incidents[0].occurred_at_ms);
+}
+
+test "torn exact settlement republishes stale backlog without reapplying totals" {
+    const Checkpoint = struct {
+        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
+    };
+    const RejectPublication = struct {
+        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            if (event == .generation) return error.InjectedPublicationFailure;
+        }
+    };
+    const PublicationProbe = struct {
+        generations: usize = 0,
+
+        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .generation) self.generations += 1;
+        }
+    };
+    const LookupProbe = struct {
+        calls: usize = 0,
+
+        fn lookup(
+            raw: ?*anyopaque,
+            _: Allocator,
+            _: generation_usage.LookupInput,
+        ) generation_usage.LookupError!generation_usage.LookupOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return error.Unavailable;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const completion: types.ModelCompletion = .{
+        .generation_id = "response-torn-1",
+        .billing = .{
+            .created_at_ms = 100,
+            .model = "codex/gpt-test",
+            .total_cost = 0,
+            .input_tokens = 17,
+            .output_tokens = 7,
+            .cache_read_tokens = 2,
+            .cache_write_tokens = 0,
+            .reasoning_tokens = 1,
+            .billable_web_search_calls = 0,
+        },
+    };
+    const exact = stream_provider.UsageOutcome{ .exact = .codex };
+
+    var checkpoint_context: u8 = 0;
+    var publication_context: u8 = 0;
+    var bridge_source = session_usage.Usage.initFresh();
+    defer bridge_source.deinit(alloc);
+    bridge_source.configureCheckpointSink(.{
+        .context = &checkpoint_context,
+        .allocator = alloc,
+        .persist = Checkpoint.persist,
+    });
+    bridge_source.configurePublicationSink(.{
+        .context = &publication_context,
+        .allocator = alloc,
+        .publish = RejectPublication.publish,
+    });
+    const bridge_observation = try session_usage.InvocationObservation.begin(&bridge_source);
+    try bridge_observation.complete(alloc, completion, exact);
+    var stale_rich = try bridge_source.snapshot(alloc);
+    defer stale_rich.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), stale_rich.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), stale_rich.publication_backlog.len);
+    try std.testing.expectEqual(@as(u64, 0), stale_rich.input_tokens);
+
+    var settled_source = session_usage.Usage.initFresh();
+    defer settled_source.deinit(alloc);
+    const settled_observation = try session_usage.InvocationObservation.begin(&settled_source);
+    try settled_observation.complete(alloc, completion, exact);
+    var durable = try settled_source.snapshot(alloc);
+    defer durable.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), durable.pending.len);
+    try std.testing.expectEqual(@as(u64, 17), durable.input_tokens);
+
+    const stale_bytes = try encode(alloc, "session-torn", stale_rich);
+    defer alloc.free(stale_bytes);
+    try std.testing.expectEqual(
+        RestoreOutcome.mismatched,
+        try restoreCaptured(
+            alloc,
+            .{ .encoded = stale_bytes },
+            "session-torn",
+            200,
+            &durable,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), durable.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), durable.publication_backlog.len);
+    try std.testing.expectEqual(@as(u64, 17), durable.input_tokens);
+
+    var lookup = LookupProbe{};
+    var publication = PublicationProbe{};
+    var resumed = session_usage.Usage.initFreshWithProviders(.{
+        .codex = .{ .context = &lookup, .lookup_fn = LookupProbe.lookup },
+    });
+    defer resumed.deinit(alloc);
+    resumed.configurePublicationSink(.{
+        .context = &publication,
+        .allocator = alloc,
+        .publish = PublicationProbe.publish,
+    });
+    try resumed.restore(alloc, durable, 1);
+
+    var final = try resumed.snapshot(alloc);
+    defer final.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), publication.generations);
+    try std.testing.expectEqual(@as(usize, 0), lookup.calls);
+    try std.testing.expectEqual(@as(usize, 0), final.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), final.publication_backlog.len);
+    try std.testing.expectEqual(@as(u64, 17), final.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), final.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), final.request_count);
+}
+
+fn legacyCopyForTest(
+    alloc: Allocator,
+    snapshot: session_usage.Snapshot,
+) !session_usage.Snapshot {
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try session_usage.writeSnapshot(&encoded.writer, snapshot);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        encoded.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    return session_usage.parseSnapshotValue(alloc, parsed.value);
+}

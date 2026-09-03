@@ -535,3 +535,174 @@ fn has_shell_metachar(value: []const u8) bool {
     }
     return false;
 }
+
+test "pipe_segments splits unquoted pipes" {
+    const alloc = std.testing.allocator;
+    const segments = try pipe_segments(alloc, "printf a | grep a | wc -l");
+    defer alloc.free(segments);
+
+    try std.testing.expectEqual(@as(usize, 3), segments.len);
+    try std.testing.expectEqualStrings("printf a", segments[0].text);
+    try std.testing.expectEqualStrings("grep a", segments[1].text);
+    try std.testing.expectEqualStrings("wc -l", segments[2].text);
+}
+
+test "pipe_segments ignores quoted pipes" {
+    const alloc = std.testing.allocator;
+    const segments = try pipe_segments(alloc, "printf 'a|b' | grep \"c|d\"");
+    defer alloc.free(segments);
+
+    try std.testing.expectEqual(@as(usize, 2), segments.len);
+    try std.testing.expectEqualStrings("printf 'a|b'", segments[0].text);
+    try std.testing.expectEqualStrings("grep \"c|d\"", segments[1].text);
+}
+
+test "pipe_segments ignores escaped pipes" {
+    const alloc = std.testing.allocator;
+    const segments = try pipe_segments(alloc, "printf a\\|b | cat");
+    defer alloc.free(segments);
+
+    try std.testing.expectEqual(@as(usize, 2), segments.len);
+    try std.testing.expectEqualStrings("printf a\\|b", segments[0].text);
+}
+
+test "pipe_segments does not split logical or" {
+    const alloc = std.testing.allocator;
+    const segments = try pipe_segments(alloc, "grep x file || true");
+    defer alloc.free(segments);
+
+    try std.testing.expectEqual(@as(usize, 1), segments.len);
+    try std.testing.expectEqualStrings("grep x file || true", segments[0].text);
+}
+
+test "pipe_segments keeps overwrite pipe redirection within its segment" {
+    const alloc = std.testing.allocator;
+    const segments = try pipe_segments(alloc, "printf x >| out | cat");
+    defer alloc.free(segments);
+
+    try std.testing.expectEqual(@as(usize, 2), segments.len);
+    try std.testing.expectEqualStrings("printf x >| out", segments[0].text);
+    try std.testing.expectEqualStrings("cat", segments[1].text);
+}
+
+test "pipe_segments reports unbalanced quotes" {
+    try std.testing.expectError(error.UnbalancedQuote, pipe_segments(std.testing.allocator, "printf 'x | cat"));
+}
+
+test "pipe_segments reports malformed trailing escapes" {
+    try std.testing.expectError(error.MalformedEscape, pipe_segments(std.testing.allocator, "printf x\\"));
+}
+
+test "pipe_segments rejects embedded nul and invalid utf8" {
+    try std.testing.expectError(error.EmbeddedNul, pipe_segments(std.testing.allocator, "cat \x00 file"));
+    try std.testing.expectError(error.InvalidUtf8, pipe_segments(std.testing.allocator, "cat \xff"));
+}
+
+test "tokenize_argv decodes single and double quoted tokens" {
+    var argv = try tokenize_argv(std.testing.allocator, "grep 'hello world' \"file name.txt\"");
+    defer argv.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), argv.tokens.len);
+    try std.testing.expectEqualStrings("hello world", argv.tokens[1].value);
+    try std.testing.expectEqualStrings("file name.txt", argv.tokens[2].value);
+    try std.testing.expect(argv.tokens[1].quoted);
+}
+
+test "tokenize_argv preserves raw byte offsets" {
+    var argv = try tokenize_argv(std.testing.allocator, "  cat 'a b'");
+    defer argv.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), argv.tokens[0].start);
+    try std.testing.expectEqual(@as(usize, 5), argv.tokens[0].end);
+    try std.testing.expectEqualStrings("'a b'", argv.tokens[1].raw);
+}
+
+test "tokenize_argv handles escaped spaces without splitting" {
+    var argv = try tokenize_argv(std.testing.allocator, "cat file\\ name.txt");
+    defer argv.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), argv.tokens.len);
+    try std.testing.expectEqualStrings("file name.txt", argv.tokens[1].value);
+    try std.testing.expectEqualStrings("file\\ name.txt", argv.tokens[1].raw);
+}
+
+test "tokenize_argv emits redirection operators as tokens" {
+    var argv = try tokenize_argv(std.testing.allocator, "printf ok>out.txt &>> log.txt >&err.txt < in.txt <> state.txt << EOF <<< value <& 0");
+    defer argv.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(">", argv.tokens[2].value);
+    try std.testing.expectEqualStrings("&>>", argv.tokens[4].value);
+    try std.testing.expectEqualStrings(">&", argv.tokens[6].value);
+    try std.testing.expectEqualStrings("err.txt", argv.tokens[7].value);
+    try std.testing.expectEqualStrings("<", argv.tokens[8].value);
+    try std.testing.expectEqualStrings("<>", argv.tokens[10].value);
+    try std.testing.expectEqualStrings("<<", argv.tokens[12].value);
+    try std.testing.expectEqualStrings("<<<", argv.tokens[14].value);
+    try std.testing.expectEqualStrings("<&", argv.tokens[16].value);
+}
+
+test "redirection_kind classifies shell redirects" {
+    try std.testing.expectEqual(RedirectionKind.read_path, redirection_kind("<").?);
+    try std.testing.expectEqual(RedirectionKind.read_write_path, redirection_kind("<>").?);
+    try std.testing.expectEqual(RedirectionKind.write_path, redirection_kind(">").?);
+    try std.testing.expectEqual(RedirectionKind.write_path, redirection_kind("&>>").?);
+    try std.testing.expectEqual(RedirectionKind.unsupported, redirection_kind("<<").?);
+    try std.testing.expectEqual(RedirectionKind.unsupported, redirection_kind("<<<").?);
+    try std.testing.expectEqual(RedirectionKind.unsupported, redirection_kind("<&").?);
+    try std.testing.expect(redirection_kind("|") == null);
+}
+
+test "tokenize_argv distinguishes empty argv from tokenization failure" {
+    var argv = try tokenize_argv(std.testing.allocator, "   \t ");
+    defer argv.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), argv.tokens.len);
+
+    try std.testing.expectError(error.UnbalancedQuote, tokenize_argv(std.testing.allocator, "\"unterminated"));
+}
+
+test "tokenize_argv reports malformed trailing escapes" {
+    try std.testing.expectError(error.MalformedEscape, tokenize_argv(std.testing.allocator, "printf x\\"));
+}
+
+test "tokenize_argv rejects embedded nul and invalid utf8" {
+    try std.testing.expectError(error.EmbeddedNul, tokenize_argv(std.testing.allocator, "cat \x00 file"));
+    try std.testing.expectError(error.InvalidUtf8, tokenize_argv(std.testing.allocator, "cat \xff"));
+}
+
+test "unsafe_compound_indicator detects subshells and groups" {
+    try std.testing.expect(unsafe_compound_indicator("echo $(pwd)"));
+    try std.testing.expect(unsafe_compound_indicator("(cd src; make)"));
+    try std.testing.expect(unsafe_compound_indicator("{ echo hi; }"));
+    try std.testing.expect(!unsafe_compound_indicator("grep '(' file"));
+}
+
+test "unsafe_compound_indicator detects logical control syntax" {
+    try std.testing.expect(unsafe_compound_indicator("cd src && touch x"));
+    try std.testing.expect(unsafe_compound_indicator("grep x file || true"));
+    try std.testing.expect(unsafe_compound_indicator("sleep 1 &"));
+    try std.testing.expect(!unsafe_compound_indicator("printf a | grep a"));
+}
+
+test "unsafe_compound_indicator ignores escaped and quoted compound characters" {
+    try std.testing.expect(!unsafe_compound_indicator("printf \\& \\| \\;"));
+    try std.testing.expect(!unsafe_compound_indicator("printf \"$(literal)\""));
+}
+
+test "wrapper_strip_argv strips safe env and process wrappers" {
+    var argv = try tokenize_argv(std.testing.allocator, "env NODE_ENV=prod nice -n 5 timeout --foreground 10s grep x file");
+    defer argv.deinit(std.testing.allocator);
+
+    const stripped = wrapper_strip_argv(argv.tokens).?;
+    try std.testing.expectEqualStrings("grep", stripped[0].value);
+    try std.testing.expectEqualStrings("file", stripped[2].value);
+}
+
+test "wrapper_strip_argv declines ambiguous wrappers" {
+    var env_argv = try tokenize_argv(std.testing.allocator, "env -i grep x");
+    defer env_argv.deinit(std.testing.allocator);
+    try std.testing.expect(wrapper_strip_argv(env_argv.tokens) == null);
+
+    var timeout_argv = try tokenize_argv(std.testing.allocator, "timeout --kill-after '1;rm' 10s grep x");
+    defer timeout_argv.deinit(std.testing.allocator);
+    try std.testing.expect(wrapper_strip_argv(timeout_argv.tokens) == null);
+}

@@ -1,12 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
+const host_contract = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
+const session_presence = @import("session_presence.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -89,6 +91,23 @@ fn storageBackend() StorageBackend {
     // Keychain-specific tests inject their backend explicitly.
     if (comptime builtin.is_test) return .profile_file;
     return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
+}
+
+pub fn presence() host_contract.SecretStorePresence {
+    const file_presence = session_presence.profileFile(
+        auth_file_name,
+        max_auth_file_bytes,
+    );
+    if (storageBackend() == .profile_file or file_presence == .present) {
+        return file_presence;
+    }
+    const keychain_presence = native_keychain.oauthSessionPresence() catch
+        return .unavailable;
+    if (keychain_presence == .present) return .present;
+    if (file_presence == .missing and keychain_presence == .missing) {
+        return .missing;
+    }
+    return .unavailable;
 }
 
 fn selectResolution(file: FileState, keychain: KeychainState) Resolution {
@@ -643,7 +662,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session 
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("auth", "session load failed step=parse err={s}", .{@errorName(err)});
-            return null;
+            if (mode == .tolerate_open_failure) return null else return err;
         },
     };
 }
@@ -886,6 +905,68 @@ fn requiredInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
 
 const test_session_json = "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\",\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_at_ms\":1,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\",\"team_slug\":\"team-slug\",\"team_id\":\"team-id\"}";
 
+const HostStoreTestState = struct {
+    record: ?[]const u8 = test_session_json,
+    revision: []const u8 = "7",
+    next_revision: []const u8 = "8",
+    force_conflict: bool = false,
+    commit_count: usize = 0,
+    remove_count: usize = 0,
+    expected_revision_matched: bool = false,
+    committed_format_matched: bool = false,
+
+    fn provider(self: *@This()) js_host_auth.SessionStore {
+        return .{
+            .context = self,
+            .load_fn = HostStoreTestState.load,
+            .commit_fn = HostStoreTestState.commit,
+            .remove_fn = HostStoreTestState.remove,
+        };
+    }
+
+    fn load(raw: ?*anyopaque, alloc: Allocator) !?js_host_auth.StoredSession {
+        const self = state(raw);
+        const record = self.record orelse return null;
+        const bytes = try alloc.dupe(u8, record);
+        errdefer secret.zeroAndFree(alloc, bytes);
+        return .{
+            .bytes = bytes,
+            .revision = try alloc.dupe(u8, self.revision),
+        };
+    }
+
+    fn commit(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        bytes: []const u8,
+        expected_revision: ?[]const u8,
+    ) ![]u8 {
+        const self = state(raw);
+        self.commit_count += 1;
+        self.expected_revision_matched = expected_revision != null and
+            std.mem.eql(u8, expected_revision.?, self.revision);
+        self.committed_format_matched = std.mem.eql(u8, bytes, test_session_json ++ "\n");
+        if (self.force_conflict) return error.OAuthSessionRevisionConflict;
+        self.revision = self.next_revision;
+        return alloc.dupe(u8, self.revision);
+    }
+
+    fn remove(raw: ?*anyopaque, expected_revision: ?[]const u8) !js_host_auth.RemoveOutcome {
+        const self = state(raw);
+        self.remove_count += 1;
+        self.expected_revision_matched = expected_revision != null and
+            std.mem.eql(u8, expected_revision.?, self.revision);
+        if (self.force_conflict) return error.OAuthSessionRevisionConflict;
+        if (self.record == null) return .missing;
+        self.record = null;
+        return .deleted;
+    }
+
+    fn state(raw: ?*anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw.?));
+    }
+};
+
 fn check_parse_allocation_failures(alloc: Allocator) !void {
     var session = try parse(alloc, test_session_json);
     defer session.deinit(alloc);
@@ -895,6 +976,69 @@ fn check_load_allocation_failures(alloc: Allocator, dir: *std.Io.Dir) !void {
     var session = (try loadFromDir(alloc, dir, .report_open_failure)) orelse return error.TestUnexpectedMissingSession;
     defer session.deinit(alloc);
 }
+
+test "oauth session stringifies and parses" {
+    var session = Session{
+        .issuer = try std.testing.allocator.dupe(u8, issuer),
+        .client_id = try std.testing.allocator.dupe(u8, "client"),
+        .access_token = try std.testing.allocator.dupe(u8, "access"),
+        .refresh_token = try std.testing.allocator.dupe(u8, "refresh"),
+        .expires_at_ms = 1234,
+        .scope = try std.testing.allocator.dupe(u8, "openid offline_access"),
+        .token_type = try std.testing.allocator.dupe(u8, "Bearer"),
+        .team_slug = try std.testing.allocator.dupe(u8, "vercel-labs"),
+        .team_id = try std.testing.allocator.dupe(u8, "team_123"),
+    };
+    defer session.deinit(std.testing.allocator);
+
+    const text = try stringify(std.testing.allocator, session);
+    defer secret.zeroAndFree(std.testing.allocator, text);
+    var parsed = try parse(std.testing.allocator, text);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(issuer, parsed.issuer);
+    try std.testing.expectEqualStrings("client", parsed.client_id);
+    try std.testing.expectEqualStrings("access", parsed.access_token);
+    try std.testing.expectEqualStrings("vercel-labs", parsed.team_slug.?);
+    try std.testing.expectEqualStrings("team_123", parsed.team_id.?);
+}
+
+test "OAuth storage backend selection is platform scoped and explicitly disableable" {
+    try std.testing.expectEqual(StorageBackend.macos_keychain, selectStorageBackend(.macos, false));
+    try std.testing.expectEqual(StorageBackend.profile_file, selectStorageBackend(.macos, true));
+    try std.testing.expectEqual(StorageBackend.profile_file, selectStorageBackend(.linux, false));
+    try std.testing.expectEqual(StorageBackend.profile_file, selectStorageBackend(.windows, false));
+}
+
+test "OAuth test builds use profile file storage" {
+    try std.testing.expectEqual(StorageBackend.profile_file, storageBackend());
+}
+
+test "OAuth source resolution covers every file and Keychain state" {
+    const cases = [_]struct {
+        file: FileState,
+        keychain: KeychainState,
+        expected: Resolution,
+    }{
+        .{ .file = .absent, .keychain = .absent, .expected = .missing },
+        .{ .file = .absent, .keychain = .valid, .expected = .keychain },
+        .{ .file = .absent, .keychain = .invalid, .expected = .storage_error },
+        .{ .file = .absent, .keychain = .unavailable, .expected = .storage_error },
+        .{ .file = .valid, .keychain = .absent, .expected = .file_migrate },
+        .{ .file = .valid, .keychain = .valid, .expected = .file_migrate },
+        .{ .file = .valid, .keychain = .invalid, .expected = .file_migrate },
+        .{ .file = .valid, .keychain = .unavailable, .expected = .file_defer_migration },
+        .{ .file = .unusable, .keychain = .valid, .expected = .keychain },
+        .{ .file = .unusable, .keychain = .absent, .expected = .missing },
+        .{ .file = .unusable, .keychain = .invalid, .expected = .storage_error },
+        .{ .file = .unusable, .keychain = .unavailable, .expected = .storage_error },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, selectResolution(case.file, case.keychain));
+    }
+}
+
+const alternate_test_session_json = "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\",\"access_token\":\"keychain-access\",\"refresh_token\":\"keychain-refresh\",\"expires_at_ms\":2,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}";
 
 const FakeOAuthKeychain = struct {
     alloc: Allocator,
@@ -944,6 +1088,294 @@ const FakeOAuthKeychain = struct {
     }
 };
 
+fn writeTestAuthFile(dir: std.Io.Dir, contents: []const u8) !void {
+    var file = try dir.createFile(std.testing.io, auth_file_name, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, contents);
+}
+
+fn testKeychainMutation(dir: std.Io.Dir, keychain: KeychainBackend) !Mutation {
+    return lockMutationWithBackend(
+        .{ .dir = try dir.openDir(std.testing.io, ".", .{ .iterate = true }) },
+        0,
+        .{},
+        .macos_keychain,
+        keychain,
+    );
+}
+
+test "OAuth migration keeps a valid file authoritative until verified cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+
+    var fake = FakeOAuthKeychain{
+        .alloc = alloc,
+        .value = try alloc.dupe(u8, alternate_test_session_json),
+    };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    var loaded = (try mutation.load(alloc)).?;
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings("access", loaded.access_token);
+    try std.testing.expectEqual(@as(usize, 1), fake.store_calls);
+    try std.testing.expectEqual(Authority.keychain, mutation.authority);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, auth_file_name, .{}),
+    );
+
+    var persisted = try parse(alloc, fake.value.?);
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("access", persisted.access_token);
+
+    secret.zeroAndFree(alloc, loaded.access_token);
+    loaded.access_token = try alloc.dupe(u8, "keychain-only-update");
+    try mutation.save(alloc, loaded);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, auth_file_name, .{}),
+    );
+    var updated = try parse(alloc, fake.value.?);
+    defer updated.deinit(alloc);
+    try std.testing.expectEqualStrings("keychain-only-update", updated.access_token);
+}
+
+test "new OAuth login replaces an existing file before deferred migration" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+
+    var fake = FakeOAuthKeychain{ .alloc = alloc, .fail_store = true };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+    var replacement = try parse(alloc, alternate_test_session_json);
+    defer replacement.deinit(alloc);
+
+    try mutation.save(alloc, replacement);
+    var persisted = (try loadFromDir(alloc, &tmp.dir, .report_open_failure)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("keychain-access", persisted.access_token);
+    try std.testing.expectEqual(Authority.profile_file, mutation.authority);
+}
+
+test "OAuth migration preserves and updates the file when Keychain publication fails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+
+    var fake = FakeOAuthKeychain{ .alloc = alloc, .fail_store = true };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    var loaded = (try mutation.load(alloc)).?;
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(Authority.profile_file, mutation.authority);
+    secret.zeroAndFree(alloc, loaded.access_token);
+    loaded.access_token = try alloc.dupe(u8, "updated-access");
+    try mutation.save(alloc, loaded);
+
+    var persisted = (try loadFromDir(alloc, &tmp.dir, .report_open_failure)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("updated-access", persisted.access_token);
+    try std.testing.expectEqual(@as(usize, 2), fake.store_calls);
+}
+
+test "OAuth resolver uses valid Keychain state without deleting an unusable file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, "not-json");
+
+    var fake = FakeOAuthKeychain{
+        .alloc = alloc,
+        .value = try alloc.dupe(u8, alternate_test_session_json),
+    };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    var loaded = (try mutation.load(alloc)).?;
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings("keychain-access", loaded.access_token);
+    _ = try tmp.dir.statFile(std.testing.io, auth_file_name, .{});
+}
+
+test "OAuth resolver reports invalid Keychain state when no valid file exists" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fake = FakeOAuthKeychain{
+        .alloc = alloc,
+        .value = try alloc.dupe(u8, "not-json"),
+    };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    try std.testing.expectError(error.InvalidOAuthKeychainSession, mutation.load(alloc));
+}
+
+test "OAuth logout deletion attempts Keychain and file cleanup independently" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+    var fake = FakeOAuthKeychain{
+        .alloc = alloc,
+        .value = try alloc.dupe(u8, alternate_test_session_json),
+        .fail_delete = true,
+    };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    const result = try mutation.delete(alloc);
+    try std.testing.expect(result.session_deleted);
+    try std.testing.expect(result.local_cleanup_failed);
+    try std.testing.expectEqual(@as(usize, 1), fake.delete_calls);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, auth_file_name, .{}),
+    );
+}
+
+test "JS host OAuth session load commit and remove preserve the native format and revision" {
+    var state: HostStoreTestState = .{};
+    var loaded = (try loadFromHost(std.testing.allocator, state.provider())).?;
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("access", loaded.access_token);
+
+    var mutation = HostMutation.init(state.provider());
+    defer mutation.deinit();
+    var current = (try mutation.load(std.testing.allocator)).?;
+    defer current.deinit(std.testing.allocator);
+    try mutation.save(std.testing.allocator, current);
+    try std.testing.expectEqual(@as(usize, 1), state.commit_count);
+    try std.testing.expect(state.expected_revision_matched);
+    try std.testing.expect(state.committed_format_matched);
+
+    const deleted = try mutation.delete(std.testing.allocator);
+    try std.testing.expect(deleted.session_deleted);
+    try std.testing.expect(!deleted.local_cleanup_failed);
+    try std.testing.expectEqual(@as(usize, 1), state.remove_count);
+    try std.testing.expect(state.expected_revision_matched);
+}
+
+test "JS host OAuth session revision conflict does not take session ownership" {
+    var state = HostStoreTestState{ .force_conflict = true };
+    var mutation = HostMutation.init(state.provider());
+    defer mutation.deinit();
+    var current = (try mutation.load(std.testing.allocator)).?;
+    defer current.deinit(std.testing.allocator);
+    const access_token = current.access_token.ptr;
+
+    try std.testing.expectError(
+        error.OAuthSessionRevisionConflict,
+        mutation.save(std.testing.allocator, current),
+    );
+    try std.testing.expectEqual(access_token, current.access_token.ptr);
+    try std.testing.expectEqualStrings("access", current.access_token);
+    try std.testing.expectEqual(@as(usize, 1), state.commit_count);
+}
+
+test "oauth session parse cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_parse_allocation_failures, .{});
+}
+
+test "oauth session parse rejects non-object JSON" {
+    try std.testing.expectError(error.InvalidAuthSession, parse(std.testing.allocator, "[]"));
+}
+
+test "oauth session loading propagates allocation failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try file.writeStreamingAll(
+        std.testing.io,
+        test_session_json,
+    );
+    file.close(std.testing.io);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        check_load_allocation_failures,
+        .{&tmp.dir},
+    );
+}
+
+test "OAuth mutation loads report auth file open failures" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(std.testing.io, "missing-auth-target", auth_file_name, .{ .is_directory = false });
+
+    try std.testing.expect((try loadFromDir(std.testing.allocator, &tmp.dir, .tolerate_open_failure)) == null);
+    try std.testing.expectError(
+        error.SymLinkLoop,
+        loadFromDir(std.testing.allocator, &tmp.dir, .report_open_failure),
+    );
+}
+
+test "OAuth mutation distinguishes an invalid session from an absent session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try file.writeStreamingAll(std.testing.io, "{\"version\":2}\n");
+    file.close(std.testing.io);
+
+    try std.testing.expect((try loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        .tolerate_open_failure,
+    )) == null);
+    try std.testing.expectError(
+        error.InvalidAuthSession,
+        loadFromDir(std.testing.allocator, &tmp.dir, .report_open_failure),
+    );
+}
+
+test "oauth session rejects invalid saved issuers" {
+    try std.testing.expectError(
+        error.InvalidAuthSession,
+        parse(
+            std.testing.allocator,
+            "{\"version\":1,\"issuer\":\"https://example.com\",\"client_id\":\"client\",\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_at_ms\":1234,\"scope\":\"openid\",\"token_type\":\"Bearer\"}",
+        ),
+    );
+}
+
+test "oauth session treats near-expiry as expired" {
+    var session = Session{
+        .issuer = try std.testing.allocator.dupe(u8, issuer),
+        .client_id = try std.testing.allocator.dupe(u8, "client"),
+        .access_token = try std.testing.allocator.dupe(u8, "access"),
+        .refresh_token = try std.testing.allocator.dupe(u8, "refresh"),
+        .expires_at_ms = 100_000,
+        .scope = try std.testing.allocator.dupe(u8, "openid"),
+        .token_type = try std.testing.allocator.dupe(u8, "Bearer"),
+    };
+    defer session.deinit(std.testing.allocator);
+    try std.testing.expect(session.expired(50_000));
+    try std.testing.expect(!session.expired(1));
+    try std.testing.expect(session.expired(std.math.maxInt(i64)));
+}
+
 const DeleteSyncProbe = struct {
     sync_count: usize = 0,
     fail: bool = false,
@@ -954,3 +1386,97 @@ const DeleteSyncProbe = struct {
         if (self.fail) return error.InjectedSyncFailure;
     }
 };
+
+test "OAuth session deletion reports deleted and missing files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{});
+    file.close(std.testing.io);
+
+    var probe: DeleteSyncProbe = .{};
+    const ops = io_mod.DurableOps{
+        .ctx = &probe,
+        .sync_dir = DeleteSyncProbe.syncDir,
+    };
+    const deleted = try deleteAuthFile(&tmp.dir, ops);
+    try std.testing.expectEqual(DeleteOutcome.deleted, deleted);
+    try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
+    const missing = try deleteAuthFile(&tmp.dir, ops);
+    try std.testing.expectEqual(DeleteOutcome.missing, missing);
+    try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
+}
+
+test "OAuth session deletion reports directory sync failure after unlink" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{});
+    file.close(std.testing.io);
+
+    var probe = DeleteSyncProbe{ .fail = true };
+    const ops = io_mod.DurableOps{
+        .ctx = &probe,
+        .sync_dir = DeleteSyncProbe.syncDir,
+    };
+    const outcome = try deleteAuthFile(&tmp.dir, ops);
+    try std.testing.expectEqual(DeleteOutcome.deleted_not_durable, outcome);
+    try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, auth_file_name, .{}),
+    );
+
+    probe.fail = false;
+    const missing = try deleteAuthFile(&tmp.dir, ops);
+    try std.testing.expectEqual(DeleteOutcome.missing, missing);
+    try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
+}
+
+test "OAuth session mutation lock serializes independent handles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var first = try lockMutationWithOps(
+        .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) },
+        0,
+        .{},
+    );
+    defer first.deinit();
+
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationWithOps(
+            .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) },
+            0,
+            .{},
+        ),
+    );
+}
+
+test "oauth E2E issuer override accepts loopback HTTP only" {
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:43123",
+        try selectIssuerUrl("http://127.0.0.1:43123"),
+    );
+    try std.testing.expectEqualStrings(
+        "http://localhost:43123",
+        try selectIssuerUrl("http://localhost:43123"),
+    );
+    try std.testing.expectError(
+        error.InvalidE2EOAuthIssuer,
+        selectIssuerUrl("https://example.com"),
+    );
+    try std.testing.expectError(
+        error.InvalidE2EOAuthIssuer,
+        selectIssuerUrl("http://127.0.0.1:43123@evil.example"),
+    );
+    try validateE2EEndpoint(
+        "http://127.0.0.1:43123",
+        "http://localhost:43123/oauth/token",
+    );
+    try std.testing.expectError(
+        error.InvalidE2EOAuthEndpoint,
+        validateE2EEndpoint("http://127.0.0.1:43123", "https://example.com/oauth/token"),
+    );
+}

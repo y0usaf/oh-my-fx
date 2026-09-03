@@ -263,3 +263,32 @@ pub fn footerTopRowForExtra(self: anytype, extra: u16) u16 {
         self.cursor_row;
     return @min(after_content, max_top);
 }
+
+test "footer top row uses committed reserved base rows when present" {
+    const layout = types.Layout{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    };
+    const Host = struct {
+        layout: types.Layout,
+        cursor_row: u16,
+        cursor_col: u16,
+        footer_reserved_base_rows: u16,
+    };
+
+    var tint_host = Host{
+        .layout = layout,
+        .cursor_row = 100,
+        .cursor_col = 1,
+        .footer_reserved_base_rows = 2,
+    };
+    try std.testing.expectEqual(@as(u16, 22), footerTopRowForExtra(tint_host, 0));
+
+    tint_host.footer_reserved_base_rows = 3;
+    try std.testing.expectEqual(@as(u16, 21), footerTopRowForExtra(tint_host, 0));
+}

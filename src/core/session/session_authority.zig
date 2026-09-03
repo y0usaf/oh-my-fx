@@ -538,6 +538,23 @@ fn verifyOpenedSessionFile(
     }
 }
 
+test "read-only session files accept an atomically unlinked descriptor" {
+    var stat = std.mem.zeroes(std.Io.File.Stat);
+    stat.kind = .file;
+    stat.nlink = 0;
+    try verifyOpenedSessionFile(stat, .read_only);
+    try std.testing.expectError(
+        error.SessionPathUnsafe,
+        verifyOpenedSessionFile(stat, .writable),
+    );
+
+    stat.nlink = 2;
+    try std.testing.expectError(
+        error.SessionPathUnsafe,
+        verifyOpenedSessionFile(stat, .read_only),
+    );
+}
+
 /// Reports whether `name` exists directly under the session dir, mapping
 /// unsafe link/dir shapes to `error.SessionPathUnsafe`.
 pub fn entryExistsRelative(

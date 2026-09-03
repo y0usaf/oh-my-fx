@@ -72,19 +72,6 @@ pub const Decoder = struct {
         }
 
         if (self.stage != 0) {
-            if (context.child_route_active and self.stage == 1 and byte == 0x1b) {
-                const was_cancel_pending = self.cancel_pending;
-                self.reset();
-                debug_trace.logf(
-                    "input",
-                    "event=child_escape_replay boundary=selected_child",
-                    .{},
-                );
-                appendAction(&ingress, .escape, was_cancel_pending);
-                ingress.replay_byte_after_routing = 0x1b;
-                return ingress;
-            }
-
             const prior_stage = self.stage;
             const action = escape_parser.consumeInputEscapeByteWithMouse(
                 &self.stage,
@@ -242,4 +229,117 @@ fn shouldReplayControlAfterBareEscape(byte: u8) bool {
         3, 7, 12, 15, 22, 24 => true,
         else => false,
     };
+}
+
+test "plain byte carries composer fallback without consuming product routing" {
+    var decoder = Decoder{};
+    const ingress = decoder.feed(11, .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = false,
+    });
+
+    try std.testing.expectEqual(@as(u8, 11), ingress.event.?.raw.byte);
+    try std.testing.expectEqual(
+        input_action.ShortcutAction.delete_to_line_end,
+        ingress.event.?.raw.composer_shortcut.?,
+    );
+}
+
+test "bare Escape control replay preserves event order" {
+    var decoder = Decoder{};
+    _ = decoder.feed(0x1b, .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = true,
+    });
+    const ingress = decoder.feed(3, .{
+        .now_ms = 2,
+        .paste_active = false,
+        .cancel_pending = true,
+    });
+
+    try std.testing.expectEqual(input_action.Action.escape, ingress.event.?.action.action);
+    try std.testing.expect(ingress.event.?.action.cancel_pending);
+    try std.testing.expectEqual(@as(?u8, 3), ingress.replay_byte_after_routing);
+}
+
+test "escape timeout emits one semantic action" {
+    var decoder = Decoder{};
+    _ = decoder.feed(0x1b, .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = true,
+    });
+    const ingress = decoder.flush(31, 30, false);
+
+    try std.testing.expectEqual(input_action.Action.escape, ingress.event.?.action.action);
+    try std.testing.expect(ingress.event.?.action.cancel_pending);
+    try std.testing.expect(!decoder.hasPending());
+}
+
+test "active paste bypasses decoding and preserves pending text ownership" {
+    var decoder = Decoder{};
+    const ingress = decoder.feed(0x1b, .{
+        .now_ms = 1,
+        .paste_active = true,
+        .cancel_pending = true,
+    });
+
+    try std.testing.expectEqual(@as(u8, 0x1b), ingress.event.?.paste_byte);
+    try std.testing.expect(!ingress.interrupts_pending_text);
+    try std.testing.expect(!decoder.hasPending());
+}
+
+test "unknown escape resolves to ignore instead of Escape" {
+    var decoder = Decoder{};
+    _ = decoder.feed(0x1b, .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = true,
+    });
+    const ingress = decoder.feed('x', .{
+        .now_ms = 2,
+        .paste_active = false,
+        .cancel_pending = false,
+    });
+
+    try std.testing.expectEqual(input_action.Action.ignore, ingress.event.?.action.action);
+    try std.testing.expect(ingress.event.?.action.cancel_pending);
+    try std.testing.expect(!decoder.hasPending());
+}
+
+test "unknown complete CSI stays pending until its final byte and resolves to ignore" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = true,
+    };
+
+    _ = decoder.feed(0x1b, context);
+    for ("[>0") |byte| {
+        const ingress = decoder.feed(byte, context);
+        try std.testing.expect(ingress.event == null);
+        try std.testing.expect(decoder.hasPending());
+    }
+    const ingress = decoder.feed('q', context);
+    try std.testing.expectEqual(input_action.Action.ignore, ingress.event.?.action.action);
+    try std.testing.expect(ingress.event.?.action.cancel_pending);
+    try std.testing.expect(!decoder.hasPending());
+}
+
+test "incomplete CSI expires without producing Escape" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = true,
+    };
+
+    _ = decoder.feed(0x1b, context);
+    _ = decoder.feed('[', context);
+    const ingress = decoder.flush(31, 30, false);
+    try std.testing.expect(ingress.event == null);
+    try std.testing.expect(!decoder.hasPending());
 }

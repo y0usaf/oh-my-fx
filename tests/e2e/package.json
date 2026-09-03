@@ -1,0 +1,16 @@
+{
+  "name": "fx-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "render-lab": "bun render-lab/index.ts",
+    "test": "bun test",
+    "test:cli": "bun test cli.test.ts",
+    "test:acp": "bun test acp.test.ts",
+    "test:tui": "bun test tui-*.test.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}

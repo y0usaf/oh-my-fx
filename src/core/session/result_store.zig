@@ -56,7 +56,9 @@ pub fn prepare(
     inline_cap: usize,
 ) !PreparedResult {
     if (result_dir) |dir| {
-        if (output_bytes > large_result_threshold_bytes) {
+        if (output_bytes > large_result_threshold_bytes or
+            durable_output.len > inline_cap)
+        {
             return prepareStoredResult(
                 alloc,
                 .{ .legacy_dir = dir },
@@ -88,7 +90,9 @@ pub fn prepareManaged(
     inline_cap: usize,
 ) !PreparedResult {
     if (capability) |managed| {
-        if (output_bytes > large_result_threshold_bytes) {
+        if (output_bytes > large_result_threshold_bytes or
+            durable_output.len > inline_cap)
+        {
             return prepareStoredResult(
                 alloc,
                 .{ .managed = managed },
@@ -192,6 +196,19 @@ fn storeLargeResultAtHandle(
         handle,
         text,
     );
+}
+
+pub fn storeLargeResultManaged(
+    alloc: Allocator,
+    capability: *session_child_store.SessionChildCapability,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    text: []const u8,
+) ![]u8 {
+    const handle = try makeHandle(alloc, tool_call_id, tool_name, text);
+    errdefer alloc.free(handle);
+    try storeLargeResultAtHandleManaged(alloc, capability, handle, text);
+    return handle;
 }
 
 fn storeLargeResultAtHandleManaged(
@@ -350,6 +367,17 @@ pub fn openReaderManaged(
     return .{ .file = file, .size = size };
 }
 
+pub fn deleteManaged(
+    capability: *session_child_store.SessionChildCapability,
+    handle: []const u8,
+) !void {
+    try validateHandle(handle);
+    capability.delete(.tool_results, handle) catch |err| switch (err) {
+        error.FileNotFound => return error.ResultHandleNotFound,
+        else => return err,
+    };
+}
+
 fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8, max_bytes: usize) ![]u8 {
     const marker = try std.fmt.allocPrint(
         alloc,
@@ -433,4 +461,524 @@ fn validateHandle(handle: []const u8) !void {
         const ok = std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.';
         if (!ok) return error.InvalidHandle;
     }
+}
+
+test "large result storage creates stable handle and bounded preview" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+
+    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    const prepared = try prepare(alloc, dir, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024);
+    defer alloc.free(prepared.model_output);
+    defer alloc.free(@constCast(prepared.memory.output_handle.?));
+    defer alloc.free(@constCast(prepared.memory.preview.?));
+
+    try std.testing.expect(prepared.memory.truncated);
+    try std.testing.expect(prepared.memory.preview.?.len <= preview_bytes);
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, prepared.memory.output_handle.?) != null);
+
+    const again = try prepare(alloc, dir, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024);
+    defer alloc.free(again.model_output);
+    defer alloc.free(@constCast(again.memory.output_handle.?));
+    defer alloc.free(@constCast(again.memory.preview.?));
+    try std.testing.expectEqualStrings(prepared.memory.output_handle.?, again.memory.output_handle.?);
+}
+
+test "inline cap and stored preview keep complete codepoints" {
+    const alloc = std.testing.allocator;
+
+    const inline_text = "x" ++ ("\xc3\xa9" ** 300);
+    for ([_]usize{ 128, 129 }) |cap| {
+        const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap);
+        defer alloc.free(prepared.model_output);
+        const marker_start = std.mem.find(u8, prepared.model_output, "\n... [tool result truncated").?;
+        const prefix = prepared.model_output[0..marker_start];
+        try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
+        try std.testing.expect(std.mem.endsWith(u8, prefix, "\xc3\xa9"));
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const stored_text = "x" ++ ("\xc3\xa9" ** 8200);
+    const stored = try prepare(alloc, dir, "call/3", "run_command", stored_text.len, stored_text, 64 * 1024);
+    defer alloc.free(stored.model_output);
+    defer alloc.free(@constCast(stored.memory.output_handle.?));
+    defer alloc.free(@constCast(stored.memory.preview.?));
+    try std.testing.expectEqual(@as(usize, preview_bytes - 1), stored.memory.preview.?.len);
+    try std.testing.expect(std.mem.endsWith(u8, stored.memory.preview.?, "\xc3\xa9"));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(stored.memory.preview.?));
+}
+
+test "large result handles never expose token-shaped call ids" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+
+    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 1);
+    const secret_id = "sk-abcdefghijklmnop";
+    const prepared = try prepare(
+        alloc,
+        dir,
+        secret_id,
+        "read_file",
+        bytes.len,
+        bytes[0..],
+        bytes.len,
+    );
+    defer alloc.free(prepared.model_output);
+    defer alloc.free(@constCast(prepared.memory.output_handle.?));
+    defer alloc.free(@constCast(prepared.memory.preview.?));
+
+    try std.testing.expect(
+        std.mem.find(u8, prepared.memory.output_handle.?, secret_id) == null,
+    );
+    try std.testing.expect(
+        std.mem.find(u8, prepared.model_output, secret_id) == null,
+    );
+}
+
+const PrepareRoute = enum {
+    legacy,
+    managed,
+};
+
+fn expectLargeResultPreparationLeavesNoOrphan(route: PrepareRoute) !void {
+    const base = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "results");
+    const dir = try io_mod.dirRealpathAlloc(base, tmp.dir, "results");
+    defer base.free(dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        base,
+        dir,
+        .tool_results,
+        .writable,
+    );
+    defer capability.deinit();
+
+    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    var reached_success = false;
+    var fail_index: usize = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            base,
+            .{ .fail_index = fail_index },
+        );
+        const alloc = failing.allocator();
+        const prepared_result = switch (route) {
+            .legacy => prepare(
+                alloc,
+                dir,
+                "call",
+                "read_file",
+                bytes.len,
+                bytes[0..],
+                bytes.len,
+            ),
+            .managed => prepareManaged(
+                alloc,
+                &capability,
+                "call",
+                "read_file",
+                bytes.len,
+                bytes[0..],
+                bytes.len,
+            ),
+        };
+        if (prepared_result) |prepared| {
+            defer alloc.free(@constCast(prepared.model_output));
+            defer if (prepared.memory.output_handle) |handle| {
+                alloc.free(@constCast(handle));
+            };
+            defer if (prepared.memory.preview) |preview| {
+                alloc.free(@constCast(preview));
+            };
+            if (prepared.memory.output_handle) |handle| {
+                try deleteManaged(&capability, handle);
+            }
+            reached_success = true;
+            break;
+        } else |_| {
+            var entries = try capability.iterate(base, .tool_results);
+            defer entries.deinit();
+            try std.testing.expectEqual(@as(usize, 0), entries.names.len);
+        }
+    }
+    try std.testing.expect(reached_success);
+}
+
+test "legacy large result preparation removes committed files on later allocation failure" {
+    try expectLargeResultPreparationLeavesNoOrphan(.legacy);
+}
+
+test "managed large result preparation removes committed files on later allocation failure" {
+    try expectLargeResultPreparationLeavesNoOrphan(.managed);
+}
+
+fn expectExistingLargeResultSurvivesPreparationFailure(
+    route: PrepareRoute,
+) !void {
+    const base = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "results");
+    const dir = try io_mod.dirRealpathAlloc(base, tmp.dir, "results");
+    defer base.free(dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        base,
+        dir,
+        .tool_results,
+        .writable,
+    );
+    defer capability.deinit();
+
+    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    const seeded_handle = try storeLargeResultManaged(
+        base,
+        &capability,
+        "call",
+        "read_file",
+        bytes[0..],
+    );
+    defer base.free(seeded_handle);
+    defer deleteManaged(&capability, seeded_handle) catch {};
+
+    var reached_success = false;
+    var fail_index: usize = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            base,
+            .{ .fail_index = fail_index },
+        );
+        const alloc = failing.allocator();
+        const prepared_result = switch (route) {
+            .legacy => prepare(
+                alloc,
+                dir,
+                "call",
+                "read_file",
+                bytes.len,
+                bytes[0..],
+                bytes.len,
+            ),
+            .managed => prepareManaged(
+                alloc,
+                &capability,
+                "call",
+                "read_file",
+                bytes.len,
+                bytes[0..],
+                bytes.len,
+            ),
+        };
+        if (prepared_result) |prepared| {
+            defer alloc.free(@constCast(prepared.model_output));
+            defer if (prepared.memory.output_handle) |handle| {
+                alloc.free(@constCast(handle));
+            };
+            defer if (prepared.memory.preview) |preview| {
+                alloc.free(@constCast(preview));
+            };
+            reached_success = true;
+            break;
+        } else |_| {
+            const stored = try readByRangeManaged(
+                base,
+                &capability,
+                seeded_handle,
+                1,
+                bytes.len,
+            );
+            defer base.free(stored);
+            try std.testing.expect(std.mem.find(u8, stored, bytes[0..64]) != null);
+        }
+    }
+    try std.testing.expect(reached_success);
+}
+
+test "legacy preparation failure preserves an existing deterministic handle" {
+    try expectExistingLargeResultSurvivesPreparationFailure(.legacy);
+}
+
+test "managed preparation failure preserves an existing deterministic handle" {
+    try expectExistingLargeResultSurvivesPreparationFailure(.managed);
+}
+
+test "stored result reads support ranges and literal queries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+
+    const handle = try storeLargeResult(alloc, dir, "call", "grep_files", "alpha\nneedle one\nbeta\nneedle two\n");
+    defer alloc.free(handle);
+    const ranged = try readByRange(alloc, dir, handle, 1, 5);
+    defer alloc.free(ranged);
+    try std.testing.expect(std.mem.find(u8, ranged, "alpha") != null);
+
+    const queried = try searchByQuery(alloc, dir, handle, "needle");
+    defer alloc.free(queried);
+    try std.testing.expect(std.mem.find(u8, queried, "needle one") != null);
+    try std.testing.expect(std.mem.find(u8, queried, "needle two") != null);
+}
+
+test "range reads snap to utf8 rune boundaries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+
+    const handle = try storeLargeResult(alloc, dir, "call", "grep_files", "ab\xc3\xa9\xc3\xa9cd");
+    defer alloc.free(handle);
+
+    const tail = try readByRange(alloc, dir, handle, 4, 3);
+    defer alloc.free(tail);
+    try std.testing.expect(std.mem.find(u8, tail, "start_byte=\"5\" end_byte=\"6\"") != null);
+    try std.testing.expect(std.mem.find(u8, tail, "\n\xc3\xa9\n") != null);
+
+    const head = try readByRange(alloc, dir, handle, 1, 3);
+    defer alloc.free(head);
+    try std.testing.expect(std.mem.find(u8, head, "start_byte=\"1\" end_byte=\"2\"") != null);
+    try std.testing.expect(std.mem.find(u8, head, "\nab\n") != null);
+}
+
+test "managed result reader reaches head middle and tail through bounded pages" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "results");
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "results");
+    defer alloc.free(result_dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        result_dir,
+        .tool_results,
+        .writable,
+    );
+    defer capability.deinit();
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(alloc);
+    try content.appendSlice(alloc, "FULL_READER_HEAD\n");
+    try content.appendNTimes(alloc, 'x', 8 * 1024 * 1024);
+    try content.appendSlice(alloc, "\nFULL_READER_TAIL\n");
+    const handle = try storeLargeResultManaged(
+        alloc,
+        &capability,
+        "full-reader",
+        "read_file",
+        content.items,
+    );
+    defer alloc.free(handle);
+    defer deleteManaged(&capability, handle) catch {};
+
+    var reader = try openReaderManaged(alloc, &capability, handle);
+    defer reader.deinit();
+    try std.testing.expectEqual(content.items.len, reader.size);
+
+    const head = try reader.readPage(alloc, 0, full_read_chunk_bytes);
+    defer alloc.free(head);
+    try std.testing.expect(std.mem.startsWith(u8, head, "FULL_READER_HEAD\n"));
+
+    const middle = try reader.readPage(alloc, reader.size / 2, full_read_chunk_bytes);
+    defer alloc.free(middle);
+    try std.testing.expectEqual(@as(usize, full_read_chunk_bytes), middle.len);
+    try std.testing.expect(std.mem.indexOfScalar(u8, middle, 'x') != null);
+
+    const tail_offset = reader.size - "\nFULL_READER_TAIL\n".len;
+    const tail = try reader.readPage(alloc, tail_offset, full_read_chunk_bytes);
+    defer alloc.free(tail);
+    try std.testing.expectEqualStrings("\nFULL_READER_TAIL\n", tail);
+}
+
+test "managed replay reads a complete result whose close tag is beyond the range limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        dir,
+        .tool_results,
+        .writable,
+    );
+    defer capability.deinit();
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(alloc);
+    try output.appendSlice(alloc, "<stdout>\n");
+    try output.appendNTimes(alloc, 'x', read_max_bytes);
+    try output.appendSlice(alloc, "\n</stdout>\n");
+
+    const handle = try storeLargeResultManaged(
+        alloc,
+        &capability,
+        "replay",
+        "run_command",
+        output.items,
+    );
+    defer alloc.free(handle);
+
+    const ranged = try readByRangeManaged(
+        alloc,
+        &capability,
+        handle,
+        1,
+        read_max_bytes,
+    );
+    defer alloc.free(ranged);
+    try std.testing.expect(std.mem.find(u8, ranged, "</stdout>") == null);
+
+    const replayed = try readForReplayManaged(
+        alloc,
+        &capability,
+        handle,
+        output.items.len,
+    );
+    defer alloc.free(replayed);
+    try std.testing.expectEqualStrings(output.items, replayed);
+    try std.testing.expectError(
+        error.ResultSizeMismatch,
+        readForReplayManaged(alloc, &capability, handle, output.items.len - 1),
+    );
+    try std.testing.expectError(
+        error.ResultSizeUnsupported,
+        readForReplayManaged(alloc, &capability, handle, stored_text_max_bytes + 1),
+    );
+}
+
+test "managed result create read stat delete remains contained after route swap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "results");
+    try tmp.dir.createDirPath(io_mod.getIo(), "outside");
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "results");
+    defer alloc.free(result_dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        result_dir,
+        .tool_results,
+        .writable,
+    );
+    defer capability.deinit();
+
+    try tmp.dir.rename(
+        "results",
+        tmp.dir,
+        "retained-results",
+        io_mod.getIo(),
+    );
+    try tmp.dir.symLink(
+        io_mod.getIo(),
+        "outside",
+        "results",
+        .{ .is_directory = true },
+    );
+
+    const handle = try storeLargeResultManaged(
+        alloc,
+        &capability,
+        "managed",
+        "grep_files",
+        "alpha\nneedle\n",
+    );
+    defer alloc.free(handle);
+    const stat = try statManaged(&capability, handle);
+    try std.testing.expectEqual(@as(u64, 13), stat.size);
+    const ranged = try readByRangeManaged(
+        alloc,
+        &capability,
+        handle,
+        1,
+        5,
+    );
+    defer alloc.free(ranged);
+    try std.testing.expect(std.mem.find(u8, ranged, "alpha") != null);
+    const outside_path = try std.fs.path.join(
+        alloc,
+        &.{ "outside", handle },
+    );
+    defer alloc.free(outside_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(io_mod.getIo(), outside_path, .{}),
+    );
+
+    try deleteManaged(&capability, handle);
+    try std.testing.expectError(
+        error.ResultHandleNotFound,
+        readByRangeManaged(alloc, &capability, handle, 1, 5),
+    );
+}
+
+test "managed result read only absence does not create route" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "session",
+    );
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .read_only,
+        .{},
+    );
+    defer capability.deinit();
+
+    try std.testing.expectError(
+        error.ResultHandleNotFound,
+        readByRangeManaged(alloc, &capability, "missing.txt", 1, 5),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        session_dir.statFile(io_mod.getIo(), "tool-results", .{}),
+    );
+}
+
+test "managed result handles authenticate stored content" {
+    const alloc = std.testing.allocator;
+    const content = "authenticated result";
+    const handle = try makeHandle(
+        alloc,
+        "call-authenticated",
+        "run_command",
+        content,
+    );
+    defer alloc.free(handle);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
+    try std.testing.expect(handleMatchesContentDigest(handle, digest));
+    std.crypto.hash.sha2.Sha256.hash("xuthenticated result", &digest, .{});
+    try std.testing.expect(!handleMatchesContentDigest(handle, digest));
+    try std.testing.expect(!handleMatchesContentDigest(
+        "result-run_command-legacy.txt",
+        digest,
+    ));
 }

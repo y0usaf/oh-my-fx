@@ -1714,6 +1714,240 @@ fn monotonicMillis() i64 {
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
+test "web_fetch response parser decodes chunked transfer encoding" {
+    const alloc = std.testing.allocator;
+
+    var reader: std.Io.Reader = .fixed(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/html; charset=utf-8\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "5\r\nhello\r\n" ++
+            "6; ext=value\r\n world\r\n" ++
+            "0\r\nETag: ignored\r\n\r\n",
+    );
+    var failure_stage: FailureStage = .response_head;
+    var response = try readResponse(alloc, &reader, max_body_bytes, .{}, &failure_stage);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(.ok, response.status);
+    try std.testing.expectEqualStrings("hello world", response.body);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", response.content_type.?);
+}
+
+test "web_fetch response parser caps chunked bodies" {
+    const alloc = std.testing.allocator;
+
+    var reader: std.Io.Reader = .fixed(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "6\r\nabcdef\r\n" ++
+            "0\r\n\r\n",
+    );
+
+    var failure_stage: FailureStage = .response_head;
+    try std.testing.expectError(error.BodyTooLarge, readResponse(alloc, &reader, 5, .{}, &failure_stage));
+}
+
+fn expectResponseError(expected: anyerror, payload: []const u8) !void {
+    var reader: std.Io.Reader = .fixed(payload);
+    var failure_stage: FailureStage = .response_head;
+    try std.testing.expectError(
+        expected,
+        readResponse(std.testing.allocator, &reader, max_body_bytes, .{}, &failure_stage),
+    );
+}
+
+fn expectResponseBody(payload: []const u8, expected_status: u16, expected_body: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var reader: std.Io.Reader = .fixed(payload);
+    var failure_stage: FailureStage = .response_head;
+    var response = try readResponse(alloc, &reader, max_body_bytes, .{}, &failure_stage);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(expected_status, @intFromEnum(response.status));
+    try std.testing.expectEqualStrings(expected_body, response.body);
+}
+
+test "web_fetch final response head accepts exact versions statuses and identical lengths" {
+    const accepted = [_]struct {
+        payload: []const u8,
+        status: u16 = 200,
+        body: []const u8,
+    }{
+        .{
+            .payload = "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            .body = "hello",
+        },
+        .{
+            .payload = "HTTP/1.1 599 Edge Status\r\nContent-Length: 0\r\n\r\n",
+            .status = 599,
+            .body = "",
+        },
+        .{
+            .payload = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+            .body = "hello",
+        },
+        .{
+            .payload = "HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\nhello",
+            .body = "hello",
+        },
+        .{
+            .payload = "HTTP/1.1 200 OK\r\nContent-Length:\t5 ,\t5 \r\n\r\nhello",
+            .body = "hello",
+        },
+    };
+    for (accepted) |case| try expectResponseBody(case.payload, case.status, case.body);
+}
+
+test "web_fetch final response head rejects invalid status and field syntax" {
+    const invalid = [_][]const u8{
+        "HTTP/1.2 200 OK\r\nContent-Length: 0\r\n\r\n",
+        "http/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 20 OK\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 0200 OK\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1  200 OK\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 600 Invalid\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 999 Invalid\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 Bad\x01Reason\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nBad\x01Name: value\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nMissing-Colon\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n continuation\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nX-Test: bad\x01value\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nX-Test: bad\x7fvalue\r\nContent-Length: 0\r\n\r\n",
+    };
+    for (invalid) |payload| try expectResponseError(error.InvalidHttpResponse, payload);
+}
+
+test "web_fetch final response head normalizes obs fold values" {
+    const alloc = std.testing.allocator;
+    var reader: std.Io.Reader = .fixed(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/\r\n" ++
+            "\t html; charset=utf-8\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "\r\n",
+    );
+    var failure_stage: FailureStage = .response_head;
+    var response = try readResponse(alloc, &reader, max_body_bytes, .{}, &failure_stage);
+    defer response.deinit(alloc);
+    try std.testing.expectEqualStrings("text/ html; charset=utf-8", response.content_type.?);
+}
+
+test "web_fetch content length list validation rejects empty overflow and conflicts" {
+    const invalid = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: ,\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5,,5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nContent-Length: ,5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5,\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5 5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999999999999999999999\r\n\r\n",
+    };
+    for (invalid) |payload| try expectResponseError(error.InvalidHttpResponse, payload);
+
+    const ambiguous = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\nhello!",
+    };
+    for (ambiguous) |payload| try expectResponseError(error.AmbiguousHttpFraming, payload);
+}
+
+test "web_fetch transfer encoding parser validates ordered coding members" {
+    const accepted = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: , chunked,\r\n\r\n0\r\n\r\n",
+    };
+    for (accepted) |payload| try expectResponseBody(payload, 200, "");
+
+    const invalid = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: , ,\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chun ked\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked; foo=bar\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip; foo\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip; foo=\"unterminated\r\n\r\n",
+        "HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    };
+    for (invalid) |payload| try expectResponseError(error.InvalidHttpResponse, payload);
+
+    const unsupported = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip; foo=\"a,b\", chunked\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+    };
+    for (unsupported) |payload| try expectResponseError(error.UnsupportedTransferEncoding, payload);
+
+    try expectResponseError(
+        error.AmbiguousHttpFraming,
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n",
+    );
+}
+
+test "web_fetch bodyless response framing ignores fields and rejects pending body" {
+    try expectResponseBody(
+        "HTTP/1.1 204 No Content\r\nTransfer-Encoding: gzip\r\nContent-Length: 99\r\n\r\n",
+        204,
+        "",
+    );
+    try expectResponseBody(
+        "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: gzip\r\nContent-Length: 99\r\n\r\n",
+        304,
+        "",
+    );
+    try expectResponseError(
+        error.UnexpectedBodyForBodylessResponse,
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\nunexpected",
+    );
+}
+
+test "web_fetch response parser consumes informational heads before final response" {
+    const informational = [_][]const u8{
+        "100 Continue",
+        "102 Processing",
+        "103 Early Hints",
+    };
+    for (informational) |status_line| {
+        const payload = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "HTTP/1.1 {s}\r\nX-Interim: yes\r\n\r\n" ++
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            .{status_line},
+        );
+        defer std.testing.allocator.free(payload);
+        try expectResponseBody(payload, 200, "ok");
+    }
+
+    try expectResponseError(
+        error.UnsupportedProtocolUpgrade,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+    );
+}
+
+test "web_fetch response parser caps informational response count" {
+    const alloc = std.testing.allocator;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    for (0..16) |_| {
+        try payload.appendSlice(alloc, "HTTP/1.1 103 Early Hints\r\n\r\n");
+    }
+    try payload.appendSlice(alloc, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    try expectResponseBody(payload.items, 200, "ok");
+
+    payload.clearRetainingCapacity();
+    for (0..17) |_| {
+        try payload.appendSlice(alloc, "HTTP/1.1 103 Early Hints\r\n\r\n");
+    }
+    try expectResponseError(error.TooManyInterimResponses, payload.items);
+}
+
 fn appendRepeatedByte(list: *std.ArrayList(u8), alloc: Allocator, byte: u8, count: usize) !void {
     try list.ensureUnusedCapacity(alloc, count);
     for (0..count) |_| list.appendAssumeCapacity(byte);
@@ -1732,6 +1966,131 @@ fn appendBudgetedInterimResponse(
     try list.appendSlice(alloc, suffix);
 }
 
+test "web_fetch response parser enforces exact cumulative head budget" {
+    const alloc = std.testing.allocator;
+    const final_head = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+    var exact: std.ArrayList(u8) = .empty;
+    defer exact.deinit(alloc);
+    try appendBudgetedInterimResponse(&exact, alloc, max_header_bytes - final_head.len);
+    try exact.appendSlice(alloc, final_head);
+    try std.testing.expectEqual(max_header_bytes, exact.items.len);
+    try expectResponseBody(exact.items, 200, "");
+
+    var cumulative_over: std.ArrayList(u8) = .empty;
+    defer cumulative_over.deinit(alloc);
+    try appendBudgetedInterimResponse(&cumulative_over, alloc, max_header_bytes - final_head.len + 1);
+    try cumulative_over.appendSlice(alloc, final_head);
+    try expectResponseError(error.HttpHeadersOversize, cumulative_over.items);
+
+    const prefix = "HTTP/1.1 200 OK\r\nX-Fill: ";
+    var delimiter_over: std.ArrayList(u8) = .empty;
+    defer delimiter_over.deinit(alloc);
+    try delimiter_over.appendSlice(alloc, prefix);
+    try appendRepeatedByte(&delimiter_over, alloc, 'a', max_header_bytes - 1 - prefix.len);
+    try delimiter_over.appendSlice(alloc, "\r\n\r\n");
+    try std.testing.expectEqual(max_header_bytes + 3, delimiter_over.items.len);
+    try expectResponseError(error.HttpHeadersOversize, delimiter_over.items);
+}
+
+test "web_fetch chunked framing accepts exact hexadecimal sizes and valid extensions" {
+    const accepted = [_]struct {
+        payload: []const u8,
+        body: []const u8,
+    }{
+        .{
+            .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "a\r\n0123456789\r\n0\r\n\r\n",
+            .body = "0123456789",
+        },
+        .{
+            .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "A\r\n0123456789\r\n0\r\n\r\n",
+            .body = "0123456789",
+        },
+        .{
+            .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "A;foo=bar\r\n0123456789\r\n0\r\n\r\n",
+            .body = "0123456789",
+        },
+        .{
+            .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "A ;foo=bar; quoted=\"a,b\\\"c\";flag\r\n0123456789\r\n0\r\n\r\n",
+            .body = "0123456789",
+        },
+        .{
+            .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "A;\tfoo = \"bar\"\r\n0123456789\r\n0\r\n\r\n",
+            .body = "0123456789",
+        },
+    };
+    for (accepted) |case| try expectResponseBody(case.payload, 200, case.body);
+}
+
+test "web_fetch chunked framing rejects malformed size extensions and delimiters" {
+    const invalid = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n A\r\n0123456789\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA \r\n0123456789\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA;\r\n0123456789\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA;foo=\r\n0123456789\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA;foo=\"bad\x01\"\r\n0123456789\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA;foo=\"bad\\\x01\"\r\n0123456789\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA;foo=\"unterminated\r\n0123456789\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA trailing\r\n0123456789\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\nx\r\n0\r\n\r\n",
+    };
+    for (invalid) |payload| try expectResponseError(error.InvalidHttpResponse, payload);
+
+    const incomplete = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n",
+    };
+    for (incomplete) |payload| try expectResponseError(error.UnexpectedClose, payload);
+}
+
+test "web_fetch chunked trailers normalize folds and validate every field" {
+    try expectResponseBody(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "4\r\ntest\r\n" ++
+            "0\r\n" ++
+            "X-Trailer: one\r\n" ++
+            "\t two\r\n" ++
+            "\r\n",
+        200,
+        "test",
+    );
+
+    const invalid = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n continuation\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Name: value\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nMissing-Colon\r\n\r\n",
+    };
+    for (invalid) |payload| try expectResponseError(error.InvalidHttpResponse, payload);
+}
+
+test "web_fetch chunked trailers enforce line and cumulative limits" {
+    const alloc = std.testing.allocator;
+
+    var long_line: std.ArrayList(u8) = .empty;
+    defer long_line.deinit(alloc);
+    try long_line.appendSlice(alloc, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: ");
+    try appendRepeatedByte(&long_line, alloc, 'a', 4097);
+    try long_line.appendSlice(alloc, "\r\n\r\n");
+    try expectResponseError(error.InvalidHttpResponse, long_line.items);
+
+    var oversized: std.ArrayList(u8) = .empty;
+    defer oversized.deinit(alloc);
+    try oversized.appendSlice(alloc, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+    while (oversized.items.len < max_header_bytes + 1024) {
+        try oversized.appendSlice(alloc, "X-Trailer: ");
+        try appendRepeatedByte(&oversized, alloc, 'a', 80);
+        try oversized.appendSlice(alloc, "\r\n");
+    }
+    try oversized.appendSlice(alloc, "\r\n");
+    try expectResponseError(error.HttpTrailersOversize, oversized.items);
+}
+
 fn appendTrailerLine(
     payload: *std.ArrayList(u8),
     alloc: Allocator,
@@ -1741,6 +2100,71 @@ fn appendTrailerLine(
     try payload.appendSlice(alloc, "X:");
     try appendRepeatedByte(payload, alloc, 'a', line_len - 2);
     try payload.appendSlice(alloc, "\r\n");
+}
+
+test "web_fetch chunk size lines accept the exact limit and reject one byte beyond it" {
+    const alloc = std.testing.allocator;
+
+    var exact: std.ArrayList(u8) = .empty;
+    defer exact.deinit(alloc);
+    try exact.appendSlice(alloc, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;");
+    try appendRepeatedByte(&exact, alloc, 'a', 4094);
+    try exact.appendSlice(alloc, "\r\nx\r\n0\r\n\r\n");
+    try expectResponseBody(exact.items, 200, "x");
+
+    var over: std.ArrayList(u8) = .empty;
+    defer over.deinit(alloc);
+    try over.appendSlice(alloc, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;");
+    try appendRepeatedByte(&over, alloc, 'a', 4095);
+    try over.appendSlice(alloc, "\r\nx\r\n0\r\n\r\n");
+    try expectResponseError(error.InvalidHttpResponse, over.items);
+}
+
+test "web_fetch trailer section accepts the exact cumulative limit and rejects one byte beyond it" {
+    const alloc = std.testing.allocator;
+
+    var exact: std.ArrayList(u8) = .empty;
+    defer exact.deinit(alloc);
+    try exact.appendSlice(alloc, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+    for (0..15) |_| try appendTrailerLine(&exact, alloc, 4096);
+    try appendTrailerLine(&exact, alloc, 4062);
+    try exact.appendSlice(alloc, "\r\n");
+    try expectResponseBody(exact.items, 200, "");
+
+    var over: std.ArrayList(u8) = .empty;
+    defer over.deinit(alloc);
+    try over.appendSlice(alloc, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+    for (0..15) |_| try appendTrailerLine(&over, alloc, 4096);
+    try appendTrailerLine(&over, alloc, 4063);
+    try over.appendSlice(alloc, "\r\n");
+    try expectResponseError(error.HttpTrailersOversize, over.items);
+}
+
+test "web_fetch self delimited chunked response returns without eof read" {
+    const alloc = std.testing.allocator;
+    var short = ShortCompleteResponseReader{};
+    short.init(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "5\r\nhello\r\n" ++
+            "0\r\n\r\n",
+        0,
+    );
+
+    var failure_stage: FailureStage = .response_head;
+    var response = try readResponse(alloc, &short.interface, max_body_bytes, .{}, &failure_stage);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqualStrings("hello", response.body);
+    try std.testing.expectEqual(@as(usize, 0), short.reads_after_payload);
+}
+
+test "web_fetch short content length response fails before accepting partial body" {
+    try expectResponseError(
+        error.UnexpectedClose,
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfour",
+    );
 }
 
 const FragmentedResponseReader = struct {
@@ -1796,6 +2220,134 @@ const FragmentedResponseReader = struct {
         return n;
     }
 };
+
+test "web_fetch response parsing is invariant across hostile fragmentation and zero progress" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "HTTP/1.1 103 Early Hints\r\n" ++
+        "Link: </style.css>;\r\n" ++
+        "\trel=preload\r\n" ++
+        "\r\n" ++
+        "HTTP/1.1 200 OK\r\n" ++
+        "Transfer-Encoding: , chunked,\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "\r\n" ++
+        "3; first=\"a,b\"\r\none\r\n" ++
+        "3 ; second=token\r\ntwo\r\n" ++
+        "0\r\n" ++
+        "X-Trailer: folded\r\n" ++
+        "\tvalue\r\n" ++
+        "\r\n";
+
+    var max_chunk: usize = 1;
+    while (max_chunk <= payload.len) : (max_chunk += 1) {
+        var fragmented: FragmentedResponseReader = undefined;
+        fragmented.init(payload, max_chunk, 3);
+        var failure_stage: FailureStage = .response_head;
+        var response = try readResponse(
+            alloc,
+            &fragmented.interface,
+            max_body_bytes,
+            .{},
+            &failure_stage,
+        );
+        defer response.deinit(alloc);
+
+        try std.testing.expectEqual(.ok, response.status);
+        try std.testing.expectEqualStrings("onetwo", response.body);
+        try std.testing.expectEqualStrings("text/plain", response.content_type.?);
+        try std.testing.expectEqual(FailureStage.response_body, failure_stage);
+    }
+}
+
+test "web_fetch malformed responses fail consistently across fragmentation" {
+    const cases = [_]struct {
+        expected: anyerror,
+        payload: []const u8,
+    }{
+        .{
+            .expected = error.AmbiguousHttpFraming,
+            .payload = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx",
+        },
+        .{
+            .expected = error.InvalidHttpResponse,
+            .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;bad=\r\nx\r\n0\r\n\r\n",
+        },
+        .{
+            .expected = error.UnexpectedClose,
+            .payload = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx",
+        },
+        .{
+            .expected = error.UnexpectedClose,
+            .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n",
+        },
+    };
+
+    for (cases) |case| {
+        var max_chunk: usize = 1;
+        while (max_chunk <= case.payload.len) : (max_chunk += 1) {
+            var fragmented: FragmentedResponseReader = undefined;
+            fragmented.init(case.payload, max_chunk, 4);
+            var failure_stage: FailureStage = .response_head;
+            try std.testing.expectError(
+                case.expected,
+                readResponse(
+                    std.testing.allocator,
+                    &fragmented.interface,
+                    max_body_bytes,
+                    .{},
+                    &failure_stage,
+                ),
+            );
+        }
+    }
+}
+
+test "web_fetch content length and close delimited bodies enforce exact caps" {
+    const alloc = std.testing.allocator;
+    const cap: usize = 4;
+
+    try expectResponseBody(
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nfour",
+        200,
+        "four",
+    );
+
+    var content_length_reader: std.Io.Reader = .fixed(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+    );
+    var failure_stage: FailureStage = .response_head;
+    try std.testing.expectError(
+        error.BodyTooLarge,
+        readResponse(alloc, &content_length_reader, cap, .{}, &failure_stage),
+    );
+
+    var close_delimited_reader: std.Io.Reader = .fixed(
+        "HTTP/1.1 200 OK\r\n\r\n12345",
+    );
+    failure_stage = .response_head;
+    try std.testing.expectError(
+        error.BodyTooLarge,
+        readResponse(alloc, &close_delimited_reader, cap, .{}, &failure_stage),
+    );
+}
+
+test "web_fetch chunked body rejects cumulative announced size before reading payload" {
+    const alloc = std.testing.allocator;
+    const payloads = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n2\r\n",
+    };
+
+    for (payloads) |payload| {
+        var reader: std.Io.Reader = .fixed(payload);
+        var failure_stage: FailureStage = .response_head;
+        try std.testing.expectError(
+            error.BodyTooLarge,
+            readResponse(alloc, &reader, 4, .{}, &failure_stage),
+        );
+    }
+}
 
 const ZeroProgressReader = struct {
     calls: usize = 0,
@@ -1965,6 +2517,160 @@ fn pipeBackedTlsBoundaryReader(
     return fds[0];
 }
 
+test "web_fetch TLS boundary completes self delimited response without reading eof" {
+    const alloc = std.testing.allocator;
+    var transport_reader: PlainDeadlineReader = undefined;
+    var boundary_reader: ScriptedTlsBoundaryReader = undefined;
+    const fd = try pipeBackedTlsBoundaryReader(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "\r\n" ++
+            "hello",
+        .truncated,
+        &transport_reader,
+        &boundary_reader,
+    );
+    defer closeFd(fd);
+
+    var failure_stage: FailureStage = .response_head;
+    var response = try readResponse(alloc, &boundary_reader.interface, max_body_bytes, .{}, &failure_stage);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqualStrings("hello", response.body);
+    try std.testing.expectEqual(@as(usize, 0), boundary_reader.reads_after_payload);
+    try std.testing.expectEqual(FailureStage.response_body, failure_stage);
+}
+
+test "web_fetch TLS boundary accepts clean close delimited eof" {
+    const alloc = std.testing.allocator;
+    var transport_reader: PlainDeadlineReader = undefined;
+    var boundary_reader: ScriptedTlsBoundaryReader = undefined;
+    const fd = try pipeBackedTlsBoundaryReader(
+        "HTTP/1.1 200 OK\r\n\r\nhello",
+        .clean,
+        &transport_reader,
+        &boundary_reader,
+    );
+    defer closeFd(fd);
+
+    var failure_stage: FailureStage = .response_head;
+    var response = try readResponse(alloc, &boundary_reader.interface, max_body_bytes, .{}, &failure_stage);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqualStrings("hello", response.body);
+    try std.testing.expectEqual(@as(usize, 1), boundary_reader.reads_after_payload);
+    try std.testing.expectEqual(FailureStage.response_body, failure_stage);
+}
+
+test "web_fetch TLS boundary unwraps truncated close delimited eof" {
+    const alloc = std.testing.allocator;
+    var transport_reader: PlainDeadlineReader = undefined;
+    var boundary_reader: ScriptedTlsBoundaryReader = undefined;
+    const fd = try pipeBackedTlsBoundaryReader(
+        "HTTP/1.1 200 OK\r\n\r\nhello",
+        .truncated,
+        &transport_reader,
+        &boundary_reader,
+    );
+    defer closeFd(fd);
+
+    var failure_stage: FailureStage = .response_head;
+    var response = readResponse(
+        alloc,
+        &boundary_reader.interface,
+        max_body_bytes,
+        .{},
+        &failure_stage,
+    ) catch |err| {
+        const root = unwrapReadFailure(err, boundary_reader.tls_err, transport_reader.err);
+        try std.testing.expectEqual(error.TlsConnectionTruncated, root);
+        try std.testing.expectEqual(@as(usize, 1), boundary_reader.reads_after_payload);
+        try std.testing.expectEqual(FailureStage.response_body, failure_stage);
+        return;
+    };
+    response.deinit(alloc);
+    return error.TestExpectedError;
+}
+
+test "web_fetch response parser checks deadline before transport reads" {
+    const alloc = std.testing.allocator;
+
+    var zero = ZeroProgressReader{};
+    zero.init();
+
+    var failure_stage: FailureStage = .response_head;
+    try std.testing.expectError(error.Timeout, readResponse(alloc, &zero.interface, max_body_bytes, .{
+        .deadline = .{ .deadline_ms = monotonicMillis() - 1 },
+    }, &failure_stage));
+    try std.testing.expectEqual(@as(usize, 0), zero.calls);
+}
+
+test "web_fetch response parser returns complete short bodies without EOF" {
+    const alloc = std.testing.allocator;
+
+    var short = ShortCompleteResponseReader{};
+    short.init(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "\r\n" ++
+            "hello",
+        1,
+    );
+
+    var failure_stage: FailureStage = .response_head;
+    var response = try readResponse(alloc, &short.interface, max_body_bytes, .{}, &failure_stage);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(.ok, response.status);
+    try std.testing.expectEqualStrings("hello", response.body);
+    try std.testing.expectEqual(@as(usize, 0), short.reads_after_payload);
+}
+
+test "web_fetch response parser ignores pending bytes beyond content length" {
+    const alloc = std.testing.allocator;
+
+    var reader: std.Io.Reader = .fixed(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "\r\n" ++
+            "helloEXTRA",
+    );
+    var failure_stage: FailureStage = .response_head;
+    var response = try readResponse(alloc, &reader, max_body_bytes, .{}, &failure_stage);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqualStrings("hello", response.body);
+}
+
+test "web_fetch TLS encrypted transport buffers satisfy stdlib minimums" {
+    var reader: TlsDeadlineReader = undefined;
+    reader.init(-1, .{});
+    try std.testing.expect(reader.interface.buffer.len >= std.crypto.tls.Client.min_buffer_len);
+
+    var writer: TlsDeadlineWriter = undefined;
+    writer.init(-1, .{});
+    try std.testing.expect(writer.interface.buffer.len >= std.crypto.tls.Client.min_buffer_len);
+}
+
+test "web_fetch TLS deadline reader fills internal buffer for zero length readVec" {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    const payload = "HTTP";
+    const written = std.c.write(fds[1], payload.ptr, payload.len);
+    if (written < 0) return error.PipeWriteFailed;
+    try std.testing.expectEqual(payload.len, @as(usize, @intCast(written)));
+
+    var reader: TlsDeadlineReader = undefined;
+    reader.init(fds[0], .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } });
+
+    var empty: [1][]u8 = .{""};
+    try std.testing.expectEqual(@as(usize, 0), try reader.interface.vtable.readVec(&reader.interface, &empty));
+    try std.testing.expectEqualStrings(payload, reader.interface.buffer[reader.interface.seek..reader.interface.end]);
+}
+
 const ResponseSpec = struct {
     status: std.http.Status,
     body: []const u8,
@@ -2079,6 +2785,175 @@ const RawResponseConnector = struct {
     }
 };
 
+fn compressFlateForTest(alloc: Allocator, plain: []const u8, container: std.compress.flate.Container) ![]u8 {
+    var output = try std.Io.Writer.Allocating.initCapacity(alloc, 64);
+    defer output.deinit();
+    var scratch: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&output.writer, &scratch, container, .fastest);
+    try compressor.writer.writeAll(plain);
+    try compressor.finish();
+    return output.toOwnedSlice();
+}
+
+test "web_fetch advertises supported content codings" {
+    const alloc = std.testing.allocator;
+    var url = try url_policy.normalize(alloc, "https://example.com/docs?q=1");
+    defer url.deinit(alloc);
+
+    var request: std.Io.Writer.Allocating = .init(alloc);
+    defer request.deinit();
+    try writeRequest(&request.writer, .{
+        .url = url,
+        .admitted_addresses = &.{},
+        .tls_server_name = "example.com",
+        .host_header = "example.com",
+    }, .{});
+
+    try std.testing.expectEqualStrings(
+        "GET /docs?q=1 HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "User-Agent: fx (web_fetch; +https://github.com/vercel-labs/fx)\r\n" ++
+            "Accept: text/markdown, text/html, */*\r\n" ++
+            "Accept-Encoding: gzip, deflate, zstd\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+        request.written(),
+    );
+}
+
+test "web_fetch decodes each supported content coding" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { encoding: []const u8, body: []const u8 }{
+        .{ .encoding = "gzip", .body = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00" },
+        .{ .encoding = "deflate", .body = "\x78\x9c\xcb\x48\xcd\xc9\xc9\x07\x00\x06\x2c\x02\x15" },
+        .{ .encoding = "zstd", .body = "\x28\xb5\x2f\xfd\x04\x58\x29\x00\x00\x68\x65\x6c\x6c\x6f\xa3\x6d\x9f\x88" },
+    };
+
+    for (cases) |case| {
+        var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+        defer resolver.deinit(alloc);
+        var connector = FakeConnector{ .responses = &.{.{ .status = .ok, .body = case.body, .content_encoding = case.encoding }} };
+        defer connector.deinit(alloc);
+        var target = try url_policy.normalize(alloc, "https://example.com/compressed");
+        defer target.deinit(alloc);
+
+        var result = try fetch(alloc, target, .{}, .{
+            .resolver = resolver.resolver(),
+            .connector = connector.connector(),
+        });
+        defer result.deinit(alloc);
+
+        try std.testing.expect(result == .success);
+        try std.testing.expectEqualStrings("hello", result.success.body);
+    }
+}
+
+test "web_fetch rejects repeated or chained content encodings" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Encoding: gzip\r\n" ++
+            "Content-Encoding: identity\r\n" ++
+            "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Encoding: gzip, identity\r\n" ++
+            "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Encoding: br\r\n" ++
+            "Content-Length: 5\r\n\r\nhello",
+    };
+
+    for (cases) |payload| {
+        var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+        defer resolver.deinit(alloc);
+        var connector = RawResponseConnector{ .payload = payload };
+        var target = try url_policy.normalize(alloc, "https://example.com/chained");
+        defer target.deinit(alloc);
+
+        var result = try fetch(alloc, target, .{}, .{
+            .resolver = resolver.resolver(),
+            .connector = connector.connector(),
+        });
+        defer result.deinit(alloc);
+
+        try std.testing.expect(result == .failure);
+        try std.testing.expectEqual(.unexpected_content_encoding, result.failure.kind);
+    }
+}
+
+test "web_fetch decoded body cap is inclusive" {
+    const alloc = std.testing.allocator;
+    var target = try url_policy.normalize(alloc, "https://example.com/capped");
+    defer target.deinit(alloc);
+
+    for ([_]usize{ max_body_bytes, max_body_bytes + 1 }) |plain_len| {
+        const plain = try alloc.alloc(u8, plain_len);
+        defer alloc.free(plain);
+        @memset(plain, 'a');
+        const compressed = try compressFlateForTest(alloc, plain, .gzip);
+        defer alloc.free(compressed);
+
+        var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+        defer resolver.deinit(alloc);
+        var connector = FakeConnector{ .responses = &.{.{ .status = .ok, .body = compressed, .content_encoding = "gzip" }} };
+        defer connector.deinit(alloc);
+
+        if (plain_len == max_body_bytes) {
+            var result = try fetch(alloc, target, .{}, .{
+                .resolver = resolver.resolver(),
+                .connector = connector.connector(),
+            });
+            defer result.deinit(alloc);
+            try std.testing.expect(result == .success);
+            try std.testing.expectEqual(max_body_bytes, result.success.body.len);
+        } else {
+            try std.testing.expectError(error.BodyTooLarge, fetch(alloc, target, .{}, .{
+                .resolver = resolver.resolver(),
+                .connector = connector.connector(),
+            }));
+        }
+    }
+}
+
+test "web_fetch leaves redirects ahead of content encoding and rejects encoded error statuses" {
+    const alloc = std.testing.allocator;
+    var target = try url_policy.normalize(alloc, "https://example.com/start");
+    defer target.deinit(alloc);
+
+    {
+        var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+        defer resolver.deinit(alloc);
+        var connector = FakeConnector{ .responses = &.{
+            .{ .status = .found, .body = "not gzip", .location = "https://www.example.com/next", .content_encoding = "gzip" },
+            .{ .status = .ok, .body = "next" },
+        } };
+        defer connector.deinit(alloc);
+
+        var result = try fetch(alloc, target, .{}, .{
+            .resolver = resolver.resolver(),
+            .connector = connector.connector(),
+        });
+        defer result.deinit(alloc);
+        try std.testing.expect(result == .success);
+        try std.testing.expectEqualStrings("next", result.success.body);
+    }
+
+    for ([_]std.http.Status{ .not_found, .internal_server_error }) |status| {
+        var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+        defer resolver.deinit(alloc);
+        var connector = FakeConnector{ .responses = &.{.{ .status = status, .body = "not gzip", .content_encoding = "gzip" }} };
+        defer connector.deinit(alloc);
+
+        var result = try fetch(alloc, target, .{}, .{
+            .resolver = resolver.resolver(),
+            .connector = connector.connector(),
+        });
+        defer result.deinit(alloc);
+        try std.testing.expect(result == .failure);
+        try std.testing.expectEqual(.unexpected_content_encoding, result.failure.kind);
+    }
+}
+
 fn replaceOwned(alloc: Allocator, slot: *?[]u8, value: []const u8) !void {
     if (slot.*) |old| alloc.free(old);
     slot.* = try alloc.dupe(u8, value);
@@ -2086,6 +2961,494 @@ fn replaceOwned(alloc: Allocator, slot: *?[]u8, value: []const u8) !void {
 
 fn ip(text: []const u8, port: u16) !IpAddress {
     return std.Io.net.IpAddress.parse(text, port);
+}
+
+test "web_fetch rejects mixed public private dns answers without dialing" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{
+        try ip("93.184.216.34", 443),
+        try ip("10.0.0.5", 443),
+    } };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{};
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://example.com/docs");
+    defer target.deinit(alloc);
+
+    try std.testing.expectError(error.NonPublicDnsAnswer, fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    }));
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 0), connector.calls);
+}
+
+test "web_fetch pinned connector never performs a second hostname lookup" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{ .responses = &.{.{ .status = .ok, .body = "ok" }} };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://example.com/docs");
+    defer target.deinit(alloc);
+
+    var result = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result == .success);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 1), connector.calls);
+    try std.testing.expectEqual(@as(usize, 1), connector.last_admitted_len.?);
+}
+
+test "web_fetch default call shares one hop deadline across resolver and connector" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{ .responses = &.{.{ .status = .ok, .body = "ok" }} };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://example.com/docs");
+    defer target.deinit(alloc);
+
+    var result = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    });
+    defer result.deinit(alloc);
+
+    const resolver_deadline = resolver.deadlines[0] orelse return error.TestExpectedEqual;
+    const connector_deadline = connector.deadlines[0] orelse return error.TestExpectedEqual;
+    try std.testing.expect(result == .success);
+    try std.testing.expectEqual(resolver_deadline, connector_deadline);
+}
+
+test "web_fetch followed redirects get fresh hop deadline while sharing deadlines within each hop" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{
+        .responses = &.{
+            .{ .status = .moved_permanently, .body = "", .location = "https://www.example.com/next" },
+            .{ .status = .ok, .body = "next" },
+        },
+        .sleep_after_first_call_ms = 20,
+    };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://example.com/start");
+    defer target.deinit(alloc);
+
+    var result = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result == .success);
+    try std.testing.expectEqual(@as(usize, 2), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 2), connector.calls);
+
+    const first_resolver_deadline = resolver.deadlines[0] orelse return error.TestExpectedEqual;
+    const first_connector_deadline = connector.deadlines[0] orelse return error.TestExpectedEqual;
+    const second_resolver_deadline = resolver.deadlines[1] orelse return error.TestExpectedEqual;
+    const second_connector_deadline = connector.deadlines[1] orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(first_resolver_deadline, first_connector_deadline);
+    try std.testing.expectEqual(second_resolver_deadline, second_connector_deadline);
+    try std.testing.expect(second_resolver_deadline > first_resolver_deadline);
+}
+
+test "web_fetch preserves canonical tls and host identity while dialing admitted address" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{ .responses = &.{.{ .status = .ok, .body = "ok" }} };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://Example.COM.:443/a#frag");
+    defer target.deinit(alloc);
+
+    var result = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqualStrings("example.com", resolver.last_host.?);
+    try std.testing.expectEqualStrings("example.com", connector.last_canonical_host.?);
+    try std.testing.expectEqualStrings("example.com", connector.last_tls_server_name.?);
+    try std.testing.expectEqualStrings("example.com", connector.last_host_header.?);
+    try std.testing.expectEqualStrings("/a", connector.last_path_query.?);
+    try std.testing.expect(connector.last_first_admitted_address.?.eql(&resolver.addresses[0]));
+}
+
+test "web_fetch safe redirect repeats hostname policy dns admission and pinned dialing" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{ .responses = &.{
+        .{ .status = .moved_permanently, .body = "", .location = "https://www.example.com/next" },
+        .{ .status = .ok, .body = "next" },
+    } };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://example.com/start");
+    defer target.deinit(alloc);
+
+    var result = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result == .success);
+    try std.testing.expectEqual(@as(usize, 2), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 2), connector.calls);
+    try std.testing.expectEqualStrings("www.example.com", resolver.last_host.?);
+    try std.testing.expectEqualStrings("https://www.example.com/next", result.success.final_url);
+}
+
+test "web_fetch follows HTTP 303 See Other redirects" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{ .responses = &.{
+        .{ .status = .see_other, .body = "", .location = "/next" },
+        .{ .status = .ok, .body = "next" },
+    } };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://example.com/start");
+    defer target.deinit(alloc);
+
+    var result = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result == .success);
+    try std.testing.expectEqual(@as(usize, 2), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 2), connector.calls);
+    try std.testing.expectEqualStrings("/next", connector.last_path_query.?);
+    try std.testing.expectEqualStrings("https://example.com/next", result.success.final_url);
+    try std.testing.expectEqualStrings("next", result.success.body);
+}
+
+test "web_fetch cross host redirect returns reinvocation result without following" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{ .responses = &.{
+        .{ .status = .found, .body = "", .location = "https://example.org/next" },
+    } };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://example.com/start");
+    defer target.deinit(alloc);
+
+    var result = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result == .cross_host_redirect);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(usize, 1), connector.calls);
+    try std.testing.expectEqualStrings("https://example.org/next", result.cross_host_redirect);
+}
+
+test "web_fetch ordinary non success and unexpected content encoding never convert cache or extract" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var non_success_connector = FakeConnector{ .responses = &.{.{ .status = .not_found, .body = "nope" }} };
+    defer non_success_connector.deinit(alloc);
+    var target = try url_policy.normalize(alloc, "https://example.com/missing");
+    defer target.deinit(alloc);
+
+    var non_success = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = non_success_connector.connector(),
+    });
+    defer non_success.deinit(alloc);
+    try std.testing.expect(non_success == .failure);
+    try std.testing.expectEqual(.non_success_status, non_success.failure.kind);
+
+    var encoding_connector = FakeConnector{ .responses = &.{.{ .status = .ok, .body = "compressed", .content_encoding = "gzip" }} };
+    defer encoding_connector.deinit(alloc);
+    var unexpected_encoding = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = encoding_connector.connector(),
+    });
+    defer unexpected_encoding.deinit(alloc);
+    try std.testing.expect(unexpected_encoding == .failure);
+    try std.testing.expectEqual(.unexpected_content_encoding, unexpected_encoding.failure.kind);
+}
+
+test "web_fetch body timeout cancellation and ten mebibyte cap are bounded" {
+    const alloc = std.testing.allocator;
+
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{ .err = error.Canceled };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://example.com/slow");
+    defer target.deinit(alloc);
+
+    try std.testing.expectError(error.Canceled, fetch(alloc, target, .{
+        .deadline = .{ .deadline_ms = 1 },
+        .cancel_flag = null,
+    }, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    }));
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), connector.last_max_body_bytes.?);
+    try std.testing.expect(connector.last_deadline_ms != null);
+}
+
+test "web_fetch deadline helpers fail before io when expired or canceled" {
+    try std.testing.expectError(error.Timeout, checkControl(.{
+        .deadline = .{ .deadline_ms = monotonicMillis() - 1 },
+    }));
+    try std.testing.expectError(error.Timeout, pollTimeoutMs(.{
+        .deadline = .{ .deadline_ms = monotonicMillis() - 1 },
+    }));
+
+    var cancel_flag: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Canceled, checkControl(.{
+        .cancel_flag = &cancel_flag,
+    }));
+    try std.testing.expectError(error.Canceled, pollTimeoutMs(.{
+        .cancel_flag = &cancel_flag,
+    }));
+}
+
+test "web_fetch wrapper failures preserve the most specific matching cause" {
+    const ReadCase = struct {
+        err: anyerror,
+        tls_err: ?anyerror,
+        transport_err: ?anyerror,
+        expected: anyerror,
+    };
+    const read_cases = [_]ReadCase{
+        .{
+            .err = error.ReadFailed,
+            .tls_err = error.TlsConnectionTruncated,
+            .transport_err = error.ConnectionResetByPeer,
+            .expected = error.TlsConnectionTruncated,
+        },
+        .{
+            .err = error.ReadFailed,
+            .tls_err = null,
+            .transport_err = error.ConnectionResetByPeer,
+            .expected = error.ConnectionResetByPeer,
+        },
+        .{
+            .err = error.ReadFailed,
+            .tls_err = null,
+            .transport_err = null,
+            .expected = error.ReadFailed,
+        },
+        .{
+            .err = error.InvalidHttpResponse,
+            .tls_err = error.TlsConnectionTruncated,
+            .transport_err = error.ConnectionResetByPeer,
+            .expected = error.InvalidHttpResponse,
+        },
+        .{
+            .err = error.BodyTooLarge,
+            .tls_err = null,
+            .transport_err = error.Timeout,
+            .expected = error.BodyTooLarge,
+        },
+    };
+    for (read_cases) |case| {
+        try std.testing.expectEqual(case.expected, unwrapReadFailure(
+            case.err,
+            case.tls_err,
+            case.transport_err,
+        ));
+    }
+
+    const WriteCase = struct {
+        err: anyerror,
+        transport_err: ?anyerror,
+        expected: anyerror,
+    };
+    const write_cases = [_]WriteCase{
+        .{
+            .err = error.WriteFailed,
+            .transport_err = error.BrokenPipe,
+            .expected = error.BrokenPipe,
+        },
+        .{
+            .err = error.WriteFailed,
+            .transport_err = null,
+            .expected = error.WriteFailed,
+        },
+        .{
+            .err = error.CertificateVerificationFailed,
+            .transport_err = error.BrokenPipe,
+            .expected = error.CertificateVerificationFailed,
+        },
+    };
+    for (write_cases) |case| {
+        try std.testing.expectEqual(case.expected, unwrapWriteFailure(
+            case.err,
+            case.transport_err,
+        ));
+    }
+}
+
+test "web_fetch private framing contract represents every completion mode" {
+    const cases = [_]BodyFraming{
+        .no_body,
+        .{ .content_length = 42 },
+        .chunked,
+        .close_delimited,
+    };
+
+    try std.testing.expectEqual(@as(usize, 4), cases.len);
+    try std.testing.expectEqual(@as(usize, 42), cases[1].content_length);
+}
+
+fn expectAndTraceResponseFailure(
+    reader: *std.Io.Reader,
+    expected_stage: FailureStage,
+    expected_error: anyerror,
+) !void {
+    const alloc = std.testing.allocator;
+    var failure_stage: FailureStage = .response_head;
+    var response = readResponse(alloc, reader, max_body_bytes, .{}, &failure_stage) catch |err| {
+        const root = unwrapReadFailure(err, null, null);
+        try std.testing.expectEqual(expected_stage, failure_stage);
+        try std.testing.expectEqual(expected_error, root);
+        traceFailure(failure_stage, root);
+        return;
+    };
+    response.deinit(alloc);
+    return error.TestExpectedError;
+}
+
+fn expectAndTraceTlsTruncation(
+    transport_reader: *PlainDeadlineReader,
+    boundary_reader: *ScriptedTlsBoundaryReader,
+) !void {
+    const alloc = std.testing.allocator;
+    var failure_stage: FailureStage = .response_head;
+    var response = readResponse(
+        alloc,
+        &boundary_reader.interface,
+        max_body_bytes,
+        .{},
+        &failure_stage,
+    ) catch |err| {
+        const root = unwrapReadFailure(err, boundary_reader.tls_err, transport_reader.err);
+        try std.testing.expectEqual(FailureStage.response_body, failure_stage);
+        try std.testing.expectEqual(error.TlsConnectionTruncated, root);
+        traceFailure(failure_stage, root);
+        return;
+    };
+    response.deinit(alloc);
+    return error.TestExpectedError;
+}
+
+test "web_fetch transport traces stable stages and redact sensitive values" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-fetch-transport.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "tool");
+
+    traceFailure(.connect, error.ConnectionRefused);
+    traceFailure(.tls_handshake, error.CertificateVerificationFailed);
+    traceFailure(.request_write, error.BrokenPipe);
+
+    var malformed_reader: std.Io.Reader = .fixed(
+        "NOT-HTTP 200 OK\r\nContent-Length: 0\r\n\r\n",
+    );
+    try expectAndTraceResponseFailure(
+        &malformed_reader,
+        .response_head,
+        error.InvalidHttpResponse,
+    );
+
+    var transport_reader: PlainDeadlineReader = undefined;
+    var boundary_reader: ScriptedTlsBoundaryReader = undefined;
+    const truncated_fd = try pipeBackedTlsBoundaryReader(
+        "HTTP/1.1 200 OK\r\n\r\nRESPONSE_BODY_MARKER",
+        .truncated,
+        &transport_reader,
+        &boundary_reader,
+    );
+    defer closeFd(truncated_fd);
+    try expectAndTraceTlsTruncation(&transport_reader, &boundary_reader);
+
+    const addresses = [_]IpAddress{
+        try ip("93.184.216.34", 443),
+        try ip("93.184.216.35", 443),
+    };
+    var scripted = ScriptedDialer{
+        .errors = &.{ error.ConnectionRefused, error.NetworkUnreachable },
+        .returned_fds = &.{ -1, -1 },
+    };
+    try std.testing.expectError(error.NetworkUnreachable, connectAdmitted(
+        &addresses,
+        .{},
+        scripted.dialer(),
+    ));
+    debug_trace.shutdown();
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace);
+
+    const expected = [_][]const u8{
+        "[tool] web_fetch transport failed stage=connect err=ConnectionRefused",
+        "[tool] web_fetch transport failed stage=tls_handshake err=CertificateVerificationFailed",
+        "[tool] web_fetch transport failed stage=request_write err=BrokenPipe",
+        "[tool] web_fetch transport failed stage=response_head err=InvalidHttpResponse",
+        "[tool] web_fetch transport failed stage=response_body err=TlsConnectionTruncated",
+        "[tool] web_fetch dial failed stage=connect attempt=1/2 err=ConnectionRefused",
+        "[tool] web_fetch dial failed stage=connect attempt=2/2 err=NetworkUnreachable",
+    };
+    for (expected) |needle| {
+        try std.testing.expect(std.mem.find(u8, trace, needle) != null);
+    }
+
+    const sensitive = [_][]const u8{
+        "signature-value",
+        "RESPONSE_BODY_MARKER",
+        "Authorization: Bearer secret",
+        "credential-marker",
+    };
+    for (sensitive) |needle| {
+        try std.testing.expect(std.mem.find(u8, trace, needle) == null);
+    }
 }
 
 const ScriptedDialer = struct {
@@ -2117,6 +3480,115 @@ const ScriptedDialer = struct {
         return error.ConnectionFailed;
     }
 };
+
+test "web_fetch admitted dialing preserves order and one shared deadline" {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer closeFd(fds[1]);
+
+    const addresses = [_]IpAddress{
+        try ip("93.184.216.34", 443),
+        try ip("93.184.216.35", 443),
+    };
+    const deadline_ms = monotonicMillis() + 10_000;
+    var scripted = ScriptedDialer{
+        .errors = &.{ error.ConnectionRefused, null },
+        .returned_fds = &.{ -1, fds[0] },
+    };
+
+    const fd = try connectAdmitted(&addresses, .{
+        .deadline = .{ .deadline_ms = deadline_ms },
+    }, scripted.dialer());
+    defer closeFd(fd);
+
+    try std.testing.expectEqual(@as(usize, 2), scripted.calls);
+    try std.testing.expect(scripted.attempts[0].eql(&addresses[0]));
+    try std.testing.expect(scripted.attempts[1].eql(&addresses[1]));
+    try std.testing.expectEqual(deadline_ms, scripted.deadlines[0].?);
+    try std.testing.expectEqual(deadline_ms, scripted.deadlines[1].?);
+}
+
+test "web_fetch admitted dialing stops on control and local resource failures" {
+    const addresses = [_]IpAddress{
+        try ip("93.184.216.34", 443),
+        try ip("93.184.216.35", 443),
+    };
+
+    var cancel_flag: std.atomic.Value(bool) = .init(false);
+    var canceled = ScriptedDialer{
+        .errors = &.{ error.ConnectionRefused, null },
+        .returned_fds = &.{ -1, -1 },
+        .cancel_after_call = 1,
+        .cancel_flag = &cancel_flag,
+    };
+    try std.testing.expectError(error.Canceled, connectAdmitted(&addresses, .{
+        .cancel_flag = &cancel_flag,
+    }, canceled.dialer()));
+    try std.testing.expectEqual(@as(usize, 1), canceled.calls);
+
+    var resources = ScriptedDialer{
+        .errors = &.{ error.SystemResources, null },
+        .returned_fds = &.{ -1, -1 },
+    };
+    try std.testing.expectError(error.SystemResources, connectAdmitted(
+        &addresses,
+        .{},
+        resources.dialer(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), resources.calls);
+
+    var expired = ScriptedDialer{
+        .errors = &.{null},
+        .returned_fds = &.{-1},
+    };
+    try std.testing.expectError(error.Timeout, connectAdmitted(&addresses, .{
+        .deadline = .{ .deadline_ms = monotonicMillis() - 1 },
+    }, expired.dialer()));
+    try std.testing.expectEqual(@as(usize, 0), expired.calls);
+
+    var exhausted = ScriptedDialer{
+        .errors = &.{ error.ConnectionRefused, error.HostUnreachable },
+        .returned_fds = &.{ -1, -1 },
+    };
+    try std.testing.expectError(error.HostUnreachable, connectAdmitted(
+        &addresses,
+        .{},
+        exhausted.dialer(),
+    ));
+    try std.testing.expectEqual(@as(usize, 2), exhausted.calls);
+
+    try std.testing.expectError(error.NoAddressReturned, connectAdmitted(
+        &.{},
+        .{},
+        exhausted.dialer(),
+    ));
+}
+
+test "web_fetch connect errno classification keeps terminal local failures out of fallback" {
+    const cases = [_]struct {
+        errno: posix.E,
+        expected: anyerror,
+        retryable: bool,
+    }{
+        .{ .errno = .CONNREFUSED, .expected = error.ConnectionRefused, .retryable = true },
+        .{ .errno = .CONNRESET, .expected = error.ConnectionResetByPeer, .retryable = true },
+        .{ .errno = .TIMEDOUT, .expected = error.Timeout, .retryable = true },
+        .{ .errno = .NETUNREACH, .expected = error.NetworkUnreachable, .retryable = true },
+        .{ .errno = .HOSTUNREACH, .expected = error.HostUnreachable, .retryable = true },
+        .{ .errno = .NETDOWN, .expected = error.NetworkDown, .retryable = false },
+        .{ .errno = .NOBUFS, .expected = error.SystemResources, .retryable = false },
+        .{ .errno = .NOMEM, .expected = error.SystemResources, .retryable = false },
+        .{ .errno = .BADF, .expected = error.InvalidDescriptor, .retryable = false },
+        .{ .errno = .CANCELED, .expected = error.Canceled, .retryable = false },
+        .{ .errno = .IO, .expected = error.InputOutput, .retryable = false },
+    };
+
+    for (cases) |case| {
+        const root = classifyConnectErrno(case.errno);
+        try std.testing.expectEqual(case.expected, root);
+        try std.testing.expectEqual(case.retryable, isRetryableConnectError(root));
+    }
+}
 
 const ScriptedPoller = struct {
     result: enum { ready, interrupted_once, system_resources, network_down } = .ready,
@@ -2151,6 +3623,67 @@ const ScriptedPoller = struct {
     }
 };
 
+test "web_fetch poll events preserve requested readiness and hangup semantics" {
+    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.HUP);
+    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.ERR);
+    try classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.OUT | posix.POLL.HUP);
+    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.HUP);
+    try std.testing.expectError(
+        error.UnexpectedClose,
+        classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.HUP),
+    );
+    try std.testing.expectError(
+        error.InvalidDescriptor,
+        classifyPollEvents(-1, posix.POLL.IN, posix.POLL.NVAL),
+    );
+
+    var sockets: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
+        return error.SocketPairFailed;
+    defer closeFd(sockets[0]);
+    defer closeFd(sockets[1]);
+    try std.testing.expectError(
+        error.UnexpectedClose,
+        classifyPollEvents(sockets[0], posix.POLL.IN, posix.POLL.ERR),
+    );
+}
+
+test "web_fetch injected poll failures and arguments remain exact" {
+    var interrupted = ScriptedPoller{
+        .result = .interrupted_once,
+        .revents = posix.POLL.IN,
+    };
+    try pollFdWith(
+        42,
+        posix.POLL.IN,
+        .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } },
+        interrupted.poller(),
+    );
+    try std.testing.expectEqual(@as(usize, 2), interrupted.calls);
+    try std.testing.expectEqual(posix.POLL.IN, interrupted.observed_events);
+
+    var resources = ScriptedPoller{ .result = .system_resources };
+    try std.testing.expectError(error.SystemResources, pollFdWith(
+        42,
+        posix.POLL.IN,
+        .{},
+        resources.poller(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), resources.calls);
+    try std.testing.expectEqual(posix.POLL.IN, resources.observed_events);
+    try std.testing.expectEqual(@as(i32, 1000), resources.observed_timeout_ms);
+
+    var network_down = ScriptedPoller{ .result = .network_down };
+    try std.testing.expectError(error.NetworkDown, pollFdWith(
+        42,
+        posix.POLL.OUT,
+        .{},
+        network_down.poller(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), network_down.calls);
+    try std.testing.expectEqual(posix.POLL.OUT, network_down.observed_events);
+}
+
 fn noOpSignalHandler(_: posix.SIG) callconv(.c) void {}
 
 const PollSignalStorm = struct {
@@ -2165,6 +3698,83 @@ const PollSignalStorm = struct {
         }
     }
 };
+
+test "web_fetch poll deadline is not extended by interrupted syscalls" {
+    const action: posix.Sigaction = .{
+        .handler = .{ .handler = noOpSignalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    var old_action: posix.Sigaction = undefined;
+    posix.sigaction(.USR1, &action, &old_action);
+    defer posix.sigaction(.USR1, &old_action, null);
+
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    const started_ms = monotonicMillis();
+    const deadline_ms = started_ms + 75;
+    var stop: std.atomic.Value(bool) = .init(false);
+    const storm = try std.Thread.spawn(
+        .{},
+        PollSignalStorm.run,
+        .{PollSignalStorm{
+            .target = std.c.pthread_self(),
+            .stop = &stop,
+        }},
+    );
+    defer {
+        stop.store(true, .seq_cst);
+        storm.join();
+    }
+
+    try std.testing.expectError(error.Timeout, pollFd(
+        fds[0],
+        posix.POLL.IN,
+        .{ .deadline = .{ .deadline_ms = deadline_ms } },
+    ));
+    const elapsed_ms = monotonicMillis() - started_ms;
+    try std.testing.expect(elapsed_ms < 1000);
+}
+
+fn expectSyscallFailure(action: SyscallErrorAction, expected: anyerror) !void {
+    switch (action) {
+        .retry => return error.TestExpectedEqual,
+        .failure => |err| try std.testing.expectEqual(expected, err),
+    }
+}
+
+test "web_fetch socket errno classifiers preserve named causes" {
+    const Case = struct {
+        errno: posix.E,
+        read_error: anyerror,
+        write_error: anyerror,
+    };
+    const cases = [_]Case{
+        .{ .errno = .CONNRESET, .read_error = error.ConnectionResetByPeer, .write_error = error.ConnectionResetByPeer },
+        .{ .errno = .PIPE, .read_error = error.BrokenPipe, .write_error = error.BrokenPipe },
+        .{ .errno = .NOTCONN, .read_error = error.SocketUnconnected, .write_error = error.SocketUnconnected },
+        .{ .errno = .NETDOWN, .read_error = error.NetworkDown, .write_error = error.NetworkDown },
+        .{ .errno = .NOBUFS, .read_error = error.SystemResources, .write_error = error.SystemResources },
+        .{ .errno = .NOMEM, .read_error = error.SystemResources, .write_error = error.SystemResources },
+        .{ .errno = .IO, .read_error = error.InputOutput, .write_error = error.InputOutput },
+        .{ .errno = .BADF, .read_error = error.InvalidDescriptor, .write_error = error.InvalidDescriptor },
+        .{ .errno = .CANCELED, .read_error = error.Canceled, .write_error = error.Canceled },
+        .{ .errno = .TIMEDOUT, .read_error = error.Timeout, .write_error = error.Timeout },
+        .{ .errno = .PERM, .read_error = error.ReadFailed, .write_error = error.WriteFailed },
+    };
+    for (cases) |case| {
+        try expectSyscallFailure(classifyReadErrno(case.errno), case.read_error);
+        try expectSyscallFailure(classifyWriteErrno(case.errno), case.write_error);
+    }
+
+    try std.testing.expectEqual(SyscallErrorAction.retry, classifyReadErrno(.AGAIN));
+    try std.testing.expectEqual(SyscallErrorAction.retry, classifyReadErrno(.INTR));
+    try std.testing.expectEqual(SyscallErrorAction.retry, classifyWriteErrno(.AGAIN));
+    try std.testing.expectEqual(SyscallErrorAction.retry, classifyWriteErrno(.INTR));
+}
 
 const InterruptingRead = struct {
     cancel_flag: *std.atomic.Value(bool),
@@ -2181,3 +3791,93 @@ const InterruptingRead = struct {
         return .{ .failure = .INTR };
     }
 };
+
+test "web_fetch interrupted socket read rechecks cancellation before retry" {
+    var cancel_flag: std.atomic.Value(bool) = .init(false);
+    var poller = ScriptedPoller{ .revents = posix.POLL.IN };
+    var read = InterruptingRead{ .cancel_flag = &cancel_flag };
+    var buf: [1]u8 = undefined;
+
+    try std.testing.expectError(error.Canceled, rawReadWith(
+        42,
+        &buf,
+        .{ .cancel_flag = &cancel_flag },
+        poller.poller(),
+        read.syscall(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), read.calls);
+    try std.testing.expectEqual(@as(usize, 1), poller.calls);
+}
+
+test "web_fetch deadline reader drains bytes after hangup and then returns eof" {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer closeFd(fds[0]);
+
+    const payload = "final bytes";
+    const written = std.c.write(fds[1], payload.ptr, payload.len);
+    if (written < 0) return error.PipeWriteFailed;
+    try std.testing.expectEqual(payload.len, @as(usize, @intCast(written)));
+    closeFd(fds[1]);
+
+    var reader: PlainDeadlineReader = undefined;
+    reader.init(fds[0], .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } });
+    var storage: [32]u8 = undefined;
+    var data: [1][]u8 = .{&storage};
+    const count = try reader.interface.vtable.readVec(&reader.interface, &data);
+    try std.testing.expectEqualStrings(payload, storage[0..count]);
+
+    try std.testing.expectError(
+        error.EndOfStream,
+        reader.interface.vtable.readVec(&reader.interface, &data),
+    );
+    try std.testing.expect(reader.err == null);
+}
+
+test "web_fetch deadline adapters retain invalid descriptor causes" {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    closeFd(fds[0]);
+    closeFd(fds[1]);
+
+    const options: FetchOptions = .{
+        .deadline = .{ .deadline_ms = monotonicMillis() + 1000 },
+    };
+    var reader: PlainDeadlineReader = undefined;
+    reader.init(fds[0], options);
+    var byte: [1]u8 = undefined;
+    var data: [1][]u8 = .{&byte};
+    try std.testing.expectError(
+        error.ReadFailed,
+        reader.interface.vtable.readVec(&reader.interface, &data),
+    );
+    try std.testing.expectEqual(error.InvalidDescriptor, reader.err.?);
+
+    var writer: PlainDeadlineWriter = undefined;
+    writer.init(fds[1], options);
+    try writer.interface.writeAll("x");
+    try std.testing.expectError(error.WriteFailed, writer.interface.flush());
+    try std.testing.expectEqual(error.InvalidDescriptor, writer.err.?);
+}
+
+test "web_fetch closed peer write returns a cause without terminating process" {
+    var sockets: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
+        return error.SocketPairFailed;
+    defer closeFd(sockets[0]);
+    if (std.c.shutdown(sockets[1], posix.SHUT.RDWR) != 0)
+        return error.SocketShutdownFailed;
+    closeFd(sockets[1]);
+
+    var poller = ScriptedPoller{ .revents = posix.POLL.OUT | posix.POLL.HUP };
+    rawWriteAllWith(
+        sockets[0],
+        "x",
+        .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } },
+        poller.poller(),
+    ) catch |err| {
+        try std.testing.expect(err == error.BrokenPipe or err == error.ConnectionResetByPeer);
+        return;
+    };
+    return error.TestExpectedError;
+}

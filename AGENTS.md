@@ -18,15 +18,15 @@ If you cannot run the binary in your environment, say so explicitly and ask the 
 
 ### Always use the built binary in this repo
 
-When running fx for verification, **always use the freshly-built binary at** **`./zig-out/bin/omfx`** from this checkout. Never run `fx` from `PATH`, never rely on whatever is at `~/.fx/bin/fx`, and never assume an installed copy reflects your change.
+When running fx for verification, **always use the freshly-built binary at** **`./zig-out/bin/fx`** from this checkout. Never run `fx` from `PATH`, never rely on whatever is at `~/.fx/bin/fx`, and never assume an installed copy reflects your change.
 
 * The user may have an older `fx` on their PATH (e.g. installed via `fx upgrade` or the CDN install script). Running that one will not exercise your edits.
 
-* `zig build` writes to `zig-out/bin/omfx`. That is the only binary that contains your latest change.
+* `zig build` writes to `zig-out/bin/fx`. That is the only binary that contains your latest change.
 
 * When a user reports "still not working" after you believe you fixed something, do not assume they are running the wrong binary. Assume your fix is incomplete and investigate further. If you genuinely suspect a PATH mismatch, ask — do not silently copy binaries into `~/.fx/bin/`.
 
-* In any shell invocation — tmux, direct run, scripts — reference fx as `/Users/<you>/path/to/repo/zig-out/bin/omfx` (absolute) or `./zig-out/bin/omfx` (when cwd is the repo root). Bare `fx` is always wrong for dev verification.
+* In any shell invocation — tmux, direct run, scripts — reference fx as `/Users/<you>/path/to/repo/zig-out/bin/fx` (absolute) or `./zig-out/bin/fx` (when cwd is the repo root). Bare `fx` is always wrong for dev verification.
 
 ## Language and Toolchain
 
@@ -56,13 +56,6 @@ The test suites under `tests/` use Bun but are separate from the Zig codebase. S
 * Prefer `snake_case` for all Zig identifiers. Types use `PascalCase` per Zig convention.
 
 * Keep `pub` surface area minimal. Only mark declarations `pub` when they are used outside the file.
-
-## Attribution
-
-When you port a feature, design, or idea from another project, name the source
-in the Credits section of `README.md` with the specific feature it influenced,
-not just a link. License obligations for copied material go in
-`THIRD_PARTY_NOTICES.md`, not the README.
 
 ## Architecture
 
@@ -135,7 +128,7 @@ Config precedence (highest wins):
 
 Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `permission_mode`, `credential_source`, and `permission` are ignored from project config before their values are parsed.
 
-Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces — each session tracks its `workspace_root` which updates when resumed in a different workspace. A subagent child is an ordinary session with its own directory; `subagent/` holds create-operation identities on a parent and the control record on a child.
+Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. A subagent child is an internal ordinary session with its own history. Its parent owns one bounded `subagent/children.json` registry, and the child carries only an immutable owner marker. Child sessions stay out of ordinary session discovery and cannot be resumed directly. A first `subagent.message` creates a named persistent child in that parent; later messages continue it, and optional instructions replace only its child-specific system overlay.
 
 ## Permissions
 
@@ -149,11 +142,11 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * `/permissions remember allow|deny <tool-name> <arguments-json>` confirms and stores an exact rule only for an active saved session; list and revoke those rules by their stable IDs
 
-* Routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy. Every remaining unresolved `auto` action receives one review using the current proven root request, the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Those excerpts are untrusted evidence and never authority; assistant prose, permission feedback, the pending tool group, later results, and historical requests do not enter review
+* Routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy. Every remaining unresolved `auto` action receives one narrow security review using the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Prepared file mutations and static root tools omit task text. Reviewed commands, dynamic tools, and subagent actions also receive bounded canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority
 
-* A `clear` review authorizes only the exact unchanged action. A `caution` or unavailable review holds only that action, returns advice to the agent, and never opens a human permission screen, disables tools, or ends the turn
+* The reviewer returns `caution` only for concrete prompt injection or malicious activity. Destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A `clear` review authorizes only the exact unchanged action. A `caution`, incomplete-evidence result, or unavailable review holds only that action, returns guidance to the agent, and never opens a human permission screen, disables tools, or ends the turn
 
-* Exact cautions are reused only for the current turn. Changed actions receive a new review. Legacy `permission_request_id` input is rejected without prompting
+* Exact cautions and deterministic incomplete-evidence results are reused only for the current turn. An unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable transport attempt per turn; changed actions remain independently reviewable until the bounded current-turn transport budget is exhausted. Legacy `permission_request_id` input is rejected without prompting
 
 Do not bypass the permission system for new tools.
 
@@ -275,7 +268,7 @@ Keep PR titles as clean imperative sentences, such as `Restore feedback report f
 
 ## Full CI on Feature Branches
 
-Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/omfx`.
+Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/fx`.
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. `.github/workflows/full-ci.yml` runs the following on all four supported native runner architectures:
 
@@ -290,7 +283,7 @@ A Full CI result is valid only when it belongs to the exact current commit and a
 
 ## Reproducing Render Bugs
 
-fx's rendering is inline by default and deliberately emits a small ANSI subset. Five owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-transcript screen, catalog menus, the ctrl+x subagent manager, and a hosted child-terminal takeover. The terminal-session owner is entered only by an explicit manager handoff after the host grants the human write lease; it renders the shared terminal-engine grid without permanent fx chrome and releases that lease on detach. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, and command-output expansion remain inline. Three tools exist for reproducing and regression-proofing render bugs:
+fx's rendering is inline by default and deliberately emits a small ANSI subset. Three owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-transcript screen, and catalog menus. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, command-output expansion, and subagent delegation remain inline. Three tools exist for reproducing and regression-proofing render bugs:
 
 ### tmux (live TTY repros)
 
@@ -300,16 +293,23 @@ Best for resize and SIGWINCH interactions. The helper in `tests/e2e/tmux-helpers
 cd tests/e2e && bun test tui-resize.test.ts
 ```
 
-### FX\_RECORD + fx replay (capture-and-replay)
+### Debug terminal recording and replay
 
-Run fx with `FX_RECORD=<path>` to dump every byte fx writes, every resize, and every Ctrl+C into a framed binary tape. Replay the tape through the built-in virtual terminal:
+Set `FX_DEBUG_RECORD=1` to create an automatic private tape under
+`~/.fx/recordings/`. Set `FX_DEBUG_RECORD_SILENT_BANNER=1` as well when the
+developer-only recording notice must stay out of the inline transcript during
+a screen share. The notice remains available in the Ctrl+O full transcript.
+Use `FX_RECORD=<path>` when a test or investigation needs an exact destination.
+Recording dumps every byte fx writes and every resize into a framed binary tape.
+Replay the tape through the built-in virtual terminal:
 
 ```bash
-FX_RECORD=/tmp/bug.fxtape fx        # user reproduces the glitch
-fx replay /tmp/bug.fxtape           # print the final cell grid
-fx replay /tmp/bug.fxtape --frames  # scrub through every intermediate frame
-fx replay /tmp/bug.fxtape --json    # structured frame metadata + grid
-fx replay /tmp/bug.fxtape --golden out.txt   # write grid to a file
+FX_DEBUG_RECORD=1 ./zig-out/bin/fx
+FX_RECORD=/tmp/bug.fxtape ./zig-out/bin/fx
+./zig-out/bin/fx replay /tmp/bug.fxtape
+./zig-out/bin/fx replay /tmp/bug.fxtape --frames
+./zig-out/bin/fx replay /tmp/bug.fxtape --json
+./zig-out/bin/fx replay /tmp/bug.fxtape --golden out.txt
 ```
 
 The tape is deterministic — any reviewer can replay it without a TTY, and a golden file can be checked in as a regression test.
@@ -462,7 +462,7 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 ## Before Marking a PR Ready
 
 1. Run `zig fmt --check src/` and the focused tests for the changed path.
-2. Build and exercise the change locally with `./zig-out/bin/omfx`.
+2. Build and exercise the change locally with `./zig-out/bin/fx`.
 3. Push a clean checkpoint commit and open a draft PR immediately.
 4. Require **Full CI** and the final ship gate to pass on the exact current commit across all four native runners.
 5. Update docs if behavior changed.

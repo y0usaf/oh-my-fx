@@ -635,6 +635,429 @@ fn containsPath(files: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+test "workspace file provider tracked git argv uses nul-separated cached files" {
+    const argv = gitTrackedFilesArgv("git");
+
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
+    try std.testing.expectEqualStrings("ls-files", argv[2]);
+    try std.testing.expectEqualStrings("-z", argv[3]);
+    try std.testing.expectEqualStrings("--cached", argv[4]);
+}
+
+test "workspace file provider optional untracked git argv includes exclude-standard" {
+    const argv = gitTrackedAndOtherFilesArgv("git");
+
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
+    try std.testing.expectEqualStrings("ls-files", argv[2]);
+    try std.testing.expectEqualStrings("-z", argv[3]);
+    try std.testing.expectEqualStrings("--cached", argv[4]);
+    try std.testing.expectEqualStrings("--others", argv[5]);
+    try std.testing.expectEqualStrings("--exclude-standard", argv[6]);
+}
+
+test "workspace file provider untracked git argv uses others exclude-standard" {
+    const argv = gitOtherFilesArgv("git");
+
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
+    try std.testing.expectEqualStrings("ls-files", argv[2]);
+    try std.testing.expectEqualStrings("-z", argv[3]);
+    try std.testing.expectEqualStrings("--others", argv[4]);
+    try std.testing.expectEqualStrings("--exclude-standard", argv[5]);
+}
+
+test "workspace directory provider asks Git only for ignored directory roots" {
+    const argv = gitIgnoredDirectoriesArgv("git");
+
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
+    try std.testing.expectEqualStrings("ls-files", argv[2]);
+    try std.testing.expectEqualStrings("-z", argv[3]);
+    try std.testing.expectEqualStrings("--others", argv[4]);
+    try std.testing.expectEqualStrings("--ignored", argv[5]);
+    try std.testing.expectEqualStrings("--directory", argv[6]);
+    try std.testing.expectEqualStrings("--exclude-standard", argv[7]);
+}
+
+test "workspace directory provider parses only ignored directory entries" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var ignored = try parseRawIgnoredDirectories(
+        arena_state.allocator(),
+        "ignored-dir/\x00ignored.txt\x00nested/ignored/\x00",
+    );
+    defer ignored.deinit(arena_state.allocator());
+
+    try std.testing.expect(ignored.contains("ignored-dir"));
+    try std.testing.expect(ignored.contains("nested/ignored"));
+    try std.testing.expect(!ignored.contains("ignored.txt"));
+}
+
+test "workspace file provider caps candidates and reports incomplete status" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const raw = "a.zig\x00b.zig\x00c.zig\x00";
+    const result = try parseRawList(arena_state.allocator(), raw, .git, .{ .candidate_cap = 2 });
+
+    try std.testing.expectEqual(@as(usize, 2), result.files.len);
+    try std.testing.expect(result.incomplete);
+    try std.testing.expectEqual(CapReason.candidate_cap, result.cap_reason.?);
+    try std.testing.expectEqualStrings("a.zig", result.files[0]);
+    try std.testing.expectEqualStrings("b.zig", result.files[1]);
+}
+
+test "workspace file provider applies bytewise ordering to Git results when requested" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const result = try parseRawList(arena_state.allocator(), "z.zig\x00a.zig\x00m.zig\x00", .git, .{ .sort_paths = true });
+
+    try std.testing.expectEqualStrings("a.zig", result.files[0]);
+    try std.testing.expectEqualStrings("m.zig", result.files[1]);
+    try std.testing.expectEqualStrings("z.zig", result.files[2]);
+}
+
+test "workspace file provider git discovery includes tracked build files and skips hidden directories" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const raw = "build/script.ts\x00.eslint-plugin-local/rule.ts\x00src/.esbuild.ts\x00src/main.ts\x00";
+    const result = try parseRawList(arena_state.allocator(), raw, .git, .{});
+
+    try std.testing.expectEqual(@as(usize, 3), result.files.len);
+    try std.testing.expect(containsPath(result.files, "build/script.ts"));
+    try std.testing.expect(containsPath(result.files, "src/.esbuild.ts"));
+    try std.testing.expect(containsPath(result.files, "src/main.ts"));
+    try std.testing.expect(!containsPath(result.files, ".eslint-plugin-local/rule.ts"));
+}
+
+test "workspace file provider recursive fallback skips ignored directories and includes nested files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "src/main.zig", "main\n");
+    try writeTestFile(tmp.dir, "src/nested/lib.zig", "lib\n");
+    try writeTestFile(tmp.dir, "node_modules/pkg/ignored.zig", "ignored\n");
+    try writeTestFile(tmp.dir, ".zig-cache/o/ignored.o", "ignored\n");
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try discover(arena_state.allocator(), root, .{ .force_fallback = true });
+
+    try std.testing.expectEqual(Source.recursive, result.source);
+    try std.testing.expect(containsPath(result.files, "src/main.zig"));
+    try std.testing.expect(containsPath(result.files, "src/nested/lib.zig"));
+    try std.testing.expect(!containsPath(result.files, "node_modules/pkg/ignored.zig"));
+    try std.testing.expect(!containsPath(result.files, ".zig-cache/o/ignored.o"));
+}
+
+test "workspace directory provider fallback includes nested empty directories and skips ignored roots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "empty/deep");
+    try tmp.dir.createDirPath(std.testing.io, ".hidden/empty");
+    try tmp.dir.createDirPath(std.testing.io, "ignored-dir/deep");
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try discoverDirectoriesWithStop(
+        arena_state.allocator(),
+        root,
+        .{
+            .force_fallback = true,
+            .include_hidden = true,
+            .ignored_names = &.{"ignored-dir"},
+        },
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(Source.recursive, result.source);
+    try std.testing.expect(containsPath(result.directories, ".hidden"));
+    try std.testing.expect(containsPath(result.directories, ".hidden/empty"));
+    try std.testing.expect(containsPath(result.directories, "empty"));
+    try std.testing.expect(containsPath(result.directories, "empty/deep"));
+    try std.testing.expect(!containsPath(result.directories, "ignored-dir"));
+}
+
+test "workspace directory provider honors its cap and cancellation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "first", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "second", .default_dir);
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try discoverDirectoriesWithStop(
+        arena_state.allocator(),
+        root,
+        .{ .candidate_cap = 1, .force_fallback = true },
+        null,
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), result.directories.len);
+    try std.testing.expect(result.incomplete);
+    try std.testing.expectEqual(CapReason.candidate_cap, result.cap_reason.?);
+
+    var stop_requested = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        discoverDirectoriesWithStop(arena_state.allocator(), root, .{ .force_fallback = true }, &stop_requested, null),
+    );
+}
+
+test "workspace file provider recursive fallback does not recurse symlink directories" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "real/inside.txt", "inside\n");
+    try tmp.dir.symLink(std.testing.io, "real", "linked", .{ .is_directory = true });
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try discover(arena_state.allocator(), root, .{ .force_fallback = true });
+
+    try std.testing.expect(containsPath(result.files, "linked"));
+    try std.testing.expect(!containsPath(result.files, "linked/inside.txt"));
+}
+
+test "workspace file provider overlong paths are skipped without aborting" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const long_path = try std.testing.allocator.alloc(u8, max_relative_path_bytes + 1);
+    defer std.testing.allocator.free(long_path);
+    @memset(long_path, 'a');
+    const raw = try std.mem.concat(std.testing.allocator, u8, &.{ "kept.zig\x00", long_path, "\x00also-kept.zig\x00" });
+    defer std.testing.allocator.free(raw);
+
+    const result = try parseRawList(arena_state.allocator(), raw, .git, .{});
+
+    try std.testing.expectEqual(@as(usize, 2), result.files.len);
+    try std.testing.expectEqual(@as(usize, 1), result.skipped_overlong);
+    try std.testing.expect(containsPath(result.files, "kept.zig"));
+    try std.testing.expect(containsPath(result.files, "also-kept.zig"));
+}
+
+test "workspace file provider falls back when git is skipped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "nested/file.txt", "file\n");
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try discover(arena_state.allocator(), root, .{ .force_fallback = true });
+
+    try std.testing.expectEqual(Source.recursive, result.source);
+    try std.testing.expect(containsPath(result.files, "nested/file.txt"));
+}
+
+test "workspace file provider treats empty successful git result as authoritative" {
+    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "untracked.txt", "not tracked\n");
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    try runGitForTest(alloc, root, &.{ "git", "init", "--quiet" });
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try discoverWithStop(
+        arena_state.allocator(),
+        root,
+        .{ .git_worktree_is_authoritative = true },
+        null,
+        "git",
+    );
+
+    try std.testing.expectEqual(Source.git, result.source);
+    try std.testing.expectEqual(@as(usize, 0), result.files.len);
+}
+
+test "workspace file provider walks a Git worktree when no trusted Git executable is available" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    try writeTestFile(tmp.dir, "fallback.txt", "fallback\n");
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try discoverWithStop(
+        arena_state.allocator(),
+        root,
+        .{ .git_worktree_is_authoritative = true },
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(Source.recursive, result.source);
+    try std.testing.expect(containsPath(result.files, "fallback.txt"));
+}
+
+test "workspace file provider does not recurse after a selected Git executable fails" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, ".git", "gitdir: /missing\n");
+    try writeTestFile(tmp.dir, "untracked.txt", "not tracked\n");
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try std.testing.expectError(
+        error.GitFileListFailed,
+        discoverWithStop(
+            arena_state.allocator(),
+            root,
+            .{ .git_worktree_is_authoritative = true },
+            null,
+            "/definitely/missing/fx-git",
+        ),
+    );
+}
+
+test "workspace file provider git result contains tracked files only" {
+    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, ".gitignore", "ignored.txt\n");
+    try writeTestFile(tmp.dir, "tracked.txt", "tracked\n");
+    try writeTestFile(tmp.dir, ".hidden/tracked.txt", "hidden\n");
+    try writeTestFile(tmp.dir, "ignored.txt", "ignored\n");
+    try writeTestFile(tmp.dir, "untracked.txt", "untracked\n");
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    try runGitForTest(alloc, root, &.{ "git", "init", "--quiet" });
+    try runGitForTest(alloc, root, &.{ "git", "add", ".gitignore", "tracked.txt", ".hidden/tracked.txt" });
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try discoverWithStop(arena_state.allocator(), root, .{ .include_hidden = true }, null, "git");
+
+    try std.testing.expectEqual(Source.git, result.source);
+    try std.testing.expect(containsPath(result.files, ".gitignore"));
+    try std.testing.expect(containsPath(result.files, "tracked.txt"));
+    try std.testing.expect(containsPath(result.files, ".hidden/tracked.txt"));
+    try std.testing.expect(!containsPath(result.files, "ignored.txt"));
+    try std.testing.expect(!containsPath(result.files, "untracked.txt"));
+}
+
+test "workspace directory provider uses Git ignores without collapsing nested empty directories" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, ".gitignore", "ignored-dir/\n");
+    try tmp.dir.createDirPath(std.testing.io, "empty-dir");
+    try tmp.dir.createDirPath(std.testing.io, "nested-empty/deep");
+    try tmp.dir.createDirPath(std.testing.io, ".hidden/empty");
+    try tmp.dir.createDirPath(std.testing.io, "ignored-dir/deep");
+    try writeTestFile(tmp.dir, "build/tracked.txt", "tracked\n");
+
+    const alloc = std.testing.allocator;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    try runGitForTest(alloc, root, &.{ "git", "init", "--quiet" });
+    try runGitForTest(alloc, root, &.{ "git", "add", "build/tracked.txt" });
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try discoverDirectoriesWithStop(
+        arena_state.allocator(),
+        root,
+        .{ .include_hidden = true },
+        null,
+        "git",
+    );
+
+    try std.testing.expectEqual(Source.git, result.source);
+    try std.testing.expect(containsPath(result.directories, ".hidden"));
+    try std.testing.expect(containsPath(result.directories, ".hidden/empty"));
+    try std.testing.expect(containsPath(result.directories, "empty-dir"));
+    try std.testing.expect(containsPath(result.directories, "nested-empty"));
+    try std.testing.expect(containsPath(result.directories, "nested-empty/deep"));
+    try std.testing.expect(containsPath(result.directories, "build"));
+    try std.testing.expect(!containsPath(result.directories, "ignored-dir"));
+}
+
+test "workspace file provider cancellable fallback stops before traversal" {
+    var stop_requested = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        discoverCancellable(std.testing.allocator, "/unused", .{ .force_fallback = true }, &stop_requested),
+    );
+}
+
+test "workspace file provider cancellation terminates an active child" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var stop_requested = std.atomic.Value(bool).init(false);
+    const RequestStop = struct {
+        fn run(stop: *std.atomic.Value(bool)) void {
+            sleepBlocking(20);
+            stop.store(true, .seq_cst);
+        }
+    };
+    const stop_thread = try std.Thread.spawn(.{}, RequestStop.run, .{&stop_requested});
+    defer stop_thread.join();
+
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expectError(
+        error.Canceled,
+        runCancellable(
+            std.testing.allocator,
+            .{
+                .argv = &.{ "/bin/sleep", "60" },
+                .stdout_limit = .limited(1024),
+                .stderr_limit = .limited(1024),
+            },
+            &stop_requested,
+        ),
+    );
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms < 1000);
+}
+
 fn sleepBlocking(milliseconds: u64) void {
     var sleep_io_backend: std.Io.Threaded = .init_single_threaded;
     sleep_io_backend.io().sleep(.fromMilliseconds(@intCast(milliseconds)), .real) catch {};

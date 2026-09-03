@@ -211,3 +211,93 @@ fn count(text: []const u8, needle: []const u8) usize {
     }
     return result;
 }
+
+test "supported source gains balanced colors without changing code bytes" {
+    const alloc = std.testing.allocator;
+    const source = "const value = \"const\"; // return\n";
+    const styled = try highlight(alloc, source, languages.resolve("zig").?, .dark);
+    defer alloc.free(styled);
+
+    const plain = try stripAnsi(alloc, styled);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(source, plain);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;") != null);
+    try std.testing.expectEqual(count(styled, "\x1b[38;5;"), count(styled, "\x1b[39m"));
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mconst") != null);
+    try std.testing.expectEqual(@as(usize, 1), count(styled, "\x1b[38;5;252mconst"));
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m\"const\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mreturn") == null);
+}
+
+test "light theme uses a readable syntax palette without changing code bytes" {
+    const alloc = std.testing.allocator;
+    const source = "const value = \"ready\"; // comment\n";
+    const styled = try highlight(alloc, source, languages.resolve("zig").?, .light);
+    defer alloc.free(styled);
+
+    const plain = try stripAnsi(alloc, styled);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(source, plain);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;238mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;243m// comment\x1b[39m") != null);
+    try std.testing.expectEqual(count(styled, "\x1b[38;5;"), count(styled, "\x1b[39m"));
+}
+
+test "every registered profile highlights representative source" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        label: []const u8,
+        source: []const u8,
+    }{
+        .{ .label = "zig", .source = "pub fn main() void { return; }" },
+        .{ .label = "ts", .source = "const ready = true;" },
+        .{ .label = "json", .source = "{\"ready\": true}" },
+        .{ .label = "sh", .source = "if true; then echo \"ready\"; fi" },
+        .{ .label = "python", .source = "def ready(): return True" },
+        .{ .label = "yaml", .source = "ready: true # comment" },
+        .{ .label = "toml", .source = "ready = true # comment" },
+        .{ .label = "sql", .source = "SELECT id FROM users" },
+        .{ .label = "dockerfile", .source = "FROM alpine:3.20" },
+        .{ .label = "rust", .source = "fn main() { let ready = true; }" },
+        .{ .label = "go", .source = "package main\nfunc main() {}" },
+        .{ .label = "c", .source = "int main(void) { return 0; }" },
+        .{ .label = "cpp", .source = "class Ready { public: bool value = true; };" },
+        .{ .label = "csharp", .source = "public class Ready { }" },
+        .{ .label = "java", .source = "public class Ready { }" },
+        .{ .label = "kotlin", .source = "fun ready(): Boolean = true" },
+        .{ .label = "php", .source = "<?php function ready() { return true; }" },
+        .{ .label = "ruby", .source = "def ready\n  true\nend" },
+        .{ .label = "swift", .source = "func ready() -> Bool { true }" },
+        .{ .label = "powershell", .source = "Function Ready { return $true }" },
+        .{ .label = "lua", .source = "local ready = true" },
+        .{ .label = "html", .source = "<main class=\"ready\"></main>" },
+        .{ .label = "xml", .source = "<?xml version=\"1.0\"?>" },
+        .{ .label = "css", .source = ".ready { color: red; }" },
+        .{ .label = "hcl", .source = "resource \"ready\" \"main\" {}" },
+    };
+
+    for (cases) |case| {
+        const styled = try highlight(alloc, case.source, languages.resolve(case.label).?, .dark);
+        defer alloc.free(styled);
+        const plain = try stripAnsi(alloc, styled);
+        defer alloc.free(plain);
+        try std.testing.expectEqualStrings(case.source, plain);
+        try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;") != null);
+    }
+}
+
+test "profiles use configured block comments and case-insensitive keywords" {
+    const alloc = std.testing.allocator;
+    const source = "/* comment */\nSELECT id FROM users\n<!-- note -->";
+    const css = try highlight(alloc, source[0..13], languages.resolve("css").?, .dark);
+    defer alloc.free(css);
+    const sql = try highlight(alloc, source[14..34], languages.resolve("sql").?, .dark);
+    defer alloc.free(sql);
+    const html = try highlight(alloc, source[35..], languages.resolve("html").?, .dark);
+    defer alloc.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, css, "\x1b[38;5;245m/* comment */\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\x1b[38;5;252mSELECT\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "\x1b[38;5;245m<!-- note -->\x1b[39m") != null);
+}

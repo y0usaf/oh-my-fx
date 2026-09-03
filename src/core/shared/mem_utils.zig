@@ -35,3 +35,29 @@ noinline fn freeErased(
     @memset(bytes, undefined);
     alloc.rawFree(bytes, alignment, ret_addr);
 }
+
+test "free releases an allocated slice" {
+    const alloc = std.testing.allocator;
+    const buf = try alloc.alloc(u64, 16);
+    free(alloc, buf);
+}
+
+test "free accepts an empty slice" {
+    const alloc = std.testing.allocator;
+    const buf = try alloc.alloc(u8, 0);
+    free(alloc, buf);
+}
+
+test "deinitList releases list capacity" {
+    const alloc = std.testing.allocator;
+    var list: std.ArrayList(usize) = .empty;
+    try list.append(alloc, 7);
+    try list.append(alloc, 11);
+    deinitList(alloc, &list);
+}
+
+test "deinitList on a never-grown list is a no-op" {
+    const alloc = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    deinitList(alloc, &list);
+}

@@ -8,14 +8,12 @@ pub const IdleFacts = struct {
     connected_clients: usize = 0,
     pending_requests: usize = 0,
     live_work: usize = 0,
-    monitor_required: bool = false,
 };
 
 pub fn idleEligible(facts: IdleFacts) bool {
     return facts.connected_clients == 0 and
         facts.pending_requests == 0 and
-        facts.live_work == 0 and
-        !facts.monitor_required;
+        facts.live_work == 0;
 }
 
 pub const QueueAdmission = enum {
@@ -142,3 +140,62 @@ pub const PendingRequests = struct {
         return false;
     }
 };
+
+test "idle eligibility accounts for every host owner" {
+    try std.testing.expect(idleEligible(.{}));
+    try std.testing.expect(!idleEligible(.{ .connected_clients = 1 }));
+    try std.testing.expect(!idleEligible(.{ .pending_requests = 1 }));
+    try std.testing.expect(!idleEligible(.{ .live_work = 1 }));
+}
+
+test "queue admission is bounded and rejects shutdown" {
+    try std.testing.expectEqual(
+        QueueAdmission.admit,
+        classifyQueueAdmission(queue_capacity - 1, queue_capacity, false),
+    );
+    try std.testing.expectEqual(
+        QueueAdmission.full,
+        classifyQueueAdmission(queue_capacity, queue_capacity, false),
+    );
+    try std.testing.expectEqual(
+        QueueAdmission.stopping,
+        classifyQueueAdmission(0, queue_capacity, true),
+    );
+}
+
+test "reconciliation requires both lock and liveness proof before cleanup" {
+    try std.testing.expectEqual(
+        Reconciliation.wait_for_authority,
+        classifyReconciliation(.refused, .held, .dead),
+    );
+    try std.testing.expectEqual(
+        Reconciliation.preserve_identity_conflict,
+        classifyReconciliation(.refused, .acquired, .live),
+    );
+    try std.testing.expectEqual(
+        Reconciliation.preserve_identity_conflict,
+        classifyReconciliation(.refused, .acquired, .unverifiable),
+    );
+    try std.testing.expectEqual(
+        Reconciliation.remove_stale_then_start,
+        classifyReconciliation(.refused, .acquired, .dead),
+    );
+    try std.testing.expectEqual(
+        Reconciliation.start_host,
+        classifyReconciliation(.endpoint_missing, .acquired, .absent),
+    );
+}
+
+test "targeted cancellation releases only its pending request" {
+    var pending: PendingRequests = .{};
+    const first = contracts.CorrelationId{ .value = 1 };
+    const second = contracts.CorrelationId{ .value = 2 };
+    try pending.add(first);
+    try pending.add(second);
+    try std.testing.expectError(error.DuplicateCorrelation, pending.add(first));
+    try std.testing.expect(pending.cancel(first));
+    try std.testing.expect(!pending.contains(first));
+    try std.testing.expect(pending.contains(second));
+    try std.testing.expect(!pending.cancel(.{ .value = 99 }));
+    try std.testing.expect(pending.complete(second));
+}

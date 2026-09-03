@@ -15,7 +15,11 @@ const scripts = [
   "test-native-core-fetch-failure.mjs",
   "test-native-core-cancel-before-fetch.mjs",
   "test-native-core-cancel.mjs",
+  "test-native-host-tool-late-settle.mjs",
+  "test-default-import.mjs",
   "test-libfx-loader.mjs",
+  "test-agent-bootstrap.mjs",
+  "test-instruction-limits.mjs",
 ];
 for (const script of scripts) {
   const args = [fileURLToPath(new URL(script, import.meta.url))];

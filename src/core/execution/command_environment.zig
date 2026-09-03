@@ -33,9 +33,11 @@ pub const Environment = union(enum) {
 };
 
 const permission_identity_prefix = "@fx-terminal-env:";
+const tty_permission_identity_prefix = "@fx-shell-mode:tty:";
 
 pub fn isExplicitPermissionCommandIdentity(value: []const u8) bool {
-    return std.mem.startsWith(u8, value, permission_identity_prefix);
+    return std.mem.startsWith(u8, value, permission_identity_prefix) or
+        std.mem.startsWith(u8, value, tty_permission_identity_prefix);
 }
 
 /// Binds shell startup to a retained command grant. Legacy callers keep the
@@ -50,6 +52,16 @@ pub fn permissionCommandIdentity(
         .clean => |path| formatPermissionCommandIdentity(alloc, "clean", path, command),
         .user => |path| formatPermissionCommandIdentity(alloc, "user", path, command),
     };
+}
+
+pub fn ttyPermissionCommandIdentity(
+    alloc: std.mem.Allocator,
+    environment: Environment,
+    command: []const u8,
+) ![]u8 {
+    const identity = try permissionCommandIdentity(alloc, environment, command);
+    defer alloc.free(identity);
+    return std.mem.concat(alloc, u8, &.{ tty_permission_identity_prefix, identity });
 }
 
 fn formatPermissionCommandIdentity(
@@ -68,8 +80,18 @@ fn formatPermissionCommandIdentity(
 /// Removes the opaque environment prefix only for configured permission-rule
 /// matching and human-facing policy display. Session grants retain it.
 pub fn commandFromPermissionIdentity(identity: []const u8) []const u8 {
-    if (!isExplicitPermissionCommandIdentity(identity)) return identity;
-    var rest = identity[permission_identity_prefix.len..];
+    const environment_identity = if (std.mem.startsWith(
+        u8,
+        identity,
+        tty_permission_identity_prefix,
+    ))
+        identity[tty_permission_identity_prefix.len..]
+    else
+        identity;
+    if (!std.mem.startsWith(u8, environment_identity, permission_identity_prefix)) {
+        return environment_identity;
+    }
+    var rest = environment_identity[permission_identity_prefix.len..];
     const profile_end = std.mem.findScalar(u8, rest, ':') orelse return identity;
     rest = rest[profile_end + 1 ..];
     const length_end = std.mem.findScalar(u8, rest, ':') orelse return identity;
@@ -88,22 +110,22 @@ pub fn formatApprovalCommand(
     return switch (environment) {
         .legacy => std.fmt.allocPrint(
             alloc,
-            "# terminal.exec profile=omitted (legacy)\n{s}",
+            "# shell.run profile=omitted (legacy)\n{s}",
             .{command},
         ),
         .workspace_clean => std.fmt.allocPrint(
             alloc,
-            "# terminal.exec profile=clean workspace=root-fixed\n{s}",
+            "# shell.run profile=clean workspace=root-fixed\n{s}",
             .{command},
         ),
         .clean => |path| std.fmt.allocPrint(
             alloc,
-            "# terminal.exec profile=clean shell={s}\n{s}",
+            "# shell.run profile=clean shell={s}\n{s}",
             .{ path, command },
         ),
         .user => |path| std.fmt.allocPrint(
             alloc,
-            "# terminal.exec profile=user shell={s}\n{s}",
+            "# shell.run profile=user shell={s}\n{s}",
             .{ path, command },
         ),
     };
@@ -113,3 +135,49 @@ pub const Host = enum {
     native,
     workspace_clean,
 };
+
+test "command environment equality includes explicit shell identity" {
+    try std.testing.expect((Environment{ .legacy = {} }).eql(.legacy));
+    try std.testing.expect((Environment{ .workspace_clean = {} }).eql(.workspace_clean));
+    try std.testing.expect((Environment{ .clean = "/bin/zsh" }).eql(.{ .clean = "/bin/zsh" }));
+    try std.testing.expect(!(Environment{ .clean = "/bin/zsh" }).eql(.{ .clean = "/bin/bash" }));
+    try std.testing.expect(!(Environment{ .clean = "/bin/zsh" }).eql(.{ .user = "/bin/zsh" }));
+}
+
+test "explicit profiles require their selected shell route" {
+    try std.testing.expect(!(Environment{ .legacy = {} }).requiresShellRoute());
+    try std.testing.expect((Environment{ .clean = "/bin/zsh" }).requiresShellRoute());
+    try std.testing.expect((Environment{ .user = "/bin/zsh" }).requiresShellRoute());
+    try std.testing.expect(!(Environment{ .workspace_clean = {} }).requiresShellRoute());
+}
+
+test "explicit permission identities bind profile and exact shell" {
+    const alloc = std.testing.allocator;
+    const command = "printf 'a::b'";
+    const clean = try permissionCommandIdentity(alloc, .{ .clean = "/bin/zsh" }, command);
+    defer alloc.free(clean);
+    const user = try permissionCommandIdentity(alloc, .{ .user = "/bin/zsh" }, command);
+    defer alloc.free(user);
+    const other_shell = try permissionCommandIdentity(alloc, .{ .clean = "/opt/bin::zsh" }, command);
+    defer alloc.free(other_shell);
+
+    try std.testing.expect(!std.mem.eql(u8, clean, user));
+    try std.testing.expect(!std.mem.eql(u8, clean, other_shell));
+    try std.testing.expectEqualStrings(command, commandFromPermissionIdentity(clean));
+    try std.testing.expectEqualStrings(command, commandFromPermissionIdentity(other_shell));
+
+    const tty = try ttyPermissionCommandIdentity(
+        alloc,
+        .{ .clean = "/bin/zsh" },
+        command,
+    );
+    defer alloc.free(tty);
+    try std.testing.expect(isExplicitPermissionCommandIdentity(tty));
+    try std.testing.expect(!std.mem.eql(u8, clean, tty));
+    try std.testing.expectEqualStrings(command, commandFromPermissionIdentity(tty));
+
+    const legacy = try permissionCommandIdentity(alloc, .legacy, command);
+    defer alloc.free(legacy);
+    try std.testing.expectEqualStrings(command, legacy);
+    try std.testing.expectEqualStrings(command, commandFromPermissionIdentity(legacy));
+}

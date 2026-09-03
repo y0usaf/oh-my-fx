@@ -203,3 +203,131 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8) !void {
     var file = try dir.createFile(std.testing.io, path, .{ .truncate = true });
     file.close(std.testing.io);
 }
+
+test "path completion classifies and splits only path-shaped queries" {
+    try std.testing.expectEqual(QueryMode.workspace_index, queryMode("main"));
+    try std.testing.expectEqual(QueryMode.workspace_index, queryMode("~"));
+    try std.testing.expectEqual(QueryMode.explicit_path, queryMode("~/Dow"));
+    try std.testing.expectEqual(QueryMode.explicit_path, queryMode("/tmp/fi"));
+    try std.testing.expectEqual(QueryMode.explicit_path, queryMode("./src/"));
+    try std.testing.expectEqual(QueryMode.explicit_path, queryMode("../shared/"));
+    try std.testing.expectEqual(QueryMode.explicit_path, queryMode("src/core/"));
+
+    const parsed = parseExplicitQuery("../shared/na").?;
+    try std.testing.expectEqualStrings("../shared", parsed.parent);
+    try std.testing.expectEqualStrings("../shared/", parsed.display_prefix);
+    try std.testing.expectEqualStrings("na", parsed.basename_prefix);
+}
+
+test "path completion enumerates immediate entries with deterministic bounded order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/src/empty");
+    try tmp.dir.createDirPath(std.testing.io, "workspace/src/nested/deeper");
+    try writeTestFile(tmp.dir, "workspace/src/zeta.txt");
+    try writeTestFile(tmp.dir, "workspace/src/Alpha.txt");
+    try writeTestFile(tmp.dir, "workspace/src/beta.txt");
+    try writeTestFile(tmp.dir, "workspace/src/.hidden.txt");
+    try writeTestFile(tmp.dir, "workspace/src/space \" file.txt");
+
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+    var results: [3]file_index.SearchResult = undefined;
+    var spans: [3]file_index.MatchSpan = undefined;
+    var paths: [3 * file_index.max_path_len]u8 = undefined;
+
+    const count = try complete(root, "./src/", &results, &spans, &paths);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualStrings("./src/.hidden.txt", results[0].path);
+    try std.testing.expectEqualStrings("./src/Alpha.txt", results[1].path);
+    try std.testing.expectEqualStrings("./src/beta.txt", results[2].path);
+
+    const filtered_count = try complete(root, "src/al", &results, &spans, &paths);
+    try std.testing.expectEqual(@as(usize, 1), filtered_count);
+    try std.testing.expectEqualStrings("src/Alpha.txt", results[0].path);
+    try std.testing.expectEqual(file_index.CandidateKind.file, results[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), results[0].matched_spans.len);
+    try std.testing.expectEqual(@as(u16, "src/".len), results[0].matched_spans[0].byte_start);
+    try std.testing.expectEqual(@as(u16, "src/al".len), results[0].matched_spans[0].byte_end);
+    try std.testing.expectEqual(@as(usize, 0), try complete(root, "src/space", &results, &spans, &paths));
+}
+
+test "path completion resolves parent and absolute forms without recursive traversal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.createDirPath(std.testing.io, "outside/empty");
+    try writeTestFile(tmp.dir, "outside/external.txt");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+    const outside = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "outside");
+    defer alloc.free(outside);
+
+    var results: [8]file_index.SearchResult = undefined;
+    var spans: [8]file_index.MatchSpan = undefined;
+    var paths: [8 * file_index.max_path_len]u8 = undefined;
+    const parent_count = try complete(root, "../outside/", &results, &spans, &paths);
+    try std.testing.expectEqual(@as(usize, 2), parent_count);
+    try std.testing.expectEqualStrings("../outside/empty", results[0].path);
+    try std.testing.expectEqual(file_index.CandidateKind.directory, results[0].kind);
+    try std.testing.expectEqualStrings("../outside/external.txt", results[1].path);
+
+    var absolute_query_storage: [file_index.max_path_len]u8 = undefined;
+    const absolute_query = try std.fmt.bufPrint(&absolute_query_storage, "{s}/ex", .{outside});
+    const absolute_count = try complete(root, absolute_query, &results, &spans, &paths);
+    try std.testing.expectEqual(@as(usize, 1), absolute_count);
+    var expected_storage: [file_index.max_path_len]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_storage, "{s}/external.txt", .{outside});
+    try std.testing.expectEqualStrings(expected, results[0].path);
+}
+
+test "path completion follows listed symlinks and filters unsafe names" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/target-dir");
+    try writeTestFile(tmp.dir, "workspace/target.txt");
+    try writeTestFile(tmp.dir, "workspace/unsafe-\x1b.txt");
+    try tmp.dir.symLink(std.testing.io, "target-dir", "workspace/linked-dir", .{ .is_directory = true });
+    try tmp.dir.symLink(std.testing.io, "target.txt", "workspace/linked-file", .{ .is_directory = false });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var results: [4]file_index.SearchResult = undefined;
+    var spans: [4]file_index.MatchSpan = undefined;
+    var paths: [4 * file_index.max_path_len]u8 = undefined;
+    const count = try complete(root, "./linked", &results, &spans, &paths);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(file_index.CandidateKind.directory, results[0].kind);
+    try std.testing.expectEqual(file_index.CandidateKind.file, results[1].kind);
+    try std.testing.expectEqual(@as(usize, 0), try complete(root, "./unsafe", &results, &spans, &paths));
+}
+
+test "path completion reports bounded storage and unavailable parents" {
+    var results: [1]file_index.SearchResult = undefined;
+    var spans: [1]file_index.MatchSpan = undefined;
+    var too_small: [file_index.max_path_len - 1]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, complete("/", "./", &results, &spans, &too_small));
+
+    var paths: [file_index.max_path_len]u8 = undefined;
+    try std.testing.expectError(error.PathUnavailable, complete("/", "/definitely/missing/fx-path/", &results, &spans, &paths));
+}
+
+test "path completion validates the current explicit candidate kind" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/folder");
+    try writeTestFile(tmp.dir, "workspace/file.txt");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    try std.testing.expect(isCurrentCandidateKind(root, "./folder", .directory));
+    try std.testing.expect(!isCurrentCandidateKind(root, "./folder", .file));
+    try std.testing.expect(isCurrentCandidateKind(root, "./file.txt", .file));
+    try std.testing.expect(!isCurrentCandidateKind(root, "./missing", .file));
+}

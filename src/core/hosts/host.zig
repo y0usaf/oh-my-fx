@@ -12,7 +12,7 @@ pub const TerminalSupport = enum {
 };
 
 pub const Capabilities = struct {
-    background_processes: bool,
+    process_control: bool,
     url_open: bool,
     native_url_open: bool,
     terminal: TerminalSupport,
@@ -87,10 +87,17 @@ pub const SecretStoreWriteError = std.mem.Allocator.Error || error{
     StoredKeyWriteFailed,
 };
 
+pub const SecretStorePresence = enum {
+    present,
+    missing,
+    unavailable,
+};
+
 pub const SecretStore = struct {
     context: ?*anyopaque = null,
     backend_label: []const u8,
     is_disabled_fn: *const fn (?*anyopaque) bool,
+    presence_fn: *const fn (?*anyopaque) SecretStorePresence = unavailableSecretStorePresence,
     load_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
@@ -106,6 +113,12 @@ pub const SecretStore = struct {
 
     pub fn isDisabled(self: SecretStore) bool {
         return self.is_disabled_fn(self.context);
+    }
+
+    /// Reports only whether a secret exists. No secret bytes are returned or
+    /// transferred across this host boundary.
+    pub fn presence(self: SecretStore) SecretStorePresence {
+        return self.presence_fn(self.context);
     }
 
     /// Returns an owned secret, or null when none is stored. The caller must
@@ -138,6 +151,7 @@ pub const SecretStore = struct {
 pub const unavailable_secret_store: SecretStore = .{
     .backend_label = "configured credential store",
     .is_disabled_fn = unavailableSecretStoreIsDisabled,
+    .presence_fn = missingSecretStorePresence,
     .load_fn = unavailableSecretStoreLoad,
     .store_fn = unavailableSecretStoreWrite,
     .store_interactive_fn = unavailableSecretStoreInteractiveWrite,
@@ -145,6 +159,14 @@ pub const unavailable_secret_store: SecretStore = .{
 
 fn unavailableSecretStoreIsDisabled(_: ?*anyopaque) bool {
     return false;
+}
+
+fn unavailableSecretStorePresence(_: ?*anyopaque) SecretStorePresence {
+    return .unavailable;
+}
+
+fn missingSecretStorePresence(_: ?*anyopaque) SecretStorePresence {
+    return .missing;
 }
 
 fn unavailableSecretStoreLoad(
@@ -224,7 +246,7 @@ fn capabilitiesForTarget(
 ) Capabilities {
     if (wasm.isTarget(arch)) {
         return .{
-            .background_processes = wasm.background_processes,
+            .process_control = wasm.process_control,
             .url_open = false,
             .native_url_open = false,
             .terminal = terminalSupportForOs(os_tag),
@@ -242,7 +264,7 @@ pub fn terminalSupportForOs(os_tag: std.Target.Os.Tag) TerminalSupport {
 
 pub fn nativeForOs(os_tag: std.Target.Os.Tag) Capabilities {
     return .{
-        .background_processes = os_tag != .windows and os_tag != .wasi,
+        .process_control = os_tag != .windows and os_tag != .wasi,
         .url_open = os_tag == .macos or os_tag == .linux,
         .native_url_open = os_tag == .macos,
         .terminal = terminalSupportForOs(os_tag),
@@ -264,4 +286,122 @@ pub fn operatingSystemText(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u
     const release = std.mem.sliceTo(&uts.release, 0);
     if (release.len == 0) return alloc.dupe(u8, sysname);
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ sysname, release });
+}
+
+test "terminal title forwards borrowed label bytes and clear" {
+    const Capture = struct {
+        label: [64]u8 = undefined,
+        label_len: usize = 0,
+        clear_count: usize = 0,
+
+        fn set(raw: ?*anyopaque, label: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.label_len = @min(label.len, self.label.len);
+            @memcpy(self.label[0..self.label_len], label[0..self.label_len]);
+        }
+
+        fn clear(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.clear_count += 1;
+        }
+
+        fn label_text(self: *const @This()) []const u8 {
+            return self.label[0..self.label_len];
+        }
+    };
+
+    var capture = Capture{};
+    const terminal_title = TerminalTitle{
+        .context = &capture,
+        .set_fn = Capture.set,
+        .clear_fn = Capture.clear,
+    };
+
+    terminal_title.set("session name");
+    terminal_title.clear();
+
+    try std.testing.expectEqualStrings("session name", capture.label_text());
+    try std.testing.expectEqual(@as(usize, 1), capture.clear_count);
+}
+
+test "unavailable terminal title accepts set and clear" {
+    unavailable_terminal_title.set("provider/model");
+    unavailable_terminal_title.clear();
+}
+
+test "native host capabilities expose process and URL support" {
+    const macos = nativeForOs(.macos);
+    try std.testing.expect(macos.process_control);
+    try std.testing.expect(macos.url_open);
+    try std.testing.expect(macos.native_url_open);
+    try std.testing.expectEqual(TerminalSupport.supported, macos.terminal);
+
+    const linux = nativeForOs(.linux);
+    try std.testing.expect(linux.process_control);
+    try std.testing.expect(linux.url_open);
+    try std.testing.expect(!linux.native_url_open);
+    try std.testing.expectEqual(TerminalSupport.supported, linux.terminal);
+
+    const windows = nativeForOs(.windows);
+    try std.testing.expect(!windows.process_control);
+    try std.testing.expect(!windows.url_open);
+    try std.testing.expect(!windows.native_url_open);
+    try std.testing.expectEqual(TerminalSupport.unsupported, windows.terminal);
+
+    const wasi = nativeForOs(.wasi);
+    try std.testing.expect(!wasi.process_control);
+    try std.testing.expect(!wasi.url_open);
+    try std.testing.expect(!wasi.native_url_open);
+    try std.testing.expectEqual(TerminalSupport.unsupported, wasi.terminal);
+
+    try std.testing.expectEqual(
+        TerminalSupport.unsupported,
+        terminalSupportForOs(.freebsd),
+    );
+}
+
+test "host boundary routes WebAssembly targets to WASM capabilities" {
+    const emscripten = capabilitiesForTarget(.wasm32, .emscripten);
+    try std.testing.expect(!emscripten.process_control);
+    try std.testing.expect(!emscripten.url_open);
+    try std.testing.expect(!emscripten.native_url_open);
+    try std.testing.expectEqual(TerminalSupport.unsupported, emscripten.terminal);
+
+    const wasi = capabilitiesForTarget(.wasm64, .wasi);
+    try std.testing.expect(!wasi.process_control);
+    try std.testing.expect(!wasi.url_open);
+    try std.testing.expect(!wasi.native_url_open);
+    try std.testing.expectEqual(TerminalSupport.unsupported, wasi.terminal);
+}
+
+test "unavailable URL opener keeps the manual fallback available" {
+    try std.testing.expect(!try unavailable_url_opener.open(
+        std.testing.allocator,
+        "https://example.test",
+    ));
+}
+
+test "unavailable secret store reports absence and refuses writes" {
+    try std.testing.expect(!unavailable_secret_store.isDisabled());
+    try std.testing.expect((try unavailable_secret_store.load(std.testing.allocator)) == null);
+    try std.testing.expectError(
+        error.StoredKeyWriteFailed,
+        unavailable_secret_store.store(std.testing.allocator, "secret"),
+    );
+    try std.testing.expect(!try unavailable_secret_store.storeInteractive());
+}
+
+test "unavailable clipboard rejects text and file references" {
+    try std.testing.expect(!try unavailable_clipboard.copy("text"));
+    try std.testing.expect(!try unavailable_clipboard.copy_file(std.testing.allocator, "/tmp/report.md"));
+}
+
+test "current host describes its operating system" {
+    const text = try operatingSystemText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(text.len > 0);
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        try std.testing.expectEqualStrings(@tagName(builtin.os.tag), text);
+    }
 }

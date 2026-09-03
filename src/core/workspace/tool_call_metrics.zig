@@ -12,10 +12,18 @@ pub const max_args_len: usize = 1200;
 pub const max_result_len: usize = 2000;
 pub const ring_capacity: usize = 64;
 
+pub const ToolCallOutcome = enum(u8) {
+    succeeded,
+    rejected,
+    command_failed,
+    tool_failed,
+    runtime_failed,
+};
+
 pub const ToolCallMetric = struct {
     started_at_ms: i64 = 0,
     duration_ms: u32 = 0,
-    ok: bool = true,
+    outcome: ToolCallOutcome = .succeeded,
     subagent_id: u64 = 0,
     name_buf: [max_name_len]u8 = [_]u8{0} ** max_name_len,
     name_len: u8 = 0,
@@ -82,7 +90,7 @@ pub const ToolCallRecord = struct {
     name: []const u8,
     arguments_json: []const u8,
     model_output: []const u8,
-    ok: bool,
+    outcome: ToolCallOutcome,
     started_at_ms: i64,
     subagent_id: u64 = 0,
 };
@@ -117,7 +125,7 @@ pub fn recordResult(input: ToolCallRecord) void {
     var metric: ToolCallMetric = .{
         .started_at_ms = input.started_at_ms,
         .duration_ms = @intCast(@min(@as(i64, elapsed), std.math.maxInt(u32))),
-        .ok = input.ok,
+        .outcome = input.outcome,
         .subagent_id = input.subagent_id,
     };
     metric.setName(input.name);
@@ -148,4 +156,65 @@ pub fn reset() void {
 
 pub fn resetForTest() void {
     reset();
+}
+
+test "tool call ring keeps last N records in chronological order" {
+    resetForTest();
+    defer resetForTest();
+
+    var i: u32 = 0;
+    while (i < ring_capacity + 3) : (i += 1) {
+        var call: ToolCallMetric = .{ .duration_ms = i };
+        call.setName("read_file");
+        call.setArgs("{}");
+        call.setResult("ok");
+        record(call);
+    }
+
+    var buf: [ring_capacity]ToolCallMetric = undefined;
+    const n = snapshot(&buf);
+    try std.testing.expectEqual(ring_capacity, n);
+    try std.testing.expectEqual(@as(u32, 3), buf[0].duration_ms);
+    try std.testing.expectEqual(@as(u32, ring_capacity + 3 - 1), buf[ring_capacity - 1].duration_ms);
+}
+
+test "args and result are truncated and total length tracked" {
+    resetForTest();
+    defer resetForTest();
+
+    const huge_len: usize = @as(usize, @max(max_args_len, max_result_len)) + 200;
+    var huge: [huge_len]u8 = undefined;
+    @memset(&huge, 'a');
+    var call: ToolCallMetric = .{};
+    call.setName("read_file");
+    call.setArgs(&huge);
+    call.setResult(&huge);
+    record(call);
+
+    var buf: [1]ToolCallMetric = undefined;
+    const n = snapshot(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u16, max_args_len), buf[0].args_len);
+    try std.testing.expectEqual(@as(u32, huge_len), buf[0].args_total_bytes);
+    try std.testing.expectEqual(@as(u16, max_result_len), buf[0].result_len);
+    try std.testing.expectEqual(@as(u32, huge_len), buf[0].result_total_bytes);
+}
+
+test "tool call outcome labels remain exact" {
+    const cases = [_]struct {
+        outcome: ToolCallOutcome,
+        label: []const u8,
+        success: bool,
+    }{
+        .{ .outcome = .succeeded, .label = "succeeded", .success = true },
+        .{ .outcome = .rejected, .label = "rejected", .success = false },
+        .{ .outcome = .command_failed, .label = "command_failed", .success = false },
+        .{ .outcome = .tool_failed, .label = "tool_failed", .success = false },
+        .{ .outcome = .runtime_failed, .label = "runtime_failed", .success = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.label, @tagName(case.outcome));
+        try std.testing.expectEqual(case.success, case.outcome == .succeeded);
+    }
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ToolCallOutcome.succeeded));
 }

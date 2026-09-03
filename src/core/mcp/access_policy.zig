@@ -224,3 +224,100 @@ pub fn authorize(captured: View, live: View, target: Target) Decision {
     }
     return .allow;
 }
+
+test "MCP view authorization intersects immutable and live authority" {
+    const alloc = std.testing.allocator;
+    var captured = View{
+        .runtime_generation = 7,
+        .owner_id = try alloc.dupe(u8, "session"),
+        .parent_id = try alloc.dupe(u8, "parent"),
+        .features_visible = true,
+        .servers = try alloc.alloc(ServerIdentity, 1),
+        .tools = try alloc.alloc(ToolIdentity, 1),
+    };
+    captured.servers[0] = .{
+        .name = try alloc.dupe(u8, "docs"),
+        .source = .profile,
+        .scope = .profile,
+        .connection_generation = 2,
+        .catalog_generation = 3,
+        .auth_generation = 4,
+    };
+    captured.tools[0] = .{
+        .name = try alloc.dupe(u8, "docs_search"),
+        .server_name = try alloc.dupe(u8, "docs"),
+    };
+    defer captured.deinit(alloc);
+    var live = try captured.clone(alloc);
+    defer live.deinit(alloc);
+
+    try std.testing.expectEqual(authorityGeneration(captured), authorityGeneration(live));
+    try std.testing.expectEqual(Decision.allow, authorize(captured, live, .{ .tool = "docs_search" }));
+    try std.testing.expectEqual(Decision.allow, authorize(captured, live, .{ .tool_server = "docs" }));
+    try std.testing.expectEqual(Decision.reject_tool, authorize(captured, live, .{ .tool = "other" }));
+
+    live.owner_id[0] = 'x';
+    try std.testing.expectEqual(Decision.reject_owner, authorize(captured, live, .{ .tool = "docs_search" }));
+    live.owner_id[0] = 's';
+    live.parent_id[0] = 'x';
+    try std.testing.expectEqual(Decision.reject_owner, authorize(captured, live, .{ .tool = "docs_search" }));
+    live.parent_id[0] = 'p';
+    live.runtime_generation += 1;
+    try std.testing.expectEqual(Decision.reject_runtime_generation, authorize(captured, live, .{ .tool = "docs_search" }));
+    live.runtime_generation -= 1;
+    live.features_visible = false;
+    try std.testing.expectEqual(Decision.reject_features, authorize(captured, live, .{ .feature_server = "docs" }));
+    live.features_visible = true;
+    live.servers[0].source = .acp;
+    try std.testing.expectEqual(Decision.reject_server, authorize(captured, live, .{ .feature_server = "docs" }));
+    live.servers[0].source = .profile;
+    live.servers[0].scope = .acp_session;
+    try std.testing.expectEqual(Decision.reject_server, authorize(captured, live, .{ .feature_server = "docs" }));
+    live.servers[0].scope = .profile;
+    live.servers[0].connection_generation += 1;
+    try std.testing.expectEqual(Decision.reject_server_generation, authorize(captured, live, .{ .tool = "docs_search" }));
+    live.servers[0].connection_generation -= 1;
+    live.servers[0].catalog_generation += 1;
+    try std.testing.expectEqual(Decision.reject_server_generation, authorize(captured, live, .{ .tool = "docs_search" }));
+    live.servers[0].catalog_generation -= 1;
+    live.servers[0].auth_generation += 1;
+    try std.testing.expect(authorityGeneration(captured) != authorityGeneration(live));
+    try std.testing.expectEqual(Decision.reject_server_generation, authorize(captured, live, .{ .feature_server = "docs" }));
+    live.servers[0].auth_generation -= 1;
+    live.tools[0].name[0] = 'x';
+    try std.testing.expectEqual(Decision.reject_tool, authorize(captured, live, .{ .tool = "docs_search" }));
+}
+
+test "MCP view clone cleans up every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkViewCloneAllocationFailures,
+        .{},
+    );
+}
+
+fn checkViewCloneAllocationFailures(alloc: Allocator) !void {
+    var source = View{
+        .runtime_generation = 7,
+        .owner_id = try std.testing.allocator.dupe(u8, "child"),
+        .parent_id = try std.testing.allocator.dupe(u8, "parent"),
+        .features_visible = true,
+        .servers = try std.testing.allocator.alloc(ServerIdentity, 1),
+        .tools = try std.testing.allocator.alloc(ToolIdentity, 1),
+    };
+    source.servers[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "server"),
+        .source = .profile,
+        .scope = .profile,
+        .connection_generation = 1,
+        .catalog_generation = 2,
+        .auth_generation = 3,
+    };
+    source.tools[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "mcp_server_tool"),
+        .server_name = try std.testing.allocator.dupe(u8, "server"),
+    };
+    defer source.deinit(std.testing.allocator);
+    var cloned = try source.clone(alloc);
+    defer cloned.deinit(alloc);
+}

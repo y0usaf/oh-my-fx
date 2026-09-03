@@ -17,7 +17,6 @@ pub const AuthorityPreparation = struct {
     actor: contracts.ActorRole,
     controls: contracts.AllowedControls,
     lifetime: contracts.TerminalLifetime,
-    repeated_probes: []const contracts.RepeatedProbeAuthority = &.{},
     direct_human_model_read_only: bool = false,
 };
 
@@ -35,10 +34,6 @@ pub const PreparedAuthority = struct {
         std.crypto.secureZero(
             u8,
             @volatileCast(self.persistence.proof.bytes[0..]),
-        );
-        free_repeated_probes(
-            self.alloc,
-            self.persistence.grant.repeated_probes,
         );
         free_principal(self.alloc, self.persistence.grant.principal);
         self.* = undefined;
@@ -124,7 +119,6 @@ fn construct_start_persistence(
             .actor = input.actor,
             .controls = input.controls,
             .generation = try contracts.AuthorityGeneration.init(1),
-            .repeated_probes = input.repeated_probes,
         },
         .proof = proof,
         .direct_human_model_read_only = input.direct_human_model_read_only,
@@ -135,10 +129,6 @@ fn construct_start_persistence(
     });
     const principal = try dupe_principal(alloc, borrowed.grant.principal);
     errdefer free_principal(alloc, principal);
-    const repeated_probes = try dupe_repeated_probes(
-        alloc,
-        borrowed.grant.repeated_probes,
-    );
     return .{
         .alloc = alloc,
         .persistence = .{
@@ -147,52 +137,11 @@ fn construct_start_persistence(
                 .actor = borrowed.grant.actor,
                 .controls = borrowed.grant.controls,
                 .generation = borrowed.grant.generation,
-                .repeated_probes = repeated_probes,
             },
             .proof = borrowed.proof,
             .direct_human_model_read_only = borrowed.direct_human_model_read_only,
         },
     };
-}
-
-fn dupe_repeated_probes(
-    alloc: Allocator,
-    probes: []const contracts.RepeatedProbeAuthority,
-) ![]contracts.RepeatedProbeAuthority {
-    const owned = try alloc.alloc(contracts.RepeatedProbeAuthority, probes.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (owned[0..initialized]) |probe| {
-            alloc.free(probe.cwd);
-            alloc.free(probe.command);
-        }
-        alloc.free(owned);
-    }
-    for (probes, 0..) |probe, index| {
-        try probe.validate();
-        const command = try alloc.dupe(u8, probe.command);
-        errdefer alloc.free(command);
-        owned[index] = .{
-            .command = command,
-            .cwd = try alloc.dupe(u8, probe.cwd),
-            .check_schedule = probe.check_schedule,
-            .notify_schedule = probe.notify_schedule,
-            .lifetime = probe.lifetime,
-        };
-        initialized += 1;
-    }
-    return owned;
-}
-
-fn free_repeated_probes(
-    alloc: Allocator,
-    probes: []const contracts.RepeatedProbeAuthority,
-) void {
-    for (probes) |probe| {
-        alloc.free(probe.cwd);
-        alloc.free(probe.command);
-    }
-    alloc.free(probes);
 }
 
 inline fn failOwnedAuthorityClaim(err: anytype) @TypeOf(err)!OwnedAuthorityClaim {
@@ -201,6 +150,18 @@ inline fn failOwnedAuthorityClaim(err: anytype) @TypeOf(err)!OwnedAuthorityClaim
 
 noinline fn failOwnedAuthorityClaimDynamic(err: anyerror) anyerror!OwnedAuthorityClaim {
     return err;
+}
+
+test "owned authority claim failures preserve exact error types and identities" {
+    const invalid = failOwnedAuthorityClaim(error.InvalidAuthorityGrant);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidAuthorityGrant}!OwnedAuthorityClaim,
+    );
+    try std.testing.expectError(error.InvalidAuthorityGrant, invalid);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failOwnedAuthorityClaim(error.OutOfMemory),
+    );
 }
 
 pub fn ownAuthorityClaim(
@@ -314,7 +275,6 @@ pub fn validate(request: contracts.ActionRequest) ValidationError!void {
         .screen => |value| try require_claim(value.authority),
         .write => |value| try require_claim(value.authority),
         .wait => |value| try require_claim(value.authority),
-        .monitor => |value| try require_claim(value.authority),
         .inspect => |value| try require_claim(value.authority),
         .list => |value| {
             const owner_authority = value.owner_authority orelse
@@ -339,7 +299,6 @@ pub fn claim(request: contracts.ActionRequest) ?contracts.AuthorityClaim {
         .screen => |value| value.authority,
         .write => |value| value.authority,
         .wait => |value| value.authority,
-        .monitor => |value| value.authority,
         .inspect => |value| value.authority,
         .list => null,
         .resize => |value| value.authority,
@@ -367,7 +326,6 @@ pub fn authoritySessionId(request: contracts.ActionRequest) ?[]const u8 {
         .screen => |value| value.session_id,
         .write => |value| value.session_id,
         .wait => |value| value.session_id,
-        .monitor => |value| value.session_id,
         .inspect => |value| value.session_id,
         .list => null,
         .resize => |value| value.session_id,
@@ -378,9 +336,8 @@ pub fn authoritySessionId(request: contracts.ActionRequest) ?[]const u8 {
 
 pub fn requiresOrderedMutation(request: contracts.ActionRequest) bool {
     return switch (request) {
-        .write, .monitor, .resize, .signal, .close => true,
-        .inspect => |inspect| inspect.acknowledge_event_id != null,
-        .start, .read, .screen, .wait, .list => false,
+        .write, .resize, .signal, .close => true,
+        .start, .read, .screen, .wait, .inspect, .list => false,
     };
 }
 
@@ -395,6 +352,40 @@ pub fn execute(
     return backend.executeAuthorized(request, cancelled);
 }
 
+test "private operation validation requires durable authority on every action" {
+    try std.testing.expectError(
+        error.MissingTerminalAuthority,
+        validate(.{ .screen = .{ .session_id = "terminal-1" } }),
+    );
+    try std.testing.expectError(
+        error.MissingTerminalAuthority,
+        validate(.{ .list = .{} }),
+    );
+    try std.testing.expectError(
+        error.MissingTerminalAuthority,
+        validate(.{ .start = .{ .cwd = "/workspace" } }),
+    );
+}
+
+test "terminal mutations that share session write ownership stay ordered" {
+    try std.testing.expect(requiresOrderedMutation(.{ .write = .{
+        .session_id = "terminal-1",
+        .payload = .{ .text = "input" },
+    } }));
+    try std.testing.expect(requiresOrderedMutation(.{ .close = .{
+        .session_id = "terminal-1",
+        .policy = .graceful,
+    } }));
+    try std.testing.expect(!requiresOrderedMutation(.{ .inspect = .{
+        .session_id = "terminal-1",
+    } }));
+    try std.testing.expect(!requiresOrderedMutation(.{ .wait = .{
+        .session_id = "terminal-1",
+        .return_when = .exit,
+        .safety_ceiling_ms = 1,
+    } }));
+}
+
 fn test_preparation() AuthorityPreparation {
     return .{
         .profile_user = "profile-user",
@@ -407,6 +398,42 @@ fn test_preparation() AuthorityPreparation {
         .controls = .full(),
         .lifetime = .session,
     };
+}
+
+test "production preparation mints canonical generation one authority" {
+    var prepared = try prepareStartPersistence(
+        std.testing.allocator,
+        test_preparation(),
+    );
+    defer prepared.deinit();
+    const persistence = prepared.view();
+    try persistence.validate(.{
+        .cwd = "/workspace/project",
+        .backend = .native,
+    });
+    try std.testing.expectEqual(@as(u64, 1), persistence.grant.generation.value);
+    try std.testing.expectEqual(contracts.TerminalLifetime.session, persistence.grant.principal.lifetime);
+    try persistence.proof.validate();
+}
+
+test "pure authority construction validates direct human policy" {
+    const proof = contracts.HolderProof{ .bytes = @splat(9) };
+    var input = test_preparation();
+    input.actor = .human;
+    input.direct_human_model_read_only = true;
+    var prepared = try construct_start_persistence(
+        std.testing.allocator,
+        input,
+        proof,
+    );
+    defer prepared.deinit();
+    try std.testing.expect(prepared.view().direct_human_model_read_only);
+
+    input.actor = .agent;
+    try std.testing.expectError(
+        error.InvalidStartPersistence,
+        construct_start_persistence(std.testing.allocator, input, proof),
+    );
 }
 
 fn check_preparation_allocation_failures(alloc: Allocator) !void {
@@ -428,4 +455,12 @@ fn check_preparation_allocation_failures(alloc: Allocator) !void {
         persistence.grant.controls,
     );
     defer owned_claim.deinit();
+}
+
+test "authority preparation and owned claims cover allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        check_preparation_allocation_failures,
+        .{},
+    );
 }

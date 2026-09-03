@@ -48,3 +48,29 @@ pub fn consume(checkpoint: ?*BuildCheckpoint, units: usize) !void {
 pub fn poll(checkpoint: ?*BuildCheckpoint) !void {
     if (checkpoint) |active| try active.poll();
 }
+
+test "checkpoint polls only when its quota is exhausted" {
+    const Probe = struct {
+        polls: usize = 0,
+
+        fn pending(context: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.polls += 1;
+            return false;
+        }
+    };
+
+    var probe = Probe{};
+    var checkpoint = BuildCheckpoint.init(&probe, Probe.pending);
+    try consume(&checkpoint, work_quota - 1);
+    try std.testing.expectEqual(@as(usize, 0), probe.polls);
+    try tick(&checkpoint);
+    try std.testing.expectEqual(@as(usize, 1), probe.polls);
+    try consume(&checkpoint, work_quota * 2 + 7);
+    try std.testing.expectEqual(@as(usize, 2), probe.polls);
+    try consume(&checkpoint, work_quota - 8);
+    try std.testing.expectEqual(@as(usize, 2), probe.polls);
+    try tick(&checkpoint);
+    try std.testing.expectEqual(@as(usize, 3), probe.polls);
+    try consume(null, work_quota);
+}

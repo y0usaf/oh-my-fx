@@ -53,6 +53,13 @@ pub fn freeDiffEntryPayload(alloc: Allocator, payload: DiffEntryPayload) void {
     if (payload.full) |full| full.deinit(alloc);
 }
 
+test "diff entry payload has one canonical preview" {
+    try std.testing.expect(@hasField(DiffEntryPayload, "preview"));
+    try std.testing.expect(!@hasField(DiffEntryPayload, "quiet"));
+    try std.testing.expect(!@hasField(DiffEntryPayload, "normal"));
+    try std.testing.expect(!@hasField(DiffEntryPayload, "active"));
+}
+
 pub fn wrapWithMarkers(alloc: Allocator, id: u32, content: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -1794,4 +1801,979 @@ fn appendTrailingNewlineMarker(
     } else {
         try new_lines.append(alloc, trailing_newline_added_marker);
     }
+}
+
+test "compute: identical inputs produce only equal ops" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nb\nc\n", "a\nb\nc\n");
+    defer alloc.free(diff);
+
+    try std.testing.expectEqual(@as(usize, 3), diff.len);
+    for (diff) |line| {
+        try std.testing.expectEqual(LineOp.equal, line.op);
+    }
+    try std.testing.expectEqual(Stats{}, countStats(diff));
+}
+
+test "compute: pure insert in the middle" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nb\n", "a\nX\nb\n");
+    defer alloc.free(diff);
+
+    try std.testing.expectEqual(@as(usize, 3), diff.len);
+    try std.testing.expectEqual(LineOp.equal, diff[0].op);
+    try std.testing.expectEqual(LineOp.add, diff[1].op);
+    try std.testing.expectEqualStrings("X", diff[1].text);
+    try std.testing.expectEqual(@as(?u32, null), diff[1].old_num);
+    try std.testing.expectEqual(@as(?u32, 2), diff[1].new_num);
+    try std.testing.expectEqual(LineOp.equal, diff[2].op);
+    try std.testing.expectEqual(Stats{ .additions = 1 }, countStats(diff));
+}
+
+test "compute: pure delete" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nb\nc\n", "a\nc\n");
+    defer alloc.free(diff);
+
+    try std.testing.expectEqual(@as(usize, 3), diff.len);
+    try std.testing.expectEqual(LineOp.remove, diff[1].op);
+    try std.testing.expectEqualStrings("b", diff[1].text);
+    try std.testing.expectEqual(@as(?u32, 2), diff[1].old_num);
+    try std.testing.expectEqual(@as(?u32, null), diff[1].new_num);
+    try std.testing.expectEqual(Stats{ .deletions = 1 }, countStats(diff));
+}
+
+test "compute: replace single line" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nold\nc\n", "a\nnew\nc\n");
+    defer alloc.free(diff);
+
+    try std.testing.expectEqual(@as(usize, 4), diff.len);
+    try std.testing.expectEqual(LineOp.remove, diff[1].op);
+    try std.testing.expectEqualStrings("old", diff[1].text);
+    try std.testing.expectEqual(LineOp.add, diff[2].op);
+    try std.testing.expectEqualStrings("new", diff[2].text);
+    try std.testing.expectEqual(Stats{ .additions = 1, .deletions = 1 }, countStats(diff));
+}
+
+test "compute: trailing-newline-only changes are visible" {
+    const alloc = std.testing.allocator;
+
+    const removed = try compute(alloc, "a\n", "a");
+    defer alloc.free(removed);
+    try std.testing.expectEqual(Stats{ .deletions = 1 }, countStats(removed));
+    try std.testing.expectEqual(LineOp.remove, removed[1].op);
+    try std.testing.expectEqualStrings(trailing_newline_removed_marker, removed[1].text);
+
+    const added = try compute(alloc, "a", "a\n");
+    defer alloc.free(added);
+    try std.testing.expectEqual(Stats{ .additions = 1 }, countStats(added));
+    try std.testing.expectEqual(LineOp.add, added[1].op);
+    try std.testing.expectEqualStrings(trailing_newline_added_marker, added[1].text);
+}
+
+test "compute: empty old (new-file creation)" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "", "first\nsecond\n");
+    defer alloc.free(diff);
+
+    try std.testing.expectEqual(@as(usize, 2), diff.len);
+    try std.testing.expectEqual(LineOp.add, diff[0].op);
+    try std.testing.expectEqual(@as(?u32, 1), diff[0].new_num);
+    try std.testing.expectEqual(LineOp.add, diff[1].op);
+    try std.testing.expectEqual(@as(?u32, 2), diff[1].new_num);
+    try std.testing.expectEqual(Stats{ .additions = 2 }, countStats(diff));
+}
+
+test "compute: line numbers increment monotonically" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nb\nc\n", "a\nX\nb\nc\n");
+    defer alloc.free(diff);
+
+    try std.testing.expectEqual(@as(usize, 4), diff.len);
+    try std.testing.expectEqual(@as(?u32, 1), diff[0].old_num);
+    try std.testing.expectEqual(@as(?u32, 1), diff[0].new_num);
+    try std.testing.expectEqual(@as(?u32, null), diff[1].old_num);
+    try std.testing.expectEqual(@as(?u32, 2), diff[1].new_num);
+    try std.testing.expectEqual(@as(?u32, 2), diff[2].old_num);
+    try std.testing.expectEqual(@as(?u32, 3), diff[2].new_num);
+    try std.testing.expectEqual(@as(?u32, 3), diff[3].old_num);
+    try std.testing.expectEqual(@as(?u32, 4), diff[3].new_num);
+}
+
+test "formatUnified: rows contain signs for changed lines" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nold\nc\n", "a\nnew\nc\n");
+    defer alloc.free(diff);
+    const out = try formatUnified(alloc, diff, .{}, null, .edited);
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.find(u8, out, "+ new") != null);
+    try std.testing.expect(std.mem.find(u8, out, "- old") != null);
+}
+
+test "formatUnified: marker accent colors only the number and sign" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nold\nc\n", "a\nnew\nc\n");
+    defer alloc.free(diff);
+    const styles: FormatStyles = .{
+        .added_marker_fg = "[G]",
+        .removed_marker_fg = "[R]",
+    };
+    const out = try formatUnified(alloc, diff, styles, null, .edited);
+    defer alloc.free(out);
+
+    // The accent wraps the number and sign, then the line color is reasserted
+    // before the text, so the text stays neutral.
+    try std.testing.expect(std.mem.find(u8, out, "[G]2 +") != null);
+    try std.testing.expect(std.mem.find(u8, out, "[R]2 -") != null);
+    try std.testing.expect(std.mem.find(u8, out, "+\x1b[38;5;252m new") != null);
+    try std.testing.expect(std.mem.find(u8, out, "-\x1b[38;5;252m old") != null);
+    // The text is never inside the accent run.
+    try std.testing.expect(std.mem.find(u8, out, "[G]2 + new") == null);
+}
+
+test "formatUnified: trailing-newline-only edits render markers" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\n", "a");
+    defer alloc.free(diff);
+    const out = try formatUnified(alloc, diff, .{}, "file.txt", .edited);
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.find(u8, out, "- (trailing newline removed)") != null);
+}
+
+test "formatUnified: gutter width fits largest line number" {
+    const alloc = std.testing.allocator;
+    var old_buf: std.ArrayList(u8) = .empty;
+    defer old_buf.deinit(alloc);
+    var new_buf: std.ArrayList(u8) = .empty;
+    defer new_buf.deinit(alloc);
+
+    var index: u32 = 1;
+    while (index <= 12) : (index += 1) {
+        const line = try std.fmt.allocPrint(alloc, "line{d}\n", .{index});
+        defer alloc.free(line);
+        try old_buf.appendSlice(alloc, line);
+        try new_buf.appendSlice(alloc, line);
+    }
+    try new_buf.appendSlice(alloc, "extra\n");
+
+    const diff = try compute(alloc, old_buf.items, new_buf.items);
+    defer alloc.free(diff);
+    const out = try formatUnified(alloc, diff, .{}, null, .edited);
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.find(u8, out, "13 + extra") != null);
+}
+
+test "formatUnified: only emits changed hunks with limited context" {
+    const alloc = std.testing.allocator;
+    var old_buf: std.ArrayList(u8) = .empty;
+    defer old_buf.deinit(alloc);
+    var new_buf: std.ArrayList(u8) = .empty;
+    defer new_buf.deinit(alloc);
+
+    var index: u32 = 1;
+    while (index <= 20) : (index += 1) {
+        const old_line = if (index == 10) "old-line-10\n" else "same\n";
+        const new_line = if (index == 10) "new-line-10\n" else "same\n";
+        try old_buf.appendSlice(alloc, old_line);
+        try new_buf.appendSlice(alloc, new_line);
+    }
+
+    const diff = try compute(alloc, old_buf.items, new_buf.items);
+    defer alloc.free(diff);
+    const out = try formatUnified(alloc, diff, .{}, null, .edited);
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.find(u8, out, "+ new-line-10") != null);
+    try std.testing.expect(std.mem.find(u8, out, "- old-line-10") != null);
+    try std.testing.expect(std.mem.find(u8, out, " 1   same") == null);
+    try std.testing.expect(std.mem.find(u8, out, "20   same") == null);
+}
+
+test "formatUnified: single line-number column" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nold\nc\n", "a\nnew\nc\n");
+    defer alloc.free(diff);
+    const out = try formatUnified(alloc, diff, .{}, null, .edited);
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.find(u8, out, "1 1 ") == null);
+}
+
+test "freeDiffEntryPayload releases all owned buffers" {
+    const alloc = std.testing.allocator;
+    freeDiffEntryPayload(alloc, .{
+        .preview = try alloc.dupe(u8, "preview"),
+        .full = .{
+            .content = try alloc.dupe(u8, "full"),
+            .lifecycle_id = .{
+                .turn_id = 1,
+                .call_id = try alloc.dupe(u8, "call"),
+            },
+        },
+    });
+}
+
+test "formatUnified: emits diff lines without header" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nold\nc\n", "a\nnew\nc\n");
+    defer alloc.free(diff);
+    const out = try formatUnified(alloc, diff, .{}, "src/app/page.tsx", .added);
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.find(u8, out, "+ new") != null);
+    try std.testing.expect(std.mem.find(u8, out, "- old") != null);
+}
+
+test "formatUnified: separated hunks emit vertical elision row" {
+    const alloc = std.testing.allocator;
+    var old_buf: std.ArrayList(u8) = .empty;
+    defer old_buf.deinit(alloc);
+    var new_buf: std.ArrayList(u8) = .empty;
+    defer new_buf.deinit(alloc);
+
+    var index: u32 = 1;
+    while (index <= 16) : (index += 1) {
+        const old_line = if (index == 3)
+            "old-line-3\n"
+        else if (index == 14)
+            "old-line-14\n"
+        else
+            "same\n";
+        const new_line = if (index == 3)
+            "new-line-3\n"
+        else if (index == 14)
+            "new-line-14\n"
+        else
+            "same\n";
+        try old_buf.appendSlice(alloc, old_line);
+        try new_buf.appendSlice(alloc, new_line);
+    }
+
+    const diff = try compute(alloc, old_buf.items, new_buf.items);
+    defer alloc.free(diff);
+    const out = try formatUnified(alloc, diff, .{}, null, .edited);
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.find(u8, out, "\xe2\x8b\xaf") != null);
+    try std.testing.expect(std.mem.find(u8, out, "+ new-line-3") != null);
+}
+
+test "persisted edit emits one canonical preview without a full snapshot" {
+    const alloc = std.testing.allocator;
+    const lines = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .addition, .new_line = 1, .text = "changed" },
+    };
+    const payload = try formatPersistedFileChangePayload(
+        alloc,
+        .{
+            .path = "existing.md",
+            .kind = .edited,
+            .lines = &lines,
+            .additions = 1,
+            .deletions = 0,
+            .truncated = false,
+        },
+        .{},
+    );
+    defer freeDiffEntryPayload(alloc, payload);
+
+    try std.testing.expect(std.mem.find(u8, payload.preview, "changed") != null);
+    try std.testing.expectEqual(@as(u32, 1), payload.additions);
+    try std.testing.expectEqual(@as(u32, 0), payload.deletions);
+    try std.testing.expect(payload.full == null);
+}
+
+test "wrapWithMarkers surrounds content with start/end OSC markers" {
+    const alloc = std.testing.allocator;
+    const out = try wrapWithMarkers(alloc, 7, "hello\n");
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings("\x1b]9050;7\x07hello\n\x1b]9051;7\x07", out);
+}
+
+test "DiffEntry.deinit releases owned full detail" {
+    const alloc = std.testing.allocator;
+    var entry = DiffEntry{
+        .id = 1,
+        .full = .{
+            .content = try alloc.dupe(u8, "full"),
+            .lifecycle_id = .{
+                .turn_id = 1,
+                .call_id = try alloc.dupe(u8, "call"),
+            },
+        },
+    };
+
+    entry.deinit(alloc);
+}
+
+test "buildBoundedPreview preserves admitted compute ordering and line numbers" {
+    const cases = [_]struct {
+        old_text: []const u8,
+        new_text: []const u8,
+    }{
+        .{
+            .old_text = "a\nb\na\n",
+            .new_text = "a\na\nb\n",
+        },
+        .{
+            .old_text = "line\n",
+            .new_text = "line",
+        },
+    };
+
+    for (cases) |case| {
+        const full_diff = try compute(std.testing.allocator, case.old_text, case.new_text);
+        defer std.testing.allocator.free(full_diff);
+        var preview = try buildBoundedPreview(
+            std.testing.allocator,
+            case.old_text,
+            case.new_text,
+            .{},
+        );
+        defer preview.deinit(std.testing.allocator);
+
+        const stats = countStats(full_diff);
+        try std.testing.expectEqual(@as(usize, stats.additions), preview.additions);
+        try std.testing.expectEqual(@as(usize, stats.deletions), preview.deletions);
+
+        var projected_index: usize = 0;
+        for (full_diff) |line| {
+            if (line.op == .equal) continue;
+            while (preview.lines[projected_index].op == .context) {
+                projected_index += 1;
+            }
+            const projected = preview.lines[projected_index];
+            try std.testing.expectEqual(
+                switch (line.op) {
+                    .equal => unreachable,
+                    .add => PreviewOp.addition,
+                    .remove => PreviewOp.deletion,
+                },
+                projected.op,
+            );
+            try std.testing.expectEqual(line.old_num, projected.old_line);
+            try std.testing.expectEqual(line.new_num, projected.new_line);
+            try std.testing.expectEqualStrings(line.text, projected.text);
+            projected_index += 1;
+        }
+        while (projected_index < preview.lines.len) : (projected_index += 1) {
+            try std.testing.expectEqual(
+                PreviewOp.context,
+                preview.lines[projected_index].op,
+            );
+        }
+    }
+}
+
+test "buildBoundedPreview includes symmetric context for one exact hunk" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "alpha\nbefore\nomega\n",
+        "alpha\nafter\nomega\n",
+        .{},
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), preview.lines.len);
+    try std.testing.expectEqual(PreviewOp.context, preview.lines[0].op);
+    try std.testing.expectEqual(@as(?u32, 1), preview.lines[0].old_line);
+    try std.testing.expectEqual(@as(?u32, 1), preview.lines[0].new_line);
+    try std.testing.expectEqualStrings("alpha", preview.lines[0].text);
+    try std.testing.expectEqual(PreviewOp.deletion, preview.lines[1].op);
+    try std.testing.expectEqualStrings("before", preview.lines[1].text);
+    try std.testing.expectEqual(PreviewOp.addition, preview.lines[2].op);
+    try std.testing.expectEqualStrings("after", preview.lines[2].text);
+    try std.testing.expectEqual(PreviewOp.context, preview.lines[3].op);
+    try std.testing.expectEqual(@as(?u32, 3), preview.lines[3].old_line);
+    try std.testing.expectEqual(@as(?u32, 3), preview.lines[3].new_line);
+    try std.testing.expectEqualStrings("omega", preview.lines[3].text);
+    try std.testing.expect(!preview.truncated);
+}
+
+test "buildBoundedPreview includes one exact context only at a file boundary" {
+    const cases = [_]struct {
+        old_text: []const u8,
+        new_text: []const u8,
+        context_index: usize,
+        context_text: []const u8,
+    }{
+        .{
+            .old_text = "before\nomega\n",
+            .new_text = "after\nomega\n",
+            .context_index = 2,
+            .context_text = "omega",
+        },
+        .{
+            .old_text = "alpha\nbefore\n",
+            .new_text = "alpha\nafter\n",
+            .context_index = 0,
+            .context_text = "alpha",
+        },
+    };
+    for (cases) |case| {
+        var preview = try buildBoundedPreview(
+            std.testing.allocator,
+            case.old_text,
+            case.new_text,
+            .{},
+        );
+        defer preview.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 3), preview.lines.len);
+        try std.testing.expectEqual(
+            PreviewOp.context,
+            preview.lines[case.context_index].op,
+        );
+        try std.testing.expectEqualStrings(
+            case.context_text,
+            preview.lines[case.context_index].text,
+        );
+    }
+}
+
+test "buildBoundedPreview leaves a lone interior context slot unused" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "alpha\nbefore\nomega\n",
+        "alpha\nafter\nomega\n",
+        .{ .max_lines = 3 },
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), preview.lines.len);
+    for (preview.lines) |line| {
+        try std.testing.expect(line.op != .context);
+    }
+}
+
+test "buildBoundedPreview does not synthesize context for multiple hunks" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "alpha\nbefore\nmiddle\nold\nomega\n",
+        "alpha\nafter\nmiddle\nnew\nomega\n",
+        .{},
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), preview.lines.len);
+    for (preview.lines) |line| {
+        try std.testing.expect(line.op != .context);
+    }
+}
+
+test "buildBoundedPreview bounds selected rows with explicit elision" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "a\nb\nc\nd\ne\n",
+        "v\nw\nx\ny\nz\n",
+        .{},
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), preview.additions);
+    try std.testing.expectEqual(@as(usize, 5), preview.deletions);
+    try std.testing.expectEqual(@as(usize, 6), preview.lines.len);
+    try std.testing.expect(preview.truncated);
+
+    var elisions: usize = 0;
+    for (preview.lines) |line| {
+        if (line.op == .elision) elisions += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), elisions);
+    for (preview.lines) |line| {
+        if (line.op != .elision) continue;
+        var retained_additions: usize = 0;
+        var retained_deletions: usize = 0;
+        for (preview.lines) |retained| {
+            retained_additions += @intFromBool(retained.op == .addition);
+            retained_deletions += @intFromBool(retained.op == .deletion);
+        }
+        const expected = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "⋯ +{d} -{d} omitted",
+            .{
+                preview.additions - retained_additions,
+                preview.deletions - retained_deletions,
+            },
+        );
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, line.text);
+    }
+}
+
+test "file review exposes every changed line beyond the bounded preview cap" {
+    const alloc = std.testing.allocator;
+    var after: std.ArrayList(u8) = .empty;
+    defer after.deinit(alloc);
+
+    for (1..31) |line_number| {
+        var line: [32]u8 = undefined;
+        try after.appendSlice(
+            alloc,
+            try std.fmt.bufPrint(&line, "line {d}\n", .{line_number}),
+        );
+    }
+
+    var review = try FileReview.init(alloc, "", after.items);
+    defer review.deinit(alloc);
+
+    var viewport = try review.viewport(alloc, 24, 6);
+    defer viewport.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 30), review.rowCount());
+    try std.testing.expectEqual(@as(usize, 6), viewport.lines.len);
+    try std.testing.expectEqual(@as(?u32, 25), viewport.lines[0].new_line);
+    try std.testing.expectEqualStrings("line 25", viewport.lines[0].text);
+    try std.testing.expectEqual(@as(?u32, 30), viewport.lines[5].new_line);
+    try std.testing.expectEqualStrings("line 30", viewport.lines[5].text);
+}
+
+test "fallback file review seeks to replacement boundaries" {
+    const alloc = std.testing.allocator;
+    var before: std.ArrayList(u8) = .empty;
+    defer before.deinit(alloc);
+    var after: std.ArrayList(u8) = .empty;
+    defer after.deinit(alloc);
+
+    for (1..2049) |line_number| {
+        var line: [32]u8 = undefined;
+        try before.appendSlice(
+            alloc,
+            try std.fmt.bufPrint(&line, "old-{d:0>4}\n", .{line_number}),
+        );
+        try after.appendSlice(
+            alloc,
+            try std.fmt.bufPrint(&line, "new-{d:0>4}\n", .{line_number}),
+        );
+    }
+
+    var review = try FileReview.init(alloc, before.items, after.items);
+    defer review.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4096), review.rowCount());
+
+    var middle = try review.viewport(alloc, 2047, 2);
+    defer middle.deinit(alloc);
+    try std.testing.expectEqual(PreviewOp.deletion, middle.lines[0].op);
+    try std.testing.expectEqualStrings("old-2048", middle.lines[0].text);
+    try std.testing.expectEqual(PreviewOp.addition, middle.lines[1].op);
+    try std.testing.expectEqualStrings("new-0001", middle.lines[1].text);
+
+    var tail = try review.viewport(alloc, review.rowCount() - 2, 2);
+    defer tail.deinit(alloc);
+    try std.testing.expectEqualStrings("new-2047", tail.lines[0].text);
+    try std.testing.expectEqualStrings("new-2048", tail.lines[1].text);
+}
+
+test "file review projects five context lines and exact computed elisions" {
+    const alloc = std.testing.allocator;
+    const before =
+        "lead-01\nlead-02\nlead-03\nlead-04\nlead-05\nlead-06\nlead-07\nlead-08\n" ++
+        "old-one\n" ++
+        "middle-01\nmiddle-02\nmiddle-03\nmiddle-04\nmiddle-05\nmiddle-06\n" ++
+        "middle-07\nmiddle-08\nmiddle-09\nmiddle-10\nmiddle-11\nmiddle-12\n" ++
+        "old-two\n" ++
+        "tail-01\ntail-02\ntail-03\ntail-04\ntail-05\ntail-06\ntail-07\ntail-08\n";
+    const after =
+        "lead-01\nlead-02\nlead-03\nlead-04\nlead-05\nlead-06\nlead-07\nlead-08\n" ++
+        "new-one\n" ++
+        "middle-01\nmiddle-02\nmiddle-03\nmiddle-04\nmiddle-05\nmiddle-06\n" ++
+        "middle-07\nmiddle-08\nmiddle-09\nmiddle-10\nmiddle-11\nmiddle-12\n" ++
+        "new-two\n" ++
+        "tail-01\ntail-02\ntail-03\ntail-04\ntail-05\ntail-06\ntail-07\ntail-08\n";
+
+    var review = try FileReview.init(alloc, before, after);
+    defer review.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 27), review.rowCount());
+
+    var rows = try review.viewport(alloc, 0, review.rowCount());
+    defer rows.deinit(alloc);
+    try std.testing.expect(@hasField(ReviewLine, "elision_count"));
+    try std.testing.expectEqual(PreviewOp.elision, rows.lines[0].op);
+    if (comptime @hasField(ReviewLine, "elision_count")) {
+        try std.testing.expectEqual(@as(usize, 3), @field(rows.lines[0], "elision_count"));
+    }
+    try std.testing.expectEqualStrings("", rows.lines[0].text);
+
+    for (0..5) |index| {
+        const line = rows.lines[index + 1];
+        try std.testing.expectEqual(PreviewOp.context, line.op);
+        try std.testing.expectEqual(@as(?u32, @intCast(index + 4)), line.old_line);
+        try std.testing.expectEqual(@as(?u32, @intCast(index + 4)), line.new_line);
+    }
+    try std.testing.expectEqualStrings("lead-04", rows.lines[1].text);
+    try std.testing.expectEqualStrings("lead-08", rows.lines[5].text);
+    try std.testing.expectEqual(PreviewOp.deletion, rows.lines[6].op);
+    try std.testing.expectEqualStrings("old-one", rows.lines[6].text);
+    try std.testing.expectEqual(PreviewOp.addition, rows.lines[7].op);
+    try std.testing.expectEqualStrings("new-one", rows.lines[7].text);
+
+    try std.testing.expectEqualStrings("middle-01", rows.lines[8].text);
+    try std.testing.expectEqualStrings("middle-05", rows.lines[12].text);
+    try std.testing.expectEqual(PreviewOp.elision, rows.lines[13].op);
+    if (comptime @hasField(ReviewLine, "elision_count")) {
+        try std.testing.expectEqual(@as(usize, 2), @field(rows.lines[13], "elision_count"));
+    }
+    try std.testing.expectEqualStrings("middle-08", rows.lines[14].text);
+    try std.testing.expectEqualStrings("middle-12", rows.lines[18].text);
+    try std.testing.expectEqualStrings("tail-01", rows.lines[21].text);
+    try std.testing.expectEqualStrings("tail-05", rows.lines[25].text);
+    try std.testing.expectEqual(PreviewOp.elision, rows.lines[26].op);
+    if (comptime @hasField(ReviewLine, "elision_count")) {
+        try std.testing.expectEqual(@as(usize, 3), @field(rows.lines[26], "elision_count"));
+    }
+}
+
+test "file review projects only proven fallback context with exact elisions" {
+    const alloc = std.testing.allocator;
+    var before: std.ArrayList(u8) = .empty;
+    defer before.deinit(alloc);
+    var after: std.ArrayList(u8) = .empty;
+    defer after.deinit(alloc);
+
+    for (1..1001) |line_number| {
+        var line: [16]u8 = undefined;
+        const formatted = try std.fmt.bufPrint(&line, "line-{d:0>4}\n", .{line_number});
+        try before.appendSlice(alloc, formatted);
+        try after.appendSlice(alloc, formatted);
+        if (line_number == 500) {
+            try after.appendSlice(alloc, "inserted-context-a\ninserted-context-b\n");
+        }
+    }
+
+    var review = try FileReview.init(alloc, before.items, after.items);
+    defer review.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 14), review.rowCount());
+
+    var rows = try review.viewport(alloc, 0, review.rowCount());
+    defer rows.deinit(alloc);
+    try std.testing.expect(@hasField(ReviewLine, "elision_count"));
+    try std.testing.expectEqual(PreviewOp.elision, rows.lines[0].op);
+    if (comptime @hasField(ReviewLine, "elision_count")) {
+        try std.testing.expectEqual(@as(usize, 495), @field(rows.lines[0], "elision_count"));
+    }
+    try std.testing.expectEqualStrings("line-0496", rows.lines[1].text);
+    try std.testing.expectEqualStrings("line-0500", rows.lines[5].text);
+    try std.testing.expectEqual(PreviewOp.addition, rows.lines[6].op);
+    try std.testing.expectEqual(@as(?u32, 501), rows.lines[6].new_line);
+    try std.testing.expectEqualStrings("inserted-context-a", rows.lines[6].text);
+    try std.testing.expectEqual(PreviewOp.addition, rows.lines[7].op);
+    try std.testing.expectEqual(@as(?u32, 502), rows.lines[7].new_line);
+    try std.testing.expectEqualStrings("inserted-context-b", rows.lines[7].text);
+    try std.testing.expectEqualStrings("line-0501", rows.lines[8].text);
+    try std.testing.expectEqual(@as(?u32, 501), rows.lines[8].old_line);
+    try std.testing.expectEqual(@as(?u32, 503), rows.lines[8].new_line);
+    try std.testing.expectEqualStrings("line-0505", rows.lines[12].text);
+    try std.testing.expectEqual(PreviewOp.elision, rows.lines[13].op);
+    if (comptime @hasField(ReviewLine, "elision_count")) {
+        try std.testing.expectEqual(@as(usize, 495), @field(rows.lines[13], "elision_count"));
+    }
+}
+
+test "file review preserves replacements and trailing-newline markers" {
+    const alloc = std.testing.allocator;
+
+    var replacement = try FileReview.init(alloc, "old\n", "new\n");
+    defer replacement.deinit(alloc);
+    var replacement_rows = try replacement.viewport(alloc, 0, replacement.rowCount());
+    defer replacement_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), replacement_rows.lines.len);
+    try std.testing.expectEqual(PreviewOp.deletion, replacement_rows.lines[0].op);
+    try std.testing.expectEqualStrings("old", replacement_rows.lines[0].text);
+    try std.testing.expectEqual(PreviewOp.addition, replacement_rows.lines[1].op);
+    try std.testing.expectEqualStrings("new", replacement_rows.lines[1].text);
+
+    var newline_change = try FileReview.init(alloc, "a\n", "a");
+    defer newline_change.deinit(alloc);
+    var newline_rows = try newline_change.viewport(alloc, 0, newline_change.rowCount());
+    defer newline_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), newline_rows.lines.len);
+    try std.testing.expectEqual(PreviewOp.context, newline_rows.lines[0].op);
+    try std.testing.expectEqualStrings("a", newline_rows.lines[0].text);
+    try std.testing.expectEqual(PreviewOp.deletion, newline_rows.lines[1].op);
+    try std.testing.expectEqualStrings(
+        trailing_newline_removed_marker,
+        newline_rows.lines[1].text,
+    );
+}
+
+test "buildBoundedPreview elision reports one-sided omitted polarity" {
+    const cases = [_]struct {
+        old_text: []const u8,
+        new_text: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .old_text = "",
+            .new_text = "1\n2\n3\n4\n5\n6\n7\n",
+            .expected = "⋯ +2 omitted",
+        },
+        .{
+            .old_text = "1\n2\n3\n4\n5\n6\n7\n",
+            .new_text = "",
+            .expected = "⋯ -2 omitted",
+        },
+    };
+    for (cases) |case| {
+        var preview = try buildBoundedPreview(
+            std.testing.allocator,
+            case.old_text,
+            case.new_text,
+            .{},
+        );
+        defer preview.deinit(std.testing.allocator);
+
+        var found = false;
+        for (preview.lines) |line| {
+            if (line.op != .elision) continue;
+            found = true;
+            try std.testing.expectEqualStrings(case.expected, line.text);
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "buildBoundedPreview rejects LCS matrix amplification from one-byte lines" {
+    const alloc = std.testing.allocator;
+    const line_count = 1001;
+    var old_text = try std.ArrayList(u8).initCapacity(alloc, line_count * 2);
+    defer old_text.deinit(alloc);
+    var new_text = try std.ArrayList(u8).initCapacity(alloc, line_count * 2);
+    defer new_text.deinit(alloc);
+
+    for (0..line_count) |_| {
+        try old_text.appendSlice(alloc, "a\n");
+        try new_text.appendSlice(alloc, "b\n");
+    }
+
+    var preview = try buildBoundedPreview(alloc, old_text.items, new_text.items, .{});
+    defer preview.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, line_count), preview.additions);
+    try std.testing.expectEqual(@as(usize, line_count), preview.deletions);
+}
+
+test "buildBoundedPreview streams fallback without materializing changed middle" {
+    const alloc = std.testing.allocator;
+    const line_count = 20_000;
+    var old_text = try std.ArrayList(u8).initCapacity(alloc, line_count * 2);
+    defer old_text.deinit(alloc);
+    var new_text = try std.ArrayList(u8).initCapacity(alloc, line_count * 2);
+    defer new_text.deinit(alloc);
+
+    for (0..line_count) |_| {
+        try old_text.appendSlice(alloc, "a\n");
+        try new_text.appendSlice(alloc, "b\n");
+    }
+
+    var preview = try buildBoundedPreview(
+        alloc,
+        old_text.items,
+        new_text.items,
+        .{},
+    );
+    defer preview.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, line_count), preview.additions);
+    try std.testing.expectEqual(@as(usize, line_count), preview.deletions);
+    try std.testing.expect(preview.lines.len <= 6);
+    try std.testing.expect(preview.truncated);
+}
+
+test "buildBoundedPreview fallback retains exact common prefix and suffix counts" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "same\nold-a\nold-b\nlast\n",
+        "same\nnew-a\nlast\n",
+        .{ .max_matrix_cells = 1 },
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), preview.additions);
+    try std.testing.expectEqual(@as(usize, 2), preview.deletions);
+    try std.testing.expectEqual(@as(usize, 3), preview.lines.len);
+    try std.testing.expectEqualStrings("old-a", preview.lines[0].text);
+    try std.testing.expectEqualStrings("old-b", preview.lines[1].text);
+    try std.testing.expectEqualStrings("new-a", preview.lines[2].text);
+    for (preview.lines) |line| {
+        try std.testing.expect(line.op != .context);
+    }
+}
+
+test "buildBoundedPreview fallback keeps informative elision without context" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "same\n1\n2\n3\n4\n5\n6\nlast\n",
+        "same\na\nb\nc\nd\ne\nf\nlast\n",
+        .{ .max_matrix_cells = 1 },
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    var elision_count: usize = 0;
+    for (preview.lines) |line| {
+        try std.testing.expect(line.op != .context);
+        if (line.op == .elision) {
+            elision_count += 1;
+            try std.testing.expect(std.mem.find(u8, line.text, "omitted") != null);
+            try std.testing.expect(std.mem.find(u8, line.text, "+") != null);
+            try std.testing.expect(std.mem.find(u8, line.text, "-") != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), elision_count);
+}
+
+test "buildBoundedPreview fallback never treats an aligned middle as context" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "start\nold-a\nmiddle\nold-b\nend\n",
+        "start\nnew-a\nmiddle\nnew-b\nend\n",
+        .{ .max_matrix_cells = 1 },
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    for (preview.lines) |line| {
+        try std.testing.expect(line.op != .context);
+    }
+    try std.testing.expectEqual(@as(usize, 3), preview.deletions);
+    try std.testing.expectEqual(@as(usize, 3), preview.additions);
+}
+
+test "buildBoundedPreview preserves trailing-newline markers with boundary context" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "alpha\nbeta\n",
+        "alpha\nbeta",
+        .{},
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), preview.lines.len);
+    try std.testing.expectEqual(PreviewOp.context, preview.lines[0].op);
+    try std.testing.expectEqualStrings("beta", preview.lines[0].text);
+    try std.testing.expectEqual(PreviewOp.deletion, preview.lines[1].op);
+    try std.testing.expectEqualStrings(
+        trailing_newline_removed_marker,
+        preview.lines[1].text,
+    );
+}
+
+test "buildBoundedPreview bounds rows and escapes terminal controls" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "",
+        "\x1b[31mred\nsecond\nthird\nfourth\nfifth\nsixth\nseventh\n",
+        .{},
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(preview.truncated);
+    var encoded_bytes: usize = 0;
+    for (preview.lines) |line| {
+        try std.testing.expect(line.text.len <= 4096);
+        try std.testing.expect(std.mem.indexOfScalar(u8, line.text, 0x1b) == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, line.text, '\n') == null);
+        encoded_bytes += line.text.len;
+    }
+    try std.testing.expect(encoded_bytes <= max_encoded_preview_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, preview.lines[0].text, "\\x1b") != null);
+}
+
+test "buildBoundedPreview enforces per-line and aggregate encoded budgets" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "",
+        "\x1b\x1b\x1b\x1b\n\x1b\x1b\x1b\x1b\n",
+        .{
+            .max_encoded_line_bytes = 8,
+            .max_encoded_preview_bytes = 12,
+        },
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(preview.truncated);
+    var encoded_bytes: usize = 0;
+    for (preview.lines) |line| {
+        try std.testing.expect(line.text.len <= 8);
+        encoded_bytes += line.text.len;
+    }
+    try std.testing.expect(encoded_bytes <= 12);
+}
+
+test "buildBoundedPreview encoding truncation does not invent data elision" {
+    var preview = try buildBoundedPreview(
+        std.testing.allocator,
+        "",
+        "abcdefghijklmnopqrstuvwxyz\n",
+        .{
+            .max_encoded_line_bytes = 8,
+            .max_encoded_preview_bytes = 8,
+        },
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(preview.truncated);
+    try std.testing.expectEqual(@as(usize, 1), preview.lines.len);
+    try std.testing.expectEqual(PreviewOp.addition, preview.lines[0].op);
+}
+
+test "file change preview validates bounds and line number semantics" {
+    const valid: FileChangePreview = .{
+        .path = "note.txt",
+        .lines = &.{
+            .{ .op = .context, .old_line = 1, .new_line = 1, .text = "alpha" },
+            .{ .op = .deletion, .old_line = 2, .text = "beta" },
+            .{ .op = .addition, .new_line = 2, .text = "BETA" },
+        },
+        .additions = 1,
+        .deletions = 1,
+        .truncated = false,
+    };
+    try valid.validate();
+
+    const invalid_lines = [_]PreviewLine{
+        .{ .op = .context, .old_line = 1, .text = "missing new" },
+        .{ .op = .addition, .old_line = 1, .new_line = 1, .text = "old forbidden" },
+        .{ .op = .deletion, .old_line = 1, .new_line = 1, .text = "new forbidden" },
+        .{ .op = .elision, .old_line = 1, .text = "..." },
+        .{ .op = .notice, .new_line = 1, .text = "notice" },
+        .{ .op = .addition, .new_line = 0, .text = "zero" },
+    };
+    for (invalid_lines) |line| {
+        var invalid = valid;
+        invalid.lines = &.{line};
+        try std.testing.expectError(error.InvalidLineNumbers, invalid.validate());
+    }
+
+    var too_many_rows: [max_preview_lines + 1]PreviewLine = undefined;
+    for (&too_many_rows) |*line| {
+        line.* = .{ .op = .addition, .new_line = 1, .text = "x" };
+    }
+    var invalid = valid;
+    invalid.lines = &too_many_rows;
+    try std.testing.expectError(error.TooManyLines, invalid.validate());
+
+    var long_path: [max_encoded_path_bytes + 1]u8 = undefined;
+    invalid = valid;
+    invalid.path = &long_path;
+    try std.testing.expectError(error.PathTooLong, invalid.validate());
+
+    var long_line: [max_encoded_line_bytes + 1]u8 = undefined;
+    invalid = valid;
+    invalid.lines = &.{.{ .op = .addition, .new_line = 1, .text = &long_line }};
+    try std.testing.expectError(error.LineTooLong, invalid.validate());
+
+    var aggregate_lines: [max_preview_lines]PreviewLine = undefined;
+    var aggregate_text: [max_encoded_line_bytes]u8 = undefined;
+    for (&aggregate_lines) |*line| {
+        line.* = .{ .op = .addition, .new_line = 1, .text = &aggregate_text };
+    }
+    invalid = valid;
+    invalid.lines = &aggregate_lines;
+    invalid.additions = aggregate_lines.len;
+    invalid.deletions = 0;
+    try invalid.validate();
 }

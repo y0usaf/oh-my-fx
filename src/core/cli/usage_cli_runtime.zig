@@ -32,3 +32,25 @@ pub fn collect(
         .unknown_pending = recovery.unknown_pending,
     });
 }
+
+test "usage CLI collection does not create profile state for an empty home" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io_mod = @import("../shared/io.zig");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var report = try collect(
+        alloc,
+        home,
+        .days_30,
+        std.time.ms_per_day * 40,
+    );
+    defer report.deinit(alloc);
+    try std.testing.expectEqual(usage_report.Coverage.not_started, report.coverage);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io_mod.getIo(), ".fx", .{}),
+    );
+}

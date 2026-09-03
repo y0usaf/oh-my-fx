@@ -421,7 +421,11 @@ fn formatGroupHeader(
     try appendSegment(&out.writer, summary.failed, "failed");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
-    try appendSegment(&out.writer, summary.deferred, "deferred");
+    try appendSegment(
+        &out.writer,
+        summary.deferred,
+        if (summary.deferred == 1) "command not run" else "commands not run",
+    );
 
     const plain = try out.toOwnedSlice();
     defer alloc.free(plain);
@@ -476,10 +480,15 @@ fn formatGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         if (statusNamesAsk(entry, detail) or focused_entry_id == entry_id) continue;
 
-        const phrase = switch (entry) {
+        const raw_phrase = switch (entry) {
             .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
             else => null,
         } orelse if (detail) |record| record.tool_name else "tool activity";
+        const phrase = try reprojectTruncatedCommandPhrase(
+            scratch,
+            raw_phrase,
+            detail,
+        ) orelse raw_phrase;
         static_index += 1;
         const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
         const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
@@ -504,6 +513,19 @@ fn formatGroupBlock(
         terminal.deinit(scratch);
     }
     return out.toOwnedSlice();
+}
+
+fn reprojectTruncatedCommandPhrase(
+    scratch: std.mem.Allocator,
+    phrase: []const u8,
+    detail: ?*const ToolDetailRecord,
+) !?[]const u8 {
+    const record = detail orelse return null;
+    if (!record.isCapturedCommand() or record.outcome != .completed) return null;
+    if (!std.mem.endsWith(u8, phrase, "...")) return null;
+    const command = record.command_display orelse return null;
+    const action = record.command_action_label orelse return null;
+    return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
 }
 
 fn formatExpandedChild(
@@ -1058,4 +1080,1141 @@ fn buildWithStyleAndStats(
     }
 
     return projection;
+}
+
+test "collapsed tool groups render only the summary header" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = @constCast("● Read file\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = @constCast("● List files\n"), .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
+        .{ .entry_id = 2, .tool_name = @constCast("list_files"), .activity_kind = .list },
+    };
+
+    var projection = try buildStyledFocused(alloc, &entries, &details, 120, null, true, .{}, .{});
+    defer projection.deinit(alloc);
+    const block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, block, "2 tool calls") != null);
+    try std.testing.expect(std.mem.find(u8, block, "Read file") == null);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
+}
+
+test "tool relationship grouping retries cleanly after cancellation" {
+    const alloc = std.testing.allocator;
+    const entries = try alloc.alloc(TranscriptEntry, 5_000);
+    defer alloc.free(entries);
+    for (entries, 0..) |*entry, index| {
+        entry.* = .{ .raw_bytes = .{
+            .id = @intCast(index + 1),
+            .bytes = @constCast("retained\n"),
+        } };
+    }
+    const Probe = struct {
+        fn pending(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var context: u8 = 0;
+    var checkpoint = build_checkpoint.BuildCheckpoint.init(&context, Probe.pending);
+
+    try std.testing.expectError(
+        error.InputPending,
+        buildExpandedRelationshipsInterruptible(alloc, entries, &.{}, &checkpoint),
+    );
+    var retry = try buildExpandedRelationshipsInterruptible(alloc, entries, &.{}, null);
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(entries.len, retry.entry_actions.items.len);
+    try std.testing.expect(retry.entry_actions.items[0] == .keep);
+    try std.testing.expect(retry.entry_actions.items[entries.len - 1] == .keep);
+}
+
+test "minimal tool group summary uses semantic category order and outcomes" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read runtime.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Edited main.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran zig build\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .failed },
+        .{ .entry_id = 3, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expectEqualStrings(
+        "● 3 tool calls · 1 read · 1 edit · 1 command · 1 failed\n" ++
+            "├ Read runtime.zig\n" ++
+            "├ Edited main.zig\n" ++
+            "└ Ran zig build",
+        projection.entry_actions.items[0].override.bytes,
+    );
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    try std.testing.expectEqual(types.ToolActivityKind.read, details[0].activity_kind.?);
+}
+
+test "small minimal tool groups surface canonical action targets" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched\x1b[0m \x1b[38;5;245msnapshot\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Editing\x1b[0m \x1b[38;5;245mstore.zig\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("grep_files"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = null },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 3 tool calls · 2 read · 1 edit\n" ++
+            "├ Read runtime.zig\n" ++
+            "├ Searched snapshot\n" ++
+            "└ Editing store.zig",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal tool groups preserve denied and not-run action text" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "⊘ Denied by auto agent zig build\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Not run — project instructions changed: runtime.zig\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("terminal"), .activity_kind = .command, .outcome = .denied },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .deferred },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 1 read · 1 command · 1 denied · 1 command not run\n" ++
+            "├ Denied by auto agent zig build\n" ++
+            "└ Not run — project instructions changed: runtime.zig",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal tool group pluralizes context-withheld commands" {
+    const alloc = std.testing.allocator;
+    const header = try formatGroupHeader(
+        alloc,
+        .{ .total = 3, .deferred = 3 },
+        120,
+        .{},
+    );
+    defer alloc.free(header);
+
+    try std.testing.expectEqualStrings(
+        "● 3 tool calls · 3 commands not run",
+        header,
+    );
+}
+
+test "focused tool remains counted but is omitted from stable child rows" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read runtime.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running zig build test\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("run_command"), .activity_kind = .command },
+    };
+
+    var projection = try buildStyledFocused(alloc, &entries, &details, 120, 2, false, .{}, .{});
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 1 read · 1 command\n├ Read runtime.zig",
+        projection.entry_actions.items[0].override.bytes,
+    );
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
+}
+
+test "minimal command details expose running completed and failed process states" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running\x1b[0m \x1b[38;5;245mrg snapshot\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran\x1b[0m \x1b[38;5;245mzig build\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = null },
+        .{ .entry_id = 2, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed, .command_process_presentation = .{ .exit_code = 0 } },
+        .{ .entry_id = 3, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed, .command_process_presentation = .{ .exit_code = 7 } },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 3 tool calls · 3 commands · 1 failed\n" ++
+            "├ Running rg snapshot\n" ++
+            "├ Ran zig build\n" ++
+            "└ Ran zig build test",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal completed command rows reproject stored arguments at the current width" {
+    const alloc = std.testing.allocator;
+    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const arguments_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"command\":{f}}}",
+        .{std.json.fmt(command, .{})},
+    );
+    defer alloc.free(arguments_json);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mprintf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .arguments_json = arguments_json,
+            .command_display = @constCast(command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+    };
+
+    var narrow = try build(alloc, &entries, &details, 80);
+    defer narrow.deinit(alloc);
+    const narrow_row = narrow.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…"));
+    try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
+
+    var wide = try build(alloc, &entries, &details, 240);
+    defer wide.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Ran " ++ command,
+        wide.entry_actions.items[0].override.bytes,
+    );
+
+    const legacy_details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .outcome = .completed,
+        },
+    };
+    var legacy = try build(alloc, &entries, &legacy_details, 240);
+    defer legacy.deinit(alloc);
+    try std.testing.expect(std.mem.endsWith(u8, legacy.entry_actions.items[0].override.bytes, "..."));
+
+    const relative_command = "cd ./packages/cli && " ++ ("printf relative-path " ** 6);
+    const relative_arguments_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"command\":{f}}}",
+        .{std.json.fmt(relative_command, .{})},
+    );
+    defer alloc.free(relative_arguments_json);
+    const relative_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran cd ./packages/cli && printf relative-path printf relative-path printf relative-path printf relative-path printf relative-path pri...\n",
+            .class = .tool_status,
+        } },
+    };
+    const relative_details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .arguments_json = relative_arguments_json,
+            .command_display = @constCast(relative_command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+    };
+    var relative = try build(alloc, &relative_entries, &relative_details, 240);
+    defer relative.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Ran " ++ relative_command,
+        relative.entry_actions.items[0].override.bytes,
+    );
+
+    const compatibility_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Installed skill printf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-...\n",
+            .class = .tool_status,
+        } },
+    };
+    const compatibility_details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .captured_command = true,
+        .activity_kind = .command,
+        .arguments_json = arguments_json,
+        .command_display = @constCast(command),
+        .command_action_label = @constCast("Installed skill"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+    var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
+    defer compatibility.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Installed skill " ++ command,
+        compatibility.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal command timeout uses its typed cause in the row and group" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Timed out sleep 5\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .outcome = .failed,
+            .command_process_presentation = .timed_out,
+        },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command · 1 timed out\n" ++
+            "└ Timed out sleep 5",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "tool-heavy groups render every canonical action" {
+    const alloc = std.testing.allocator;
+    const tool_count = 20;
+    var entries: [tool_count]TranscriptEntry = undefined;
+    var details: [tool_count]ToolDetailRecord = undefined;
+
+    for (&entries, &details, 0..) |*entry, *detail, index| {
+        const entry_id: u32 = @intCast(index + 1);
+        const is_command = index >= 10 and index < 18;
+        const is_edit = index >= 18;
+        const is_failed_command = index == 17;
+        const is_current_edit = index == 19;
+        entry.* = .{ .raw_bytes = .{
+            .id = entry_id,
+            .bytes = if (is_failed_command)
+                @constCast("● Ran\x1b[0m \x1b[38;5;245mrg snapshot\x1b[0m\n")
+            else if (is_current_edit)
+                @constCast("● Editing\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n")
+            else if (is_command)
+                @constCast("● Ran\x1b[0m \x1b[38;5;245mzig build\x1b[0m\n")
+            else if (is_edit)
+                @constCast("● Edited\x1b[0m \x1b[38;5;245mstore.zig\x1b[0m\n")
+            else
+                @constCast("● Read\x1b[0m \x1b[38;5;245mfile.zig\x1b[0m\n"),
+            .class = .tool_status,
+        } };
+        detail.* = .{
+            .entry_id = entry_id,
+            .tool_name = if (is_command) @constCast("run_command") else if (is_edit) @constCast("edit_file") else @constCast("read_file"),
+            .activity_kind = if (is_command) .command else if (is_edit) .edit else .read,
+            .outcome = if (is_current_edit) null else .completed,
+            .command_process_presentation = if (is_command)
+                if (is_failed_command) .{ .exit_code = 1 } else .{ .exit_code = 0 }
+            else
+                null,
+        };
+    }
+
+    var projection = try build(alloc, &entries, &details, 100);
+    defer projection.deinit(alloc);
+    const summary = projection.entry_actions.items[0].override.bytes;
+
+    try std.testing.expect(std.mem.find(u8, summary, "20 tool calls") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "10 read") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "8 commands") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "1 failed") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "Ran rg snapshot") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "Editing runtime.zig") != null);
+    try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, summary, "\n"));
+    var lines = std.mem.splitScalar(u8, summary, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 100);
+    }
+
+    entries[19].raw_bytes.bytes = @constCast("● Edited\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n");
+    details[19].outcome = .completed;
+    var completed_projection = try build(alloc, &entries, &details, 100);
+    defer completed_projection.deinit(alloc);
+    const completed_summary = completed_projection.entry_actions.items[0].override.bytes;
+
+    try std.testing.expect(std.mem.find(u8, completed_summary, "Edited runtime.zig") != null);
+    try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, completed_summary, "\n"));
+}
+
+test "minimal tool group keeps cancellation in the header and child row" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "■ Cancelled sleep 30 · What can fx do differently?", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .cancelled },
+    };
+    var projection = try buildStyled(alloc, &entries, &details, 120, .{}, .{});
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command · 1 cancelled\n" ++
+            "└ Cancelled sleep 30\n\n" ++
+            "■ Cancelled sleep 30 · What can fx do differently?",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal tool group clips cancellation to one child row" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "■ Cancelled sleep waiting command words extend past line two",
+            .class = .tool_status,
+        } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .cancelled },
+    };
+
+    var projection = try build(alloc, &entries, &details, 24);
+    defer projection.deinit(alloc);
+
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    const gap = std.mem.find(u8, bytes, "\n\n") orelse return error.TestExpectedEqual;
+    var group_lines = std.mem.splitScalar(u8, bytes[0..gap], '\n');
+    var group_line_count: usize = 0;
+    while (group_lines.next()) |line| {
+        group_line_count += 1;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 24);
+    }
+    try std.testing.expectEqual(@as(usize, 2), group_line_count);
+
+    var feedback_lines = std.mem.splitScalar(u8, bytes[gap + 2 ..], '\n');
+    while (feedback_lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 24);
+    }
+}
+
+test "minimal tool group keeps later cancelled rows and hides other details" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "read", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "cancelled", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "output", .class = .command_output } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .cancelled },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+}
+
+test "cancelled actions remain inside the message-delimited block" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "■ Cancelled first", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "■ Cancelled second", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "output", .class = .command_output } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "read", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .cancelled },
+        .{ .entry_id = 2, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .cancelled },
+        .{ .entry_id = 4, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled first") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled second") != null);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    try std.testing.expect(projection.entry_actions.items[3] == .hide);
+}
+
+test "assistant prose splits tool groups and attached rows stay inside their group" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "output", .class = .command_output } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "diff", .class = .diff_block } },
+        .{ .assistant_turn = .{ .id = 4, .segments = .{} } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "read", .class = .tool_status } },
+    };
+    try entries[3].assistant_turn.segments.text.appendSlice(alloc, "assistant message");
+    defer entries[3].assistant_turn.segments.deinit(alloc);
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    try std.testing.expect(projection.entry_actions.items[3] == .keep);
+    try std.testing.expect(projection.entry_actions.items[4] == .override);
+}
+
+test "minimal hides command output separated from its tool status" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "output", .class = .command_output } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "diff", .class = .diff_block } },
+    };
+    try entries[1].assistant_turn.segments.text.appendSlice(alloc, "provider bridge");
+    defer entries[1].assistant_turn.segments.deinit(alloc);
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    try std.testing.expect(projection.entry_actions.items[3] == .keep);
+}
+
+test "one presentation group keeps sibling tools in creation order across assistant prose" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running second", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running first", .class = .tool_status } },
+    };
+    try entries[1].assistant_turn.segments.text.appendSlice(alloc, "provider bridge");
+    defer entries[1].assistant_turn.segments.deinit(alloc);
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("first") },
+            .presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 11 },
+        },
+        .{
+            .entry_id = 3,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("second") },
+            .presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 11 },
+        },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 2 commands\n" ++
+            "├ Running first\n" ++
+            "└ Running second",
+        projection.entry_actions.items[0].override.bytes,
+    );
+    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+}
+
+test "different presentation groups remain separate within one turn" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read first", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read second", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("read_file"),
+            .activity_kind = .read,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("first") },
+            .presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 11 },
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("read_file"),
+            .activity_kind = .read,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("second") },
+            .presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 12 },
+        },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 read\n└ Read first",
+        projection.entry_actions.items[0].override.bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 read\n└ Read second",
+        projection.entry_actions.items[1].override.bytes,
+    );
+}
+
+test "legacy lifecycle records without group identity respect transcript boundaries" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read first", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Running second", .class = .tool_status } },
+    };
+    try entries[1].assistant_turn.segments.text.appendSlice(alloc, "next model step");
+    defer entries[1].assistant_turn.segments.deinit(alloc);
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("read_file"),
+            .activity_kind = .read,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("first") },
+        },
+        .{
+            .entry_id = 3,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("second") },
+        },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 read\n└ Read first",
+        projection.entry_actions.items[0].override.bytes,
+    );
+    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Running second",
+        projection.entry_actions.items[2].override.bytes,
+    );
+}
+
+fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running second", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 3, .segments = .{} } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running first", .class = .tool_status } },
+    };
+    try entries[1].assistant_turn.segments.text.appendSlice(alloc, "provider bridge");
+    defer entries[1].assistant_turn.segments.deinit(alloc);
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("first") },
+            .presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 11 },
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("second") },
+            .presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 11 },
+        },
+    };
+
+    var projection = build(alloc, &entries, &details, 120) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 2 commands\n" ++
+            "├ Running first\n" ++
+            "└ Running second",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "presentation grouping is atomic across allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkPresentationGroupingAllocationFailures,
+        .{},
+    );
+}
+
+test "entries hidden by compact presentation do not split tool groups" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "read", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
+        .{ .semantic_notice = .{
+            .id = 3,
+            .topic = "context",
+            .tone = .warning,
+            .body = "hidden",
+            .visibility = .full_only,
+        } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "edit", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 1 read · 1 edit\n" ++
+            "├ read_file\n" ++
+            "└ edit_file",
+        projection.entry_actions.items[0].override.bytes,
+    );
+    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expect(projection.entry_actions.items[2] == .keep);
+    try std.testing.expect(projection.entry_actions.items[3] == .hide);
+}
+
+test "visible assistant messages split groups while silent entries do not" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "read one", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "read two", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "read three", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "list one", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "list two", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 6, .segments = .{} } },
+        .{ .raw_bytes = .{ .id = 7, .bytes = "command one", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 8, .segments = .{} } },
+        .{ .raw_bytes = .{ .id = 9, .bytes = "read four", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 10, .bytes = "read five", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 11, .bytes = "read six", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 12, .bytes = "command two", .class = .tool_status } },
+    };
+    try entries[5].assistant_turn.segments.text.appendSlice(alloc, "permission feedback");
+    defer entries[5].assistant_turn.segments.deinit(alloc);
+    try entries[7].assistant_turn.segments.text.appendSlice(alloc, "next model step");
+    defer entries[7].assistant_turn.segments.deinit(alloc);
+
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("glob_files"), .activity_kind = .list, .outcome = .completed },
+        .{ .entry_id = 5, .tool_name = @constCast("glob_files"), .activity_kind = .list, .outcome = .completed },
+        .{ .entry_id = 7, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+        .{ .entry_id = 9, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 10, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 11, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 12, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 5 tool calls · 3 read · 2 list\n" ++
+            "├ read_file\n├ read_file\n├ read_file\n├ glob_files\n└ glob_files",
+        projection.entry_actions.items[0].override.bytes,
+    );
+    for (projection.entry_actions.items[1..5]) |action| {
+        try std.testing.expect(action == .hide);
+    }
+    try std.testing.expect(projection.entry_actions.items[5] == .keep);
+    try std.testing.expect(projection.entry_actions.items[6] == .override);
+    try std.testing.expect(projection.entry_actions.items[7] == .keep);
+    try std.testing.expectEqualStrings(
+        "● 4 tool calls · 3 read · 1 command\n" ++
+            "├ read_file\n├ read_file\n├ read_file\n└ run_command",
+        projection.entry_actions.items[8].override.bytes,
+    );
+    for (projection.entry_actions.items[9..12]) |action| {
+        try std.testing.expect(action == .hide);
+    }
+}
+
+test "message-delimited groups hide attached detail across compact-only entries" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status } },
+        .{ .semantic_notice = .{
+            .id = 2,
+            .topic = "permission",
+            .tone = .information,
+            .body = "full detail",
+            .visibility = .full_only,
+        } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "diff", .class = .diff_block } },
+        .{ .assistant_turn = .{ .id = 4, .segments = .{} } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "read", .class = .tool_status } },
+    };
+    try entries[3].assistant_turn.segments.text.appendSlice(alloc, "visible message");
+    defer entries[3].assistant_turn.segments.deinit(alloc);
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    try std.testing.expect(projection.entry_actions.items[3] == .keep);
+    try std.testing.expect(projection.entry_actions.items[4] == .override);
+}
+
+test "ask activity remains outside tool groups" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "question", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "read", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("ask_user_question"), .activity_kind = .ask, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = null },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .keep);
+    try std.testing.expect(projection.entry_actions.items[1] == .override);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 read\n└ read_file",
+        projection.entry_actions.items[1].override.bytes,
+    );
+}
+
+test "ask activity remains outside tool groups without complete detail metadata" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Reading /tmp/ask_user_question", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● ask_user_question\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "read", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● ask_user_question", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("ask_user_question"), .activity_kind = null, .outcome = .failed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expect(projection.entry_actions.items[2] == .override);
+    try std.testing.expect(projection.entry_actions.items[3] == .keep);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call\n└ Reading /tmp/ask_user_question",
+        projection.entry_actions.items[0].override.bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 read\n└ read_file",
+        projection.entry_actions.items[2].override.bytes,
+    );
+}
+
+test "narrow block clips every row without wrapping" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "read", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "edit", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "command", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .failed },
+        .{ .entry_id = 3, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+    };
+    var projection = try build(alloc, &entries, &details, 45);
+    defer projection.deinit(alloc);
+
+    const block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, block, "\n"));
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 45);
+    }
+}
+
+test "mixed group keeps the count header before every action" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read one.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read two.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read three.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Read four.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● Read five.zig", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 6, .bytes = "● Ran git -C /workspace status --short", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 6, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed, .command_process_presentation = .{ .exit_code = 0 } },
+    };
+
+    var projection = try build(alloc, &entries, &details, 60);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 6 tool calls · 5 read · 1 command\n" ++
+            "├ Read one.zig\n" ++
+            "├ Read two.zig\n" ++
+            "├ Read three.zig\n" ++
+            "├ Read four.zig\n" ++
+            "├ Read five.zig\n" ++
+            "└ Ran git -C /workspace status --short",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "styled minimal summary preserves the clipped width" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "read", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
+    };
+
+    var projection = try buildStyled(alloc, &entries, &details, 2, .{
+        .marker_style = "\x1b[38;5;81m",
+        .text_style = "\x1b[1;3m",
+        .reset_style = "\x1b[0m",
+    }, .{});
+    defer projection.deinit(alloc);
+    const summary = projection.entry_actions.items[0].override.bytes;
+
+    var lines = std.mem.splitScalar(u8, summary, '\n');
+    var line_count: usize = 0;
+    while (lines.next()) |line| {
+        line_count += 1;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 2);
+    }
+    try std.testing.expectEqual(@as(usize, 2), line_count);
+}
+
+test "expanded tool title stays primary while the group summary stays secondary" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "Listed .", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("glob_files"), .activity_kind = .list },
+    };
+
+    var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{
+        .marker_style = "<marker>",
+        .text_style = "<secondary>",
+        .reset_style = "<reset>",
+    }, .{}, null);
+    defer projection.deinit(alloc);
+    const expanded = projection.entry_actions.items[0].override.bytes;
+
+    try std.testing.expect(std.mem.find(u8, expanded, "<secondary>1 tool call · 1 list<reset>") != null);
+    try std.testing.expect(std.mem.find(u8, expanded, "\n└ Listed .") != null);
+    try std.testing.expect(std.mem.find(u8, expanded, "\n│\n") == null);
+    try std.testing.expect(std.mem.find(u8, expanded, "<secondary>└ Listed .") == null);
+}
+
+test "expanded tool relationships materialize at multiple widths" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "Listed .", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("glob_files"), .activity_kind = .list },
+    };
+    const style = SummaryStyle{
+        .marker_style = "\x1b[38;5;81m",
+        .text_style = "\x1b[1;3m",
+        .reset_style = "\x1b[0m",
+    };
+
+    var relationships = try buildExpandedRelationshipsInterruptible(
+        alloc,
+        &entries,
+        &details,
+        null,
+    );
+    defer relationships.deinit(alloc);
+    var narrow = try materializeExpandedRelationshipsRangeInterruptible(
+        alloc,
+        &relationships,
+        0,
+        2,
+        style,
+        null,
+    );
+    defer narrow.deinit(alloc);
+    var wide = try materializeExpandedRelationshipsRangeInterruptible(
+        alloc,
+        &relationships,
+        0,
+        80,
+        style,
+        null,
+    );
+    defer wide.deinit(alloc);
+
+    var narrow_lines = std.mem.splitScalar(u8, narrow.entry_actions.items[0].override.bytes, '\n');
+    while (narrow_lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 2);
+    }
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;81m●\x1b[0m \x1b[1;3m1 tool call · 1 list\x1b[0m\n└ Listed .",
+        wide.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "ordinary append does not reopen a retained tool run" {
+    const alloc = std.testing.allocator;
+    const retained_count = 5_000;
+    const entries = try alloc.alloc(TranscriptEntry, retained_count + 1);
+    defer alloc.free(entries);
+    for (entries[0..retained_count], 0..) |*entry, index| {
+        entry.* = .{ .raw_bytes = .{
+            .id = @intCast(index),
+            .bytes = "● Read file.zig\n",
+            .class = .tool_status,
+        } };
+    }
+    entries[retained_count] = .{ .raw_bytes = .{
+        .id = @intCast(retained_count),
+        .bytes = "new message\n",
+    } };
+
+    try std.testing.expectEqual(
+        retained_count,
+        incrementalRebuildStart(entries, &.{}, @intCast(retained_count)).?,
+    );
+}
+
+test "incremental rebuild uses transcript order after lifecycle reposition" {
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 2, .bytes = "second\n" } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "third\n" } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "repositioned\n" } },
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        incrementalRebuildStart(&entries, &.{}, 2).?,
+    );
+}
+
+test "tool-heavy projection performs a bounded number of indexed detail lookups" {
+    const alloc = std.testing.allocator;
+    const tool_count = 2_000;
+    const entries = try alloc.alloc(TranscriptEntry, tool_count);
+    defer alloc.free(entries);
+    const details = try alloc.alloc(ToolDetailRecord, tool_count);
+    defer alloc.free(details);
+
+    for (entries, details, 0..) |*entry, *detail, index| {
+        const entry_id: u32 = @intCast(index + 1);
+        entry.* = .{ .raw_bytes = .{
+            .id = entry_id,
+            .bytes = @constCast("tool"),
+            .class = .tool_status,
+        } };
+        detail.* = .{
+            .entry_id = entry_id,
+            .tool_name = @constCast("read_file"),
+            .activity_kind = .read,
+            .outcome = .completed,
+        };
+    }
+
+    var stats: BuildStats = .{};
+    var projection = try buildWithStats(alloc, entries, details, 120, &stats);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqual(tool_count, projection.entry_actions.items.len);
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[tool_count - 1] == .hide);
+    try std.testing.expect(stats.detail_lookups <= tool_count * 3);
+}
+
+test "many presentation groups perform a bounded number of indexed detail lookups" {
+    const alloc = std.testing.allocator;
+    const tool_count = 200;
+    const entries = try alloc.alloc(TranscriptEntry, tool_count);
+    defer alloc.free(entries);
+    const details = try alloc.alloc(ToolDetailRecord, tool_count);
+    defer alloc.free(details);
+
+    for (entries, details, 0..) |*entry, *detail, index| {
+        const entry_id: u32 = @intCast(index + 1);
+        entry.* = .{ .raw_bytes = .{
+            .id = entry_id,
+            .bytes = @constCast("tool"),
+            .class = .tool_status,
+        } };
+        detail.* = .{
+            .entry_id = entry_id,
+            .tool_name = @constCast("read_file"),
+            .activity_kind = .read,
+            .outcome = .completed,
+            .lifecycle_id = .{
+                .turn_id = index + 1,
+                .call_id = @constCast("call"),
+            },
+            .presentation_group_id = .{
+                .turn_id = index + 1,
+                .anchor_step_id = index + 1,
+            },
+        };
+    }
+
+    var stats: BuildStats = .{};
+    var projection = try buildWithStats(alloc, entries, details, 120, &stats);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqual(tool_count, projection.entry_actions.items.len);
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[tool_count - 1] == .override);
+    try std.testing.expect(stats.detail_lookups <= tool_count * 4);
 }

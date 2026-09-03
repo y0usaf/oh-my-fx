@@ -23,3 +23,25 @@ pub fn begin(current: State, owner: text_scalar.Owner) BeginTransition {
 pub fn clear() State {
     return .{};
 }
+
+test "input limit rejection coalesces only within one owner episode" {
+    const composer = begin(.{}, .composer);
+    try std.testing.expect(composer.should_report);
+    try std.testing.expectEqual(text_scalar.Owner.composer, composer.next.owner.?);
+
+    const repeated = begin(composer.next, .composer);
+    try std.testing.expect(!repeated.should_report);
+    try std.testing.expectEqual(composer.next, repeated.next);
+
+    const question = begin(repeated.next, .question_freeform);
+    try std.testing.expect(question.should_report);
+    try std.testing.expectEqual(text_scalar.Owner.question_freeform, question.next.owner.?);
+}
+
+test "input limit rejection clear starts a new episode" {
+    const active = begin(.{}, .approval_amendment).next;
+    try std.testing.expectEqual(text_scalar.Owner.approval_amendment, active.owner.?);
+    const cleared = clear();
+    try std.testing.expect(cleared.owner == null);
+    try std.testing.expect(begin(cleared, .approval_amendment).should_report);
+}

@@ -5,7 +5,6 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const background_commands = @import("../background/background_commands.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -32,6 +31,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
 const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
@@ -40,7 +40,6 @@ const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
-const ui_subagents = @import("../../ui/subagent/runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const test_builtin_skills = if (@import("builtin").is_test)
     @import("../../builtins/skills.zig")
@@ -354,12 +353,8 @@ pub fn Handlers(comptime App: type) type {
                 .show_help = commandShowHelp,
                 .login = commandLogin,
                 .logout = commandLogout,
-                .setup = commandSetup,
+                .provider = commandProvider,
                 .show_status = commandShowStatus,
-                .show_background = commandShowBackground,
-                .stop_background = commandStopBackground,
-                .open_background = commandOpenBackground,
-                .show_background_logs = commandShowBackgroundLogs,
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
@@ -392,6 +387,17 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
             var completion = (try app.takeMcpReloadCompletion()) orelse return;
             defer completion.deinit(app.alloc);
+            if (comptime @hasDecl(App, "mcpReloadCompletionOrigin") and
+                @hasDecl(App, "applyMcpMenuReloadCompletion"))
+            {
+                switch (app.mcpReloadCompletionOrigin()) {
+                    .command => {},
+                    .menu => |generation| {
+                        try app.applyMcpMenuReloadCompletion(generation, &completion);
+                        return;
+                    },
+                }
+            }
             var warning = false;
             const body = switch (completion) {
                 .outcome => |outcome| switch (outcome) {
@@ -474,6 +480,17 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasDecl(App, "takeMcpAuthenticationCompletion")) return;
             var completion = (try app.takeMcpAuthenticationCompletion()) orelse return;
             defer completion.deinit(app.alloc);
+            if (comptime @hasDecl(App, "mcpAuthenticationCompletionOrigin") and
+                @hasDecl(App, "applyMcpMenuAuthenticationCompletion"))
+            {
+                switch (app.mcpAuthenticationCompletionOrigin()) {
+                    .command => {},
+                    .menu => |generation| {
+                        try app.applyMcpMenuAuthenticationCompletion(generation, &completion);
+                        return;
+                    },
+                }
+            }
 
             if (completion.result) |authentication| {
                 switch (authentication) {
@@ -694,15 +711,15 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        fn commandSetup(ctx: *anyopaque) !void {
+        fn commandProvider(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "openSetupHub")) {
-                try app.openSetupHub();
+            if (comptime @hasDecl(App, "runProviderCommand")) {
+                try app.runProviderCommand();
             } else {
                 try app.writeDomainNotice(.{
-                    .topic = "setup",
+                    .topic = "provider",
                     .tone = .@"error",
-                    .body = "setup is not available in this runtime",
+                    .body = "provider selection is not available in this runtime",
                 }, true);
             }
         }
@@ -710,26 +727,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowStatus(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).showStatus(app);
-        }
-
-        fn commandShowBackground(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).show(app);
-        }
-
-        fn commandStopBackground(ctx: *anyopaque, target: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).stop(app, target);
-        }
-
-        fn commandOpenBackground(ctx: *anyopaque, target: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).open(app, target);
-        }
-
-        fn commandShowBackgroundLogs(ctx: *anyopaque, target: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).logs(app, target);
         }
 
         fn commandAttachImage(ctx: *anyopaque, path: []const u8) !void {
@@ -1274,6 +1271,25 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (std.mem.trim(u8, rest, " \t").len == 0 and
+                comptime @hasDecl(App, "openMcpMenu"))
+            {
+                closeModelMenuIfPresent(app);
+                closeHelpMenuIfPresent(app);
+                closeInlineCommandMenusIfPresent(app);
+                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+                if (comptime @hasField(App, "input_runtime")) {
+                    if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
+                        app.input_runtime.settings_menu.close();
+                    }
+                }
+                if (comptime @hasField(App, "session_persistence")) {
+                    app.session_persistence.session_picker.active = false;
+                }
+                try app.openMcpMenu();
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
                 .home = io_mod.getenv("HOME"),
                 .list_ctx = @ptrCast(app),
@@ -1680,7 +1696,64 @@ pub fn Handlers(comptime App: type) type {
             const provider = app.skillsCommandProvider();
             const command = provider.parseCommand(rest);
 
-            try app.reloadSkills();
+            if (comptime @hasDecl(App, "requestSkillsRefresh")) switch (command) {
+                .list => {
+                    const generation = try app.requestSkillsRefresh();
+                    try app.skills.queueRefreshAction(app.alloc, generation, .list);
+                    try collectSkillsRefreshFacts(app);
+                    return;
+                },
+                .show => |name| {
+                    const generation = try app.requestSkillsRefresh();
+                    try app.skills.queueRefreshAction(
+                        app.alloc,
+                        generation,
+                        .{ .show = name },
+                    );
+                    try collectSkillsRefreshFacts(app);
+                    return;
+                },
+                .install, .create, .remove, .path, .usage => {},
+            };
+            try executeSkillsCommand(app, provider, command);
+            try collectSkillsRefreshFacts(app);
+        }
+
+        pub fn collectSkillsRefreshFacts(app: *App) !void {
+            var ready = app.skills.takeReadyRefreshAction() orelse return;
+            defer ready.deinit(app.alloc);
+            if (!ready.succeeded) {
+                try app.writeDomainNotice(.{
+                    .topic = "skills",
+                    .tone = .@"error",
+                    .body = "Skills could not be refreshed. The previous catalog was not shown as current.",
+                }, true);
+                return;
+            }
+            switch (ready.action) {
+                .list => try executeSkillsCommand(
+                    app,
+                    app.skillsCommandProvider(),
+                    .list,
+                ),
+                .show => |name| try executeSkillsCommand(
+                    app,
+                    app.skillsCommandProvider(),
+                    .{ .show = name },
+                ),
+                .notice => |body| try app.writeDomainNotice(.{
+                    .topic = "skills",
+                    .tone = .neutral,
+                    .body = body,
+                }, true),
+            }
+        }
+
+        fn executeSkillsCommand(
+            app: *App,
+            provider: skill_commands.Provider,
+            command: skill_commands.Command,
+        ) !void {
             try writeSkillDiagnosticNotice(app);
 
             switch (command) {
@@ -1771,12 +1844,15 @@ pub fn Handlers(comptime App: type) type {
                     }
                 },
                 .notice => |notice| {
-                    try app.writeDomainNotice(.{
-                        .topic = "skills",
-                        .tone = .neutral,
-                        .body = notice.text,
-                    }, true);
-                    if (notice.reload) try app.reloadSkills();
+                    if (notice.reload and comptime @hasDecl(App, "requestSkillsRefresh")) {
+                        try queueSkillsNoticeAfterRefresh(app, notice.text);
+                    } else {
+                        try app.writeDomainNotice(.{
+                            .topic = "skills",
+                            .tone = .neutral,
+                            .body = notice.text,
+                        }, true);
+                    }
                 },
                 .installed => |install_result| {
                     var installed_notice: std.Io.Writer.Allocating = .init(app.alloc);
@@ -1788,14 +1864,29 @@ pub fn Handlers(comptime App: type) type {
 
                     const msg = try installed_notice.toOwnedSlice();
                     defer app.alloc.free(msg);
-                    try app.writeDomainNotice(.{
-                        .topic = "skills",
-                        .tone = .neutral,
-                        .body = std.mem.trimEnd(u8, msg, "\n"),
-                    }, true);
-                    try app.reloadSkills();
+                    if (comptime @hasDecl(App, "requestSkillsRefresh")) {
+                        try queueSkillsNoticeAfterRefresh(
+                            app,
+                            std.mem.trimEnd(u8, msg, "\n"),
+                        );
+                    } else {
+                        try app.writeDomainNotice(.{
+                            .topic = "skills",
+                            .tone = .neutral,
+                            .body = std.mem.trimEnd(u8, msg, "\n"),
+                        }, true);
+                    }
                 },
             }
+        }
+
+        fn queueSkillsNoticeAfterRefresh(app: *App, body: []const u8) !void {
+            const generation = try app.requestSkillsRefresh();
+            try app.skills.queueRefreshAction(
+                app.alloc,
+                generation,
+                .{ .notice = body },
+            );
         }
 
         fn closeModelMenuIfPresent(app: *App) void {
@@ -1856,11 +1947,34 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandCompactHistory(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).compactHistory(app);
+            if (comptime @hasDecl(App, "enqueueContextCompaction")) {
+                if (!app.hasContextToCompact()) {
+                    try app.writeDomainNotice(.{
+                        .topic = "context",
+                        .tone = .neutral,
+                        .body = "No context to compact.",
+                    }, true);
+                    return;
+                }
+                if (try app.enqueueContextCompaction()) {
+                    try app.writeDomainNotice(.{
+                        .topic = "context",
+                        .tone = .neutral,
+                        .body = "Compaction queued.",
+                    }, true);
+                } else {
+                    try app.writeDomainNotice(.{
+                        .topic = "context",
+                        .tone = .warning,
+                        .body = "Wait for the active work to finish before compacting context.",
+                    }, true);
+                }
+                return;
+            }
             try app.writeDomainNotice(.{
                 .topic = "context",
                 .tone = .neutral,
-                .body = "Context compacted.",
+                .body = "No context to compact.",
             }, true);
         }
 
@@ -2099,10 +2213,9 @@ fn buildTraceReport(app: anytype) ![]u8 {
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
     try writeProblemsSummary(&out.writer, app, app.alloc);
-    try writeLastInterruptedDetail(&out.writer, app.session.history.items, app.alloc);
+    try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
-    try writeToolCallsSummary(&out.writer, app.alloc);
-    try writeSubagentsSummary(&out.writer, app.alloc, &app.subagents);
+    try writeToolCallsSummary(&out.writer, app.alloc, app.session.agent.history.items);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
     try writeRendererState(&out.writer, app, app.alloc);
@@ -2138,6 +2251,45 @@ noinline fn writeMaskedInline(writer: *std.Io.Writer, alloc: std.mem.Allocator, 
     try writer.writeAll(masked);
 }
 
+fn traceToolDisplayName(tool_name: []const u8) []const u8 {
+    return if (tool_presentation.isProviderSearchAlias(tool_name))
+        "web_search"
+    else
+        tool_name;
+}
+
+fn isTraceToolTokenByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+fn providerSearchAliasPrefixLen(token: []const u8) ?usize {
+    var end: usize = 1;
+    while (end <= token.len) : (end += 1) {
+        if (!tool_presentation.isProviderSearchAlias(token[0..end])) continue;
+        if (end == token.len or token[end] == '_') return end;
+    }
+    return null;
+}
+
+fn writeTraceTextNeutralized(writer: *std.Io.Writer, text: []const u8) !void {
+    var token_start: usize = 0;
+    var scan_index: usize = 0;
+    var written_through: usize = 0;
+    while (scan_index < text.len) {
+        if (!isTraceToolTokenByte(text[scan_index])) {
+            scan_index += 1;
+            continue;
+        }
+        token_start = scan_index;
+        while (scan_index < text.len and isTraceToolTokenByte(text[scan_index])) : (scan_index += 1) {}
+        const alias_len = providerSearchAliasPrefixLen(text[token_start..scan_index]) orelse continue;
+        try writer.writeAll(text[written_through..token_start]);
+        try writer.writeAll("web_search");
+        written_through = token_start + alias_len;
+    }
+    try writer.writeAll(text[written_through..]);
+}
+
 fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
     const App = @TypeOf(app.*);
     try writer.writeAll("\n## Current State\n");
@@ -2161,7 +2313,13 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
         try writer.print("tokens_total: {d}->{d}\n", .{ app.total_input_tokens, app.total_output_tokens });
     }
     if (comptime @hasField(App, "total_web_search_requests")) {
-        try writer.print("web_search_requests_total: {d}\n", .{app.total_web_search_requests});
+        var usage = try app.session.usage.snapshot(alloc);
+        defer usage.deinit(alloc);
+        try writeSearchUsageSummary(
+            writer,
+            app.total_web_search_requests,
+            usage.billable_web_search_calls,
+        );
     }
     try writeAuthStateSummary(writer, app);
     try writeProcessSummary(writer, alloc);
@@ -2337,10 +2495,10 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         }
     }
 
-    if (lastInterruptedTurn(app.session.history.items)) |entry| {
+    if (lastInterruptedTurn(app.session.agent.history.items)) |entry| {
         count += 1;
         try writer.writeAll("- interrupted turn");
-        if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{call.name});
+        if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{traceToolDisplayName(call.name)});
         if (entry.completed_tool_names.len > 0) try writer.print(" completed_tools={d}", .{entry.completed_tool_names.len});
         try writer.writeByte('\n');
     }
@@ -2366,21 +2524,11 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
     while (ti > 0 and tool_reported < 5) {
         ti -= 1;
         const call = tool_buf[ti];
-        if (call.ok) continue;
+        if (call.outcome == .succeeded) continue;
         count += 1;
         tool_reported += 1;
         try writer.writeAll("- tool ");
         try writeToolCallCompact(writer, call);
-    }
-
-    const entries = app.subagents.snapshotEntries(alloc) catch &.{};
-    defer if (entries.len > 0) alloc.free(entries);
-    for (entries) |entry| {
-        if (entry.status != .failed) continue;
-        count += 1;
-        try writer.print("- subagent failed id={s} label=", .{entry.id});
-        try writeMaskedInline(writer, alloc, entry.label);
-        try writer.writeByte('\n');
     }
 
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
@@ -2409,7 +2557,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         }
     }
 
-    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, subagent, or MCP state\n");
+    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, or MCP state\n");
 }
 
 fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
@@ -2417,29 +2565,6 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
     try writer.print("TERM: {s}\n", .{io_mod.getenv("TERM") orelse "(unset)"});
     try writer.print("TERM_PROGRAM: {s}\n", .{io_mod.getenv("TERM_PROGRAM") orelse "(unset)"});
     try writer.print("LANG: {s}\n", .{io_mod.getenv("LANG") orelse "(unset)"});
-
-    const tasks = app.background.snapshotTasks(alloc) catch null;
-    if (tasks) |snapshot| {
-        defer snapshot.deinit(alloc);
-        if (snapshot.items.len == 0) {
-            try writer.writeAll("background_tasks: none\n");
-        } else {
-            try writer.print("background_tasks ({d}):\n", .{snapshot.items.len});
-            for (snapshot.items) |task| {
-                try writer.print("  - id={d} state={s} pid={s} cwd=", .{ task.id, @tagName(task.state), task.pid });
-                try writeMaskedInline(writer, alloc, task.cwd);
-                try writer.writeAll(" command=");
-                try writeMaskedInline(writer, alloc, task.command);
-                try writer.writeAll(" log=");
-                try writeMaskedInline(writer, alloc, task.log_path);
-                if (task.server_url) |url| {
-                    try writer.writeAll(" url=");
-                    try writeMaskedInline(writer, alloc, url);
-                }
-                try writer.writeByte('\n');
-            }
-        }
-    }
 
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()
@@ -2609,71 +2734,157 @@ fn writePermissionsSummary(writer: *std.Io.Writer, grants: []const types.Permiss
     }
     try writer.print("\n## Permissions\npermission grants ({d}):\n", .{grants.len});
     for (grants) |grant| {
-        try writer.print("  - {s} :: {s}\n", .{ grant.tool_name, grant.target_path });
-    }
-}
-
-fn writeSubagentsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator, controller: anytype) !void {
-    const entries = controller.snapshotEntries(alloc) catch {
-        try writer.writeAll("\n## Subagents\n(snapshot failed)\n");
-        return;
-    };
-    defer alloc.free(entries);
-    if (entries.len == 0) {
-        try writer.writeAll("\n## Subagents\n(none)\n");
-        return;
-    }
-    try writer.print("\n## Subagents\ncount={d}\n", .{entries.len});
-    for (entries) |entry| {
-        try writer.print("[{s}] ", .{entry.id});
-        try writeMaskedInline(writer, alloc, entry.label);
-        try writer.print(" status={s} unread={d}", .{ ui_subagents.statusLabelPublic(entry.status), entry.unread_count });
-        if (entry.external_busy) try writer.writeAll(" external_busy=true");
-        try writer.writeByte('\n');
+        try writer.print("  - {s} :: {s}\n", .{ traceToolDisplayName(grant.tool_name), grant.target_path });
     }
 }
 
 fn writeToolCallCompact(writer: *std.Io.Writer, call: diagnostics.ToolCallMetric) !void {
     try writeTraceTimestampUtc(writer, call.started_at_ms);
-    try writer.print(" name={s} status={s} duration={d}ms", .{ call.name(), if (call.ok) "ok" else "err", call.duration_ms });
+    try writer.print(" name={s} outcome={s} duration={d}ms", .{ traceToolDisplayName(call.name()), @tagName(call.outcome), call.duration_ms });
     if (call.subagent_id != 0) try writer.print(" source=subagent#{d}", .{call.subagent_id}) else try writer.writeAll(" source=parent");
     try writer.writeByte('\n');
 }
 
-noinline fn writeToolCallsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+const ProviderToolCallSummary = struct {
+    call_id: []const u8,
+    status: ?types.PersistedToolStatus,
+};
+
+fn findPersistedToolResult(
+    execution: types.ExecutionMemory,
+    call_id: []const u8,
+) ?types.PersistedToolResult {
+    for (execution.tool_steps) |step| {
+        for (step.tool_results) |result| {
+            if (std.mem.eql(u8, result.tool_call_id, call_id)) return result;
+        }
+    }
+    return null;
+}
+
+fn projectProviderToolCalls(
+    history: []const types.HistoryTurn,
+    output: []ProviderToolCallSummary,
+) usize {
+    if (output.len == 0) return 0;
+
+    var count: usize = 0;
+    for (history) |turn| {
+        const execution: types.ExecutionMemory = switch (turn) {
+            .assistant => |entry| entry.execution,
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => continue,
+        };
+        for (execution.tool_steps) |step| {
+            for (step.tool_calls) |call| {
+                if (call.provenance != .provider_executed or
+                    !tool_presentation.isProviderSearchAlias(call.name)) continue;
+                const summary: ProviderToolCallSummary = .{
+                    .call_id = call.id,
+                    .status = if (findPersistedToolResult(execution, call.id)) |result|
+                        result.status
+                    else
+                        null,
+                };
+                if (count < output.len) {
+                    output[count] = summary;
+                    count += 1;
+                } else {
+                    std.mem.copyForwards(
+                        ProviderToolCallSummary,
+                        output[0 .. output.len - 1],
+                        output[1..],
+                    );
+                    output[output.len - 1] = summary;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+fn providerToolStatusLabel(status: ?types.PersistedToolStatus) []const u8 {
+    return if (status) |value| switch (value) {
+        .success => "ok",
+        .failure => "err",
+    } else "pending";
+}
+
+fn writeSearchUsageSummary(writer: *std.Io.Writer, observed: u64, billed: u64) !void {
+    try writer.print("web_search_requests_total: {d} (observed)\n", .{observed});
+    try writer.print("billable_web_search_calls: {d} (billed)\n", .{billed});
+}
+
+noinline fn writeToolCallsSummary(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    history: []const types.HistoryTurn,
+) !void {
     var buf: [diagnostics.tool_call_ring_capacity]diagnostics.ToolCallMetric = undefined;
     const n = diagnostics.snapshotToolCalls(&buf);
-    if (n == 0) {
+    var provider_buf: [diagnostics.tool_call_ring_capacity]ProviderToolCallSummary = undefined;
+    const provider_n = projectProviderToolCalls(history, &provider_buf);
+    if (n == 0 and provider_n == 0) {
         try writer.writeAll("\n## Tool Calls\n(none recorded)\n");
         return;
     }
 
-    var ok_count: u32 = 0;
-    var error_count: u32 = 0;
-    var total_ms: u64 = 0;
-    for (buf[0..n]) |call| {
-        if (call.ok) ok_count += 1 else error_count += 1;
-        total_ms += call.duration_ms;
-    }
-
-    try writer.print("\n## Tool Calls\nlast={d} ok={d} errors={d} total={d}ms\n", .{ n, ok_count, error_count, total_ms });
-    if (error_count > 0) {
-        try writer.writeAll("errors first:\n");
+    try writer.writeAll("\n## Tool Calls\n### Local\n");
+    if (n == 0) {
+        try writer.writeAll("(none locally executed)\n");
+    } else {
+        var succeeded_count: u32 = 0;
+        var rejected_count: u32 = 0;
+        var command_failed_count: u32 = 0;
+        var tool_failed_count: u32 = 0;
+        var runtime_failed_count: u32 = 0;
+        var total_ms: u64 = 0;
         for (buf[0..n]) |call| {
-            if (call.ok) continue;
+            switch (call.outcome) {
+                .succeeded => succeeded_count += 1,
+                .rejected => rejected_count += 1,
+                .command_failed => command_failed_count += 1,
+                .tool_failed => tool_failed_count += 1,
+                .runtime_failed => runtime_failed_count += 1,
+            }
+            total_ms += call.duration_ms;
+        }
+
+        try writer.print(
+            "last={d} succeeded={d} rejected={d} command_failed={d} tool_failed={d} runtime_failed={d} total={d}ms\n",
+            .{ n, succeeded_count, rejected_count, command_failed_count, tool_failed_count, runtime_failed_count, total_ms },
+        );
+        if (succeeded_count != n) {
+            try writer.writeAll("non-successes first:\n");
+            for (buf[0..n]) |call| {
+                if (call.outcome == .succeeded) continue;
+                try writeToolCallCompact(writer, call);
+                try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
+                try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
+            }
+            try writer.writeAll("recent successes (compact):\n");
+        } else {
+            try writer.writeAll("recent successes (compact):\n");
+        }
+        for (buf[0..n]) |call| {
+            if (call.outcome != .succeeded) continue;
             try writeToolCallCompact(writer, call);
             try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
-            try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
+            try writeToolResultPreview(writer, alloc, call.result(), call.result_total_bytes);
         }
-        try writer.writeAll("recent successes (compact):\n");
-    } else {
-        try writer.writeAll("recent successes (compact):\n");
     }
-    for (buf[0..n]) |call| {
-        if (!call.ok) continue;
-        try writeToolCallCompact(writer, call);
-        try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
-        try writeToolResultPreview(writer, alloc, call.result(), call.result_total_bytes);
+
+    try writer.writeAll("### Web Search\n");
+    if (provider_n == 0) {
+        try writer.writeAll("(none retained)\n");
+        return;
+    }
+    try writer.print("last={d}\n", .{provider_n});
+    for (provider_buf[0..provider_n]) |call| {
+        try writer.print(
+            "name=web_search status={s}\n",
+            .{providerToolStatusLabel(call.status)},
+        );
     }
 }
 
@@ -2742,7 +2953,7 @@ fn writeLastInterruptedDetail(writer: *std.Io.Writer, items: []const types.Histo
         .interrupted => |t| {
             try writer.writeAll("\n## Interrupted Turn\nlast turn was interrupted by user\n");
             if (t.tool_call) |call| {
-                try writer.print("  in_flight_tool: {s}\n", .{call.name});
+                try writer.print("  in_flight_tool: {s}\n", .{traceToolDisplayName(call.name)});
                 if (call.arguments_json.len > 0) {
                     try writer.writeAll("  in_flight_args:\n");
                     if (call.arguments_json.len > trace_tool_args_max_bytes) {
@@ -2758,7 +2969,7 @@ fn writeLastInterruptedDetail(writer: *std.Io.Writer, items: []const types.Histo
             }
             if (t.completed_tool_names.len > 0) {
                 try writer.print("  completed_tools ({d}):", .{t.completed_tool_names.len});
-                for (t.completed_tool_names) |name| try writer.print(" {s}", .{name});
+                for (t.completed_tool_names) |name| try writer.print(" {s}", .{traceToolDisplayName(name)});
                 try writer.writeByte('\n');
             }
         },
@@ -2807,11 +3018,14 @@ fn writeTraceLogTail(writer: *std.Io.Writer, alloc: std.mem.Allocator, path: []c
     for (lines.items[start..]) |line| {
         const masked = try text_utils.maskSecrets(alloc, line);
         defer if (masked.ptr != line.ptr) alloc.free(masked);
+        const visible = if (masked.len > trace_transcript_max_line_bytes)
+            masked[0..trace_transcript_max_line_bytes]
+        else
+            masked;
+        try writeTraceTextNeutralized(writer, visible);
         if (masked.len > trace_transcript_max_line_bytes) {
-            try writer.writeAll(masked[0..trace_transcript_max_line_bytes]);
             try writer.writeAll(" ...\n");
         } else {
-            try writer.writeAll(masked);
             try writer.writeByte('\n');
         }
     }
@@ -2939,6 +3153,210 @@ fn renderThematicRuleTimelineBody(alloc: std.mem.Allocator, text: []const u8) ![
     defer alloc.free(stripped);
     const trimmed = std.mem.trimEnd(u8, stripped, " \t\r\n");
     return std.fmt.allocPrint(alloc, "  {s}\n", .{trimmed});
+}
+
+test "workspace slash parser preserves paths with spaces and rejects incomplete actions" {
+    try std.testing.expect((try parseWorkspaceCommand("")) == null);
+    try std.testing.expect((try parseWorkspaceCommand(" list ")) == null);
+    switch ((try parseWorkspaceCommand("clear")).?) {
+        .clear => {},
+        else => return error.TestExpectedEqual,
+    }
+    switch ((try parseWorkspaceCommand(" add /tmp/shared project ")).?) {
+        .add => |path| try std.testing.expectEqualStrings("/tmp/shared project", path),
+        else => return error.TestExpectedEqual,
+    }
+    switch ((try parseWorkspaceCommand("remove\t/tmp/shared project")).?) {
+        .remove => |path| try std.testing.expectEqualStrings("/tmp/shared project", path),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectError(error.InvalidWorkspaceCommand, parseWorkspaceCommand("add"));
+    try std.testing.expectError(error.InvalidWorkspaceCommand, parseWorkspaceCommand("remove"));
+    try std.testing.expectError(error.InvalidWorkspaceCommand, parseWorkspaceCommand("unknown"));
+}
+
+test "workspace mutation admission rejects queue-zero processing gap" {
+    const alloc = std.testing.allocator;
+    var app = struct {
+        stream: struct { active: bool = false } = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+    }{};
+    defer app.worker.deinit(alloc);
+
+    try app.worker.enqueuePrompt(alloc, .{
+        .prompt = try alloc.dupe(u8, "active turn"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    const active = (try app.worker.waitAndTakeNextPrompt(alloc)).?;
+    defer worker_runtime.freeQueuedPrompt(alloc, active);
+
+    try std.testing.expectEqual(@as(usize, 0), app.worker.queuedPromptCount());
+    try std.testing.expect(!tryBeginWorkspaceMutation(&app));
+
+    app.worker.finishProcessing();
+    try std.testing.expect(tryBeginWorkspaceMutation(&app));
+    app.worker.releaseTurnStartHold();
+}
+
+test "workspace list refresh waits for an idle turn" {
+    const alloc = std.testing.allocator;
+    const TestApp = struct {
+        stream: struct { active: bool = false } = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+        available: bool = true,
+        active: bool = true,
+        index_refresh_count: usize = 0,
+
+        fn refreshWorkspaceAccess(self: *@This()) !bool {
+            self.available = false;
+            self.active = false;
+            self.index_refresh_count += 1;
+            return true;
+        }
+    };
+    var app = TestApp{};
+    defer app.worker.deinit(alloc);
+
+    app.stream.active = true;
+    try refreshWorkspaceAvailabilityForList(&app);
+    try std.testing.expect(app.available);
+    try std.testing.expect(app.active);
+    try std.testing.expectEqual(@as(usize, 0), app.index_refresh_count);
+
+    app.stream.active = false;
+    try app.worker.enqueuePrompt(alloc, .{
+        .prompt = try alloc.dupe(u8, "active turn"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    const queued = (try app.worker.waitAndTakeNextPrompt(alloc)).?;
+    defer worker_runtime.freeQueuedPrompt(alloc, queued);
+
+    try refreshWorkspaceAvailabilityForList(&app);
+    try std.testing.expect(app.available);
+    try std.testing.expect(app.active);
+    try std.testing.expectEqual(@as(usize, 0), app.index_refresh_count);
+
+    app.worker.finishProcessing();
+    try refreshWorkspaceAvailabilityForList(&app);
+    try std.testing.expect(!app.available);
+    try std.testing.expect(!app.active);
+    try std.testing.expectEqual(@as(usize, 1), app.index_refresh_count);
+}
+
+test "workspace list reports refresh rejection without replacing access" {
+    const alloc = std.testing.allocator;
+    const Access = @import("../workspace/workspace_access.zig").WorkspaceAccess;
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        workspace_root: []const u8 = "/tmp/workspace",
+        stream: struct { active: bool = false } = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+        access: Access = .{},
+        transcript: std.ArrayList(u8) = .empty,
+        last_tone: ?types.NoticeTone = null,
+
+        fn deinit(self: *@This()) void {
+            self.worker.deinit(self.alloc);
+            self.transcript.deinit(self.alloc);
+        }
+
+        fn refreshWorkspaceAccess(_: *@This()) !bool {
+            return error.TooManyDirectories;
+        }
+
+        fn workspaceAccess(self: *@This()) *const Access {
+            return &self.access;
+        }
+
+        fn installWorkspaceAccess(_: *@This(), _: *Access) bool {
+            return false;
+        }
+
+        noinline fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.last_tone = notice.tone;
+            try self.transcript.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = TestApp{ .alloc = alloc };
+    defer app.deinit();
+    try handleWorkspaceCommand(&app, "");
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Workspace refresh rejected: additional directory limit reached") != null);
+    try std.testing.expectEqual(@as(usize, 0), app.access.entries.len);
+}
+
+test "trace timeline retains semantic table contents" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit(alloc);
+    }
+
+    const table = try assistant_presentation.parseTablePayload(
+        alloc,
+        "| Name | Count |\n" ++
+            "|------|------:|\n" ++
+            "| api | 7 |\n",
+    );
+    try entries.append(alloc, .{ .assistant_table = .{ .id = 1, .table = table } });
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeTranscriptTimeline(&out.writer, alloc, entries.items);
+
+    try std.testing.expect(std.mem.find(u8, out.written(), "api") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "[structured table]") == null);
+}
+
+test "trace timeline retains semantic code block contents" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit(alloc);
+    }
+
+    const block = assistant_presentation.CodeBlockPayload{
+        .language = try alloc.dupe(u8, "zig"),
+        .code = try alloc.dupe(u8, "const value = 1;\n"),
+    };
+    try entries.append(alloc, .{ .assistant_code_block = .{ .id = 1, .block = block } });
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeTranscriptTimeline(&out.writer, alloc, entries.items);
+
+    try std.testing.expect(std.mem.find(u8, out.written(), "assistant code block") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "const value = 1;") != null);
+}
+
+test "trace timeline retains the semantic thematic rule adapter" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit(alloc);
+    }
+    try entries.append(alloc, .{ .assistant_thematic_rule = .{ .id = 1 } });
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeTranscriptTimeline(&out.writer, alloc, entries.items);
+
+    try std.testing.expect(std.mem.find(u8, out.written(), "assistant thematic rule") != null);
+    try std.testing.expectEqual(@as(usize, 60), std.mem.count(u8, out.written(), "\xe2\x94\x80"));
 }
 
 fn isBannerNoiseLine(line: []const u8) bool {
@@ -3421,6 +3839,174 @@ const CreditsCommandFakeApp = struct {
     }
 };
 
+const McpCommandFakeApp = struct {
+    const ReloadBehavior = enum {
+        published_empty,
+        published_healthy,
+        published_degraded,
+        retained,
+        completion_failed,
+        begin_failed,
+    };
+
+    alloc: std.mem.Allocator,
+    notice_body: std.ArrayList(u8) = .empty,
+    list_count: usize = 0,
+    reload_count: usize = 0,
+    notice_count: usize = 0,
+    last_topic: ?[]const u8 = null,
+    last_tone: ?types.NoticeTone = null,
+    reload_behavior: ReloadBehavior = .published_empty,
+    reload_pending: bool = false,
+    authentication_pending: bool = false,
+    completion_origin: app_mcp_runtime.PresentationOrigin = .command,
+    menu_reload_completions: usize = 0,
+    menu_authentication_completions: usize = 0,
+
+    fn deinit(self: *McpCommandFakeApp) void {
+        self.notice_body.deinit(self.alloc);
+    }
+
+    fn mcpCommandProvider(_: *const McpCommandFakeApp) mcp_command_provider.Provider {
+        return .{ .handle_fn = handleMcpCommand };
+    }
+
+    fn handleMcpCommand(
+        alloc: std.mem.Allocator,
+        rest: []const u8,
+        request: mcp_command_provider.Request,
+    ) !mcp_command_provider.Result {
+        if (std.mem.eql(u8, rest, "reload")) {
+            return .{
+                .display = .{
+                    .line = try alloc.dupe(u8, "Evaluating trusted profile MCP configuration."),
+                },
+                .reload = true,
+                .report_reload = true,
+            };
+        }
+        try std.testing.expectEqualStrings("auth fixture --open", rest);
+        const self: *McpCommandFakeApp = @ptrCast(@alignCast(request.list_ctx));
+        self.authentication_pending = true;
+        return .{
+            .display = .{
+                .line = try alloc.dupe(
+                    u8,
+                    "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
+                ),
+            },
+        };
+    }
+
+    fn listMcpServersAndTools(self: *McpCommandFakeApp, alloc: std.mem.Allocator) ![]u8 {
+        self.list_count += 1;
+        return alloc.dupe(u8, "configured server and tool\n");
+    }
+
+    fn summarizeMcpServers(self: *McpCommandFakeApp, alloc: std.mem.Allocator) ![]u8 {
+        return self.listMcpServersAndTools(alloc);
+    }
+
+    fn beginMcpReload(self: *McpCommandFakeApp) !void {
+        self.reload_count += 1;
+        if (self.reload_behavior == .begin_failed) return error.TestReloadFailed;
+        self.reload_pending = true;
+    }
+
+    fn takeMcpReloadCompletion(self: *McpCommandFakeApp) !?app_mcp_runtime.ReloadCompletion {
+        if (!self.reload_pending) return null;
+        self.reload_pending = false;
+        return switch (self.reload_behavior) {
+            .published_empty => .{ .outcome = .{ .published = .{
+                .generation = null,
+                .health = .ready,
+                .configured_server_count = 0,
+                .unavailable_server_names = try self.alloc.alloc([]u8, 0),
+            } } },
+            .published_healthy => .{ .outcome = .{ .published = .{
+                .generation = 42,
+                .health = .ready,
+                .configured_server_count = 1,
+                .unavailable_server_names = try self.alloc.alloc([]u8, 0),
+            } } },
+            .published_degraded => degraded: {
+                const names = try self.alloc.alloc([]u8, 2);
+                errdefer self.alloc.free(names);
+                names[0] = try self.alloc.dupe(u8, "alpha");
+                errdefer self.alloc.free(names[0]);
+                names[1] = try self.alloc.dupe(u8, "beta");
+                break :degraded .{ .outcome = .{ .published = .{
+                    .generation = 43,
+                    .health = .degraded,
+                    .configured_server_count = 3,
+                    .unavailable_server_names = names,
+                } } };
+            },
+            .retained => .{ .outcome = .{
+                .retained_required_failure = try self.alloc.dupe(
+                    u8,
+                    "Required MCP server 'fixture' failed to start.",
+                ),
+            } },
+            .completion_failed => .{ .failed = error.TestReloadFailed },
+            .begin_failed => unreachable,
+        };
+    }
+
+    fn mcpReloadCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+        return self.completion_origin;
+    }
+
+    fn applyMcpMenuReloadCompletion(
+        self: *McpCommandFakeApp,
+        generation: u64,
+        _: *const app_mcp_runtime.ReloadCompletion,
+    ) !void {
+        try std.testing.expectEqual(@as(u64, 77), generation);
+        self.menu_reload_completions += 1;
+    }
+
+    fn takeMcpAuthenticationCompletion(
+        self: *McpCommandFakeApp,
+    ) !?app_mcp_runtime.AuthenticationCompletion {
+        if (!self.authentication_pending) return null;
+        self.authentication_pending = false;
+        return .{
+            .server_name = try self.alloc.dupe(u8, "fixture"),
+            .result = .{ .authenticated = .{} },
+        };
+    }
+
+    fn mcpAuthenticationCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+        return self.completion_origin;
+    }
+
+    fn applyMcpMenuAuthenticationCompletion(
+        self: *McpCommandFakeApp,
+        generation: u64,
+        _: *const app_mcp_runtime.AuthenticationCompletion,
+    ) !void {
+        try std.testing.expectEqual(@as(u64, 77), generation);
+        self.menu_authentication_completions += 1;
+    }
+
+    noinline fn writeDomainNotice(self: *McpCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
+        self.notice_count += 1;
+        self.last_topic = notice.topic;
+        self.last_tone = notice.tone;
+        try self.notice_body.appendSlice(self.alloc, notice.body);
+    }
+};
+
+test "sound command parses toggle and off/on/max levels" {
+    try std.testing.expectEqual(ParsedSoundCommand.toggle, parseSoundCommand("  \t"));
+    try std.testing.expectEqual(ParsedSoundCommand{ .set = .on }, parseSoundCommand("on"));
+    try std.testing.expectEqual(ParsedSoundCommand{ .set = .off }, parseSoundCommand("off"));
+    try std.testing.expectEqual(ParsedSoundCommand{ .set = .max }, parseSoundCommand("max"));
+    try std.testing.expectEqual(ParsedSoundCommand.invalid, parseSoundCommand("turn-end"));
+    try std.testing.expectEqual(ParsedSoundCommand.invalid, parseSoundCommand("max extra"));
+}
+
 const ClearCommandFakeApp = struct {
     clear_count: usize = 0,
     new_count: usize = 0,
@@ -3443,6 +4029,19 @@ const QuitCommandFakeApp = struct {
     should_exit: bool = false,
     session_persistence: app_session_runtime.Persistence = .{},
 };
+
+test "quit command requests resume handoff before exit" {
+    var app = QuitCommandFakeApp{};
+    defer app.session_persistence.deinit(std.testing.allocator);
+
+    requestResumeExit(&app);
+
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(
+        app_session_runtime.ResumeHandoffIntent.requested,
+        app.session_persistence.resume_handoff_intent,
+    );
+}
 
 const ClipboardCommandFakeApp = struct {
     const CopyOutcome = enum {
@@ -3535,8 +4134,10 @@ const SkillsInstallReplayApp = struct {
         self.shell.deinit(self.alloc);
     }
 
-    fn reloadSkills(self: *SkillsInstallReplayApp) !void {
+    fn requestSkillsRefresh(self: *SkillsInstallReplayApp) !u64 {
         self.reload_count += 1;
+        self.skills.fresh_through_generation = self.reload_count;
+        return self.reload_count;
     }
 
     noinline fn writeDomainNotice(self: *SkillsInstallReplayApp, notice: types.SemanticNotice, _: bool) !void {
@@ -3564,3 +4165,854 @@ const ChangeCommandFakeApp = struct {
         try self.transcript.appendSlice(self.alloc, notice.body);
     }
 };
+
+fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
+    if (std.fs.path.dirname(sub_path)) |parent| {
+        try tmp.dir.createDirPath(io_mod.getIo(), parent);
+    }
+    var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), content);
+}
+
+test "trace notice distinguishes Markdown file outcomes without a feedback CTA" {
+    const report_path = "/tmp/trace.md";
+    const cases = [_]struct {
+        disposition: TraceReportDisposition,
+        expected: []const u8,
+    }{
+        .{
+            .disposition = .{ .copied_file = report_path },
+            .expected = "Trace copied to clipboard. Review and redact it before sharing.",
+        },
+        .{
+            .disposition = .{ .copy_failed = report_path },
+            .expected = "Clipboard copy failed. Trace saved at /tmp/trace.md. Review and redact it before sharing.",
+        },
+        .{
+            .disposition = .{ .saved = report_path },
+            .expected = "Trace saved at /tmp/trace.md. Review and redact it before sharing.",
+        },
+        .{
+            .disposition = .unavailable,
+            .expected = "Could not create trace.",
+        },
+    };
+
+    for (cases) |case| {
+        const body = try format_trace_notice(std.testing.allocator, case.disposition);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqualStrings(case.expected, body);
+        try std.testing.expect(std.mem.find(u8, body, "feedback") == null);
+        try std.testing.expect(std.mem.find(u8, body, "Report issue") == null);
+    }
+}
+
+test "trace report file uses private randomized markdown path" {
+    const alloc = std.testing.allocator;
+    const path = try writeTraceReportFile(alloc, "hello\n");
+    defer alloc.free(path);
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+
+    try std.testing.expect(std.mem.find(u8, path, "fx-trace-") != null);
+    try std.testing.expect(std.mem.endsWith(u8, path, ".md"));
+
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    const stat = try file.stat(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 6), stat.size);
+    if (@import("builtin").os.tag != .windows) {
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+    }
+}
+
+test "trace auth summary preserves missing and loaded status text" {
+    const alloc = std.testing.allocator;
+    var app = struct { auth: auth_runtime.Runtime = .{} }{};
+    defer app.auth.deinit(alloc);
+
+    var missing: std.Io.Writer.Allocating = .init(alloc);
+    defer missing.deinit();
+    try writeAuthStateSummary(&missing.writer, &app);
+    try std.testing.expectEqualStrings(
+        "auth: source=missing refreshable=false gateway_team=unknown\n",
+        missing.written(),
+    );
+
+    var credential = credentials.Credential{
+        .token = try alloc.dupe(u8, "token"),
+        .source = .fx_login,
+    };
+    defer credential.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &credential);
+    var loaded: std.Io.Writer.Allocating = .init(alloc);
+    defer loaded.deinit();
+    try writeAuthStateSummary(&loaded.writer, &app);
+    try std.testing.expectEqualStrings(
+        "auth: source=fx login refreshable=true gateway_team=unset\n",
+        loaded.written(),
+    );
+}
+
+test "trace tool calls preserve outcomes and mask obvious secrets" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    const fixtures = [_]struct {
+        name: []const u8,
+        outcome: diagnostics.ToolCallOutcome,
+        args: []const u8,
+        result: []const u8,
+        subagent_id: u64 = 0,
+    }{
+        .{ .name = "read_file", .outcome = .succeeded, .args = "{\"path\":\"README.md\"}", .result = "read ok" },
+        .{ .name = "edit_file", .outcome = .rejected, .args = "{}", .result = "not unique" },
+        .{ .name = "shell", .outcome = .command_failed, .args = "{}", .result = "exit 7" },
+        .{ .name = "read_file", .outcome = .tool_failed, .args = "{}", .result = "missing" },
+        .{ .name = "run_command", .outcome = .runtime_failed, .args = "{\"command\":\"AI_GATEWAY_API_KEY=abcdefghijklmnop zig build\"}", .result = "failed with PASSWORD=abcdefghijklmnop", .subagent_id = 3 },
+    };
+    for (fixtures, 0..) |fixture, index| {
+        var call: diagnostics.ToolCallMetric = .{
+            .started_at_ms = @intCast(1000 + index),
+            .duration_ms = 1,
+            .outcome = fixture.outcome,
+            .subagent_id = fixture.subagent_id,
+        };
+        call.setName(fixture.name);
+        call.setArgs(fixture.args);
+        call.setResult(fixture.result);
+        diagnostics.recordToolCall(call);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallsSummary(&out.writer, alloc, &.{});
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "last=5 succeeded=1 rejected=1 command_failed=1 tool_failed=1 runtime_failed=1") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=edit_file outcome=rejected") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=shell outcome=command_failed") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=read_file outcome=tool_failed") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=run_command outcome=runtime_failed") != null);
+    const non_success_pos = std.mem.find(u8, text, "name=run_command") orelse return error.TestExpectedEqual;
+    const success_pos = std.mem.find(u8, text, "name=read_file outcome=succeeded") orelse return error.TestExpectedEqual;
+    try std.testing.expect(non_success_pos < success_pos);
+    try std.testing.expect(std.mem.find(u8, text, "source=subagent#3") != null);
+    try std.testing.expect(std.mem.find(u8, text, "abcdefghijklmnop") == null);
+    try std.testing.expect(std.mem.find(u8, text, "AI_GATEWAY_API_KEY=[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "PASSWORD=[redacted]") != null);
+}
+
+test "trace successful tool calls use compact result previews" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var call: diagnostics.ToolCallMetric = .{ .started_at_ms = 3000, .duration_ms = 1, .outcome = .succeeded };
+    call.setName("read_file");
+    call.setArgs("{\"path\":\"README.md\"}");
+    call.setResult("<path>README.md</path>\n<content>\n# fx\n\nlong body line\n</content>");
+    diagnostics.recordToolCall(call);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallsSummary(&out.writer, alloc, &.{});
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "recent successes (compact):") != null);
+    try std.testing.expect(std.mem.find(u8, text, "result_preview: # fx") != null);
+    try std.testing.expect(std.mem.find(u8, text, "<path>README.md</path>") == null);
+    try std.testing.expect(std.mem.find(u8, text, "long body line") == null);
+}
+
+test "trace omits web_fetch URL and result bodies from tool-call diagnostics" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var call: diagnostics.ToolCallMetric = .{ .started_at_ms = 4000, .duration_ms = 3, .outcome = .succeeded };
+    call.setName("web_fetch");
+    call.setArgs("{\"url\":\"https://example.com/docs\"}");
+    call.setResult("<content>\nFETCHED_PAGE_SECRET_RAW\nEXTRACTED_RESULT_SECRET\n</content>");
+    diagnostics.recordToolCall(call);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallsSummary(&out.writer, alloc, &.{});
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "name=web_fetch") != null);
+    try std.testing.expect(std.mem.find(u8, text, "source=parent") != null);
+    try std.testing.expect(std.mem.find(u8, text, "PROMPT_BODY_SECRET") == null);
+    try std.testing.expect(std.mem.find(u8, text, "FETCHED_PAGE_SECRET_RAW") == null);
+    try std.testing.expect(std.mem.find(u8, text, "EXTRACTED_RESULT_SECRET") == null);
+    try std.testing.expect(std.mem.find(u8, text, "args:") == null);
+    try std.testing.expect(std.mem.find(u8, text, "result_preview:") == null);
+}
+
+test "trace web search calls hide provider names and payloads" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var calls = [_]types.ToolCall{
+        .{
+            .id = "call_exa",
+            .name = "exa_search",
+            .arguments_json = "{\"query\":\"PROVIDER_ARGUMENT_SECRET\"}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "call_parallel",
+            .name = "parallel_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "call_pending",
+            .name = "perplexity_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "call_local",
+            .name = "read_file",
+            .arguments_json = "{}",
+            .provenance = .fx_local,
+        },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_parallel"),
+            .tool_name = @constCast("parallel_search"),
+            .status = .failure,
+            .output = @constCast("PROVIDER_RESULT_SECRET"),
+            .output_bytes = 22,
+            .stored_output_bytes = 22,
+            .provider_native = true,
+        },
+        .{
+            .tool_call_id = @constCast("call_exa"),
+            .tool_name = @constCast("exa_search"),
+            .status = .success,
+            .output = @constCast("{\"results\":[]}"),
+            .output_bytes = 14,
+            .stored_output_bytes = 14,
+            .provider_native = true,
+        },
+    };
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("search") },
+        .assistant = @constCast("answer"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallsSummary(&out.writer, alloc, &history);
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "name=web_search status=ok") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=web_search status=err") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=web_search status=pending") != null);
+    try std.testing.expect(std.mem.find(u8, text, "call_id=") == null);
+    try std.testing.expect(std.mem.find(u8, text, "exa_search") == null);
+    try std.testing.expect(std.mem.find(u8, text, "parallel_search") == null);
+    try std.testing.expect(std.mem.find(u8, text, "perplexity_search") == null);
+    try std.testing.expect(std.mem.find(u8, text, "name=read_file") == null);
+    try std.testing.expect(std.mem.find(u8, text, "PROVIDER_ARGUMENT_SECRET") == null);
+    try std.testing.expect(std.mem.find(u8, text, "PROVIDER_RESULT_SECRET") == null);
+    try std.testing.expect(std.mem.find(u8, text, "(none recorded)") == null);
+}
+
+test "trace text normalizes internal search aliases" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeTraceTextNeutralized(
+        &out.writer,
+        "name=exa_search call_id=exa_search_0 fallback=parallel_search legacy=perplexity_search visible=web_search",
+    );
+
+    try std.testing.expectEqualStrings(
+        "name=web_search call_id=web_search_0 fallback=web_search legacy=web_search visible=web_search",
+        out.written(),
+    );
+}
+
+test "trace provider tool projection keeps the most recent bounded calls" {
+    var calls: [diagnostics.tool_call_ring_capacity + 1]types.ToolCall = undefined;
+    for (&calls, 0..) |*call, index| {
+        call.* = .{
+            .id = if (index == 0)
+                "oldest"
+            else if (index + 1 == calls.len)
+                "newest"
+            else
+                "middle",
+            .name = "exa_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        };
+    }
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("search") },
+        .assistant = @constCast("answer"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    var summaries: [diagnostics.tool_call_ring_capacity]ProviderToolCallSummary = undefined;
+
+    const count = projectProviderToolCalls(&history, &summaries);
+
+    try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, count);
+    try std.testing.expectEqualStrings("middle", summaries[0].call_id);
+    try std.testing.expectEqualStrings("newest", summaries[count - 1].call_id);
+}
+
+test "trace labels observed and billed search usage independently" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeSearchUsageSummary(&out.writer, 3, 1);
+
+    try std.testing.expectEqualStrings(
+        "web_search_requests_total: 3 (observed)\n" ++
+            "billable_web_search_calls: 1 (billed)\n",
+        out.written(),
+    );
+}
+
+test "trace renders web search request count without content" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var call: diagnostics.NetworkCall = .{
+        .kind = .web_search,
+        .started_at_ms = 3000,
+        .duration_ms = 11,
+        .status = 200,
+        .input_tokens = 12,
+        .output_tokens = 34,
+        .is_web_search = true,
+        .web_search_requests = 2,
+    };
+    call.setModel("gateway/native-search-worker");
+    call.setTerminalStopReason("max_tokens");
+    diagnostics.recordNetworkCall(call);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "web_search_requests=2") != null);
+    try std.testing.expect(std.mem.find(u8, text, "stop_reason=max_tokens") != null);
+    try std.testing.expect(std.mem.find(u8, text, "raw result content") == null);
+}
+
+test "trace renders gateway schema diagnostics without raw payload content" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var call: diagnostics.NetworkCall = .{
+        .started_at_ms = 5000,
+        .duration_ms = 17,
+        .status = 400,
+        .response_bytes = 91,
+        .turn_id = 12,
+        .step_id = 34,
+    };
+    call.setModel("zai/glm-5.2-fast");
+    call.setGatewaySchemaDiagnostic("path=prompt.0.content expected=string received=array");
+    call.setGatewayRequestShape("bytes=123 prompt_count=1 prompt.0 role=system content=array tools=array tools_count=0 toolChoice=auto");
+    diagnostics.recordNetworkCall(call);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "status=400") != null);
+    try std.testing.expect(std.mem.find(u8, text, "turn=12") != null);
+    try std.testing.expect(std.mem.find(u8, text, "step=34") != null);
+    try std.testing.expect(std.mem.find(u8, text, "gateway_schema=\"path=prompt.0.content expected=string received=array\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "request_shape=\"bytes=123 prompt_count=1 prompt.0 role=system content=array") != null);
+    try std.testing.expect(std.mem.find(u8, text, "SECRET_RAW_PROMPT") == null);
+}
+
+test "app_commands exposes active handler API surface" {
+    const HandlerSurface = Handlers(SurfaceOnlyApp);
+
+    const route_info = @typeInfo(@TypeOf(HandlerSurface.route)).@"fn";
+    try std.testing.expectEqual(@as(usize, 2), route_info.params.len);
+    try std.testing.expect(route_info.params[0].type.? == *SurfaceOnlyApp);
+    try std.testing.expect(route_info.params[1].type.? == []const u8);
+
+    const handlers_info = @typeInfo(@TypeOf(HandlerSurface.commandHandlers)).@"fn";
+    try std.testing.expectEqual(@as(usize, 1), handlers_info.params.len);
+    try std.testing.expect(handlers_info.params[0].type.? == *SurfaceOnlyApp);
+    try std.testing.expect(handlers_info.return_type.? == command_router.CommandHandlers);
+}
+
+test "credits command renders through the composed provider" {
+    var app = CreditsCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(CreditsCommandFakeApp).commandShowCredits(@ptrCast(&app));
+
+    try std.testing.expectEqual(@as(usize, 1), app.calls);
+    try std.testing.expect(app.saw_expected_input);
+    try std.testing.expectEqualStrings("credits", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings("balance=10", app.notice_body.items);
+}
+
+test "app_commands routes clear through carry-forward session reset" {
+    var app = ClearCommandFakeApp{};
+
+    try clearSessionForClearCommand(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.clear_count);
+    try std.testing.expectEqual(@as(usize, 0), app.reset_count);
+}
+
+test "copy command routes exact reply bytes through the host clipboard" {
+    var app = ClipboardCommandFakeApp{
+        .session = .{ .reply = "reply\nwith exact bytes" },
+    };
+
+    try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
+
+    try std.testing.expectEqual(@as(usize, 1), app.copy_calls);
+    try std.testing.expectEqualStrings("reply\nwith exact bytes", app.copied_text.?);
+    try std.testing.expectEqualStrings("clipboard", app.last_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    try std.testing.expectEqualStrings("Copied to clipboard.", app.last_body.?);
+}
+
+test "copy command reports missing replies and host failures" {
+    var app = ClipboardCommandFakeApp{};
+
+    try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
+    try std.testing.expectEqual(@as(usize, 0), app.copy_calls);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    try std.testing.expectEqualStrings("No assistant reply to copy.", app.last_body.?);
+
+    app.session.reply = "reply";
+    for ([_]ClipboardCommandFakeApp.CopyOutcome{ .unavailable, .failed }) |outcome| {
+        app.copy_outcome = outcome;
+        app.last_tone = null;
+        app.last_body = null;
+
+        try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
+
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+        try std.testing.expectEqualStrings("Failed to copy to clipboard.", app.last_body.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), app.copy_calls);
+}
+
+test "app_commands renders transactional status for explicit MCP reload" {
+    var app = McpCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "reload");
+
+    try std.testing.expectEqual(@as(usize, 0), app.list_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqualStrings("mcp", app.last_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    try std.testing.expectEqualStrings(
+        "MCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
+        app.notice_body.items,
+    );
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        app.notice_body.items,
+        "MCP configuration reloaded. No servers are configured.",
+    ));
+}
+
+test "menu-origin MCP completions never publish transcript notices" {
+    var reload_app = McpCommandFakeApp{
+        .alloc = std.testing.allocator,
+        .reload_pending = true,
+        .completion_origin = .{ .menu = 77 },
+    };
+    defer reload_app.deinit();
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&reload_app);
+    try std.testing.expectEqual(@as(usize, 1), reload_app.menu_reload_completions);
+    try std.testing.expectEqual(@as(usize, 0), reload_app.notice_count);
+
+    var authentication_app = McpCommandFakeApp{
+        .alloc = std.testing.allocator,
+        .authentication_pending = true,
+        .completion_origin = .{ .menu = 77 },
+    };
+    defer authentication_app.deinit();
+    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&authentication_app);
+    try std.testing.expectEqual(@as(usize, 1), authentication_app.menu_authentication_completions);
+    try std.testing.expectEqual(@as(usize, 0), authentication_app.notice_count);
+}
+
+test "app_commands explains healthy and degraded MCP reloads without internal state" {
+    const cases = [_]struct {
+        behavior: McpCommandFakeApp.ReloadBehavior,
+        tone: types.NoticeTone,
+        expected: []const u8,
+    }{
+        .{
+            .behavior = .published_healthy,
+            .tone = .neutral,
+            .expected = "MCP configuration reloaded successfully.",
+        },
+        .{
+            .behavior = .published_degraded,
+            .tone = .warning,
+            .expected = "MCP configuration reloaded, but 2 servers are unavailable: 'alpha', 'beta'. Run /mcp list for details.",
+        },
+    };
+
+    for (cases) |case| {
+        var app = McpCommandFakeApp{
+            .alloc = std.testing.allocator,
+            .reload_behavior = case.behavior,
+        };
+        defer app.deinit();
+
+        try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "reload");
+        try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+
+        try std.testing.expectEqual(case.tone, app.last_tone.?);
+        try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, case.expected));
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "runtime 42") == null);
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "degraded") == null);
+    }
+}
+
+test "app_commands preserves command display after implicit MCP reload" {
+    var app = McpCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "auth fixture --open");
+
+    try std.testing.expectEqual(@as(usize, 0), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqualStrings("mcp", app.last_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    try std.testing.expectEqualStrings(
+        "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
+        app.notice_body.items,
+    );
+    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        app.notice_body.items,
+        "Authenticated MCP server 'fixture'.\nMCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
+    ));
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try std.testing.expectEqual(@as(usize, 3), app.notice_count);
+}
+
+test "app_commands warns when implicit MCP reload cannot replace the active servers" {
+    for ([_]McpCommandFakeApp.ReloadBehavior{ .retained, .completion_failed, .begin_failed }) |behavior| {
+        var app = McpCommandFakeApp{
+            .alloc = std.testing.allocator,
+            .reload_behavior = behavior,
+        };
+        defer app.deinit();
+
+        try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "auth fixture --open");
+
+        try std.testing.expectEqual(@as(usize, 0), app.reload_count);
+        try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+        try std.testing.expectEqualStrings("mcp", app.last_topic.?);
+        try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&app);
+        try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+        try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+        if (behavior != .begin_failed) {
+            try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+            try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+            try std.testing.expectEqual(@as(usize, 3), app.notice_count);
+            try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
+            try std.testing.expect(std.mem.find(
+                u8,
+                app.notice_body.items,
+                "MCP configuration could not be reloaded. Your existing MCP servers are still active.",
+            ) != null);
+        } else {
+            try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
+            try std.testing.expect(std.mem.find(
+                u8,
+                app.notice_body.items,
+                "MCP configuration could not be reloaded. Your existing MCP servers are still active.",
+            ) != null);
+        }
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "TestReloadFailed") == null);
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "/mcp list") != null);
+    }
+}
+
+test "skills install groups command notice fragments for entry replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempSkillFile(&tmp, "pack/SKILL.md", "---\nname: root-skill\ndescription: root\n---\n\nbody\n");
+    try writeTempSkillFile(&tmp, "pack/nested/SKILL.md", "---\nname: nested-skill\ndescription: nested\n---\n\nbody\n");
+    try tmp.dir.createDirPath(io_mod.getIo(), "dest");
+
+    const pack_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "pack");
+    defer alloc.free(pack_dir);
+    const dest_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "dest");
+    defer alloc.free(dest_dir);
+
+    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .dir = dest_dir } };
+    defer app.deinit();
+
+    const args = try std.fmt.allocPrint(alloc, "install {s}", .{pack_dir});
+    defer alloc.free(args);
+    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), args);
+
+    try std.testing.expectEqual(@as(usize, 2), app.shell.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.write_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
+    try std.testing.expect(app.shell.entries.items[1] == .semantic_notice);
+    try std.testing.expectEqualStrings("skills", app.shell.entries.items[0].semantic_notice.topic);
+    const installing_body = try std.fmt.allocPrint(alloc, "Installing from {s}...", .{pack_dir});
+    defer alloc.free(installing_body);
+    try std.testing.expectEqualStrings(installing_body, app.shell.entries.items[0].semantic_notice.body);
+    try std.testing.expectEqualStrings(
+        "Installed: root-skill\nInstalled: nested-skill",
+        app.shell.entries.items[1].semantic_notice.body,
+    );
+
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "● Skills: Installing from "));
+    try std.testing.expect(std.mem.find(u8, rendered, "\n\n● Skills: Installed: root-skill") != null);
+    try std.testing.expect(std.mem.endsWith(u8, rendered, "  Installed: nested-skill"));
+}
+
+test "help command opens the catalog without writing transcript output" {
+    const alloc = std.testing.allocator;
+    var app = SkillsInstallReplayApp{ .alloc = alloc };
+    defer app.deinit();
+    app.skills.openMenu();
+
+    try Handlers(SkillsInstallReplayApp).commandShowHelp(@ptrCast(&app));
+
+    try std.testing.expect(!app.skills.menu.active);
+    try std.testing.expect(app.input_runtime.help_menu.active);
+    try std.testing.expectEqual(@as(usize, 0), app.write_count);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.entries.items.len);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "skills list opens menu without transcript inventory" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{
+            .name = "managed",
+            .description = "managed skill",
+            .path = "/tmp/managed/SKILL.md",
+            .source = .global_fx,
+        },
+        .{
+            .name = "workspace",
+            .description = "workspace skill",
+            .path = "/tmp/workspace/skills/workspace/SKILL.md",
+            .source = .workspace_shared,
+        },
+    };
+    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .items = @constCast(&skills) } };
+    defer app.deinit();
+
+    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "list");
+
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 0), app.write_count);
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expectEqual(@as(usize, 0), app.skills.menu.selected_index);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "Visible skills (") == null);
+}
+
+test "skills list reports a bounded discovery warning with an escaped candidate path" {
+    const alloc = std.testing.allocator;
+    const skill_diagnostics = [_]skill_runtime.SkillDiagnostic{.{
+        .path = "/tmp/hostile\npath/body-sentinel",
+        .source = .workspace_shared,
+        .scope = .candidate,
+        .cause = .{ .invalid_metadata = .missing_name },
+    }};
+    var app = SkillsInstallReplayApp{
+        .alloc = alloc,
+        .skills = .{ .diagnostics = @constCast(&skill_diagnostics) },
+    };
+    defer app.deinit();
+
+    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "list");
+
+    try std.testing.expectEqual(@as(usize, 1), app.write_count);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.entries.items.len);
+    try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
+    const notice = app.shell.entries.items[0].semantic_notice;
+    try std.testing.expectEqualStrings("skills", notice.topic);
+    try std.testing.expectEqual(types.NoticeTone.warning, notice.tone);
+    try std.testing.expect(std.mem.find(u8, notice.body, "skill discovery warning:") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "hostile&#x0a;path/body-sentinel") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "metadata is invalid (missing_name)") != null);
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "● Skills: skill discovery warning:") != null);
+}
+
+test "skills show focuses matching menu row without transcript body" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{
+            .name = "managed",
+            .description = "managed skill",
+            .path = "/tmp/managed/SKILL.md",
+            .source = .global_fx,
+        },
+        .{
+            .name = "workspace",
+            .description = "workspace skill",
+            .path = "/tmp/workspace/skills/workspace/SKILL.md",
+            .source = .workspace_shared,
+        },
+    };
+    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .items = @constCast(&skills) } };
+    defer app.deinit();
+
+    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "show workspace");
+
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 0), app.write_count);
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expectEqual(skill_runtime.SkillMenuSourceFilter.workspace, app.skills.menu.source_filter);
+    try std.testing.expectEqual(@as(usize, 0), app.skills.menu.selected_index);
+    try std.testing.expectEqualStrings("workspace", app.skills.selectedMenuSkill().?.name);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "skills show exposes duplicate rows without focusing a precedence winner" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{
+        .{
+            .name = "review",
+            .description = "managed review",
+            .path = "/tmp/managed/review",
+            .source = .global_fx,
+        },
+        .{
+            .name = "review",
+            .description = "workspace review",
+            .path = "/tmp/workspace/skills/review",
+            .source = .workspace_shared,
+        },
+    };
+    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .items = @constCast(&skills) } };
+    defer app.deinit();
+
+    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "show review");
+
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 0), app.write_count);
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expectEqualStrings("review", app.skills.menu.query());
+    try std.testing.expectEqualStrings("review", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        app.skills.menu.filteredItemCount(app.skills.items),
+    );
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "skills remove prefers a managed match after a workspace duplicate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempSkillFile(&tmp, "home/.fx/skills/review/SKILL.md", "---\nname: review\n---\nmanaged body\n");
+    try writeTempSkillFile(&tmp, "home/workspace/.agents/skills/review/SKILL.md", "---\nname: review\n---\nworkspace body\n");
+
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const managed_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills/review");
+    defer alloc.free(managed_skill);
+    const workspace_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/.agents/skills/review");
+    defer alloc.free(workspace_skill);
+    const skills = [_]skill_runtime.Skill{
+        .{
+            .name = "review",
+            .description = "workspace review",
+            .path = workspace_skill,
+            .source = .workspace_agents,
+        },
+        .{
+            .name = "review",
+            .description = "managed review",
+            .path = managed_skill,
+            .source = .global_fx,
+        },
+    };
+    var app = SkillsInstallReplayApp{
+        .alloc = alloc,
+        .skills = .{ .dir = managed_root, .items = @constCast(&skills) },
+    };
+    defer app.deinit();
+
+    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "remove review");
+
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "Removed skill 'review'.") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io_mod.getIo(), "home/.fx/skills/review", .{}),
+    );
+    try tmp.dir.access(io_mod.getIo(), "home/workspace/.agents/skills/review/SKILL.md", .{});
+}
+
+test "skills show missing name keeps not found notice" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "managed",
+        .description = "managed skill",
+        .path = "/tmp/managed/SKILL.md",
+        .source = .global_fx,
+    }};
+    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .items = @constCast(&skills) } };
+    defer app.deinit();
+
+    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "show missing");
+
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 1), app.write_count);
+    try std.testing.expect(!app.skills.menu.active);
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "Skill 'missing' not found.") != null);
+}

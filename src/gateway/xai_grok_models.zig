@@ -58,15 +58,12 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
-    if (input.access.credentialSource() != .grok_subscription) {
+    const request_auth = catalogRequestAuth(input.access) orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    }
-    const credential = input.access.authorizationCredential() orelse
-        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    const account_id = input.access.accountId() orelse
-        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    if (!grok_session.validAccountId(account_id)) {
-        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+    if (request_auth.account_id) |account_id| {
+        if (!grok_session.validAccountId(account_id)) {
+            return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+        }
     }
     const request_url = modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -88,8 +85,9 @@ fn fetchCatalogForProvider(
     var response = fetchCatalogResponse(
         alloc,
         request_url,
-        credential,
-        account_id,
+        request_auth.credential,
+        request_auth.account_id,
+        request_auth.include_subscription_headers,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -103,8 +101,9 @@ fn fetchCatalogForProvider(
     var modalities_response = fetchCatalogResponse(
         alloc,
         modalities_url,
-        credential,
+        request_auth.credential,
         null,
+        false,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -120,6 +119,28 @@ fn fetchCatalogForProvider(
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
     return .{ .catalog = catalog };
+}
+
+const CatalogRequestAuth = struct {
+    credential: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    include_subscription_headers: bool = false,
+};
+
+fn catalogRequestAuth(access: credentials.CatalogAccess) ?CatalogRequestAuth {
+    return switch (access) {
+        .host_managed => .{},
+        .public_only => null,
+        .authenticated => |authenticated| if (authenticated.source == .grok_subscription and
+            authenticated.account_id != null)
+            .{
+                .credential = authenticated.credential,
+                .account_id = authenticated.account_id,
+                .include_subscription_headers = true,
+            }
+        else
+            null,
+    };
 }
 
 fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
@@ -141,14 +162,23 @@ const FetchResponse = struct {
 const FetchOperation = struct {
     alloc: std.mem.Allocator,
     url: []const u8,
-    credential: []const u8,
+    credential: ?[]const u8,
     account_id: ?[]const u8,
+    include_subscription_headers: bool,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
         defer client.deinit();
-        const auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{self.credential});
-        defer secret.zeroAndFree(self.alloc, auth_header);
+        var auth_header: ?[]u8 = null;
+        defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
+        var headers: std.http.Client.Request.Headers = .{
+            .user_agent = .{ .override = gateway_client.user_agent },
+            .accept_encoding = .omit,
+        };
+        if (self.credential) |credential| {
+            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            headers.authorization = .{ .override = auth_header.? };
+        }
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
@@ -156,20 +186,18 @@ const FetchOperation = struct {
         var extra_headers_len: usize = 0;
         extra_headers_buffer[extra_headers_len] = .{ .name = "accept", .value = "application/json" };
         extra_headers_len += 1;
-        if (self.account_id) |account_id| {
+        if (self.include_subscription_headers) {
             extra_headers_buffer[extra_headers_len] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
             extra_headers_len += 1;
+        }
+        if (self.account_id) |account_id| {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-userid", .value = account_id };
             extra_headers_len += 1;
         }
         const result = client.fetch(.{
             .location = .{ .url = self.url },
             .method = .GET,
-            .headers = .{
-                .authorization = .{ .override = auth_header },
-                .user_agent = .{ .override = gateway_client.user_agent },
-                .accept_encoding = .omit,
-            },
+            .headers = headers,
             .extra_headers = extra_headers_buffer[0..extra_headers_len],
             .response_writer = &response_writer,
             .redirect_behavior = .unhandled,
@@ -189,8 +217,9 @@ const FetchOperation = struct {
 fn fetchCatalogResponse(
     alloc: std.mem.Allocator,
     url: []const u8,
-    credential: []const u8,
+    credential: ?[]const u8,
     account_id: ?[]const u8,
+    include_subscription_headers: bool,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !FetchResponse {
@@ -199,6 +228,7 @@ fn fetchCatalogResponse(
         .url = url,
         .credential = credential,
         .account_id = account_id,
+        .include_subscription_headers = include_subscription_headers,
     };
     return gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -379,6 +409,134 @@ fn validateCatalogModelCount(count: usize) !void {
     if (count > max_catalog_models) return error.InvalidGrokModelCatalog;
 }
 
+test "Grok catalog parser joins provider-owned subscription capabilities and modalities" {
+    const alloc = std.testing.allocator;
+    const subscription_json =
+        \\{"data":[
+        \\  {"id":"current-a","model":"current-a","api_backend":"responses","context_window":500123,"max_completion_tokens":32768,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"xhigh"},{"value":"medium"}]},
+        \\  {"id":"current-b","model":"current-b","api_backend":"responses","context_window":480321,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"provider-next"},{"value":"low"}]},
+        \\  {"id":"chat-only","model":"chat-only","api_backend":"chat_completions","context_window":200000,"supports_reasoning_effort":false,"reasoning_efforts":[]}
+        \\]}
+    ;
+    const modalities_json =
+        \\{"models":[
+        \\  {"id":"current-a","input_modalities":["text","image"],"output_modalities":["text"]},
+        \\  {"id":"current-b","input_modalities":["text"],"output_modalities":["text"]},
+        \\  {"id":"chat-only","input_modalities":["text"],"output_modalities":["text"]}
+        \\]}
+    ;
+    var catalog = try parseCatalog(alloc, subscription_json, modalities_json);
+    defer model_catalog.freeModelCatalog(alloc, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+    const first = catalog.items[0];
+    try std.testing.expectEqualStrings("current-a", first.id);
+    try std.testing.expectEqual(@as(u32, 500_123), first.context_window);
+    try std.testing.expectEqual(@as(u32, 32_768), first.max_tokens);
+    try std.testing.expectEqual(@as(usize, 2), first.reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("xhigh", first.reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("medium", first.reasoning_efforts.items[1].label());
+    try std.testing.expect(first.has_vision);
+    try std.testing.expect(first.has_file_input);
+
+    const second = catalog.items[1];
+    try std.testing.expectEqualStrings("current-b", second.id);
+    try std.testing.expectEqual(@as(u32, 480_321), second.context_window);
+    try std.testing.expectEqual(@as(u32, 0), second.max_tokens);
+    try std.testing.expectEqual(@as(usize, 2), second.reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("provider-next", second.reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("low", second.reasoning_efforts.items[1].label());
+    try std.testing.expect(!second.has_vision);
+}
+
+test "Grok catalog rejects missing provider-owned capability metadata" {
+    const modalities =
+        \\{"models":[{"id":"current","input_modalities":["text"],"output_modalities":["text"]}]}
+    ;
+    const cases = [_][]const u8{
+        \\{"data":[{"id":"current","model":"current","api_backend":"responses","supports_reasoning_effort":false,"reasoning_efforts":[]}]}
+        ,
+        \\{"data":[{"id":"current","model":"current","api_backend":"responses","context_window":500000,"supports_reasoning_effort":true,"reasoning_efforts":[]}]}
+        ,
+    };
+    for (cases) |subscription| {
+        try expectCatalogParseError(error.InvalidGrokModelCatalog, subscription, modalities);
+    }
+    const missing_modalities =
+        \\{"models":[{"id":"other","input_modalities":["text"],"output_modalities":["text"]}]}
+    ;
+    const valid_subscription =
+        \\{"data":[{"id":"current","model":"current","api_backend":"responses","context_window":500000,"supports_reasoning_effort":false,"reasoning_efforts":[]}]}
+    ;
+    try expectCatalogParseError(error.InvalidGrokModelCatalog, valid_subscription, missing_modalities);
+}
+
+test "Grok catalog URLs use provider-owned subscription and modality endpoints" {
+    const subscription_url = try modelsUrl(std.testing.allocator);
+    defer std.testing.allocator.free(subscription_url);
+    try std.testing.expectEqualStrings(default_models_endpoint, subscription_url);
+    const modalities_url = try modalitiesUrl(std.testing.allocator);
+    defer std.testing.allocator.free(modalities_url);
+    try std.testing.expectEqualStrings(default_modalities_endpoint, modalities_url);
+}
+
+test "Grok subscription catalog requires account identity before network I/O" {
+    const result = try model_catalog_provider.fetch(std.testing.allocator, .{
+        .access = .{ .authenticated = .{
+            .source = .grok_subscription,
+            .credential = "grok-token",
+            .team_context = null,
+        } },
+        .endpoint = "",
+    });
+    switch (result) {
+        .failure => |failure| {
+            try std.testing.expectEqual(model_catalog.FailureCategory.authentication, failure.category);
+            try std.testing.expectEqual(std.http.Status.unauthorized, failure.http_status.?);
+        },
+        .catalog => |catalog| {
+            var unexpected = catalog;
+            model_catalog.freeModelCatalog(std.testing.allocator, &unexpected);
+            return error.TestExpectedAuthenticationFailure;
+        },
+    }
+    try expectCatalogProviderFailure(
+        try model_catalog_provider.fetch(std.testing.allocator, .{
+            .access = .{ .authenticated = .{
+                .source = .grok_subscription,
+                .credential = "grok-token",
+                .team_context = null,
+                .account_id = "acct\r\ninjected",
+            } },
+            .endpoint = "",
+        }),
+        .authentication,
+    );
+}
+
+test "Grok oversized catalog responses are terminal malformed data" {
+    const failure = catalogFetchFailure(error.GrokModelCatalogTooLarge);
+    try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, failure.category);
+    try std.testing.expect(!failure.retryable);
+}
+
+test "Grok model ids enforce the exact provider-local bound" {
+    const exact_json = try buildCatalogJson(std.testing.allocator, 1, max_model_id_bytes, 0);
+    defer std.testing.allocator.free(exact_json);
+    const exact_modalities = try buildModalitiesJson(std.testing.allocator, max_model_id_bytes);
+    defer std.testing.allocator.free(exact_modalities);
+    var exact = try parseCatalog(std.testing.allocator, exact_json, exact_modalities);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &exact);
+    try std.testing.expectEqual(@as(usize, 1), exact.items.len);
+    try std.testing.expectEqual(max_model_id_bytes, exact.items[0].id.len);
+
+    const excess_json = try buildCatalogJson(std.testing.allocator, 1, max_model_id_bytes + 1, 0);
+    defer std.testing.allocator.free(excess_json);
+    const excess_modalities = try buildModalitiesJson(std.testing.allocator, max_model_id_bytes + 1);
+    defer std.testing.allocator.free(excess_modalities);
+    try expectCatalogParseError(error.InvalidGrokModelCatalog, excess_json, excess_modalities);
+}
+
 fn buildCatalogJson(alloc: std.mem.Allocator, model_count: usize, id_bytes: usize, total_bytes: usize) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -410,6 +568,15 @@ fn buildModalitiesJson(alloc: std.mem.Allocator, id_bytes: usize) ![]u8 {
     try out.writer.splatByteAll('g', id_bytes);
     try out.writer.writeAll("\",\"input_modalities\":[\"text\"],\"output_modalities\":[\"text\"]}]}");
     return out.toOwnedSlice();
+}
+
+fn expectCatalogParseError(expected: anyerror, subscription: []const u8, modalities: []const u8) !void {
+    var catalog = parseCatalog(std.testing.allocator, subscription, modalities) catch |err| {
+        try std.testing.expectEqual(expected, err);
+        return;
+    };
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    return error.TestExpectedCatalogFailure;
 }
 
 const CatalogBodyFixture = struct {
@@ -499,6 +666,22 @@ const CatalogBodyFixture = struct {
     }
 };
 
+test "Grok catalog fixture cleanup joins without a client" {
+    var fixture = try CatalogBodyFixture.init("{}");
+    defer fixture.deinit();
+    try fixture.start();
+    fixture.deinit();
+    try std.testing.expect(fixture.thread == null);
+    try std.testing.expect(fixture.failure == null);
+}
+
+test "host-managed Grok catalog auth carries no local headers" {
+    const auth = catalogRequestAuth(.host_managed) orelse return error.TestExpectedHostManagedCatalogAuth;
+    try std.testing.expect(auth.credential == null);
+    try std.testing.expect(auth.account_id == null);
+    try std.testing.expect(!auth.include_subscription_headers);
+}
+
 var stable_catalog_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableCatalogTestEnviron() !*const std.process.Environ.Map {
@@ -543,4 +726,137 @@ const CatalogEndpointEnvironment = struct {
 
 fn catalogFixtureUrl(alloc: std.mem.Allocator, fixture: *CatalogBodyFixture, path: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/{s}", .{ fixture.port(), path });
+}
+
+fn expectCatalogProviderFailure(
+    result: model_catalog.ProviderResult,
+    expected: model_catalog.FailureCategory,
+) !void {
+    switch (result) {
+        .failure => |failure| {
+            try std.testing.expectEqual(expected, failure.category);
+            try std.testing.expect(!failure.retryable);
+        },
+        .catalog => |catalog| {
+            var unexpected = catalog;
+            model_catalog.freeModelCatalog(std.testing.allocator, &unexpected);
+            return error.TestExpectedCatalogFailure;
+        },
+    }
+}
+
+fn fetchCatalogFixture(body: []const u8) !FetchResponse {
+    var fixture = try CatalogBodyFixture.init(body);
+    defer fixture.deinit();
+    try fixture.start();
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/models",
+        .{fixture.port()},
+    );
+    defer std.testing.allocator.free(url);
+    var operation = FetchOperation{
+        .alloc = std.testing.allocator,
+        .url = url,
+        .credential = "grok-test-token",
+        .account_id = "acct_test",
+        .include_subscription_headers = true,
+    };
+    const result = operation.run();
+    fixture.deinit();
+    if (fixture.failure) |err| return err;
+    return result;
+}
+
+fn expectCatalogFetchError(expected: anyerror, body: []const u8) !void {
+    var response = fetchCatalogFixture(body) catch |err| {
+        try std.testing.expectEqual(expected, err);
+        return;
+    };
+    defer response.deinit(std.testing.allocator);
+    return error.TestExpectedCatalogFailure;
+}
+
+test "Grok catalog fetch and parser enforce body and model-count bounds" {
+    const exact_body = try buildCatalogJson(std.testing.allocator, 1, 8, max_catalog_bytes);
+    defer std.testing.allocator.free(exact_body);
+    var exact_response = try fetchCatalogFixture(exact_body);
+    defer exact_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(max_catalog_bytes, exact_response.body.len);
+    const modalities = try buildModalitiesJson(std.testing.allocator, 8);
+    defer std.testing.allocator.free(modalities);
+    var exact_catalog = try parseCatalog(std.testing.allocator, exact_response.body, modalities);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &exact_catalog);
+    try std.testing.expectEqual(@as(usize, 1), exact_catalog.items.len);
+
+    const excess_body = try buildCatalogJson(std.testing.allocator, 1, 8, max_catalog_bytes + 1);
+    defer std.testing.allocator.free(excess_body);
+    try expectCatalogFetchError(error.GrokModelCatalogTooLarge, excess_body);
+
+    const exact_count = try buildCatalogJson(std.testing.allocator, max_catalog_models, 8, 0);
+    defer std.testing.allocator.free(exact_count);
+    var count_catalog = try parseCatalog(std.testing.allocator, exact_count, modalities);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &count_catalog);
+    try std.testing.expectEqual(max_catalog_models, count_catalog.items.len);
+
+    const excess_count = try buildCatalogJson(std.testing.allocator, max_catalog_models + 1, 8, 0);
+    defer std.testing.allocator.free(excess_count);
+    try expectCatalogParseError(error.InvalidGrokModelCatalog, excess_count, modalities);
+}
+
+test "Grok catalog adapter classifies oversized bodies at both provider origins" {
+    const alloc = std.testing.allocator;
+    const oversized_subscription = try buildCatalogJson(alloc, 1, 8, max_catalog_bytes + 1);
+    defer alloc.free(oversized_subscription);
+    var subscription_fixture = try CatalogBodyFixture.init(oversized_subscription);
+    defer subscription_fixture.deinit();
+    try subscription_fixture.start();
+    const subscription_url = try catalogFixtureUrl(alloc, &subscription_fixture, "models");
+    defer alloc.free(subscription_url);
+    const access: credentials.CatalogAccess = .{ .authenticated = .{
+        .source = .grok_subscription,
+        .credential = "grok-token",
+        .team_context = null,
+        .account_id = "acct_grok",
+    } };
+    {
+        const environment = try CatalogEndpointEnvironment.install(
+            alloc,
+            subscription_url,
+            "http://127.0.0.1:1/modalities",
+        );
+        defer environment.deinit();
+        try expectCatalogProviderFailure(
+            try model_catalog_provider.fetch(alloc, .{ .access = access, .endpoint = "" }),
+            .malformed_response,
+        );
+    }
+    subscription_fixture.deinit();
+    if (subscription_fixture.failure) |err| return err;
+
+    const valid_subscription = try buildCatalogJson(alloc, 1, 8, 0);
+    defer alloc.free(valid_subscription);
+    const oversized_modalities = try alloc.alloc(u8, max_catalog_bytes + 1);
+    defer alloc.free(oversized_modalities);
+    @memset(oversized_modalities, 'x');
+    var valid_fixture = try CatalogBodyFixture.init(valid_subscription);
+    defer valid_fixture.deinit();
+    var modalities_fixture = try CatalogBodyFixture.init(oversized_modalities);
+    defer modalities_fixture.deinit();
+    try valid_fixture.start();
+    try modalities_fixture.start();
+    const valid_url = try catalogFixtureUrl(alloc, &valid_fixture, "models");
+    defer alloc.free(valid_url);
+    const modalities_url = try catalogFixtureUrl(alloc, &modalities_fixture, "modalities");
+    defer alloc.free(modalities_url);
+    const modalities_environment = try CatalogEndpointEnvironment.install(alloc, valid_url, modalities_url);
+    defer modalities_environment.deinit();
+    try expectCatalogProviderFailure(
+        try model_catalog_provider.fetch(alloc, .{ .access = access, .endpoint = "" }),
+        .malformed_response,
+    );
+    valid_fixture.deinit();
+    modalities_fixture.deinit();
+    if (valid_fixture.failure) |err| return err;
+    if (modalities_fixture.failure) |err| return err;
 }

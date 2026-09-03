@@ -222,6 +222,56 @@ pub const PromptHistoryRuntime = struct {
     }
 };
 
+test "runtime loads enabled history and tracks loaded count" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var seed = try prompt_history_store.Store.initFromHome(alloc, home);
+    defer seed.deinit(alloc);
+    _ = try seed.append(alloc, 1, "/tmp/workspace", "one");
+    _ = try seed.append(alloc, 2, "/tmp/workspace", "two");
+
+    var runtime = PromptHistoryRuntime{};
+    defer runtime.deinit(alloc);
+    try std.testing.expectEqual(
+        InitializeOutcome.available,
+        try runtime.initialize(alloc, home, true, true),
+    );
+    const entries = try runtime.loadRecent(alloc, "/tmp/workspace", 100);
+    defer prompt_history_store.freeLoadedEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 2), runtime.loaded_count);
+    try std.testing.expectEqualStrings("one", entries[0].text);
+    try std.testing.expectEqualStrings("two", entries[1].text);
+}
+
+test "runtime disabled or unavailable history performs no disk load or append" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var runtime = PromptHistoryRuntime{};
+    defer runtime.deinit(alloc);
+    try std.testing.expectEqual(
+        InitializeOutcome.unavailable,
+        try runtime.initialize(alloc, home, true, false),
+    );
+    try std.testing.expectEqual(
+        RecordOutcome.skipped_unavailable,
+        runtime.recordAccepted(alloc, 1, "/tmp/workspace", "prompt"),
+    );
+
+    runtime.enabled = false;
+    try std.testing.expectEqual(
+        RecordOutcome.skipped_disabled,
+        runtime.recordAccepted(alloc, 2, "/tmp/workspace", "prompt"),
+    );
+}
+
 const BusyLockState = struct {
     now_ms: i64 = 0,
 
@@ -239,3 +289,72 @@ const BusyLockState = struct {
         self.now_ms += @intCast(millis);
     }
 };
+
+test "runtime emits one append warning per failure interval and resets after success" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var runtime = PromptHistoryRuntime{};
+    defer runtime.deinit(alloc);
+    _ = try runtime.initialize(alloc, home, true, true);
+    var state = BusyLockState{};
+    runtime.setStoreLockOpsForTest(.{
+        .ctx = &state,
+        .try_lock = BusyLockState.busy,
+        .now_ms = BusyLockState.now,
+        .sleep_ms = BusyLockState.sleep,
+    });
+
+    try std.testing.expectEqual(
+        RecordOutcome.warning,
+        runtime.recordAccepted(alloc, 1, "/tmp/workspace", "one"),
+    );
+    try std.testing.expectEqual(
+        RecordOutcome.trace_only,
+        runtime.recordAccepted(alloc, 2, "/tmp/workspace", "two"),
+    );
+
+    runtime.clearStoreTestControls();
+    try std.testing.expectEqual(
+        RecordOutcome.appended,
+        runtime.recordAccepted(alloc, 3, "/tmp/workspace", "three"),
+    );
+    runtime.setStoreLockOpsForTest(.{
+        .ctx = &state,
+        .try_lock = BusyLockState.busy,
+        .now_ms = BusyLockState.now,
+        .sleep_ms = BusyLockState.sleep,
+    });
+    try std.testing.expectEqual(
+        RecordOutcome.warning,
+        runtime.recordAccepted(alloc, 4, "/tmp/workspace", "four"),
+    );
+}
+
+test "runtime clear remains available while recording is disabled" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var runtime = PromptHistoryRuntime{};
+    defer runtime.deinit(alloc);
+    _ = try runtime.initialize(alloc, home, true, true);
+    try std.testing.expectEqual(
+        RecordOutcome.appended,
+        runtime.recordAccepted(alloc, 1, "/tmp/workspace", "saved"),
+    );
+    runtime.enabled = false;
+    try runtime.clearWorkspace(alloc, "/tmp/workspace");
+    const entries = try runtime.loadRecentIncludingDisabledForTest(
+        alloc,
+        "/tmp/workspace",
+        100,
+    );
+    defer prompt_history_store.freeLoadedEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}

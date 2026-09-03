@@ -1305,6 +1305,7 @@ fn prepareTranscriptSurfacePaintWithOwnedSource(
         true,
         false,
         .apply,
+        null,
     );
     if (source.bytes.len > 0) {
         prepared.owns_bytes = true;
@@ -1330,6 +1331,7 @@ pub fn prepareTranscriptSurfacePaintFromSourceForArea(
         false,
         false,
         .apply,
+        null,
     );
 }
 
@@ -1350,6 +1352,7 @@ pub fn preparePreselectedTranscriptSurfacePaintFromSourceForArea(
         false,
         false,
         .skip,
+        null,
     );
 }
 
@@ -1371,6 +1374,29 @@ pub fn prepareTranscriptSurfacePaintFromSourceForFrame(
         false,
         allow_projection_rebase,
         .apply,
+        null,
+    );
+}
+
+pub fn prepareIndexedFullTranscriptSurfacePaintForArea(
+    self: anytype,
+    alloc: Allocator,
+    metrics: *Metrics,
+    source: *const TranscriptPreparationSource,
+    area: render_engine.frame_layout.FrameRect,
+    visual_offset: u32,
+) !PreparedTranscriptSurfacePaint {
+    return prepareTranscriptSurfacePaintInternal(
+        self,
+        alloc,
+        metrics,
+        0,
+        area,
+        source,
+        false,
+        false,
+        .skip,
+        visual_offset,
     );
 }
 
@@ -1649,6 +1675,7 @@ fn prepareTranscriptSurfacePaintInternal(
     commit_runtime_state: bool,
     allow_projection_rebase: bool,
     resize_history_policy: ResizeHistoryPolicy,
+    forced_visual_offset: ?u32,
 ) !PreparedTranscriptSurfacePaint {
     if (commit_runtime_state) try self.ensurePaintReservation(alloc);
 
@@ -1789,7 +1816,6 @@ fn prepareTranscriptSurfacePaintInternal(
     var repl_line_idx: usize = total_lines;
     var tracked_visible_line: ?usize = null;
     const precomputed_plain_lines =
-        !self.fullTranscriptActive() and
         !effective_replaceable_last_line and
         tracked_entry_start_line == null and
         total_lines == transcript_line_count and
@@ -2038,6 +2064,41 @@ fn prepareTranscriptSurfacePaintInternal(
             welcome_decision = .none;
             self.tail_viewport_resolution = resolution;
         }
+    }
+    if (forced_visual_offset) |visual_offset| {
+        const remaining_visual_rows = projectionRemainingVisualRows(
+            &prepared,
+            visual_offset,
+        ) orelse return error.InvalidTranscriptTransition;
+        const projection_rows = @min(
+            remaining_visual_rows,
+            @as(u32, visible_rows),
+        );
+        if (projection_rows == 0) return error.InvalidTranscriptTransition;
+        const visual_end = visual_offset + projection_rows;
+        const start = sourceStartPosition(&prepared, visual_offset) orelse
+            return error.InvalidTranscriptTransition;
+        const boundary = preparedProjectionBoundary(
+            &prepared,
+            self.layout.cols,
+            visual_end,
+        ) orelse return error.InvalidTranscriptTransition;
+        try replacePreparedProjectionResumeBytes(
+            alloc,
+            &prepared,
+            self.layout.cols,
+            visual_offset,
+        );
+        prepared.projection_visual_rows = @intCast(projection_rows);
+        prepared.projection_ends_with_newline = boundary.line_terminated;
+        viewport_selection_snapshot.start_line = start.line;
+        viewport_selection_snapshot.partial_skip_rows = start.intra_line_rows;
+        viewport_selection_snapshot.line_count = prepared.sourceVisibleLines().len;
+        viewport_selection_snapshot.last_visible_row = 0;
+        viewport_selection_snapshot.last_visible_row_blank = false;
+        viewport_selection_snapshot.replaceable_start_row = top_row;
+        rows_budget = visible_rows - @as(u16, @intCast(projection_rows));
+        welcome_decision = .none;
     }
     const start_line = viewport_selection_snapshot.start_line;
     const partial_skip_rows = viewport_selection_snapshot.partial_skip_rows;
@@ -2751,6 +2812,55 @@ pub fn prepareTranscriptDocumentAppendBytes(
     return result;
 }
 
+test "document append preparation emits terminal-ready newlines" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "one\ntwo\n", .expected = "one\r\ntwo\r\n" },
+        .{ .input = "one\r\ntwo\r", .expected = "one\r\ntwo\r" },
+    };
+    for (cases) |case| {
+        const prepared = try prepareTranscriptDocumentAppendBytes(
+            std.testing.allocator,
+            case.input,
+            80,
+            0,
+            case.input.len,
+            false,
+        );
+        defer std.testing.allocator.free(prepared);
+        try std.testing.expectEqualStrings(case.expected, prepared);
+    }
+
+    const prepared = try prepareTranscriptDocumentAppendBytes(
+        std.testing.allocator,
+        "no newline",
+        80,
+        0,
+        "no newline".len,
+        false,
+    );
+    try std.testing.expectEqual(@as(usize, 0), prepared.len);
+}
+
+test "document append preparation preserves presentation boundaries" {
+    const open = "\x1b]8;id=fx-42;https://example.com\x1b\\";
+    const raw = "old\nnew";
+    const close = "\x1b]8;;\x1b\\";
+    const source = open ++ raw ++ close;
+    const prepared = try prepareTranscriptDocumentAppendBytes(
+        std.testing.allocator,
+        source,
+        80,
+        open.len,
+        open.len + raw.len,
+        true,
+    );
+    defer std.testing.allocator.free(prepared);
+    try std.testing.expectEqualStrings(open ++ "old\r\nnew" ++ close, prepared);
+}
+
 pub const PreparedResumeDocumentAppend = struct {
     bytes: []u8 = &.{},
     endpoint_resume_bytes: []u8 = &.{},
@@ -2960,6 +3070,99 @@ fn advanceResetReplayDocumentCursor(
     }
 }
 
+test "reset replay document preserves folded rows without filler" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "hidden raw source\ntail", 24);
+    defer batch.deinit(alloc);
+    batch.lines[0] = .{ .folded_line = .{ .text = "folded-prefix", .stream = .stdout } };
+    batch.line_visual_rows[0] = 1;
+
+    var host = TestTranscriptPainterHost.init(alloc, testLayout(24, 8, 4));
+    defer host.deinit();
+    const replay = try prepareResetReplayDocument(
+        &host,
+        alloc,
+        batch.transcript_bytes,
+        batch.lines,
+        batch.line_visual_rows,
+        false,
+        0,
+    );
+    defer if (replay.len > 0) alloc.free(replay);
+
+    try std.testing.expect(std.mem.indexOf(u8, replay, "│ folded-prefix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "tail") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, replay, "\r\n"));
+
+    var terminal = try vt_emulator.Grid.init(alloc, 24, 1);
+    defer terminal.deinit();
+    var stats: vt_emulator.FeedStats = .{};
+    try terminal.feedWithStats(replay, &stats);
+    try std.testing.expectEqual(@as(u16, 1), stats.scroll_rows);
+}
+
+test "reset replay document fills an unused terminal tail without scrolling blanks" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "head\ntail", 10);
+    defer batch.deinit(alloc);
+
+    var host = TestTranscriptPainterHost.init(alloc, testLayout(10, 8, 4));
+    defer host.deinit();
+    const replay = try prepareResetReplayDocument(
+        &host,
+        alloc,
+        batch.transcript_bytes,
+        batch.lines,
+        batch.line_visual_rows,
+        false,
+        2,
+    );
+    defer if (replay.len > 0) alloc.free(replay);
+
+    var terminal = try vt_emulator.Grid.init(alloc, 10, 4);
+    defer terminal.deinit();
+    var stats: vt_emulator.FeedStats = .{};
+    try terminal.feedWithStats(replay, &stats);
+    try std.testing.expectEqual(@as(u16, 0), stats.scroll_rows);
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    try terminal.rowTextTrimmed(1, &row);
+    try std.testing.expectEqualStrings("head", row.items);
+    row.clearRetainingCapacity();
+    try terminal.rowTextTrimmed(2, &row);
+    try std.testing.expectEqualStrings("tail", row.items);
+}
+
+test "reset replay document crosses the u16 row chunk boundary" {
+    const alloc = std.testing.allocator;
+    const head = try alloc.alloc(u8, std.math.maxInt(u16));
+    defer alloc.free(head);
+    @memset(head, 'x');
+    const transcript = try std.mem.concat(alloc, u8, &.{ head, "\ntail" });
+    defer alloc.free(transcript);
+    var batch = try transcriptTestBatch(alloc, transcript, 1);
+    defer batch.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(u32, std.math.maxInt(u16)) + 4,
+        totalVisualRows(batch.line_visual_rows),
+    );
+
+    var host = TestTranscriptPainterHost.init(alloc, testLayout(1, 8, 4));
+    defer host.deinit();
+    const replay = try prepareResetReplayDocument(
+        &host,
+        alloc,
+        batch.transcript_bytes,
+        batch.lines,
+        batch.line_visual_rows,
+        false,
+        0,
+    );
+    defer if (replay.len > 0) alloc.free(replay);
+
+    try std.testing.expect(std.mem.indexOf(u8, replay, "tail") != null);
+}
+
 fn preparedProjectionBoundary(
     prepared: *const PreparedTranscriptSurfacePaint,
     cols: u16,
@@ -3101,6 +3304,29 @@ pub fn paintPreparedTranscriptIntoSurface(
     return result;
 }
 
+pub fn paintTranscriptIntoSurface(
+    self: anytype,
+    alloc: Allocator,
+    surface: *frame_surface.FrameSurface,
+    batch: VisibleTranscriptBatch,
+    line_visual_rows: []const u16,
+    total_lines: usize,
+    transcript_ends_with_newline: bool,
+) !paint_plan.TranscriptPaintResult {
+    return paintTranscriptIntoSurfaceWithLimit(
+        self,
+        alloc,
+        surface,
+        batch,
+        line_visual_rows,
+        total_lines,
+        transcript_ends_with_newline,
+        null,
+        &.{},
+        null,
+    );
+}
+
 fn paintTranscriptIntoSurfaceWithLimit(
     self: anytype,
     alloc: Allocator,
@@ -3180,6 +3406,92 @@ fn paintTranscriptIntoSurfaceWithLimit(
     };
 }
 
+const TestFullRepaintMode = enum {
+    enabled,
+    diagnostic_wipe_only,
+};
+
+const TestFooterGeometry = struct {
+    top: u16 = 0,
+};
+
+const TestFooterViewport = struct {
+    externally_invalidated: bool = false,
+    has_frame: bool = false,
+    geometry: TestFooterGeometry = .{},
+
+    fn invalidateAfterExternalClear(self: *TestFooterViewport) void {
+        self.externally_invalidated = true;
+    }
+};
+
+const TestPaintTrace = struct {
+    transcript_log_frame: bool = false,
+};
+
+const TestTranscriptPainterHost = struct {
+    alloc: Allocator,
+    layout: types.Layout,
+    shadow: ?*vt_emulator.Grid = null,
+    emitted: std.ArrayList(u8) = .empty,
+    footer_viewport: TestFooterViewport = .{},
+    paint_trace: TestPaintTrace = .{},
+    reflow_clear_guard_rows: u16 = 0,
+    viewport_clear_pending: bool = false,
+    owned_top_row: u16 = 1,
+    last_visible_transcript_last_row: u16 = 0,
+    last_visible_transcript_last_row_blank: bool = false,
+    cursor_row: u16 = 1,
+    cursor_col: u16 = 1,
+    extra_input_rows: u16 = 0,
+    replaceable_last_line: bool = false,
+    replaceable_start: usize = 0,
+    replaceable_row: u16 = 1,
+
+    fn init(alloc: Allocator, layout: types.Layout) TestTranscriptPainterHost {
+        return .{
+            .alloc = alloc,
+            .layout = layout,
+            .cursor_row = if (layout.content_bottom == 0) 1 else layout.content_bottom,
+        };
+    }
+
+    fn deinit(self: *TestTranscriptPainterHost) void {
+        self.emitted.deinit(self.alloc);
+    }
+
+    fn emit(self: *TestTranscriptPainterHost, _: *Metrics, bytes: []const u8) !void {
+        try self.emitted.appendSlice(self.alloc, bytes);
+        if (self.shadow) |shadow| try shadow.feed(bytes);
+    }
+
+    fn footerTopRowForExtra(self: *TestTranscriptPainterHost, _: u16) u16 {
+        return self.layout.divider_top_row;
+    }
+};
+
+const TestTranscriptBatch = struct {
+    transcript_bytes: []u8,
+    hard_lines: ?HardLineStarts = null,
+    lines: []VisibleTranscriptLine,
+    line_visual_rows: []u16,
+    ends_with_newline: bool = false,
+
+    fn deinit(self: *TestTranscriptBatch, alloc: Allocator) void {
+        if (self.hard_lines) |hard_lines| hard_lines.deinit(alloc);
+        alloc.free(self.transcript_bytes);
+        alloc.free(self.lines);
+        alloc.free(self.line_visual_rows);
+    }
+
+    fn batch(self: TestTranscriptBatch) VisibleTranscriptBatch {
+        return .{
+            .transcript = .{ .bytes = self.transcript_bytes },
+            .lines = self.lines,
+        };
+    }
+};
+
 fn testLayout(cols: u16, rows: u16, content_bottom: u16) types.Layout {
     return .{
         .rows = rows,
@@ -3189,6 +3501,55 @@ fn testLayout(cols: u16, rows: u16, content_bottom: u16) types.Layout {
         .input_row = content_bottom + 2,
         .divider_bottom_row = content_bottom + 3,
         .hint_row = rows,
+    };
+}
+
+fn transcriptTestBatch(alloc: Allocator, bytes: []const u8, cols: u16) !TestTranscriptBatch {
+    const owned = try alloc.dupe(u8, bytes);
+    errdefer alloc.free(owned);
+    const hard_lines = try buildHardLineStarts(alloc, owned);
+    errdefer hard_lines.deinit(alloc);
+    const line_count = hard_lines.len();
+    const lines = try alloc.alloc(VisibleTranscriptLine, line_count);
+    errdefer alloc.free(lines);
+    const line_visual_rows = try alloc.alloc(u16, line_count);
+    errdefer alloc.free(line_visual_rows);
+
+    var index: usize = 0;
+    while (index < line_count) : (index += 1) {
+        const ref = hardLineRefAt(hard_lines, owned.len, index);
+        lines[index] = visibleFromTranscript(ref);
+        line_visual_rows[index] = visualRowsForLine(ref.resolve(owned), cols);
+    }
+
+    return .{
+        .transcript_bytes = owned,
+        .hard_lines = hard_lines,
+        .lines = lines,
+        .line_visual_rows = line_visual_rows,
+        .ends_with_newline = hard_lines.ends_with_newline,
+    };
+}
+
+fn foldedTestBatch(
+    alloc: Allocator,
+    stdout_text: []const u8,
+    stderr_text: []const u8,
+    cols: u16,
+) !TestTranscriptBatch {
+    const lines = try alloc.alloc(VisibleTranscriptLine, 2);
+    errdefer alloc.free(lines);
+    const line_visual_rows = try alloc.alloc(u16, 2);
+    errdefer alloc.free(line_visual_rows);
+    lines[0] = .{ .folded_line = .{ .text = stdout_text, .stream = .stdout } };
+    lines[1] = .{ .folded_line = .{ .text = stderr_text, .stream = .stderr } };
+    const effective_cols: u16 = if (cols > 2) cols - 2 else cols;
+    line_visual_rows[0] = visualRowsForLine(stripTrailingNewline(stdout_text), effective_cols);
+    line_visual_rows[1] = visualRowsForLine(stripTrailingNewline(stderr_text), effective_cols);
+    return .{
+        .transcript_bytes = try alloc.dupe(u8, ""),
+        .lines = lines,
+        .line_visual_rows = line_visual_rows,
     };
 }
 
@@ -3207,6 +3568,67 @@ fn testFooterRows(layout: types.Layout) render_engine.footer_layout.FooterRows {
     };
 }
 
+fn testPaintPlan(layout: types.Layout, selection: ViewportSelection) paint_plan.PaintPlan {
+    const preserved_band = if (selection.top_row > 1)
+        paint_plan.FrameBand{ .top = 1, .bottom = selection.top_row - 1, .owner = .preserved_shell }
+    else
+        paint_plan.FrameBand.empty(.preserved_shell);
+    return .{
+        .layout = layout,
+        .viewport = selection,
+        .footer = testFooterRows(layout),
+        .activity = .none,
+        .preserved_band = preserved_band,
+        .transcript_band = .{ .top = selection.top_row, .bottom = selection.bottom_row, .owner = .transcript },
+        .activity_band = paint_plan.FrameBand.empty(.activity),
+        .footer_band = .{ .top = layout.divider_top_row, .bottom = layout.rows, .owner = .footer },
+        .invalidation = paint_plan.FrameInvalidationSet.empty(),
+        .footer_clean_allowed = true,
+        .synchronized_update = false,
+        .cursor_target = null,
+        .footer_reservation_source = .none,
+        .bottom_reserved_rows = 0,
+        .preserve_scrollback = true,
+    };
+}
+
+fn expectTranscriptSurfacePaint(
+    alloc: Allocator,
+    layout: types.Layout,
+    selection: ViewportSelection,
+    batch: TestTranscriptBatch,
+) !vt_emulator.Grid {
+    var surface_shadow = try vt_emulator.Grid.init(alloc, layout.cols, layout.rows);
+    defer surface_shadow.deinit();
+    var surface = try frame_surface.FrameSurface.initFromShadow(alloc, testPaintPlan(layout, selection), surface_shadow);
+    defer surface.deinit();
+    var surface_host = TestTranscriptPainterHost.init(alloc, layout);
+    defer surface_host.deinit();
+    const result = try paintTranscriptIntoSurface(
+        &surface_host,
+        alloc,
+        &surface,
+        batch.batch(),
+        batch.line_visual_rows,
+        batch.lines.len,
+        batch.ends_with_newline,
+    );
+    var target = try surface.copyToTargetGrid(alloc);
+    errdefer target.deinit();
+
+    try std.testing.expect(result.first_row >= selection.top_row);
+    try std.testing.expect(result.last_row <= selection.bottom_row);
+    try std.testing.expect(result.replaceable_start_row >= selection.top_row);
+    try std.testing.expectEqual(@as(u16, @intCast(result.last_row - selection.top_row + 1)), result.painted_rows);
+    const cursor = surface.cursor_target.?;
+    try std.testing.expect(cursor.row >= selection.top_row);
+    try std.testing.expect(cursor.row <= selection.bottom_row);
+    try std.testing.expect(cursor.col >= 1);
+    try surface.validate();
+
+    return target;
+}
+
 fn expectGridContains(grid: *vt_emulator.Grid, alloc: Allocator, needle: []const u8) !void {
     var row_text: std.ArrayList(u8) = .empty;
     defer row_text.deinit(alloc);
@@ -3217,4 +3639,673 @@ fn expectGridContains(grid: *vt_emulator.Grid, alloc: Allocator, needle: []const
         if (std.mem.find(u8, row_text.items, needle) != null) return;
     }
     return error.ExpectedTextNotFound;
+}
+
+test "resize history offset preserves the measured intra-line endpoint" {
+    const rows = [_]u16{ 1, 1, 2, 1 };
+    var selection = ViewportSelection{
+        .top_row = 1,
+        .bottom_row = 8,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = rows.len,
+    };
+
+    try std.testing.expect(applyResizeHistoryOffset(&selection, &rows, 3));
+    try std.testing.expectEqual(@as(usize, 2), selection.start_line);
+    try std.testing.expectEqual(@as(u16, 1), selection.partial_skip_rows);
+}
+
+test "measured source rows release partial groups at a folded boundary" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "abcdefghij\nhidden", 5);
+    defer batch.deinit(alloc);
+    batch.lines[1] = .{ .folded_line = .{ .text = "folded", .stream = .stdout } };
+
+    const groups = try collectMeasuredSourceRows(
+        alloc,
+        batch.batch(),
+        5,
+        0,
+        batch.transcript_bytes.len,
+    );
+    try std.testing.expect(groups == null);
+}
+
+test "measured history endpoint is unavailable when selection starts on folded output" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "summary\ntail", 8);
+    defer batch.deinit(alloc);
+    batch.lines[0] = .{ .folded_line = .{ .text = "folded", .stream = .stdout } };
+
+    const endpoint = try advanceMeasuredHistoryEndpoint(
+        alloc,
+        batch.batch(),
+        .{
+            .top_row = 1,
+            .bottom_row = 2,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = batch.lines.len,
+        },
+        8,
+        4,
+        1,
+    );
+    try std.testing.expect(endpoint == null);
+}
+
+test "measured history endpoint advances through exact wrapped source rows" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(
+        alloc,
+        "abcdefghij\nklmnopqrst\nuvwxyz",
+        10,
+    );
+    defer batch.deinit(alloc);
+
+    const endpoint = (try advanceMeasuredHistoryEndpoint(
+        alloc,
+        batch.batch(),
+        .{
+            .top_row = 1,
+            .bottom_row = 3,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = batch.lines.len,
+        },
+        10,
+        5,
+        1,
+    )) orelse return error.TestExpectedMeasuredEndpoint;
+    try std.testing.expectEqual(@as(usize, 5), endpoint.flow_offset);
+    const target_rows = [_]u16{ 2, 2, 2 };
+    try std.testing.expectEqual(
+        @as(?u32, 1),
+        visualOffsetForExactFlowOffset(
+            batch.batch(),
+            &target_rows,
+            5,
+            endpoint.flow_offset,
+        ),
+    );
+}
+
+test "rewinding a measured endpoint returns to the advance origin" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(
+        alloc,
+        "abcdefghij\nklmnopqrst\nuvwxyz",
+        10,
+    );
+    defer batch.deinit(alloc);
+
+    const endpoint = (try advanceMeasuredHistoryEndpoint(
+        alloc,
+        batch.batch(),
+        .{
+            .top_row = 1,
+            .bottom_row = 3,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = batch.lines.len,
+        },
+        10,
+        5,
+        3,
+    )) orelse return error.TestExpectedMeasuredEndpoint;
+    try std.testing.expectEqual(@as(usize, 16), endpoint.flow_offset);
+
+    const rewound = try rewindMeasuredHistoryEndpoint(
+        alloc,
+        batch.batch(),
+        endpoint,
+        5,
+        3,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, endpoint.span_start_flow_offset),
+        rewound,
+    );
+
+    const rewound_one = try rewindMeasuredHistoryEndpoint(
+        alloc,
+        batch.batch(),
+        endpoint,
+        5,
+        1,
+    );
+    try std.testing.expectEqual(@as(?usize, 11), rewound_one);
+}
+
+test "empty hard line start maps to its exact visual row" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "head\n\ntail", 10);
+    defer batch.deinit(alloc);
+
+    const projection = visualProjectionForFlowOffset(
+        batch.batch(),
+        batch.line_visual_rows,
+        10,
+        5,
+    ) orelse return error.TestExpectedFlowProjection;
+    try std.testing.expectEqual(@as(u32, 1), projection.visual_offset);
+    try std.testing.expect(projection.exact);
+    try std.testing.expectEqual(
+        @as(?u32, 1),
+        visualOffsetForExactFlowOffset(
+            batch.batch(),
+            batch.line_visual_rows,
+            10,
+            5,
+        ),
+    );
+}
+
+test "inexact measured endpoint resumes from its containing target row" {
+    const alloc = std.testing.allocator;
+    const record = "a" ** 249;
+    const flow =
+        record ++ "\n" ++
+        record ++ "\n" ++
+        record ++ "\n" ++
+        record ++ "\n" ++
+        record ++ "\n" ++
+        record;
+    var batch = try transcriptTestBatch(alloc, flow, 70);
+    defer batch.deinit(alloc);
+
+    const endpoint = (try advanceMeasuredHistoryEndpoint(
+        alloc,
+        batch.batch(),
+        .{
+            .top_row = 1,
+            .bottom_row = 30,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = batch.lines.len,
+        },
+        120,
+        70,
+        29,
+    )) orelse return error.TestExpectedMeasuredEndpoint;
+    try std.testing.expectEqual(@as(usize, 1490), endpoint.flow_offset);
+
+    const projection = visualProjectionForFlowOffset(
+        batch.batch(),
+        batch.line_visual_rows,
+        70,
+        endpoint.flow_offset,
+    ) orelse return error.TestExpectedFlowProjection;
+    try std.testing.expectEqual(@as(u32, 23), projection.visual_offset);
+    try std.testing.expect(!projection.exact);
+
+    const layout = testLayout(70, 24, 20);
+    var host = TestTranscriptPainterHost.init(alloc, layout);
+    defer host.deinit();
+    var rendered = try renderTranscriptRows(
+        &host,
+        alloc,
+        batch.batch(),
+        batch.line_visual_rows,
+        batch.lines.len,
+        5,
+        3,
+        1,
+        20,
+        null,
+        &.{},
+        endpoint.flow_offset,
+    );
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 9), rendered.rows.items[0].bytes.len);
+    try std.testing.expectEqualStrings("a" ** 9, rendered.rows.items[0].bytes);
+    try std.testing.expectEqual(@as(u16, 1), rendered.rows.items[0].rows_painted);
+    try std.testing.expectEqualStrings("a" ** 9, rendered.last_visible_line);
+    const cursor = calculateViewportCursor(
+        layout,
+        20,
+        batch.lines.len,
+        5,
+        batch.lines.len,
+        1,
+        rendered.last_visible_line,
+        rendered.last_visible_row,
+        false,
+        1,
+        false,
+        false,
+        1,
+    );
+    try std.testing.expectEqual(@as(u16, 1), cursor.cursor_row);
+    try std.testing.expectEqual(@as(u16, 10), cursor.cursor_col);
+}
+
+test "committed measured endpoint advances by source hard-row groups" {
+    const flow = ("a" ** 21) ++ "\n" ++ ("b" ** 21) ++ "\n";
+    const advanced = advanceMeasuredHistoryOriginForCommittedRows(
+        flow,
+        .{
+            .source_cols = 10,
+            .source_visual_offset = 0,
+            .endpoint = .{
+                .span_start_flow_offset = 0,
+                .flow_offset = 0,
+                .hard_row_cols = 10,
+            },
+        },
+        6,
+        5,
+    ) orelse return error.TestExpectedMeasuredHistoryOrigin;
+    try std.testing.expectEqual(@as(usize, 22), advanced.endpoint.?.flow_offset);
+}
+
+test "exact measured endpoint mapping is inexact when folded output precedes it" {
+    const alloc = std.testing.allocator;
+    var source = try transcriptTestBatch(alloc, "head\ntail", 8);
+    defer source.deinit(alloc);
+    const endpoint = (try advanceMeasuredHistoryEndpoint(
+        alloc,
+        source.batch(),
+        .{
+            .top_row = 1,
+            .bottom_row = 2,
+            .start_line = 1,
+            .partial_skip_rows = 0,
+            .line_count = source.lines.len,
+        },
+        8,
+        4,
+        1,
+    )) orelse return error.TestExpectedMeasuredEndpoint;
+
+    source.lines[0] = .{ .folded_line = .{ .text = "folded", .stream = .stdout } };
+    try std.testing.expect(
+        visualOffsetForExactFlowOffset(
+            source.batch(),
+            source.line_visual_rows,
+            4,
+            endpoint.flow_offset,
+        ) == null,
+    );
+}
+
+test "resize history offset drops a pinned welcome split" {
+    const rows = [_]u16{ 1, 1, 1, 1, 1 };
+    var selection = ViewportSelection{
+        .top_row = 1,
+        .bottom_row = 4,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 4,
+        .split_active = true,
+        .split_prefix_lines = 2,
+        .split_suffix_start_line = 3,
+    };
+
+    _ = applyResizeHistoryOffset(&selection, &rows, 2);
+    try std.testing.expect(!selection.split_active);
+    try std.testing.expectEqual(@as(usize, 3), selection.start_line);
+}
+
+test "resize history offset applies measured rows to the committed prefix" {
+    try std.testing.expectEqual(@as(u32, 8), offsetBySignedRows(8, 0));
+    try std.testing.expectEqual(@as(u32, 12), offsetBySignedRows(4, 8));
+    try std.testing.expectEqual(@as(u32, 0), offsetBySignedRows(4, -10));
+}
+
+test "resize history offset replays the welcome tail when history returns" {
+    const rows = [_]u16{ 1, 1, 1, 1, 2, 1, 1, 2 };
+    const boundary = transcript_blocks.LeadingWelcomeBoundary{
+        .full_cut_line = 7,
+        .tail_replay_line = 5,
+    };
+    try std.testing.expectEqual(
+        @as(u32, 8),
+        preserveWelcomeReplayBoundary(4, 4, boundary, &rows),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 6),
+        preserveWelcomeReplayBoundary(4, -2, boundary, &rows),
+    );
+}
+
+test "transcript surface painter renders welcome plus user rows" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "fx welcome\n\n╭ user prompt\n╰ done", 24);
+    defer batch.deinit(alloc);
+    const layout = testLayout(24, 10, 6);
+    var target = try expectTranscriptSurfacePaint(alloc, layout, .{
+        .top_row = 1,
+        .bottom_row = 6,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = batch.lines.len,
+    }, batch);
+    defer target.deinit();
+    try expectGridContains(&target, alloc, "fx welcome");
+    try expectGridContains(&target, alloc, "user prompt");
+}
+
+test "transcript surface painter renders assistant partial tail" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "abcdefghijklmnopqrst", 5);
+    defer batch.deinit(alloc);
+    const layout = testLayout(5, 8, 4);
+    var target = try expectTranscriptSurfacePaint(alloc, layout, .{
+        .top_row = 2,
+        .bottom_row = 3,
+        .start_line = 0,
+        .partial_skip_rows = 2,
+        .line_count = batch.lines.len,
+    }, batch);
+    defer target.deinit();
+    try expectGridContains(&target, alloc, "klmno");
+    try expectGridContains(&target, alloc, "pqrst");
+}
+
+test "transcript surface painter renders soft wrap across three rows" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "abcdefghijkl", 5);
+    defer batch.deinit(alloc);
+    const layout = testLayout(5, 8, 4);
+    var target = try expectTranscriptSurfacePaint(alloc, layout, .{
+        .top_row = 1,
+        .bottom_row = 3,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = batch.lines.len,
+    }, batch);
+    defer target.deinit();
+    try expectGridContains(&target, alloc, "abcde");
+    try expectGridContains(&target, alloc, "fghij");
+    try expectGridContains(&target, alloc, "kl");
+}
+
+test "transcript surface painter materializes an ANSI-only logical row" {
+    const alloc = std.testing.allocator;
+    const styled_notice = "\x1b[2m" ++ ("x" ** 391) ++ "\x1b[0m";
+    try std.testing.expectEqual(@as(usize, 399), styled_notice.len);
+
+    var batch = try transcriptTestBatch(alloc, styled_notice ++ "\n\x1b[0m", 123);
+    defer batch.deinit(alloc);
+    try std.testing.expectEqualSlices(u16, &.{ 4, 1 }, batch.line_visual_rows);
+
+    const layout = testLayout(123, 34, 30);
+    var target = try expectTranscriptSurfacePaint(alloc, layout, .{
+        .top_row = 1,
+        .bottom_row = 5,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = batch.lines.len,
+    }, batch);
+    defer target.deinit();
+    try expectGridContains(&target, alloc, "xxxxxxxx");
+}
+
+test "ANSI-only transcript bytes retain controls and materialize their planned row" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "\x1b[0m", 123);
+    defer batch.deinit(alloc);
+    const layout = testLayout(123, 34, 30);
+    var host = TestTranscriptPainterHost.init(alloc, layout);
+    defer host.deinit();
+
+    var rendered = try renderTranscriptRows(
+        &host,
+        alloc,
+        batch.batch(),
+        batch.line_visual_rows,
+        batch.lines.len,
+        0,
+        0,
+        1,
+        1,
+        null,
+        &.{},
+        null,
+    );
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 1), rendered.rows.items[0].rows_painted);
+    try std.testing.expectEqualStrings("\x1b[0m\x1b[2K", rendered.rows.items[0].bytes);
+}
+
+test "transcript surface painter renders hard newline row boundaries" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "alpha\nbeta\n\ngamma", 20);
+    defer batch.deinit(alloc);
+    const layout = testLayout(20, 10, 6);
+    var target = try expectTranscriptSurfacePaint(alloc, layout, .{
+        .top_row = 1,
+        .bottom_row = 6,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = batch.lines.len,
+    }, batch);
+    defer target.deinit();
+    try expectGridContains(&target, alloc, "alpha");
+    try expectGridContains(&target, alloc, "beta");
+    try expectGridContains(&target, alloc, "gamma");
+}
+
+test "transcript surface painter renders folded stdout and stderr" {
+    const alloc = std.testing.allocator;
+    var batch = try foldedTestBatch(alloc, "stdout wraps here", "stderr wraps here", 10);
+    defer batch.deinit(alloc);
+    const layout = testLayout(10, 10, 6);
+    var target = try expectTranscriptSurfacePaint(alloc, layout, .{
+        .top_row = 1,
+        .bottom_row = 6,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = batch.lines.len,
+    }, batch);
+    defer target.deinit();
+    try expectGridContains(&target, alloc, "stdout");
+    try expectGridContains(&target, alloc, "stderr");
+}
+
+test "transcript surface painter renders block gap rows" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "raw block\n\nassistant block\n\n╭ user block", 28);
+    defer batch.deinit(alloc);
+    const layout = testLayout(28, 10, 7);
+    var target = try expectTranscriptSurfacePaint(alloc, layout, .{
+        .top_row = 1,
+        .bottom_row = 7,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = batch.lines.len,
+    }, batch);
+    defer target.deinit();
+    try expectGridContains(&target, alloc, "raw block");
+    try expectGridContains(&target, alloc, "assistant block");
+    try expectGridContains(&target, alloc, "user block");
+}
+
+test "transcript surface painter preserves OSC 8 links through target-grid diff" {
+    const alloc = std.testing.allocator;
+    const linked = "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\";
+    var batch = try transcriptTestBatch(alloc, linked, 20);
+    defer batch.deinit(alloc);
+    const layout = testLayout(20, 8, 4);
+    var target = try expectTranscriptSurfacePaint(alloc, layout, .{
+        .top_row = 1,
+        .bottom_row = 4,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = batch.lines.len,
+    }, batch);
+    defer target.deinit();
+
+    const target_cell = target.cellAt(1, 1).?;
+    try std.testing.expect(target_cell.style.hyperlink_id != 0);
+    try std.testing.expectEqualStrings("https://example.com", target.hyperlinkUrl(target_cell.style.hyperlink_id).?);
+
+    var diff_prev = try vt_emulator.Grid.init(alloc, layout.cols, layout.rows);
+    defer diff_prev.deinit();
+    var diff_buf: std.ArrayList(u8) = .empty;
+    defer diff_buf.deinit(alloc);
+    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, &diff_buf);
+    try vt_emulator.Grid.diffBand(diff_prev, target, 1, 1, &writer.writer);
+    diff_buf = writer.toArrayList();
+    try diff_prev.feed(diff_buf.items);
+    const diff_cell = diff_prev.cellAt(1, 1).?;
+    try std.testing.expectEqualStrings("https://example.com", diff_prev.hyperlinkUrl(diff_cell.style.hyperlink_id).?);
+}
+
+test "resume document append matches full prefix replay" {
+    const alloc = std.testing.allocator;
+    const prefix = "\x1b[31mABCD";
+    const middle = "\x1b[32mEFGH\nI";
+    const flow = prefix ++ middle ++ "\x1b[0mJ";
+
+    var start = try vt_emulator.Grid.init(alloc, 4, 1);
+    defer start.deinit();
+    try start.feed(prefix);
+    var start_resume: std.Io.Writer.Allocating = .init(alloc);
+    defer start_resume.deinit();
+    try start.writePresentationResume(&start_resume.writer);
+
+    var append = try prepareResumeDocumentAppend(
+        alloc,
+        flow,
+        4,
+        prefix.len,
+        prefix.len + middle.len,
+        true,
+        .{
+            .resume_bytes = start_resume.written(),
+            .cursor_col = start.cursor_col,
+            .pending_wrap = start.pending_wrap,
+        },
+        true,
+    );
+    defer append.deinit(alloc);
+    const replay = try prepareTranscriptDocumentAppendBytes(
+        alloc,
+        flow,
+        4,
+        prefix.len,
+        prefix.len + middle.len,
+        true,
+    );
+    defer if (replay.len > 0) alloc.free(replay);
+
+    try std.testing.expectEqualStrings(replay, append.bytes);
+    var endpoint = try vt_emulator.Grid.init(alloc, 4, 1);
+    defer endpoint.deinit();
+    try endpoint.feed(flow[0 .. prefix.len + middle.len]);
+    var endpoint_resume: std.Io.Writer.Allocating = .init(alloc);
+    defer endpoint_resume.deinit();
+    try endpoint.writePresentationResume(&endpoint_resume.writer);
+    try std.testing.expectEqualStrings(endpoint_resume.written(), append.endpoint_resume_bytes);
+    try std.testing.expectEqual(endpoint.cursor_col, append.endpoint_cursor_col);
+    try std.testing.expectEqual(endpoint.pending_wrap, append.endpoint_pending_wrap);
+}
+
+test "transcript surface painter handles zero transcript lines" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "", 20);
+    defer batch.deinit(alloc);
+    const layout = testLayout(20, 8, 4);
+    const selection: ViewportSelection = .{
+        .top_row = 1,
+        .bottom_row = 4,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 0,
+    };
+    var shadow = try vt_emulator.Grid.init(alloc, layout.cols, layout.rows);
+    defer shadow.deinit();
+    var surface = try frame_surface.FrameSurface.initFromShadow(alloc, testPaintPlan(layout, selection), shadow);
+    defer surface.deinit();
+    var host = TestTranscriptPainterHost.init(alloc, layout);
+    defer host.deinit();
+
+    const result = try paintTranscriptIntoSurface(&host, alloc, &surface, batch.batch(), batch.line_visual_rows, 0, false);
+    try std.testing.expectEqual(@as(u16, 0), result.painted_rows);
+    try std.testing.expectEqual(@as(u16, 0), result.first_row);
+    try std.testing.expectEqual(@as(u16, 0), result.last_row);
+    try std.testing.expect(surface.cursor_target == null);
+}
+
+test "transcript selection bottom follows sparse rendered rows" {
+    const alloc = std.testing.allocator;
+    var batch = try transcriptTestBatch(alloc, "alpha\nbeta\n", 20);
+    defer batch.deinit(alloc);
+    const layout = testLayout(20, 12, 8);
+    var host = TestTranscriptPainterHost.init(alloc, layout);
+    defer host.deinit();
+
+    var selection = buildViewportSelection(.{
+        .top_row = 1,
+        .bottom_row = 8,
+        .line_visual_rows = batch.line_visual_rows,
+        .visible_rows = 8,
+        .replaceable_line_index = batch.lines.len,
+    }).selection;
+    try std.testing.expectEqual(@as(u16, 8), selection.bottom_row);
+
+    var rendered_rows = try renderTranscriptRows(
+        &host,
+        alloc,
+        batch.batch(),
+        batch.line_visual_rows,
+        batch.lines.len,
+        selection.start_line,
+        selection.partial_skip_rows,
+        selection.top_row,
+        selection.bottom_row,
+        null,
+        &.{},
+        null,
+    );
+    defer rendered_rows.deinit(alloc);
+
+    applyRenderedRowsToSelection(&selection, &rendered_rows);
+    try std.testing.expectEqual(rendered_rows.last_visible_row, selection.last_visible_row);
+    try std.testing.expectEqual(rendered_rows.last_visible_row, selection.bottom_row);
+    try std.testing.expectEqual(@as(u16, 2), selection.bottom_row);
+}
+
+test "transcript document control cursor matches independent boundary preparation" {
+    const alloc = std.testing.allocator;
+    const bytes = "\x1b[31mred-red\nstill-red\x1b[0m\n" ++
+        "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\nplain";
+    const ranges = [_][2]usize{
+        .{ 5, 12 },
+        .{ 13, 26 },
+        .{ 27, 64 },
+        .{ 65, 70 },
+    };
+
+    var cursor = try TranscriptDocumentControlCursor.init(alloc, bytes, 20);
+    defer cursor.deinit();
+    for (ranges) |range| {
+        const expected = try prepareTranscriptDocumentAppendBytes(
+            alloc,
+            bytes,
+            20,
+            range[0],
+            range[1],
+            true,
+        );
+        defer if (expected.len > 0) alloc.free(expected);
+        const actual = try cursor.prepareAppendBytes(
+            alloc,
+            range[0],
+            range[1],
+            true,
+        );
+        defer if (actual.len > 0) alloc.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "transcript paint row traces stay metadata only" {
+    const source = @embedFile("painter.zig");
+    const forbidden_preview = "pre" ++ "view=";
+    try std.testing.expect(std.mem.find(u8, source, "transcript_line row=") != null);
+    try std.testing.expect(std.mem.find(u8, source, forbidden_preview) == null);
 }

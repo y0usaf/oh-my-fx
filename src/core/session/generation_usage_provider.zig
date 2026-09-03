@@ -4,7 +4,7 @@ const model_provider = @import("../config/model_provider.zig");
 const Allocator = std.mem.Allocator;
 
 pub const LookupInput = struct {
-    credential: []const u8,
+    credential: ?[]const u8,
     tenant: ?[]const u8,
     origin: []const u8,
     generation_id: []const u8,
@@ -98,3 +98,80 @@ pub const Set = struct {
         };
     }
 };
+
+test "generation usage lookup dispatches through the injected provider" {
+    const Fake = struct {
+        calls: usize = 0,
+        saw_expected_input: bool = false,
+
+        fn lookup(
+            raw_context: ?*anyopaque,
+            alloc: Allocator,
+            input: LookupInput,
+        ) LookupError!LookupOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw_context.?));
+            self.calls += 1;
+            self.saw_expected_input =
+                input.credential != null and
+                std.mem.eql(u8, "credential", input.credential.?) and
+                std.mem.eql(u8, "generation", input.generation_id);
+            const id = try alloc.dupe(u8, input.generation_id);
+            errdefer alloc.free(id);
+            const model = try alloc.dupe(u8, "provider/model");
+            return .{ .found = .{
+                .id = id,
+                .model = model,
+                .total_cost = 1,
+                .input_tokens = 2,
+                .output_tokens = 3,
+                .cache_read_tokens = 0,
+                .cache_write_tokens = 0,
+                .billable_web_search_calls = 0,
+            } };
+        }
+    };
+
+    var fake: Fake = .{};
+    const provider = Provider{
+        .context = &fake,
+        .lookup_fn = Fake.lookup,
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    var outcome = try provider.lookup(std.testing.allocator, .{
+        .credential = "credential",
+        .tenant = null,
+        .origin = "https://provider.example",
+        .generation_id = "generation",
+        .cancel_flag = &cancel,
+    });
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(fake.saw_expected_input);
+    try std.testing.expectEqualStrings("provider/model", outcome.found.model);
+}
+
+test "generation usage lookup can defer authentication to the host" {
+    const Fake = struct {
+        fn lookup(_: ?*anyopaque, _: Allocator, input: LookupInput) LookupError!LookupOutcome {
+            if (input.credential != null) return error.Unavailable;
+            return .preserve_pending;
+        }
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    const outcome = try (Provider{ .lookup_fn = Fake.lookup }).lookup(std.testing.allocator, .{
+        .credential = null,
+        .tenant = null,
+        .origin = "https://ai-gateway.vercel.sh",
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .cancel_flag = &cancel,
+    });
+    try std.testing.expectEqual(LookupOutcome.preserve_pending, outcome);
+}
+
+test "generation usage providers are selected by provider identity" {
+    const routes = Set.gatewayOnly(unavailable_provider);
+    try std.testing.expect(routes.select(.gateway) != null);
+    try std.testing.expect(routes.select(.codex) == null);
+    try std.testing.expect(routes.select(.grok) == null);
+}

@@ -95,11 +95,6 @@ const Generation = struct {
     /// match if `(path_mask & query_mask) == query_mask`, since every letter
     /// in the query must appear somewhere in the path for a subsequence match.
     char_masks: []u32 = &.{},
-    /// Presence bitmap for lowered bytes 0x20..0x3f (space, punctuation,
-    /// digits). Companion to `char_masks`: lets the search reject entries
-    /// missing a non-letter query byte without scanning. Bits only exist
-    /// for 0x20..0x3f, so an uncovered byte imposes no constraint.
-    punct_masks: []u32 = &.{},
     /// The loader publishes an immutable prefix with release stores after
     /// every parallel-buffer entry is complete. Search pairs this with an
     /// acquire load before reading that prefix.
@@ -180,7 +175,6 @@ const Generation = struct {
             @memcpy(self.paths_buf[start .. start + len], path);
 
             var mask: u32 = 0;
-            var punct_mask: u32 = 0;
             var contains_non_ascii = false;
             for (path, 0..) |byte, byte_index| {
                 const lower = asciiToLower(byte);
@@ -188,9 +182,6 @@ const Generation = struct {
                 if (byte >= 0x80) contains_non_ascii = true;
                 if (lower >= 'a' and lower <= 'z') {
                     mask |= @as(u32, 1) << @intCast(lower - 'a');
-                }
-                if (lower >= 0x20 and lower <= 0x3f) {
-                    punct_mask |= @as(u32, 1) << @intCast(lower - 0x20);
                 }
             }
 
@@ -201,7 +192,6 @@ const Generation = struct {
                 start;
             if (contains_non_ascii) mask |= non_ascii_mask;
             self.char_masks[candidate_index] = mask;
-            self.punct_masks[candidate_index] = punct_mask;
             self.kinds[candidate_index] = accepted.kind;
             buffer_position += len;
             self.offsets[candidate_index + 1] = buffer_position;
@@ -227,8 +217,6 @@ const Generation = struct {
         errdefer alloc.free(basename_starts);
         const char_masks = try alloc.alloc(u32, totals.n);
         errdefer alloc.free(char_masks);
-        const punct_masks = try alloc.alloc(u32, totals.n);
-        errdefer alloc.free(punct_masks);
         const kinds = try alloc.alloc(CandidateKind, totals.n);
         errdefer alloc.free(kinds);
 
@@ -237,7 +225,6 @@ const Generation = struct {
         self.offsets = offsets;
         self.basename_starts = basename_starts;
         self.char_masks = char_masks;
-        self.punct_masks = punct_masks;
         self.kinds = kinds;
     }
 
@@ -247,14 +234,12 @@ const Generation = struct {
         if (self.offsets.len > 0) alloc.free(self.offsets);
         if (self.basename_starts.len > 0) alloc.free(self.basename_starts);
         if (self.char_masks.len > 0) alloc.free(self.char_masks);
-        if (self.punct_masks.len > 0) alloc.free(self.punct_masks);
         if (self.kinds.len > 0) alloc.free(self.kinds);
         self.paths_buf = &.{};
         self.lower_buf = &.{};
         self.offsets = &.{};
         self.basename_starts = &.{};
         self.char_masks = &.{};
-        self.punct_masks = &.{};
         self.kinds = &.{};
         self.ready_count.store(0, .release);
     }
@@ -1009,21 +994,6 @@ fn alphaMask(bytes: []const u8) u32 {
     return m;
 }
 
-/// Returns a presence bitmap for bytes 0x20..0x3f (space through '?':
-/// whitespace, most punctuation, digits). Bytes outside that range
-/// contribute no bits, so the mask can only under-constrain a query,
-/// never falsely reject one.
-fn punctMask(bytes: []const u8) u32 {
-    var m: u32 = 0;
-    for (bytes) |b| {
-        const lower = asciiToLower(b);
-        if (lower >= 0x20 and lower <= 0x3f) {
-            m |= @as(u32, 1) << @intCast(lower - 0x20);
-        }
-    }
-    return m;
-}
-
 const non_ascii_mask: u32 = @as(u32, 1) << 31;
 const max_search_results: usize = 64;
 
@@ -1138,7 +1108,6 @@ fn rankTopN(generation: *const Generation, query: PreparedQuery, out: []u32) usi
 
     const query_ascii = query.ascii;
     const query_mask = if (query_ascii) |ascii| alphaMask(ascii) else 0;
-    const query_punct_mask = if (query_ascii) |ascii| punctMask(ascii) else 0;
     var scalar_scratch: FoldedPathScratch = undefined;
 
     const total = generation.count();
@@ -1149,9 +1118,6 @@ fn rankTopN(generation: *const Generation, query: PreparedQuery, out: []u32) usi
         const score = if ((path_mask & non_ascii_mask) == 0) ascii_path: {
             const ascii = query_ascii orelse continue;
             if ((path_mask & query_mask) != query_mask) continue;
-            if (query_punct_mask != 0) {
-                if ((generation.punct_masks[candidate_index] & query_punct_mask) != query_punct_mask) continue;
-            }
             break :ascii_path scoreAsciiMatch(
                 generation.pathAt(candidate_index),
                 generation.lowerPathAt(candidate_index),
@@ -1208,15 +1174,8 @@ noinline fn scoreAsciiRange(
     var previous_position: usize = 0;
     var run_length: usize = 0;
     var position = range_start;
-    if (query.len != 0) {
-        if (std.mem.indexOfScalarPos(u8, path_lower, range_start, query[0])) |first_hit| {
-            position = first_hit;
-        } else return null;
-    }
     while (position < path_lower.len and query_index < query.len) : (position += 1) {
-        if (path_lower[position] != query[query_index]) {
-            position = std.mem.indexOfScalarPos(u8, path_lower, position + 1, query[query_index]) orelse return null;
-        }
+        if (path_lower[position] != query[query_index]) continue;
 
         if (query_index == 0) {
             facts.first_position = position - range_start;
@@ -1438,11 +1397,1155 @@ fn spansFromMatchedOffsets(
     return span_count;
 }
 
+fn expectValidSearchSpans(result: SearchResult) !void {
+    var previous_end: usize = 0;
+    for (result.matched_spans) |span| {
+        try std.testing.expect(span.byte_start < span.byte_end);
+        try std.testing.expect(span.byte_start >= previous_end);
+        try std.testing.expect(span.byte_end <= result.path.len);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(result.path[span.byte_start..span.byte_end]));
+        previous_end = span.byte_end;
+    }
+}
+
+fn TestSearchBuffer(comptime capacity: usize) type {
+    return struct {
+        results: [capacity]SearchResult = undefined,
+        spans: [capacity * max_path_len]MatchSpan = undefined,
+
+        fn run(self: *@This(), index: *const FileIndex, query: []const u8) SearchError![]const SearchResult {
+            const count = try index.searchTyped(query, &self.results, &self.spans);
+            return self.results[0..count];
+        }
+    };
+}
+
+fn expectFirstSearchPath(raw: []const u8, query: []const u8, expected: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, raw);
+
+    var search: TestSearchBuffer(8) = .{};
+    const results = try search.run(&index, query);
+    try std.testing.expect(results.len > 0);
+    try std.testing.expectEqualStrings(expected, results[0].path);
+}
+
 fn containsCandidate(candidates: []const Candidate, path: []const u8, kind: CandidateKind) bool {
     for (candidates) |candidate| {
         if (candidate.kind == kind and std.mem.eql(u8, candidate.path, path)) return true;
     }
     return false;
+}
+
+fn runGitForFileIndexTest(alloc: Allocator, cwd: []const u8, argv: []const []const u8) !void {
+    const result = try std.process.run(alloc, io_mod.getIo(), .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .signal, .stopped, .unknown => return error.TestUnexpectedResult,
+    }
+}
+
+test "buildFromRaw parses newline-separated list" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    try index.buildFromRaw(alloc, "src/main.zig\nsrc/core/shared/io.zig\nREADME.md\n");
+
+    try std.testing.expectEqual(@as(usize, 3), index.count());
+    try std.testing.expectEqualStrings("src/main.zig", index.pathAt(0));
+    try std.testing.expectEqualStrings("src/core/shared/io.zig", index.pathAt(1));
+    try std.testing.expectEqualStrings("README.md", index.pathAt(2));
+}
+
+test "buildFromRaw parses nul-separated list from git ls-files -z" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    try index.buildFromRaw(alloc, "a/b.zig\x00CAMEL.md\x00");
+
+    try std.testing.expectEqual(@as(usize, 2), index.count());
+    try std.testing.expectEqualStrings("a/b.zig", index.pathAt(0));
+    try std.testing.expectEqualStrings("CAMEL.md", index.pathAt(1));
+    try std.testing.expectEqualStrings("camel.md", index.lowerPathAt(1));
+}
+
+test "buildFromRaw precomputes basename starts" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    try index.buildFromRaw(alloc, "a/b/c.txt\nroot.txt\n");
+
+    const generation = index.active_generation.?;
+    const first_base = generation.paths_buf[generation.basename_starts[0]..generation.offsets[1]];
+    const second_base = generation.paths_buf[generation.basename_starts[1]..generation.offsets[2]];
+    try std.testing.expectEqualStrings("c.txt", first_base);
+    try std.testing.expectEqualStrings("root.txt", second_base);
+}
+
+test "buildFromRaw precomputes a-z char masks" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    try index.buildFromRaw(alloc, "src/Main.zig\nREADME.md\n");
+
+    const generation = index.active_generation.?;
+    try std.testing.expectEqual(alphaMask("src/main.zig"), generation.char_masks[0]);
+    try std.testing.expectEqual(alphaMask("readme.md"), generation.char_masks[1]);
+}
+
+test "countAndSize applies the same filters as the fill pass" {
+    const long_path = "a" ** (max_path_len + 1);
+    const raw = "ok.zig\n" ++ long_path ++ "\n\nother.md\n";
+    const totals = countAndSize(.{ .file_raw = raw });
+    // "ok.zig" + "" (empty) + long_path (too long) + "other.md" -> 2 kept.
+    try std.testing.expectEqual(@as(u32, 2), totals.n);
+    try std.testing.expectEqual(@as(u32, "ok.zig".len + "other.md".len), totals.bytes);
+}
+
+test "buildFromCandidates stores one mixed typed inventory in input order" {
+    const alloc = std.testing.allocator;
+    const candidates = [_]Candidate{
+        .{ .path = "src", .kind = .directory },
+        .{ .path = "src", .kind = .directory },
+        .{ .path = "src", .kind = .file },
+        .{ .path = "src/main.zig", .kind = .file },
+        .{ .path = "docs", .kind = .directory },
+    };
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromCandidates(alloc, &candidates);
+
+    try std.testing.expectEqual(@as(usize, 4), index.count());
+    try std.testing.expectEqualStrings("src", index.pathAt(0));
+    try std.testing.expectEqual(CandidateKind.directory, index.kindAt(0));
+    try std.testing.expectEqualStrings("src", index.pathAt(1));
+    try std.testing.expectEqual(CandidateKind.file, index.kindAt(1));
+    try std.testing.expectEqualStrings("src/main.zig", index.pathAt(2));
+    try std.testing.expectEqual(CandidateKind.file, index.kindAt(2));
+    try std.testing.expectEqualStrings("docs", index.pathAt(3));
+    try std.testing.expectEqual(CandidateKind.directory, index.kindAt(3));
+}
+
+test "buildFromCandidates handles empty and rejected typed candidates" {
+    const alloc = std.testing.allocator;
+
+    var empty = FileIndex{};
+    defer empty.deinit(alloc);
+    try empty.buildFromCandidates(alloc, &.{});
+    try std.testing.expectEqual(@as(usize, 0), empty.count());
+
+    const long_path = "a" ** (max_path_len + 1);
+    const candidates = [_]Candidate{
+        .{ .path = "src/", .kind = .directory },
+        .{ .path = "escape-\x1b[2J", .kind = .directory },
+        .{ .path = "space \" dir", .kind = .directory },
+        .{ .path = long_path, .kind = .file },
+        .{ .path = "src", .kind = .directory },
+        .{ .path = "README.md", .kind = .file },
+    };
+
+    var filtered = FileIndex{};
+    defer filtered.deinit(alloc);
+    try filtered.buildFromCandidates(alloc, &candidates);
+    try std.testing.expectEqual(@as(usize, 2), filtered.count());
+    try std.testing.expectEqualStrings("src", filtered.pathAt(0));
+    try std.testing.expectEqual(CandidateKind.directory, filtered.kindAt(0));
+    try std.testing.expectEqualStrings("README.md", filtered.pathAt(1));
+    try std.testing.expectEqual(CandidateKind.file, filtered.kindAt(1));
+}
+
+test "typed candidate publication exposes matching immutable kinds" {
+    const alloc = std.testing.allocator;
+    const candidates = [_]Candidate{
+        .{ .path = "src", .kind = .directory },
+        .{ .path = "src/main.zig", .kind = .file },
+        .{ .path = "docs", .kind = .directory },
+    };
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromCandidates(alloc, &candidates);
+
+    const generation = index.active_generation.?;
+    index.active_generation = null;
+    index.loading_generation = generation;
+    generation.state.store(@intFromEnum(GenerationState.loading), .release);
+    generation.ready_count.store(2, .release);
+    try std.testing.expectEqual(@as(usize, 2), index.count());
+    try std.testing.expectEqual(CandidateKind.directory, index.kindAt(0));
+    try std.testing.expectEqual(CandidateKind.file, index.kindAt(1));
+
+    var search: TestSearchBuffer(3) = .{};
+    const results = try search.run(&index, "");
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("src", results[0].path);
+    try std.testing.expectEqualStrings("src/main.zig", results[1].path);
+
+    generation.ready_count.store(3, .release);
+    try std.testing.expectEqual(CandidateKind.directory, index.kindAt(2));
+}
+
+test "typed candidate cap is shared across files and directories" {
+    const alloc = std.testing.allocator;
+    const candidate_count = max_indexed_files + 1;
+    const path_stride: usize = 32;
+    const path_storage_len = try std.math.mul(usize, candidate_count, path_stride);
+    const path_storage = try alloc.alloc(u8, path_storage_len);
+    defer alloc.free(path_storage);
+    const candidates = try alloc.alloc(Candidate, candidate_count);
+    defer alloc.free(candidates);
+
+    for (candidates, 0..) |*candidate, index| {
+        const slot = path_storage[index * path_stride ..][0..path_stride];
+        candidate.* = .{
+            .path = try std.fmt.bufPrint(slot, "candidate-{d:0>6}", .{index}),
+            .kind = if (index % 2 == 0) .file else .directory,
+        };
+    }
+
+    var file_index = FileIndex{};
+    defer file_index.deinit(alloc);
+    try file_index.buildFromCandidates(alloc, candidates);
+
+    try std.testing.expectEqual(max_indexed_files, file_index.count());
+    try std.testing.expectEqualStrings("candidate-099999", file_index.pathAt(max_indexed_files - 1));
+    try std.testing.expectEqual(CandidateKind.directory, file_index.kindAt(max_indexed_files - 1));
+}
+
+test "sorted discovery merge retains directories at the exact shared cap" {
+    const files = try std.testing.allocator.alloc([]const u8, max_indexed_files);
+    defer std.testing.allocator.free(files);
+    @memset(files, "z-file");
+    const directories = [_][]const u8{"a-empty-directory"};
+    var file_cursor: usize = 0;
+    var directory_cursor: usize = 0;
+    var count: usize = 0;
+    var saw_directory = false;
+
+    while (count < max_indexed_files) : (count += 1) {
+        const candidate = nextSortedDiscoveredCandidate(files, &directories, &file_cursor, &directory_cursor).?;
+        saw_directory = saw_directory or candidate.kind == .directory;
+    }
+
+    try std.testing.expect(saw_directory);
+    try std.testing.expectEqual(max_indexed_files - 1, file_cursor);
+    try std.testing.expectEqual(@as(usize, 1), directory_cursor);
+}
+
+test "subsequence scoring prefers basename prefix over mid-path match" {
+    const path_a = "src/main.zig";
+    const path_b = "src/wasm_term_main.zig";
+
+    const a = scoreAsciiMatch(path_a, path_a, 4, "main").?;
+    const b = scoreAsciiMatch(path_b, path_b, 4, "main").?;
+    try std.testing.expect(scoreBetter(a, b));
+}
+
+test "subsequence scoring prefers earlier match position" {
+    const path = "src/main.zig";
+    const early = scoreAsciiMatch(path, path, 4, "main").?;
+    const late_path = "foo/bar/baz-main.zig";
+    const late = scoreAsciiMatch(late_path, late_path, 8, "main").?;
+    try std.testing.expect(scoreBetter(early, late));
+}
+
+test "subsequence scoring returns no match when query is absent" {
+    const path = "src/main.zig";
+    try std.testing.expect(scoreAsciiMatch(path, path, 4, "xyz") == null);
+}
+
+test "subsequence scoring accepts longer query than basename via full path" {
+    const path = "src/main.zig";
+    try std.testing.expect(scoreAsciiMatch(path, path, 4, "src/main") != null);
+}
+
+test "search returns best matches first" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    const raw = "src/wasm_term_main.zig\nsrc/main.zig\nREADME.md\nsrc/core/shared/io.zig\nbenchmarks/startup.sh\n";
+    try index.buildFromRaw(alloc, raw);
+
+    var search: TestSearchBuffer(8) = .{};
+    const results = try search.run(&index, "main");
+    try std.testing.expect(results.len >= 2);
+    try std.testing.expectEqualStrings("src/main.zig", results[0].path);
+    try std.testing.expectEqualStrings("src/wasm_term_main.zig", results[1].path);
+}
+
+test "typed search supports abbreviated subsequences and caller-owned spans" {
+    const alloc = std.testing.allocator;
+    const candidates = [_]Candidate{
+        .{ .path = "src/core/workspace", .kind = .directory },
+        .{ .path = "src/core/workspace/file_index.zig", .kind = .file },
+        .{ .path = "src/core/workspace/workspace_files.zig", .kind = .file },
+    };
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromCandidates(alloc, &candidates);
+
+    var results: [4]SearchResult = undefined;
+    var spans: [32]MatchSpan = undefined;
+    const result_count = try index.searchTyped("FIIDX", &results, &spans);
+    try std.testing.expectEqual(@as(usize, 1), result_count);
+    try std.testing.expectEqualStrings("src/core/workspace/file_index.zig", results[0].path);
+    try std.testing.expectEqual(CandidateKind.file, results[0].kind);
+    try expectValidSearchSpans(results[0]);
+
+    var matched_bytes: [16]u8 = undefined;
+    var matched_len: usize = 0;
+    for (results[0].matched_spans) |span| {
+        const bytes = results[0].path[span.byte_start..span.byte_end];
+        @memcpy(matched_bytes[matched_len..][0..bytes.len], bytes);
+        matched_len += bytes.len;
+    }
+    try std.testing.expectEqualStrings("fiidx", matched_bytes[0..matched_len]);
+}
+
+test "ranking signals follow the accepted descending influence" {
+    const cases = [_]struct {
+        name: []const u8,
+        raw: []const u8,
+        query: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .name = "exact full path",
+            .raw = "other/src/core/main.zig\nsrc/core/main.zig\n",
+            .query = "src/core/main.zig",
+            .expected = "src/core/main.zig",
+        },
+        .{
+            .name = "exact basename",
+            .raw = "src/main.zig.backup\nsrc/main.zig\n",
+            .query = "main.zig",
+            .expected = "src/main.zig",
+        },
+        .{
+            .name = "basename",
+            .raw = "core/guide.txt\ndocs/core-guide.txt\n",
+            .query = "core",
+            .expected = "docs/core-guide.txt",
+        },
+        .{
+            .name = "path segment boundaries",
+            .raw = "misc/scattered/memo.zig\nsrc/core/main.zig\n",
+            .query = "scm",
+            .expected = "src/core/main.zig",
+        },
+        .{
+            .name = "basename prefix",
+            .raw = "src/xwidget.zig\nsrc/widgetx.zig\n",
+            .query = "wid",
+            .expected = "src/widgetx.zig",
+        },
+        .{
+            .name = "path prefix",
+            .raw = "x/a/b\na/x/b\n",
+            .query = "ab",
+            .expected = "a/x/b",
+        },
+        .{
+            .name = "earlier position",
+            .raw = "src/xxidxx.zig\nsrc/xidxxx.zig\n",
+            .query = "id",
+            .expected = "src/xidxxx.zig",
+        },
+        .{
+            .name = "consecutive run",
+            .raw = "src/axbyc.zig\nsrc/abczz.zig\n",
+            .query = "abc",
+            .expected = "src/abczz.zig",
+        },
+        .{
+            .name = "smaller gaps",
+            .raw = "src/axxxbxc.zig\nsrc/axbxczz.zig\n",
+            .query = "abc",
+            .expected = "src/axbxczz.zig",
+        },
+        .{
+            .name = "shorter path",
+            .raw = "src/abc-long-name.txt\nsrc/abc.txt\n",
+            .query = "abc",
+            .expected = "src/abc.txt",
+        },
+    };
+
+    for (cases) |case| {
+        try expectFirstSearchPath(case.raw, case.query, case.expected);
+    }
+}
+
+test "ranking is independent of discovery order and resolves ties bytewise" {
+    try expectFirstSearchPath(
+        "src/zeta.txt\nsrc/beta.txt\n",
+        "ta",
+        "src/beta.txt",
+    );
+    try expectFirstSearchPath(
+        "src/beta.txt\nsrc/zeta.txt\n",
+        "ta",
+        "src/beta.txt",
+    );
+}
+
+test "file and directory candidates have no ranking priority" {
+    const alloc = std.testing.allocator;
+    const first_kinds = [_]Candidate{
+        .{ .path = "src/zeta.txt", .kind = .file },
+        .{ .path = "src/beta.txt", .kind = .directory },
+    };
+    const reversed_kinds = [_]Candidate{
+        .{ .path = "src/zeta.txt", .kind = .directory },
+        .{ .path = "src/beta.txt", .kind = .file },
+    };
+
+    for ([_][]const Candidate{ &first_kinds, &reversed_kinds }) |candidates| {
+        var index = FileIndex{};
+        defer index.deinit(alloc);
+        try index.buildFromCandidates(alloc, candidates);
+        var results: [2]SearchResult = undefined;
+        var spans: [8]MatchSpan = undefined;
+        try std.testing.expectEqual(@as(usize, 2), try index.searchTyped("ta", &results, &spans));
+        try std.testing.expectEqualStrings("src/beta.txt", results[0].path);
+        try std.testing.expectEqualStrings("src/zeta.txt", results[1].path);
+    }
+}
+
+test "typed empty search preserves mixed inventory order without spans" {
+    const alloc = std.testing.allocator;
+    const candidates = [_]Candidate{
+        .{ .path = "src", .kind = .directory },
+        .{ .path = "src/main.zig", .kind = .file },
+        .{ .path = "docs", .kind = .directory },
+    };
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromCandidates(alloc, &candidates);
+
+    var results: [2]SearchResult = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try index.searchTyped("", &results, &.{}));
+    try std.testing.expectEqualStrings("src", results[0].path);
+    try std.testing.expectEqual(CandidateKind.directory, results[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), results[0].matched_spans.len);
+    try std.testing.expectEqualStrings("src/main.zig", results[1].path);
+    try std.testing.expectEqual(CandidateKind.file, results[1].kind);
+}
+
+test "punctuation remains matchable under case-insensitive subsequence search" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "src/API-route.ts\nsrc/api_handler.ts\n");
+
+    var results: [4]SearchResult = undefined;
+    var spans: [16]MatchSpan = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try index.searchTyped("api-rt", &results, &spans));
+    try std.testing.expectEqualStrings("src/API-route.ts", results[0].path);
+    try expectValidSearchSpans(results[0]);
+}
+
+test "search is case-insensitive" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    const raw = "README.md\nsrc/Main.zig\n";
+    try index.buildFromRaw(alloc, raw);
+
+    var readme_search: TestSearchBuffer(4) = .{};
+    const readme_results = try readme_search.run(&index, "README");
+    try std.testing.expect(readme_results.len >= 1);
+    try std.testing.expectEqualStrings("README.md", readme_results[0].path);
+
+    var lowercase_search: TestSearchBuffer(4) = .{};
+    const lowercase_results = try lowercase_search.run(&index, "readme");
+    try std.testing.expect(lowercase_results.len >= 1);
+    try std.testing.expectEqualStrings("README.md", lowercase_results[0].path);
+
+    var main_search: TestSearchBuffer(4) = .{};
+    const main_results = try main_search.run(&index, "main");
+    try std.testing.expect(main_results.len >= 1);
+    try std.testing.expectEqualStrings("src/Main.zig", main_results[0].path);
+}
+
+test "search uses Unicode 17 simple folding and preserves raw spelling" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    try index.buildFromRaw(alloc, "docs/Ärger-file.txt\x00docs/Σigma.txt\x00docs/ςigma-final.txt\x00docs/Kelvin.txt\x00docs/kettle.txt\x00");
+
+    var search: TestSearchBuffer(8) = .{};
+    const arger_results = try search.run(&index, "ärger");
+    try std.testing.expectEqual(@as(usize, 1), arger_results.len);
+    try std.testing.expectEqualStrings("docs/Ärger-file.txt", arger_results[0].path);
+
+    const sigma_results = try search.run(&index, "σigma");
+    try std.testing.expectEqual(@as(usize, 2), sigma_results.len);
+    try std.testing.expectEqualStrings("docs/Σigma.txt", sigma_results[0].path);
+
+    const kelvin_results = try search.run(&index, "kelvin");
+    try std.testing.expect(kelvin_results.len >= 1);
+    try std.testing.expectEqualStrings("docs/Kelvin.txt", kelvin_results[0].path);
+
+    const ascii_k_results = try search.run(&index, "k");
+    try std.testing.expect(ascii_k_results.len >= 2);
+    var saw_kelvin = false;
+    for (ascii_k_results) |result| {
+        if (std.mem.eql(u8, result.path, "docs/Kelvin.txt")) saw_kelvin = true;
+    }
+    try std.testing.expect(saw_kelvin);
+
+    const kelvin_query_results = try search.run(&index, "K");
+    try std.testing.expect(kelvin_query_results.len >= 2);
+    var saw_ascii_k = false;
+    for (kelvin_query_results) |result| {
+        if (std.mem.eql(u8, result.path, "docs/kettle.txt")) saw_ascii_k = true;
+    }
+    try std.testing.expect(saw_ascii_k);
+}
+
+test "Unicode search keeps normalization and full folding out of scope" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "Ärger.txt\x00Fuß.txt\x00");
+
+    var search: TestSearchBuffer(4) = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, "A\u{0308}rger")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, "Fuss")).len);
+}
+
+test "Unicode search rejects invalid and truncated UTF-8 queries" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "Ärger.txt\x00");
+
+    var search: TestSearchBuffer(4) = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, "\xff")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, "\xc3")).len);
+}
+
+test "typed Unicode subsequences preserve simple-fold spelling and scalar spans" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "docs/Ärger-Kelvin.txt\x00docs/kettle.txt\x00");
+
+    var results: [4]SearchResult = undefined;
+    var spans: [32]MatchSpan = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try index.searchTyped("ärgk", &results, &spans));
+    try std.testing.expectEqualStrings("docs/Ärger-Kelvin.txt", results[0].path);
+    try expectValidSearchSpans(results[0]);
+
+    const kelvin_count = try index.searchTyped("kelvin", &results, &spans);
+    try std.testing.expect(kelvin_count >= 1);
+    try std.testing.expectEqualStrings("docs/Ärger-Kelvin.txt", results[0].path);
+    try std.testing.expect(std.mem.find(u8, results[0].path, "Kelvin") != null);
+}
+
+test "typed spans keep combining display sequences intact" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "docs/Cafe\u{0301}-note.txt\x00");
+
+    var results: [2]SearchResult = undefined;
+    var spans: [16]MatchSpan = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try index.searchTyped("e\u{0301}n", &results, &spans));
+    try std.testing.expectEqualStrings("docs/Cafe\u{0301}-note.txt", results[0].path);
+    try expectValidSearchSpans(results[0]);
+    try std.testing.expect(results[0].matched_spans.len >= 1);
+    const first = results[0].matched_spans[0];
+    try std.testing.expectEqualStrings("e\u{0301}", results[0].path[first.byte_start..first.byte_end]);
+
+    try std.testing.expectEqual(@as(usize, 1), try index.searchTyped("\u{0301}", &results, &spans));
+    try std.testing.expectEqual(@as(usize, 1), results[0].matched_spans.len);
+    const combining = results[0].matched_spans[0];
+    try std.testing.expectEqualStrings("e\u{0301}", results[0].path[combining.byte_start..combining.byte_end]);
+}
+
+test "typed search handles repeated query scalars" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "src/axaya.zig\x00src/alpha.zig\x00");
+
+    var results: [4]SearchResult = undefined;
+    var spans: [16]MatchSpan = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try index.searchTyped("aaa", &results, &spans));
+    try std.testing.expectEqualStrings("src/axaya.zig", results[0].path);
+    try expectValidSearchSpans(results[0]);
+}
+
+test "typed invalid UTF-8 and no-match queries return no results" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "docs/Ärger.txt\x00");
+
+    var results: [4]SearchResult = undefined;
+    var spans: [16]MatchSpan = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try index.searchTyped("\xff", &results, &spans));
+    try std.testing.expectEqual(@as(usize, 0), try index.searchTyped("\xc3", &results, &spans));
+    try std.testing.expectEqual(@as(usize, 0), try index.searchTyped("not-present", &results, &spans));
+}
+
+test "interleaved typed searches keep generation and prior caller metadata stable" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "src/main.zig\x00docs/Ärger.txt\x00src/core/file_index.zig\x00");
+
+    const generation = index.active_generation.?;
+    const paths_before = try alloc.dupe(u8, generation.paths_buf);
+    defer alloc.free(paths_before);
+    const lower_before = try alloc.dupe(u8, generation.lower_buf);
+    defer alloc.free(lower_before);
+
+    var first_results: [4]SearchResult = undefined;
+    var first_spans: [16]MatchSpan = undefined;
+    const first_count = try index.searchTyped("mn", &first_results, &first_spans);
+    try std.testing.expect(first_count >= 1);
+    const first_path = first_results[0].path;
+    const first_span_count = first_results[0].matched_spans.len;
+
+    var repeated_results: [4]SearchResult = undefined;
+    var repeated_spans: [16]MatchSpan = undefined;
+    const repeated_count = try index.searchTyped("mn", &repeated_results, &repeated_spans);
+    try std.testing.expectEqual(first_count, repeated_count);
+    for (first_results[0..first_count], repeated_results[0..repeated_count]) |first_result, repeated_result| {
+        try std.testing.expectEqualStrings(first_result.path, repeated_result.path);
+        try std.testing.expectEqualSlices(MatchSpan, first_result.matched_spans, repeated_result.matched_spans);
+    }
+
+    var second_results: [4]SearchResult = undefined;
+    var second_spans: [16]MatchSpan = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try index.searchTyped("är", &second_results, &second_spans));
+    try std.testing.expectEqualStrings("docs/Ärger.txt", second_results[0].path);
+
+    try std.testing.expectEqualStrings(first_path, first_results[0].path);
+    try std.testing.expectEqual(first_span_count, first_results[0].matched_spans.len);
+    try expectValidSearchSpans(first_results[0]);
+    try std.testing.expectEqualSlices(u8, paths_before, generation.paths_buf);
+    try std.testing.expectEqualSlices(u8, lower_before, generation.lower_buf);
+}
+
+test "typed search sustains one thousand alternating ASCII and Unicode queries without mutating its generation" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(
+        alloc,
+        "src/main.zig\x00docs/Cafe\u{0301}-note.txt\x00docs/Ärger-Kelvin.txt\x00src/core/workspace/file_index.zig\x00",
+    );
+
+    const generation = index.active_generation.?;
+    const paths_before = try alloc.dupe(u8, generation.paths_buf);
+    defer alloc.free(paths_before);
+    const lower_before = try alloc.dupe(u8, generation.lower_buf);
+    defer alloc.free(lower_before);
+    const offsets_before = try alloc.dupe(u32, generation.offsets);
+    defer alloc.free(offsets_before);
+    const kinds_before = try alloc.dupe(CandidateKind, generation.kinds);
+    defer alloc.free(kinds_before);
+
+    const queries = [_][]const u8{ "mn", "e\u{0301}n", "ärgk", "scwfi", "zzz" };
+    var checksum: usize = 0;
+    for (0..1_000) |iteration| {
+        var results: [8]SearchResult = undefined;
+        var spans: [64]MatchSpan = undefined;
+        const query = queries[iteration % queries.len];
+        const count = try index.searchTyped(query, &results, &spans);
+        checksum +%= count;
+        for (results[0..count]) |result| {
+            try expectValidSearchSpans(result);
+            checksum +%= result.path.len + result.matched_spans.len;
+        }
+    }
+
+    try std.testing.expect(checksum > 0);
+    try std.testing.expectEqualSlices(u8, paths_before, generation.paths_buf);
+    try std.testing.expectEqualSlices(u8, lower_before, generation.lower_buf);
+    try std.testing.expectEqualSlices(u32, offsets_before, generation.offsets);
+    try std.testing.expectEqualSlices(CandidateKind, kinds_before, generation.kinds);
+}
+
+test "typed search reports insufficient caller span storage" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "src/axbyc.zig\x00");
+
+    var results: [1]SearchResult = undefined;
+    var spans: [2]MatchSpan = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, index.searchTyped("abc", &results, &spans));
+}
+
+test "Unicode search compares mixed basename and full-path scores" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "docs/Ärger.txt\x00Ärger/docs.txt\x00");
+
+    var search: TestSearchBuffer(4) = .{};
+    const results = try search.run(&index, "ärger");
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("docs/Ärger.txt", results[0].path);
+    try std.testing.expectEqualStrings("Ärger/docs.txt", results[1].path);
+}
+
+test "search with empty query returns files in index order" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    const raw = "a.zig\nb.zig\nc.zig\n";
+    try index.buildFromRaw(alloc, raw);
+
+    var search: TestSearchBuffer(2) = .{};
+    const results = try search.run(&index, "");
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("a.zig", results[0].path);
+    try std.testing.expectEqualStrings("b.zig", results[1].path);
+}
+
+test "bitmap prefilter does not reject when query has no a-z letters" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    const raw = "docs/123.md\nsrc/main.zig\n";
+    try index.buildFromRaw(alloc, raw);
+
+    var search: TestSearchBuffer(4) = .{};
+    const results = try search.run(&index, "123");
+    try std.testing.expect(results.len >= 1);
+    try std.testing.expectEqualStrings("docs/123.md", results[0].path);
+}
+
+test "bitmap prefilter rejects when required letter is absent" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    const raw = "docs/readme.md\nsrc/main.zig\n";
+    try index.buildFromRaw(alloc, raw);
+
+    var search: TestSearchBuffer(4) = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, "xyz")).len);
+}
+
+test "search returns zero when index is not ready" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    var search: TestSearchBuffer(4) = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, "x")).len);
+}
+
+test "search returns zero when the index has failed" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    index.initial_failed = true;
+
+    var search: TestSearchBuffer(4) = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, "main")).len);
+}
+
+test "search returns partial results while ready_count is below total" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    try index.buildFromRaw(alloc, "src/wasm_term_main.zig\nsrc/main.zig\nREADME.md\nsrc/core/shared/io.zig\n");
+    try std.testing.expectEqual(@as(usize, 4), index.count());
+
+    const generation = index.active_generation.?;
+    index.active_generation = null;
+    index.loading_generation = generation;
+    generation.state.store(@intFromEnum(GenerationState.loading), .release);
+    generation.ready_count.store(2, .release);
+    try std.testing.expectEqual(@as(usize, 2), index.count());
+
+    var search: TestSearchBuffer(4) = .{};
+    const results = try search.run(&index, "main");
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |result| {
+        try std.testing.expect(std.mem.indexOf(u8, result.path, "main") != null);
+    }
+
+    generation.ready_count.store(4, .release);
+    try std.testing.expectEqual(@as(usize, 2), (try search.run(&index, "main")).len);
+
+    const readme_results = try search.run(&index, "README");
+    try std.testing.expectEqual(@as(usize, 1), readme_results.len);
+    try std.testing.expectEqualStrings("README.md", readme_results[0].path);
+}
+
+test "search caps ranked results at 64 even with larger output" {
+    const alloc = std.testing.allocator;
+    var raw_builder: std.Io.Writer.Allocating = .init(alloc);
+    errdefer raw_builder.deinit();
+
+    var i: usize = 0;
+    while (i < 80) : (i += 1) {
+        try raw_builder.writer.print("src/match-{d:0>3}.zig\n", .{i});
+    }
+
+    const raw = try raw_builder.toOwnedSlice();
+    defer alloc.free(raw);
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, raw);
+
+    var search: TestSearchBuffer(80) = .{};
+    const results = try search.run(&index, "match");
+    try std.testing.expectEqual(@as(usize, 64), results.len);
+
+    const generation = index.active_generation.?;
+    const paths_start = @intFromPtr(generation.paths_buf.ptr);
+    const paths_end = paths_start + generation.paths_buf.len;
+
+    i = 0;
+    while (i < results.len) : (i += 1) {
+        const ptr = @intFromPtr(results[i].path.ptr);
+        try std.testing.expect(ptr >= paths_start);
+        try std.testing.expect(ptr + results[i].path.len <= paths_end);
+
+        var expected_buf: [32]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buf, "src/match-{d:0>3}.zig", .{i});
+        try std.testing.expectEqualStrings(expected, results[i].path);
+        try std.testing.expectEqual(CandidateKind.file, results[i].kind);
+        try expectValidSearchSpans(results[i]);
+    }
+}
+
+test "search rejects queries longer than max_path_len" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    const path = "a" ** max_path_len;
+    const query = ("a" ** max_path_len) ++ "b";
+    try index.buildFromRaw(alloc, path);
+
+    var search: TestSearchBuffer(1) = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, query)).len);
+}
+
+test "buildFromRaw omits unsafe controls and preserves neighboring safe paths" {
+    const alloc = std.testing.allocator;
+
+    var newline_index = FileIndex{};
+    defer newline_index.deinit(alloc);
+    try newline_index.buildFromRaw(alloc, "safe-before\nnewline-path\r\nsafe-after\n");
+    try std.testing.expectEqual(@as(usize, 3), newline_index.count());
+    try std.testing.expectEqualStrings("newline-path", newline_index.pathAt(1));
+
+    var nul_index = FileIndex{};
+    defer nul_index.deinit(alloc);
+    try nul_index.buildFromRaw(alloc, "safe.txt\x00escape-\x1b[2J.txt\x00cr-path\r\x00invalid-\xff\x00other.txt\x00");
+    try std.testing.expectEqual(@as(usize, 2), nul_index.count());
+    try std.testing.expectEqualStrings("safe.txt", nul_index.pathAt(0));
+    try std.testing.expectEqualStrings("other.txt", nul_index.pathAt(1));
+}
+
+test "scope discovery emits primary-relative and added-absolute paths in root order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "primary");
+    try tmp.dir.createDirPath(io_mod.getIo(), "shared/nested");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "primary/main.zig", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "shared/nested/lib.zig", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
+    defer alloc.free(primary);
+    const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
+    defer alloc.free(shared);
+    const shared_file = try std.fs.path.join(alloc, &.{ shared, "nested/lib.zig" });
+    defer alloc.free(shared_file);
+    const shared_directory = try std.fs.path.join(alloc, &.{ shared, "nested" });
+    defer alloc.free(shared_directory);
+    const roots = [_][]const u8{ primary, shared };
+    var stop_requested = std.atomic.Value(bool).init(false);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const candidates = try discoverScopeCandidatesWithFallback(arena_state.allocator(), &roots, &stop_requested, true);
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromCandidates(alloc, candidates);
+    try std.testing.expectEqual(@as(usize, 3), index.count());
+    try std.testing.expectEqualStrings("main.zig", index.pathAt(0));
+    try std.testing.expectEqual(CandidateKind.file, index.kindAt(0));
+    try std.testing.expectEqualStrings(shared_directory, index.pathAt(1));
+    try std.testing.expectEqual(CandidateKind.directory, index.kindAt(1));
+    try std.testing.expectEqualStrings(shared_file, index.pathAt(2));
+    try std.testing.expectEqual(CandidateKind.file, index.kindAt(2));
+}
+
+test "production scope admits tracked untracked hidden and direct directory candidates" {
+    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "root/.hidden");
+    try tmp.dir.createDirPath(io_mod.getIo(), "root/nested/deep");
+    try tmp.dir.createDirPath(io_mod.getIo(), "root/ignored-dir");
+    try tmp.dir.createDirPath(io_mod.getIo(), "root/empty-dir");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "root/.gitignore", .{ .truncate = true });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "ignored.txt\nignored-dir/\n");
+    }
+    const file_paths = [_][]const u8{
+        "root/tracked.txt",
+        "root/untracked.txt",
+        "root/.hidden/tracked.txt",
+        "root/.hidden/untracked.txt",
+        "root/nested/deep/item.txt",
+        "root/ignored.txt",
+        "root/ignored-dir/item.txt",
+    };
+    for (file_paths) |path| {
+        var file = try tmp.dir.createFile(io_mod.getIo(), path, .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    for (0..40) |index| {
+        var path_storage: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_storage, "root/z-file-{d:0>2}.txt", .{index});
+        var file = try tmp.dir.createFile(io_mod.getIo(), path, .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    if (comptime @import("builtin").os.tag != .windows) {
+        try tmp.dir.symLink(std.testing.io, "nested", "root/linked-dir", .{ .is_directory = true });
+    }
+
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "root");
+    defer alloc.free(root);
+    try runGitForFileIndexTest(alloc, root, &.{ "git", "init", "--quiet" });
+    try runGitForFileIndexTest(alloc, root, &.{ "git", "add", ".gitignore", "tracked.txt", ".hidden/tracked.txt" });
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var stop_requested = std.atomic.Value(bool).init(false);
+    const candidates = try discoverScopeCandidates(arena_state.allocator(), &.{root}, &stop_requested);
+
+    try std.testing.expect(containsCandidate(candidates, "tracked.txt", .file));
+    try std.testing.expect(containsCandidate(candidates, "untracked.txt", .file));
+    try std.testing.expect(containsCandidate(candidates, ".hidden/tracked.txt", .file));
+    try std.testing.expect(containsCandidate(candidates, ".hidden/untracked.txt", .file));
+    try std.testing.expect(containsCandidate(candidates, ".hidden", .directory));
+    try std.testing.expect(containsCandidate(candidates, "nested/deep/item.txt", .file));
+    try std.testing.expect(containsCandidate(candidates, "nested/deep", .directory));
+    try std.testing.expect(containsCandidate(candidates, "nested", .directory));
+    try std.testing.expect(containsCandidate(candidates, "linked-dir", .file));
+    try std.testing.expect(!containsCandidate(candidates, "linked-dir", .directory));
+    try std.testing.expect(!containsCandidate(candidates, "ignored.txt", .file));
+    try std.testing.expect(!containsCandidate(candidates, "ignored-dir", .directory));
+    try std.testing.expect(containsCandidate(candidates, "empty-dir", .directory));
+    for (candidates) |candidate| {
+        try std.testing.expect(!workspace_files.pathContainsIgnoredDir(&.{".git"}, candidate.path));
+    }
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromCandidates(alloc, candidates);
+    var search: TestSearchBuffer(32) = .{};
+    const empty_results = try search.run(&index, "");
+    var includes_directory = false;
+    for (empty_results) |result| includes_directory = includes_directory or result.kind == .directory;
+    try std.testing.expect(includes_directory);
+}
+
+test "scope discovery deduplicates overlapping roots and tolerates one failed root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "primary/nested");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "primary/nested/item.txt", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
+    defer alloc.free(primary);
+    const nested = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary/nested");
+    defer alloc.free(nested);
+    const missing = try std.fs.path.join(alloc, &.{ primary, "missing" });
+    defer alloc.free(missing);
+    const roots = [_][]const u8{ primary, nested, missing };
+    var stop_requested = std.atomic.Value(bool).init(false);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const candidates = try discoverScopeCandidatesWithFallback(arena_state.allocator(), &roots, &stop_requested, true);
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromCandidates(alloc, candidates);
+    try std.testing.expectEqual(@as(usize, 2), index.count());
+    try std.testing.expectEqualStrings("nested", index.pathAt(0));
+    try std.testing.expectEqual(CandidateKind.directory, index.kindAt(0));
+    try std.testing.expectEqualStrings("nested/item.txt", index.pathAt(1));
+    try std.testing.expectEqual(CandidateKind.file, index.kindAt(1));
+}
+
+test "typed current candidate validation rejects missing and changed kinds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "primary/folder");
+    try tmp.dir.createDirPath(io_mod.getIo(), "primary/directory-to-file");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "primary/file.txt", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "primary/file-to-directory", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
+    defer alloc.free(primary);
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    index.roots = try cloneRoots(alloc, &.{primary});
+
+    try std.testing.expect(index.isCurrentCandidateKind("file.txt", .file));
+    try std.testing.expect(!index.isCurrentCandidateKind("file.txt", .directory));
+    try std.testing.expect(index.isCurrentCandidateKind("folder", .directory));
+    try std.testing.expect(!index.isCurrentCandidateKind("folder", .file));
+    try std.testing.expect(!index.isCurrentCandidateKind("missing", .file));
+    try std.testing.expect(!index.isCurrentCandidateKind("unsafe\x1b", .file));
+
+    try tmp.dir.deleteFile(io_mod.getIo(), "primary/file-to-directory");
+    try tmp.dir.createDir(io_mod.getIo(), "primary/file-to-directory", .default_dir);
+    try std.testing.expect(!index.isCurrentCandidateKind("file-to-directory", .file));
+    try std.testing.expect(index.isCurrentCandidateKind("file-to-directory", .directory));
+
+    try tmp.dir.deleteDir(io_mod.getIo(), "primary/directory-to-file");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "primary/directory-to-file", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    try std.testing.expect(!index.isCurrentCandidateKind("directory-to-file", .directory));
+    try std.testing.expect(index.isCurrentCandidateKind("directory-to-file", .file));
+}
+
+test "typed current candidate validation keeps symlinks as file references" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "primary/target-dir");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "primary/target.txt", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    try tmp.dir.symLink(std.testing.io, "target.txt", "primary/file-link", .{ .is_directory = false });
+    try tmp.dir.symLink(std.testing.io, "target-dir", "primary/directory-link", .{ .is_directory = true });
+    const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
+    defer alloc.free(primary);
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    index.roots = try cloneRoots(alloc, &.{primary});
+
+    try std.testing.expect(index.isCurrentCandidateKind("file-link", .file));
+    try std.testing.expect(!index.isCurrentCandidateKind("file-link", .directory));
+    try std.testing.expect(index.isCurrentCandidateKind("directory-link", .file));
+    try std.testing.expect(!index.isCurrentCandidateKind("directory-link", .directory));
+}
+
+test "current candidate rejects an added-root selection after scope removal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "primary");
+    try tmp.dir.createDirPath(io_mod.getIo(), "shared");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "shared/item.txt", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
+    defer alloc.free(primary);
+    const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
+    defer alloc.free(shared);
+    const shared_file = try std.fs.path.join(alloc, &.{ shared, "item.txt" });
+    defer alloc.free(shared_file);
+    const entries = [_]workspace_access.Entry{.{
+        .path = @constCast(shared),
+        .saved = true,
+        .command_line = false,
+        .available = true,
+        .active = true,
+    }};
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    index.roots = try activeRootsAlloc(alloc, .{
+        .primary_directory = primary,
+        .additional_directories = &entries,
+    });
+    try std.testing.expect(index.isCurrentCandidateKind(shared_file, .file));
+    try std.testing.expect(index.isCurrentCandidateKind(shared_file, .file));
+
+    freeRoots(alloc, index.roots);
+    index.roots = try activeRootsAlloc(alloc, workspace_access.AccessScope.primaryOnly(primary));
+    try std.testing.expect(!index.isCurrentCandidateKind(shared_file, .file));
+}
+
+const TestLoaderGate = struct {
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cleanup_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cleanup_release: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    cleanup_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    publish_count: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    outcome: GenerationState,
+};
+
+fn testLoaderThread(generation: *Generation, gate: *TestLoaderGate) void {
+    gate.started.store(true, .release);
+    while (!gate.release.load(.acquire)) std.atomic.spinLoopHint();
+    gate.cleanup_started.store(true, .release);
+    while (!gate.cleanup_release.load(.acquire)) std.atomic.spinLoopHint();
+    gate.cleanup_finished.store(true, .release);
+    _ = gate.publish_count.fetchAdd(1, .seq_cst);
+    const outcome: LoaderOutcome = switch (gate.outcome) {
+        .loading => unreachable,
+        .ready => .ready,
+        .failed => .{ .failed = .{ .stage = .storage, .err = error.TestLoaderFailure } },
+        .canceled => .canceled,
+    };
+    publishLoaderOutcomeAfterCleanup(generation, outcome);
 }
 
 fn waitForTestFlag(flag: *const std.atomic.Value(bool)) !void {
@@ -1465,6 +2568,119 @@ fn waitForGenerationState(generation: *const Generation, expected: GenerationSta
     }
 }
 
+const TestReapAttempt = struct {
+    index: *FileIndex,
+    alloc: Allocator,
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    visible_changed: bool = false,
+};
+
+fn testReapThread(attempt: *TestReapAttempt) void {
+    attempt.started.store(true, .release);
+    attempt.visible_changed = attempt.index.joinThreadIfDone(attempt.alloc);
+    attempt.finished.store(true, .release);
+}
+
+fn expectReapReturnsDuringCleanup(index: *FileIndex, alloc: Allocator, gate: *TestLoaderGate) !void {
+    var attempt: TestReapAttempt = .{ .index = index, .alloc = alloc };
+    const thread = try std.Thread.spawn(.{}, testReapThread, .{&attempt});
+    waitForTestFlag(&attempt.started) catch |err| {
+        gate.cleanup_release.store(true, .release);
+        thread.join();
+        return err;
+    };
+    waitForTestFlag(&attempt.finished) catch |err| {
+        gate.cleanup_release.store(true, .release);
+        thread.join();
+        return err;
+    };
+    thread.join();
+    try std.testing.expect(!attempt.visible_changed);
+    try std.testing.expect(!gate.cleanup_release.load(.acquire));
+}
+
+fn installTestLoader(
+    index: *FileIndex,
+    alloc: Allocator,
+    raw_list: []const u8,
+    gate: *TestLoaderGate,
+) !*Generation {
+    const generation_id = index.generation + 1;
+    const generation = try Generation.create(alloc, generation_id);
+    errdefer generation.destroy(alloc);
+    try generation.fillProgressive(alloc, .{ .file_raw = raw_list }, null);
+
+    index.loading_generation = generation;
+    index.generation = generation_id;
+    index.thread = std.Thread.spawn(.{}, testLoaderThread, .{ generation, gate }) catch |err| {
+        index.loading_generation = null;
+        return err;
+    };
+    waitForTestFlag(&gate.started) catch |err| {
+        gate.release.store(true, .release);
+        index.thread.?.join();
+        index.thread = null;
+        index.loading_generation = null;
+        return err;
+    };
+    return generation;
+}
+
+test "current candidate uses pending scope while refresh is coalesced" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "primary");
+    try tmp.dir.createDirPath(io_mod.getIo(), "shared");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "shared/item.txt", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
+    defer alloc.free(primary);
+    const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
+    defer alloc.free(shared);
+    const shared_file = try std.fs.path.join(alloc, &.{ shared, "item.txt" });
+    defer alloc.free(shared_file);
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    index.roots = try cloneRoots(alloc, &.{ primary, shared });
+    var gate: TestLoaderGate = .{ .outcome = .canceled };
+    _ = try installTestLoader(&index, alloc, "item.txt\x00", &gate);
+    try std.testing.expect(index.isCurrentCandidateKind(shared_file, .file));
+    try std.testing.expect(index.isCurrentCandidateKind(shared_file, .file));
+
+    index.refreshScope(alloc, workspace_access.AccessScope.primaryOnly(primary));
+
+    try std.testing.expect(!index.isCurrentCandidateKind(shared_file, .file));
+    index.requestStop();
+    gate.release.store(true, .release);
+    try waitForGenerationState(index.loading_generation.?, .canceled);
+    try std.testing.expect(!index.joinThreadIfDone(alloc));
+}
+
+test "refresh during a coalesced scope change keeps the latest roots" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    index.roots = try cloneRoots(alloc, &.{"/primary"});
+    index.pending_roots = try cloneRoots(alloc, &.{ "/primary", "/shared" });
+    var gate: TestLoaderGate = .{ .outcome = .canceled };
+    _ = try installTestLoader(&index, alloc, "item.txt\x00", &gate);
+
+    index.refresh(alloc);
+
+    const pending = index.pending_roots orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqualStrings("/shared", pending[1]);
+    index.requestStop();
+    gate.release.store(true, .release);
+    try waitForGenerationState(index.loading_generation.?, .canceled);
+    try std.testing.expect(!index.joinThreadIfDone(alloc));
+}
+
 fn checkBuildFromRawAllocationFailures(alloc: Allocator) !void {
     var index = FileIndex{};
     defer index.deinit(alloc);
@@ -1480,6 +2696,459 @@ fn checkBuildFromCandidatesAllocationFailures(alloc: Allocator) !void {
     var index = FileIndex{};
     defer index.deinit(alloc);
     try index.buildFromCandidates(alloc, &candidates);
+}
+
+test "file-only builder frees partial buffers across allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkBuildFromRawAllocationFailures,
+        .{},
+    );
+}
+
+test "typed builder frees dedupe state and partial buffers across allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkBuildFromCandidatesAllocationFailures,
+        .{},
+    );
+}
+
+test "kind buffer allocation failure retains the existing index" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "existing.txt\x00");
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 6 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        index.buildFromRaw(failing.allocator(), "replacement.txt\x00other.txt\x00"),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), index.count());
+    try std.testing.expectEqualStrings("existing.txt", index.pathAt(0));
+    try std.testing.expectEqual(CandidateKind.file, index.kindAt(0));
+}
+
+test "refresh traces snapshot allocation failures and retains roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "core");
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    index.roots = try cloneRoots(alloc, &.{ "/primary", "/shared" });
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    index.refreshScope(failing.allocator(), workspace_access.AccessScope.primaryOnly("/primary"));
+    try std.testing.expect(failing.has_induced_failure);
+
+    var refresh_failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    index.refresh(refresh_failing.allocator());
+    try std.testing.expect(refresh_failing.has_induced_failure);
+
+    try std.testing.expectEqual(@as(usize, 2), index.roots.len);
+    try std.testing.expectEqualStrings("/shared", index.roots[1]);
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer trace_file.close(std.testing.io);
+    var read_buf: [1024]u8 = undefined;
+    var reader = trace_file.reader(std.testing.io, &read_buf);
+    const trace = try reader.interface.allocRemaining(alloc, std.Io.Limit.limited(4096));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "file index scope snapshot failed") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "file index refresh snapshot failed") != null);
+}
+
+test "ensureScope with empty workspace root stays idle" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+
+    index.ensureScope(alloc, workspace_access.AccessScope.primaryOnly(""));
+
+    try std.testing.expectEqual(State.idle, index.currentState());
+    try std.testing.expect(index.thread == null);
+    try std.testing.expectEqual(@as(usize, 0), index.roots.len);
+}
+
+test "terminal publication follows worker cleanup before ready and failed reap" {
+    const alloc = std.testing.allocator;
+
+    {
+        var index = FileIndex{};
+        defer index.deinit(alloc);
+        try index.buildFromRaw(alloc, "stable.txt\x00");
+        const previous = index.active_generation.?;
+
+        var gate: TestLoaderGate = .{ .outcome = .ready };
+        gate.cleanup_release.store(false, .release);
+        const replacement = try installTestLoader(&index, alloc, "replacement.txt\x00", &gate);
+        gate.release.store(true, .release);
+        try waitForTestFlag(&gate.cleanup_started);
+
+        try std.testing.expect(!gate.cleanup_finished.load(.acquire));
+        try std.testing.expectEqual(GenerationState.loading, replacement.currentState());
+        try expectReapReturnsDuringCleanup(&index, alloc, &gate);
+        try std.testing.expect(index.thread != null);
+        try std.testing.expect(index.active_generation.? == previous);
+
+        gate.cleanup_release.store(true, .release);
+        try waitForGenerationState(replacement, .ready);
+        try std.testing.expect(gate.cleanup_finished.load(.acquire));
+        try std.testing.expectEqual(@as(u8, 1), gate.publish_count.load(.seq_cst));
+        try std.testing.expect(index.joinThreadIfDone(alloc));
+        try std.testing.expect(index.thread == null);
+        try std.testing.expect(index.loading_generation == null);
+        try std.testing.expect(index.active_generation.? == replacement);
+        try std.testing.expect(!index.joinThreadIfDone(alloc));
+    }
+
+    {
+        var index = FileIndex{};
+        defer index.deinit(alloc);
+        try index.buildFromRaw(alloc, "stable.txt\x00");
+        const active = index.active_generation.?;
+
+        var gate: TestLoaderGate = .{ .outcome = .failed };
+        gate.cleanup_release.store(false, .release);
+        const replacement = try installTestLoader(&index, alloc, "discarded.txt\x00", &gate);
+        gate.release.store(true, .release);
+        try waitForTestFlag(&gate.cleanup_started);
+
+        try std.testing.expect(!gate.cleanup_finished.load(.acquire));
+        try std.testing.expectEqual(GenerationState.loading, replacement.currentState());
+        try expectReapReturnsDuringCleanup(&index, alloc, &gate);
+        try std.testing.expect(index.thread != null);
+        try std.testing.expect(index.active_generation.? == active);
+
+        gate.cleanup_release.store(true, .release);
+        try waitForGenerationState(replacement, .failed);
+        try std.testing.expect(gate.cleanup_finished.load(.acquire));
+        try std.testing.expectEqual(@as(u8, 1), gate.publish_count.load(.seq_cst));
+        try std.testing.expect(!index.joinThreadIfDone(alloc));
+        try std.testing.expect(index.thread == null);
+        try std.testing.expect(index.loading_generation == null);
+        try std.testing.expect(index.active_generation.? == active);
+        try std.testing.expect(!index.joinThreadIfDone(alloc));
+    }
+}
+
+test "active generation remains exclusive while replacement loads and is adopted once" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "old-one.txt\x00old-two.txt\x00");
+    const old_generation = index.active_generation.?;
+
+    var gate: TestLoaderGate = .{ .outcome = .ready };
+    const replacement = try installTestLoader(&index, alloc, "new-one.txt\x00new-two.txt\x00", &gate);
+    replacement.ready_count.store(1, .release);
+
+    var search: TestSearchBuffer(4) = .{};
+    var results = try search.run(&index, "");
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("old-one.txt", results[0].path);
+    try std.testing.expectEqualStrings("old-two.txt", results[1].path);
+    const borrowed_path = results[0].path;
+    try std.testing.expect(!index.joinThreadIfDone(alloc));
+    try std.testing.expectEqualStrings("old-one.txt", borrowed_path);
+    try std.testing.expect(index.active_generation.? == old_generation);
+
+    replacement.ready_count.store(2, .release);
+    gate.release.store(true, .release);
+    try waitForGenerationState(replacement, .ready);
+    results = try search.run(&index, "");
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("old-one.txt", results[0].path);
+    try std.testing.expect(index.joinThreadIfDone(alloc));
+    try std.testing.expect(index.thread == null);
+    try std.testing.expect(index.active_generation.? == replacement);
+    try std.testing.expect(index.active_generation.? != old_generation);
+    results = try search.run(&index, "");
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("new-one.txt", results[0].path);
+    try std.testing.expectEqualStrings("new-two.txt", results[1].path);
+    try std.testing.expect(!index.joinThreadIfDone(alloc));
+}
+
+test "failed replacement retains active results count and render facts" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "stable.txt\x00");
+    const active = index.active_generation.?;
+
+    var gate: TestLoaderGate = .{ .outcome = .failed };
+    const replacement = try installTestLoader(&index, alloc, "replacement.txt\x00", &gate);
+    try std.testing.expectEqual(State.ready, index.currentState());
+    try std.testing.expectEqual(@as(usize, 1), index.count());
+
+    gate.release.store(true, .release);
+    try waitForGenerationState(replacement, .failed);
+    try std.testing.expect(!index.joinThreadIfDone(alloc));
+    try std.testing.expect(index.active_generation.? == active);
+    try std.testing.expectEqual(State.ready, index.currentState());
+    try std.testing.expectEqual(@as(usize, 1), index.count());
+    var search: TestSearchBuffer(1) = .{};
+    const results = try search.run(&index, "stable");
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("stable.txt", results[0].path);
+}
+
+test "replacement generation allocation failure retains active results" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "stable.txt\x00");
+    index.roots = try cloneRoots(alloc, &.{"/primary"});
+    const active = index.active_generation.?;
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expect(!index.startLoad(failing.allocator()));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(index.active_generation.? == active);
+    try std.testing.expect(index.loading_generation == null);
+    try std.testing.expectEqual(State.ready, index.currentState());
+    try std.testing.expectEqual(@as(usize, 1), index.count());
+}
+
+test "initial allocation failure reports failure and a later load retries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "retry.txt", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    index.roots = try cloneRoots(alloc, &.{root});
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expect(!index.startLoad(failing.allocator()));
+    try std.testing.expectEqual(State.failed, index.currentState());
+    try std.testing.expectEqual(@as(usize, 0), index.count());
+
+    try std.testing.expect(index.startLoad(alloc));
+    const loading = index.loading_generation.?;
+    const retry_started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    while (loading.currentState() == .loading) {
+        if (retry_started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds() > 5000) {
+            return error.TestUnexpectedResult;
+        }
+        sleepBlocking(1);
+    }
+    try std.testing.expectEqual(GenerationState.ready, loading.currentState());
+    try std.testing.expect(index.joinThreadIfDone(alloc));
+    try std.testing.expectEqual(State.ready, index.currentState());
+    try std.testing.expectEqual(@as(usize, 0), index.count());
+}
+
+test "latest and identical refresh roots coalesce without a second loader" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    index.roots = try cloneRoots(alloc, &.{"/primary"});
+
+    var gate: TestLoaderGate = .{ .outcome = .canceled };
+    _ = try installTestLoader(&index, alloc, "item.txt\x00", &gate);
+    index.refreshScope(alloc, .{
+        .primary_directory = "/primary",
+        .additional_directories = &.{.{
+            .path = @constCast("/shared"),
+            .saved = true,
+            .command_line = false,
+            .available = true,
+            .active = true,
+        }},
+    });
+    const first_pending = index.pending_roots.?;
+    index.refreshScope(alloc, .{
+        .primary_directory = "/primary",
+        .additional_directories = &.{.{
+            .path = @constCast("/shared"),
+            .saved = true,
+            .command_line = false,
+            .available = true,
+            .active = true,
+        }},
+    });
+    try std.testing.expect(index.pending_roots.?.ptr == first_pending.ptr);
+
+    index.refreshScope(alloc, .{
+        .primary_directory = "/primary",
+        .additional_directories = &.{.{
+            .path = @constCast("/latest"),
+            .saved = true,
+            .command_line = false,
+            .available = true,
+            .active = true,
+        }},
+    });
+    try std.testing.expectEqualStrings("/latest", index.pending_roots.?[1]);
+    try std.testing.expectEqual(@as(usize, 1), index.generation);
+
+    index.requestStop();
+    gate.release.store(true, .release);
+    try waitForGenerationState(index.loading_generation.?, .canceled);
+    try std.testing.expect(!index.joinThreadIfDone(alloc));
+    try std.testing.expect(index.thread == null);
+}
+
+test "failed generation starts one queued refresh after reap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "queued.txt", .{ .truncate = true });
+        file.close(io_mod.getIo());
+    }
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "stable.txt\x00");
+    index.roots = try cloneRoots(alloc, &.{root});
+
+    var gate: TestLoaderGate = .{ .outcome = .failed };
+    const failed = try installTestLoader(&index, alloc, "discarded.txt\x00", &gate);
+    const previous_active = index.active_generation.?;
+    index.refresh(alloc);
+    gate.release.store(true, .release);
+    try waitForGenerationState(failed, .failed);
+    try std.testing.expect(!index.joinThreadIfDone(alloc));
+    try std.testing.expectEqual(@as(usize, 3), index.generation);
+    try std.testing.expect(index.thread != null);
+
+    const queued = index.loading_generation.?;
+    const queued_started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    while (queued.currentState() == .loading) {
+        if (queued_started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds() > 5000) {
+            return error.TestUnexpectedResult;
+        }
+        sleepBlocking(1);
+    }
+    try std.testing.expectEqual(GenerationState.ready, queued.currentState());
+    try std.testing.expect(index.joinThreadIfDone(alloc));
+    try std.testing.expect(index.active_generation.? != previous_active);
+    try std.testing.expectEqual(@as(usize, 0), index.count());
+}
+
+test "stop before and after completion suppresses queued work" {
+    const alloc = std.testing.allocator;
+
+    {
+        var index = FileIndex{};
+        defer index.deinit(alloc);
+        index.roots = try cloneRoots(alloc, &.{"/primary"});
+        var gate: TestLoaderGate = .{ .outcome = .canceled };
+        const loading = try installTestLoader(&index, alloc, "partial.txt\x00", &gate);
+        index.refresh(alloc);
+        index.requestStop();
+        gate.release.store(true, .release);
+        try waitForGenerationState(loading, .canceled);
+        try std.testing.expect(!index.joinThreadIfDone(alloc));
+        try std.testing.expect(index.thread == null);
+        try std.testing.expectEqual(@as(usize, 1), index.generation);
+        try std.testing.expect(index.pending_roots != null);
+    }
+
+    {
+        var index = FileIndex{};
+        defer index.deinit(alloc);
+        index.roots = try cloneRoots(alloc, &.{"/primary"});
+        var gate: TestLoaderGate = .{ .outcome = .ready };
+        const loading = try installTestLoader(&index, alloc, "finished.txt\x00", &gate);
+        index.refresh(alloc);
+        gate.release.store(true, .release);
+        try waitForGenerationState(loading, .ready);
+        index.requestStop();
+        try std.testing.expect(index.joinThreadIfDone(alloc));
+        try std.testing.expectEqual(@as(usize, 1), index.generation);
+        try std.testing.expectEqualStrings("finished.txt", index.pathAt(0));
+    }
+}
+
+test "deinit cancels and joins one loader while suppressing queued refresh" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    index.roots = try cloneRoots(alloc, &.{"/primary"});
+    index.pending_roots = try cloneRoots(alloc, &.{ "/primary", "/queued" });
+    const loading = try Generation.create(alloc, 1);
+    index.loading_generation = loading;
+    index.generation = 1;
+
+    var observed_stop = std.atomic.Value(bool).init(false);
+    const WaitForStop = struct {
+        fn run(
+            generation: *Generation,
+            stop_requested: *std.atomic.Value(bool),
+            observed: *std.atomic.Value(bool),
+        ) void {
+            while (!stop_requested.load(.seq_cst)) std.atomic.spinLoopHint();
+            observed.store(true, .release);
+            generation.finish(.canceled);
+        }
+    };
+    index.thread = try std.Thread.spawn(.{}, WaitForStop.run, .{ loading, &index.stop_requested, &observed_stop });
+
+    index.deinit(alloc);
+
+    try std.testing.expect(observed_stop.load(.acquire));
+    try std.testing.expect(index.stop_requested.load(.seq_cst));
+    try std.testing.expect(index.thread == null);
+    try std.testing.expect(index.loading_generation == null);
+    try std.testing.expect(index.active_generation == null);
+    try std.testing.expect(index.pending_roots == null);
+}
+
+test "file index raw-list and Unicode query bytes remain bounded" {
+    try std.testing.fuzz({}, fuzzRawListAndQuery, .{
+        .corpus = &.{
+            "safe.txt\x00ärger",
+            "escape-\x1b[2J.txt\x00\xff",
+            "Ärger-file.txt\x00ärger",
+            "docs/Kelvin.txt\x00k",
+            "src/core/file_index.zig\x00fiidx",
+            "docs/Cafe\u{0301}.txt\x00e\u{0301}",
+            "src/axaya.zig\x00aaa",
+            "truncated.txt\x00\xc3",
+        },
+    });
+}
+
+fn fuzzRawListAndQuery(_: void, smith: *std.testing.Smith) !void {
+    var bytes: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&bytes));
+    const split = len / 2;
+
+    var index = FileIndex{};
+    defer index.deinit(std.testing.allocator);
+    try index.buildFromRaw(std.testing.allocator, bytes[0..split]);
+
+    var typed_results: [8]SearchResult = undefined;
+    var span_storage: [8 * max_path_len]MatchSpan = undefined;
+    const typed_count = try index.searchTyped(bytes[split..len], &typed_results, &span_storage);
+    for (typed_results[0..typed_count]) |typed| {
+        try std.testing.expect(typed.path.len <= max_path_len);
+        try std.testing.expect(text_utils.isTerminalSafe(typed.path));
+        try std.testing.expectEqual(CandidateKind.file, typed.kind);
+        try expectValidSearchSpans(typed);
+    }
 }
 
 fn sleepBlocking(milliseconds: u64) void {

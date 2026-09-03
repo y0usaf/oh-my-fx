@@ -535,6 +535,11 @@ pub const State = struct {
         }
 
         replaceActiveComposer(alloc, active, &prepared);
+        if (restoring_draft) {
+            active.picker.resetInlinePickerEpisode();
+        } else {
+            active.picker.resetInlinePickerForHistoryRecall(active.edit);
+        }
         if (active.images) |images| {
             if (entering_history) {
                 for (images.items) |image| types.freeImageAttachment(alloc, image);
@@ -584,6 +589,7 @@ fn replaceActiveComposer(
         );
     }
     active.picker.clearModelPickerFlow();
+    active.picker.clearProviderPickerFlow();
 
     var previous_text: std.ArrayList(u8) = .empty;
     active.edit.swapInput(&previous_text);
@@ -596,9 +602,153 @@ fn replaceActiveComposer(
     );
     previous_text.deinit(alloc);
 
-    active.picker.resetInlinePickerEpisode();
     active.picker.model_completion_index = 0;
     active.picker.model_completion_window_start = 0;
     active.picker.resetFilePickerIndex();
     active.input_limit_rejection.* = input_limit_rejection.clear();
+}
+
+test "navigation target follows bounded older and newer history laws" {
+    try std.testing.expectEqual(NavigationTarget.unchanged, navigationTarget(null, 0, -1));
+    try std.testing.expectEqual(NavigationTarget{ .entry = 2 }, navigationTarget(null, 3, -1));
+    try std.testing.expectEqual(NavigationTarget.unchanged, navigationTarget(0, 3, -1));
+    try std.testing.expectEqual(NavigationTarget{ .entry = 1 }, navigationTarget(0, 3, 1));
+    try std.testing.expectEqual(NavigationTarget.draft, navigationTarget(2, 3, 1));
+    try std.testing.expectEqual(NavigationTarget.unchanged, navigationTarget(null, 3, 1));
+    try std.testing.expectEqual(NavigationTarget.unchanged, navigationTarget(3, 3, -1));
+}
+
+test "record deduplicates adjacent entries and prunes the oldest" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.record(alloc, 2, "one", &.{}, &.{}, &.{}, &.{});
+    try state.record(alloc, 2, "one", &.{}, &.{}, &.{}, &.{});
+    try state.record(alloc, 2, "two", &.{}, &.{}, &.{}, &.{});
+    try state.record(alloc, 2, "three", &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), state.count());
+    try std.testing.expectEqualStrings("two", state.entryText(0).?);
+    try std.testing.expectEqualStrings("three", state.entryText(1).?);
+}
+
+test "navigation recalls entries and restores the unsent draft" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.installTextEntries(alloc, &.{ "older", "newer" });
+
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "unsent draft");
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var picker: picker_state.State = .{};
+    defer picker.deinit(alloc);
+    var vertical_intent: vertical_navigation.State = .{ .preferred_column = 4 };
+    var limit_rejection: input_limit_rejection.State = .{ .owner = .composer };
+    const active = ActiveComposer{
+        .edit = &edit,
+        .entities = &entities,
+        .picker = &picker,
+        .vertical_navigation = &vertical_intent,
+        .input_limit_rejection = &limit_rejection,
+        .images = null,
+    };
+
+    try std.testing.expectEqual(
+        NavigationResult{ .moved = 0 },
+        try state.navigate(alloc, -1, active, 1, 4096),
+    );
+    try std.testing.expectEqualStrings("newer", edit.input.items);
+    try std.testing.expectEqualStrings("unsent draft", state.draftText().?);
+    try std.testing.expectEqual(@as(?usize, 1), state.activeIndex());
+    try std.testing.expectEqual(@as(?usize, null), vertical_intent.preferredColumn());
+    try std.testing.expectEqual(input_limit_rejection.State{}, limit_rejection);
+
+    try std.testing.expectEqual(
+        NavigationResult{ .moved = 0 },
+        try state.navigate(alloc, 1, active, 1, 4096),
+    );
+    try std.testing.expectEqualStrings("unsent draft", edit.input.items);
+    try std.testing.expect(state.draftText() == null);
+    try std.testing.expectEqual(@as(?usize, null), state.activeIndex());
+}
+
+test "history recall suppresses slash queries until edit and restores draft eligibility" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.installTextEntries(alloc, &.{"/hel"});
+
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "/he");
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var picker: picker_state.State = .{};
+    defer picker.deinit(alloc);
+    var vertical_intent: vertical_navigation.State = .{};
+    var limit_rejection: input_limit_rejection.State = .{};
+    const active = ActiveComposer{
+        .edit = &edit,
+        .entities = &entities,
+        .picker = &picker,
+        .vertical_navigation = &vertical_intent,
+        .input_limit_rejection = &limit_rejection,
+        .images = null,
+    };
+
+    try std.testing.expectEqual(
+        NavigationResult{ .moved = 0 },
+        try state.navigate(alloc, -1, active, 1, 4096),
+    );
+    try std.testing.expectEqualStrings("/hel", edit.input.items);
+    try std.testing.expect(picker.isInlinePickerSuppressed(.slash));
+    try std.testing.expect(!picker.isInlinePickerDismissed(.slash));
+
+    try edit.setText(alloc, "/he");
+    picker.reconcileInlinePickerAfterEdit(&edit);
+    try std.testing.expect(!picker.isInlinePickerSuppressed(.slash));
+
+    try std.testing.expectEqual(
+        NavigationResult{ .moved = 0 },
+        try state.navigate(alloc, 1, active, 1, 4096),
+    );
+    try std.testing.expectEqualStrings("/he", edit.input.items);
+    try std.testing.expect(!picker.isInlinePickerSuppressed(.slash));
+}
+
+test "oversized recall leaves active composer and history position unchanged" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.installTextEntries(alloc, &.{"oversized"});
+
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "draft");
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var picker: picker_state.State = .{};
+    defer picker.deinit(alloc);
+    var vertical_intent: vertical_navigation.State = .{ .preferred_column = 2 };
+    var limit_rejection: input_limit_rejection.State = .{};
+
+    try std.testing.expectEqual(
+        NavigationResult{ .limit_exceeded = "oversized".len },
+        try state.navigate(alloc, -1, .{
+            .edit = &edit,
+            .entities = &entities,
+            .picker = &picker,
+            .vertical_navigation = &vertical_intent,
+            .input_limit_rejection = &limit_rejection,
+            .images = null,
+        }, 1, 4),
+    );
+    try std.testing.expectEqualStrings("draft", edit.input.items);
+    try std.testing.expectEqual(@as(?usize, null), state.activeIndex());
+    try std.testing.expect(state.draftText() == null);
+    try std.testing.expectEqual(@as(?usize, 2), vertical_intent.preferredColumn());
 }

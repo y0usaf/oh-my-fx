@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const managed_execution = @import("../../core/execution/managed_execution.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -270,6 +271,40 @@ fn nextResizeBottomAnchorPending(
     return next;
 }
 
+test "resize bottom anchor remains pending until a cancel projection reaches it" {
+    const Case = struct {
+        pending: bool,
+        terminal_reset_commit: bool,
+        resize_reset_commit: bool,
+        tail_kind: ?TranscriptBlockKind,
+        occupied_last_row: u16,
+        content_bottom_row: u16,
+        expected: bool,
+    };
+    const cases = [_]Case{
+        .{ .pending = false, .terminal_reset_commit = false, .resize_reset_commit = false, .tail_kind = null, .occupied_last_row = 4, .content_bottom_row = 8, .expected = false },
+        .{ .pending = false, .terminal_reset_commit = true, .resize_reset_commit = true, .tail_kind = null, .occupied_last_row = 4, .content_bottom_row = 8, .expected = true },
+        .{ .pending = true, .terminal_reset_commit = false, .resize_reset_commit = false, .tail_kind = .assistant_turn, .occupied_last_row = 4, .content_bottom_row = 8, .expected = true },
+        .{ .pending = true, .terminal_reset_commit = false, .resize_reset_commit = false, .tail_kind = .cancel_notice, .occupied_last_row = 4, .content_bottom_row = 8, .expected = true },
+        .{ .pending = true, .terminal_reset_commit = false, .resize_reset_commit = false, .tail_kind = .cancel_notice, .occupied_last_row = 8, .content_bottom_row = 8, .expected = false },
+        .{ .pending = true, .terminal_reset_commit = true, .resize_reset_commit = false, .tail_kind = null, .occupied_last_row = 4, .content_bottom_row = 8, .expected = false },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            nextResizeBottomAnchorPending(
+                case.pending,
+                case.terminal_reset_commit,
+                case.resize_reset_commit,
+                case.tail_kind,
+                case.occupied_last_row,
+                case.content_bottom_row,
+            ),
+        );
+    }
+}
+
 const MaterializedEndpoint = struct {
     visual_offset: u32 = 0,
     visual_rows: u16 = 0,
@@ -297,6 +332,7 @@ pub const TranscriptTransition = struct {
     body_disposition: TranscriptBodyDisposition = .paint,
     target_flow: []u8,
     target_flow_owned: bool = true,
+    borrows_full_page: bool = false,
     presentation_resume_bytes: []u8 = &.{},
     presentation_pending_wrap: bool = false,
     presentation_valid: bool = false,
@@ -547,6 +583,1170 @@ fn traceLifecycleFailure(
     );
 }
 
+test "formatTurnSummaryLine renders total duration and tokens" {
+    var buf: [128]u8 = undefined;
+    const line = formatTurnSummaryLine(&buf, .{
+        .thinking_duration_ms = 15_000,
+        .turn_duration_ms = 130_000,
+        .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
+    });
+    try std.testing.expectEqualStrings("  2m 10s (↑10k ↓5k)", line);
+}
+
+test "formatTurnSummaryLine renders only total duration without token estimate" {
+    var buf: [128]u8 = undefined;
+    const line = formatTurnSummaryLine(&buf, .{
+        .thinking_duration_ms = 3_000,
+        .turn_duration_ms = 3_600_000,
+    });
+    try std.testing.expectEqualStrings("  1h 00m", line);
+}
+
+test "appendTurnSummaryEntry stores classified dim transcript row" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    _ = try runtime.appendTurnSummaryEntry(alloc, .{
+        .thinking_duration_ms = 15_000,
+        .turn_duration_ms = 130_000,
+        .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
+    try std.testing.expect(runtime.entries.items[0] == .raw_bytes);
+    try std.testing.expectEqual(RawEntryClass.turn_summary, runtime.entries.items[0].raw_bytes.class);
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
+
+    const rendered = try renderEntriesToBytes(alloc, runtime.entries.items, runtime.layout.cols, .{});
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings("\x1b[38;5;245m  2m 10s (↑10k ↓5k)\x1b[0m\n", rendered);
+}
+
+test "recovered route status is transient and final summary stays normal" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    runtime.worker_status.set_route_recovery(.{
+        .kind = .auto_recovered,
+        .succeeded_attempt = 3,
+        .attempt_limit = 3,
+    }, 1_000);
+
+    switch (runtime.activityProjection()) {
+        .turn_thinking => |thinking| {
+            try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.success, thinking.tone);
+            try std.testing.expectEqualStrings("✓ recovered · attempt 3/3", thinking.label);
+        },
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!runtime.worker_status.expire_transient(2_499));
+    try std.testing.expect(runtime.worker_status.expire_transient(2_500));
+    try std.testing.expect(runtime.activityProjection() == .none);
+
+    runtime.worker_status.set_route_recovery(.{
+        .kind = .auto_recovered,
+        .succeeded_attempt = 3,
+        .attempt_limit = 3,
+    }, 3_000);
+    _ = try runtime.appendTurnSummaryEntry(alloc, .{
+        .thinking_duration_ms = 15_000,
+        .turn_duration_ms = 130_000,
+        .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
+    });
+
+    try std.testing.expect(runtime.activityProjection() == .none);
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, ui_render.dim_style) != null);
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
+}
+
+test "appendTurnSummaryEntry leaves terminal route status visible" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    runtime.worker_status.set_route_recovery(.{ .kind = .content_filter }, 0);
+    _ = try runtime.appendTurnSummaryEntry(alloc, .{
+        .thinking_duration_ms = 15_000,
+        .turn_duration_ms = 130_000,
+        .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
+    });
+
+    switch (runtime.activityProjection()) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ blocked · content filter", thinking.label),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
+}
+
+test "full transcript projection opens without folded command output" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    try std.testing.expect(try runtime.setTranscriptPresentationDepth(alloc, .full));
+    try std.testing.expect(runtime.fullTranscriptActive());
+}
+
+test "closing the full transcript resets bounded paging to the tail" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    try std.testing.expect(try runtime.setTranscriptPresentationDepth(alloc, .full));
+    runtime.full_transcript_page_anchor = .{ .entry_index = 17 };
+
+    try std.testing.expect(try runtime.setTranscriptPresentationDepth(alloc, .inline_mode));
+    try std.testing.expect(std.meta.eql(
+        @as(full_transcript_page.Anchor, .tail),
+        runtime.full_transcript_page_anchor,
+    ));
+}
+
+test "live command keeps the full transcript stable until completion" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .full_transcript = .{ .depth = .full },
+        .full_transcript_content_revision = 40,
+        .command_output_display = .{ .open_command_block = 0 },
+        .full_transcript_installed_page = .{
+            .source = .{
+                .request = .{
+                    .content_revision = 40,
+                    .cols = 80,
+                    .anchor = .tail,
+                },
+                .range = .{ .start = 0, .end = 0 },
+            },
+            .projection = .{ .styles = .{} },
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    for (0..32) |_| {
+        runtime.markTranscriptContentDirty();
+        try std.testing.expect(!runtime.render_requests.hasReason(.transcript));
+    }
+    runtime.command_output_display.open_command_block = null;
+    runtime.markTranscriptContentDirty();
+    try std.testing.expect(runtime.render_requests.hasReason(.transcript));
+
+    runtime.command_output_display.open_command_block = 0;
+    runtime.full_transcript_open_request = runtime.desiredFullTranscriptPageRequest();
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expect(runtime.full_transcript_page_load.busy());
+}
+
+test "installed full transcript stays stable only while its command is active" {
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .full_transcript_content_revision = 41,
+        .full_transcript_installed_page = .{
+            .source = .{
+                .request = .{
+                    .content_revision = 40,
+                    .cols = 80,
+                    .anchor = .tail,
+                },
+                .range = .{ .start = 0, .end = 0 },
+            },
+            .projection = .{ .styles = .{} },
+        },
+    };
+    defer runtime.deinit(std.testing.allocator);
+
+    try std.testing.expect(runtime.installedFullTranscriptPageProjection() == null);
+    runtime.full_transcript_prepared_page_visible = true;
+    try std.testing.expect(runtime.installedFullTranscriptPageProjection() != null);
+    runtime.full_transcript_prepared_page_visible = false;
+    runtime.command_output_display.open_command_block = 0;
+    try std.testing.expect(runtime.installedFullTranscriptPageProjection() != null);
+    runtime.full_transcript_content_revision = 48;
+    try std.testing.expect(runtime.installedFullTranscriptPageProjection() != null);
+    runtime.command_output_display.open_command_block = null;
+    try std.testing.expect(runtime.installedFullTranscriptPageProjection() == null);
+}
+
+test "active full transcript keeps its installed page while replacement loads" {
+    const alloc = std.testing.allocator;
+    const page_alloc = std.heap.c_allocator;
+    const prepared_source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+        page_alloc,
+        try page_alloc.dupe(u8, "installed page\n"),
+        80,
+        null,
+    );
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .full_transcript = .{ .depth = .full },
+        .full_transcript_content_revision = 41,
+        .full_transcript_installed_page = .{
+            .source = .{
+                .request = .{
+                    .content_revision = 40,
+                    .cols = 80,
+                    .anchor = .tail,
+                },
+                .range = .{ .start = 0, .end = 0 },
+            },
+            .projection = .{ .styles = .{} },
+            .prepared_window = .{
+                .source = prepared_source,
+                .start_row = 0,
+            },
+        },
+    };
+    defer runtime.deinit(alloc);
+    const installed = &runtime.full_transcript_installed_page.?.projection;
+    const visible = try runtime.preparedFullTranscriptPageProjectionInterruptible(
+        null,
+        null,
+        null,
+    );
+    try std.testing.expect(visible == installed);
+    try std.testing.expect(runtime.full_transcript_page_load.busy());
+}
+
+test "active full transcript defers repaint while width replacement loads" {
+    const alloc = std.testing.allocator;
+    const page_alloc = std.heap.c_allocator;
+    const prepared_source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+        page_alloc,
+        try page_alloc.dupe(u8, "installed page\n"),
+        80,
+        null,
+    );
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 100,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .full_transcript = .{ .depth = .full },
+        .full_transcript_content_revision = 41,
+        .full_transcript_installed_page = .{
+            .source = .{
+                .request = .{
+                    .content_revision = 40,
+                    .cols = 80,
+                    .anchor = .tail,
+                },
+                .range = .{ .start = 0, .end = 0 },
+            },
+            .projection = .{ .styles = .{} },
+            .prepared_window = .{
+                .source = prepared_source,
+                .start_row = 0,
+            },
+        },
+    };
+    defer runtime.deinit(alloc);
+    try std.testing.expectError(
+        error.InputPending,
+        runtime.preparedFullTranscriptPageProjectionInterruptible(
+            null,
+            null,
+            null,
+        ),
+    );
+    try std.testing.expect(runtime.full_transcript_page_load.busy());
+}
+
+test "cross-page replacement preserves its pending boundary until adoption" {
+    const alloc = std.testing.allocator;
+    const page_alloc = std.heap.c_allocator;
+    const Case = struct {
+        installed_anchor: full_transcript_page.Anchor,
+        boundary_index: usize,
+    };
+    const cases = [_]Case{
+        .{ .installed_anchor = .tail, .boundary_index = 743 },
+        .{ .installed_anchor = .{ .entry_index = 743 }, .boundary_index = 871 },
+    };
+
+    for (cases) |case| {
+        var runtime = TranscriptRuntime{
+            .layout = .{
+                .rows = 24,
+                .cols = 80,
+                .content_bottom = 20,
+                .divider_top_row = 21,
+                .input_row = 22,
+                .divider_bottom_row = 23,
+                .hint_row = 24,
+            },
+            .owned_top_row = 1,
+            .full_transcript = .{ .depth = .full, .follow_tail = false },
+        };
+        defer runtime.deinit(alloc);
+        for (0..1_000) |_| {
+            _ = try runtime.appendRawTranscriptEntryClassified(
+                alloc,
+                "row\n",
+                .unknown_raw,
+            );
+        }
+
+        const installed_request = full_transcript_page.Request{
+            .content_revision = runtime.full_transcript_content_revision,
+            .cols = runtime.layout.cols,
+            .anchor = case.installed_anchor,
+        };
+        runtime.full_transcript_installed_page = .{
+            .source = .{
+                .request = installed_request,
+                .range = full_transcript_page.sourceRange(
+                    installed_request,
+                    runtime.entries.items.len,
+                ),
+            },
+            .projection = .{ .styles = .{} },
+            .prepared_window = .{
+                .source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+                    page_alloc,
+                    try page_alloc.dupe(u8, "installed page\n"),
+                    runtime.layout.cols,
+                    null,
+                ),
+                .start_row = 0,
+            },
+        };
+        runtime.full_transcript_page_anchor = .{ .entry_index = case.boundary_index };
+        runtime.full_transcript = runtime.full_transcript.select_page_boundary(
+            runtime.entries.items[case.boundary_index].id(),
+        );
+        const before = runtime.full_transcript.snapshot();
+
+        try std.testing.expectError(
+            error.InputPending,
+            runtime.preparedFullTranscriptPageProjectionInterruptible(
+                null,
+                null,
+                null,
+            ),
+        );
+        try std.testing.expectEqualDeep(before, runtime.full_transcript.snapshot());
+        try std.testing.expect(runtime.full_transcript_page_load.busy());
+    }
+}
+
+test "restored full transcript opens without replacing its exact offset" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 60,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .full_transcript = .{
+            .depth = .full,
+            .scroll_rows = 47,
+            .follow_tail = false,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    runtime.deferRestoredFullTranscriptOpen();
+    try std.testing.expectEqual(
+        transcript_presentation.Depth.inline_mode,
+        runtime.full_transcript.depth,
+    );
+    try std.testing.expect(try runtime.setTranscriptPresentationDepth(alloc, .full));
+    const selected = runtime.full_transcript.select_visual_offset(100, 8, &.{});
+    try std.testing.expectEqual(@as(u32, 47), selected.offset);
+}
+
+test "full transcript viewport snapshot restores reading position" {
+    var source = TranscriptRuntime{
+        .full_transcript = .{
+            .depth = .full,
+            .scroll_rows = 37,
+            .follow_tail = false,
+            .anchor_entry_id = 19,
+            .anchor_pending = true,
+        },
+        .full_transcript_page_anchor = .{ .entry_index = 17 },
+    };
+    defer source.deinit(std.testing.allocator);
+    const snapshot = source.snapshotFullTranscriptViewport();
+
+    var restored = TranscriptRuntime{};
+    defer restored.deinit(std.testing.allocator);
+    restored.restoreFullTranscriptViewport(snapshot);
+
+    try std.testing.expect(std.meta.eql(
+        snapshot,
+        restored.snapshotFullTranscriptViewport(),
+    ));
+    try std.testing.expect(std.meta.eql(
+        source.full_transcript_page_anchor,
+        restored.full_transcript_page_anchor,
+    ));
+}
+
+test "full transcript page snapshot retains active command records" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const entry_id = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "│ compact output\n",
+        .command_output,
+    );
+    var block = CommandOutputBlock{
+        .entry_id = entry_id,
+        .total_lines = 1,
+        .retained_text_bytes = "ACTIVE_SNAPSHOT_RECORD\n".len,
+    };
+    try block.lines.append(alloc, .{
+        .stream = .stdout,
+        .text = try alloc.dupe(u8, "ACTIVE_SNAPSHOT_RECORD\n"),
+        .entry_id = entry_id,
+        .terminated = true,
+    });
+    try block.source_entry_ids.append(alloc, entry_id);
+    try runtime.command_output_blocks.append(alloc, block);
+
+    var source = try runtime.snapshotFullTranscriptPage(.{
+        .content_revision = runtime.full_transcript_content_revision,
+        .cols = 80,
+        .anchor = .tail,
+    }, null, null);
+    defer source.deinit(std.heap.c_allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), source.command_blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), source.command_blocks.items[0].lines.items.len);
+    try std.testing.expectEqualStrings(
+        "ACTIVE_SNAPSHOT_RECORD\n",
+        source.command_blocks.items[0].lines.items[0].text,
+    );
+}
+
+test "full transcript prewarm rejects an oversized main-thread snapshot" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const oversized = try alloc.alloc(
+        u8,
+        full_transcript_snapshot_clone_max_bytes + 1,
+    );
+    @memset(oversized, 'x');
+    _ = try runtime.appendRawBytesEntryClassified(
+        alloc,
+        oversized,
+        .unknown_raw,
+    );
+
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expect(!runtime.full_transcript_page_load.busy());
+    try std.testing.expect(runtime.full_transcript_failed_request != null);
+    try std.testing.expect(!runtime.requestFullTranscriptOpen());
+    try std.testing.expect(runtime.takeFullTranscriptPreparationFailure());
+    try std.testing.expect(!runtime.fullTranscriptPreparedForOpen());
+}
+
+test "full transcript page navigation preserves tail intent while the page loads" {
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 60,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .full_transcript = .{ .depth = .full },
+    };
+    const task = try std.heap.c_allocator.create(full_transcript_worker.Task);
+    task.* = .{ .source = .{
+        .request = .{
+            .content_revision = 0,
+            .cols = 60,
+            .anchor = .tail,
+        },
+        .range = .{ .start = 0, .end = 0 },
+        .styles = .{},
+    } };
+    runtime.full_transcript_page_load.task = task;
+    defer runtime.deinit(std.testing.allocator);
+
+    runtime.scrollFullTranscript(.up, .page);
+
+    try std.testing.expect(runtime.full_transcript.follow_tail);
+    try std.testing.expectEqual(@as(u32, 0), runtime.full_transcript.scroll_rows);
+}
+
+test "cancelled full transcript page completion is never installed" {
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(12) };
+    runtime.layout.cols = 60;
+    defer runtime.deinit(std.testing.allocator);
+
+    const task = try std.heap.c_allocator.create(full_transcript_worker.Task);
+    task.* = .{
+        .source = .{
+            .request = .{
+                .content_revision = 0,
+                .cols = 60,
+                .anchor = .tail,
+            },
+            .range = .{ .start = 0, .end = 0 },
+            .styles = .{},
+        },
+        .projection = .{ .styles = .{} },
+    };
+    task.cancel_requested.store(true, .release);
+    task.done.store(true, .release);
+    runtime.full_transcript_page_load.task = task;
+
+    try std.testing.expect(!try runtime.pollFullTranscriptPageLoad());
+    try std.testing.expect(runtime.full_transcript_installed_page == null);
+}
+
+test "full transcript page boundaries preserve monotonic navigation" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{ .depth = .full, .follow_tail = false },
+    };
+    defer runtime.deinit(alloc);
+
+    for (0..1_000) |_| {
+        _ = try runtime.appendRawTranscriptEntryClassified(
+            alloc,
+            "row\n",
+            .unknown_raw,
+        );
+    }
+
+    const PageWindow = struct {
+        fn install(
+            current: *TranscriptRuntime,
+            request: full_transcript_page.Request,
+        ) !*InstalledFullTranscriptPage {
+            const range = full_transcript_page.sourceRange(
+                request,
+                current.entries.items.len,
+            );
+            if (current.full_transcript_installed_page == null) {
+                current.full_transcript_installed_page = .{
+                    .source = .{
+                        .request = request,
+                        .range = range,
+                    },
+                    .projection = .{ .styles = .{} },
+                };
+            }
+            const page = &current.full_transcript_installed_page.?;
+            page.source.request = request;
+            page.source.range = range;
+            page.projection.measured_item_rows.clearRetainingCapacity();
+            for (range.start..range.end) |entry_index| {
+                try page.projection.measured_item_rows.append(std.heap.c_allocator, .{
+                    .entry_id = current.entries.items[entry_index].id(),
+                    .row = @intCast(entry_index - range.start),
+                });
+            }
+            page.projection.measured_total_rows = @intCast(range.len());
+            return page;
+        }
+    };
+
+    const tail_request = full_transcript_page.Request{
+        .content_revision = runtime.full_transcript_content_revision,
+        .cols = runtime.layout.cols,
+        .anchor = .tail,
+    };
+    var installed = try PageWindow.install(&runtime, tail_request);
+    const tail_start = installed.source.range.start;
+
+    runtime.scrollFullTranscript(.up, .page);
+    const older_anchor = switch (runtime.full_transcript_page_anchor) {
+        .entry_index => |index| index,
+        .tail => return error.TestExpectedOlderPage,
+    };
+    try std.testing.expectEqual(@as(usize, 743), older_anchor);
+    try std.testing.expect(runtime.full_transcript.bookmark_pending);
+    try std.testing.expectEqual(
+        @as(?u32, runtime.entries.items[older_anchor].id()),
+        runtime.full_transcript.bookmark_entry_id,
+    );
+
+    var older_request = tail_request;
+    older_request.anchor = .{ .entry_index = older_anchor };
+    installed = try PageWindow.install(&runtime, older_request);
+    var selected = runtime.full_transcript.select_visual_offset(
+        installed.projection.measured_total_rows,
+        20,
+        installed.projection.measured_item_rows.items,
+    );
+    runtime.full_transcript = selected.state;
+    const after_page_up = installed.source.range.start + @as(usize, @intCast(selected.offset));
+    try std.testing.expectEqual(@as(usize, 743), after_page_up);
+    try std.testing.expect(after_page_up < tail_start);
+
+    const max_offset = installed.projection.measured_total_rows - 20;
+    runtime.full_transcript.scroll_rows = max_offset;
+    runtime.full_transcript.follow_tail = true;
+    const before_page_down = installed.source.range.start + @as(usize, max_offset);
+    runtime.scrollFullTranscript(.down, .page);
+    const newer_anchor = switch (runtime.full_transcript_page_anchor) {
+        .entry_index => |index| index,
+        .tail => return error.TestExpectedNewerPage,
+    };
+    try std.testing.expectEqual(@as(usize, 871), newer_anchor);
+    try std.testing.expect(runtime.full_transcript.bookmark_pending);
+    try std.testing.expectEqual(
+        @as(?u32, runtime.entries.items[newer_anchor].id()),
+        runtime.full_transcript.bookmark_entry_id,
+    );
+
+    var newer_request = older_request;
+    newer_request.anchor = .{ .entry_index = newer_anchor };
+    installed = try PageWindow.install(&runtime, newer_request);
+    selected = runtime.full_transcript.select_visual_offset(
+        installed.projection.measured_total_rows,
+        20,
+        installed.projection.measured_item_rows.items,
+    );
+    const after_page_down = installed.source.range.start + @as(usize, @intCast(selected.offset));
+    try std.testing.expectEqual(@as(usize, 871), after_page_down);
+    try std.testing.expect(after_page_down > before_page_down);
+}
+
+test "opening the full transcript leaves compact command projection unchanged" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var metrics: Metrics = .{};
+    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "first\n", true);
+    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "second\n", true);
+    try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
+    var compact_before = try runtime.prepareTranscriptSource(alloc, null);
+    defer compact_before.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), compact_before.bytes.len);
+
+    _ = try runtime.setTranscriptPresentationDepth(alloc, .full);
+    var compact_after = try runtime.prepareTranscriptSource(alloc, null);
+    defer compact_after.deinit(alloc);
+    try std.testing.expectEqualStrings(compact_before.bytes, compact_after.bytes);
+}
+
+test "full transcript staging paints its selected wheel viewport without reselection" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{
+            .depth = .full,
+            .scroll_rows = 3,
+            .follow_tail = false,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "row-0\nrow-1\nrow-2\nrow-3\nrow-4\nrow-5\nrow-6\nrow-7\n",
+        .unknown_raw,
+    );
+    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    var metrics: Metrics = .{};
+    var staged = try runtime.prepareFullTranscriptSurfacePaint(
+        alloc,
+        &metrics,
+        &projection,
+        null,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer staged.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), runtime.full_transcript.scroll_rows);
+    try std.testing.expect(!runtime.full_transcript.follow_tail);
+    try std.testing.expectEqual(@as(usize, 0), staged.prepared.selection.start_line);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-3") != null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-0") == null);
+}
+
+test "installed full transcript paints from the worker indexed source" {
+    const alloc = std.testing.allocator;
+    const page_alloc = std.heap.c_allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{
+            .depth = .full,
+            .scroll_rows = 3,
+            .follow_tail = false,
+        },
+    };
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\nrow-0\nrow-1\nrow-2\nrow-3\nrow-4\nrow-5\nrow-6\nrow-7\n",
+        .unknown_raw,
+    );
+    var projection = try runtime.buildFullTranscriptProjection(page_alloc, null);
+    const bytes = try full_transcript_screen.renderProjectionViewportSourceBoundedInterruptible(
+        page_alloc,
+        &projection,
+        null,
+        runtime.layout.cols,
+        256,
+        0,
+        2 * 1024 * 1024,
+        null,
+    );
+    const prepared_source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+        page_alloc,
+        bytes,
+        runtime.layout.cols,
+        null,
+    );
+    runtime.full_transcript_installed_page = .{
+        .source = .{
+            .request = runtime.desiredFullTranscriptPageRequest(),
+            .range = .{ .start = 0, .end = runtime.entries.items.len },
+        },
+        .projection = projection,
+        .prepared_window = .{
+            .source = prepared_source,
+            .start_row = 0,
+        },
+    };
+    const installed = &runtime.full_transcript_installed_page.?;
+    var metrics: Metrics = .{};
+    var staged = try runtime.prepareFullTranscriptSurfacePaint(
+        alloc,
+        &metrics,
+        &installed.projection,
+        null,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer staged.deinit(alloc);
+
+    try std.testing.expect(staged.owned_source == null);
+    try std.testing.expect(staged.borrowed_source == &installed.prepared_window.?.source);
+    try std.testing.expectEqual(@as(?u16, 4), staged.prepared.projection_visual_rows);
+    try std.testing.expect(staged.prepared.selection.last_visible_row <= 4);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-0") != null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-7") != null);
+}
+
+test "clear retains installed full transcript page until window worker terminates" {
+    const alloc = std.testing.allocator;
+    const page_alloc = std.heap.c_allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 8,
+        .cols = 40,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 7,
+        .hint_row = 8,
+    } };
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "row-0\nrow-1\nrow-2\nrow-3\nrow-4\n",
+        .unknown_raw,
+    );
+    runtime.full_transcript_installed_page = .{
+        .source = .{
+            .request = runtime.desiredFullTranscriptPageRequest(),
+            .range = .{ .start = 0, .end = runtime.entries.items.len },
+        },
+        .projection = try runtime.buildFullTranscriptProjection(page_alloc, null),
+    };
+    const page = &runtime.full_transcript_installed_page.?;
+    const task = try page_alloc.create(full_transcript_worker.WindowTask);
+    task.* = .{
+        .request = .{
+            .page_request = page.source.request,
+            .target_offset = 1,
+            .start_row = 0,
+            .row_count = 4,
+        },
+        .projection = &page.projection,
+        .capability = null,
+    };
+    runtime.full_transcript_window_load.task = task;
+
+    runtime.clearFullTranscriptDetails(alloc);
+    try std.testing.expect(runtime.full_transcript_installed_page != null);
+    try std.testing.expect(task.cancel_requested.load(.acquire));
+
+    task.done.store(true, .release);
+    try std.testing.expect(!try runtime.pollFullTranscriptPageLoad());
+    try std.testing.expect(runtime.full_transcript_installed_page == null);
+}
+
+test "compact transcript cache survives navigation and invalidates on content change" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{ .depth = .full },
+    };
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "row-0\nrow-1\nrow-2\nrow-3\nrow-4\n",
+        .unknown_raw,
+    );
+
+    var compact = try runtime.cachedTranscriptSource(alloc);
+    defer compact.deinit(alloc);
+    const cached_compact = runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        runtime.has_committed_frame,
+    ).?;
+    const compact_bytes = cached_compact.bytes.ptr;
+    try std.testing.expect(cached_compact.hard_line_starts.len > 0);
+    try std.testing.expectEqual(
+        cached_compact.hard_line_starts.len,
+        cached_compact.transcript_visible_lines.len,
+    );
+    try std.testing.expectEqual(
+        cached_compact.hard_line_starts.len,
+        cached_compact.transcript_line_visual_rows.len,
+    );
+    try std.testing.expectEqual(
+        cached_compact.transcript_visible_lines.len,
+        compact.transcript_visible_lines.len,
+    );
+    runtime.markTranscriptDirty();
+    var same_compact = try runtime.cachedTranscriptSource(alloc);
+    defer same_compact.deinit(alloc);
+    try std.testing.expectEqual(compact_bytes, runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        runtime.has_committed_frame,
+    ).?.bytes.ptr);
+    runtime.has_committed_frame = true;
+    try std.testing.expectEqual(@as(?*TranscriptPreparationSource, null), runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        runtime.has_committed_frame,
+    ));
+    var committed_compact = try runtime.cachedTranscriptSource(alloc);
+    committed_compact.deinit(alloc);
+    runtime.has_committed_frame = false;
+
+    runtime.markTranscriptContentDirty();
+    var rebuilt_compact = try runtime.cachedTranscriptSource(alloc);
+    defer rebuilt_compact.deinit(alloc);
+    try std.testing.expect(compact_bytes != runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        runtime.has_committed_frame,
+    ).?.bytes.ptr);
+}
+
+test "cached compact transcript refreshes after streamed assistant text" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "existing transcript\n",
+        .unknown_raw,
+    );
+
+    var before = try runtime.cachedTranscriptSource(alloc);
+    defer before.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, before.bytes, "streamed assistant") == null);
+
+    var metrics = Metrics{};
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "streamed assistant\n");
+    var after = try runtime.cachedTranscriptSource(alloc);
+    defer after.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, after.bytes, "streamed assistant") != null);
+}
+
+test "clearing a transcript releases compact source and installed page" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{ .depth = .full },
+    };
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "old session transcript\n",
+        .unknown_raw,
+    );
+
+    var compact = try runtime.cachedTranscriptSource(alloc);
+    compact.deinit(alloc);
+    const content_revision = runtime.full_transcript_content_revision;
+    runtime.full_transcript_installed_page = .{
+        .source = .{
+            .request = .{
+                .content_revision = content_revision,
+                .cols = runtime.layout.cols,
+                .anchor = .tail,
+            },
+            .range = .{ .start = 0, .end = 0 },
+        },
+        .projection = .{ .styles = .{} },
+    };
+    try std.testing.expect(runtime.compact_transcript_source_cache.find(
+        content_revision,
+        runtime.layout.cols,
+        runtime.has_committed_frame,
+    ) != null);
+    try std.testing.expect(runtime.full_transcript_installed_page != null);
+
+    runtime.clearTranscript(alloc);
+
+    try std.testing.expect(runtime.compact_transcript_source_cache.find(
+        content_revision,
+        runtime.layout.cols,
+        runtime.has_committed_frame,
+    ) == null);
+    try std.testing.expect(runtime.full_transcript_installed_page == null);
+}
+
+test "cached compact transcript preserves pending resume flow" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "retained tail only\n",
+        .unknown_raw,
+    );
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, "full resume history\nretained tail only\n"),
+    );
+
+    var source = try runtime.cachedTranscriptSource(alloc);
+    defer source.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, source.bytes, "full resume history") != null);
+}
+
+test "startup resume view release preserves later structured notices" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const resume_entry_id = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "cached resume view\n",
+        .unknown_raw,
+    );
+    _ = try runtime.appendSemanticNotice(alloc, .{
+        .topic = "recording",
+        .tone = .warning,
+        .body = "terminal capture is active",
+    });
+    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "cached resume view") != null);
+    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "terminal capture is active") != null);
+
+    try std.testing.expect(try runtime.releaseStartupResumeViewEntry(alloc, resume_entry_id));
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
+    try std.testing.expect(runtime.entries.items[0] == .semantic_notice);
+    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "cached resume view") == null);
+    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "terminal capture is active") != null);
+    try std.testing.expect(!try runtime.releaseStartupResumeViewEntry(alloc, resume_entry_id));
+}
+
 const PendingBuildProbe = struct {
     polls: usize = 0,
     pending_after: ?usize = null,
@@ -558,11 +1758,2164 @@ const PendingBuildProbe = struct {
     }
 };
 
+test "pending resume source publishes its line index once" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    runtime.layout.cols = 40;
+    defer runtime.deinit(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..5_000) |_| try flow.appendSlice(alloc, "resume row\n");
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try flow.toOwnedSlice(alloc),
+    );
+    const flow_ptr = runtime.pendingResumeFlow().ptr;
+
+    var cancelled_probe = PendingBuildProbe{ .pending_after = 1 };
+    var cancelled = build_checkpoint.BuildCheckpoint.init(
+        &cancelled_probe,
+        PendingBuildProbe.pending,
+    );
+    try std.testing.expectError(
+        error.InputPending,
+        runtime.pendingResumeSourceInterruptible(alloc, &cancelled),
+    );
+    try std.testing.expectEqual(@as(usize, 0), runtime.pending_resume_source.?.hard_line_starts.len);
+    try std.testing.expectEqual(flow_ptr, runtime.pendingResumeFlow().ptr);
+
+    var build_probe = PendingBuildProbe{};
+    var build = build_checkpoint.BuildCheckpoint.init(&build_probe, PendingBuildProbe.pending);
+    const source = (try runtime.pendingResumeSourceInterruptible(alloc, &build)).?;
+    const source_ptr = source;
+    const index_ptr = source.hard_line_starts.ptr;
+    try std.testing.expect(source.hard_line_starts.len > 0);
+
+    runtime.layout.cols = 41;
+    var resize_probe = PendingBuildProbe{ .pending_after = 2 };
+    var resize = build_checkpoint.BuildCheckpoint.init(&resize_probe, PendingBuildProbe.pending);
+    try std.testing.expectError(
+        error.InputPending,
+        runtime.pendingResumeSourceInterruptible(alloc, &resize),
+    );
+    try std.testing.expectEqual(source_ptr, &runtime.pending_resume_source.?);
+    try std.testing.expectEqual(@as(u16, 40), runtime.pending_resume_source.?.cols);
+    runtime.layout.cols = 40;
+
+    for (0..3) |_| {
+        var reuse_probe = PendingBuildProbe{};
+        var reuse = build_checkpoint.BuildCheckpoint.init(&reuse_probe, PendingBuildProbe.pending);
+        const reused = (try runtime.pendingResumeSourceInterruptible(alloc, &reuse)).?;
+        try std.testing.expectEqual(source_ptr, reused);
+        try std.testing.expectEqual(index_ptr, reused.hard_line_starts.ptr);
+        try std.testing.expectEqual(@as(usize, 1), reuse_probe.polls);
+    }
+
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        source,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(source.transcript_visible_lines.ptr, prepared.sourceVisibleLines().ptr);
+    try std.testing.expectEqual(source.transcript_line_visual_rows.ptr, prepared.sourceVisualRows().ptr);
+    try std.testing.expectEqual(
+        source.transcript_visual_row_offsets[source.transcript_visual_row_offsets.len - 1],
+        prepared.sourceTotalVisualRows(),
+    );
+}
+
+test "full transcript staging keeps its selected viewport visible during resize recovery" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{
+            .depth = .full,
+            .scroll_rows = 3,
+            .follow_tail = false,
+        },
+        .resize_history_row_delta = 22,
+    };
+    defer runtime.deinit(alloc);
+
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "row-0\nrow-1\nrow-2\nrow-3\nrow-4\nrow-5\nrow-6\nrow-7\n",
+        .unknown_raw,
+    );
+    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    var metrics: Metrics = .{};
+    var staged = try runtime.prepareFullTranscriptSurfacePaint(
+        alloc,
+        &metrics,
+        &projection,
+        null,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer staged.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-3") != null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-0") == null);
+    try std.testing.expectEqual(@as(?i32, 22), runtime.resize_history_row_delta);
+    try std.testing.expectEqual(@as(usize, 0), staged.prepared.selection.start_line);
+    try std.testing.expect(staged.prepared.selection.last_visible_row >= staged.prepared.selection.top_row);
+}
+
+test "auto permission notice is retained without changing compact transcript geometry" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const cursor_row_before = runtime.cursor_row;
+    const cursor_col_before = runtime.cursor_col;
+    const viewport_before = runtime.viewport_top_row;
+
+    _ = try runtime.appendSemanticNotice(alloc, .{
+        .topic = "system",
+        .tone = .information,
+        .body = "Auto agent approved this request: Running command.",
+        .visibility = .full_only,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
+    try std.testing.expect(runtime.entries.items[0] == .semantic_notice);
+    try std.testing.expectEqualStrings("system", runtime.entries.items[0].semantic_notice.topic);
+    try std.testing.expectEqual(types.NoticeTone.information, runtime.entries.items[0].semantic_notice.tone);
+    try std.testing.expectEqualStrings(
+        "Auto agent approved this request: Running command.",
+        runtime.entries.items[0].semantic_notice.body,
+    );
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, runtime.entries.items[0].semantic_notice.visibility);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transcript.items.len);
+    try std.testing.expectEqual(cursor_row_before, runtime.cursor_row);
+    try std.testing.expectEqual(cursor_col_before, runtime.cursor_col);
+    try std.testing.expectEqual(viewport_before, runtime.viewport_top_row);
+
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "● Ran printf done\n",
+        .tool_status,
+    );
+    var compact = try runtime.prepareTranscriptSource(alloc, null);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "Auto agent approved") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 tool call") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "Ran printf done") != null);
+
+    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    const full = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+        alloc,
+        &projection,
+        null,
+        runtime.layout.cols,
+        20,
+        0,
+        null,
+    );
+    defer alloc.free(full);
+    const notice_index = std.mem.find(u8, full, "Auto agent approved") orelse
+        return error.TestExpectedAutoPermissionNotice;
+    const status_index = std.mem.find(u8, full, "Ran printf done") orelse
+        return error.TestExpectedToolStatus;
+    try std.testing.expect(notice_index < status_index);
+}
+
+fn checkAutoPermissionNoticeAllocationFailures(alloc: Allocator) !void {
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    const cursor_row_before = runtime.cursor_row;
+    const cursor_col_before = runtime.cursor_col;
+
+    _ = runtime.appendSemanticNotice(alloc, .{
+        .topic = "system",
+        .tone = .information,
+        .body = "Auto agent approved this request: Running command.",
+        .visibility = .full_only,
+    }) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), runtime.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 0), runtime.transcript.items.len);
+        try std.testing.expectEqual(cursor_row_before, runtime.cursor_row);
+        try std.testing.expectEqual(cursor_col_before, runtime.cursor_col);
+        return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            else => err,
+        };
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transcript.items.len);
+}
+
+test "auto permission notice write is atomic across allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkAutoPermissionNoticeAllocationFailures,
+        .{},
+    );
+}
+
+test "full transcript opening follows the tail instead of consuming its compact anchor" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "row-0\nrow-1\nrow-2\n",
+        .unknown_raw,
+    );
+    const anchor_id = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "anchor\n",
+        .unknown_raw,
+    );
+    runtime.full_transcript = runtime.full_transcript.capture_anchor(anchor_id).with_depth(.full);
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "row-4\nrow-5\nrow-6\nrow-7\n",
+        .unknown_raw,
+    );
+
+    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    const measurement = try full_transcript_screen.measureProjectionInterruptible(
+        alloc,
+        &projection,
+        null,
+        runtime.layout.cols,
+        null,
+    );
+    var metrics: Metrics = .{};
+    var staged = try runtime.prepareFullTranscriptSurfacePaint(
+        alloc,
+        &metrics,
+        &projection,
+        null,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer staged.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), staged.prepared.selection.start_line);
+    try std.testing.expectEqual(
+        measurement.total_rows -| 4,
+        runtime.full_transcript.scroll_rows,
+    );
+    try std.testing.expect(runtime.full_transcript.follow_tail);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-7") != null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "anchor") == null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-0") == null);
+    try std.testing.expect(!runtime.full_transcript.anchor_pending);
+}
+
+test "full transcript primary restore repairs resize debt after geometry returns" {
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    runtime.full_transcript_open_content_revision = 7;
+    runtime.full_transcript_content_revision = 7;
+    runtime.full_transcript_open_cols = 80;
+    runtime.full_transcript_open_rows = 24;
+
+    try std.testing.expectEqual(FullTranscriptPrimaryRestore.exact, runtime.fullTranscriptPrimaryRestore());
+    runtime.terminal_reset_pending = true;
+    try std.testing.expectEqual(FullTranscriptPrimaryRestore.resized, runtime.fullTranscriptPrimaryRestore());
+    runtime.full_transcript_content_revision = 8;
+    try std.testing.expectEqual(FullTranscriptPrimaryRestore.changed_resized, runtime.fullTranscriptPrimaryRestore());
+}
+
+test "full transcript primary restore consumes the pending settled resize" {
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    runtime.render_requests.completeResizeGeometry(true);
+    runtime.pending_resize_observation = .{
+        .layout = runtime.layout,
+        .apply_after_ms = 17,
+        .expected_row = null,
+        .result = .unavailable,
+        .phase = .settle_pending,
+    };
+    runtime.terminal_reset_pending = true;
+    runtime.resize_history_row_delta = 4;
+
+    runtime.repaintRestoredPrimaryTranscriptAfterResize();
+
+    try std.testing.expect(!runtime.render_requests.pending_settled_width_reflow);
+    try std.testing.expectEqual(@as(?ResizeObservation, null), runtime.pending_resize_observation);
+    try std.testing.expect(!runtime.terminal_reset_pending);
+    try std.testing.expectEqual(@as(?i32, null), runtime.resize_history_row_delta);
+}
+
+test "full transcript recovery starts at closest visible entry before a hidden anchor" {
+    const provenance = [_]transcript_blocks.LineProvenance{
+        .{ .entry = .{ .entry_id = 10, .entry_class = .unknown_raw } },
+        .{ .entry = .{ .entry_id = 10, .entry_class = .unknown_raw } },
+        .block_separator,
+        .{ .entry = .{ .entry_id = 14, .entry_class = .tool_status } },
+        .{ .entry = .{ .entry_id = 14, .entry_class = .tool_status } },
+        .{ .entry = .{ .entry_id = 22, .entry_class = .assistant_turn } },
+    };
+
+    try std.testing.expectEqual(
+        @as(?usize, 3),
+        TranscriptRuntime.fullTranscriptRecoveryPredecessorStartLine(&provenance, 18),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 0),
+        TranscriptRuntime.fullTranscriptRecoveryPredecessorStartLine(&provenance, 10),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        TranscriptRuntime.fullTranscriptRecoveryPredecessorStartLine(&provenance, 9),
+    );
+}
+
+test "authoritative lifecycle detail is retained by its compact status entry" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "read-1" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = .{ .turn_id = 1, .anchor_step_id = 4 },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+        .arguments_json = "{\"path\":\"README.md\"}",
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Read README.md" },
+        .result = "# README\nfull result",
+    } });
+
+    const entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    const detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqual(types.ToolActivityKind.read, detail.activity_kind.?);
+    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", detail.arguments_json.?);
+    try std.testing.expectEqualStrings("# README\nfull result", detail.result.?);
+    try std.testing.expectEqual(@as(u64, 1), detail.lifecycle_id.?.turn_id);
+    try std.testing.expectEqualStrings("read-1", detail.lifecycle_id.?.call_id);
+    try std.testing.expect(detail.lifecycle_id.?.call_id.ptr != id.call_id.ptr);
+    try std.testing.expectEqual(
+        types.ToolPresentationGroupId{ .turn_id = 1, .anchor_step_id = 4 },
+        detail.presentation_group_id.?,
+    );
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Read README.md") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "input") == null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "full result") == null);
+}
+
+test "paused tool turn can resume the same lifecycle identity before finalization" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 41, .call_id = "resume-tool" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+        .turn_id = id.turn_id,
+        .outcome = .paused,
+    } });
+    try runtime.finishLifecycleBatch(alloc);
+
+    try std.testing.expectEqual(@as(u64, 0), runtime.finalizedToolTurnWatermark());
+    try std.testing.expect(runtime.toolActivityRecord(id) == null);
+    var paused_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer paused_source.deinit(alloc);
+    try std.testing.expect(std.mem.find(
+        u8,
+        paused_source.bytes,
+        "Tool state preserved for recovery",
+    ) != null);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expect(runtime.toolActivityRecord(id) != null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.activeToolActivityCount());
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+        .turn_id = id.turn_id,
+        .outcome = .completed,
+    } });
+    try runtime.finishLifecycleBatch(alloc);
+    try std.testing.expectEqual(id.turn_id, runtime.finalizedToolTurnWatermark());
+}
+
+test "provisional lifecycle owns semantic detail before authoritative reconciliation" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 7, .call_id = "provisional-command" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .tool_name = null,
+        .activity_kind = .command,
+    } });
+
+    const entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    const initial_detail = runtime.toolDetailForEntry(entry_id);
+    try std.testing.expect(initial_detail != null);
+    try std.testing.expectEqualStrings("tool", initial_detail.?.tool_name);
+    try std.testing.expectEqual(types.ToolActivityKind.command, initial_detail.?.activity_kind.?);
+    try std.testing.expectEqual(@as(u64, 7), initial_detail.?.lifecycle_id.?.turn_id);
+    try std.testing.expectEqualStrings("provisional-command", initial_detail.?.lifecycle_id.?.call_id);
+    try std.testing.expect(initial_detail.?.lifecycle_id.?.call_id.ptr != id.call_id.ptr);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .tool_name = "run_command",
+        .activity_kind = .command,
+    } });
+    const updated_detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqualStrings("run_command", updated_detail.tool_name);
+    try std.testing.expectEqual(@as(usize, 1), runtime.tool_details.items.len);
+}
+
+test "nonzero command remains Ran in the current compact projection" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "exit-7" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"false\"}",
+    } });
+    try std.testing.expect(runtime.toolActivityRecord(id).?.captured_command);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran false" },
+        .result_memory = .{ .command_process_presentation = .{ .exit_code = 7 } },
+    } });
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran false") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source.bytes, "│ exit code 7"));
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
+}
+
+test "terminal lifecycle records distinguish captured exec from durable actions" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+    const exec_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "exec" };
+    const start_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "start" };
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = exec_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf exec\"}",
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = start_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"start\",\"command\":\"printf start\"}",
+    } });
+
+    try std.testing.expect(runtime.toolActivityRecord(exec_id).?.captured_command);
+    try std.testing.expect(!runtime.toolActivityRecord(start_id).?.captured_command);
+}
+
+test "nonzero streamed command reuses its active output block" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    const id = types.ToolLifecycleId{ .turn_id = 2, .call_id = "streamed-exit-7" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf lines; exit 7\"}",
+    } });
+    const started_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try std.testing.expect(runtime.toolDetailForEntry(started_entry_id).?.isCapturedCommand());
+    var metrics: Metrics = .{};
+    try runtime.writeCommandOutputChunkForLifecycle(
+        alloc,
+        &metrics,
+        styles,
+        id,
+        .stdout,
+        "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\n",
+        true,
+    );
+    try std.testing.expect(runtime.toolDetailForEntry(started_entry_id).?.isCapturedCommand());
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran printf lines; exit 7" },
+        .result_memory = .{ .command_process_presentation = .{ .exit_code = 7 } },
+    } });
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.command_output_blocks.items.len);
+    try runtime.flushCommandOutputSummaryForLifecycle(
+        alloc,
+        &metrics,
+        styles,
+        id,
+        true,
+    );
+
+    const block = runtime.command_output_blocks.items[0];
+    const status_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try std.testing.expect(runtime.toolDetailForEntry(status_entry_id).?.isCapturedCommand());
+    try std.testing.expectEqual(
+        block.entry_id,
+        runtime.toolDetailForEntry(status_entry_id).?.command_output_entry_id,
+    );
+    try std.testing.expect(command_output_runtime.processPresentationForBlock(&runtime, block) != null);
+    var projection = try command_output_runtime.renderCompactCommandOutputWithProcessPresentation(
+        alloc,
+        block,
+        .{ .styles = styles },
+        80,
+        command_output_runtime.processPresentationForBlock(&runtime, block),
+    );
+    defer projection.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, command_output_runtime.compact_output_row_limit + 1),
+        std.mem.count(u8, projection.bytes.items, "\n") + 1,
+    );
+    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-4") != null);
+    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-5") == null);
+    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ … 2 lines more (ctrl o to view)") != null);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, projection.bytes.items, "│ exit code 7"),
+    );
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran printf lines; exit 7") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
+}
+
+test "compact run command group stays width safe after resize" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 24,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    const id = types.ToolLifecycleId{ .turn_id = 3, .call_id = "long-command-header" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "run_command",
+        .activity_kind = .command,
+        .arguments_json = "{\"command\":\"printf a deliberately long command preview\"}",
+    } });
+    var metrics: Metrics = .{};
+    try runtime.writeCommandOutputChunkForLifecycle(
+        alloc,
+        &metrics,
+        styles,
+        id,
+        .stdout,
+        "payload\n",
+        true,
+    );
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{
+            .kind = .completed,
+            .summary = "Ran printf a deliberately long command preview that exceeds both narrow and normal transcript widths without losing its typed command identity",
+        },
+    } });
+    try runtime.flushCommandOutputSummaryForLifecycle(
+        alloc,
+        &metrics,
+        styles,
+        id,
+        true,
+    );
+
+    const status_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    const output_entry_id = runtime.command_output_blocks.items[0].entry_id.?;
+    for ([_]u16{ 24, 80 }) |cols| {
+        runtime.layout.cols = cols;
+        var source = try runtime.prepareTranscriptSource(alloc, null);
+        defer source.deinit(alloc);
+
+        var status_line: ?usize = null;
+        var output_line: ?usize = null;
+        var status_line_count: usize = 0;
+        for (source.line_provenance, 0..) |provenance, line_index| {
+            switch (provenance) {
+                .entry => |entry| {
+                    if (entry.entry_id == status_entry_id) {
+                        if (status_line == null) status_line = line_index;
+                        status_line_count += 1;
+                    }
+                    if (entry.entry_id == output_entry_id and output_line == null) {
+                        output_line = line_index;
+                    }
+                },
+                else => {},
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), status_line_count);
+        try std.testing.expect(output_line == null);
+
+        try std.testing.expect(status_line != null);
+        var lines = std.mem.splitScalar(u8, source.bytes, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+        try std.testing.expect(std.mem.find(u8, source.bytes, "…") != null);
+    }
+}
+
+fn checkToolDetailResultReplacementAllocationFailures(alloc: Allocator) !void {
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var tool_name: ?[]u8 = try alloc.dupe(u8, "read_file");
+    errdefer if (tool_name) |value| alloc.free(value);
+    var previous_result: ?[]u8 = try alloc.dupe(u8, "previous result");
+    errdefer if (previous_result) |value| alloc.free(value);
+    var previous_artifact: ?[]u8 = try alloc.dupe(u8, "fx-command-previous.log");
+    errdefer if (previous_artifact) |value| alloc.free(value);
+    try runtime.tool_details.append(alloc, .{
+        .entry_id = 1,
+        .tool_name = tool_name.?,
+        .result = previous_result.?,
+        .command_artifact_handle = previous_artifact.?,
+    });
+    tool_name = null;
+    previous_result = null;
+    previous_artifact = null;
+
+    runtime.updateToolDetailTerminal(
+        alloc,
+        1,
+        null,
+        "read_file",
+        .read,
+        .completed,
+        "replacement result",
+        null,
+        "fx-command-replacement.log",
+        null,
+    ) catch |err| {
+        try std.testing.expectEqualStrings(
+            "previous result",
+            runtime.toolDetailForEntry(1).?.result.?,
+        );
+        try std.testing.expectEqualStrings(
+            "fx-command-previous.log",
+            runtime.toolDetailForEntry(1).?.command_artifact_handle.?,
+        );
+        return err;
+    };
+    try std.testing.expectEqualStrings(
+        "replacement result",
+        runtime.toolDetailForEntry(1).?.result.?,
+    );
+    try std.testing.expectEqualStrings(
+        "fx-command-replacement.log",
+        runtime.toolDetailForEntry(1).?.command_artifact_handle.?,
+    );
+}
+
+test "tool detail result replacement preserves the prior allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkToolDetailResultReplacementAllocationFailures,
+        .{},
+    );
+}
+
+test "historical tool detail attaches to the exact replayed status entry" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .completed,
+        "Read README.md",
+        true,
+    );
+    try runtime.attachHistoricalToolDetail(
+        alloc,
+        entry_id,
+        .{ .id = "replayed-read", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" },
+        .read,
+        .{
+            .tool_call_id = @constCast("replayed-read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("# README\nfull replayed result"),
+            .output_bytes = 29,
+            .stored_output_bytes = 29,
+            .created_at_ms = 123,
+        },
+    );
+
+    const detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", detail.arguments_json.?);
+    try std.testing.expectEqualStrings("# README\nfull replayed result", detail.result.?);
+    try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
+    try std.testing.expectEqual(@as(i64, 123), detail.created_at_ms);
+}
+
+test "historical context-withheld tool detail keeps the call without result evidence" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .deferred,
+        "Not run — project instructions changed: Running cat nested/input.txt",
+        true,
+    );
+    try runtime.attachHistoricalToolDetail(
+        alloc,
+        entry_id,
+        .{
+            .id = "deferred-command",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"cat nested/input.txt\"}",
+        },
+        .command,
+        .{
+            .tool_call_id = @constCast("deferred-command"),
+            .tool_name = @constCast("run_command"),
+            .status = .failure,
+            .output = @constCast(types.context_deferred_tool_result_output),
+            .output_handle = @constCast("should-not-be-exposed.txt"),
+            .preview = @constCast("should not be exposed"),
+            .output_bytes = types.context_deferred_tool_result_output.len,
+            .stored_output_bytes = types.context_deferred_tool_result_output.len,
+            .truncated = true,
+            .command_output_replay = .unavailable,
+            .command_process_presentation = .{ .exit_code = 7 },
+        },
+    );
+
+    const detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqualStrings("run_command", detail.tool_name);
+    try std.testing.expectEqualStrings("{\"command\":\"cat nested/input.txt\"}", detail.arguments_json.?);
+    try std.testing.expectEqual(types.ToolOutcomeKind.deferred, detail.outcome.?);
+    try std.testing.expect(detail.result == null);
+    try std.testing.expect(detail.result_handle == null);
+    try std.testing.expect(detail.command_artifact_handle == null);
+    try std.testing.expect(detail.command_output_replay == null);
+    try std.testing.expect(detail.command_process_presentation == null);
+    try std.testing.expect(detail.command_output_entry_id == null);
+
+    const legacy_entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .denied,
+        "Not executed: Reading stale.txt",
+        true,
+    );
+    try runtime.attachHistoricalToolDetail(
+        alloc,
+        legacy_entry_id,
+        .{
+            .id = "legacy-deferred-read",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"stale.txt\"}",
+        },
+        .read,
+        .{
+            .tool_call_id = @constCast("legacy-deferred-read"),
+            .tool_name = @constCast("read_file"),
+            .status = .failure,
+            .output = @constCast(types.deferred_tool_result_output),
+            .output_bytes = types.deferred_tool_result_output.len,
+            .stored_output_bytes = types.deferred_tool_result_output.len,
+        },
+    );
+    const legacy_detail = runtime.toolDetailForEntry(legacy_entry_id).?;
+    try std.testing.expectEqual(types.ToolOutcomeKind.denied, legacy_detail.outcome.?);
+    try std.testing.expect(legacy_detail.result == null);
+
+    const failed_entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .failed,
+        "Failed printf failure",
+        true,
+    );
+    try runtime.attachHistoricalToolDetail(
+        alloc,
+        failed_entry_id,
+        .{
+            .id = "failed-command",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"printf failure; exit 7\"}",
+        },
+        .command,
+        .{
+            .tool_call_id = @constCast("failed-command"),
+            .tool_name = @constCast("run_command"),
+            .status = .failure,
+            .output = @constCast("ordinary failure"),
+            .output_handle = @constCast("ordinary-failure.txt"),
+            .output_bytes = 16,
+            .stored_output_bytes = 16,
+        },
+    );
+
+    const failed_detail = runtime.toolDetailForEntry(failed_entry_id).?;
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, failed_detail.outcome.?);
+    try std.testing.expectEqualStrings("ordinary failure", failed_detail.result.?);
+    try std.testing.expectEqualStrings("ordinary-failure.txt", failed_detail.result_handle.?);
+}
+
+test "historical permission denial keeps denied outcome without internal result detail" {
+    const alloc = std.testing.allocator;
+    const denial_output = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .denied,
+        "Denied by auto agent pwd",
+        true,
+    );
+    try runtime.attachHistoricalToolDetail(
+        alloc,
+        entry_id,
+        .{
+            .id = "denied-command",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+        },
+        .command,
+        .{
+            .tool_call_id = @constCast("denied-command"),
+            .tool_name = @constCast("terminal"),
+            .status = .failure,
+            .output = @constCast(denial_output),
+            .output_bytes = denial_output.len,
+            .stored_output_bytes = denial_output.len,
+        },
+    );
+
+    const detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqual(types.ToolOutcomeKind.denied, detail.outcome.?);
+    try std.testing.expect(detail.result == null);
+    try std.testing.expect(detail.result_handle == null);
+    try std.testing.expect(detail.command_output_entry_id == null);
+}
+
+test "historical command detail keeps artifact handles after command block attaches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+    const stored_result = "exit_code=0\n<stdout>\nRESUMED_EXACT_RESULT\n</stdout>\n";
+    const result_handle = try result_store.storeLargeResultManaged(
+        alloc,
+        &capability,
+        "replayed-command",
+        "run_command",
+        stored_result,
+    );
+    defer alloc.free(result_handle);
+    defer result_store.deleteManaged(&capability, result_handle) catch {};
+
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const raw_preview = "exit_code=0\ntruncated=true\nstdout_bytes=21\nstderr_bytes=0\noutput_file=/tmp/fx-command-replayed.log\n<stdout>RESUMED_EXACT_RESULT\n</stdout>";
+    const raw_result = try std.fmt.allocPrint(
+        alloc,
+        "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}\n</tool_result_preview>\n" ++
+            "<tool_result_handle>{s}</tool_result_handle>",
+        .{ result_handle, stored_result.len, raw_preview, result_handle },
+    );
+    defer alloc.free(raw_result);
+    var metrics: Metrics = .{};
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .completed,
+        "Ran printf restored",
+        true,
+    );
+    try runtime.attachHistoricalToolDetail(
+        alloc,
+        entry_id,
+        .{ .id = "replayed-command", .name = "run_command", .arguments_json = "{\"command\":\"printf restored\"}" },
+        .command,
+        .{
+            .tool_call_id = @constCast("replayed-command"),
+            .tool_name = @constCast("run_command"),
+            .status = .success,
+            .output = @constCast(raw_result),
+            .output_handle = result_handle,
+            .preview = @constCast(raw_preview),
+            .output_bytes = stored_result.len,
+            .stored_output_bytes = stored_result.len,
+            .truncated = true,
+        },
+    );
+
+    runtime.attachHistoricalCommandOutput(alloc, entry_id);
+
+    const fallback_detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expect(fallback_detail.command_output_entry_id == null);
+    try std.testing.expectEqualStrings(raw_result, fallback_detail.result.?);
+    try std.testing.expectEqualStrings(result_handle, fallback_detail.result_handle.?);
+    try std.testing.expectEqualStrings("fx-command-replayed.log", fallback_detail.command_artifact_handle.?);
+
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    try runtime.writeCommandOutputChunk(
+        alloc,
+        &metrics,
+        styles,
+        .stdout,
+        "RESUMED_EXACT_RESULT\n",
+        true,
+    );
+    try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
+
+    runtime.attachHistoricalCommandOutput(alloc, entry_id);
+
+    const command_detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expect(command_detail.command_output_entry_id != null);
+    try std.testing.expectEqualStrings(raw_result, command_detail.result.?);
+    try std.testing.expectEqualStrings(result_handle, command_detail.result_handle.?);
+    try std.testing.expectEqualStrings("fx-command-replayed.log", command_detail.command_artifact_handle.?);
+
+    runtime.full_transcript.depth = .full;
+    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    const full_source = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+        alloc,
+        &projection,
+        &capability,
+        runtime.layout.cols,
+        10,
+        0,
+        null,
+    );
+    defer alloc.free(full_source);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, full_source, "RESUMED_EXACT_RESULT"),
+    );
+    try std.testing.expect(std.mem.find(u8, full_source, "exit_code=0") == null);
+    try std.testing.expect(std.mem.find(u8, full_source, "<stdout>") == null);
+    try std.testing.expect(std.mem.find(u8, full_source, "</stdout>") == null);
+}
+
+test "historical nonzero command keeps replay ownership outside compact sidebands" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .completed,
+        "Ran false",
+        true,
+    );
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    try runtime.writeCommandOutputChunk(
+        alloc,
+        &metrics,
+        styles,
+        .stdout,
+        "one\ntwo\nthree\nfour\nfive\nsix\n",
+        true,
+    );
+    try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
+    const command_output_entry_id = runtime.latestCommandOutputEntryId().?;
+
+    const replay_handle = "fx-command-replay-historical.bin";
+    try runtime.attachHistoricalToolDetailAfterCommandOutput(
+        alloc,
+        entry_id,
+        .{ .id = "historical-exit", .name = "run_command", .arguments_json = "{\"command\":\"false\"}" },
+        .command,
+        .{
+            .tool_call_id = @constCast("historical-exit"),
+            .tool_name = @constCast("run_command"),
+            .status = .failure,
+            .output = @constCast("exit_code=7\n(no output)\n"),
+            .output_bytes = 24,
+            .stored_output_bytes = 24,
+            .command_output_replay = .{ .available = .{
+                .handle = replay_handle,
+                .framed_bytes = 123,
+            } },
+            .command_process_presentation = .{ .exit_code = 7 },
+        },
+    );
+    runtime.attachHistoricalCommandOutput(alloc, entry_id);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.command_output_blocks.items.len);
+    const detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
+    try std.testing.expectEqual(command_output_entry_id, detail.command_output_entry_id.?);
+    try std.testing.expectEqual(
+        types.CommandProcessPresentation{ .exit_code = 7 },
+        detail.command_process_presentation.?,
+    );
+    const replay = detail.command_output_replay.?;
+    const descriptor = switch (replay) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    try std.testing.expectEqualStrings(replay_handle, descriptor.handle);
+    try std.testing.expect(descriptor.handle.ptr != replay_handle.ptr);
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source.bytes, "│ "));
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran false") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "│ exit code 7") == null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "│ … 2 lines more") == null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "│ five") == null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
+}
+
+test "historical command detail ignores artifact-shaped command output" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    const raw_result = "exit_code=0\n<stdout>\noutput_file=/tmp/fx-command-other.log\n</stdout>\n";
+    var metrics: Metrics = .{};
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .completed,
+        "Ran printf artifact-shaped-output",
+        true,
+    );
+    try runtime.attachHistoricalToolDetail(
+        alloc,
+        entry_id,
+        .{ .id = "replayed-command", .name = "run_command", .arguments_json = "{\"command\":\"printf artifact-shaped-output\"}" },
+        .command,
+        .{
+            .tool_call_id = @constCast("replayed-command"),
+            .tool_name = @constCast("run_command"),
+            .status = .success,
+            .output = @constCast(raw_result),
+            .output_bytes = raw_result.len,
+            .stored_output_bytes = raw_result.len,
+        },
+    );
+
+    try std.testing.expect(runtime.toolDetailForEntry(entry_id).?.command_artifact_handle == null);
+}
+
+test "full transcript retains previews when stored result handles cannot be opened" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "results");
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "results");
+    defer alloc.free(result_dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        result_dir,
+        .tool_results,
+        .writable,
+    );
+    defer capability.deinit();
+    const handle = try result_store.storeLargeResultManaged(
+        alloc,
+        &capability,
+        "detail",
+        "read_file",
+        "FULL_TRANSCRIPT_SIDECAR_BODY\n",
+    );
+    defer alloc.free(handle);
+    defer result_store.deleteManaged(&capability, handle) catch {};
+
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+    try runtime.tool_details.append(alloc, .{
+        .entry_id = 1,
+        .tool_name = try alloc.dupe(u8, "read_file"),
+        .result = try alloc.dupe(u8, "preview"),
+        .result_handle = try alloc.dupe(u8, handle),
+    });
+    try runtime.tool_details.append(alloc, .{
+        .entry_id = 2,
+        .tool_name = try alloc.dupe(u8, "read_file"),
+        .result_handle = try alloc.dupe(u8, "missing-result.txt"),
+    });
+
+    try std.testing.expect(runtime.hasStoredResultDetails());
+    try std.testing.expectEqualStrings(
+        "preview",
+        runtime.toolDetailForEntry(1).?.result.?,
+    );
+    try std.testing.expect(runtime.toolDetailForEntry(2).?.result == null);
+}
+
+test "command terminal detail owns the consolidated command output entry" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    const id = types.ToolLifecycleId{ .turn_id = 9, .call_id = "command-9" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "run_command",
+        .activity_kind = .command,
+        .arguments_json = "{\"command\":\"printf demo\"}",
+    } });
+    var metrics: Metrics = .{};
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, id, .stdout, "first\n", true);
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, id, .stdout, "second\n", true);
+    try runtime.flushCommandOutputSummaryForLifecycle(
+        alloc,
+        &metrics,
+        styles,
+        id,
+        true,
+    );
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran printf demo" },
+        .command_artifact_handle = "fx-command-live.log",
+    } });
+
+    const status_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    const detail = runtime.toolDetailForEntry(status_entry_id).?;
+    try std.testing.expectEqual(runtime.command_output_blocks.items[0].entry_id, detail.command_output_entry_id);
+    try std.testing.expectEqualStrings("fx-command-live.log", detail.command_artifact_handle.?);
+}
+
+test "late command output reopens its completed lifecycle block" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+    var metrics: Metrics = .{};
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    const id = types.ToolLifecycleId{ .turn_id = 7, .call_id = "late-output" };
+
+    try runtime.writeCommandOutputChunkForLifecycle(
+        alloc,
+        &metrics,
+        styles,
+        id,
+        .stdout,
+        "one\ntwo\nthree\nfour\nfive\nsix\n",
+        true,
+    );
+    try runtime.flushCommandOutputSummaryForLifecycle(
+        alloc,
+        &metrics,
+        styles,
+        id,
+        true,
+    );
+    const entry_id = runtime.command_output_blocks.items[0].entry_id.?;
+
+    try runtime.writeCommandOutputChunkForLifecycle(
+        alloc,
+        &metrics,
+        styles,
+        id,
+        .stdout,
+        "seven\neight\n",
+        true,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.command_output_blocks.items.len);
+    try std.testing.expectEqual(entry_id, runtime.command_output_blocks.items[0].entry_id.?);
+    try std.testing.expectEqual(@as(usize, 8), runtime.command_output_blocks.items[0].total_lines);
+    runtime.resetCommandOutputDisplay(alloc, "worker inactive");
+    try std.testing.expectEqual(@as(usize, 1), runtime.command_output_blocks.items.len);
+}
+
+test "command terminal detail resolves split command output source rows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    const id = types.ToolLifecycleId{ .turn_id = 9, .call_id = "command-split" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "run_command",
+        .activity_kind = .command,
+        .arguments_json = "{\"command\":\"printf demo\"}",
+    } });
+
+    var metrics: Metrics = .{};
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, id, .stdout, "first\n", true);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "intervening\n", .unknown_raw);
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, id, .stdout, "second\n", true);
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, id, true);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran printf demo" },
+    } });
+
+    const status_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    const block = runtime.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 2), block.source_entry_ids.items.len);
+    try std.testing.expectEqual(status_entry_id, runtime.detailEntryIdForCommandOutputSource(block.source_entry_ids.items[0]).?);
+    try std.testing.expectEqual(status_entry_id, runtime.detailEntryIdForCommandOutputSource(block.source_entry_ids.items[1]).?);
+}
+
+test "command output consolidation preserves current compact ownership" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 32,
+        .cols = 100,
+        .content_bottom = 28,
+        .divider_top_row = 29,
+        .input_row = 30,
+        .divider_bottom_row = 31,
+        .hint_row = 32,
+    } };
+    defer runtime.deinit(alloc);
+
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "streaming-command" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "run_command",
+        .activity_kind = .command,
+        .arguments_json = "{\"command\":\"stream\"}",
+    } });
+    const status_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+
+    var metrics: Metrics = .{};
+    for (0..80) |index| {
+        var line: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line, "STREAM {d:0>3}\n", .{index + 1});
+        try runtime.writeCommandOutputChunkForLifecycle(
+            alloc,
+            &metrics,
+            styles,
+            id,
+            .stdout,
+            text,
+            true,
+        );
+    }
+
+    var live = try runtime.prepareTranscriptSourceOmittingEntry(alloc, status_entry_id);
+    defer live.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), live.bytes.len);
+
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, id, true);
+
+    var compact = try runtime.prepareTranscriptSource(alloc, null);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, compact.bytes, "STREAM 001") == null);
+    try std.testing.expect(std.mem.indexOf(u8, compact.bytes, "1 tool call") != null);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran stream" },
+    } });
+    var completed = try runtime.prepareTranscriptSource(alloc, null);
+    defer completed.deinit(alloc);
+
+    const status_pos = std.mem.indexOf(u8, completed.bytes, "Ran stream") orelse
+        return error.MissingCommandStatus;
+    try std.testing.expect(std.mem.indexOf(u8, completed.bytes, "STREAM 001") == null);
+    try std.testing.expect(status_pos < completed.bytes.len);
+
+    const output_entry_id = runtime.command_output_blocks.items[0].entry_id.?;
+    const output_index = entryIndex(&runtime, output_entry_id).?;
+    const status_index = entryIndex(&runtime, status_entry_id).?;
+    try std.testing.expect(status_index < output_index);
+}
+
 fn entryIndex(runtime: *const TranscriptRuntime, entry_id: u32) ?usize {
     for (runtime.entries.items, 0..) |entry, index| {
         if (entry.id() == entry_id) return index;
     }
     return null;
+}
+
+test "command output records span callbacks and keep first-byte ownership" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 40,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var metrics: Metrics = .{};
+    try runtime.writeCommandOutputChunk(
+        alloc,
+        &metrics,
+        styles,
+        .stdout,
+        "hel",
+        true,
+    );
+    const first_entry_id = runtime.command_output_blocks.items[0].lines.items[0].entry_id.?;
+    const intervening_entry_id = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "intervening\n",
+        .unknown_raw,
+    );
+    try runtime.writeCommandOutputChunk(
+        alloc,
+        &metrics,
+        styles,
+        .stdout,
+        "lo\nnext\n",
+        true,
+    );
+
+    const block = runtime.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 2), block.lines.items.len);
+    try std.testing.expectEqualStrings("hello", block.lines.items[0].text);
+    try std.testing.expectEqualStrings("next", block.lines.items[1].text);
+    const second_entry_id = block.lines.items[1].entry_id.?;
+    try std.testing.expect(entryIndex(&runtime, first_entry_id).? < entryIndex(&runtime, intervening_entry_id).?);
+    try std.testing.expect(entryIndex(&runtime, intervening_entry_id).? < entryIndex(&runtime, second_entry_id).?);
+}
+
+test "split utf8 keeps cross-stream first-byte ownership and pure ansi is pruned" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 40,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var metrics: Metrics = .{};
+
+    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "\xe2\x82", true);
+    const stdout_entry_id = runtime.command_output_blocks.items[0].lines.items[0].entry_id.?;
+    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stderr, "err\n", true);
+    const stderr_entry_id = runtime.command_output_blocks.items[0].lines.items[1].entry_id.?;
+    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "\xac\n", true);
+    try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, "\x1b[31m", true);
+    try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
+
+    const block = runtime.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 2), block.lines.items.len);
+    try std.testing.expectEqualStrings("€", block.lines.items[0].text);
+    try std.testing.expectEqualStrings("err", block.lines.items[1].text);
+    try std.testing.expectEqual(@as(usize, 0), block.lines.items[0].record_ordinal);
+    try std.testing.expectEqual(@as(usize, 1), block.lines.items[1].record_ordinal);
+    try std.testing.expect(entryIndex(&runtime, stdout_entry_id).? < entryIndex(&runtime, stderr_entry_id).?);
+}
+
+test "prepared canonical command mutation stays bounded across twenty four thousand records" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 72,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var metrics: Metrics = .{};
+    for (0..24_000) |_| {
+        try runtime.writeCommandOutputChunk(
+            alloc,
+            &metrics,
+            styles,
+            .stdout,
+            "record\n",
+            true,
+        );
+        try std.testing.expect(
+            runtime.retainedStructuredBytesForCommandOutput() <=
+                runtime.max_retained_transcript_bytes,
+        );
+    }
+    const block = runtime.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 24_000), block.total_lines);
+    try std.testing.expect(block.retention_overflow);
+    try std.testing.expect(block.lines.items.len < block.total_lines);
+    for (block.lines.items, 0..) |line, record_ordinal| {
+        try std.testing.expectEqual(record_ordinal, line.record_ordinal);
+    }
+}
+
+test "oversized open command record stops growing after overflow" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 72,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .max_retained_transcript_bytes = 8 * 1024,
+    };
+    defer runtime.deinit(alloc);
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var metrics: Metrics = .{};
+    var fragment: [4096]u8 = undefined;
+    @memset(&fragment, 'x');
+    var retained_after_overflow: ?usize = null;
+    var source_entry_id: ?u32 = null;
+    for (0..256) |_| {
+        try runtime.writeCommandOutputChunk(
+            alloc,
+            &metrics,
+            styles,
+            .stdout,
+            &fragment,
+            true,
+        );
+        const block = runtime.command_output_blocks.items[0];
+        if (source_entry_id == null) source_entry_id = block.lines.items[0].entry_id;
+        try std.testing.expectEqual(source_entry_id, block.lines.items[0].entry_id);
+        try std.testing.expect(
+            runtime.retainedStructuredBytesForCommandOutput() <=
+                runtime.max_retained_transcript_bytes,
+        );
+        if (block.retention_overflow) {
+            if (retained_after_overflow) |retained| {
+                try std.testing.expectEqual(retained, block.retained_text_bytes);
+            } else {
+                retained_after_overflow = block.retained_text_bytes;
+            }
+        }
+    }
+    try std.testing.expect(retained_after_overflow != null);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try runtime.writeCommandOutputChunk(
+        failing.allocator(),
+        &metrics,
+        styles,
+        .stdout,
+        &fragment,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "descriptor capped bare carriage return replaces one dropped record" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 72,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+    };
+    defer runtime.deinit(alloc);
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var metrics: Metrics = .{};
+
+    _ = try command_output_runtime.writeCommandOutputChunkUncommitted(
+        &runtime,
+        alloc,
+        &metrics,
+        styles,
+        null,
+        .stdout,
+        "kept\n",
+        true,
+    );
+    const kept_entry_id = runtime.command_output_blocks.items[0].lines.items[0].entry_id.?;
+    runtime.max_retained_transcript_bytes = runtime.retainedStructuredBytesForCommandOutput();
+
+    _ = try command_output_runtime.writeCommandOutputChunkUncommitted(
+        &runtime,
+        alloc,
+        &metrics,
+        styles,
+        null,
+        .stdout,
+        "dropped\rreplacement",
+        true,
+    );
+    var block = &runtime.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 2), block.total_lines);
+    try std.testing.expectEqual(@as(usize, 1), block.lines.items.len);
+    try std.testing.expectEqual(kept_entry_id, block.lines.items[0].entry_id.?);
+    try std.testing.expect(block.overflow_open_records[0]);
+    try std.testing.expect(block.overflow_record_visible[0]);
+
+    _ = try command_output_runtime.writeCommandOutputChunkUncommitted(
+        &runtime,
+        alloc,
+        &metrics,
+        styles,
+        null,
+        .stdout,
+        "\n",
+        true,
+    );
+    block = &runtime.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 2), block.total_lines);
+    try std.testing.expectEqual(@as(usize, 1), block.lines.items.len);
+    try std.testing.expectEqual(kept_entry_id, block.lines.items[0].entry_id.?);
+    try std.testing.expect(!block.overflow_open_records[0]);
+}
+
+test "descriptor capped ansi-only prefix keeps later visible overflow record" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 72,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+    };
+    defer runtime.deinit(alloc);
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var metrics: Metrics = .{};
+
+    _ = try command_output_runtime.writeCommandOutputChunkUncommitted(
+        &runtime,
+        alloc,
+        &metrics,
+        styles,
+        null,
+        .stdout,
+        "kept\n",
+        true,
+    );
+    runtime.max_retained_transcript_bytes = runtime.retainedStructuredBytesForCommandOutput();
+
+    _ = try command_output_runtime.writeCommandOutputChunkUncommitted(
+        &runtime,
+        alloc,
+        &metrics,
+        styles,
+        null,
+        .stdout,
+        "\x1b[31m",
+        true,
+    );
+    var block = &runtime.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 2), block.total_lines);
+    try std.testing.expect(block.overflow_open_records[0]);
+    try std.testing.expect(!block.overflow_record_visible[0]);
+    try std.testing.expect(block.decoders[0].isIdle());
+
+    _ = try command_output_runtime.writeCommandOutputChunkUncommitted(
+        &runtime,
+        alloc,
+        &metrics,
+        styles,
+        null,
+        .stdout,
+        "visible",
+        true,
+    );
+    block = &runtime.command_output_blocks.items[0];
+    try std.testing.expect(block.overflow_record_visible[0]);
+    runtime.max_retained_transcript_bytes = std.math.maxInt(usize);
+
+    _ = try command_output_runtime.flushCommandOutputSummaryUncommitted(
+        &runtime,
+        alloc,
+        &metrics,
+        styles,
+        null,
+        true,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        runtime.command_output_blocks.items[0].total_lines,
+    );
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), source.bytes.len);
+}
+
+test "descriptor capped split osc terminator preserves record boundaries" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 72,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+    };
+    defer runtime.deinit(alloc);
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var metrics: Metrics = .{};
+
+    try runtime.writeCommandOutputChunk(
+        alloc,
+        &metrics,
+        styles,
+        .stdout,
+        "kept\n",
+        true,
+    );
+    runtime.max_retained_transcript_bytes = runtime.retainedStructuredBytesForCommandOutput();
+
+    try runtime.writeCommandOutputChunk(
+        alloc,
+        &metrics,
+        styles,
+        .stdout,
+        "\x1b]0;title",
+        true,
+    );
+    var block = &runtime.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 2), block.total_lines);
+    try std.testing.expect(block.overflow_open_records[0]);
+
+    try runtime.writeCommandOutputChunk(
+        alloc,
+        &metrics,
+        styles,
+        .stdout,
+        "\x07",
+        true,
+    );
+    try runtime.writeCommandOutputChunk(
+        alloc,
+        &metrics,
+        styles,
+        .stdout,
+        "\nnext\n",
+        true,
+    );
+
+    block = &runtime.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 3), block.total_lines);
+    try std.testing.expect(!block.overflow_open_records[0]);
+}
+
+test "command terminal detail resolves its lifecycle output instead of the latest block" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    const first = types.ToolLifecycleId{ .turn_id = 9, .call_id = "command-first" };
+    const second = types.ToolLifecycleId{ .turn_id = 9, .call_id = "command-second" };
+    for ([_]types.ToolLifecycleId{ first, second }) |id| {
+        _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "run_command",
+            .activity_kind = .command,
+            .arguments_json = "{\"command\":\"printf demo\"}",
+        } });
+    }
+
+    var metrics: Metrics = .{};
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, first, .stdout, "first\n", true);
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, first, true);
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, second, .stdout, "second\n", true);
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, second, true);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = first,
+        .outcome = .{ .kind = .completed, .summary = "Ran first" },
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = second,
+        .outcome = .{ .kind = .completed, .summary = "Ran second" },
+    } });
+
+    const first_status = runtime.toolActivityRecord(first).?.entry_id;
+    const second_status = runtime.toolActivityRecord(second).?.entry_id;
+    try std.testing.expectEqual(runtime.command_output_blocks.items[0].entry_id, runtime.toolDetailForEntry(first_status).?.command_output_entry_id);
+    try std.testing.expectEqual(runtime.command_output_blocks.items[1].entry_id, runtime.toolDetailForEntry(second_status).?.command_output_entry_id);
+}
+
+test "command output consolidation keeps compact tool order" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    const first = types.ToolLifecycleId{ .turn_id = 9, .call_id = "command-first" };
+    const second = types.ToolLifecycleId{ .turn_id = 9, .call_id = "command-second" };
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = first,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "run_command",
+        .activity_kind = .command,
+        .arguments_json = "{\"command\":\"printf first\"}",
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = second,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "run_command",
+        .activity_kind = .command,
+        .arguments_json = "{\"command\":\"printf second\"}",
+    } });
+
+    var metrics: Metrics = .{};
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, first, .stdout, "FIRST_OUTPUT\n", true);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = first,
+        .outcome = .{ .kind = .completed, .summary = "Ran first" },
+    } });
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, first, true);
+
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, second, .stdout, "SECOND_OUTPUT\n", true);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = second,
+        .outcome = .{ .kind = .completed, .summary = "Ran second" },
+    } });
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, second, true);
+
+    var compact = try runtime.prepareTranscriptSource(alloc, null);
+    defer compact.deinit(alloc);
+
+    const first_status = std.mem.indexOf(u8, compact.bytes, "Ran first") orelse
+        return error.MissingFirstStatus;
+    const second_status = std.mem.indexOf(u8, compact.bytes, "Ran second") orelse
+        return error.MissingSecondStatus;
+
+    try std.testing.expect(first_status < second_status);
+    try std.testing.expect(std.mem.indexOf(u8, compact.bytes, "FIRST_OUTPUT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, compact.bytes, "SECOND_OUTPUT") == null);
+
+    const first_status_entry = runtime.toolActivityRecord(first).?.entry_id;
+    const second_status_entry = runtime.toolActivityRecord(second).?.entry_id;
+    try std.testing.expectEqual(runtime.command_output_blocks.items[0].entry_id, runtime.toolDetailForEntry(first_status_entry).?.command_output_entry_id);
+    try std.testing.expectEqual(runtime.command_output_blocks.items[1].entry_id, runtime.toolDetailForEntry(second_status_entry).?.command_output_entry_id);
+}
+
+test "command output completion ignores mismatched lifecycle" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const styles: Styles = .{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    const first = types.ToolLifecycleId{ .turn_id = 9, .call_id = "command-first" };
+    const second = types.ToolLifecycleId{ .turn_id = 9, .call_id = "command-second" };
+
+    var metrics: Metrics = .{};
+    try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, first, .stdout, "first\n", true);
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, null, true);
+    try std.testing.expect(runtime.command_output_display.open_command_block != null);
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, second, true);
+    try std.testing.expect(runtime.command_output_display.open_command_block != null);
+    try std.testing.expect(runtime.command_output_blocks.items[0].entry_id == null);
+
+    try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, first, true);
+    try std.testing.expect(runtime.command_output_display.open_command_block == null);
+    try std.testing.expect(runtime.command_output_blocks.items[0].entry_id != null);
+}
+
+test "retintEntriesForTheme rewrites owned presentation without touching external raw bytes" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const owned_id = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "\x1b[38;5;252m■\x1b[38;5;255m cancelled\x1b[39m\n",
+        .tool_status,
+    );
+    const command_id = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "\x1b[38;5;252mcommand\x1b[39m\n",
+        .command_output,
+    );
+    const unknown_id = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "\x1b[38;5;252munknown\x1b[39m\n",
+        .unknown_raw,
+    );
+    const assistant_id = try runtime.appendAssistantTurnEntry(alloc);
+    const segments = runtime.lookupAssistantSegments(assistant_id).?;
+    try segments.text.appendSlice(alloc, "\x1b[38;5;245mcode\x1b[39m \x1b[38;5;252m✓\x1b[39m\n");
+
+    try runtime.retintEntriesForTheme(alloc, false, true);
+
+    try std.testing.expectEqual(owned_id, runtime.entries.items[0].id());
+    try std.testing.expectEqual(command_id, runtime.entries.items[1].id());
+    try std.testing.expectEqual(unknown_id, runtime.entries.items[2].id());
+    try std.testing.expectEqual(assistant_id, runtime.entries.items[3].id());
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;238m■\x1b[38;5;235m cancelled\x1b[39m\n",
+        runtime.entries.items[0].raw_bytes.bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;252mcommand\x1b[39m\n",
+        runtime.entries.items[1].raw_bytes.bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;252munknown\x1b[39m\n",
+        runtime.entries.items[2].raw_bytes.bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;247mcode\x1b[39m \x1b[38;5;238m✓\x1b[39m\n",
+        runtime.entries.items[3].assistant_turn.segments.text.items,
+    );
 }
 
 pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
@@ -576,6 +3929,7 @@ pub const PaintTestMode = enum {
 
 const PaintTestModeField = if (@import("builtin").is_test) PaintTestMode else void;
 const default_max_retained_transcript_bytes: usize = 1024 * 1024;
+const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
 const resume_publication_rows_per_frame: u32 = 64;
 
 pub const PaintTraceState = struct {
@@ -678,12 +4032,22 @@ pub const FullTranscriptPrimaryRestore = enum {
 };
 
 const InstalledFullTranscriptPage = struct {
-    source: full_transcript_worker.Source,
+    source: full_transcript_worker.InstalledSource,
     projection: full_transcript_screen.Projection,
+    prepared_window: ?full_transcript_worker.PreparedWindow = null,
+    measured_total_rows: u32 = 0,
+    measured_anchor_row: ?u32 = null,
+    measured_item_rows: []transcript_presentation.ItemRow = &.{},
+    measurement_snapshot_ready: bool = false,
+    presented_offset: u32 = 0,
 
     fn deinit(self: *InstalledFullTranscriptPage) void {
+        if (self.prepared_window) |*window| window.deinit(std.heap.c_allocator);
+        if (self.measured_item_rows.len > 0) {
+            std.heap.c_allocator.free(self.measured_item_rows);
+        }
         self.projection.deinit(std.heap.c_allocator);
-        self.source.deinit(std.heap.c_allocator);
+        self.source.deinit();
         self.* = undefined;
     }
 };
@@ -821,9 +4185,15 @@ pub const TranscriptRuntime = struct {
     full_transcript_open_rows: u16 = 0,
     full_transcript_primary_recovery_entry_id: ?u32 = null,
     full_transcript_page_load: full_transcript_worker.Load = .{},
+    full_transcript_window_load: full_transcript_worker.WindowLoad = .{},
     full_transcript_page_anchor: full_transcript_page.Anchor = .tail,
     full_transcript_installed_page: ?InstalledFullTranscriptPage = null,
-    full_transcript_loading_projection: ?full_transcript_screen.Projection = null,
+    full_transcript_installed_page_retired: bool = false,
+    full_transcript_failed_request: ?full_transcript_page.Request = null,
+    full_transcript_failure_pending: bool = false,
+    full_transcript_open_request: ?full_transcript_page.Request = null,
+    full_transcript_restore_open_pending: bool = false,
+    full_transcript_prepared_page_visible: bool = false,
     full_transcript_content_revision: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
     /// When enabled, compact transcript tool groups render only their summary
@@ -944,11 +4314,9 @@ pub const TranscriptRuntime = struct {
 
     pub fn deinit(self: *TranscriptRuntime, alloc: Allocator) void {
         self.disableShadowVt();
+        self.full_transcript_window_load.deinit();
         self.full_transcript_page_load.deinit();
-        if (self.full_transcript_installed_page) |*page| page.deinit();
-        if (self.full_transcript_loading_projection) |*projection| {
-            projection.deinit(alloc);
-        }
+        self.discardInstalledFullTranscriptPage();
         self.compact_transcript_source_cache.deinit(alloc);
         self.lifecycle_state.deinit(alloc);
         for (self.tool_details.items) |*detail| detail.deinit(alloc);
@@ -1845,6 +5213,40 @@ pub const TranscriptRuntime = struct {
         return &self.tool_details.items[search.index];
     }
 
+    pub fn setToolCommandMetadata(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        id: types.ToolLifecycleId,
+        display: []const u8,
+        action_label: []const u8,
+    ) !void {
+        const record = self.lifecycle_state.record(id) orelse return error.UnknownToolLifecycleIdentity;
+        try self.setToolCommandMetadataForEntry(
+            alloc,
+            record.entry_id,
+            display,
+            action_label,
+        );
+    }
+
+    pub fn setToolCommandMetadataForEntry(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        entry_id: u32,
+        display: []const u8,
+        action_label: []const u8,
+    ) !void {
+        const detail = self.toolDetailPtr(entry_id) orelse return error.MissingToolDetail;
+        const owned_display = try alloc.dupe(u8, display);
+        errdefer alloc.free(owned_display);
+        const owned_label = try alloc.dupe(u8, action_label);
+        if (detail.command_display) |previous| alloc.free(previous);
+        if (detail.command_action_label) |previous| alloc.free(previous);
+        detail.command_display = owned_display;
+        detail.command_action_label = owned_label;
+        self.markTranscriptContentDirtyFrom(entry_id);
+    }
+
     fn toolDetailPtr(self: *TranscriptRuntime, entry_id: u32) ?*ToolDetailRecord {
         const search = self.toolDetailSearch(entry_id);
         if (!search.found) return null;
@@ -1949,7 +5351,20 @@ pub const TranscriptRuntime = struct {
         const context_deferred = types.isContextDeferredToolResult(result);
         const deferred = types.isDeferredToolResult(result);
         const permission_denied = tool_result_errors.toolPermissionDenialReason(result.output) != null;
-        const command_artifact_handle = if (!deferred and !permission_denied and activity_kind == .command)
+        const shell_command = !deferred and
+            !permission_denied and
+            activity_kind == .command and
+            std.mem.eql(u8, call.name, "shell");
+        const projected_shell_result = if (shell_command)
+            try managed_execution.modelOutputDelta(alloc, result.output)
+        else
+            null;
+        defer if (projected_shell_result) |value| alloc.free(value);
+        const presentation_result = projected_shell_result orelse result.output;
+        const command_artifact_handle = if (!deferred and
+            !permission_denied and
+            activity_kind == .command and
+            !shell_command)
             command_output_runtime.commandArtifactHandleFromResult(result.output)
         else
             null;
@@ -1972,10 +5387,10 @@ pub const TranscriptRuntime = struct {
                 .completed
             else
                 .failed,
-            if (deferred or permission_denied) null else result.output,
+            if (deferred or permission_denied) null else presentation_result,
             if (deferred or permission_denied) null else .{
-                .output_handle = result.output_handle,
-                .preview = result.preview,
+                .output_handle = if (shell_command) null else result.output_handle,
+                .preview = projected_shell_result orelse result.preview,
                 .output_bytes = result.output_bytes,
                 .stored_output_bytes = result.stored_output_bytes,
                 .truncated = result.truncated,
@@ -2461,10 +5876,20 @@ pub const TranscriptRuntime = struct {
     pub fn clearFullTranscriptDetails(self: *TranscriptRuntime, alloc: Allocator) void {
         self.compact_transcript_source_cache.deinit(alloc);
         self.resetFullTranscriptPageNavigation();
-        if (self.full_transcript_installed_page) |*page| page.deinit();
-        self.full_transcript_installed_page = null;
+        if (self.full_transcript_window_load.busy()) {
+            self.full_transcript_installed_page_retired =
+                self.full_transcript_installed_page != null;
+        } else {
+            self.discardInstalledFullTranscriptPage();
+        }
         self.clearToolDetails(alloc);
         self.full_transcript = self.full_transcript.closed();
+    }
+
+    fn discardInstalledFullTranscriptPage(self: *TranscriptRuntime) void {
+        if (self.full_transcript_installed_page) |*page| page.deinit();
+        self.full_transcript_installed_page = null;
+        self.full_transcript_installed_page_retired = false;
     }
 
     pub fn resetCommandOutputDisplay(self: *TranscriptRuntime, alloc: Allocator, reason: []const u8) void {
@@ -2744,15 +6169,26 @@ pub const TranscriptRuntime = struct {
         depth: transcript_presentation.Depth,
     ) !bool {
         const current = self.full_transcript.depth;
-        if (current == depth) return false;
+        if (current == depth) {
+            if (depth == .inline_mode) {
+                self.full_transcript_restore_open_pending = false;
+            }
+            return false;
+        }
+        const restored_open = current == .inline_mode and
+            depth != .inline_mode and
+            self.full_transcript_restore_open_pending;
         if (current == .inline_mode and depth != .inline_mode) {
+            self.full_transcript_prepared_page_visible = false;
             self.full_transcript_open_content_revision = self.full_transcript_content_revision;
             self.full_transcript_open_cols = self.layout.cols;
             self.full_transcript_open_rows = self.layout.rows;
-            try self.captureFullTranscriptAnchor(alloc);
+            if (!restored_open) try self.captureFullTranscriptAnchor(alloc);
         }
         self.full_transcript = self.full_transcript.with_depth(depth);
+        if (depth != .inline_mode) self.full_transcript_restore_open_pending = false;
         if (depth == .inline_mode) {
+            self.full_transcript_restore_open_pending = false;
             self.full_transcript_open_content_revision = null;
             self.full_transcript_open_cols = 0;
             self.full_transcript_open_rows = 0;
@@ -2930,6 +6366,12 @@ pub const TranscriptRuntime = struct {
         return self.full_transcript.depth.active();
     }
 
+    pub fn fullTranscriptFocusedWorkActive(self: *const TranscriptRuntime) bool {
+        return self.full_transcript_window_load.busy() or
+            (self.full_transcript_page_load.busy() and
+                self.full_transcript_open_request != null);
+    }
+
     pub fn transcriptPresentationDepth(
         self: *const TranscriptRuntime,
     ) transcript_presentation.Depth {
@@ -2991,6 +6433,10 @@ pub const TranscriptRuntime = struct {
 
     fn resetFullTranscriptPageNavigation(self: *TranscriptRuntime) void {
         self.full_transcript_page_anchor = .tail;
+        self.full_transcript_prepared_page_visible = false;
+        self.full_transcript_open_request = null;
+        self.full_transcript_restore_open_pending = false;
+        self.full_transcript_window_load.cancelActive();
         self.full_transcript_page_load.cancelActive();
     }
 
@@ -3028,7 +6474,7 @@ pub const TranscriptRuntime = struct {
         }, rows);
         const local_visible_rows = @max(@as(u32, 1), self.layout.rows -| 4);
         const local_total_rows = if (self.full_transcript_installed_page) |*page|
-            page.projection.measured_total_rows
+            self.installedPageMeasurement(page).total_rows
         else
             0;
         const local_max_offset = local_total_rows -| local_visible_rows;
@@ -3907,6 +7353,21 @@ pub const TranscriptRuntime = struct {
         ));
     }
 
+    fn layoutForTranscriptProjection(
+        layout: Layout,
+        target_area: render_engine.frame_layout.FrameRect,
+    ) !Layout {
+        if (target_area.bottom > layout.rows) {
+            return error.InvalidTranscriptTransition;
+        }
+        var projection_layout = layout;
+        projection_layout.content_bottom = @max(
+            projection_layout.content_bottom,
+            target_area.bottom,
+        );
+        return projection_layout;
+    }
+
     const TransitionTarget = struct {
         body_disposition: TranscriptBodyDisposition = .paint,
         selection: ViewportSelection,
@@ -3974,11 +7435,12 @@ pub const TranscriptRuntime = struct {
             target_area: render_engine.frame_layout.FrameRect,
             visual_offset: u32,
         ) !void {
+            const projection_layout = try layoutForTranscriptProjection(layout, target_area);
             self.visual_offset = visual_offset;
             if (visual_offset == self.total_visual_rows) {
                 try transcript_painter.reprojectPreparedTranscriptForVisualOffset(
                     alloc,
-                    layout,
+                    projection_layout,
                     prepared,
                     target_area,
                     visual_offset,
@@ -3992,7 +7454,7 @@ pub const TranscriptRuntime = struct {
             } else {
                 const staged = try transcript_painter.stagePreparedTranscriptForVisualOffset(
                     alloc,
-                    layout,
+                    projection_layout,
                     prepared,
                     target_area,
                     visual_offset,
@@ -4163,6 +7625,7 @@ pub const TranscriptRuntime = struct {
         source_bytes: []const u8,
         prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
         target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+        projection_area: render_engine.frame_layout.FrameRect,
         scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
         scroll_facts: TranscriptScrollFacts,
         accepted_semantic_rows: u32,
@@ -4218,7 +7681,7 @@ pub const TranscriptRuntime = struct {
                         alloc,
                         self.layout,
                         prepared,
-                        target_layout.transcript_area,
+                        projection_area,
                         scroll_facts.source_visual_offset + accepted_semantic_progress_rows,
                     );
                 }
@@ -4230,7 +7693,7 @@ pub const TranscriptRuntime = struct {
                         alloc,
                         self.layout,
                         prepared,
-                        target_layout.transcript_area,
+                        projection_area,
                     );
                 }
                 if (target.normal_buffer_recovery_pending and
@@ -4245,7 +7708,7 @@ pub const TranscriptRuntime = struct {
                     !scroll_facts.recovery_rebase and
                     !self.fullTranscriptActive() and
                     !prepared.selection.split_active and
-                    !target_layout.transcript_area.isEmpty() and
+                    !projection_area.isEmpty() and
                     scroll_facts.target_visual_offset -|
                         committedProjectionVisualOffset(anchor) >
                         scroll_facts.semantic_rows and
@@ -4255,13 +7718,11 @@ pub const TranscriptRuntime = struct {
                     // release: slide the window with an in-place repaint at
                     // the target offset. The rows passed over stay
                     // unreleased and settle later through the replay.
-                    var projection_layout = self.layout;
-                    projection_layout.content_bottom = target_layout.transcript_area.bottom;
                     try target.stagePreparedProjection(
                         alloc,
-                        projection_layout,
+                        self.layout,
                         prepared,
-                        target_layout.transcript_area,
+                        projection_area,
                         scroll_facts.target_visual_offset,
                     );
                     target.hold_staged = true;
@@ -4276,13 +7737,11 @@ pub const TranscriptRuntime = struct {
                     );
                 }
                 if (self.stableHistoryFloor(target, anchor, scroll_facts)) |history_floor| {
-                    var projection_layout = self.layout;
-                    projection_layout.content_bottom = target_layout.transcript_area.bottom;
                     try target.stagePreparedProjection(
                         alloc,
-                        projection_layout,
+                        self.layout,
                         prepared,
-                        target_layout.transcript_area,
+                        projection_area,
                         history_floor,
                     );
                     target.source_endpoint_visual_offset = history_floor;
@@ -4322,15 +7781,19 @@ pub const TranscriptRuntime = struct {
                             alloc,
                             self.layout,
                             prepared,
-                            target_layout.transcript_area,
+                            projection_area,
                             target.visual_offset,
                         );
                     } else {
+                        const projection_layout = try layoutForTranscriptProjection(
+                            self.layout,
+                            projection_area,
+                        );
                         try transcript_painter.reprojectPreparedTranscriptForVisualOffset(
                             alloc,
-                            self.layout,
+                            projection_layout,
                             prepared,
-                            target_layout.transcript_area,
+                            projection_area,
                             target.visual_offset,
                         );
                         target.usePreparedProjection(prepared);
@@ -4346,7 +7809,7 @@ pub const TranscriptRuntime = struct {
                     alloc,
                     self.layout,
                     prepared,
-                    target_layout.transcript_area,
+                    projection_area,
                     accepted_semantic_progress_rows,
                 );
             },
@@ -4587,6 +8050,38 @@ pub const TranscriptRuntime = struct {
         };
     }
 
+    test "history offset advances only when transcript bytes are materialized" {
+        const deferred = resolvePlannedHistoryMaterialization(
+            4,
+            12,
+            12,
+            false,
+            true,
+        );
+        try std.testing.expectEqual(@as(u32, 4), deferred.visual_offset);
+        try std.testing.expect(deferred.normal_buffer_recovery_pending);
+
+        const caught_up = resolvePlannedHistoryMaterialization(
+            4,
+            12,
+            12,
+            true,
+            true,
+        );
+        try std.testing.expectEqual(@as(u32, 12), caught_up.visual_offset);
+        try std.testing.expect(!caught_up.normal_buffer_recovery_pending);
+
+        const bounded = resolvePlannedHistoryMaterialization(
+            4,
+            8,
+            12,
+            true,
+            true,
+        );
+        try std.testing.expectEqual(@as(u32, 8), bounded.visual_offset);
+        try std.testing.expect(bounded.normal_buffer_recovery_pending);
+    }
+
     fn resolveMaterializedEndpoint(
         target: TransitionTarget,
         source_endpoint_cursor_row: u16,
@@ -4720,6 +8215,39 @@ pub const TranscriptRuntime = struct {
         destructive_invalidation: bool,
         activity_overlay_active: bool,
     ) !ResolvedTranscriptTarget {
+        return self.resolveTranscriptTransitionTargetForFrameInArea(
+            alloc,
+            source,
+            prepared,
+            target_layout,
+            target_layout.transcript_area,
+            scroll_plan,
+            scroll_facts,
+            destructive_invalidation,
+            activity_overlay_active,
+        );
+    }
+
+    pub fn resolveTranscriptTransitionTargetForFrameInArea(
+        self: *const TranscriptRuntime,
+        alloc: Allocator,
+        source: *const TranscriptPreparationSource,
+        prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
+        target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+        projection_area: render_engine.frame_layout.FrameRect,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+        scroll_facts: TranscriptScrollFacts,
+        destructive_invalidation: bool,
+        activity_overlay_active: bool,
+    ) !ResolvedTranscriptTarget {
+        const target_area = target_layout.transcript_area;
+        if (target_area.isEmpty() != projection_area.isEmpty() or
+            (!target_area.isEmpty() and
+                (projection_area.top != target_area.top or
+                    projection_area.bottom > target_area.bottom)))
+        {
+            return error.InvalidTranscriptTransition;
+        }
         try scroll_plan.validate(self.layout.rows);
         if (scroll_plan.requested_inline_advance_rows != scroll_facts.planned_rows) {
             return error.InvalidFrameScrollPlan;
@@ -4738,6 +8266,7 @@ pub const TranscriptRuntime = struct {
             source.bytes,
             prepared,
             target_layout,
+            projection_area,
             scroll_plan,
             scroll_facts,
             accepted.semantic_rows,
@@ -4764,16 +8293,16 @@ pub const TranscriptRuntime = struct {
             );
             return err;
         };
-        if (!target_layout.transcript_area.isEmpty() and
-            target.selection.last_visible_row > target_layout.transcript_area.bottom)
+        if (!projection_area.isEmpty() and
+            target.selection.last_visible_row > projection_area.bottom)
         {
             debug_trace.logf(
                 "scroll",
                 "transcript_target_outside_candidate last_visible={d} target_area={d}..{d} body_disposition={s}",
                 .{
                     target.selection.last_visible_row,
-                    target_layout.transcript_area.top,
-                    target_layout.transcript_area.bottom,
+                    projection_area.top,
+                    projection_area.bottom,
                     @tagName(target.body_disposition),
                 },
             );
@@ -4882,6 +8411,8 @@ pub const TranscriptRuntime = struct {
             },
         }
         const borrows_pending_resume = resolved.borrows_pending_resume;
+        const borrows_full_page = self.borrowsInstalledFullTranscriptSource(source);
+        const borrows_source = borrows_pending_resume or borrows_full_page;
         const scroll_plan = resolved.scroll_plan;
         const scroll_facts = resolved.scroll_facts;
         const accepted = resolved.accepted;
@@ -4913,7 +8444,7 @@ pub const TranscriptRuntime = struct {
         const target_cache_start =
             transcript_store.cappedTailStart(source.bytes, self.max_transcript_bytes);
         const target_cache_bytes = source.bytes[target_cache_start..];
-        if (!borrows_pending_resume) {
+        if (!borrows_source) {
             try target_cache.ensureTotalCapacityPrecise(
                 alloc,
                 @max(target_cache_bytes.len, self.transcript.capacity),
@@ -4939,12 +8470,12 @@ pub const TranscriptRuntime = struct {
         }
 
         const target_flow = source.bytes;
-        if (!borrows_pending_resume) source.bytes = &.{};
-        errdefer if (!borrows_pending_resume and target_flow.len > 0) alloc.free(target_flow);
+        if (!borrows_source) source.bytes = &.{};
+        errdefer if (!borrows_source and target_flow.len > 0) alloc.free(target_flow);
 
         const folded_summary_indices = source.folded_summary_indices;
-        if (!borrows_pending_resume) source.folded_summary_indices = &.{};
-        errdefer if (!borrows_pending_resume and folded_summary_indices.len > 0) {
+        if (!borrows_source) source.folded_summary_indices = &.{};
+        errdefer if (!borrows_source and folded_summary_indices.len > 0) {
             alloc.free(folded_summary_indices);
         };
         const source_row_provenance: []const transcript_blocks.RowProvenance =
@@ -5195,12 +8726,13 @@ pub const TranscriptRuntime = struct {
             .recovery_projection_deferred = scroll_facts.recovery_projection_deferred,
             .body_disposition = target.body_disposition,
             .target_flow = target_flow,
-            .target_flow_owned = !borrows_pending_resume,
+            .target_flow_owned = !borrows_source,
+            .borrows_full_page = borrows_full_page,
             .presentation_resume_bytes = presentation_resume_bytes,
             .presentation_pending_wrap = presentation_pending_wrap,
             .presentation_valid = presentation_valid,
             .target_cache = target_cache,
-            .target_cache_unchanged = borrows_pending_resume,
+            .target_cache_unchanged = borrows_source,
             .target_cache_origin_untrimmed = target_cache_origin_untrimmed,
             .folded_summary_indices = folded_summary_indices,
             .target_layout = target_layout,
@@ -5294,6 +8826,18 @@ pub const TranscriptRuntime = struct {
 
         if (result.is_committed()) {
             self.committed_frame_layout = transition.target_layout;
+        }
+
+        if (transition.borrows_full_page) {
+            transition.target_flow = &.{};
+            transition.folded_summary_indices = &.{};
+            transition.consumed = true;
+            debug_trace.logf(
+                "scroll",
+                "transcript_transition_commit state=full_page_borrowed",
+                .{},
+            );
+            return;
         }
 
         const borrowed_resume_source = if (!transition.target_flow_owned)
@@ -6018,8 +9562,20 @@ pub const TranscriptRuntime = struct {
     }
 
     pub const FullTranscriptSurfacePaint = struct {
-        source: TranscriptPreparationSource,
+        owned_source: ?TranscriptPreparationSource = null,
+        borrowed_source: ?*TranscriptPreparationSource = null,
         prepared: transcript_painter.PreparedTranscriptSurfacePaint,
+
+        pub fn source(self: *FullTranscriptSurfacePaint) *TranscriptPreparationSource {
+            if (self.owned_source) |*owned| return owned;
+            return self.borrowed_source.?;
+        }
+
+        pub fn deinit(self: *FullTranscriptSurfacePaint, alloc: Allocator) void {
+            self.prepared.deinit(alloc);
+            if (self.owned_source) |*source_value| source_value.deinit(alloc);
+            self.* = undefined;
+        }
     };
 
     pub noinline fn buildFullTranscriptProjection(
@@ -6042,6 +9598,49 @@ pub const TranscriptRuntime = struct {
     pub fn pollFullTranscriptPageLoad(
         self: *TranscriptRuntime,
     ) !bool {
+        if (self.full_transcript_window_load.takeCompleted()) |window_task| {
+            defer window_task.deinit();
+            if (self.full_transcript_installed_page_retired) {
+                self.discardInstalledFullTranscriptPage();
+                return false;
+            }
+            const page = if (self.full_transcript_installed_page) |*value| value else null;
+            if (window_task.cancel_requested.load(.acquire)) {
+                // Superseded scroll windows are expected and have no visible
+                // failure state; the latest offset schedules on the next tick.
+            } else if (window_task.failure) |failure| {
+                self.full_transcript_failed_request = window_task.request.page_request;
+                self.full_transcript_failure_pending = true;
+                if (failure != error.InputPending) {
+                    debug_trace.logf(
+                        "full_transcript_cache",
+                        "window_build_failed revision={d} cols={d} offset={d} err={s}",
+                        .{
+                            window_task.request.page_request.content_revision,
+                            window_task.request.page_request.cols,
+                            window_task.request.target_offset,
+                            @errorName(failure),
+                        },
+                    );
+                }
+            } else if (page != null and
+                !window_task.cancel_requested.load(.acquire) and
+                full_transcript_page.sameRequest(
+                    page.?.source.request,
+                    window_task.request.page_request,
+                ))
+            {
+                if (window_task.takePreparedWindow()) |window| {
+                    if (page.?.prepared_window) |*current| {
+                        current.deinit(std.heap.c_allocator);
+                    }
+                    page.?.prepared_window = window;
+                    page.?.presented_offset = window.target_offset;
+                    self.full_transcript_failed_request = null;
+                    return true;
+                }
+            }
+        }
         const task = self.full_transcript_page_load.takeCompleted() orelse
             return false;
         defer task.deinit();
@@ -6049,7 +9648,12 @@ pub const TranscriptRuntime = struct {
         const request = task.source.request;
         const desired = self.desiredFullTranscriptPageRequest();
         var installed = false;
-        if (task.failure) |failure| {
+        if (task.cancel_requested.load(.acquire)) {
+            // Closing, resizing, or superseding a page intentionally cancels
+            // its worker. It must not poison the next open request.
+        } else if (task.failure) |failure| {
+            self.full_transcript_failed_request = request;
+            self.full_transcript_failure_pending = true;
             if (failure != error.InputPending) {
                 debug_trace.logf(
                     "full_transcript_cache",
@@ -6061,12 +9665,30 @@ pub const TranscriptRuntime = struct {
             full_transcript_page.sameSurface(desired, request))
         {
             if (task.takeProjection()) |projection| {
-                const source = task.takeSource();
+                const prepared_window = task.takePreparedWindow() orelse
+                    return error.MissingPreparedFullTranscriptSource;
+                const measured_item_rows = try std.heap.c_allocator.dupe(
+                    transcript_presentation.ItemRow,
+                    projection.measured_item_rows.items,
+                );
+                errdefer if (measured_item_rows.len > 0) {
+                    std.heap.c_allocator.free(measured_item_rows);
+                };
+                const source = task.takeInstalledSource();
+                std.debug.assert(!self.full_transcript_installed_page_retired);
                 if (self.full_transcript_installed_page) |*page| page.deinit();
                 self.full_transcript_installed_page = .{
                     .source = source,
                     .projection = projection,
+                    .prepared_window = prepared_window,
+                    .measured_total_rows = projection.measured_total_rows,
+                    .measured_anchor_row = projection.measured_anchor_row,
+                    .measured_item_rows = measured_item_rows,
+                    .measurement_snapshot_ready = true,
+                    .presented_offset = prepared_window.target_offset,
                 };
+                self.full_transcript_installed_page_retired = false;
+                self.full_transcript_failed_request = null;
                 installed = true;
             }
         }
@@ -6074,9 +9696,100 @@ pub const TranscriptRuntime = struct {
         return installed or self.full_transcript.depth == .full;
     }
 
+    pub fn prewarmFullTranscriptPage(
+        self: *TranscriptRuntime,
+        capability: ?*session_child_store.SessionChildCapability,
+        full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
+    ) !void {
+        try self.ensureFullTranscriptPageLoad(capability, full_diff_resolver);
+    }
+
+    pub fn fullTranscriptPreparedForOpen(self: *const TranscriptRuntime) bool {
+        if (self.entries.items.len == 0) return true;
+        if (self.full_transcript_installed_page_retired) return false;
+        const page = if (self.full_transcript_installed_page) |*value| value else return false;
+        return page.prepared_window != null and
+            full_transcript_page.sameRequest(
+                self.desiredFullTranscriptPageRequest(),
+                page.source.request,
+            );
+    }
+
+    pub fn requestFullTranscriptOpen(self: *TranscriptRuntime) bool {
+        self.full_transcript_restore_open_pending = false;
+        if (self.fullTranscriptPreparedForOpen()) {
+            self.full_transcript_open_request = null;
+            debug_trace.logf("full_transcript", "open_request state=ready", .{});
+            return true;
+        }
+        if (self.full_transcript_open_request != null) {
+            self.full_transcript_open_request = null;
+            debug_trace.logf("full_transcript", "open_request state=cancelled", .{});
+            return false;
+        }
+        const request = self.desiredFullTranscriptPageRequest();
+        if (self.full_transcript_failed_request) |failed| {
+            if (full_transcript_page.sameRequest(
+                request,
+                failed,
+            )) {
+                self.full_transcript_open_request = request;
+                self.full_transcript_failure_pending = true;
+                debug_trace.logf("full_transcript", "open_request state=failed", .{});
+                return false;
+            }
+        }
+        self.full_transcript_open_request = request;
+        debug_trace.logf("full_transcript", "open_request state=pending", .{});
+        return false;
+    }
+
+    pub fn deferRestoredFullTranscriptOpen(self: *TranscriptRuntime) void {
+        std.debug.assert(self.full_transcript.depth == .full);
+        self.full_transcript_open_request = self.desiredFullTranscriptPageRequest();
+        self.full_transcript = self.full_transcript.defer_full_open();
+        self.full_transcript_restore_open_pending = true;
+        debug_trace.logf(
+            "full_transcript",
+            "restored_open deferred scroll_rows={d} follow_tail={} bookmark_pending={} bookmark_entry_id={d}",
+            .{
+                self.full_transcript.scroll_rows,
+                self.full_transcript.follow_tail,
+                self.full_transcript.bookmark_pending,
+                self.full_transcript.bookmark_entry_id orelse 0,
+            },
+        );
+    }
+
+    pub fn cancelPendingFullTranscriptOpen(self: *TranscriptRuntime) bool {
+        if (self.full_transcript_open_request == null) return false;
+        self.full_transcript_open_request = null;
+        self.full_transcript_restore_open_pending = false;
+        debug_trace.logf("full_transcript", "open_request state=cancelled", .{});
+        return true;
+    }
+
+    pub fn takeReadyFullTranscriptOpen(self: *TranscriptRuntime) bool {
+        const requested = self.full_transcript_open_request orelse return false;
+        if (self.full_transcript_installed_page_retired) return false;
+        const page = if (self.full_transcript_installed_page) |*value| value else return false;
+        if (page.prepared_window == null or
+            !full_transcript_page.sameRequest(requested, page.source.request)) return false;
+        self.full_transcript_open_request = null;
+        return true;
+    }
+
+    pub fn takeFullTranscriptPreparationFailure(self: *TranscriptRuntime) bool {
+        const pending = self.full_transcript_failure_pending and
+            (self.fullTranscriptActive() or self.full_transcript_open_request != null);
+        if (!pending) return false;
+        self.full_transcript_failure_pending = false;
+        self.full_transcript_open_request = null;
+        return true;
+    }
+
     pub fn preparedFullTranscriptPageProjectionInterruptible(
         self: *TranscriptRuntime,
-        alloc: Allocator,
         full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
         capability: ?*session_child_store.SessionChildCapability,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
@@ -6086,22 +9799,47 @@ pub const TranscriptRuntime = struct {
 
         try self.ensureFullTranscriptPageLoad(capability, full_diff_resolver);
         if (self.installedFullTranscriptPageProjection()) |projection| return projection;
-        return try self.fullTranscriptLoadingProjection(alloc);
+        if (!self.full_transcript_installed_page_retired) {
+            if (self.full_transcript_installed_page) |*page| {
+                if (page.prepared_window != null and
+                    full_transcript_page.sameSurface(
+                        self.desiredFullTranscriptPageRequest(),
+                        page.source.request,
+                    ))
+                {
+                    return &page.projection;
+                }
+            }
+        }
+        return error.InputPending;
     }
 
     fn installedFullTranscriptPageProjection(
         self: *TranscriptRuntime,
     ) ?*full_transcript_screen.Projection {
+        if (self.full_transcript_installed_page_retired) return null;
         const page = if (self.full_transcript_installed_page) |*value| value else return null;
-        return if (full_transcript_page.sameSurface(
-            self.desiredFullTranscriptPageRequest(),
-            page.source.request,
-        )) &page.projection else null;
+        const desired = self.desiredFullTranscriptPageRequest();
+        if (full_transcript_page.sameRequest(desired, page.source.request)) {
+            return &page.projection;
+        }
+        if (!full_transcript_page.sameSurface(desired, page.source.request)) {
+            return null;
+        }
+        if (self.full_transcript_prepared_page_visible or
+            (self.full_transcript_page_load.busy() and
+                self.command_output_display.open_command_block != null))
+        {
+            return &page.projection;
+        }
+        if (self.command_output_display.open_command_block == null) return null;
+        return &page.projection;
     }
 
     pub fn preparedFullTranscriptPageCapability(
         self: *TranscriptRuntime,
     ) ?*session_child_store.SessionChildCapability {
+        if (self.full_transcript_installed_page_retired) return null;
         const page = if (self.full_transcript_installed_page) |*value| value else return null;
         return if (page.source.capability) |*capability| capability else null;
     }
@@ -6121,35 +9859,65 @@ pub const TranscriptRuntime = struct {
         capability: ?*session_child_store.SessionChildCapability,
         full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
     ) !void {
-        const request = self.desiredFullTranscriptPageRequest();
+        if (self.full_transcript_installed_page_retired) {
+            if (self.full_transcript_window_load.busy()) {
+                self.full_transcript_window_load.cancelActive();
+                return;
+            }
+            self.discardInstalledFullTranscriptPage();
+        }
+        const request = self.full_transcript_open_request orelse
+            self.desiredFullTranscriptPageRequest();
+        if (self.full_transcript_failed_request) |failed| {
+            if (full_transcript_page.sameRequest(request, failed)) return;
+            self.full_transcript_failed_request = null;
+        }
         if (self.full_transcript_installed_page) |*page| {
             if (full_transcript_page.sameRequest(request, page.source.request)) return;
         }
-        if (self.command_output_display.open_command_block != null) {
+        if (self.command_output_display.open_command_block != null and
+            self.full_transcript_open_request == null)
+        {
             if (self.full_transcript_installed_page) |*page| {
-                if (full_transcript_page.sameSurface(request, page.source.request) and
-                    !full_transcript_page.liveRefreshDue(
-                        page.source.request.content_revision,
-                        self.full_transcript_content_revision,
-                    )) return;
+                if (full_transcript_page.sameSurface(
+                    request,
+                    page.source.request,
+                )) return;
             }
         }
 
         if (self.full_transcript_page_load.hasRequest(request)) return;
+        if (self.full_transcript_window_load.busy()) {
+            self.full_transcript_window_load.cancelActive();
+            return;
+        }
         if (self.full_transcript_page_load.busy()) {
             if (!self.full_transcript_page_load.hasCompatibleRequest(request)) {
                 self.full_transcript_page_load.cancelActive();
             }
             return;
         }
-        var source = try self.snapshotFullTranscriptPage(
+        var source = self.snapshotFullTranscriptPage(
             request,
             capability,
             full_diff_resolver,
-        );
+        ) catch |err| switch (err) {
+            error.FullTranscriptPageSnapshotTooLarge => {
+                self.full_transcript_failed_request = request;
+                self.full_transcript_failure_pending = true;
+                debug_trace.logf(
+                    "full_transcript_cache",
+                    "page_snapshot_rejected revision={d} cols={d} err={s}",
+                    .{ request.content_revision, request.cols, @errorName(err) },
+                );
+                return;
+            },
+            else => |other| return other,
+        };
         var source_owned = true;
         errdefer if (source_owned) source.deinit(std.heap.c_allocator);
         try self.full_transcript_page_load.schedule(source);
+        self.full_transcript_failed_request = null;
         source_owned = false;
     }
 
@@ -6164,10 +9932,21 @@ pub const TranscriptRuntime = struct {
             request,
             self.entries.items.len,
         );
+        if (self.fullTranscriptPageSnapshotBytes(
+            range,
+            full_diff_resolver,
+        ) > full_transcript_snapshot_clone_max_bytes) {
+            return error.FullTranscriptPageSnapshotTooLarge;
+        }
         var source = full_transcript_worker.Source{
             .request = request,
             .range = range,
             .styles = self.command_output_render.styles,
+            .presentation = self.full_transcript,
+            .visible_rows = @intCast(@min(
+                self.fullTranscriptPageRows(),
+                std.math.maxInt(u16),
+            )),
         };
         errdefer source.deinit(alloc);
         try source.entries.ensureTotalCapacity(alloc, range.len());
@@ -6269,6 +10048,46 @@ pub const TranscriptRuntime = struct {
         return source;
     }
 
+    fn fullTranscriptPageSnapshotBytes(
+        self: *const TranscriptRuntime,
+        range: full_transcript_page.SourceRange,
+        full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
+    ) usize {
+        const entries = self.entries.items[range.start..range.end];
+        var total: usize = entries.len *| @sizeOf(TranscriptEntry);
+        for (entries) |entry| {
+            total +|= transcript_store.entrySnapshotRetainedBytes(entry);
+            if (full_diff_resolver) |resolver| {
+                const raw = switch (entry) {
+                    .raw_bytes => |value| value,
+                    else => continue,
+                };
+                if (raw.class != .diff_block) continue;
+                const marker_id = diff_mod.markedDiffBlockId(raw.bytes) orelse continue;
+                if (resolver.full_for_marker(resolver.context, marker_id)) |content| {
+                    total +|= content.len;
+                }
+            }
+            if (total > full_transcript_snapshot_clone_max_bytes) return total;
+        }
+        const bounds = snapshotEntryIdBounds(entries);
+        for (self.tool_details.items) |detail| {
+            if (bounds) |page_bounds| {
+                if (detail.entry_id < page_bounds.min or detail.entry_id > page_bounds.max) {
+                    continue;
+                }
+            } else continue;
+            total +|= toolDetailSnapshotBytes(detail);
+            if (total > full_transcript_snapshot_clone_max_bytes) return total;
+        }
+        for (self.command_output_blocks.items) |block| {
+            if (!snapshotCommandBlockIntersects(entries, bounds, block)) continue;
+            total +|= command_output_runtime.commandOutputBlockRetainedBytes(block);
+            if (total > full_transcript_snapshot_clone_max_bytes) return total;
+        }
+        return total;
+    }
+
     fn appendSnapshotFullDiffs(
         alloc: Allocator,
         source: *full_transcript_worker.Source,
@@ -6331,6 +10150,20 @@ pub const TranscriptRuntime = struct {
         min: u32,
         max: u32,
     };
+
+    fn toolDetailSnapshotBytes(detail: ToolDetailRecord) usize {
+        var total = @sizeOf(ToolDetailRecord) +| detail.tool_name.len;
+        if (detail.arguments_json) |value| total +|= value.len;
+        if (detail.result) |value| total +|= value.len;
+        if (detail.result_handle) |value| total +|= value.len;
+        if (detail.command_artifact_handle) |value| total +|= value.len;
+        if (detail.command_output_replay) |replay| switch (replay) {
+            .available => |value| total +|= value.handle.len,
+            .unavailable => {},
+        };
+        if (detail.lifecycle_id) |value| total +|= value.call_id.len;
+        return total;
+    }
 
     fn snapshotEntryIdBounds(
         entries: []const TranscriptEntry,
@@ -6458,29 +10291,6 @@ pub const TranscriptRuntime = struct {
         return source.command_blocks.items.len - 1;
     }
 
-    fn fullTranscriptLoadingProjection(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-    ) !*full_transcript_screen.Projection {
-        if (self.full_transcript_loading_projection == null) {
-            const entries = [_]TranscriptEntry{.{ .raw_bytes = .{
-                .id = 0,
-                .bytes = "Preparing full detail…\n",
-                .class = .unknown_raw,
-            } }};
-            self.full_transcript_loading_projection = try full_transcript_screen.buildProjection(
-                alloc,
-                &entries,
-                &.{},
-                &.{},
-                self.command_output_render.styles,
-                self.layout.cols,
-                null,
-            );
-        }
-        return &self.full_transcript_loading_projection.?;
-    }
-
     fn prepareFullTranscriptProjectionLayout(self: *TranscriptRuntime) void {
         self.full_transcript = self.full_transcript.prepare_projection(
             self.layout.cols,
@@ -6575,26 +10385,81 @@ pub const TranscriptRuntime = struct {
         area: render_engine.frame_layout.FrameRect,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !FullTranscriptSurfacePaint {
-        const source_bytes = if (self.fullTranscriptProjectionIsLoading(projection))
-            try full_transcript_screen.renderProjectionViewportSourceInterruptible(
-                alloc,
-                projection,
-                capability,
-                self.layout.cols,
+        if (self.installedFullTranscriptPreparedWindow(projection)) |window| {
+            self.full_transcript_prepared_page_visible = true;
+            const page = &self.full_transcript_installed_page.?;
+            const measurement = self.installedPageMeasurement(page);
+            const offset = selectProjectionViewportOffset(
+                self,
+                measurement,
                 area.height(),
-                0,
-                checkpoint,
-            )
-        else
-            try full_transcript_screen.renderProjectionViewportSourceWithSelectorInterruptible(
-                alloc,
-                projection,
-                capability,
-                self.layout.cols,
-                area.height(),
-                .{ .context = self, .select_offset = selectProjectionViewportOffset },
-                checkpoint,
             );
+            const cached_rows = @as(u32, window.source.preview.natural_visual_rows);
+            const cache_end = window.start_row +| cached_rows;
+            if (offset >= window.start_row and
+                (offset +| area.height() <= cache_end or
+                    cache_end == measurement.total_rows))
+            {
+                const local_offset = offset - window.start_row;
+                debug_trace.logf(
+                    "full_transcript_cache",
+                    "window cols={d} offset={d} local_offset={d} visible={d} source=indexed rows={d} cache_start={d} cache_rows={d}",
+                    .{
+                        self.layout.cols,
+                        offset,
+                        local_offset,
+                        area.height(),
+                        measurement.total_rows,
+                        window.start_row,
+                        cached_rows,
+                    },
+                );
+                const prepared = try transcript_painter.prepareIndexedFullTranscriptSurfacePaintForArea(
+                    self,
+                    alloc,
+                    metrics,
+                    &window.source,
+                    area,
+                    local_offset,
+                );
+                page.presented_offset = offset;
+                return .{
+                    .borrowed_source = &window.source,
+                    .prepared = prepared,
+                };
+            }
+            try self.ensureFullTranscriptWindowLoad(
+                page,
+                measurement,
+                offset,
+                area.height(),
+            );
+            const stable_offset = @min(
+                @max(page.presented_offset, window.start_row),
+                cache_end -| @min(@as(u32, area.height()), cached_rows),
+            );
+            const prepared = try transcript_painter.prepareIndexedFullTranscriptSurfacePaintForArea(
+                self,
+                alloc,
+                metrics,
+                &window.source,
+                area,
+                stable_offset -| window.start_row,
+            );
+            return .{
+                .borrowed_source = &window.source,
+                .prepared = prepared,
+            };
+        }
+        const source_bytes = try full_transcript_screen.renderProjectionViewportSourceWithSelectorInterruptible(
+            alloc,
+            projection,
+            capability,
+            self.layout.cols,
+            area.height(),
+            .{ .context = self, .select_offset = selectProjectionViewportOffset },
+            checkpoint,
+        );
         var source = try self.prepareFullTranscriptViewportSource(alloc, source_bytes);
         errdefer source.deinit(alloc);
         const prepared = try transcript_painter.preparePreselectedTranscriptSurfacePaintFromSourceForArea(
@@ -6604,18 +10469,72 @@ pub const TranscriptRuntime = struct {
             &source,
             area,
         );
-        return .{ .source = source, .prepared = prepared };
+        return .{ .owned_source = source, .prepared = prepared };
     }
 
-    fn fullTranscriptProjectionIsLoading(
+    fn installedFullTranscriptPreparedWindow(
         self: *TranscriptRuntime,
         projection: *const full_transcript_screen.Projection,
+    ) ?*full_transcript_worker.PreparedWindow {
+        if (self.full_transcript_installed_page_retired) return null;
+        const page = if (self.full_transcript_installed_page) |*value| value else return null;
+        if (&page.projection != projection) return null;
+        return if (page.prepared_window) |*window| window else null;
+    }
+
+    fn installedPageMeasurement(
+        self: *const TranscriptRuntime,
+        page: *const InstalledFullTranscriptPage,
+    ) full_transcript_screen.ProjectionMeasurement {
+        _ = self;
+        if (page.measurement_snapshot_ready) {
+            return .{
+                .total_rows = page.measured_total_rows,
+                .anchor_row = page.measured_anchor_row,
+                .item_rows = page.measured_item_rows,
+            };
+        }
+        return .{
+            .total_rows = page.projection.measured_total_rows,
+            .anchor_row = page.projection.measured_anchor_row,
+            .item_rows = page.projection.measured_item_rows.items,
+        };
+    }
+
+    fn ensureFullTranscriptWindowLoad(
+        self: *TranscriptRuntime,
+        page: *InstalledFullTranscriptPage,
+        measurement: full_transcript_screen.ProjectionMeasurement,
+        target_offset: u32,
+        visible_rows: u16,
+    ) !void {
+        if (self.full_transcript_page_load.busy()) return;
+        if (self.full_transcript_window_load.hasTarget(target_offset)) return;
+        if (self.full_transcript_window_load.busy()) {
+            self.full_transcript_window_load.cancelActive();
+            return;
+        }
+        const request = full_transcript_worker.preparedWindowRequest(
+            page.source.request,
+            measurement.total_rows,
+            target_offset,
+            visible_rows,
+        );
+        try self.full_transcript_window_load.schedule(
+            request,
+            &page.projection,
+            if (page.source.capability) |*capability| capability else null,
+        );
+    }
+
+    fn borrowsInstalledFullTranscriptSource(
+        self: *TranscriptRuntime,
+        source: *const TranscriptPreparationSource,
     ) bool {
-        const loading = if (self.full_transcript_loading_projection) |*value|
-            value
-        else
-            return false;
-        return loading == projection;
+        if (self.full_transcript_installed_page_retired) return false;
+        const page = if (self.full_transcript_installed_page) |*value| value else return false;
+        const window = if (page.prepared_window) |*value| value else return false;
+        return &window.source == source;
     }
 
     fn selectProjectionViewportOffset(
@@ -6725,17 +10644,16 @@ pub const TranscriptRuntime = struct {
         {
             return false;
         }
-        if (self.full_transcript_page_load.busy()) return true;
+        if (self.full_transcript_page_load.busy() or
+            self.full_transcript_window_load.busy()) return true;
+        if (self.full_transcript_installed_page_retired) return false;
         const page = if (self.full_transcript_installed_page) |*value| value else return false;
         if (page.source.request.cols != self.layout.cols or
             !std.meta.eql(page.source.request.anchor, self.full_transcript_page_anchor))
         {
             return false;
         }
-        return !full_transcript_page.liveRefreshDue(
-            page.source.request.content_revision,
-            self.full_transcript_content_revision,
-        );
+        return true;
     }
 
     pub fn nativeHistoryActive(self: *const TranscriptRuntime) bool {
@@ -6907,6 +10825,19 @@ pub const TranscriptRuntime = struct {
     }
 };
 
+test "transcript runtime initializer preserves an empty compact source cache" {
+    var runtime = TranscriptRuntime.init();
+    defer runtime.deinit(std.testing.allocator);
+
+    for (runtime.compact_transcript_source_cache.entries) |entry| {
+        try std.testing.expect(entry == null);
+    }
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        runtime.compact_transcript_source_cache.next_replacement,
+    );
+}
+
 fn frameBandsEqual(a: render_engine.paint_plan.FrameBand, b: render_engine.paint_plan.FrameBand) bool {
     return a.top == b.top and a.bottom == b.bottom and a.owner == b.owner;
 }
@@ -7044,6 +10975,161 @@ fn resolveTranscriptRecoveryCommit(
     };
 }
 
+test "resume view snapshot captures visible transcript styling" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    runtime.layout = .{
+        .rows = 6,
+        .cols = 12,
+        .content_bottom = 3,
+        .divider_top_row = 4,
+        .input_row = 5,
+        .divider_bottom_row = 5,
+        .hint_row = 6,
+    };
+    try runtime.enableShadowVt(alloc);
+    try runtime.shadow_vt.?.feed(
+        "\x1b[1;1Hnot cached\x1b[2;1H" ++
+            "\x1b]8;;https://example.com\x1b\\" ++
+            "\x1b[1;3;38;2;1;2;3m\x1b[48;5;245mvisible one\x1b[0m" ++
+            "\x1b]8;;\x1b\\\x1b[3;1H\x1b[31mvisible two\x1b[0m" ++
+            "\x1b[4;1Hfooter",
+    );
+    runtime.has_painted_transcript = true;
+    runtime.last_visible_transcript_top_row = 2;
+    runtime.last_visible_transcript_last_row = 3;
+
+    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 128)).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expect(snapshot.complete);
+    try std.testing.expectEqual(@as(u16, 6), snapshot.terminal_rows);
+    try std.testing.expectEqual(@as(u16, 12), snapshot.terminal_cols);
+    try std.testing.expectEqualStrings(
+        "\x1b[0m\x1b[1m\x1b[3m\x1b[38;2;1;2;3m" ++
+            "\x1b[48;5;245mvisible one\x1b[0m\n" ++
+            "\x1b[0m\x1b[31mvisible two\x1b[0m\n",
+        snapshot.text,
+    );
+}
+
+test "resume view snapshot preserves the committed footer gap" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    runtime.layout.rows = 6;
+    runtime.layout.cols = 12;
+    runtime.committed_frame_layout.footer_area = .{ .top = 4, .bottom = 6 };
+    try runtime.enableShadowVt(alloc);
+    try runtime.shadow_vt.?.feed("\x1b[1;1Hvisible");
+    runtime.has_painted_transcript = true;
+    runtime.last_visible_transcript_top_row = 1;
+    runtime.last_visible_transcript_last_row = 1;
+
+    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 128)).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expect(snapshot.complete);
+    try std.testing.expectEqualStrings("visible\n\n\n", snapshot.text);
+}
+
+test "resume view snapshot omits a visible leading welcome entry" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    runtime.layout = .{
+        .rows = 6,
+        .cols = 40,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 6,
+        .hint_row = 6,
+    };
+    var metrics: Metrics = .{};
+    try runtime.writeTranscriptClassified(
+        alloc,
+        &metrics,
+        "fx · Run /help for commands\n\n",
+        true,
+        .welcome,
+    );
+    try runtime.enableShadowVt(alloc);
+    try runtime.shadow_vt.?.feed(
+        "\x1b[1;1Hfx · Run /help for commands" ++
+            "\x1b[3;1Hvisible one\x1b[4;1Hvisible two",
+    );
+    runtime.has_painted_transcript = true;
+    runtime.last_visible_transcript_top_row = 1;
+    runtime.last_visible_transcript_last_row = 4;
+    runtime.last_viewport_selection = .{
+        .top_row = 1,
+        .bottom_row = 4,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 4,
+    };
+
+    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 128)).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expect(snapshot.complete);
+    try std.testing.expectEqualStrings("visible one\nvisible two\n", snapshot.text);
+}
+
+test "resume view snapshot keeps one complete UTF-8 row at the byte limit" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    runtime.layout.rows = 6;
+    runtime.layout.cols = 12;
+    try runtime.enableShadowVt(alloc);
+    try runtime.shadow_vt.?.feed("\x1b[1;1Hééé");
+    runtime.has_painted_transcript = true;
+    runtime.last_visible_transcript_top_row = 1;
+    runtime.last_visible_transcript_last_row = 1;
+
+    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 7)).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expect(snapshot.complete);
+    try std.testing.expectEqualStrings("ééé\n", snapshot.text);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(snapshot.text));
+}
+
+test "resume view snapshot drops oldest rows and retains the newest tail" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    runtime.layout.rows = 6;
+    runtime.layout.cols = 12;
+    try runtime.enableShadowVt(alloc);
+    try runtime.shadow_vt.?.feed(
+        "\x1b[1;1Holdest\x1b[2;1Høø\x1b[3;1HTAIL",
+    );
+    runtime.has_painted_transcript = true;
+    runtime.last_visible_transcript_top_row = 1;
+    runtime.last_visible_transcript_last_row = 3;
+
+    var snapshot = (try runtime.snapshotVisibleTranscriptText(alloc, 10)).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expect(!snapshot.complete);
+    try std.testing.expectEqualStrings("øø\nTAIL\n", snapshot.text);
+}
+
+test "resume view snapshot returns no text for empty visible rows" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    runtime.layout.rows = 6;
+    runtime.layout.cols = 12;
+    try runtime.enableShadowVt(alloc);
+    runtime.has_painted_transcript = true;
+    runtime.last_visible_transcript_top_row = 1;
+    runtime.last_visible_transcript_last_row = 2;
+
+    try std.testing.expect(
+        try runtime.snapshotVisibleTranscriptText(alloc, 128) == null,
+    );
+}
+
 fn acceptedTranscriptRows(
     scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
     committed_terminal_scroll_rows: u16,
@@ -7087,6 +11173,46 @@ fn acceptedTranscriptRowsForInlineRows(
     };
 }
 
+fn resolveAndSealTranscriptTransitionForRuntimeTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    source: *TranscriptPreparationSource,
+    prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
+    target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+    plan: *render_engine.paint_plan.PaintPlan,
+    scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+) !TranscriptTransition {
+    const scroll_facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        prepared,
+        false,
+        false,
+    );
+    const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
+        runtime.committed_frame_layout.transcript_area,
+        plan.invalidation,
+    );
+    const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        source,
+        prepared,
+        target_layout,
+        scroll_plan,
+        scroll_facts,
+        destructive_invalidation,
+        plan.activity == .overlay_entry,
+    );
+    resolved.applyToPaintPlan(plan);
+    return runtime.sealTranscriptTransition(
+        alloc,
+        source,
+        prepared,
+        plan,
+        resolved,
+    );
+}
+
 fn testFrameCommitResult(
     committed_rows: u16,
     shadow_state: render_engine.terminal_diff.ShadowCommitState,
@@ -7104,11 +11230,740 @@ fn testFrameCommitResult(
     };
 }
 
+test "transition commit snapshot derives accepted rows and stable state from frame result" {
+    const scroll_plan = render_engine.frame_scroll_plan.merge(8, 1, 0, 2);
+    var transition = TranscriptTransition{
+        .scroll_plan = scroll_plan,
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .resize_reflow_rows = 1,
+        .semantic_rows = 1,
+        .semantic_progress_rows = 1,
+        .target_flow = &.{},
+        .target_cache = .empty,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 4,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = 1,
+        },
+        .visual_offset = 0,
+        .history_visual_offset = 0,
+        .total_visual_rows = 2,
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 4,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 4,
+    };
+
+    const partial_result = testFrameCommitResult(1, .terminal_partial_write);
+    const partial = resolveTranscriptTransitionCommit(
+        &transition,
+        partial_result,
+        scroll_plan.commit(partial_result.terminal_scroll_rows_committed),
+    );
+    try std.testing.expectEqual(@as(u16, 1), partial.accepted.resize_reflow_rows);
+    try std.testing.expectEqual(@as(u32, 0), partial.accepted.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), partial.remaining_resize_reflow_rows);
+    try std.testing.expectEqual(@as(u32, 1), partial.remaining_semantic_rows);
+    try std.testing.expect(!partial.complete);
+    try std.testing.expect(!partial.stable);
+
+    const complete_result = testFrameCommitResult(2, .committed);
+    const complete = resolveTranscriptTransitionCommit(
+        &transition,
+        complete_result,
+        scroll_plan.commit(complete_result.terminal_scroll_rows_committed),
+    );
+    try std.testing.expectEqual(@as(u16, 1), complete.accepted.resize_reflow_rows);
+    try std.testing.expectEqual(@as(u32, 1), complete.accepted.semantic_rows);
+    try std.testing.expectEqual(@as(u32, 1), complete.accepted.semantic_progress_rows);
+    try std.testing.expectEqual(@as(u16, 0), complete.remaining_resize_reflow_rows);
+    try std.testing.expectEqual(@as(u32, 0), complete.remaining_semantic_rows);
+    try std.testing.expect(complete.complete);
+    try std.testing.expect(complete.stable);
+
+    transition.recovery_projection_deferred = true;
+    const deferred_result = testFrameCommitResult(2, .committed);
+    const deferred = resolveTranscriptTransitionCommit(
+        &transition,
+        deferred_result,
+        scroll_plan.commit(deferred_result.terminal_scroll_rows_committed),
+    );
+    try std.testing.expect(deferred.complete);
+    try std.testing.expect(!deferred.stable);
+}
+
+test "resume recovery selects a safe materialized endpoint for every outcome" {
+    var target_flow = [_]u8{ 'f', 'i', 'r', 's', 't', '\n', 's', 'e', 'c', 'o', 'n', 'd' };
+    const scroll_plan = render_engine.frame_scroll_plan.merge(8, 1, 0, 1);
+    var runtime = TranscriptRuntime{
+        .layout = testLayoutWithRows(8),
+        .committed_frame_layout = .{
+            .terminal_rows = 8,
+            .terminal_cols = 80,
+            .transcript_area = .{ .top = 1, .bottom = 8 },
+        },
+    };
+    defer runtime.deinit(std.testing.allocator);
+    const document_append: render_engine.frame_scroll_plan.FrameDocumentAppend = .{
+        .bytes = "first\n",
+        .start_row = 2,
+        .start_col = 3,
+    };
+    const planned: MaterializedEndpoint = .{
+        .visual_offset = 1,
+        .visual_rows = 1,
+        .flow_len = 6,
+        .cursor_row = 3,
+        .cursor_col = 1,
+    };
+    var transition = TranscriptTransition{
+        .scroll_plan = scroll_plan,
+        .document_append = document_append,
+        .semantic_rows = 2,
+        .semantic_progress_rows = 2,
+        .recovery_progress_compatible = true,
+        .recovery_tracks_semantic_progress = true,
+        .target_flow = &target_flow,
+        .target_cache = .empty,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .terminal_rows = 8,
+            .terminal_cols = 80,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 8,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = 2,
+        },
+        .visual_offset = 1,
+        .history_visual_offset = 1,
+        .total_visual_rows = 2,
+        .materialized = planned,
+        .materialized_without_append = runtime.materializedEndpointWithoutAppend(
+            document_append,
+            planned,
+        ),
+        .cursor_row = 3,
+        .cursor_col = 1,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 3,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 2,
+    };
+    const result = testFrameCommitResult(0, .terminal_partial_write);
+    const commit = resolveTranscriptTransitionCommit(
+        &transition,
+        result,
+        scroll_plan.commit(result.terminal_scroll_rows_committed),
+    );
+
+    const unapplied = resolveTranscriptRecoveryCommit(&runtime, &transition, result, commit);
+    try std.testing.expectEqual(@as(u32, 0), unapplied.materialized_visual_offset);
+    try std.testing.expectEqual(@as(u16, 0), unapplied.materialized_visual_rows);
+    try std.testing.expectEqual(@as(?usize, 0), unapplied.materialized_flow_len);
+    try std.testing.expectEqual(@as(u16, 2), unapplied.materialized_cursor_row);
+    try std.testing.expectEqual(@as(u16, 3), unapplied.materialized_cursor_col);
+
+    try std.testing.expectEqualDeep(
+        transition.materialized_without_append,
+        resolveRecoveryMaterializedEndpoint(&transition, result, commit),
+    );
+
+    var complete_commit = commit;
+    complete_commit.complete = true;
+    try std.testing.expectEqualDeep(
+        planned,
+        resolveRecoveryMaterializedEndpoint(&transition, result, complete_commit),
+    );
+
+    var appended_result = result;
+    appended_result.document_append_committed = true;
+    try std.testing.expectEqualDeep(
+        planned,
+        resolveRecoveryMaterializedEndpoint(&transition, appended_result, commit),
+    );
+
+    transition.recovery_progress_compatible = false;
+    try std.testing.expectEqualDeep(
+        planned,
+        resolveRecoveryMaterializedEndpoint(&transition, result, commit),
+    );
+    transition.recovery_progress_compatible = true;
+
+    transition.recovery_tracks_semantic_progress = false;
+    try std.testing.expectEqualDeep(
+        planned,
+        resolveRecoveryMaterializedEndpoint(&transition, result, commit),
+    );
+    transition.recovery_tracks_semantic_progress = true;
+
+    transition.recovery_rebase = true;
+    try std.testing.expectEqualDeep(
+        planned,
+        resolveRecoveryMaterializedEndpoint(&transition, result, commit),
+    );
+    transition.recovery_rebase = false;
+
+    transition.document_append = .{};
+    transition.materialized_without_append = runtime.materializedEndpointWithoutAppend(
+        .{},
+        planned,
+    );
+    const absent = resolveTranscriptRecoveryCommit(&runtime, &transition, result, commit);
+    try std.testing.expectEqual(@as(u32, 1), absent.materialized_visual_offset);
+    try std.testing.expectEqual(@as(u16, 1), absent.materialized_visual_rows);
+    try std.testing.expectEqual(@as(?usize, 6), absent.materialized_flow_len);
+    try std.testing.expectEqual(@as(u16, 3), absent.materialized_cursor_row);
+    try std.testing.expectEqual(@as(u16, 1), absent.materialized_cursor_col);
+}
+
+test "partial resume publication retains its cursor and requests the next frame" {
+    const alloc = std.testing.allocator;
+    const scroll_plan = render_engine.frame_scroll_plan.merge(8, 1, 0, 128);
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    defer runtime.deinit(alloc);
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, "pending"),
+    );
+    var transition = TranscriptTransition{
+        .scroll_plan = scroll_plan,
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .semantic_rows = 256,
+        .semantic_progress_rows = 256,
+        .recovery_progress_compatible = true,
+        .recovery_tracks_semantic_progress = true,
+        .target_flow = runtime.pending_resume_source.?.bytes,
+        .target_flow_owned = false,
+        .target_cache = .empty,
+        .target_cache_unchanged = true,
+        .folded_summary_indices = &.{},
+        .target_layout = .{ .terminal_rows = 8, .terminal_cols = 40 },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 4,
+            .start_line = 252,
+            .partial_skip_rows = 0,
+            .line_count = 256,
+        },
+        .visual_offset = 256,
+        .history_visual_offset = 128,
+        .source_endpoint_visual_offset = 256,
+        .total_visual_rows = 256,
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 4,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 4,
+    };
+    defer transition.deinit(alloc);
+
+    runtime.consumeTranscriptTransition(
+        alloc,
+        &transition,
+        testFrameCommitResult(128, .committed),
+    );
+
+    switch (runtime.transcript_commit_state) {
+        .recovering => |receipt| {
+            try std.testing.expectEqual(@as(u32, 128), receipt.accepted_visual_offset);
+            try std.testing.expectEqual(@as(u32, 128), receipt.remaining_semantic_rows);
+        },
+        .invalid, .stable => return error.TestExpectedRecoveringTranscript,
+    }
+    try std.testing.expectEqualStrings("pending", runtime.pendingResumeFlow());
+    try std.testing.expect(runtime.render_requests.hasReason(.transcript));
+}
+
+test "owned stable transition traces a superseded pending resume source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "resume-source-drop.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "session");
+
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    defer runtime.deinit(alloc);
+    runtime.bindDetachedCommitAllocator(alloc);
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, "stale"),
+    );
+    var transition = TranscriptTransition{
+        .scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(8, 1),
+        .document_append = .{},
+        .target_flow = try alloc.dupe(u8, "fresh"),
+        .target_cache = .empty,
+        .folded_summary_indices = &.{},
+        .target_layout = .{ .terminal_rows = 8, .terminal_cols = 80 },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 1,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = 1,
+        },
+        .visual_offset = 0,
+        .history_visual_offset = 0,
+        .total_visual_rows = 1,
+        .materialized_without_append = .{},
+        .cursor_row = 1,
+        .cursor_col = 6,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 1,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 1,
+    };
+    defer transition.deinit(alloc);
+
+    runtime.consumeTranscriptTransition(
+        alloc,
+        &transition,
+        testFrameCommitResult(0, .committed),
+    );
+    debug_trace.shutdown();
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer trace_file.close(std.testing.io);
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "pending resume flow dropped reason=superseded bytes=5",
+    ) != null);
+}
+
+test "stable resume publication starts a fresh retained source epoch" {
+    const alloc = std.testing.allocator;
+    const retained_flow =
+        "tail-1\n" ++
+        "tail-2\n" ++
+        "tail-3\n" ++
+        "tail-final";
+    const full_flow =
+        "old-1\nold-2\nold-3\nold-4\n" ++
+        "old-5\nold-6\nold-7\nold-8\n" ++
+        retained_flow;
+    const layout: Layout = .{
+        .rows = 8,
+        .cols = 40,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 7,
+        .hint_row = 8,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, full_flow),
+    );
+    try runtime.transcript.appendSlice(alloc, retained_flow);
+
+    var transition = TranscriptTransition{
+        .scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(
+            layout.rows,
+            runtime.owned_top_row,
+        ),
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .target_flow = runtime.pending_resume_source.?.bytes,
+        .target_flow_owned = false,
+        .target_cache = .empty,
+        .target_cache_unchanged = true,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 4,
+            .start_line = 8,
+            .partial_skip_rows = 0,
+            .line_count = 12,
+            .last_visible_row = 4,
+        },
+        .visual_offset = 8,
+        .history_visual_offset = 8,
+        .total_visual_rows = 12,
+        .cursor_row = 4,
+        .cursor_col = 11,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 4,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 4,
+    };
+    defer transition.deinit(alloc);
+    runtime.consumeTranscriptTransition(
+        alloc,
+        &transition,
+        testFrameCommitResult(0, .committed),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.pendingResumeFlow().len);
+    try std.testing.expectEqualStrings(retained_flow, runtime.transcript.items);
+    try std.testing.expectEqual(
+        TranscriptCommitDiagnosticState.invalid,
+        runtime.transcriptCommitDiagnostic().state,
+    );
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqualStrings(retained_flow, source.bytes);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), prepared.selection.start_line);
+    try std.testing.expectEqual(@as(usize, 4), prepared.selection.line_count);
+    try std.testing.expectEqual(@as(u16, 4), prepared.cursor.cursor_row);
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
+    try std.testing.expectEqual(@as(u32, 0), facts.target_visual_offset);
+    try std.testing.expect(facts.recovery_rebase);
+}
+
+test "oversized resume publication retains bounded recovery progress" {
+    const alloc = std.testing.allocator;
+    const layout = invalidationTestLayout();
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .committed_frame_layout = .{
+            .terminal_rows = layout.rows,
+            .terminal_cols = layout.cols,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..@as(usize, std.math.maxInt(u16)) + 21) |_| {
+        try flow.appendSlice(alloc, "row\n");
+    }
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, flow.items),
+    );
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = layout.content_bottom },
+    );
+    defer prepared.deinit(alloc);
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.target_visual_offset > std.math.maxInt(u16));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u16)), facts.semantic_rows);
+    try std.testing.expectEqual(
+        @as(u16, resume_publication_rows_per_frame),
+        facts.planned_rows,
+    );
+    try std.testing.expect(facts.recovery_progress_compatible);
+    try std.testing.expect(facts.recovery_tracks_semantic_progress);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    const accepted = acceptedTranscriptRows(
+        scroll_plan,
+        scroll_plan.terminal_scroll_rows,
+        facts.resize_reflow_rows,
+        facts.semantic_rows,
+        facts.semantic_progress_rows,
+    );
+    try std.testing.expectEqual(
+        @as(u32, resume_publication_rows_per_frame),
+        accepted.semantic_rows,
+    );
+    try std.testing.expect(accepted.semantic_rows < facts.semantic_rows);
+
+    const append_base = (try runtime.resolveTransitionAppendBase(
+        &prepared,
+        facts,
+        false,
+        source.bytes,
+        facts.target_visual_offset,
+    )) orelse return error.TestExpectedResumeAppendBase;
+    try std.testing.expectEqual(@as(usize, 0), append_base.flow_len);
+}
+
+test "pending tail projection seals against the complete frame layout" {
+    const alloc = std.testing.allocator;
+    const layout = invalidationTestLayout();
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..100) |_| try flow.appendSlice(alloc, "row\n");
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, flow.items),
+    );
+
+    const candidate = render_engine.frame_layout.solve(.{
+        .terminal = layout,
+        .owned_top = runtime.owned_top_row,
+        .footer = .{
+            .natural_rows = 3,
+            .min_rows = 3,
+            .max_rows = 3,
+        },
+        .transcript = runtime.pending_resume_source.?.preview,
+        .prior = runtime.committed_frame_layout,
+    });
+    const projection_area = render_engine.frame_layout.FrameRect{
+        .top = candidate.transcript_area.top,
+        .bottom = candidate.transcript_area.bottom - 1,
+    };
+    const source = (try runtime.pendingResumeSourceInterruptible(alloc, null)) orelse
+        return error.TestExpectedPendingResumeSource;
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        source,
+        projection_area,
+    );
+    errdefer prepared.deinit(alloc);
+    const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        &prepared,
+        false,
+        false,
+    );
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    const footer_rows = render_engine.footer_layout.resolve(.{
+        .footer_top_for_extra = candidate.footer_area.top,
+        .terminal_rows = layout.rows,
+        .activity_offset = 0,
+        .extra_input_rows = 0,
+        .input_extra = 0,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+    });
+    var plan = candidate.toPaintPlan(.{
+        .footer_rows = footer_rows,
+        .viewport = prepared.selection,
+        .cursor_target = .{
+            .row = prepared.cursor.cursor_row,
+            .col = prepared.cursor.cursor_col,
+            .visible = true,
+        },
+    });
+    const target_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate);
+    try std.testing.expectError(
+        error.InvalidTranscriptTransition,
+        runtime.resolveTranscriptTransitionTargetForFrameInArea(
+            alloc,
+            source,
+            &prepared,
+            target_layout,
+            .{
+                .top = projection_area.top,
+                .bottom = target_layout.transcript_area.bottom + 1,
+            },
+            scroll_plan,
+            facts,
+            false,
+            false,
+        ),
+    );
+    const resolved = try runtime.resolveTranscriptTransitionTargetForFrameInArea(
+        alloc,
+        source,
+        &prepared,
+        target_layout,
+        projection_area,
+        scroll_plan,
+        facts,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(projection_area.bottom, resolved.selection().bottom_row);
+    try std.testing.expectEqual(
+        candidate.transcript_area.bottom,
+        resolved.target_layout.transcript_area.bottom,
+    );
+    resolved.applyToPaintPlan(&plan);
+    var transition = try runtime.sealTranscriptTransition(
+        alloc,
+        source,
+        &prepared,
+        &plan,
+        resolved,
+    );
+    prepared.deinit(alloc);
+    defer transition.deinit(alloc);
+    try std.testing.expectEqual(
+        candidate.transcript_area.bottom,
+        transition.target_layout.transcript_area.bottom,
+    );
+}
+
+test "transition commit keeps unplanned physical scroll as recovery debt" {
+    const scroll_plan = render_engine.frame_scroll_plan.merge(8, 1, 0, 2);
+    var transition = TranscriptTransition{
+        .scroll_plan = scroll_plan,
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .semantic_rows = 2,
+        .semantic_progress_rows = 2,
+        .target_flow = &.{},
+        .target_cache = .empty,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 4,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = 2,
+        },
+        .visual_offset = 0,
+        .history_visual_offset = 0,
+        .total_visual_rows = 2,
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 4,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 4,
+    };
+
+    const result = testFrameCommitResult(scroll_plan.terminal_scroll_rows + 1, .committed);
+    const commit = resolveTranscriptTransitionCommit(
+        &transition,
+        result,
+        scroll_plan.commit(result.terminal_scroll_rows_committed),
+    );
+    try std.testing.expectEqual(@as(u32, 2), commit.accepted.semantic_rows);
+    try std.testing.expectEqual(@as(u32, 0), commit.remaining_semantic_rows);
+    try std.testing.expectEqual(@as(u16, 1), commit.remaining_unplanned_scroll_rows);
+    try std.testing.expect(!commit.complete);
+    try std.testing.expect(!commit.stable);
+
+    var runtime = TranscriptRuntime{
+        .layout = testLayoutWithRows(8),
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+    };
+    defer runtime.deinit(std.testing.allocator);
+    runtime.consumeFrameScrollCommit(
+        std.testing.allocator,
+        scroll_plan,
+        result,
+        &transition,
+    );
+    const diagnostic = runtime.transcriptCommitDiagnostic();
+    try std.testing.expectEqual(TranscriptCommitDiagnosticState.recovering, diagnostic.state);
+    try std.testing.expectEqual(@as(u16, 1), diagnostic.remaining_unplanned_scroll_rows);
+}
+
 fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
     return frameInlineScrollBudgetCapped(
         resize_reflow_rows,
         semantic_rows,
         std.math.maxInt(u32),
+    );
+}
+
+test "pending resume publication yields after a bounded row batch" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    const prepared = transcript_painter.PreparedTranscriptSurfacePaint{ .selection = .{
+        .top_row = 1,
+        .bottom_row = 1,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 1,
+    } };
+
+    try std.testing.expectEqual(
+        @as(u16, 1_000),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
+    );
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, "pending"),
+    );
+    try std.testing.expectEqual(
+        @as(u16, resume_publication_rows_per_frame),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
     );
 }
 
@@ -7187,6 +12042,844 @@ fn reflowedRows(
     return total;
 }
 
+test "reflowed rows count a combining suffix attached to a space" {
+    var grid = try vt_emulator.Grid.init(std.testing.allocator, 4, 1);
+    defer grid.deinit();
+    try grid.feed("   \u{0301}");
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        reflowedRows(&grid, 1, 1, 2, false),
+    );
+}
+
+fn invalidationTestLayout() Layout {
+    return .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    };
+}
+
+test "frame invalidations move into one request snapshot" {
+    var runtime = TranscriptRuntime{ .layout = invalidationTestLayout(), .owned_top_row = 5 };
+    defer runtime.deinit(std.testing.allocator);
+
+    try runtime.recordFrameInvalidation(.{ .reason = .resize, .top = 5, .bottom = 24 });
+    try runtime.recordFrameInvalidation(.{ .reason = .external_clear, .top = 21, .bottom = 24 });
+
+    var attempt = (try runtime.render_requests.beginAttempt()).?;
+    try std.testing.expectEqual(@as(u8, 2), attempt.snapshot.invalidations.len);
+    try std.testing.expectEqual(render_engine.paint_plan.FrameInvalidationReason.resize, attempt.snapshot.invalidations.ranges()[0].reason);
+    try std.testing.expectEqual(render_engine.paint_plan.FrameInvalidationReason.external_clear, attempt.snapshot.invalidations.ranges()[1].reason);
+    attempt.commit(0, render_request.animation_interval_ms, false);
+    try std.testing.expect((try runtime.render_requests.beginAttempt()) == null);
+}
+
+test "recording a frame invalidation schedules request-owned work" {
+    var runtime = TranscriptRuntime{ .layout = invalidationTestLayout(), .owned_top_row = 5 };
+    defer runtime.deinit(std.testing.allocator);
+
+    try runtime.recordFrameInvalidation(.{ .reason = .external_clear, .top = 5, .bottom = 24 });
+
+    try std.testing.expect(runtime.render_requests.hasReason(.external_damage));
+}
+
+test "terminal reset drops stale mid-scrollback footer clear before reanchor" {
+    var metrics: Metrics = .{};
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 36,
+            .cols = 120,
+            .content_bottom = 32,
+            .divider_top_row = 33,
+            .input_row = 34,
+            .divider_bottom_row = 35,
+            .hint_row = 36,
+        },
+        .owned_top_row = 22,
+        .viewport_top_row = 22,
+        .has_painted_transcript = true,
+        .min_visible_viewport_rows = 11,
+    };
+    defer runtime.deinit(std.testing.allocator);
+    runtime.footer_viewport.has_frame = true;
+    runtime.footer_viewport.geometry.top = 25;
+    runtime.footer_viewport.externally_invalidated = true;
+
+    try runtime.recordFrameInvalidation(.{
+        .reason = .external_clear,
+        .top = 25,
+        .bottom = 36,
+    });
+
+    try runtime.requestTerminalReset(&metrics);
+
+    try std.testing.expectEqual(@as(u16, 1), runtime.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 1), runtime.viewport_top_row);
+    try std.testing.expect(!runtime.footer_viewport.has_frame);
+    try std.testing.expect(!runtime.footer_viewport.externally_invalidated);
+
+    const pending = runtime.render_requests.pendingInvalidations();
+    try std.testing.expectEqual(@as(u8, 1), pending.len);
+    try std.testing.expectEqual(
+        render_engine.paint_plan.FrameInvalidationReason.viewport_reanchor,
+        pending.ranges()[0].reason,
+    );
+    try std.testing.expectEqual(@as(u16, 1), pending.ranges()[0].top);
+    try std.testing.expectEqual(@as(u16, 36), pending.ranges()[0].bottom);
+
+    var plan = render_engine.paint_plan.PaintPlan{
+        .layout = runtime.layout,
+        .viewport = .{
+            .top_row = 1,
+            .bottom_row = 3,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = 3,
+            .last_visible_row = 3,
+            .last_visible_row_blank = false,
+            .tail_kind = null,
+            .replaceable_start_row = 1,
+            .split_active = false,
+            .split_prefix_lines = 0,
+            .split_suffix_start_line = 0,
+        },
+        .footer = .{
+            .top = 4,
+            .top_divider = 4,
+            .banner = 4,
+            .banner_active = false,
+            .input_base = 5,
+            .picker_divider = 6,
+            .picker_start = 7,
+            .bottom_divider = 6,
+            .hint = 7,
+            .total_rows = 4,
+        },
+        .activity = .none,
+        .preserved_band = render_engine.paint_plan.FrameBand.empty(.preserved_shell),
+        .transcript_band = .{ .top = 1, .bottom = 3, .owner = .transcript },
+        .blank_band = render_engine.paint_plan.FrameBand.empty(.gap),
+        .activity_band = render_engine.paint_plan.FrameBand.empty(.activity),
+        .footer_gap_band = render_engine.paint_plan.FrameBand.empty(.gap),
+        .footer_band = .{ .top = 4, .bottom = 7, .owner = .footer },
+        .invalidation = pending,
+        .footer_clean_allowed = false,
+        .synchronized_update = false,
+        .cursor_target = null,
+        .footer_reservation_source = .none,
+        .bottom_reserved_rows = 0,
+        .preserve_scrollback = true,
+    };
+    try plan.validate();
+
+    try std.testing.expectError(
+        error.InvalidInvalidationRange,
+        render_engine.paint_plan.validateInvalidationRange(plan, .{
+            .reason = .external_clear,
+            .top = 25,
+            .bottom = 36,
+        }),
+    );
+}
+
+test "marking transcript cache dirty also schedules transcript work" {
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+
+    runtime.markTranscriptDirty();
+
+    try std.testing.expect(runtime.transcript_band_dirty);
+    try std.testing.expect(runtime.render_requests.hasReason(.transcript));
+}
+
+test "frame invalidation overflow collapses to owned band with dominant reason" {
+    var runtime = TranscriptRuntime{ .layout = invalidationTestLayout(), .owned_top_row = 7 };
+    defer runtime.deinit(std.testing.allocator);
+
+    var i: u8 = 0;
+    while (i < render_engine.paint_plan.max_frame_invalidation_ranges) : (i += 1) {
+        const row: u16 = 7 + i;
+        try runtime.recordFrameInvalidation(.{ .reason = .external_clear, .top = row, .bottom = row });
+    }
+    try runtime.recordFrameInvalidation(.{ .reason = .shadow_feed_failure, .top = 12, .bottom = 12 });
+
+    const pending = runtime.render_requests.pendingInvalidations();
+    try std.testing.expectEqual(@as(u8, 1), pending.len);
+    try std.testing.expectEqual(render_engine.paint_plan.FrameInvalidationReason.shadow_feed_failure, pending.ranges()[0].reason);
+    try std.testing.expectEqual(@as(u16, 7), pending.ranges()[0].top);
+    try std.testing.expectEqual(@as(u16, 24), pending.ranges()[0].bottom);
+}
+
+test "preserved row acknowledgment lowers ownership and viewport boundaries" {
+    var runtime = TranscriptRuntime{
+        .layout = invalidationTestLayout(),
+        .owned_top_row = 5,
+        .viewport_top_row = 7,
+    };
+    defer runtime.deinit(std.testing.allocator);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(runtime.layout.rows, runtime.owned_top_row, 2, 0);
+
+    try runtime.ackPreservedRowRelease(scroll_plan, 2);
+
+    try std.testing.expectEqual(@as(u16, 3), runtime.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 5), runtime.viewport_top_row);
+}
+
+test "preserved row acknowledgment applies only committed rows inside the plan" {
+    var partial = TranscriptRuntime{
+        .layout = invalidationTestLayout(),
+        .owned_top_row = 5,
+        .viewport_top_row = 7,
+    };
+    defer partial.deinit(std.testing.allocator);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(partial.layout.rows, partial.owned_top_row, 2, 0);
+
+    try partial.ackPreservedRowRelease(scroll_plan, 1);
+    try std.testing.expectEqual(@as(u16, 4), partial.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 6), partial.viewport_top_row);
+
+    var above_plan = TranscriptRuntime{
+        .layout = invalidationTestLayout(),
+        .owned_top_row = 5,
+        .viewport_top_row = 7,
+    };
+    defer above_plan.deinit(std.testing.allocator);
+    try above_plan.ackPreservedRowRelease(scroll_plan, 20);
+    try std.testing.expectEqual(@as(u16, 3), above_plan.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 5), above_plan.viewport_top_row);
+}
+
+test "preserved row acknowledgment normalizes stale resize boundaries before release" {
+    var full = TranscriptRuntime{
+        .layout = testLayoutWithRows(5),
+        .owned_top_row = 8,
+        .viewport_top_row = 9,
+    };
+    defer full.deinit(std.testing.allocator);
+    const full_plan = render_engine.frame_scroll_plan.merge(full.layout.rows, full.owned_top_row, 4, 0);
+    try full.ackPreservedRowRelease(full_plan, 4);
+    try std.testing.expectEqual(@as(u16, 1), full.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 1), full.viewport_top_row);
+
+    var partial = TranscriptRuntime{
+        .layout = testLayoutWithRows(5),
+        .owned_top_row = 8,
+        .viewport_top_row = 9,
+    };
+    defer partial.deinit(std.testing.allocator);
+    const partial_plan = render_engine.frame_scroll_plan.merge(partial.layout.rows, partial.owned_top_row, 4, 0);
+    try partial.ackPreservedRowRelease(partial_plan, 2);
+    try std.testing.expectEqual(@as(u16, 3), partial.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 3), partial.viewport_top_row);
+}
+
+test "preserved row acknowledgment normalizes shrink boundaries even without accepted release" {
+    var runtime = TranscriptRuntime{
+        .layout = testLayoutWithRows(5),
+        .owned_top_row = 8,
+        .viewport_top_row = 9,
+    };
+    defer runtime.deinit(std.testing.allocator);
+    const scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(runtime.layout.rows, runtime.owned_top_row);
+
+    try runtime.ackPreservedRowRelease(scroll_plan, 0);
+
+    try std.testing.expectEqual(@as(u16, 5), runtime.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 5), runtime.viewport_top_row);
+}
+
+test "preserved row acknowledgment keeps viewport at or below owned top boundary" {
+    var runtime = TranscriptRuntime{
+        .layout = invalidationTestLayout(),
+        .owned_top_row = 5,
+        .viewport_top_row = 2,
+    };
+    defer runtime.deinit(std.testing.allocator);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(runtime.layout.rows, runtime.owned_top_row, 4, 0);
+
+    try runtime.ackPreservedRowRelease(scroll_plan, 4);
+
+    try std.testing.expectEqual(@as(u16, 1), runtime.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 1), runtime.viewport_top_row);
+}
+
+test "transcript runtime owns render request state" {
+    try std.testing.expect(@hasField(TranscriptRuntime, "render_requests"));
+}
+
+test "recovery append prefix requires exact materialized bytes" {
+    const alloc = std.testing.allocator;
+    const receipt_flow = try alloc.dupe(u8, "prefix-good");
+    defer alloc.free(receipt_flow);
+    const receipt = TranscriptRecoveryReceipt{
+        .flow = receipt_flow,
+        .materialized_flow_len = 7,
+    };
+
+    try std.testing.expect(recoveryAppendPrefixMatches("prefix-next", receipt, 7));
+    try std.testing.expect(!recoveryAppendPrefixMatches("prefiy-next", receipt, 7));
+    try std.testing.expect(!recoveryAppendPrefixMatches("short", receipt, 7));
+}
+
+test "measured recovery rebases from accepted projection before retiring resize debt" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "aaaaaaaaaaaaaaaaaaaa\n" ++
+        "bbbbbbbbbbbbbbbbbbbb\n" ++
+        "cccccccccccccccccccc\n" ++
+        "dddddddddddddddddddd\n" ++
+        "eeeeeeeeeeeeeeeeeeee\n" ++
+        "ffffffffffffffffffff\n" ++
+        "gggggggggggggggggggg\n" ++
+        "hhhhhhhhhhhhhhhhhhhh\n";
+    const layout: Layout = .{
+        .rows = 8,
+        .cols = 10,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 7,
+        .hint_row = 8,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .resize_history_row_delta = 2,
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 20,
+        },
+    };
+    defer runtime.deinit(alloc);
+    try runtime.transcript.appendSlice(alloc, flow);
+    runtime.transcript_commit_state = .{ .recovering = .{
+        .accepted_visual_offset = 6,
+        .accepted_history_visual_offset = 6,
+        .attempt_visual_offset = 8,
+        .attempt_total_visual_rows = 8,
+        .materialized_visual_offset = 7,
+        .materialized_visual_rows = 1,
+        .materialized_flow_len = flow.len,
+        .remaining_resize_reflow_rows = 3,
+        .remaining_semantic_rows = 2,
+        .remaining_semantic_progress_rows = 2,
+        .attempt_cols = 20,
+        .projection_rebase_pending = false,
+        .tracks_semantic_progress = true,
+        .flow = try alloc.dupe(u8, flow),
+        .cursor_row = 4,
+        .cursor_col = 1,
+    } };
+    const projection = runtime.measuredResizeProjectionForFlow(flow) orelse
+        return error.TestExpectedMeasuredResizeProjection;
+    switch (projection) {
+        .stable => return error.TestExpectedRecoveringProjection,
+        .recovering => |recovering| {
+            try std.testing.expectEqual(
+                @as(u32, 6),
+                recovering.accepted_visual_offset,
+            );
+            try std.testing.expectEqual(@as(u16, 20), recovering.source_cols);
+        },
+    }
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer prepared.deinit(alloc);
+
+    try std.testing.expectEqual(
+        transcript_painter.MeasuredResizeTargetProvenance.recovering,
+        prepared.measured_resize_target_provenance,
+    );
+    const endpoint = prepared.measured_history_origin.?.endpoint orelse
+        return error.TestExpectedMeasuredHistoryEndpoint;
+    try std.testing.expectEqual(@as(usize, 147), endpoint.flow_offset);
+    try std.testing.expectEqual(
+        @as(u32, 14),
+        visualOffsetForSelection(prepared.sourceVisualRows(), prepared.selection),
+    );
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expectEqual(@as(u16, 0), facts.resize_reflow_rows);
+    try std.testing.expectEqual(@as(u16, 2), facts.semantic_rows);
+    try std.testing.expectEqual(@as(u32, 14), facts.target_visual_offset);
+
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan: render_engine.paint_plan.PaintPlan = .{
+        .layout = runtime.layout,
+        .viewport = prepared.selection,
+        .footer = .{
+            .top = 5,
+            .top_divider = 5,
+            .banner = 5,
+            .banner_active = false,
+            .input_base = 6,
+            .picker_divider = 7,
+            .picker_start = 8,
+            .bottom_divider = 7,
+            .hint = 8,
+            .total_rows = 4,
+        },
+        .activity = .none,
+        .preserved_band = render_engine.paint_plan.FrameBand.empty(.preserved_shell),
+        .transcript_band = .{ .top = 1, .bottom = 4, .owner = .transcript },
+        .activity_band = render_engine.paint_plan.FrameBand.empty(.activity),
+        .footer_band = .{ .top = 5, .bottom = 8, .owner = .footer },
+        .invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+        .footer_clean_allowed = true,
+        .synchronized_update = true,
+        .cursor_target = .{
+            .row = prepared.cursor.cursor_row,
+            .col = prepared.cursor.cursor_col,
+            .visible = true,
+        },
+        .footer_reservation_source = .none,
+        .bottom_reserved_rows = 0,
+        .preserve_scrollback = true,
+    };
+    var transition = try resolveAndSealTranscriptTransitionForRuntimeTest(
+        &runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &transition, .{
+        .bytes_written = 1,
+        .changed_cells = 1,
+        .full_repaint = true,
+        .terminal_scroll_rows_committed = 0,
+        .document_append_committed = false,
+        .committed_cursor_row = transition.cursor_row,
+        .committed_cursor_col = transition.cursor_col,
+        .shadow_state = .committed,
+        .next_invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+    });
+
+    const committed = runtime.transcriptCommitDiagnostic();
+    try std.testing.expectEqual(TranscriptCommitDiagnosticState.recovering, committed.state);
+    try std.testing.expectEqual(@as(u32, 14), committed.visual_offset);
+    switch (runtime.transcript_commit_state) {
+        .recovering => |receipt| {
+            try std.testing.expectEqual(@as(u16, 0), receipt.remaining_resize_reflow_rows);
+            try std.testing.expectEqual(@as(u32, 2), receipt.remaining_semantic_rows);
+        },
+        .invalid, .stable => return error.TestExpectedRecoveringTranscript,
+    }
+
+    runtime.resize_history_row_delta = null;
+    var retry_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer retry_source.deinit(alloc);
+    var retry_prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &retry_source,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer retry_prepared.deinit(alloc);
+    const retry = runtime.planTranscriptScroll(&retry_prepared);
+    try std.testing.expectEqual(@as(u16, 0), retry.resize_reflow_rows);
+    try std.testing.expectEqual(@as(u16, 2), retry.semantic_rows);
+}
+
+test "source rewrite replays unchanged history prefix after footer projection rebase" {
+    const alloc = std.testing.allocator;
+    const target_flow =
+        "rewrite-row-01\nrewrite-row-02\nrewrite-row-03\nrewrite-row-04\n" ++
+        "rewrite-row-05\nrewrite-row-06\nrewrite-row-07\nrewrite-row-08\n" ++
+        "rewrite-row-09\nrewrite-row-10\nrewrite-row-11\nrewrite-row-12\n";
+    const layout: Layout = .{
+        .rows = 8,
+        .cols = 40,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 7,
+        .hint_row = 8,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    var source = try runtime.prepareFullTranscriptViewportSource(
+        alloc,
+        try alloc.dupe(u8, target_flow),
+    );
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer prepared.deinit(alloc);
+
+    const target_offset = visualOffsetForSelection(
+        prepared.sourceVisualRows(),
+        prepared.selection,
+    );
+    try std.testing.expect(target_offset > 5);
+    const history_offset = target_offset - 5;
+    const previous_flow = try alloc.dupe(u8, target_flow);
+    previous_flow[previous_flow.len - 2] = 'X';
+    runtime.transcript_commit_state = .{ .stable = .{
+        .selection = prepared.selection,
+        .visual_offset = target_offset,
+        .history_visual_offset = history_offset,
+        .total_visual_rows = totalVisualRows(prepared.sourceVisualRows()),
+        .flow = previous_flow,
+        .cursor_row = prepared.cursor.cursor_row,
+        .cursor_col = prepared.cursor.cursor_col,
+        .occupied_last_row = prepared.selection.last_visible_row,
+        .occupied_last_row_blank = prepared.selection.last_visible_row_blank,
+        .layout_id = 17,
+        .normal_buffer_recovery_pending = true,
+    } };
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(!facts.source_compatible);
+    try std.testing.expect(facts.recovery_rebase);
+    try std.testing.expectEqual(target_offset, facts.target_visual_offset);
+    try std.testing.expectEqual(target_offset - history_offset, facts.semantic_rows);
+
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan: render_engine.paint_plan.PaintPlan = .{
+        .layout = runtime.layout,
+        .viewport = prepared.selection,
+        .footer = .{
+            .top = 5,
+            .top_divider = 5,
+            .banner = 5,
+            .banner_active = false,
+            .input_base = 6,
+            .picker_divider = 7,
+            .picker_start = 8,
+            .bottom_divider = 7,
+            .hint = 8,
+            .total_rows = 4,
+        },
+        .activity = .none,
+        .preserved_band = render_engine.paint_plan.FrameBand.empty(.preserved_shell),
+        .transcript_band = .{ .top = 1, .bottom = 4, .owner = .transcript },
+        .activity_band = render_engine.paint_plan.FrameBand.empty(.activity),
+        .footer_band = .{ .top = 5, .bottom = 8, .owner = .footer },
+        .invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+        .footer_clean_allowed = true,
+        .synchronized_update = true,
+        .cursor_target = .{
+            .row = prepared.cursor.cursor_row,
+            .col = prepared.cursor.cursor_col,
+            .visible = true,
+        },
+        .footer_reservation_source = .none,
+        .bottom_reserved_rows = 0,
+        .preserve_scrollback = true,
+    };
+    var transition = try resolveAndSealTranscriptTransitionForRuntimeTest(
+        &runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    try std.testing.expect(!transition.document_append.isEmpty());
+    switch (transition.document_append.clear) {
+        .rows => |rows| try std.testing.expectEqual(
+            @as(u16, @intCast(facts.semantic_rows)),
+            rows,
+        ),
+        .remainder => return error.TestExpectedHistoryReplay,
+    }
+}
+
+test "history replay starts at committed source top and follows resize eligibility" {
+    const alloc = std.testing.allocator;
+    const committed_flow =
+        "source-row-01\nsource-row-02\nsource-row-03\nsource-row-04\n";
+    const target_flow = committed_flow ++
+        "target-row-05\ntarget-row-06\ntarget-row-07\ntarget-row-08\n" ++
+        "target-row-09\ntarget-row-10\ntarget-row-11\ntarget-row-12\n";
+    const layout: Layout = .{
+        .rows = 12,
+        .cols = 40,
+        .content_bottom = 8,
+        .divider_top_row = 9,
+        .input_row = 10,
+        .divider_bottom_row = 11,
+        .hint_row = 12,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 5,
+        .viewport_top_row = 5,
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 5,
+            .owned_band = .{ .top = 5, .bottom = 12 },
+            .body_area = .{ .top = 5, .bottom = 8 },
+            .transcript_area = .{ .top = 5, .bottom = 8 },
+            .footer_area = .{ .top = 9, .bottom = 12 },
+            .solved_frame_height = 8,
+            .terminal_rows = 12,
+            .terminal_cols = 40,
+        },
+        .transcript_commit_state = .{ .stable = .{
+            .selection = .{
+                .top_row = 5,
+                .bottom_row = 8,
+                .start_line = 0,
+                .partial_skip_rows = 0,
+                .line_count = 4,
+                .last_visible_row = 8,
+            },
+            .visual_offset = 0,
+            .history_visual_offset = 0,
+            .total_visual_rows = 4,
+            .flow = try alloc.dupe(u8, committed_flow),
+            .cursor_row = 8,
+            .cursor_col = 1,
+            .occupied_last_row = 8,
+            .occupied_last_row_blank = true,
+            .layout_id = 17,
+            .history_catchup_pending = true,
+        } },
+    };
+    defer runtime.deinit(alloc);
+
+    var source = try runtime.prepareFullTranscriptViewportSource(
+        alloc,
+        try alloc.dupe(u8, target_flow),
+    );
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = 8 },
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 1), prepared.projectionArea().top);
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expectEqual(@as(u32, 4), facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 4), facts.planned_rows);
+
+    const append_base = (try runtime.resolveTransitionAppendBase(
+        &prepared,
+        facts,
+        false,
+        source.bytes,
+        facts.target_visual_offset,
+    )) orelse return error.TestExpectedHistoryReplay;
+    try std.testing.expect(append_base.history_replay != null);
+    try std.testing.expectEqual(
+        runtime.committed_frame_layout.transcript_area.top,
+        append_base.cursor_row,
+    );
+    try std.testing.expectEqual(@as(u16, 1), append_base.cursor_col);
+
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        runtime.owned_top_row - 1,
+        facts.planned_rows,
+    );
+    try std.testing.expectEqual(@as(u16, 4), scroll_plan.preserved_release_rows);
+    try std.testing.expectEqual(@as(u16, 8), scroll_plan.terminal_scroll_rows);
+
+    runtime.resize_history_row_delta = 1;
+    const resize_facts = runtime.planTranscriptScroll(&prepared);
+    const resize_append_base = (try runtime.resolveTransitionAppendBase(
+        &prepared,
+        resize_facts,
+        false,
+        source.bytes,
+        resize_facts.target_visual_offset,
+    )) orelse return error.TestExpectedNaturalAppendBase;
+    try std.testing.expect(resize_append_base.history_replay == null);
+}
+
+test "preserved source rewrite holds the normal buffer at committed history" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+        .transcript_commit_state = .{ .stable = .{
+            .selection = .{
+                .top_row = 1,
+                .bottom_row = 4,
+                .start_line = 2,
+                .partial_skip_rows = 0,
+                .line_count = 6,
+                .last_visible_row = 4,
+            },
+            .visual_offset = 5,
+            .history_visual_offset = 2,
+            .total_visual_rows = 6,
+            .flow = try alloc.dupe(u8, "old source\n"),
+            .cursor_row = 4,
+            .cursor_col = 1,
+            .occupied_last_row = 4,
+            .occupied_last_row_blank = false,
+            .layout_id = 17,
+        } },
+    };
+    defer runtime.deinit(alloc);
+
+    runtime.reconcileTranscriptCommitSourceWithRewriteMode(
+        "rewritten source\n",
+        false,
+        "test rewrite",
+        .preserve_same_epoch,
+    );
+
+    switch (runtime.transcript_commit_state) {
+        .stable => |anchor| {
+            try std.testing.expect(anchor.normal_buffer_recovery_pending);
+            try std.testing.expectEqual(
+                anchor.history_visual_offset,
+                committedProjectionVisualOffset(anchor),
+            );
+        },
+        .invalid, .recovering => return error.TestExpectedStableTranscript,
+    }
+}
+
+test "frame scroll commit consumption releases rows before transition advancement" {
+    var runtime = TranscriptRuntime{
+        .layout = testLayoutWithRows(8),
+        .owned_top_row = 4,
+        .viewport_top_row = 4,
+    };
+    defer runtime.deinit(std.testing.allocator);
+
+    const scroll_plan = render_engine.frame_scroll_plan.merge(8, 4, 3, 1);
+    var transition = TranscriptTransition{
+        .scroll_plan = scroll_plan,
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .semantic_rows = 1,
+        .semantic_progress_rows = 1,
+        .target_flow = &.{},
+        .target_cache = .empty,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .layout_id = 18,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 80,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 4,
+            .start_line = 1,
+            .partial_skip_rows = 0,
+            .line_count = 4,
+            .last_visible_row = 4,
+        },
+        .visual_offset = 1,
+        .history_visual_offset = 1,
+        .total_visual_rows = 5,
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 4,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 4,
+    };
+    defer transition.deinit(std.testing.allocator);
+
+    const result = testFrameCommitResult(scroll_plan.terminal_scroll_rows, .committed);
+    runtime.consumeFrameScrollCommit(
+        std.testing.allocator,
+        scroll_plan,
+        result,
+        &transition,
+    );
+
+    try std.testing.expect(transition.consumed);
+    try std.testing.expectEqual(@as(u16, 1), runtime.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 1), runtime.viewport_top_row);
+    const committed = runtime.transcriptCommitDiagnostic();
+    try std.testing.expectEqual(TranscriptCommitDiagnosticState.stable, committed.state);
+    try std.testing.expectEqual(@as(u32, 1), committed.visual_offset);
+}
+
 fn testLayoutWithRows(rows: u16) Layout {
     return .{
         .rows = rows,
@@ -7197,4 +12890,27 @@ fn testLayoutWithRows(rows: u16) Layout {
         .divider_bottom_row = rows,
         .hint_row = rows,
     };
+}
+
+test "notification bell writes standalone BEL bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "notification-bells.log", .{ .read = true });
+    defer file.close(io_mod.getIo());
+
+    var runtime = TranscriptRuntime{ .stdout_file = file };
+    defer runtime.deinit(std.testing.allocator);
+    var metrics: Metrics = .{};
+    runtime.writeNotificationBell(&metrics);
+
+    var bytes: [1]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try file.readPositionalAll(io_mod.getIo(), &bytes, 0),
+    );
+    try std.testing.expectEqualSlices(u8, "\x07", &bytes);
+}
+
+test {
+    _ = @import("runtime_tests.zig");
 }

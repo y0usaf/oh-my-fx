@@ -1,15 +1,15 @@
 {
-  "name": "libohmyfx",
+  "name": "libfx",
   "version": "0.0.0",
-  "description": "Embed O MyFX agents and terminals in JavaScript hosts",
+  "description": "Embed fx agents and terminals in JavaScript hosts",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/y0usaf/oh-my-fx.git",
+    "url": "git+https://github.com/vercel-labs/fx.git",
     "directory": "sdk"
   },
-  "homepage": "https://github.com/y0usaf/oh-my-fx/tree/main/sdk#readme",
-  "bugs": "https://github.com/y0usaf/oh-my-fx/issues",
+  "homepage": "https://github.com/vercel-labs/fx/tree/main/sdk#readme",
+  "bugs": "https://github.com/vercel-labs/fx/issues",
   "scripts": {
     "test:node-wasm": "node tests/test-node-wasm.mjs",
     "test:node-napi": "node tests/test-node-napi.mjs",
@@ -23,14 +23,20 @@
     },
     "./node": "./node.js",
     "./browser": "./browser.js",
-    "./wasm": "./fx-sdk.js"
+    "./wasm": "./fx-sdk.js",
+    "./mcp": "./mcp.js",
+    "./skills": "./skills.js",
+    "./skills/node": "./skills-node.js"
   },
   "files": [
     "browser.js",
     "node.js",
     "fx-sdk.js",
-    "omfx-core.wasm",
-    "omfx-term.wasm",
+    "mcp.js",
+    "skills.js",
+    "skills-node.js",
+    "fx-core.wasm",
+    "fx-term.wasm",
     "*.node",
     "README.md",
     "LICENSE"

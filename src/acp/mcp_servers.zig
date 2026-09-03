@@ -352,6 +352,122 @@ fn parseEnv(alloc: Allocator, env_value: std.json.Value) ParseError![]mcp_contra
     return env;
 }
 
+test "ACP MCP parser owns official stdio request fields" {
+    const alloc = std.testing.allocator;
+    var configs = try parse(alloc,
+        \\{"cwd":"/tmp","mcpServers":[{"name":"fixture","command":"/usr/bin/node","args":["server.mjs","--flag"],"env":[{"name":"TOKEN","value":"secret"}]}]}
+    );
+    defer configs.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), configs.items.items.len);
+    const config = configs.items.items[0];
+    try std.testing.expectEqualStrings("fixture", config.name);
+    try std.testing.expectEqualStrings("/usr/bin/node", try config.stdioCommand());
+    try std.testing.expectEqual(@as(usize, 2), config.args.len);
+    try std.testing.expectEqualStrings("server.mjs", config.args[0]);
+    try std.testing.expectEqualStrings("--flag", config.args[1]);
+    try std.testing.expectEqualStrings("TOKEN", config.env[0].key);
+    try std.testing.expectEqualStrings("secret", config.env[0].value);
+}
+
+test "ACP MCP parser accepts an authoritative empty list" {
+    const alloc = std.testing.allocator;
+    var configs = try parse(alloc, "{\"mcpServers\":[]}");
+    defer configs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), configs.items.items.len);
+}
+
+test "ACP MCP parsers treat an omitted list as authoritative empty" {
+    const alloc = std.testing.allocator;
+    var new_or_load_configs = try parse(alloc, "{}");
+    defer new_or_load_configs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), new_or_load_configs.items.items.len);
+
+    var configs = try parseResume(alloc, "{\"sessionId\":\"session\",\"cwd\":\"/tmp\"}");
+    defer configs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), configs.items.items.len);
+
+    try std.testing.expectError(error.InvalidMcpServers, parseResume(
+        alloc,
+        "{\"sessionId\":\"session\",\"cwd\":\"/tmp\",\"mcpServers\":null}",
+    ));
+}
+
+test "ACP MCP parser rejects malformed required stdio fields" {
+    const cases = [_]struct {
+        json: ?[]const u8,
+        expected: ParseError,
+    }{
+        .{ .json = null, .expected = error.MissingParams },
+        .{ .json = "[]", .expected = error.InvalidParams },
+        .{ .json = "{\"mcpServers\":{}}", .expected = error.InvalidMcpServers },
+        .{ .json = "{\"mcpServers\":[null]}", .expected = error.InvalidMcpServer },
+        .{ .json = "{\"mcpServers\":[{}]}", .expected = error.MissingServerName },
+        .{ .json = "{\"mcpServers\":[{\"name\":\"\"}]}", .expected = error.InvalidServerName },
+        .{ .json = "{\"mcpServers\":[{\"name\":\"x\"}]}", .expected = error.MissingCommand },
+        .{ .json = "{\"mcpServers\":[{\"name\":\"x\",\"command\":\"node\",\"args\":[],\"env\":[]}]}", .expected = error.CommandNotAbsolute },
+        .{ .json = "{\"mcpServers\":[{\"name\":\"x\",\"command\":\"/bin/x\",\"env\":[]}]}", .expected = error.MissingArgs },
+        .{ .json = "{\"mcpServers\":[{\"name\":\"x\",\"command\":\"/bin/x\",\"args\":[1],\"env\":[]}]}", .expected = error.InvalidArgs },
+        .{ .json = "{\"mcpServers\":[{\"name\":\"x\",\"command\":\"/bin/x\",\"args\":[]}]}", .expected = error.MissingEnv },
+        .{ .json = "{\"mcpServers\":[{\"name\":\"x\",\"command\":\"/bin/x\",\"args\":[],\"env\":[{\"name\":\"TOKEN\",\"value\":1}]}]}", .expected = error.InvalidEnv },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, parse(std.testing.allocator, case.json));
+    }
+}
+
+test "ACP MCP parser owns official HTTP request fields" {
+    const alloc = std.testing.allocator;
+    var configs = try parse(
+        alloc,
+        "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"remote\",\"url\":\"https://example.test/mcp\",\"headers\":[{\"name\":\"Authorization\",\"value\":\"Bearer secret\"}]}]}",
+    );
+    defer configs.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), configs.items.items.len);
+    const config = configs.items.items[0];
+    try std.testing.expectEqual(mcp_contract.McpTransport.http, config.transport);
+    try std.testing.expectEqualStrings("remote", config.name);
+    try std.testing.expectEqualStrings("https://example.test/mcp", try config.remoteUrl());
+    try std.testing.expectEqualStrings("Authorization", config.headers[0].name);
+    try std.testing.expectEqualStrings("Bearer secret", config.headers[0].value);
+}
+
+test "ACP MCP parser accepts deprecated SSE without losing identity" {
+    const alloc = std.testing.allocator;
+    var configs = try parse(
+        alloc,
+        "{\"mcpServers\":[{\"type\":\"sse\",\"name\":\"legacy\",\"url\":\"https://example.test/sse\",\"headers\":[{\"name\":\"X-Workspace\",\"value\":\"one\"}]}]}",
+    );
+    defer configs.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), configs.items.items.len);
+    const config = configs.items.items[0];
+    try std.testing.expectEqual(mcp_contract.McpTransport.sse, config.transport);
+    try std.testing.expectEqualStrings("https://example.test/sse", try config.remoteUrl());
+    try std.testing.expectEqualStrings("X-Workspace", config.headers[0].name);
+}
+
+test "ACP MCP parser rejects invalid remote transports" {
+    try std.testing.expectError(
+        error.MissingHeaders,
+        parse(std.testing.allocator, "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"remote\",\"url\":\"https://example.test\"}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidUrl,
+        parse(std.testing.allocator, "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"remote\",\"url\":\"http://example.test\",\"headers\":[]}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidHeaders,
+        parse(std.testing.allocator, "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"remote\",\"url\":\"https://example.test\",\"headers\":[{\"name\":\"Mcp-Method\",\"value\":\"override\"}]}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidHeaders,
+        parse(std.testing.allocator, "{\"mcpServers\":[{\"type\":\"sse\",\"name\":\"remote\",\"url\":\"https://example.test\",\"headers\":[{\"name\":\"MCP-Session-Id\",\"value\":\"override\"}]}]}"),
+    );
+}
+
 fn checkPreparationOwnershipAllocFailures(alloc: Allocator) !void {
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     runtime.* = mcp_runtime.McpRuntime.init(alloc);
@@ -370,4 +486,37 @@ fn checkPreparationOwnershipAllocFailures(alloc: Allocator) !void {
     const taken = preparation.takeRuntime().?;
     taken.deinit();
     alloc.destroy(taken);
+}
+
+test "ACP MCP preparation releases heap runtime ownership on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkPreparationOwnershipAllocFailures,
+        .{},
+    );
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    if (parse(std.testing.allocator, buffer[0..len])) |configs| {
+        var owned = configs;
+        owned.deinit(std.testing.allocator);
+    } else |_| {}
+    if (parseResume(std.testing.allocator, buffer[0..len])) |configs| {
+        var owned = configs;
+        owned.deinit(std.testing.allocator);
+    } else |_| {}
+}
+
+test "ACP MCP parser handles fuzzed request bytes" {
+    try std.testing.fuzz({}, fuzzParse, .{
+        .corpus = &.{
+            "",
+            "{}",
+            "{\"mcpServers\":[]}",
+            "{\"mcpServers\":[{\"name\":\"fixture\",\"command\":\"/bin/echo\",\"args\":[],\"env\":[]}]}",
+            "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"fixture\",\"url\":\"http://localhost:4321/mcp\",\"headers\":[]}]}",
+        },
+    });
 }

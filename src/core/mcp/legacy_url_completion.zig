@@ -133,3 +133,46 @@ pub fn wireCompletionTargetsWaiter(waiter: *const Waiter, completion: WireComple
     }
     return false;
 }
+
+test "legacy URL completion records only a matching live identity" {
+    var completed = [_]bool{false};
+    const ids = [_][]const u8{"elicitation-1"};
+    var waiter = Waiter{
+        .binding = .{
+            .server_name = "fixture",
+            .scope = .{ .operation = .{ .tools_call = "echo" } },
+            .runtime_generation = 1,
+            .connection_generation = 2,
+            .client_generation = 3,
+            .catalog_generation = 4,
+            .request_generation = 5,
+            .auth_generation = 6,
+            .deadline_ms = 100,
+        },
+        .ids = &ids,
+        .completed = &completed,
+    };
+    try std.testing.expect(!apply(&waiter, .{
+        .server_name = "other",
+        .elicitation_id = "elicitation-1",
+        .runtime_generation = 1,
+        .connection_generation = 2,
+        .client_generation = 3,
+        .catalog_generation = 4,
+        .auth_generation = 6,
+    }, 50));
+    try std.testing.expect(apply(&waiter, .{
+        .server_name = "fixture",
+        .elicitation_id = "elicitation-1",
+        .runtime_generation = 1,
+        .connection_generation = 2,
+        .client_generation = 3,
+        .catalog_generation = 4,
+        .auth_generation = 6,
+    }, 50));
+    try std.testing.expect(completed[0]);
+    try std.testing.expectEqual(
+        tool_mcp_runtime.LegacyUrlCompletionStatus.completed,
+        waiter.signal.status.load(.acquire),
+    );
+}

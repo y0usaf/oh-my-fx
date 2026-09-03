@@ -27,3 +27,25 @@ fn validateUnavailable(_: ?*anyopaque, _: Allocator, _: []const u8) Result {
 pub const unavailable_provider = Provider{
     .validate_fn = validateUnavailable,
 };
+
+test "api key validator dispatches through the injected provider" {
+    const Fake = struct {
+        calls: usize = 0,
+
+        fn validate(raw_ctx: ?*anyopaque, _: Allocator, api_key: []const u8) Result {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.calls += 1;
+            return if (std.mem.eql(u8, api_key, "accepted-key")) .accepted else .refused;
+        }
+    };
+
+    var fake: Fake = .{};
+    const provider = Provider{
+        .context = &fake,
+        .validate_fn = Fake.validate,
+    };
+
+    try std.testing.expectEqual(Result.accepted, provider.validate(std.testing.allocator, "accepted-key"));
+    try std.testing.expectEqual(Result.refused, provider.validate(std.testing.allocator, "other-key"));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}

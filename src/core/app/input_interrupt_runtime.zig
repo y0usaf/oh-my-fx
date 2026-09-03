@@ -1,14 +1,78 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const worker_runtime = @import("../agent/worker_runtime.zig");
 const session_runtime = @import("../session/session.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
+
+const CancellationTarget = enum {
+    none,
+    agent_turn,
+    context_compaction,
+};
+
+fn cancellationTarget(
+    stream_active: bool,
+    compaction_status: worker_runtime.ContextCompactionStatus,
+) CancellationTarget {
+    if (stream_active) return .agent_turn;
+    return switch (compaction_status) {
+        .idle => .none,
+        .queued, .running => .context_compaction,
+    };
+}
+
+test "cancellation target distinguishes agent turns and manual compaction" {
+    try std.testing.expectEqual(
+        CancellationTarget.none,
+        cancellationTarget(false, .idle),
+    );
+    try std.testing.expectEqual(
+        CancellationTarget.agent_turn,
+        cancellationTarget(true, .idle),
+    );
+    try std.testing.expectEqual(
+        CancellationTarget.context_compaction,
+        cancellationTarget(false, .queued),
+    );
+    try std.testing.expectEqual(
+        CancellationTarget.context_compaction,
+        cancellationTarget(false, .running),
+    );
+    try std.testing.expectEqual(
+        CancellationTarget.agent_turn,
+        cancellationTarget(true, .running),
+    );
+}
 
 pub fn InterruptRuntime(comptime App: type) type {
     return struct {
         const queue_rt = input_queue_runtime.Runtime(App);
 
+        pub fn hasActiveOperation(app: *App) bool {
+            return activeCancellationTarget(app) != .none;
+        }
+
         pub fn cancelActiveOperation(app: *App) !void {
+            if (activeCancellationTarget(app) == .context_compaction) {
+                if (comptime !@hasDecl(
+                    @TypeOf(app.worker),
+                    "cancelContextCompaction",
+                )) return;
+                const cancelled = app.worker.cancelContextCompaction(
+                    std.heap.c_allocator,
+                );
+                if (!cancelled) return;
+                app.pacer.clear(app.alloc);
+                if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
+                try app.writeDomainNotice(.{
+                    .topic = "context",
+                    .tone = .neutral,
+                    .body = "Context compaction cancelled.",
+                }, true);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             if (!app.stream.active) return;
             // Pending approval keeps the stream active until resolution.
             // Avoid duplicate cancellation notices once the worker is cancelled.
@@ -73,5 +137,45 @@ pub fn InterruptRuntime(comptime App: type) type {
             }
             return shell_runtime.activeToolActivityCount(&app.shell);
         }
+
+        fn activeCancellationTarget(app: *App) CancellationTarget {
+            const status = if (comptime @hasDecl(
+                @TypeOf(app.worker),
+                "contextCompactionStatus",
+            ))
+                app.worker.contextCompactionStatus()
+            else
+                worker_runtime.ContextCompactionStatus.idle;
+            return cancellationTarget(app.stream.active, status);
+        }
     };
+}
+
+test "interactive connectivity wait maps try later to recovery pause" {
+    const FakeWorker = struct {
+        connectivity_wait_active: bool = false,
+        pause_requested: bool = false,
+
+        pub fn isConnectivityWaitActive(self: *const @This()) bool {
+            return self.connectivity_wait_active;
+        }
+
+        pub fn requestRecoveryPause(self: *@This()) void {
+            self.pause_requested = true;
+        }
+    };
+    const FakeApp = struct {
+        stream: struct { active: bool } = .{ .active = true },
+        worker: FakeWorker = .{},
+    };
+
+    var app = FakeApp{};
+    app.worker.connectivity_wait_active = true;
+    try std.testing.expect(InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
+    try std.testing.expect(app.worker.pause_requested);
+
+    app.worker.pause_requested = false;
+    app.worker.connectivity_wait_active = false;
+    try std.testing.expect(!InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
+    try std.testing.expect(!app.worker.pause_requested);
 }

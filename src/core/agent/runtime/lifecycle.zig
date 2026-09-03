@@ -101,6 +101,10 @@ pub const PreparedToolCall = union(enum) {
     }
 };
 
+test "PreparedToolCall exposes only consuming blocked output access" {
+    try std.testing.expect(!@hasDecl(PreparedToolCall, "blockedOutput"));
+}
+
 pub noinline fn prepareToolCallForLifecycle(
     result_allocator: Allocator,
     lifecycle: LifecycleContext,

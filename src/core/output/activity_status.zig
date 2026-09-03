@@ -206,3 +206,244 @@ pub fn appendTokenProgressSuffix(writer: *std.Io.Writer, progress: types.TurnTok
 pub fn appendTurnTokenSuffix(writer: *std.Io.Writer, stream: StreamState) !void {
     try appendTokenProgressSuffix(writer, stream.token_progress);
 }
+
+test "buildTurnLabel returns thinking when no tool activity" {
+    var buf: [32]u8 = undefined;
+    const label = buildTurnLabel(&buf, .{ .active = true }, 0);
+    try std.testing.expectEqualStrings("• Thinking", label.?);
+}
+
+test "buildTurnLabel renders turn token suffix with input only" {
+    var buf: [64]u8 = undefined;
+    const label = buildTurnLabel(&buf, .{
+        .active = true,
+        .token_progress = .{ .input_tokens = 10 },
+    }, 0);
+    try std.testing.expectEqualStrings("• Thinking (↑10 ↓0)", label.?);
+}
+
+test "buildTurnLabel renders turn token suffix with input and output" {
+    var buf: [64]u8 = undefined;
+    const label = buildTurnLabel(&buf, .{
+        .active = true,
+        .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
+    }, 0);
+    try std.testing.expectEqualStrings("• Thinking (↑10 ↓20)", label.?);
+}
+
+test "buildTurnLabel renders elapsed seconds for the running turn" {
+    var buf: [64]u8 = undefined;
+    const label = buildTurnLabel(&buf, .{
+        .active = true,
+        .turn_started_ms = 1_000,
+    }, 6_500);
+    try std.testing.expectEqualStrings("• Thinking (5s)", label.?);
+}
+
+test "buildTurnLabel renders elapsed minutes and seconds for long turns" {
+    var buf: [64]u8 = undefined;
+    // 1080s of blink periods elapsed → 18m0s instead of a raw second count.
+    const label = buildTurnLabel(&buf, .{
+        .active = true,
+        .turn_started_ms = 1_000,
+    }, 1_000 + 1_080 * 1_000);
+    try std.testing.expectEqualStrings("• Thinking (18m0s)", label.?);
+}
+
+test "buildTurnLabel renders elapsed hours for very long turns" {
+    var buf: [64]u8 = undefined;
+    // 3663s → 1h1m3s.
+    const label = buildTurnLabel(&buf, .{
+        .active = true,
+        .turn_started_ms = 1_000,
+    }, 1_000 + 3_663 * 1_000);
+    try std.testing.expectEqualStrings("• Thinking (1h1m3s)", label.?);
+}
+
+test "buildTurnLabel renders elapsed seconds before the token suffix" {
+    var buf: [64]u8 = undefined;
+    const label = buildTurnLabel(&buf, .{
+        .active = true,
+        .turn_started_ms = 1_000,
+        .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
+    }, 13_000);
+    try std.testing.expectEqualStrings("• Thinking (12s) (↑10 ↓20)", label.?);
+}
+
+test "activity blink relights exactly when the seconds digit advances" {
+    const stream: StreamState = .{ .active = true, .turn_started_ms = 1_000 };
+    try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(stream, 1_000));
+    try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(stream, 1_499));
+    try std.testing.expectEqual(@as(?bool, false), activityBlinkVisible(stream, 1_500));
+    try std.testing.expectEqual(@as(?bool, false), activityBlinkVisible(stream, 1_999));
+    try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(stream, 2_000));
+
+    var label_buf: [64]u8 = undefined;
+    const at_relight = buildTurnLabel(&label_buf, stream, 2_000).?;
+    try std.testing.expectEqualStrings("• Thinking (1s)", at_relight);
+}
+
+test "activity blink has no clock without a running turn" {
+    try std.testing.expectEqual(@as(?bool, null), activityBlinkVisible(.{ .active = true }, 5_000));
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        activityBlinkVisible(.{ .active = true, .turn_started_ms = 6_000 }, 5_000),
+    );
+}
+
+test "turn clock freezes while waiting on user input and excludes the wait" {
+    var stream: StreamState = .{ .active = true, .turn_started_ms = 1_000 };
+    var buf: [64]u8 = undefined;
+
+    syncWaitingClock(&stream, true, 5_000);
+    try std.testing.expectEqual(@as(i64, 5_000), stream.waiting_since_ms);
+
+    try std.testing.expectEqualStrings("• Thinking (4s)", buildTurnLabel(&buf, stream, 900_000).?);
+    try std.testing.expectEqual(@as(?bool, true), activityBlinkVisible(stream, 900_000));
+
+    syncWaitingClock(&stream, false, 900_000);
+    try std.testing.expectEqual(@as(i64, 0), stream.waiting_since_ms);
+    try std.testing.expectEqualStrings("• Thinking (4s)", buildTurnLabel(&buf, stream, 900_000).?);
+    try std.testing.expectEqualStrings("• Thinking (7s)", buildTurnLabel(&buf, stream, 903_000).?);
+}
+
+test "waiting clock accumulates across repeated prompts in one turn" {
+    var stream: StreamState = .{ .active = true, .turn_started_ms = 0 };
+    syncWaitingClock(&stream, true, 1_000);
+    syncWaitingClock(&stream, false, 9_000);
+    try std.testing.expectEqual(@as(i64, 0), stream.turn_started_ms);
+    try std.testing.expectEqual(@as(i64, 0), stream.waiting_since_ms);
+
+    stream = .{ .active = true, .turn_started_ms = 1_000 };
+    syncWaitingClock(&stream, true, 2_000);
+    syncWaitingClock(&stream, false, 10_000);
+    syncWaitingClock(&stream, true, 11_000);
+    syncWaitingClock(&stream, false, 20_000);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("• Thinking (2s)", buildTurnLabel(&buf, stream, 20_000).?);
+}
+
+test "waiting clock does not start without an active stream" {
+    var stream: StreamState = .{ .active = false };
+    syncWaitingClock(&stream, true, 5_000);
+    try std.testing.expectEqual(@as(i64, 0), stream.waiting_since_ms);
+}
+
+test "buildTurnLabel hides elapsed seconds when the clock runs behind the mark" {
+    var buf: [64]u8 = undefined;
+    const label = buildTurnLabel(&buf, .{
+        .active = true,
+        .turn_started_ms = 2_000,
+    }, 1_000);
+    try std.testing.expectEqualStrings("• Thinking", label.?);
+}
+
+test "buildCompletedTurnLabel renders token progress without approximation markers" {
+    var buf: [64]u8 = undefined;
+    const label = buildCompletedTurnLabel(&buf, .{
+        .active = true,
+        .token_progress = .{
+            .input_tokens = 1_500,
+            .output_tokens = 20,
+            .input_exact = false,
+            .output_exact = false,
+        },
+    });
+    try std.testing.expectEqualStrings("  (↑1.5k ↓20)", label);
+}
+
+test "buildCompletedTurnLabel holds the marker column before the first usage report" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("  ", buildCompletedTurnLabel(&buf, .{ .active = true }));
+}
+
+test "buildTurnLabel returns null when tool activity is set" {
+    var buf: [32]u8 = undefined;
+    const label = buildTurnLabel(&buf, .{ .active = true, .last_activity_kind = .write }, 0);
+    try std.testing.expect(label == null);
+}
+
+test "buildThinkingLabelFull renders ordered activity counts" {
+    var buf: [256]u8 = undefined;
+    const label = buildThinkingLabelFull(&buf, .{
+        .active = true,
+        .last_activity_kind = .list,
+        .read_count = 2,
+        .list_count = 3,
+        .write_count = 4,
+        .edit_count = 5,
+        .command_count = 6,
+        .subagent_count = 7,
+        .open_count = 8,
+    });
+
+    try std.testing.expectEqualStrings(
+        "listing | 2 files read, 3 directories listed, 4 files wrote, 5 files edited, 6 commands started, 7 subagents created, 8 files opened",
+        label,
+    );
+}
+
+test "buildProgressLabel surfaces active phase and command count" {
+    var buf: [256]u8 = undefined;
+    const label = buildProgressLabel(&buf, .{
+        .active = true,
+        .last_activity_kind = .command,
+        .command_count = 1,
+    });
+
+    try std.testing.expectEqualStrings("running | 1 command started", label.?);
+}
+
+test "buildProgressLabel keeps ask status semantic" {
+    var buf: [256]u8 = undefined;
+    const label = buildProgressLabel(&buf, .{
+        .active = true,
+        .last_activity_kind = .ask,
+    });
+
+    try std.testing.expectEqualStrings("asking", label.?);
+}
+
+test "buildProgressLabel appends turn token suffix after activity list" {
+    var buf: [256]u8 = undefined;
+    const label = buildProgressLabel(&buf, .{
+        .active = true,
+        .last_activity_kind = .list,
+        .read_count = 2,
+        .list_count = 3,
+        .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
+    });
+
+    try std.testing.expectEqualStrings("listing | 2 files read, 3 directories listed (↑10 ↓20)", label.?);
+}
+
+test "buildProgressLabel keeps worst case activity and token suffix within buffer" {
+    var buf: [256]u8 = undefined;
+    const label = buildProgressLabel(&buf, .{
+        .active = true,
+        .last_activity_kind = .command,
+        .read_count = 9,
+        .list_count = 9,
+        .write_count = 9,
+        .edit_count = 9,
+        .command_count = 9,
+        .subagent_count = 9,
+        .open_count = 9,
+        .token_progress = .{ .input_tokens = 999_999, .output_tokens = 999_999 },
+    });
+
+    try std.testing.expect(std.mem.find(u8, label.?, "(↑999k ↓999k)") != null);
+    try std.testing.expect(!std.mem.eql(u8, label.?, "running"));
+}
+
+test "token progress suffix abbreviates values without exactness markers" {
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try appendTokenProgressSuffix(&out, .{
+        .input_tokens = 50_000,
+        .output_tokens = 1_250,
+        .input_exact = true,
+        .output_exact = false,
+    });
+    try std.testing.expectEqualStrings(" (↑50k ↓1.2k)", out.buffered());
+}

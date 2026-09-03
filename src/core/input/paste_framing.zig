@@ -353,6 +353,298 @@ fn ownerLabel(owner: Owner) []const u8 {
     };
 }
 
+test "authorization code paste zeroes retained capacity after handling and reset" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+
+    state.begin(.auth_code, 64);
+    for ("temporary-code") |byte| try state.consumeByte(std.testing.allocator, byte);
+    try std.testing.expect(state.buffer.capacity > 0);
+    try std.testing.expectEqual(@as(u8, 't'), state.buffer.allocatedSlice()[0]);
+    state.beginHandling();
+    state.finishSecretHandled();
+    for (state.buffer.allocatedSlice()) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    state.begin(.auth_code, 64);
+    for ("second-code") |byte| try state.consumeByte(std.testing.allocator, byte);
+    state.resetSecretWithTrace(.session_reset);
+    for (state.buffer.allocatedSlice()) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "decision paste counts content bytes and exact end marker only" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.decision_prompt, std.math.maxInt(usize));
+
+    for ("abc") |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    for (paste_end_marker[0 .. paste_end_marker.len - 1]) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    try state.consumeByte(std.testing.allocator, paste_end_marker[paste_end_marker.len - 1]);
+    try std.testing.expectEqual(@as(usize, 3), state.decision_bytes);
+    try std.testing.expectEqual(Owner.decision_prompt, state.owner);
+    try std.testing.expectEqual(BoundaryState.end_candidate, state.boundary);
+    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+}
+
+test "decision paste treats incomplete and parameterized end candidates as content" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.decision_prompt, std.math.maxInt(usize));
+
+    const payload = "\x1b[20\x1b[201;1~x";
+    for (payload) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    for (paste_end_marker) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqual(payload.len, state.decision_bytes);
+    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+}
+
+test "composer paste preserves safe bytes and tracks bounded overflow" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.composer, 3);
+
+    for ("abcd\x01") |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    for (paste_end_marker) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqualStrings("abc", state.buffer.items);
+    try std.testing.expectEqual(@as(usize, 1), state.overflow_bytes);
+    try std.testing.expectEqual(@as(usize, 4), state.attemptedBytes());
+}
+
+test "composer overflow excludes a possible exact end marker" {
+    var exact: State = .{};
+    defer exact.deinit(std.testing.allocator);
+    exact.begin(.composer, 1);
+
+    try exact.consumeByte(std.testing.allocator, 'x');
+    for (paste_end_marker[0 .. paste_end_marker.len - 1]) |byte| {
+        try exact.consumeByte(std.testing.allocator, byte);
+        try std.testing.expectEqual(@as(usize, 0), exact.confirmedOverflowBytes());
+    }
+    try exact.consumeByte(std.testing.allocator, paste_end_marker[paste_end_marker.len - 1]);
+    try std.testing.expectEqual(@as(usize, 0), exact.confirmedOverflowBytes());
+
+    var mismatch: State = .{};
+    defer mismatch.deinit(std.testing.allocator);
+    mismatch.begin(.composer, 1);
+
+    try mismatch.consumeByte(std.testing.allocator, 'x');
+    for ("\x1b[20x") |byte| {
+        try mismatch.consumeByte(std.testing.allocator, byte);
+    }
+    try std.testing.expect(mismatch.confirmedOverflowBytes() > 0);
+}
+
+test "composer overflow rejection takes precedence over an unsafe suffix" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.composer, 1);
+
+    for ("xy") |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    for (paste_end_marker) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    try state.consumeByte(std.testing.allocator, 'z');
+
+    try std.testing.expectEqual(BoundaryState.unsafe, state.boundary);
+    try std.testing.expect(state.confirmedOverflowBytes() > 0);
+    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+}
+
+test "discarding remainder preserves buffered bytes and end-marker progress" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.composer, std.math.maxInt(usize));
+
+    try state.consumeByte(std.testing.allocator, 'x');
+    try state.consumeByte(std.testing.allocator, 0x1b);
+    state.continueDiscarding();
+    for (paste_end_marker[1..]) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+
+    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+    try std.testing.expectEqualStrings("x", state.buffer.items);
+    try std.testing.expectEqual(@as(usize, 0), state.decision_bytes);
+}
+
+test "begin handling makes framing inactive and retains captured bytes" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.composer, std.math.maxInt(usize));
+    try state.buffer.appendSlice(std.testing.allocator, "captured");
+    state.end_match_len = 2;
+
+    state.beginHandling();
+
+    try std.testing.expect(!state.active());
+    try std.testing.expectEqualStrings("captured", state.buffer.items);
+    try std.testing.expectEqual(@as(usize, 0), state.end_match_len);
+}
+
+test "question and approval paste keep their owner-specific safe bytes" {
+    var question: State = .{};
+    defer question.deinit(std.testing.allocator);
+    question.begin(.question_freeform, std.math.maxInt(usize));
+    for ("one\r\ttwo\x03" ++ paste_end_marker) |byte| {
+        try question.consumeByte(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqualStrings("one\r two", question.buffer.items);
+
+    var amendment: State = .{};
+    defer amendment.deinit(std.testing.allocator);
+    amendment.begin(.approval_amendment, std.math.maxInt(usize));
+    const payload = "pasted amendment marker " ++
+        "\\x1b[200~" ++
+        "\x1b[200~" ++
+        "\x1b[201;1~" ++
+        "\t\r\x03";
+    for (payload ++ paste_end_marker) |byte| {
+        try amendment.consumeByte(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqualStrings(
+        "pasted amendment marker \\x1b[200~[200~[201;1~\t\r",
+        amendment.buffer.items,
+    );
+}
+
+test "capturing remains active when a delivery epoch ends before the marker" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.composer, std.math.maxInt(usize));
+    try state.consumeByte(std.testing.allocator, 'x');
+
+    try std.testing.expect(state.active());
+    try std.testing.expectEqual(BoundaryState.capturing, state.boundary);
+    try std.testing.expectEqual(Settlement.none, state.settleDeliveryEpoch());
+}
+
+test "end candidate stays paste owned until delivery epoch settlement" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.composer, std.math.maxInt(usize));
+    for ("safe" ++ paste_end_marker) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+
+    try std.testing.expect(state.active());
+    try std.testing.expectEqualStrings("safe", state.buffer.items);
+    try std.testing.expectEqual(BoundaryState.end_candidate, state.boundary);
+    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+}
+
+test "any same-epoch suffix makes the candidate sticky unsafe" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.composer, std.math.maxInt(usize));
+    for ("safe" ++ paste_end_marker) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    try state.consumeByte(std.testing.allocator, '\r');
+    for (paste_end_marker) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+
+    try std.testing.expect(state.active());
+    try std.testing.expectEqualStrings("safe", state.buffer.items);
+    try std.testing.expectEqual(BoundaryState.unsafe, state.boundary);
+    try std.testing.expectEqual(@as(usize, 1 + paste_end_marker.len), state.unsafe_suffix_bytes);
+    try std.testing.expectEqual(Settlement.reject, state.settleDeliveryEpoch());
+}
+
+test "traced reset reports dropped captures and clears only paste state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "paste-reset.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var decision: State = .{};
+    defer decision.deinit(alloc);
+    decision.begin(.decision_prompt, std.math.maxInt(usize));
+    decision.resetWithTrace(.session_reset);
+
+    var composer: State = .{};
+    defer composer.deinit(alloc);
+    composer.begin(.composer, std.math.maxInt(usize));
+    try composer.buffer.appendSlice(alloc, "buffered");
+    composer.resetWithTrace(.shutdown);
+
+    var stale: State = .{};
+    defer stale.deinit(alloc);
+    stale.decision_bytes = 3;
+    try stale.buffer.appendSlice(alloc, "old");
+    stale.resetWithTrace(.new_paste_stale_state);
+
+    var failed: State = .{};
+    defer failed.deinit(alloc);
+    try failed.buffer.appendSlice(alloc, "pending");
+    failed.resetWithTrace(.{ .finalize_failed = .{
+        .owner = .composer,
+        .error_name = "OutOfMemory",
+    } });
+
+    debug_trace.shutdown();
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "decision prompt paste dropped bytes=0 reason=session_reset") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "composer paste dropped bytes=8 reason=shutdown") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "decision prompt paste dropped bytes=3 reason=new_paste_stale_state") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "composer paste dropped bytes=3 reason=new_paste_stale_state") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "composer paste dropped bytes=7 reason=finalize_failed error=OutOfMemory") != null);
+}
+
+test "deinit traces an active capture once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "paste-deinit.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    {
+        var decision: State = .{};
+        decision.begin(.decision_prompt, std.math.maxInt(usize));
+        decision.deinit(alloc);
+    }
+
+    {
+        var composer: State = .{};
+        composer.begin(.composer, std.math.maxInt(usize));
+        try composer.buffer.appendSlice(alloc, "pending");
+        composer.deinit(alloc);
+    }
+
+    debug_trace.shutdown();
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "decision prompt paste dropped bytes=0 reason=shutdown"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "composer paste dropped bytes=7 reason=shutdown"));
+}
+
 fn readTraceFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());

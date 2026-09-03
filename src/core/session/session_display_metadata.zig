@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
 
@@ -78,7 +79,6 @@ fn firstPromptCandidate(history: []const session.HistoryTurn) ?PromptCandidate {
     for (history) |turn| {
         switch (turn) {
             .assistant => |entry| if (promptCandidateFromUser(entry.user)) |candidate| return candidate,
-            .background_command => |entry| if (promptCandidateFromUser(entry.user)) |candidate| return candidate,
             .interrupted => |entry| if (promptCandidateFromUser(entry.user)) |candidate| return candidate,
             .compacted_summary => {},
         }
@@ -88,9 +88,26 @@ fn firstPromptCandidate(history: []const session.HistoryTurn) ?PromptCandidate {
 
 fn promptCandidateFromUser(user: session.UserTurn) ?PromptCandidate {
     const trimmed = std.mem.trim(u8, user.text, " \t\r\n");
+    if (isCanonicalImageOnlyText(user.text, user.images)) return .image_only;
     if (trimmed.len > 0 and !isSlashCommandOnly(trimmed)) return .{ .text = user.text };
     if (user.images.len > 0) return .image_only;
     return null;
+}
+
+fn isCanonicalImageOnlyText(text: []const u8, images: []const session.ImageAttachment) bool {
+    if (images.len == 0) return false;
+
+    var text_offset: usize = 0;
+    for (images, 0..) |image, index| {
+        if (index > 0) {
+            if (text_offset >= text.len or text[text_offset] != '\n') return false;
+            text_offset += 1;
+        }
+        const placeholder = image_attachments.matchImagePlaceholder(text, text_offset) orelse return false;
+        if (placeholder.id != image.id) return false;
+        text_offset += placeholder.length;
+    }
+    return text_offset == text.len;
 }
 
 fn isSlashCommandOnly(trimmed: []const u8) bool {
@@ -280,6 +297,148 @@ fn optionalStringDup(alloc: Allocator, maybe_value: ?std.json.Value) !?[]u8 {
         },
         else => return error.InvalidDisplayMetadata,
     }
+}
+
+test "display metadata derives capped title from first prompt line and bounded preview" {
+    const alloc = std.testing.allocator;
+    const history = [_]session.HistoryTurn{
+        makeAssistantTurn(
+            "one two three four five six seven eight nine ten\nsecond line kept\nthird line dropped",
+        ),
+    };
+
+    var metadata = try deriveFromHistory(alloc, &history);
+    defer metadata.deinit(alloc);
+
+    try std.testing.expect(metadata.present);
+    try std.testing.expectEqualStrings("one two three four five six seven eight", metadata.title);
+    try std.testing.expectEqualStrings(
+        "one two three four five six seven eight nine ten\nsecond line kept",
+        metadata.preview.?,
+    );
+}
+
+test "display metadata byte-caps a single-token title" {
+    const alloc = std.testing.allocator;
+    const long_token = "x" ** 512;
+    const history = [_]session.HistoryTurn{makeAssistantTurn(long_token)};
+
+    var metadata = try deriveFromHistory(alloc, &history);
+    defer metadata.deinit(alloc);
+
+    try std.testing.expect(metadata.present);
+    try std.testing.expectEqual(max_title_bytes, metadata.title.len);
+}
+
+test "display metadata falls back for empty or non-text initial history" {
+    const alloc = std.testing.allocator;
+    var no_history = try deriveFromHistory(alloc, &.{});
+    defer no_history.deinit(alloc);
+    try std.testing.expect(!no_history.present);
+    try std.testing.expectEqualStrings("Untitled session", no_history.title);
+
+    const empty_history = [_]session.HistoryTurn{
+        makeAssistantTurn("   \n\t"),
+    };
+
+    var metadata = try deriveFromHistory(alloc, &empty_history);
+    defer metadata.deinit(alloc);
+
+    try std.testing.expect(metadata.present);
+    try std.testing.expectEqualStrings("Untitled session", metadata.title);
+    try std.testing.expect(metadata.preview == null);
+}
+
+test "display metadata skips slash-only turns and handles image-only sessions" {
+    const alloc = std.testing.allocator;
+    const slash_then_prompt = [_]session.HistoryTurn{
+        makeAssistantTurn("/resume"),
+        makeAssistantTurn("real prompt title"),
+    };
+
+    var metadata = try deriveFromHistory(alloc, &slash_then_prompt);
+    defer metadata.deinit(alloc);
+    try std.testing.expect(metadata.present);
+    try std.testing.expectEqualStrings("real prompt title", metadata.title);
+
+    const image = session.ImageAttachment{
+        .path = @constCast("/tmp/image.png"),
+        .media_type = @constCast("image/png"),
+    };
+    var images = [_]session.ImageAttachment{image};
+    const image_only = [_]session.HistoryTurn{
+        makeAssistantTurnWithImages("", images[0..]),
+    };
+
+    var image_metadata = try deriveFromHistory(alloc, &image_only);
+    defer image_metadata.deinit(alloc);
+    try std.testing.expect(image_metadata.present);
+    try std.testing.expectEqualStrings("Image session", image_metadata.title);
+    try std.testing.expect(image_metadata.preview == null);
+}
+
+test "display metadata treats canonical image placeholders as image-only syntax" {
+    const alloc = std.testing.allocator;
+    const first = session.ImageAttachment{
+        .id = 7,
+        .path = @constCast("/tmp/first.png"),
+        .media_type = @constCast("image/png"),
+    };
+    const second = session.ImageAttachment{
+        .id = 9,
+        .path = @constCast("/tmp/second.png"),
+        .media_type = @constCast("image/png"),
+    };
+    var images = [_]session.ImageAttachment{ first, second };
+
+    const image_only = [_]session.HistoryTurn{
+        makeAssistantTurnWithImages("[Image #7]\n[Image #9]", images[0..]),
+    };
+    var image_metadata = try deriveFromHistory(alloc, &image_only);
+    defer image_metadata.deinit(alloc);
+    try std.testing.expectEqualStrings(image_title, image_metadata.title);
+    try std.testing.expect(image_metadata.preview == null);
+
+    const mixed = [_]session.HistoryTurn{
+        makeAssistantTurnWithImages("Describe [Image #7]", images[0..1]),
+    };
+    var mixed_metadata = try deriveFromHistory(alloc, &mixed);
+    defer mixed_metadata.deinit(alloc);
+    try std.testing.expectEqualStrings("Describe [Image #7]", mixed_metadata.title);
+
+    const mismatched = [_]session.HistoryTurn{
+        makeAssistantTurnWithImages("[Image #8]", images[0..1]),
+    };
+    var mismatched_metadata = try deriveFromHistory(alloc, &mismatched);
+    defer mismatched_metadata.deinit(alloc);
+    try std.testing.expectEqualStrings("[Image #8]", mismatched_metadata.title);
+}
+
+test "display metadata sidecar round trips and invalid sidecar falls back" {
+    const alloc = std.testing.allocator;
+    const source = DisplayMetadata{
+        .present = true,
+        .title = @constCast("Plan release notes"),
+        .preview = @constCast("Plan release notes\nship checklist"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+    };
+
+    const bytes = try encodeSidecar(alloc, source);
+    defer alloc.free(bytes);
+
+    var decoded = try decodeSidecar(alloc, bytes);
+    defer decoded.deinit(alloc);
+
+    try std.testing.expect(decoded.present);
+    try std.testing.expectEqualStrings("Plan release notes", decoded.title);
+    try std.testing.expectEqualStrings("Plan release notes\nship checklist", decoded.preview.?);
+    try std.testing.expectEqualStrings("/tmp/origin", decoded.origin_workspace_root.?);
+
+    var fallback = try decodeSidecarOrFallback(alloc, "{\"schema_version\":1,\"title\":42}");
+    defer fallback.deinit(alloc);
+    try std.testing.expect(!fallback.present);
+    try std.testing.expectEqualStrings("Untitled session", fallback.title);
+    try std.testing.expect(fallback.preview == null);
 }
 
 fn makeAssistantTurn(text: []const u8) session.HistoryTurn {

@@ -171,20 +171,6 @@ pub const top_level_specs = [_]TopLevelSpec{
         .options = &.{json_option},
     },
     .{
-        .kind = .background,
-        .token = "background",
-        .usage = "background [last|<id>] [--json]",
-        .summary = "List or inspect background commands",
-        .options = &.{
-            .{ .flag = "last", .description = "Inspect the most recent background command" },
-            .{ .flag = "<id>", .description = "Inspect a background command by id" },
-            json_option,
-        },
-        .details = &.{
-            "With no target, lists the persisted background command history.",
-        },
-    },
-    .{
         .kind = .teams,
         .token = "teams",
         .usage = "teams",
@@ -193,7 +179,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] [--record] | session resume --id <id> [--record] | session migrate <id>|--id <id> [--allow-large] [--json] | session recover <id>|--id <id> [--json]",
+        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] | session resume --id <id> | session migrate <id>|--id <id> [--allow-large] [--json] | session recover <id>|--id <id> [--json]",
         .summary = "Inspect, resume, migrate, or recover saved sessions",
         .options = &.{
             .{ .flag = "last", .description = "Inspect the current workspace session" },
@@ -222,14 +208,13 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "resume",
         .aliases = &.{ "--resume", "--resume-last", "--continue", "-c", "-r" },
         .hidden_from_top_level_help = true,
-        .usage = "session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>",
+        .usage = "session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>",
         .summary = "Continue a saved interactive session",
         .options = &.{
             .{ .flag = "-r", .description = "Choose the session to resume from a picker" },
             .{ .flag = "last", .description = "Resume the most recent session" },
             .{ .flag = "<id>", .description = "Resume a session by id" },
             .{ .flag = "--id <id>", .description = "Resume a session by exact id" },
-            .{ .flag = "--record", .description = "Capture visible terminal content while running" },
         },
     },
     .{
@@ -269,6 +254,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "replay",
         .usage = "replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]",
         .summary = "Replay a recorded terminal session",
+        .hidden_from_top_level_help = true,
         .options = &.{
             .{ .flag = "--frames", .description = "Render each captured frame" },
             .{ .flag = "--golden <path>", .description = "Write the final rendered grid to a file" },
@@ -304,7 +290,6 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .pr, .usage = "pr [context]" },
         .{ .kind = .issue, .usage = "issue [context]" },
-        .{ .kind = .background, .usage = "background [last|<id>]" },
     } },
     .{ .entries = &.{
         .{ .kind = .sessions, .usage = "sessions" },
@@ -312,35 +297,34 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
         .{ .usage = "session migrate <id>", .summary = "Migrate a saved session to the current format" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
-        .{ .kind = .replay, .usage = "replay <tape>" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok]" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]" },
-        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>" },
-        .{ .kind = .setup, .usage = "setup" },
-        .{ .kind = .teams, .usage = "teams" },
-        .{ .kind = .credits, .usage = "credits|balance" },
-        .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]" },
+        .{ .kind = .login, .usage = "login [vercel|codex|grok]", .summary = "Sign in to a model provider" },
+        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
+        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>", .summary = "Choose the active model provider" },
+        .{ .kind = .models, .usage = "models" },
+    } },
+    .{ .entries = &.{
+        .{ .kind = .setup, .usage = "setup", .summary = "Configure a Vercel AI Gateway API key" },
+        .{ .kind = .teams, .usage = "teams", .summary = "Choose a Vercel AI Gateway team" },
+        .{ .kind = .credits, .usage = "credits|balance", .summary = "Show Vercel AI Gateway credits" },
+    } },
+    .{ .entries = &.{
+        .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]", .summary = "Show locally recorded token usage and spend" },
     } },
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
-        .{ .kind = .models, .usage = "models" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
-        .{ .kind = .upgrade, .usage = "upgrade" },
+        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },
 };
 
 pub const top_level_flags = [_]TopLevelFlag{
-    .{
-        .usage = "--record",
-        .description = "Record terminal output",
-    },
     .{
         .usage = "--context-limit <spec>",
         .description = "Set name=bytes|off; repeatable",
@@ -379,7 +363,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "-v, --version",
-        .description = "Print the 𝒇x version and exit",
+        .description = "Print the fx version and exit",
     },
 };
 
@@ -391,19 +375,19 @@ pub const top_level_examples = [_]TopLevelExample{
 };
 
 pub const top_level_notes = [_][]const u8{
-    "Run `fx <command> --help` for command-specific options and examples.",
+    "Run `fx <command> --help` for command-specific usage and options.",
     "Run `/help` inside an interactive session for slash commands.",
 };
 
 pub const top_level_resources = [_]TopLevelResource{
-    .{ .label = "Learn more about 𝒇x:", .value = "https://fx.sh/docs", .link = true },
-    .{ .label = "Report a problem:", .value = "run `/feedback` inside 𝒇x" },
+    .{ .label = "Learn more about fx:", .value = "https://fx.sh/docs", .link = true },
+    .{ .label = "Report a problem:", .value = "run `/feedback` inside fx" },
 };
 
 pub const top_level_registry = TopLevelRegistry{
     .specs = top_level_specs[0..],
     .description = "Fast, native coding agent for the terminal.",
-    .interactive_hint = "𝒇x starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
+    .interactive_hint = "fx starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
     .help_groups = top_level_help_groups[0..],
     .flags = top_level_flags[0..],
     .examples = top_level_examples[0..],
@@ -437,22 +421,18 @@ pub fn topLevelUsage(kind: TopLevelKind) []const u8 {
 
 pub const slash_specs = [_]SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general, .show_in_welcome = true },
-    .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "start a fresh session and keep background processes", .presentation_category = .general, .show_in_welcome = true },
+    .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "start a fresh conversation while keeping managed processes", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .new_session, .command = "/new", .help_entry = "/new", .completion_description = "start a fresh session", .presentation_category = .session, .show_in_welcome = true },
     .{ .kind = .reset_session, .command = "/reset", .help_entry = "/reset", .completion_description = "reset the current session context", .presentation_category = .session },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
-    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose Vercel or Codex sign-in", .presentation_category = .account },
+    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
-    .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "manage accounts and AI Gateway access", .presentation_category = .account },
+    .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .help_entry = "/provider (/setup)", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },
-    .{ .kind = .background, .command = "/background", .help_entry = "/background [open|logs|stop <id|last>]", .completion_description = "inspect background command history", .presentation_category = .agents, .show_in_welcome = true, .has_args = true },
-    .{ .kind = .background_stop, .command = "/background stop", .accepts_payload = true },
-    .{ .kind = .background_open, .command = "/background open", .accepts_payload = true },
-    .{ .kind = .background_logs, .command = "/background logs", .accepts_payload = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
@@ -464,7 +444,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
     .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace", .presentation_category = .product },
-    .{ .kind = .compact, .command = "/compact", .help_entry = "/compact", .completion_description = "compact older conversation turns", .presentation_category = .session },
+    .{ .kind = .compact, .command = "/compact", .help_entry = "/compact", .completion_description = "summarize context into a fresh window", .presentation_category = .session },
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .alias, .command = "/alias", .aliases = &.{}, .help_entry = "/alias [name] [command]", .completion_description = "show alias availability", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
@@ -533,3 +513,101 @@ pub const allowlistArgCompletionPrefix = command_specs.allowlistArgCompletionPre
 pub const statuslineArgCompletionPrefix = command_specs.statuslineArgCompletionPrefix;
 pub const notificationsArgCompletionPrefix = command_specs.notificationsArgCompletionPrefix;
 pub const permissionsArgCompletionPrefix = command_specs.permissionsArgCompletionPrefix;
+
+test "built-in slash commands register exact active order" {
+    const expected_commands = [_][]const u8{
+        "/help",
+        "/clear",
+        "/new",
+        "/reset",
+        "/resume",
+        "/continue",
+        "/rename",
+        "/login",
+        "/logout",
+        "/provider",
+        "/stats",
+        "/usage",
+        "/status",
+        "/image",
+        "/images",
+        "/model",
+        "/permissions",
+        "/allowlist",
+        "/undo",
+        "/mcp",
+        "/skills",
+        "/copy",
+        "/feedback",
+        "/trace",
+        "/compact",
+        "/settings",
+        "/alias",
+        "/credits",
+        "/paste",
+        "/fast",
+        "/statusline",
+        "/sound",
+        "/workspace",
+        "/version",
+        "/quit",
+    };
+
+    try std.testing.expectEqual(expected_commands.len, slash_specs.len);
+    for (expected_commands, slash_specs) |expected, spec| {
+        try std.testing.expectEqualStrings(expected, spec.command);
+    }
+}
+
+test "built-in slash registry resolves primary commands and aliases" {
+    const image = slash_registry.lookup("/img") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(SlashKind.image, image.kind);
+
+    const usage = slash_registry.lookup("/usage") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(SlashKind.usage, usage.kind);
+
+    const quit = slash_registry.matchExact("/exit\t") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(SlashKind.quit, quit.command.kind);
+    try std.testing.expectEqualStrings("/exit", quit.token);
+
+    const model = command_specs.matchedSlashPrefix(slash_registry, "/model\tmodel-id", .model) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/model", model);
+
+    const credits = slash_registry.lookup("/credits") orelse return error.TestExpectedEqual;
+    try std.testing.expect(credits.requires_prompt_credential);
+
+    const model_command = slash_registry.lookup("/model") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!model_command.requires_prompt_credential);
+    try std.testing.expect(slash_registry.lookup("/models") == null);
+
+    try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
+}
+
+test "retired appearance slash commands are not registered" {
+    try std.testing.expect(!isExactSlashCommand("/appearance"));
+    try std.testing.expect(!isExactSlashCommand("/input"));
+    try std.testing.expect(!isExactSlashCommand("/maxxing\t"));
+    try std.testing.expect(!isExactSlashCommand("/input lines"));
+    try std.testing.expect(!isExactSlashCommand("/unknown"));
+}
+
+test "built-in paste completion describes clipboard image attachment" {
+    const completion = nthSlashCompletion("/pas", 0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/paste", completion);
+
+    const description = nthSlashCompletionDescription("/pas", 0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("attach an image from the clipboard when supported", description);
+}
+
+test "built-in statusline help and completion include workspace" {
+    const help = try renderSlashHelp(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+    try std.testing.expect(
+        std.mem.find(u8, help, "/statusline [context|session|workspace]") != null,
+    );
+
+    try std.testing.expectEqualStrings(
+        "/statusline workspace",
+        nthSlashCompletion("/statusline w", 0).?,
+    );
+}

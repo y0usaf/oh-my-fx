@@ -2,6 +2,7 @@ const std = @import("std");
 const stream_provider = @import("../agent/stream_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const types = @import("../shared/types.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const generation_usage_provider = @import("../session/generation_usage_provider.zig");
 const gateway_provider = @import("gateway_provider.zig");
@@ -23,6 +24,7 @@ pub const Bundle = struct {
     };
 
     capabilities: Capabilities = .{},
+    compaction_model: ?[]const u8 = null,
     presentation: ?*const provider_catalog.Entry = null,
     auth_strategy: ?AuthStrategy = null,
     fallback_model_capabilities_fn: *const fn ([]const u8) model_capabilities.Capabilities = emptyModelCapabilities,
@@ -43,6 +45,16 @@ pub const Bundle = struct {
     }
 };
 
+pub const CompactionRouteDecision = union(enum) {
+    ready: model_provider.ProviderSelection,
+    unavailable: UnavailableReason,
+
+    pub const UnavailableReason = enum {
+        missing_policy,
+        unauthorized_credential,
+    };
+};
+
 fn emptyModelCapabilities(_: []const u8) model_capabilities.Capabilities {
     return .{};
 }
@@ -60,6 +72,19 @@ pub const Set = struct {
         };
     }
 
+    pub fn compactionRoute(
+        self: Set,
+        provider: model_provider.ProviderId,
+        credential_source: ?types.CredentialSource,
+    ) CompactionRouteDecision {
+        const model = self.select(provider).compaction_model orelse
+            return .{ .unavailable = .missing_policy };
+        if (!model_provider.authorizesCredential(provider, credential_source)) {
+            return .{ .unavailable = .unauthorized_credential };
+        }
+        return .{ .ready = .{ .provider = provider, .model = model } };
+    }
+
     pub fn deferredUsageProviders(self: Set) generation_usage_provider.Set {
         return .{
             .gateway = self.gateway.deferred_usage,
@@ -75,4 +100,124 @@ pub fn gateway_only(gateway: Bundle) Set {
         .codex = .{},
         .grok = .{},
     };
+}
+
+test "provider set selects each provider's complete route" {
+    var gateway_tag: u8 = 0;
+    var codex_tag: u8 = 0;
+    var grok_tag: u8 = 0;
+
+    const Fake = struct {
+        fn cli_catalog(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: gateway_provider.CliModelCatalogInput,
+        ) gateway_provider.CliModelCatalogResult {
+            return .{ .failure = .{
+                .access = .init(.{ .public_only = .no_credential }),
+                .anonymous_fallback_used = false,
+                .failure = .{ .category = .runtime },
+            } };
+        }
+
+        fn model_catalog_fetch(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: model_catalog.FetchInput,
+        ) Allocator.Error!model_catalog.ProviderResult {
+            return .{ .catalog = .empty };
+        }
+
+        fn review(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: auto_classifier.ProviderInput,
+            _: auto_classifier.ReviewRequest,
+        ) anyerror!auto_classifier.ParseOutcome {
+            return .{ .invalid = .provider_failed };
+        }
+    };
+
+    const gateway = Bundle{
+        .capabilities = .{ .fx_search = true, .vision_fallback = true },
+        .presentation = provider_catalog.find(.gateway),
+        .auth_strategy = .vercel,
+        .agent_stream = stream_provider.Provider{
+            .context = &gateway_tag,
+            .stream_fn = stream_provider.unavailable_provider.stream_fn,
+        },
+        .cli_model_catalog = .{ .context = &gateway_tag, .fetch_fn = Fake.cli_catalog },
+        .model_catalog = .{ .context = &gateway_tag, .fetch_fn = Fake.model_catalog_fetch },
+        .permission_reviewer = .{ .context = &gateway_tag, .review_fn = Fake.review },
+        .deferred_usage = generation_usage_provider.unavailable_provider,
+    };
+    const codex = Bundle{
+        .agent_stream = stream_provider.Provider{
+            .context = &codex_tag,
+            .stream_fn = stream_provider.unavailable_provider.stream_fn,
+        },
+        .cli_model_catalog = .{ .context = &codex_tag, .fetch_fn = Fake.cli_catalog },
+        .model_catalog = .{ .context = &codex_tag, .fetch_fn = Fake.model_catalog_fetch },
+        .permission_reviewer = .{ .context = &codex_tag, .review_fn = Fake.review },
+    };
+    const grok = Bundle{
+        .agent_stream = stream_provider.Provider{
+            .context = &grok_tag,
+            .stream_fn = stream_provider.unavailable_provider.stream_fn,
+        },
+        .cli_model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.cli_catalog },
+        .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
+        .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
+    };
+    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok };
+
+    try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
+    try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
+    try std.testing.expect(providers.select(.gateway).capabilities.vision_fallback);
+    try std.testing.expect(providers.select(.gateway).deferred_usage != null);
+    try std.testing.expectEqualStrings("vercel", providers.select(.gateway).presentation.?.slug);
+    try std.testing.expectEqual(Bundle.AuthStrategy.vercel, providers.select(.gateway).auth_strategy.?);
+    try std.testing.expect(!providers.select(.codex).capabilities.fx_search);
+    try std.testing.expect(providers.select(.codex).deferred_usage == null);
+    try std.testing.expect(providers.select(.gateway).cli_model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
+    try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+    try std.testing.expect(providers.select(.grok).permission_reviewer.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
+    try std.testing.expect(providers.select(.codex).agent_stream_or_unavailable().context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+
+    providers.codex.model_catalog = null;
+    try std.testing.expect(providers.select(.codex).model_catalog == null);
+    try std.testing.expect(providers.select(.gateway).model_catalog != null);
+}
+
+test "provider compaction route preserves provider and credential authority" {
+    const routes = Set{
+        .gateway = .{ .compaction_model = "openai/gpt-5.6-luna" },
+        .codex = .{ .compaction_model = "gpt-5.6-luna" },
+        .grok = .{ .compaction_model = "grok-4.5" },
+    };
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        source: types.CredentialSource,
+        model: []const u8,
+    }{
+        .{ .provider = .gateway, .source = .ai_gateway_api_key, .model = "openai/gpt-5.6-luna" },
+        .{ .provider = .codex, .source = .chatgpt_subscription, .model = "gpt-5.6-luna" },
+        .{ .provider = .grok, .source = .grok_subscription, .model = "grok-4.5" },
+    };
+    for (cases) |case| {
+        const route = routes.compactionRoute(case.provider, case.source);
+        try std.testing.expectEqual(case.provider, route.ready.provider);
+        try std.testing.expectEqualStrings(case.model, route.ready.model);
+    }
+
+    try std.testing.expectEqual(
+        CompactionRouteDecision.UnavailableReason.unauthorized_credential,
+        routes.compactionRoute(.codex, .ai_gateway_api_key).unavailable,
+    );
+    var missing = routes;
+    missing.grok.compaction_model = null;
+    try std.testing.expectEqual(
+        CompactionRouteDecision.UnavailableReason.missing_policy,
+        missing.compactionRoute(.grok, .grok_subscription).unavailable,
+    );
 }

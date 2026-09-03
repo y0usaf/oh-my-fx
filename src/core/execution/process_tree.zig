@@ -1,9 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
-const max_darwin_process_fds: usize = std.c.OPEN_MAX;
 
 const DarwinPipeIdentity = struct {
     handle: u64,
@@ -19,6 +19,7 @@ const DarwinPipeIdentity = struct {
 pub const DarwinProcessWitness = struct {
     supervisor_fd: ?std.posix.fd_t,
     child_fd: ?std.posix.fd_t,
+    descendant_fd: std.posix.fd_t,
     identity: DarwinPipeIdentity,
 
     pub fn init() !DarwinProcessWitness {
@@ -35,6 +36,7 @@ pub const DarwinProcessWitness = struct {
         return .{
             .supervisor_fd = pipe[0],
             .child_fd = pipe[1],
+            .descendant_fd = darwin_process_spawn.inherited_fd_target(pipe[1]),
             .identity = try captureDarwinPipeIdentity(std.c.getpid(), pipe[1]),
         };
     }
@@ -84,6 +86,7 @@ const ProcessSnapshot = struct {
     parent_pid: std.posix.pid_t,
     parent_unique_id: ?u64 = null,
     started_at_us: ?u64 = null,
+    zombie: bool = false,
 };
 
 pub const DeliverySummary = struct {
@@ -120,8 +123,8 @@ pub const Tracker = struct {
     processes: std.ArrayList(TrackedProcess) = .empty,
     macos_child_buffer: []std.posix.pid_t = &.{},
     macos_pid_buffer: []std.posix.pid_t = &.{},
-    macos_fd_buffer: []Darwin.ProcFdInfo = &.{},
     darwin_process_witness: ?DarwinPipeIdentity = null,
+    darwin_process_witness_fd: ?std.posix.fd_t = null,
     macos_root_started_at_us: ?u64 = null,
 
     pub fn init(alloc: Allocator) !Tracker {
@@ -158,7 +161,6 @@ pub const Tracker = struct {
         if (self.macos_pid_buffer.len > 0) {
             self.alloc.free(self.macos_pid_buffer);
         }
-        if (self.macos_fd_buffer.len > 0) self.alloc.free(self.macos_fd_buffer);
         self.* = undefined;
     }
 
@@ -168,6 +170,7 @@ pub const Tracker = struct {
     ) void {
         if (comptime builtin.os.tag != .macos) return;
         self.darwin_process_witness = witness.identity;
+        self.darwin_process_witness_fd = witness.descendant_fd;
     }
 
     pub fn refresh(self: *Tracker, root_pid: std.posix.pid_t) !void {
@@ -322,6 +325,7 @@ pub const Tracker = struct {
             return;
         };
         if (!process.identity.eql(actual.identity)) return;
+        if (actual.zombie) return;
         const process_group = switch (Effects.processGroup(process.pid)) {
             .found => |value| value,
             .vanished => return,
@@ -345,12 +349,12 @@ pub const Tracker = struct {
         if (self.root) |root| {
             const actual: ?ProcessSnapshot = captureSnapshot(self.alloc, root.pid) catch null;
             if (actual) |snapshot| {
-                if (root.identity.eql(snapshot.identity)) return true;
+                if (root.identity.eql(snapshot.identity) and snapshotIsAlive(snapshot)) return true;
             }
         }
         for (self.processes.items) |process| {
             const actual = captureSnapshot(self.alloc, process.pid) catch continue;
-            if (process.identity.eql(actual.identity)) return true;
+            if (process.identity.eql(actual.identity) and snapshotIsAlive(actual)) return true;
         }
         return false;
     }
@@ -503,30 +507,9 @@ pub const Tracker = struct {
     fn processHasBoundWitness(self: *Tracker, pid: std.posix.pid_t) !bool {
         if (comptime builtin.os.tag != .macos) return false;
         const expected = self.darwin_process_witness orelse return false;
-        if (self.macos_fd_buffer.len == 0) {
-            self.macos_fd_buffer = try self.alloc.alloc(
-                Darwin.ProcFdInfo,
-                max_darwin_process_fds,
-            );
-        }
-        const read_len = Darwin.proc_pidinfo(
-            pid,
-            Darwin.proc_pid_list_fds,
-            0,
-            self.macos_fd_buffer.ptr,
-            @intCast(self.macos_fd_buffer.len * @sizeOf(Darwin.ProcFdInfo)),
-        );
-        if (read_len <= 0) return false;
-        const fd_count = @min(
-            @as(usize, @intCast(read_len)) / @sizeOf(Darwin.ProcFdInfo),
-            self.macos_fd_buffer.len,
-        );
-        for (self.macos_fd_buffer[0..fd_count]) |fd| {
-            if (fd.proc_fd < 0 or fd.proc_fdtype != Darwin.prox_fd_type_pipe) continue;
-            const actual = captureDarwinPipeIdentity(pid, fd.proc_fd) catch continue;
-            if (expected.eql(actual)) return true;
-        }
-        return false;
+        const fd = self.darwin_process_witness_fd orelse return false;
+        const actual = captureDarwinPipeIdentity(pid, fd) catch return false;
+        return expected.eql(actual);
     }
 
     fn containsMacOSUniqueId(self: *Tracker, unique_id: u64) bool {
@@ -682,6 +665,155 @@ fn openLinuxProcFile(path: []const u8) !?std.Io.File {
     };
 }
 
+test "Linux proc helpers treat missing process data as vanished" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try std.testing.expect(
+        (try openLinuxProcDir("/proc/self/fx-process-tree-missing")) == null,
+    );
+    try std.testing.expect(
+        (try openLinuxProcFile("/proc/self/fx-process-tree-missing")) == null,
+    );
+}
+
+test "process-group exclusion preserves the captured command grace" {
+    try std.testing.expect(shouldSignalProcess(41, null));
+    try std.testing.expect(!shouldSignalProcess(41, 41));
+    try std.testing.expect(shouldSignalProcess(42, 41));
+    try std.testing.expect(!shouldSignalProcess(null, 41));
+}
+
+test "stale process identities cannot become traversal roots" {
+    try std.testing.expect(shouldTraverseParent(
+        .{ .linux_start_ticks = 41 },
+        .{ .linux_start_ticks = 41 },
+    ));
+    try std.testing.expect(!shouldTraverseParent(
+        .{ .linux_start_ticks = 41 },
+        .{ .linux_start_ticks = 42 },
+    ));
+    try std.testing.expect(!shouldTraverseParent(
+        .{ .linux_start_ticks = 41 },
+        .{ .macos_unique_id = 41 },
+    ));
+}
+
+test "child admission binds the observed process to its expected parent" {
+    const snapshot = ProcessSnapshot{
+        .identity = .{ .linux_start_ticks = 42 },
+        .parent_pid = 17,
+    };
+    try std.testing.expect(snapshotBelongsToParent(snapshot, 17));
+    try std.testing.expect(!snapshotBelongsToParent(snapshot, 18));
+}
+
+test "macOS lineage identity matches only the same unique process" {
+    try std.testing.expect(identityHasMacOSUniqueId(
+        .{ .macos_unique_id = 42 },
+        42,
+    ));
+    try std.testing.expect(!identityHasMacOSUniqueId(
+        .{ .macos_unique_id = 42 },
+        43,
+    ));
+    try std.testing.expect(!identityHasMacOSUniqueId(
+        .{ .linux_start_ticks = 42 },
+        42,
+    ));
+}
+
+test "checked signal delivery distinguishes vanished stale and failed targets" {
+    const FakeEffects = struct {
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            return switch (pid) {
+                11 => error.ProcessNotFound,
+                12 => error.ProcessIdentityUnavailable,
+                13 => .{
+                    .identity = .{ .linux_start_ticks = 113 },
+                    .parent_pid = 1,
+                },
+                else => .{
+                    .identity = .{ .linux_start_ticks = @intCast(pid) },
+                    .parent_pid = 1,
+                },
+            };
+        }
+
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            return switch (pid) {
+                14 => .vanished,
+                15 => .unavailable,
+                16 => .{ .found = 41 },
+                else => .{ .found = pid + 100 },
+            };
+        }
+
+        fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+            return switch (pid) {
+                17 => error.PermissionDenied,
+                18 => error.ProcessNotFound,
+                else => {},
+            };
+        }
+    };
+
+    var tracker = Tracker{ .alloc = std.testing.allocator };
+    defer tracker.deinit();
+    for (10..19) |pid| {
+        try tracker.processes.append(std.testing.allocator, .{
+            .pid = @intCast(pid),
+            .identity = .{ .linux_start_ticks = pid },
+        });
+    }
+
+    const summary = tracker.signalProcessesWith(
+        std.posix.SIG.TERM,
+        41,
+        FakeEffects,
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.delivered);
+    try std.testing.expect(summary.incomplete);
+}
+
+test "checked signal delivery keeps vanished stale and excluded targets complete" {
+    const FakeEffects = struct {
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            if (pid == 21) return error.ProcessNotFound;
+            return .{
+                .identity = .{ .linux_start_ticks = if (pid == 22) 122 else @as(u64, @intCast(pid)) },
+                .parent_pid = 1,
+            };
+        }
+
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            return switch (pid) {
+                23 => .vanished,
+                else => .{ .found = 41 },
+            };
+        }
+
+        fn send(_: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+            return;
+        }
+    };
+
+    var tracker = Tracker{ .alloc = std.testing.allocator };
+    defer tracker.deinit();
+    for (21..25) |pid| {
+        try tracker.processes.append(std.testing.allocator, .{
+            .pid = @intCast(pid),
+            .identity = .{ .linux_start_ticks = pid },
+        });
+    }
+
+    const summary = tracker.signalProcessesWith(
+        std.posix.SIG.TERM,
+        41,
+        FakeEffects,
+    );
+    try std.testing.expectEqual(@as(usize, 0), summary.delivered);
+    try std.testing.expect(!summary.incomplete);
+}
+
 fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
     return switch (builtin.os.tag) {
         .linux => try captureLinuxSnapshot(alloc, pid),
@@ -704,7 +836,9 @@ fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot
     var fields = std.mem.tokenizeScalar(u8, stat[close_paren + 1 ..], ' ');
     var field_number: usize = 3;
     var parent_pid: ?std.posix.pid_t = null;
+    var zombie = false;
     while (fields.next()) |field| : (field_number += 1) {
+        if (field_number == 3) zombie = field.len == 1 and field[0] == 'Z';
         if (field_number == 4) {
             parent_pid = std.fmt.parseInt(std.posix.pid_t, field, 10) catch
                 return error.ProcessIdentityUnavailable;
@@ -716,6 +850,7 @@ fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot
                 .identity = .{ .linux_start_ticks = start_ticks },
                 .parent_pid = parent_pid orelse
                     return error.ProcessIdentityUnavailable,
+                .zombie = zombie,
             };
         }
     }
@@ -773,21 +908,28 @@ fn captureMacOSSnapshot(pid: std.posix.pid_t) !ProcessSnapshot {
             info.pbi_start_tvsec,
             info.pbi_start_tvusec,
         ),
+        .zombie = info.pbi_status == Darwin.process_status_zombie,
     };
+}
+
+pub fn processIsAlive(alloc: Allocator, pid: std.posix.pid_t) !bool {
+    const snapshot = captureSnapshot(alloc, pid) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return err,
+    };
+    return snapshotIsAlive(snapshot);
+}
+
+fn snapshotIsAlive(snapshot: ProcessSnapshot) bool {
+    return !snapshot.zombie;
 }
 
 const Darwin = struct {
     // Stable libproc process-identity flavor; the SDK omits this constant from
     // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
-    const proc_pid_list_fds: c_int = 1;
     const proc_pid_fd_pipe_info: c_int = 6;
-    const prox_fd_type_pipe: u32 = 6;
-
-    const ProcFdInfo = extern struct {
-        proc_fd: i32,
-        proc_fdtype: u32,
-    };
+    const process_status_zombie: u32 = 5;
 
     const ProcFileInfo = extern struct {
         fi_openflags: u32,
@@ -896,3 +1038,34 @@ const Darwin = struct {
         buffersize: c_int,
     ) c_int;
 };
+
+test "tracked identity distinguishes process instances" {
+    const linux = Identity{ .linux_start_ticks = 42 };
+    try std.testing.expect(linux.eql(.{ .linux_start_ticks = 42 }));
+    try std.testing.expect(!linux.eql(.{ .linux_start_ticks = 43 }));
+    try std.testing.expect(!linux.eql(.{ .macos_unique_id = 42 }));
+}
+
+test "zombie snapshots are terminal process state" {
+    const live = ProcessSnapshot{
+        .identity = .{ .linux_start_ticks = 1 },
+        .parent_pid = 1,
+    };
+    var zombie = live;
+    zombie.zombie = true;
+    try std.testing.expect(snapshotIsAlive(live));
+    try std.testing.expect(!snapshotIsAlive(zombie));
+}
+
+test "Darwin witness scan excludes processes older than command root" {
+    try std.testing.expect(couldBelongByStart(null, null));
+    try std.testing.expect(!couldBelongByStart(100, null));
+    try std.testing.expect(!couldBelongByStart(100, 99));
+    try std.testing.expect(couldBelongByStart(100, 100));
+    try std.testing.expect(couldBelongByStart(100, 101));
+    try std.testing.expectEqual(@as(u64, 2_000_003), darwinStartTimeUs(2, 3));
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        darwinStartTimeUs(std.math.maxInt(u64), 1),
+    );
+}

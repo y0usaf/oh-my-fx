@@ -772,10 +772,10 @@ fn formatDirectResult(
     stderr_bytes: usize,
     duration_ms: u64,
 ) !command_contract.RunCommandResult {
-    return command_contract.formatForegroundCommandResult(alloc, .{
+    return command_contract.formatCommandResult(alloc, .{
         .command = plan.command,
         .cwd = plan.cwd,
-        .status = foregroundCommandStatusFromTerm(term),
+        .status = commandStatusFromTerm(term),
         .stdout_display = stdout_projected,
         .stderr_display = stderr_projected,
         .stdout_bytes = stdout_bytes,
@@ -784,12 +784,241 @@ fn formatDirectResult(
     });
 }
 
-fn foregroundCommandStatusFromTerm(term: std.process.Child.Term) command_contract.ForegroundCommandStatus {
+fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandStatus {
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
         .signal => |sig| .{ .signal = @intFromEnum(sig) },
         else => .finished,
     };
+}
+
+fn projectForTest(alloc: std.mem.Allocator, chunks: []const []const u8) ![]u8 {
+    var projector: DirectOutputProjector = .{};
+    var projected: std.ArrayList(u8) = .empty;
+    errdefer projected.deinit(alloc);
+    for (chunks) |chunk| try projector.push(alloc, chunk, &projected);
+    try projector.finish(alloc, &projected);
+    return projected.toOwnedSlice(alloc);
+}
+
+test "direct projector renders terminal controls invalid bytes and split utf8 visibly" {
+    const chunks = [_][]const u8{
+        "ok\n\x00\x07\x08\x09\x0d\x1b\x7f",
+        "\xc2",
+        "\x85",
+        "\xe2\x82",
+        "\xac",
+        "\xff\xf0\x9f",
+    };
+    const projected = try projectForTest(std.testing.allocator, &chunks);
+    defer std.testing.allocator.free(projected);
+
+    try std.testing.expectEqualStrings(
+        "ok\n\\x00\\x07\\x08\\x09\\x0d\\x1b\\x7f\\u{0085}\u{20ac}\\xff\\xf0\\x9f",
+        projected,
+    );
+    try std.testing.expect(std.unicode.utf8ValidateSlice(projected));
+}
+
+test "direct projector covers every c0 byte del and preserves non-control utf8" {
+    var raw: [128]u8 = undefined;
+    var len: usize = 0;
+    for (0..32) |byte| {
+        raw[len] = @intCast(byte);
+        len += 1;
+    }
+    raw[len] = 0x7f;
+    len += 1;
+    const suffix = "ASCII \u{00e9} \u{1f642}\n";
+    @memcpy(raw[len .. len + suffix.len], suffix);
+    len += suffix.len;
+
+    const projected = try projectForTest(std.testing.allocator, &.{raw[0..len]});
+    defer std.testing.allocator.free(projected);
+    try std.testing.expect(std.mem.find(u8, projected, "\\x00") != null);
+    try std.testing.expect(std.mem.find(u8, projected, "\\x1f") != null);
+    try std.testing.expect(std.mem.find(u8, projected, "\\x7f") != null);
+    try std.testing.expect(std.mem.find(u8, projected, "ASCII \u{00e9} \u{1f642}\n") != null);
+    try std.testing.expect(projected.len <= raw[0..len].len * 4);
+}
+
+test "direct output budget admits whole chunks and trips exactly once" {
+    var budget: DirectOutputBudget = .{ .limit = 8 };
+    try std.testing.expectEqual(
+        DirectOutputBudget.Charge{ .admit_chunk = true, .trip_owner = false },
+        budget.charge(4),
+    );
+    try std.testing.expectEqual(@as(usize, 4), budget.remaining());
+    try std.testing.expectEqual(
+        DirectOutputBudget.Charge{ .admit_chunk = true, .trip_owner = false },
+        budget.charge(4),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining());
+    try std.testing.expectEqual(
+        DirectOutputBudget.Charge{ .admit_chunk = false, .trip_owner = true },
+        budget.charge(1),
+    );
+    try std.testing.expectEqual(
+        DirectOutputBudget.Charge{ .admit_chunk = false, .trip_owner = false },
+        budget.charge(1),
+    );
+    try std.testing.expectEqual(@as(usize, 8), budget.admitted);
+}
+
+test "direct output budget synchronizes concurrent producers and has one trip owner" {
+    var budget: DirectOutputBudget = .{ .limit = 16 };
+    var trip_owners = std.atomic.Value(usize).init(0);
+    const Producer = struct {
+        fn run(shared_budget: *DirectOutputBudget, owners: *std.atomic.Value(usize)) void {
+            const charge = shared_budget.charge(1);
+            if (charge.trip_owner) _ = owners.fetchAdd(1, .seq_cst);
+        }
+    };
+    var threads: [32]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Producer.run, .{ &budget, &trip_owners });
+    }
+    for (threads) |thread| thread.join();
+
+    try std.testing.expectEqual(@as(usize, 16), budget.admitted);
+    try std.testing.expect(budget.tripped);
+    try std.testing.expectEqual(@as(usize, 1), trip_owners.load(.seq_cst));
+}
+
+test "direct termination arbiter gives cancellation and timeout precedence" {
+    var output = DirectOutput.init(std.testing.allocator, .{
+        .max_command_output_bytes = 1,
+    });
+    defer output.deinit();
+
+    var cancel = std.atomic.Value(bool).init(true);
+    var cancelled: SharedExecution = .{
+        .cfg = .{
+            .max_command_output_bytes = 1,
+            .cancel_flag = &cancel,
+        },
+        .budget = .{ .limit = 1 },
+        .output = &output,
+    };
+    cancelled.commit(.output_limit, error.DirectOutputLimitExceeded);
+    try std.testing.expectEqual(error.Cancelled, cancelled.failure().?);
+
+    var timed_out: SharedExecution = .{
+        .cfg = .{
+            .max_command_output_bytes = 1,
+            .timeout_ms = 1,
+            .timeout_started_ms = io_mod.milliTimestamp() - 10,
+        },
+        .budget = .{ .limit = 1 },
+        .output = &output,
+    };
+    timed_out.commit(.output_failure, error.BrokenPipe);
+    try std.testing.expectEqual(error.TimeoutExpired, timed_out.failure().?);
+
+    var first_failure: SharedExecution = .{
+        .cfg = .{
+            .max_command_output_bytes = 1,
+        },
+        .budget = .{ .limit = 1 },
+        .output = &output,
+    };
+    first_failure.commit(.output_limit, error.DirectOutputLimitExceeded);
+    first_failure.commit(.output_failure, error.BrokenPipe);
+    try std.testing.expectEqual(error.DirectOutputLimitExceeded, first_failure.failure().?);
+}
+
+test "direct executor runs fixed argv with sanitized environment and no artifact" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const argv = [_][]const u8{"/usr/bin/env"};
+    const stages = [_]command_effect.DirectStage{.{
+        .executable = "/usr/bin/env",
+        .argv = &argv,
+        .environment_profile = .basic_read_only,
+    }};
+    const result = executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, .{
+        .command = "/usr/bin/env",
+        .cwd = "/tmp",
+        .stages = &stages,
+    }) catch |err| {
+        std.debug.print("sanitized environment execution failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(std.mem.find(u8, result.output, "PATH=/usr/bin:/bin") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "LC_ALL=C") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "LANG=C") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "HOME=") == null);
+    try std.testing.expectEqual(@as(?[]const u8, null), result.command_result.?.output_file);
+}
+
+test "git direct profile removes ambient authority and disables optional mutation" {
+    var environment = try environmentForProfile(std.testing.allocator, .git_read_only);
+    defer environment.deinit();
+
+    try std.testing.expectEqualStrings("/usr/bin:/bin", environment.get("PATH").?);
+    try std.testing.expectEqualStrings("1", environment.get("GIT_CONFIG_NOSYSTEM").?);
+    try std.testing.expectEqualStrings("/dev/null", environment.get("GIT_CONFIG_GLOBAL").?);
+    try std.testing.expectEqualStrings("0", environment.get("GIT_OPTIONAL_LOCKS").?);
+    try std.testing.expectEqualStrings("0", environment.get("GIT_TERMINAL_PROMPT").?);
+    try std.testing.expectEqualStrings("cat", environment.get("GIT_PAGER").?);
+    try std.testing.expect(environment.get("HOME") == null);
+}
+
+test "direct executor runs a supported pipeline and reports final output" {
+    var admission = try command_effect.plan(
+        std.testing.allocator,
+        "printf x | wc -c",
+        "/tmp",
+        false,
+        @import("builtin").os.tag,
+    );
+    defer admission.deinit(std.testing.allocator);
+    const plan = admission.direct_read_only;
+
+    const result = executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, plan) catch |err| {
+        std.debug.print("pipeline execution failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(std.mem.find(u8, result.output, "<stdout>\n1\n</stdout>") != null);
+    const foreground = result.command_result.?;
+    try std.testing.expectEqualStrings("printf x | wc -c", foreground.command);
+    try std.testing.expectEqual(@as(?i64, 0), foreground.exit_code);
+    const expected_stdout_bytes: usize = if (builtin.os.tag == .linux) 2 else 9;
+    try std.testing.expectEqual(expected_stdout_bytes, foreground.stdout_bytes);
+    try std.testing.expectEqual(@as(?[]const u8, null), foreground.output_file);
+    try std.testing.expectEqual(@as(?[]const u8, null), foreground.stdout_file);
+    try std.testing.expectEqual(@as(?[]const u8, null), foreground.stderr_file);
+}
+
+test "direct executor rejects plans above the pipeline stage limit" {
+    const argv = [_][]const u8{ "/usr/bin/wc", "-c" };
+    var stages: [command_effect.max_direct_pipeline_stages + 1]command_effect.DirectStage = undefined;
+    for (&stages) |*stage| {
+        stage.* = .{
+            .executable = "/usr/bin/wc",
+            .argv = &argv,
+            .environment_profile = .basic_read_only,
+        };
+    }
+    try std.testing.expectError(
+        error.InvalidDirectPlan,
+        executeDirectReadOnly(.{
+            .max_command_output_bytes = 1,
+        }, std.testing.allocator, injectedPlan("/tmp", &stages)),
+    );
+}
+
+test "direct executor uses the canonical production output limit" {
+    try std.testing.expectEqual(@as(usize, 65_536), direct_output_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), direct_output_read_chunk_bytes);
 }
 
 fn createListingFiles(
@@ -817,6 +1046,77 @@ fn createListingFiles(
     }
 }
 
+test "direct executor enforces canonical capacity with native large ls output" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io_mod.getIo(), "above-32k", .default_dir);
+    try tmp.dir.createDir(io_mod.getIo(), "exact-64k", .default_dir);
+    try tmp.dir.createDir(io_mod.getIo(), "above-64k", .default_dir);
+    var above_32k = try tmp.dir.openDir(io_mod.getIo(), "above-32k", .{});
+    defer above_32k.close(io_mod.getIo());
+    var exact_64k = try tmp.dir.openDir(io_mod.getIo(), "exact-64k", .{});
+    defer exact_64k.close(io_mod.getIo());
+    var above_64k = try tmp.dir.openDir(io_mod.getIo(), "above-64k", .{});
+    defer above_64k.close(io_mod.getIo());
+    try createListingFiles(above_32k, 127, true, true);
+    try createListingFiles(exact_64k, 256, false, false);
+    try createListingFiles(above_64k, 255, true, true);
+    const cwd = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(cwd);
+
+    const SuccessCase = struct {
+        command: []const u8,
+        expected_bytes: usize,
+    };
+    for ([_]SuccessCase{
+        .{ .command = "ls above-32k", .expected_bytes = 32_769 },
+        .{ .command = "ls exact-64k", .expected_bytes = direct_output_limit_bytes },
+    }) |case| {
+        var admission = try command_effect.plan(
+            alloc,
+            case.command,
+            cwd,
+            false,
+            builtin.os.tag,
+        );
+        defer admission.deinit(alloc);
+        const result = try executeDirectReadOnly(.{
+            .max_command_output_bytes = 1,
+        }, alloc, admission.direct_read_only);
+        defer alloc.free(result.output);
+        try std.testing.expectEqual(
+            case.expected_bytes,
+            result.command_result.?.stdout_bytes,
+        );
+        try std.testing.expectEqualStrings(
+            case.command,
+            result.command_result.?.command,
+        );
+        try std.testing.expectEqual(
+            @as(?[]const u8, null),
+            result.command_result.?.output_file,
+        );
+    }
+
+    var over_admission = try command_effect.plan(
+        alloc,
+        "ls above-64k",
+        cwd,
+        false,
+        builtin.os.tag,
+    );
+    defer over_admission.deinit(alloc);
+    try std.testing.expectError(
+        error.DirectOutputLimitExceeded,
+        executeDirectReadOnly(.{
+            .max_command_output_bytes = std.math.maxInt(usize),
+        }, alloc, over_admission.direct_read_only),
+    );
+}
+
 fn injectedPlan(
     cwd: []const u8,
     stages: []const command_effect.DirectStage,
@@ -826,6 +1126,357 @@ fn injectedPlan(
         .cwd = cwd,
         .stages = stages,
     };
+}
+
+test "direct executor admits exact output limit and rejects limit plus one without artifacts" {
+    const exact_argv = [_][]const u8{ "/usr/bin/printf", "12345678" };
+    const exact_stages = [_]command_effect.DirectStage{.{
+        .executable = "/usr/bin/printf",
+        .argv = &exact_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    const exact = try executeDirectReadOnlyWithLimit(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, injectedPlan("/tmp", &exact_stages), 8);
+    defer std.testing.allocator.free(exact.output);
+    try std.testing.expectEqual(@as(usize, 8), exact.command_result.?.stdout_bytes);
+    try std.testing.expectEqual(@as(?[]const u8, null), exact.command_result.?.output_file);
+
+    const over_argv = [_][]const u8{ "/usr/bin/printf", "123456789" };
+    const over_stages = [_]command_effect.DirectStage{.{
+        .executable = "/usr/bin/printf",
+        .argv = &over_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    try std.testing.expectError(
+        error.DirectOutputLimitExceeded,
+        executeDirectReadOnlyWithLimit(.{
+            .max_command_output_bytes = 1_000_000,
+        }, std.testing.allocator, injectedPlan("/tmp", &over_stages), 8),
+    );
+}
+
+test "direct executor canonical limit covers stderr and counted pipeline relays" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const exact_stderr_argv = [_][]const u8{
+        "/usr/bin/awk",
+        "BEGIN { for (i = 0; i < 65536; i++) printf \"x\" > \"/dev/stderr\" }",
+    };
+    const exact_stderr_stages = [_]command_effect.DirectStage{.{
+        .executable = "/usr/bin/awk",
+        .argv = &exact_stderr_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    const exact_stderr = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, injectedPlan("/tmp", &exact_stderr_stages));
+    defer std.testing.allocator.free(exact_stderr.output);
+    try std.testing.expectEqual(
+        direct_output_limit_bytes,
+        exact_stderr.command_result.?.stderr_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        exact_stderr.command_result.?.stderr_file,
+    );
+
+    const over_stderr_argv = [_][]const u8{
+        "/usr/bin/awk",
+        "BEGIN { for (i = 0; i < 65537; i++) printf \"x\" > \"/dev/stderr\" }",
+    };
+    const over_stderr_stages = [_]command_effect.DirectStage{.{
+        .executable = "/usr/bin/awk",
+        .argv = &over_stderr_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    try std.testing.expectError(
+        error.DirectOutputLimitExceeded,
+        executeDirectReadOnly(.{
+            .max_command_output_bytes = std.math.maxInt(usize),
+        }, std.testing.allocator, injectedPlan("/tmp", &over_stderr_stages)),
+    );
+
+    const exact_relay_bytes = direct_output_limit_bytes / 2;
+    const exact_data = try std.testing.allocator.alloc(u8, exact_relay_bytes);
+    defer std.testing.allocator.free(exact_data);
+    @memset(exact_data, 'r');
+    const exact_producer_argv = [_][]const u8{ "/usr/bin/printf", "%s", exact_data };
+    const cat_argv = [_][]const u8{"/bin/cat"};
+    const exact_pipeline = [_]command_effect.DirectStage{
+        .{
+            .executable = "/usr/bin/printf",
+            .argv = &exact_producer_argv,
+            .environment_profile = .basic_read_only,
+        },
+        .{
+            .executable = "/bin/cat",
+            .argv = &cat_argv,
+            .environment_profile = .basic_read_only,
+        },
+    };
+    const exact_relay = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, injectedPlan("/tmp", &exact_pipeline));
+    defer std.testing.allocator.free(exact_relay.output);
+    try std.testing.expectEqual(
+        exact_relay_bytes,
+        exact_relay.command_result.?.stdout_bytes,
+    );
+
+    const over_data = try std.testing.allocator.alloc(u8, exact_relay_bytes + 1);
+    defer std.testing.allocator.free(over_data);
+    @memset(over_data, 'r');
+    const over_producer_argv = [_][]const u8{ "/usr/bin/printf", "%s", over_data };
+    const over_pipeline = [_]command_effect.DirectStage{
+        .{
+            .executable = "/usr/bin/printf",
+            .argv = &over_producer_argv,
+            .environment_profile = .basic_read_only,
+        },
+        .{
+            .executable = "/bin/cat",
+            .argv = &cat_argv,
+            .environment_profile = .basic_read_only,
+        },
+    };
+    try std.testing.expectError(
+        error.DirectOutputLimitExceeded,
+        executeDirectReadOnly(.{
+            .max_command_output_bytes = std.math.maxInt(usize),
+        }, std.testing.allocator, injectedPlan("/tmp", &over_pipeline)),
+    );
+}
+
+test "direct executor charges non-final pipeline bytes before relay" {
+    const producer_argv = [_][]const u8{ "/usr/bin/printf", "123456789" };
+    const consumer_argv = [_][]const u8{ "/usr/bin/wc", "-c" };
+    const stages = [_]command_effect.DirectStage{
+        .{
+            .executable = "/usr/bin/printf",
+            .argv = &producer_argv,
+            .environment_profile = .basic_read_only,
+        },
+        .{
+            .executable = "/usr/bin/wc",
+            .argv = &consumer_argv,
+            .environment_profile = .basic_read_only,
+        },
+    };
+    try std.testing.expectError(
+        error.DirectOutputLimitExceeded,
+        executeDirectReadOnlyWithLimit(.{
+            .max_command_output_bytes = 1_000_000,
+        }, std.testing.allocator, injectedPlan("/tmp", &stages), 8),
+    );
+}
+
+test "direct executor enforces one budget across concurrent stdout and stderr" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const exact_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "(printf 12345678) & (printf abcdefgh >&2) & wait",
+    };
+    const exact_stages = [_]command_effect.DirectStage{.{
+        .executable = "/bin/sh",
+        .argv = &exact_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    const exact = try executeDirectReadOnlyWithLimit(.{
+        .max_command_output_bytes = 1_000_000,
+    }, std.testing.allocator, injectedPlan("/tmp", &exact_stages), 16);
+    defer std.testing.allocator.free(exact.output);
+    try std.testing.expectEqual(@as(usize, 8), exact.command_result.?.stdout_bytes);
+    try std.testing.expectEqual(@as(usize, 8), exact.command_result.?.stderr_bytes);
+
+    const over_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "(printf 123456789) & (printf abcdefgh >&2) & wait",
+    };
+    const over_stages = [_]command_effect.DirectStage{.{
+        .executable = "/bin/sh",
+        .argv = &over_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    try std.testing.expectError(
+        error.DirectOutputLimitExceeded,
+        executeDirectReadOnlyWithLimit(.{
+            .max_command_output_bytes = 1_000_000,
+        }, std.testing.allocator, injectedPlan("/tmp", &over_stages), 16),
+    );
+}
+
+test "direct executor reaps partial spawn and output-limit process groups" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const PidCapture = struct {
+        pid: ?std.posix.pid_t = null,
+
+        fn afterSpawn(raw: *anyopaque, stage_index: usize, child: *const std.process.Child) void {
+            if (stage_index != 0) return;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pid = child.id;
+        }
+
+        fn expectReaped(self: *const @This()) !void {
+            const pid = self.pid.?;
+            defer {
+                std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+                _ = std.c.waitpid(pid, null, 0);
+            }
+            try std.testing.expectError(
+                error.ProcessNotFound,
+                std.posix.kill(pid, @enumFromInt(0)),
+            );
+        }
+    };
+
+    const sleep_argv = [_][]const u8{ "/bin/sleep", "10" };
+    const missing_argv = [_][]const u8{"/definitely/missing/fx-direct-second-stage"};
+    const partial_stages = [_]command_effect.DirectStage{
+        .{
+            .executable = "/bin/sleep",
+            .argv = &sleep_argv,
+            .environment_profile = .basic_read_only,
+        },
+        .{
+            .executable = "/definitely/missing/fx-direct-second-stage",
+            .argv = &missing_argv,
+            .environment_profile = .basic_read_only,
+        },
+    };
+    var partial_capture = PidCapture{};
+    try std.testing.expectError(
+        error.DirectExecutableUnavailable,
+        executeDirectReadOnlyWithLimitAndTestControls(
+            .{
+                .max_command_output_bytes = 1,
+            },
+            std.testing.allocator,
+            injectedPlan("/tmp", &partial_stages),
+            direct_output_limit_bytes,
+            .{ .context = &partial_capture, .after_spawn = PidCapture.afterSpawn },
+        ),
+    );
+    try partial_capture.expectReaped();
+
+    const limit_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf 123456789; sleep 10",
+    };
+    const limit_stages = [_]command_effect.DirectStage{.{
+        .executable = "/bin/sh",
+        .argv = &limit_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    var limit_capture = PidCapture{};
+    try std.testing.expectError(
+        error.DirectOutputLimitExceeded,
+        executeDirectReadOnlyWithLimitAndTestControls(
+            .{
+                .max_command_output_bytes = 1_000_000,
+            },
+            std.testing.allocator,
+            injectedPlan("/tmp", &limit_stages),
+            8,
+            .{ .context = &limit_capture, .after_spawn = PidCapture.afterSpawn },
+        ),
+    );
+    try limit_capture.expectReaped();
+}
+
+test "direct executor cleans up cancellation after the first pipeline spawn" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const CancelAfterSpawn = struct {
+        cancel: *std.atomic.Value(bool),
+        pid: ?std.posix.pid_t = null,
+
+        fn run(raw: *anyopaque, stage_index: usize, child: *const std.process.Child) void {
+            if (stage_index != 0) return;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pid = child.id;
+            self.cancel.store(true, .seq_cst);
+        }
+    };
+    var test_control = CancelAfterSpawn{ .cancel = &cancel };
+
+    const sleep_argv = [_][]const u8{ "/bin/sleep", "10" };
+    const wc_argv = [_][]const u8{ "/usr/bin/wc", "-c" };
+    const stages = [_]command_effect.DirectStage{
+        .{
+            .executable = "/bin/sleep",
+            .argv = &sleep_argv,
+            .environment_profile = .basic_read_only,
+        },
+        .{
+            .executable = "/usr/bin/wc",
+            .argv = &wc_argv,
+            .environment_profile = .basic_read_only,
+        },
+    };
+    try std.testing.expectError(
+        error.Cancelled,
+        executeDirectReadOnlyWithLimitAndTestControls(
+            .{
+                .max_command_output_bytes = 1,
+                .cancel_flag = &cancel,
+            },
+            std.testing.allocator,
+            injectedPlan("/tmp", &stages),
+            direct_output_limit_bytes,
+            .{ .context = &test_control, .after_spawn = CancelAfterSpawn.run },
+        ),
+    );
+
+    const pid = test_control.pid.?;
+    defer {
+        std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+        _ = std.c.waitpid(pid, null, 0);
+    }
+    try std.testing.expectError(
+        error.ProcessNotFound,
+        std.posix.kill(pid, @enumFromInt(0)),
+    );
+}
+
+test "direct executor projects hostile final stdout and stderr" {
+    const hostile_stdout = "\x1b]52;c;secret\x07\xff";
+    const stdout_argv = [_][]const u8{ "/usr/bin/printf", "%s", hostile_stdout };
+    const stdout_stages = [_]command_effect.DirectStage{.{
+        .executable = "/usr/bin/printf",
+        .argv = &stdout_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    const stdout_result = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, injectedPlan("/tmp", &stdout_stages));
+    defer std.testing.allocator.free(stdout_result.output);
+    try std.testing.expect(std.mem.find(u8, stdout_result.output, "\\x1b]52;c;secret\\x07\\xff") != null);
+    try std.testing.expect(std.mem.findScalar(u8, stdout_result.output, 0x1b) == null);
+
+    const stderr_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf '\\033[31m-missing' >&2; exit 2",
+    };
+    const stderr_stages = [_]command_effect.DirectStage{.{
+        .executable = "/bin/sh",
+        .argv = &stderr_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    const stderr_result = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, injectedPlan("/tmp", &stderr_stages));
+    defer std.testing.allocator.free(stderr_result.output);
+    try std.testing.expect(std.mem.findScalar(u8, stderr_result.output, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, stderr_result.output, "\\x1b[31m-missing") != null);
+    try std.testing.expect(stderr_result.command_result.?.stderr_bytes > 0);
 }
 
 const CallbackCapture = struct {
@@ -860,3 +1511,286 @@ const CallbackCapture = struct {
         }
     }
 };
+
+test "direct executor callbacks receive only bounded projected output" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf '\\033]52;c;stdout\\007'; printf '\\033[31mstderr\\377' >&2",
+    };
+    const stages = [_]command_effect.DirectStage{.{
+        .executable = "/bin/sh",
+        .argv = &argv,
+        .environment_profile = .basic_read_only,
+    }};
+    var capture = CallbackCapture{};
+    const result = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+        .output_chunk_ctx = &capture,
+        .on_output_chunk = CallbackCapture.onChunk,
+    }, std.testing.allocator, injectedPlan("/tmp", &stages));
+    defer std.testing.allocator.free(result.output);
+
+    const stdout = capture.stdout[0..capture.stdout_len];
+    const stderr = capture.stderr[0..capture.stderr_len];
+    try std.testing.expect(std.mem.findScalar(u8, stdout, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, stderr, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, stdout, "\\x1b]52;c;stdout\\x07") != null);
+    try std.testing.expect(std.mem.find(u8, stderr, "\\x1b[31mstderr\\xff") != null);
+    const foreground = result.command_result.?;
+    try std.testing.expect(
+        stdout.len + stderr.len <=
+            4 * (foreground.stdout_bytes + foreground.stderr_bytes),
+    );
+}
+
+test "direct executor raw callback projection keeps projected result isolated" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf '\\033[31mraw\\000\\377'",
+    };
+    const stages = [_]command_effect.DirectStage{.{
+        .executable = "/bin/sh",
+        .argv = &argv,
+        .environment_profile = .basic_read_only,
+    }};
+    var capture = CallbackCapture{};
+    const result = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+        .output_chunk_ctx = &capture,
+        .on_output_chunk = CallbackCapture.onChunk,
+        .callback_projection = .raw,
+    }, std.testing.allocator, injectedPlan("/tmp", &stages));
+    defer std.testing.allocator.free(result.output);
+
+    const stdout = capture.stdout[0..capture.stdout_len];
+    try std.testing.expect(std.mem.findScalar(u8, stdout, 0x1b) != null);
+    try std.testing.expect(std.mem.findScalar(u8, stdout, 0x00) != null);
+    try std.testing.expect(std.mem.findScalar(u8, stdout, 0xff) != null);
+    try std.testing.expect(std.mem.findScalar(u8, result.output, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, result.output, "\\x1b[31mraw\\x00\\xff") != null);
+}
+
+test "direct executor accepted callbacks preserve repeated newline-free stream order" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf E1 >&2; sleep 0.15; printf O1; sleep 0.15; printf E2 >&2; sleep 0.15; printf O2",
+    };
+    const stages = [_]command_effect.DirectStage{.{
+        .executable = "/bin/sh",
+        .argv = &argv,
+        .environment_profile = .basic_read_only,
+    }};
+    var capture = CallbackCapture{};
+    const result = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 4096,
+        .accepted_output_chunk_ctx = &capture,
+        .on_accepted_output_chunk = CallbackCapture.onChunk,
+    }, std.testing.allocator, injectedPlan("/tmp", &stages));
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expectEqual(@as(usize, 4), capture.stream_len);
+    try std.testing.expectEqual(.stderr, capture.streams[0]);
+    try std.testing.expectEqual(.stdout, capture.streams[1]);
+    try std.testing.expectEqual(.stderr, capture.streams[2]);
+    try std.testing.expectEqual(.stdout, capture.streams[3]);
+    try std.testing.expectEqualStrings("E1E2", capture.stderr[0..capture.stderr_len]);
+    try std.testing.expectEqualStrings("O1O2", capture.stdout[0..capture.stdout_len]);
+}
+
+test "direct executor keeps stderr projector state independent per child" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const producer_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf '\\302' >&2; printf x",
+    };
+    const consumer_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "cat >/dev/null; printf '\\205' >&2",
+    };
+    const stages = [_]command_effect.DirectStage{
+        .{
+            .executable = "/bin/sh",
+            .argv = &producer_argv,
+            .environment_profile = .basic_read_only,
+        },
+        .{
+            .executable = "/bin/sh",
+            .argv = &consumer_argv,
+            .environment_profile = .basic_read_only,
+        },
+    };
+    const result = executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, injectedPlan("/tmp", &stages)) catch |err| {
+        std.debug.print("downstream pipe closure failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(std.mem.find(u8, result.output, "\\xc2") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "\\x85") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "\\u{0085}") == null);
+}
+
+test "direct executor reports final stage status without pipefail" {
+    const argv = [_][]const u8{"/usr/bin/false"};
+    const stages = [_]command_effect.DirectStage{.{
+        .executable = "/usr/bin/false",
+        .argv = &argv,
+        .environment_profile = .basic_read_only,
+    }};
+    const result = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, injectedPlan("/tmp", &stages));
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 1), result.command_result.?.exit_code);
+}
+
+test "direct relay treats a closed downstream pipe as normal completion" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const argv = [_][]const u8{"/usr/bin/false"};
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = &argv,
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const destination = child.stdin.?;
+    child.stdin = null;
+    defer destination.close(io_mod.getIo());
+    _ = try child.wait(io_mod.getIo());
+
+    try std.testing.expectEqual(
+        RelayWriteResult.downstream_closed,
+        try writeRelayChunk(destination, "not consumed"),
+    );
+}
+
+test "direct executor treats downstream pipe closure as normal pipeline completion" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const producer_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "sleep 0.1; printf upstream",
+    };
+    const consumer_argv = [_][]const u8{ "/bin/pwd", "-P" };
+    const stages = [_]command_effect.DirectStage{
+        .{
+            .executable = "/bin/sh",
+            .argv = &producer_argv,
+            .environment_profile = .basic_read_only,
+        },
+        .{
+            .executable = "/bin/pwd",
+            .argv = &consumer_argv,
+            .environment_profile = .basic_read_only,
+        },
+    };
+    const result = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 1,
+    }, std.testing.allocator, injectedPlan("/tmp", &stages));
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    const physical_tmp = try io_mod.realpathAlloc(std.testing.allocator, "/tmp");
+    defer std.testing.allocator.free(physical_tmp);
+    const expected_output = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "<stdout>\n{s}\n</stdout>",
+        .{physical_tmp},
+    );
+    defer std.testing.allocator.free(expected_output);
+    try std.testing.expect(std.mem.find(u8, result.output, expected_output) != null);
+}
+
+test "direct executor fails closed for missing executable" {
+    const missing_argv = [_][]const u8{"/definitely/missing/fx-direct-command"};
+    const missing_stages = [_]command_effect.DirectStage{.{
+        .executable = "/definitely/missing/fx-direct-command",
+        .argv = &missing_argv,
+        .environment_profile = .basic_read_only,
+    }};
+    try std.testing.expectError(
+        error.DirectExecutableUnavailable,
+        executeDirectReadOnly(.{
+            .max_command_output_bytes = 1,
+        }, std.testing.allocator, injectedPlan("/tmp", &missing_stages)),
+    );
+}
+
+test "direct executor cancellation and timeout terminate and reap the process group" {
+    const argv = [_][]const u8{ "/bin/sleep", "10" };
+    const stages = [_]command_effect.DirectStage{.{
+        .executable = "/bin/sleep",
+        .argv = &argv,
+        .environment_profile = .basic_read_only,
+    }};
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const Flip = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(25 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Flip.run, .{&cancel});
+    defer thread.join();
+    try std.testing.expectError(
+        error.Cancelled,
+        executeDirectReadOnly(.{
+            .max_command_output_bytes = 1,
+            .cancel_flag = &cancel,
+        }, std.testing.allocator, injectedPlan("/tmp", &stages)),
+    );
+
+    try std.testing.expectError(
+        error.TimeoutExpired,
+        executeDirectReadOnly(.{
+            .max_command_output_bytes = 1,
+            .timeout_ms = 1,
+            .timeout_started_ms = io_mod.milliTimestamp() - 10,
+        }, std.testing.allocator, injectedPlan("/tmp", &stages)),
+    );
+}
+
+test "direct executor flushes partial callback output before timeout" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "trap 'exit 0' TERM; printf PARTIAL; sleep 10",
+    };
+    const stages = [_]command_effect.DirectStage{.{
+        .executable = "/bin/sh",
+        .argv = &argv,
+        .environment_profile = .basic_read_only,
+    }};
+    var capture = CallbackCapture{};
+
+    try std.testing.expectError(
+        error.TimeoutExpired,
+        executeDirectReadOnly(.{
+            .max_command_output_bytes = 1,
+            .timeout_ms = 500,
+            .timeout_started_ms = io_mod.milliTimestamp(),
+            .output_chunk_ctx = &capture,
+            .on_output_chunk = CallbackCapture.onChunk,
+        }, std.testing.allocator, injectedPlan("/tmp", &stages)),
+    );
+    try std.testing.expectEqualStrings("PARTIAL", capture.stdout[0..capture.stdout_len]);
+}

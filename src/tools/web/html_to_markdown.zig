@@ -526,3 +526,66 @@ fn namedEntity(entity: []const u8) ?[]const u8 {
     }
     return null;
 }
+
+test "web_fetch converts representative html to bounded markdown" {
+    const alloc = std.testing.allocator;
+    const html =
+        \\<!doctype html>
+        \\<html>
+        \\<head><title>Ignored</title><style>.x{}</style><script>alert(1)</script></head>
+        \\<body>
+        \\<h1>Release &amp; Notes</h1>
+        \\<p>Hello <a href="/docs">docs</a> and <code>fx ask</code>.</p>
+        \\<ul><li>One</li><li>Two&nbsp;items</li></ul>
+        \\<pre><code>const x = 1 &lt; 2;</code></pre>
+        \\<table><tr><th>Name</th><th>Value</th></tr><tr><td>A</td><td>42</td></tr></table>
+        \\<img src="x.png" alt="diagram">
+        \\<p>&#169; &#x00AE; &unknown;</p>
+        \\</body></html>
+    ;
+
+    const markdown = try convert(alloc, html, .{ .max_output_bytes = 4096 });
+    defer alloc.free(markdown);
+
+    try std.testing.expect(std.mem.find(u8, markdown, "# Release & Notes") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "# Ignored") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "[docs](/docs)") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "`fx ask`") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "- One") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "Two items") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "const x = 1 < 2;") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "| Name | Value |") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "diagram") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "© ® &unknown;") != null);
+    try std.testing.expect(std.mem.find(u8, markdown, "alert(1)") == null);
+    try std.testing.expect(std.mem.find(u8, markdown, ".x{}") == null);
+}
+
+test "web_fetch decodes entities in html titles" {
+    const alloc = std.testing.allocator;
+    const markdown = try convert(
+        alloc,
+        "<html><head><title>News &amp; Updates &mdash; Site</title></head><body><p>Body</p></body></html>",
+        .{ .max_output_bytes = 4096 },
+    );
+    defer alloc.free(markdown);
+
+    try std.testing.expectEqualStrings("# News & Updates — Site\n\nBody\n", markdown);
+}
+
+test "web_fetch malformed html conversion remains bounded" {
+    const alloc = std.testing.allocator;
+
+    var html: std.ArrayList(u8) = .empty;
+    defer html.deinit(alloc);
+    var index: usize = 0;
+    while (index < 2048) : (index += 1) {
+        try html.appendSlice(alloc, "<div><span>unclosed &amp; text ");
+    }
+
+    const markdown = try convert(alloc, html.items, .{ .max_output_bytes = 1024 });
+    defer alloc.free(markdown);
+
+    try std.testing.expect(markdown.len <= 1024);
+    try std.testing.expect(std.mem.find(u8, markdown, "unclosed & text") != null);
+}

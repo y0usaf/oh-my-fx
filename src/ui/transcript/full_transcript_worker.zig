@@ -8,8 +8,51 @@ const full_transcript_screen = @import("../full_transcript_screen.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const command_output_runtime = @import("command_output_runtime.zig");
+const source_preparation = @import("source_preparation.zig");
+const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 
 const Allocator = std.mem.Allocator;
+pub const prepared_cache_overscan_max_rows: u16 = 192;
+pub const prepared_cache_max_bytes: usize = 2 * 1024 * 1024;
+
+pub fn preparedWindowRequest(
+    page_request: full_transcript_page.Request,
+    total_rows: u32,
+    target_offset: u32,
+    visible_rows: u16,
+) WindowRequest {
+    const bounded_visible_rows = @max(visible_rows, 1);
+    const cache_rows: u16 = @intCast(@max(
+        @as(u32, bounded_visible_rows),
+        @min(
+            @as(u32, prepared_cache_overscan_max_rows),
+            @as(u32, bounded_visible_rows) *| 3,
+        ),
+    ));
+    const overscan = (cache_rows -| bounded_visible_rows) / 2;
+    const max_start = total_rows -| cache_rows;
+    return .{
+        .page_request = page_request,
+        .target_offset = target_offset,
+        .start_row = @min(target_offset -| overscan, max_start),
+        .row_count = cache_rows,
+    };
+}
+
+test "prepared window always covers one complete visible viewport" {
+    const request = preparedWindowRequest(
+        .{ .content_revision = 1, .cols = 80, .anchor = .tail },
+        1_000,
+        780,
+        220,
+    );
+    try std.testing.expectEqual(@as(u16, 220), request.row_count);
+    try std.testing.expect(request.start_row <= request.target_offset);
+    try std.testing.expect(
+        request.start_row + @as(u32, request.row_count) >=
+            request.target_offset + 220,
+    );
+}
 
 pub const FullDiffSnapshot = struct {
     marker_id: u32,
@@ -30,6 +73,8 @@ pub const Source = struct {
     full_diff_lifecycles: std.ArrayList(types.ToolLifecycleId) = .empty,
     styles: transcript_blocks.Styles,
     capability: ?session_child_store.SessionChildCapability = null,
+    presentation: transcript_presentation.State = .{},
+    visible_rows: u16 = 1,
 
     pub fn deinit(self: *Source, alloc: Allocator) void {
         for (self.entries.items) |*entry| entry.deinit(alloc);
@@ -106,13 +151,35 @@ pub const Source = struct {
     }
 };
 
+pub const InstalledSource = struct {
+    request: full_transcript_page.Request,
+    range: full_transcript_page.SourceRange,
+    capability: ?session_child_store.SessionChildCapability = null,
+
+    pub fn deinit(self: *InstalledSource) void {
+        if (self.capability) |*capability| capability.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const PreparedWindow = struct {
+    source: source_preparation.TranscriptPreparationSource,
+    start_row: u32,
+    target_offset: u32 = 0,
+
+    pub fn deinit(self: *PreparedWindow, alloc: Allocator) void {
+        self.source.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const Task = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     source: Source,
-    source_owned: bool = true,
     projection: ?full_transcript_screen.Projection = null,
+    prepared_window: ?PreparedWindow = null,
     failure: ?anyerror = null,
 
     pub fn deinit(self: *Task) void {
@@ -121,7 +188,10 @@ pub const Task = struct {
         if (self.projection) |*projection| {
             projection.deinit(std.heap.c_allocator);
         }
-        if (self.source_owned) self.source.deinit(std.heap.c_allocator);
+        if (self.prepared_window) |*window| {
+            window.deinit(std.heap.c_allocator);
+        }
+        self.source.deinit(std.heap.c_allocator);
         std.heap.c_allocator.destroy(self);
     }
 
@@ -131,10 +201,22 @@ pub const Task = struct {
         return projection;
     }
 
-    pub fn takeSource(self: *Task) Source {
-        std.debug.assert(self.source_owned);
-        self.source_owned = false;
-        return self.source;
+    pub fn takeInstalledSource(self: *Task) InstalledSource {
+        const capability = self.source.capability;
+        self.source.capability = null;
+        return .{
+            .request = self.source.request,
+            .range = self.source.range,
+            .capability = capability,
+        };
+    }
+
+    pub fn takePreparedWindow(
+        self: *Task,
+    ) ?PreparedWindow {
+        const window = self.prepared_window orelse return null;
+        self.prepared_window = null;
+        return window;
     }
 
     fn cancelled(context: *anyopaque) bool {
@@ -187,6 +269,29 @@ pub const Task = struct {
             self.done.store(true, .release);
             return;
         };
+        const visible_rows = @max(self.source.visible_rows, 1);
+        const selected = self.source.presentation.select_visual_offset(
+            measurement.total_rows,
+            visible_rows,
+            measurement.item_rows,
+        );
+        const window_request = preparedWindowRequest(
+            self.source.request,
+            measurement.total_rows,
+            selected.offset,
+            visible_rows,
+        );
+        const prepared_window = prepareWindowInterruptible(
+            alloc,
+            &projection,
+            if (self.source.capability) |*capability| capability else null,
+            window_request,
+            &checkpoint,
+        ) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
         debug_trace.logf(
             "full_transcript_cache",
             "page_built revision={d} cols={d} entries={d} details={d} blocks={d} segments={d} rows={d}",
@@ -201,6 +306,7 @@ pub const Task = struct {
             },
         );
         self.projection = projection;
+        self.prepared_window = prepared_window;
         projection_owned = false;
         self.done.store(true, .release);
     }
@@ -301,5 +407,149 @@ pub const Load = struct {
             return err;
         };
         self.task = task;
+    }
+};
+
+pub const WindowRequest = struct {
+    page_request: full_transcript_page.Request,
+    target_offset: u32,
+    start_row: u32,
+    row_count: u16,
+};
+
+pub const WindowTask = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    request: WindowRequest,
+    projection: *full_transcript_screen.Projection,
+    capability: ?*session_child_store.SessionChildCapability,
+    prepared_window: ?PreparedWindow = null,
+    failure: ?anyerror = null,
+
+    fn run(self: *WindowTask) void {
+        const alloc = std.heap.c_allocator;
+        var checkpoint = build_checkpoint.BuildCheckpoint.init(
+            self,
+            WindowTask.cancelled,
+        );
+        self.prepared_window = prepareWindowInterruptible(
+            alloc,
+            self.projection,
+            self.capability,
+            self.request,
+            &checkpoint,
+        ) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
+        self.done.store(true, .release);
+    }
+
+    fn cancelled(context: *anyopaque) bool {
+        const self: *WindowTask = @ptrCast(@alignCast(context));
+        return self.cancel_requested.load(.acquire);
+    }
+
+    pub fn takePreparedWindow(self: *WindowTask) ?PreparedWindow {
+        const window = self.prepared_window orelse return null;
+        self.prepared_window = null;
+        return window;
+    }
+
+    pub fn deinit(self: *WindowTask) void {
+        self.cancel_requested.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        if (self.prepared_window) |*window| {
+            window.deinit(std.heap.c_allocator);
+        }
+        std.heap.c_allocator.destroy(self);
+    }
+};
+
+fn prepareWindowInterruptible(
+    alloc: Allocator,
+    projection: *full_transcript_screen.Projection,
+    capability: ?*session_child_store.SessionChildCapability,
+    request: WindowRequest,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !PreparedWindow {
+    const bytes = try full_transcript_screen.renderProjectionViewportSourceBoundedInterruptible(
+        alloc,
+        projection,
+        capability,
+        request.page_request.cols,
+        request.row_count,
+        request.start_row,
+        prepared_cache_max_bytes,
+        checkpoint,
+    );
+    const source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+        alloc,
+        bytes,
+        request.page_request.cols,
+        checkpoint,
+    );
+    return .{
+        .source = source,
+        .start_row = request.start_row,
+        .target_offset = request.target_offset,
+    };
+}
+
+pub const WindowLoad = struct {
+    task: ?*WindowTask = null,
+
+    pub fn deinit(self: *WindowLoad) void {
+        if (self.task) |task| task.deinit();
+        self.* = .{};
+    }
+
+    pub fn busy(self: *const WindowLoad) bool {
+        return self.task != null;
+    }
+
+    pub fn schedule(
+        self: *WindowLoad,
+        request: WindowRequest,
+        projection: *full_transcript_screen.Projection,
+        capability: ?*session_child_store.SessionChildCapability,
+    ) !void {
+        if (self.task != null) return error.FullTranscriptWindowWorkerBusy;
+        const task = try std.heap.c_allocator.create(WindowTask);
+        task.* = .{
+            .request = request,
+            .projection = projection,
+            .capability = capability,
+        };
+        if (comptime builtin.single_threaded) {
+            task.run();
+            self.task = task;
+            return;
+        }
+        task.thread = std.Thread.spawn(.{}, WindowTask.run, .{task}) catch |err| {
+            std.heap.c_allocator.destroy(task);
+            return err;
+        };
+        self.task = task;
+    }
+
+    pub fn cancelActive(self: *WindowLoad) void {
+        const task = self.task orelse return;
+        task.cancel_requested.store(true, .release);
+    }
+
+    pub fn hasTarget(self: *const WindowLoad, target_offset: u32) bool {
+        const task = self.task orelse return false;
+        return task.request.target_offset == target_offset and
+            !task.cancel_requested.load(.acquire);
+    }
+
+    pub fn takeCompleted(self: *WindowLoad) ?*WindowTask {
+        const task = self.task orelse return null;
+        if (!task.done.load(.acquire)) return null;
+        self.task = null;
+        return task;
     }
 };

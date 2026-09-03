@@ -723,7 +723,11 @@ pub fn Commands(comptime App: type) type {
             if (persist) {
                 try persistPreferenceTargets(
                     app,
-                    .{ .fast_mode = app.fast_mode },
+                    .{
+                        .provider = provider_runtime.provider(app),
+                        .model = provider_runtime.model(app),
+                        .fast_mode = app.fast_mode,
+                    },
                     "fast",
                     !announce,
                 );
@@ -767,19 +771,15 @@ pub fn Commands(comptime App: type) type {
                 .model = model,
             };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (capabilities.reasoning_efforts.len == 0) {
-                if (capabilities.supports_fast_mode) {
-                    try applyFastMode(app, fast_mode, false, false);
-                    patch.fast_mode = fast_mode;
-                }
-            } else {
+            if (capabilities.reasoning_efforts.len > 0) {
                 try applyEffort(app, effort, false, false);
                 patch.effort = effort;
-                if (capabilities.supports_fast_mode) {
-                    try applyFastMode(app, fast_mode, false, false);
-                    patch.fast_mode = fast_mode;
-                }
             }
+            const selected_fast_mode = capabilities.supports_fast_mode and fast_mode;
+            if (selected_fast_mode != app.fast_mode) {
+                try applyFastMode(app, selected_fast_mode, false, false);
+            }
+            patch.fast_mode = selected_fast_mode;
             try persistPreferenceTargets(app, patch, "model picker", false);
         }
 
@@ -1035,12 +1035,17 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
+            const model_changed = !std.mem.eql(u8, provider_runtime.model(app), resolved);
             try setResolvedModelRuntime(app, resolved, announce);
+            if (model_changed and app.fast_mode) {
+                try applyFastMode(app, false, false, false);
+            }
             try persistPreferenceTargets(
                 app,
                 .{
                     .provider = provider_runtime.provider(app),
                     .model = resolved,
+                    .fast_mode = app.fast_mode,
                 },
                 "model",
                 !announce,
@@ -1243,7 +1248,6 @@ fn isKnownAllowlistTool(tool_registry: tool_dispatch.Registry, name: []const u8)
         "glob",
         "grep",
         "skill",
-        "memory",
         permissions.web_search_permission,
     };
     for (categories) |category| {
@@ -1858,8 +1862,1334 @@ fn expectTranscriptContains(app: *const FakeApp, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, app.text(), needle) != null);
 }
 
+var session_command_stable_test_environ: ?*std.process.Environ.Map = null;
+
+fn stableSessionCommandTestEnviron() !*const std.process.Environ.Map {
+    if (session_command_stable_test_environ) |map| return map;
+
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    session_command_stable_test_environ = map;
+    return map;
+}
+
+const SessionCommandTestHome = struct {
+    alloc: std.mem.Allocator,
+    map: std.process.Environ.Map,
+
+    fn install(alloc: std.mem.Allocator, home: ?[]const u8) !*SessionCommandTestHome {
+        _ = try stableSessionCommandTestEnviron();
+
+        const self = try alloc.create(SessionCommandTestHome);
+        errdefer alloc.destroy(self);
+
+        self.* = .{
+            .alloc = alloc,
+            .map = std.process.Environ.Map.init(alloc),
+        };
+        errdefer self.map.deinit();
+
+        if (home) |value| {
+            try self.map.put("HOME", value);
+        }
+        io_mod.setEnvironMap(&self.map);
+        return self;
+    }
+
+    fn deinit(self: *SessionCommandTestHome) void {
+        if (session_command_stable_test_environ) |map| {
+            io_mod.setEnvironMap(map);
+        }
+        self.map.deinit();
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+fn expectRule(rule: types.PermissionRule, permission: []const u8, pattern: []const u8, action: types.PermissionAction) !void {
+    try std.testing.expectEqualStrings(permission, rule.permission);
+    try std.testing.expectEqualStrings(pattern, rule.pattern);
+    try std.testing.expectEqual(action, rule.action);
+}
+
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
+}
+
+test "session_commands showStatus writes session status snapshot" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/test-model");
+    defer app.deinit();
+    app.permission_engine.mode = .auto;
+    app.session.history_len = 7;
+
+    try Commands(FakeApp).showStatus(&app);
+
+    try expectTranscriptContains(&app, "● Status: model=anthropic/test-model\n");
+    try expectTranscriptContains(&app, "auth=missing\n");
+    try expectTranscriptContains(&app, "auth_refreshable=false\n");
+    try expectTranscriptContains(&app, "permission_mode=auto\n");
+    try expectTranscriptContains(&app, "history_turns=7\n");
+    try expectTranscriptContains(&app, "agent_step_limit=24\n");
+
+    app.clearTranscript();
+    app.permission_engine.mode = .yolo;
+    try Commands(FakeApp).showStatus(&app);
+    try expectTranscriptContains(&app, "permission_mode=yolo\n");
+}
+
+test "session_commands history setting toggles durable input history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "workspace",
+    );
+    defer alloc.free(workspace_root);
+
+    const env = try SessionCommandTestHome.install(alloc, home_root);
+    defer env.deinit();
+    var app = try FakeHistoryCommandApp.init(
+        alloc,
+        home_root,
+        workspace_root,
+    );
+    defer app.deinit();
+    try Commands(FakeHistoryCommandApp).handleHistory(&app, "off");
+    try std.testing.expect(!app.prompt_history.enabled);
+    var disabled = try config_runtime.loadMergedSettings(
+        alloc,
+        workspace_root,
+    );
+    defer disabled.deinit(alloc);
+    try std.testing.expectEqual(false, disabled.prompt_history_enabled.?);
+
+    try Commands(FakeHistoryCommandApp).handleHistory(&app, "on");
+    try std.testing.expect(app.prompt_history.enabled);
+    var enabled = try config_runtime.loadMergedSettings(
+        alloc,
+        workspace_root,
+    );
+    defer enabled.deinit(alloc);
+    try std.testing.expectEqual(true, enabled.prompt_history_enabled.?);
+}
+
+test "session_commands handleSettings shows startup scrollback status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"startup_scrollback\":false}");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/test-model");
+    defer app.deinit();
+    app.permission_engine.mode = .auto;
+    app.agent_step_limit = 12;
+
+    try Commands(FakeApp).handleSettings(&app, "");
+
+    try expectTranscriptContains(&app, "model: anthropic/test-model");
+    try expectTranscriptContains(&app, "permission_mode: auto");
+    try expectTranscriptContains(&app, "step_limit: 12");
+    try expectTranscriptContains(&app, "startup_scrollback: off");
+}
+
+test "session_commands handleSettings toggles and persists startup scrollback" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/test-model");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleSettings(&app, "startup-scrollback");
+    try expectTranscriptContains(&app, "startup_scrollback: off (applies on next launch)");
+
+    var toggled = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer toggled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(false, toggled.startup_scrollback.?);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleSettings(&app, "startup-scrollback on");
+    try expectTranscriptContains(&app, "startup_scrollback: on (applies on next launch)");
+
+    var enabled = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer enabled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, enabled.startup_scrollback.?);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
+    try expectTranscriptContains(&app, "startup_scrollback: off (applies on next launch)");
+
+    var disabled = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(false, disabled.startup_scrollback.?);
+}
+
+test "session_commands startup scrollback ignores project profile-only shadowing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "workspace/.fx.json",
+        "{\"startup_scrollback\":true}\n",
+    );
+    const home_root = try io_mod.dirRealpathAlloc(
+        std.testing.allocator,
+        tmp.dir,
+        "home",
+    );
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(
+        std.testing.allocator,
+        tmp.dir,
+        "workspace",
+    );
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(
+        std.testing.allocator,
+        home_root,
+    );
+    defer home.deinit();
+
+    var app = try FakeApp.init(
+        std.testing.allocator,
+        workspace_root,
+        "anthropic/test-model",
+    );
+    defer app.deinit();
+
+    try Commands(FakeApp).handleSettings(
+        &app,
+        "startup-scrollback off",
+    );
+
+    try expectTranscriptContains(&app, "startup_scrollback: off (applies on next launch)");
+    try std.testing.expect(std.mem.find(u8, app.text(), "higher-precedence startup_scrollback=project") == null);
+}
+
+test "session_commands statusline shadow notice names the preference field" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try appendShadowedUserSources(
+        &out.writer,
+        .{
+            .statusline_item = .{
+                .item = .context,
+                .enabled = false,
+            },
+        },
+        .{ .statusline_context = .project },
+    );
+
+    try std.testing.expectEqualStrings(
+        "; fresh sessions here use higher-precedence statusLine.context=project",
+        out.written(),
+    );
+}
+
+test "session_commands notification shadow notice preserves valid workspace scope" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try appendShadowedUserSources(
+        &out.writer,
+        .{
+            .notification_turn_end = true,
+            .notification_max = true,
+        },
+        .{
+            .notification_turn_end = .user_workspace,
+            .notification_max = .user_workspace,
+        },
+    );
+
+    try std.testing.expectEqualStrings(
+        "; fresh sessions here use higher-precedence notifications.turn_end=user_workspace, notifications.max=user_workspace",
+        out.written(),
+    );
+}
+
+test "session_commands handleSettings reports usage and save failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const env = try SessionCommandTestHome.install(std.testing.allocator, null);
+    defer env.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/test-model");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleSettings(&app, "bogus");
+    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]]");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleSettings(&app, "startup-scrollback off extra");
+    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]]");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
+    try expectTranscriptContains(&app, "● Startup-scrollback: not saved to user settings (HomeNotSet)");
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+}
+
+test "session_commands handleModel reports current model for empty query" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleModel(&app, "");
+
+    try std.testing.expectEqualStrings("● Model: anthropic/claude-opus-4.6\n", app.text());
+    try std.testing.expect(app.worker.synced_model == null);
+    try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
+}
+
+test "session_commands handleModel resolves fuzzy cached model and syncs queued prompts" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{
+        "openai/gpt-4o-mini",
+        "anthropic/claude-sonnet-4-20250514",
+    };
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
+    defer app.deinit();
+    app.cached_ids = &ids;
+    app.selected_provider = .codex;
+
+    try Commands(FakeApp).handleModel(&app, "claude sonnet");
+
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.selected_model.items);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
+    try std.testing.expectEqualStrings(
+        "workspace · anthropic/claude-sonnet-4-20250514",
+        app.terminalTitleLabelText(),
+    );
+    try expectTranscriptContains(&app, "● Switched to anthropic/claude-sonnet-4-20250514");
+}
+
+test "session_commands handleModel falls back to raw query when model fetch fails" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
+    defer app.deinit();
+    app.fail_fetch = true;
+
+    try Commands(FakeApp).handleModel(&app, "custom/provider-model");
+
+    try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
+    try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
+    try std.testing.expectEqualStrings(
+        "workspace · custom/provider-model",
+        app.terminalTitleLabelText(),
+    );
+}
+
+test "session_commands handlePermissions persists modes and reset clears session grants" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    try app.permission_engine.allow(alloc, "bash", "git *");
+
+    try Commands(FakeApp).handlePermissions(&app, "auto");
+    try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
+    try std.testing.expectEqual(types.PermissionMode.auto, app.worker.synced_mode.?);
+    try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.last_preference_permission_mode);
+    try expectTranscriptContains(&app, "mode set to auto");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handlePermissions(&app, "yolo");
+    try std.testing.expectEqual(types.PermissionMode.yolo, app.permission_engine.mode);
+    try std.testing.expectEqual(types.PermissionMode.yolo, app.worker.synced_mode.?);
+    try std.testing.expectEqual(@as(usize, 2), app.permission_mode_preference_commit_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .yolo), app.last_preference_permission_mode);
+    try expectTranscriptContains(&app, "mode set to yolo");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handlePermissions(&app, "ask");
+    try std.testing.expectEqual(types.PermissionMode.ask, app.permission_engine.mode);
+    try std.testing.expectEqual(types.PermissionMode.ask, app.worker.synced_mode.?);
+    try std.testing.expectEqual(@as(usize, 3), app.permission_mode_preference_commit_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.last_preference_permission_mode);
+    try expectTranscriptContains(&app, "mode set to ask");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handlePermissions(&app, "reset");
+    try std.testing.expectEqual(types.PermissionMode.ask, app.permission_engine.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.permission_engine.grants.items.len);
+    try std.testing.expectEqual(types.PermissionMode.ask, app.worker.synced_state_mode.?);
+    try std.testing.expectEqual(@as(usize, 4), app.permission_mode_preference_commit_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.last_preference_permission_mode);
+    try expectTranscriptContains(&app, "permissions reset to ask, session grants cleared");
+}
+
+test "session_commands argless permissions writes one read-only status notice with switching usage" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.permission_engine.mode = .auto;
+    try app.permission_engine.allow(alloc, "bash", "git *");
+
+    try Commands(FakeApp).handlePermissions(&app, "");
+
+    try std.testing.expectEqual(@as(usize, 1), app.semantic_write_count);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    const status_index = std.mem.find(u8, app.text(), "mode=auto") orelse
+        return error.TestExpectedEqual;
+    const usage = permissions_usage ++ "\n";
+    const usage_index = std.mem.find(u8, app.text(), usage) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expect(status_index < usage_index);
+    try std.testing.expect(std.mem.endsWith(u8, app.text(), usage));
+    try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
+    try std.testing.expectEqual(@as(usize, 1), app.permission_engine.grants.items.len);
+    try std.testing.expectEqualStrings("bash", app.permission_engine.grants.items[0].tool_name);
+    try std.testing.expectEqualStrings("git *", app.permission_engine.grants.items[0].target_path);
+    try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, null), app.worker.synced_mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, null), app.worker.synced_state_mode);
+}
+
+test "session_commands handlePermissions reports usage and invalid action before touching settings" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    try Commands(FakeApp).handlePermissions(&app, "add");
+    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|yolo|reset]");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handlePermissions(&app, "remove");
+    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|yolo|reset]");
+    try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
+}
+
+test "session_commands handleAllowlist adds lists and removes workspace rules" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.tool_registry = .{ .tools = &.{builtin_tools.read_file} };
+
+    try Commands(FakeApp).handleAllowlist(&app, "add command \"git *\"");
+    try expectTranscriptContains(&app, "● Allowlist: added command: \"git *\"");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "add tool read_file");
+    try expectTranscriptContains(&app, "● Allowlist: added tool read: \"*\"");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "add url \"https://example.com/*\"");
+    try expectTranscriptContains(&app, "● Allowlist: added url: \"https://example.com/*\"");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "add command echo");
+    try expectTranscriptContains(&app, "● Allowlist: added command: \"echo\"");
+
+    _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "read", "docs/*", .allow);
+
+    var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), settings.permission_rules.rules.len);
+    try expectRule(settings.permission_rules.rules[0], "bash", "git *", .allow);
+    try expectRule(settings.permission_rules.rules[1], "bash", "echo", .allow);
+    try expectRule(settings.permission_rules.rules[2], "read", "*", .allow);
+    try expectRule(settings.permission_rules.rules[3], "read", "docs/*", .allow);
+    try expectRule(settings.permission_rules.rules[4], "url", "https://example.com/*", .allow);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "");
+    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules:");
+    try expectTranscriptContains(&app, "  tools:\n    read: workspace, docs/*");
+    try expectTranscriptContains(&app, "  commands:\n    git *, echo");
+    try expectTranscriptContains(&app, "  urls:\n    https://example.com/*");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "view");
+    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules:");
+    try expectTranscriptContains(&app, "  commands:\n    git *, echo");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "remove command \"git *\"");
+    try expectTranscriptContains(&app, "● Allowlist: removed command: \"git *\"");
+
+    var after_remove = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer after_remove.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), after_remove.permission_rules.rules.len);
+    try expectRule(after_remove.permission_rules.rules[0], "bash", "echo", .allow);
+    try expectRule(after_remove.permission_rules.rules[1], "read", "*", .allow);
+    try expectRule(after_remove.permission_rules.rules[2], "read", "docs/*", .allow);
+    try expectRule(after_remove.permission_rules.rules[3], "url", "https://example.com/*", .allow);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "reset tools");
+    try expectTranscriptContains(&app, "● Allowlist: reset tools: removed 2 rules");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "reset all");
+    try expectTranscriptContains(&app, "● Allowlist: reset all: removed 2 rules");
+
+    var after_reset = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer after_reset.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), after_reset.permission_rules.rules.len);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "view");
+    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules: (none)");
+}
+
+test "session_commands allowlist scopes expose and mutate hidden user rules independently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleAllowlist(&app, "user add command \"user *\"");
+    try expectTranscriptContains(&app, "(scope=user)");
+    try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "add command \"local *\"");
+    try expectTranscriptContains(&app, "(scope=local)");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "view user");
+    try expectTranscriptContains(&app, "● Allowlist: user persistent allow rules:");
+    try expectTranscriptContains(&app, "user *");
+    try expectTranscriptContains(&app, "user rules are shadowed by local settings");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "view local");
+    try expectTranscriptContains(&app, "● Allowlist: local persistent allow rules:");
+    try expectTranscriptContains(&app, "local *");
+    try std.testing.expect(std.mem.find(u8, app.text(), "user *") == null);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "view effective");
+    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules:");
+    try expectTranscriptContains(&app, "local *");
+    try std.testing.expect(std.mem.find(u8, app.text(), "user *") == null);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "user remove command \"user *\"");
+    try expectTranscriptContains(&app, "(scope=user)");
+    try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
+
+    var after_remove = try config_runtime.loadMergedSettingsDetailed(
+        std.testing.allocator,
+        workspace_root,
+    );
+    defer after_remove.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), after_remove.permission_sources.user.rules.len);
+    try std.testing.expectEqual(@as(usize, 1), after_remove.permission_sources.local.rules.len);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "user add command \"user-again *\"");
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "user reset all");
+    try expectTranscriptContains(&app, "reset all: removed 1 rule (scope=user)");
+    try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
+
+    var after_reset = try config_runtime.loadMergedSettingsDetailed(
+        std.testing.allocator,
+        workspace_root,
+    );
+    defer after_reset.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), after_reset.permission_sources.user.rules.len);
+    try std.testing.expectEqual(@as(usize, 1), after_reset.permission_sources.local.rules.len);
+}
+
+test "session_commands allowlist view reports unsafe settings without returning an error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "outside");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    tmp.dir.symLink(io_mod.getIo(), "../outside", "home/.fx", .{
+        .is_directory = true,
+    }) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleAllowlist(&app, "view");
+    try expectTranscriptContains(&app, "Failed to load settings: DurablePathUnsafe");
+}
+
+test "web_fetch allowlist add remove view and reset persist exact canonical domains" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleAllowlist(&app, "add web-fetch-domain Example.COM.");
+    try expectTranscriptContains(&app, "● Allowlist: added web-fetch-domain: \"domain:example.com\"");
+
+    var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), settings.permission_rules.rules.len);
+    try expectRule(settings.permission_rules.rules[0], "web_fetch", "domain:example.com", .allow);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "view");
+    try expectTranscriptContains(&app, "  web-fetch domains:\n    domain:example.com");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "remove web-fetch-domain EXAMPLE.com");
+    try expectTranscriptContains(&app, "● Allowlist: removed web-fetch-domain: \"domain:example.com\"");
+
+    _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "web_fetch", "domain:example.com", .allow);
+    _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "web_fetch", "domain:example.org", .allow);
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "reset web-fetch-domains");
+    try expectTranscriptContains(&app, "● Allowlist: reset web-fetch-domains: removed 2 rules");
+}
+
+test "web_fetch allowlist rejects wildcard url shaped and tool wide authorization" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleAllowlist(&app, "add web-fetch-domain *");
+    try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "add web-fetch-domain https://example.com");
+    try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "add tool web_fetch");
+    try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
+}
+
+test "web_fetch malformed hand edited rules render bounded allowlist warnings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "web_fetch", "*", .allow);
+    _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "read", "*", .allow);
+
+    try Commands(FakeApp).handleAllowlist(&app, "view");
+    try expectTranscriptContains(&app, "ignored 1 malformed web_fetch rule");
+    try expectTranscriptContains(&app, "  tools:\n    read: workspace");
+}
+
+test "session_commands handleAllowlist reports usage for invalid input" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleAllowlist(&app, "add");
+    try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "remove nope value");
+    try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "add tool not_a_tool");
+    try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "remove tool not_a_tool");
+    try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "reset");
+    try expectTranscriptContains(&app, "usage: /allowlist reset [commands|tools|urls|web-fetch-domains|all]");
+}
+
+test "session_commands allowlist recognizes whole-tool web_search grant" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const tool_registry = tool_dispatch.Registry{ .tools = &.{builtin_tools.web_search} };
+    const target = parseAllowlistTarget(tool_registry, "tool web_search") orelse return error.TestExpectedEqual;
+
+    try std.testing.expectEqual(AllowlistKind.tool, target.kind);
+    try std.testing.expectEqualStrings("web_search", target.category);
+    try std.testing.expectEqualStrings("*", target.pattern);
+    try std.testing.expect(parseAllowlistTarget(tool_registry, "tool web_search current news") == null);
+}
+
+test "session_commands handleAllowlist recognizes tools from the active registry" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    const provider_tool = blk: {
+        var tool = builtin_tools.read_file;
+        tool.name = "provider_custom";
+        break :blk tool;
+    };
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "test-model");
+    defer app.deinit();
+    app.tool_registry = .{ .tools = &.{provider_tool} };
+
+    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_custom");
+    try expectTranscriptContains(&app, "● Allowlist: added tool provider_custom: \"*\"");
+
+    var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), settings.permission_rules.rules.len);
+    try expectRule(settings.permission_rules.rules[0], "provider_custom", "*", .allow);
+
+    app.tool_registry = .{};
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_custom");
+    try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
+    try std.testing.expect(parseAllowlistTarget(.{}, "tool read") != null);
+    try std.testing.expect(parseAllowlistTarget(.{}, "tool memory") == null);
+}
+
+test "session_commands toggleFast reports unsupported model and redraws footer" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
+    defer app.deinit();
+
+    try Commands(FakeApp).toggleFast(&app);
+
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expect(app.worker.synced_fast_mode == null);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.fast_sync_count);
+    try expectTranscriptContains(&app, "● Fast: This model does not come with a fast mode.");
+}
+
+test "session_commands toggleFast disables stale fast mode for unsupported model" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var fast_outcome = try config_runtime.setUserPreferences(
+        std.testing.allocator,
+        .{ .fast_mode = true },
+    );
+    defer fast_outcome.deinit(std.testing.allocator);
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "openai/gpt-4o");
+    defer app.deinit();
+    app.fast_mode = true;
+    app.worker.synced_fast_mode = true;
+
+    try Commands(FakeApp).toggleFast(&app);
+
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
+
+    var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, false), settings.fast_mode);
+}
+
+test "session_commands toggleFast syncs queued fast mode for supported models" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.setGatewayControls("anthropic/claude-opus-4.6", &.{}, true);
+
+    try Commands(FakeApp).toggleFast(&app);
+
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
+    try expectTranscriptContains(&app, "● Fast: on");
+}
+
+test "session_commands selectModelFromPicker skips effort changes for models without reasoning support" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.effort = types.ReasoningEffort.literal("high");
+
+    try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), true);
+
+    try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
+    try std.testing.expectEqualStrings("openai/gpt-4o", app.worker.synced_model.?);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expect(!app.fast_mode);
+}
+
+test "session_commands model picker accepts the current selected model slice" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
+    app.setGatewayControls("anthropic/claude-opus-4.6", &efforts, true);
+
+    try Commands(FakeApp).selectModelFromPicker(
+        &app,
+        app.selected_model.items,
+        types.ReasoningEffort.literal("high"),
+        false,
+    );
+
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.selected_model.items);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.worker.synced_model.?);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
+    try std.testing.expectEqualStrings(
+        "workspace · anthropic/claude-opus-4.6",
+        app.terminalTitleLabelText(),
+    );
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+}
+
+test "session_commands selectModelFromPicker persists portable Gateway reasoning effort" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.effort = types.ReasoningEffort.literal("high");
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("low")};
+    app.setGatewayControls("provider/new-reasoning-model", &efforts, false);
+
+    try Commands(FakeApp).selectModelFromPicker(&app, "provider/new-reasoning-model", types.ReasoningEffort.literal("low"), true);
+
+    try std.testing.expectEqualStrings("provider/new-reasoning-model", app.selected_model.items);
+    try std.testing.expectEqualStrings("provider/new-reasoning-model", app.worker.synced_model.?);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.effort);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("low")), app.worker.synced_effort);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.effort_sync_count);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.last_preference_effort.?);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
+}
+
+test "session_commands model selection clears fast mode when the selected model has no fast control" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.fast_mode = true;
+    app.worker.synced_fast_mode = true;
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("max")};
+    app.setGatewayControls("zai/glm-5.3", &efforts, false);
+
+    try Commands(FakeApp).selectModelFromPicker(
+        &app,
+        "zai/glm-5.3",
+        types.ReasoningEffort.literal("max"),
+        true,
+    );
+
+    try std.testing.expectEqualStrings("zai/glm-5.3", app.selected_model.items);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
+}
+
+test "session_commands selectModelFromPicker syncs queued fast mode and effort for supported models" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
+    app.setGatewayControls("anthropic/claude-opus-4.6", &efforts, true);
+
+    try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
+
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("high")), app.worker.synced_effort);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.effort_sync_count);
+}
+
+test "session_commands model picker follows mock catalog controls independent of provider" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "provider/model");
+    defer app.deinit();
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
+    app.setGatewayControls("provider/model", &efforts, true);
+
+    try Commands(FakeApp).selectModelFromPicker(&app, "provider/model", types.ReasoningEffort.literal("future-tier"), true);
+
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expectEqualStrings("future-tier", app.effort.label());
+    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
+    try std.testing.expectEqualStrings("future-tier", app.worker.synced_effort.?.label());
+}
+
+test "session_commands model picker emits one combined preference transaction" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(
+        alloc,
+        "/tmp/workspace",
+        "anthropic/claude-opus-4.7",
+    );
+    defer app.deinit();
+    app.selected_provider = .codex;
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
+    app.setGatewayControls("anthropic/claude-opus-4.7", &efforts, true);
+
+    try Commands(FakeApp).selectModelFromPicker(
+        &app,
+        "anthropic/claude-opus-4.7",
+        types.ReasoningEffort.literal("high"),
+        true,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
+    try std.testing.expectEqualStrings(
+        "anthropic/claude-opus-4.7",
+        app.last_preference_model.items,
+    );
+    try std.testing.expectEqual(
+        types.ReasoningEffort.literal("high"),
+        app.last_preference_effort.?,
+    );
+    try std.testing.expectEqual(true, app.last_preference_fast_mode.?);
+}
+
+test "session_commands user save notice uses one post-commit load after legacy cleanup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    const fixture = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"model\":\"user/old\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(fixture);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"model\":\"project/model\"}\n");
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "old/runtime");
+    defer app.deinit();
+    app.fail_fetch = true;
+
+    try Commands(FakeApp).handleModel(&app, "user/new");
+
+    try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
+    try expectTranscriptContains(&app, "● Model: saved to user settings (scope=user)");
+    try std.testing.expect(std.mem.find(u8, app.text(), "model=project") == null);
+    try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
+    try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
+}
+
+test "session_commands durable user save survives post-commit resolver failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    const fixture = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(fixture);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "old/runtime");
+    defer app.deinit();
+    app.fail_fetch = true;
+    app.post_commit_resolution_error = error.InjectedPostCommitResolutionFailure;
+
+    try Commands(FakeApp).handleModel(&app, "user/new");
+
+    try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
+    try expectTranscriptContains(&app, "● Model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "next-startup source unknown");
+    try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
+    try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
+
+    var settings = try config_runtime.loadMergedSettings(
+        std.testing.allocator,
+        workspace_root,
+    );
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("user/new", settings.models.get(.gateway).?);
+}
+
+test "session_commands durable user save survives post-commit resolver diagnostic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "old/runtime");
+    defer app.deinit();
+    app.fail_fetch = true;
+    app.post_commit_resolution_diagnostic = .durable_path_unsafe;
+
+    try Commands(FakeApp).handleModel(&app, "user/new");
+
+    try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
+    try expectTranscriptContains(&app, "● Model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "next-startup source unknown (DurablePathUnsafe)");
+}
+
+test "session_commands allowlist failures retain explicit scope and error" {
+    const home = try SessionCommandTestHome.install(std.testing.allocator, null);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, "/tmp/workspace", "model");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleAllowlist(
+        &app,
+        "user add command \"git status *\"",
+    );
+
+    try expectTranscriptContains(
+        &app,
+        "● Allowlist: failed to add rule to settings (scope=user, error=HomeNotSet)",
+    );
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+}
+
+test "session_commands allowlist durable save survives post-commit resolver diagnostic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "model");
+    defer app.deinit();
+    app.post_commit_resolution_diagnostic = .durable_path_unsafe;
+
+    try Commands(FakeApp).handleAllowlist(
+        &app,
+        "user add command \"git status *\"",
+    );
+
+    try expectTranscriptContains(&app, "● Allowlist: added command");
+    try expectTranscriptContains(&app, "(scope=user)");
+    try expectTranscriptContains(
+        &app,
+        "saved but effective source unknown and runtime reload failed (DurablePathUnsafe)",
+    );
+    try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
+}
+
+test "session_commands runtime-first model keeps runtime state when both durable targets fail" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "old/model");
+    defer app.deinit();
+    app.fail_fetch = true;
+    app.preference_settings_error = error.SettingsWriteFailed;
+    app.preference_session_error = error.SessionPersistenceDegraded;
+
+    try Commands(FakeApp).handleModel(&app, "new/model");
+
+    try std.testing.expectEqualStrings("new/model", app.selected_model.items);
+    try std.testing.expectEqualStrings("new/model", app.worker.synced_model.?);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try expectTranscriptContains(
+        &app,
+        "● Model: active for this process but not saved to user settings",
+    );
+    try expectTranscriptContains(
+        &app,
+        "● Model: failed to persist current session",
+    );
+}
+
+test "session_commands report indeterminate settings and session failures independently" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "old/model");
+    defer app.deinit();
+    app.fail_fetch = true;
+    app.preference_settings_error = error.SettingsCommitIndeterminate;
+    app.preference_session_error = error.SessionPersistenceDegraded;
+    const recovery_paths = try alloc.alloc([]const u8, 1);
+    recovery_paths[0] = try alloc.dupe(u8, "/tmp/settings.json.preference-migration.model.json");
+    app.preference_failure_cleanup = .{
+        .fields_removed = 1,
+        .workspaces_changed = 1,
+        .recovery_paths = recovery_paths,
+    };
+
+    try Commands(FakeApp).handleModel(&app, "new/model");
+
+    try expectTranscriptContains(&app, "user settings persistence uncertain");
+    try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
+    try expectTranscriptContains(&app, "recovery=/tmp/settings.json.preference-migration.model.json");
+    try expectTranscriptContains(&app, "● Model: failed to persist current session");
+}
+
+test "session_commands no-op model still attempts its durable targets" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "same/model");
+    defer app.deinit();
+    app.fail_fetch = true;
+
+    try Commands(FakeApp).handleModel(&app, "same/model");
+
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings(
+        "same/model",
+        app.last_preference_model.items,
+    );
+}
+
+test "session_commands model controls remain catalog validated and clear unsupported fast state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.fast_mode = true;
+    app.worker.synced_fast_mode = true;
+
+    try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), false);
+
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
+    const unsupported_options = model_capabilities.resolveProviderOptionsForCapabilities(
+        app.resolvedModelCapabilities(app.selected_model.items),
+        app.effort,
+        app.worker.synced_fast_mode.?,
+    );
+    try std.testing.expect(unsupported_options.reasoning == null);
+    try std.testing.expect(!unsupported_options.fast);
+
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
+    app.gateway_metadata_model = "anthropic/claude-opus-4.6";
+    app.gateway_metadata = .{
+        .reasoning_efforts = .fromSlice(&efforts),
+        .supports_fast_mode = true,
+    };
+
+    try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
+
+    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(usize, 2), app.worker.fast_sync_count);
+    const supported_options = model_capabilities.resolveProviderOptionsForCapabilities(
+        app.resolvedModelCapabilities(app.selected_model.items),
+        app.effort,
+        app.worker.synced_fast_mode.?,
+    );
+    try std.testing.expectEqualStrings("high", supported_options.reasoning.?.label());
+    try std.testing.expect(supported_options.fast);
+}
+
+test "session_commands fuzzyModelScore returns high score for exact substring" {
+    const score = fuzzyModelScore("anthropic/claude-sonnet-4-20250514", "claude-sonnet");
+    try std.testing.expect(score >= 100);
+}
+
+test "session_commands fuzzyModelScore returns higher score for prefix match" {
+    const prefix = fuzzyModelScore("openai/gpt-4o", "openai/gpt-4o");
+    const substr = fuzzyModelScore("openai/gpt-4o-mini", "gpt-4o");
+    try std.testing.expect(prefix > substr);
+}
+
+test "session_commands fuzzyModelScore returns positive for multi-token match" {
+    const score = fuzzyModelScore("anthropic/claude-sonnet-4-20250514", "claude sonnet");
+    try std.testing.expect(score >= 80);
+}
+
+test "session_commands fuzzyModelScore returns positive for subsequence match" {
+    const score = fuzzyModelScore("anthropic/claude-sonnet-4-20250514", "anth son");
+    try std.testing.expect(score > 0);
+}
+
+test "session_commands fuzzyModelScore returns zero for no match" {
+    const score = fuzzyModelScore("openai/gpt-4o", "zzzzz");
+    try std.testing.expectEqual(@as(i32, 0), score);
+}
+
+test "session_commands fuzzyModelScore returns zero for empty query" {
+    try std.testing.expectEqual(@as(i32, 0), fuzzyModelScore("openai/gpt-4o", ""));
+}
+
+test "session_commands splitQueryTokens splits on separators" {
+    var buf: [16][]const u8 = undefined;
+    const count = splitQueryTokens("claude-sonnet/fast", &buf);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualStrings("claude", buf[0]);
+    try std.testing.expectEqualStrings("sonnet", buf[1]);
+    try std.testing.expectEqualStrings("fast", buf[2]);
+}
+
+test "session_commands isSplitter recognizes separator characters" {
+    try std.testing.expect(isSplitter(' '));
+    try std.testing.expect(isSplitter('-'));
+    try std.testing.expect(isSplitter('/'));
+    try std.testing.expect(isSplitter('_'));
+    try std.testing.expect(!isSplitter('a'));
+    try std.testing.expect(!isSplitter('0'));
+}
+
+test "session_commands startsWithWord matches word boundary" {
+    try std.testing.expect(startsWithWord("add bash gh", "add"));
+    try std.testing.expect(startsWithWord("remove bash gh", "remove"));
+    try std.testing.expect(startsWithWord("add\tbash", "add"));
+    try std.testing.expect(!startsWithWord("addition", "add"));
+    try std.testing.expect(!startsWithWord("ad", "add"));
+    try std.testing.expect(startsWithWord("add", "add"));
+    try std.testing.expect(startsWithWord("Add bash", "add"));
 }

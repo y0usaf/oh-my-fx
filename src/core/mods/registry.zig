@@ -73,3 +73,57 @@ pub fn CommandRegistry(comptime Command: type) type {
         }
     };
 }
+
+test "ToolRegistry lookup returns hit and miss" {
+    const TestTool = struct {
+        name: []const u8,
+    };
+    const tools = [_]TestTool{
+        .{ .name = "read_file" },
+        .{ .name = "run_command" },
+    };
+    const registry = ToolRegistry(TestTool){ .tools = tools[0..] };
+
+    const found = registry.lookup("run_command") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("run_command", found.name);
+    try std.testing.expect(registry.lookup("missing") == null);
+}
+
+test "CommandRegistry lookup and prefix matching use command aliases" {
+    const TestCommand = struct {
+        command: []const u8,
+        aliases: []const []const u8 = &.{},
+    };
+    const commands = [_]TestCommand{
+        .{ .command = "/model", .aliases = &.{"/m"} },
+        .{ .command = "/models" },
+    };
+    const registry = CommandRegistry(TestCommand){ .commands = commands[0..] };
+
+    const alias = registry.lookup("/m  ") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/model", alias.command);
+
+    const prefixed = registry.matchEntryPrefix("/m model-id", alias) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/m", prefixed);
+
+    try std.testing.expect(registry.matchEntryPrefix("/m\nmodel-id", alias) == null);
+    try std.testing.expect(registry.lookup("/missing") == null);
+}
+
+test "CommandRegistry matches a specific entry prefix when commands overlap" {
+    const TestCommand = struct {
+        command: []const u8,
+        aliases: []const []const u8 = &.{},
+    };
+    const commands = [_]TestCommand{
+        .{ .command = "/background" },
+        .{ .command = "/background stop" },
+    };
+    const registry = CommandRegistry(TestCommand){ .commands = commands[0..] };
+
+    const matched = registry.matchEntryPrefix("/background stop last", &commands[1]) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/background stop", matched);
+
+    const external = TestCommand{ .command = "/background stop" };
+    try std.testing.expect(registry.matchEntryPrefix("/background stop last", &external) == null);
+}

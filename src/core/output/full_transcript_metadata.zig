@@ -58,3 +58,15 @@ pub fn formatHeader(
         },
     ) catch null;
 }
+
+test "full transcript metadata formats a stable UTC entry header" {
+    var buf: [64]u8 = undefined;
+    const header = formatHeader(&buf, 1_704_164_645_006, .prompt);
+    try std.testing.expect(header != null);
+    try std.testing.expectEqualStrings(
+        "2024-01-02 03:04:05.006 UTC · Prompt",
+        header.?,
+    );
+    try std.testing.expect(formatHeader(&buf, 0, .response) == null);
+    try std.testing.expect(formatHeader(&buf, -1, .tool) == null);
+}

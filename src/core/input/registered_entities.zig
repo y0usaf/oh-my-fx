@@ -699,3 +699,71 @@ fn isWordChar(codepoint: u21) bool {
 fn isWhitespaceRune(codepoint: u21) bool {
     return codepoint == ' ' or codepoint == '\t' or codepoint == '\n' or codepoint == '\r';
 }
+
+test "registered entity lookup accepts only canonical registered bytes" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const placeholder = "[Pasted text #1, 2 lines]";
+    try state.pasted_blocks.append(alloc, .{
+        .id = 1,
+        .text = try alloc.dupe(u8, "first\nsecond"),
+        .line_count = 2,
+        .span = .{ .raw_start = 0, .raw_end = placeholder.len },
+    });
+
+    try std.testing.expectEqual(
+        Kind.paste,
+        state.entityStartingAt(placeholder, 0).?.kind,
+    );
+    try std.testing.expect(state.entityStartingAt("[Pasted text #1, 3 lines]", 0) == null);
+}
+
+test "registered entity projections shift external edits and drop interior edits" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.skill_tokens.append(alloc, .{
+        .raw_start = 4,
+        .raw_end = 11,
+        .name = try alloc.dupe(u8, "review"),
+        .path = try alloc.dupe(u8, "/skills/review.md"),
+    });
+
+    state.shiftForInsert(alloc, 2, 3);
+    try std.testing.expectEqual(@as(usize, 7), state.skill_tokens.items[0].raw_start);
+    try std.testing.expectEqual(@as(usize, 14), state.skill_tokens.items[0].raw_end);
+
+    state.adjustForDelete(alloc, 8, 9);
+    try std.testing.expectEqual(@as(usize, 0), state.skill_tokens.items.len);
+}
+
+test "skill binding and separator claim form one atomic state transition" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+
+    try editor.setText(alloc, "$rev");
+    try state.bindSkillToken(
+        alloc,
+        &editor,
+        0,
+        editor.input.items.len,
+        "review",
+        "/skills/review.md",
+        null,
+    );
+    try std.testing.expectEqualStrings("$review ", editor.input.items);
+    try std.testing.expect(state.skill_tokens.items[0].owns_trailing_separator);
+    try std.testing.expect(state.claimPendingAutoSeparator(
+        editor.input.items,
+        editor.cursor,
+        ' ',
+    ));
+    try std.testing.expect(!state.skill_tokens.items[0].owns_trailing_separator);
+    try std.testing.expectEqualStrings("$review ", editor.input.items);
+}

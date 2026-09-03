@@ -24,11 +24,22 @@ const ToolCall = types.ToolCall;
 const Config = runtime_config.Config;
 const ToolExecutionStatus = runtime_tool_contracts.ToolExecutionStatus;
 
-const steering_open = "<user_steering>\n";
+const steering_open =
+    "<user_steering>\n" ++
+    "Apply this live user update to the current task. Continue working unless the user asks you to stop, the task is complete, or a genuine blocker prevents progress.\n\n";
 const steering_close = "\n</user_steering>";
 
 pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, steering_open ++ "{s}" ++ steering_close, .{text});
+}
+
+test "steering message tells the model to apply the update and continue" {
+    const message = try steeringMessage(std.testing.allocator, "focus on rendering");
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.find(u8, message, "live user update") != null);
+    try std.testing.expect(std.mem.find(u8, message, "Continue working") != null);
+    try std.testing.expectEqualStrings("focus on rendering", steeringText(message).?);
 }
 
 pub fn persistedStatusForCurrentFxLocalResult(
@@ -50,23 +61,64 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
     );
     errdefer types.freeExecutionMemory(alloc, execution);
 
-    var steering: std.ArrayList([]u8) = .empty;
+    var steering: std.ArrayList(types.PersistedSteering) = .empty;
     errdefer {
-        for (steering.items) |text| alloc.free(text);
+        for (steering.items) |item| {
+            alloc.free(item.text);
+            if (item.assistant_prefix) |prefix| alloc.free(prefix);
+        }
         steering.deinit(alloc);
     }
-    for (within_turn_suffix) |message| {
+    var tool_step_count: usize = 0;
+    var assistant_prefix: ?[]const u8 = null;
+    for (within_turn_suffix, 0..) |message, index| {
+        if (startsPersistedToolStep(within_turn_suffix, index)) {
+            tool_step_count += 1;
+            assistant_prefix = null;
+        } else if (message.role == .assistant) {
+            assistant_prefix = message.content;
+        }
         if (message.role != .user) continue;
         const content = message.content orelse continue;
-        const text = steeringText(content) orelse continue;
+        const text = steeringText(content) orelse {
+            assistant_prefix = null;
+            continue;
+        };
         const copy = try alloc.dupe(u8, text);
-        steering.append(alloc, copy) catch |err| {
+        const prefix_copy = if (assistant_prefix) |prefix|
+            execution_memory_helpers.redactText(alloc, prefix) catch |err| {
+                alloc.free(copy);
+                return err;
+            }
+        else
+            null;
+        steering.append(alloc, .{
+            .text = copy,
+            .assistant_prefix = prefix_copy,
+            .after_tool_step_count = tool_step_count,
+        }) catch |err| {
             alloc.free(copy);
+            if (prefix_copy) |prefix| alloc.free(prefix);
             return err;
         };
+        assistant_prefix = null;
     }
+    std.debug.assert(tool_step_count == execution.tool_steps.len);
     execution.steering = try steering.toOwnedSlice(alloc);
     return execution;
+}
+
+fn startsPersistedToolStep(messages: []const ChatMessage, assistant_index: usize) bool {
+    const assistant = messages[assistant_index];
+    if (assistant.role != .assistant or assistant.tool_calls.len == 0) return false;
+    var result_index = assistant_index + 1;
+    while (result_index < messages.len and messages[result_index].role == .tool) : (result_index += 1) {
+        const result_call_id = messages[result_index].tool_call_id orelse continue;
+        for (assistant.tool_calls) |call| {
+            if (std.mem.eql(u8, call.id, result_call_id)) return true;
+        }
+    }
+    return false;
 }
 
 fn steeringText(content: []const u8) ?[]const u8 {
@@ -189,6 +241,32 @@ pub fn retainCancelledCommandReplay(
     return if (replay) |value| .{ .output_replay = value } else null;
 }
 
+test "interrupted execution memory retains marked feedback through mixed user tail" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{
+        .{ .id = "call_first", .name = "run_command", .arguments_json = "{\"command\":\"printf first\"}" },
+        .{ .id = "call_second", .name = "run_command", .arguments_json = "{\"command\":\"printf second\"}" },
+        .{ .id = "call_active", .name = "run_command", .arguments_json = "{\"command\":\"printf active\"}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..] },
+        .{ .role = .tool, .content = "first command completed", .tool_call_id = calls[0].id, .tool_name = calls[0].name, .tool_result_status = .success },
+        .{ .role = .tool, .content = "second command completed", .tool_call_id = calls[1].id, .tool_name = calls[1].name, .tool_result_status = .success },
+        .{ .role = .user, .content = "first command feedback marker", .tool_call_id = calls[0].id, .permission_feedback = true },
+        .{ .role = .user, .content = "custom hint", .permission_feedback = false },
+        .{ .role = .user, .content = "second command feedback marker", .tool_call_id = calls[1].id, .permission_feedback = true },
+    };
+
+    const memory = try buildInterruptedExecutionMemory(alloc, &messages, calls[2]);
+    defer types.freeExecutionMemory(alloc, memory);
+
+    const results = memory.tool_steps[0].tool_results;
+    try std.testing.expectEqual(@as(usize, 1), results[0].permission_feedback.len);
+    try std.testing.expectEqualStrings("first command feedback marker", results[0].permission_feedback[0]);
+    try std.testing.expectEqual(@as(usize, 1), results[1].permission_feedback.len);
+    try std.testing.expectEqualStrings("second command feedback marker", results[1].permission_feedback[0]);
+}
+
 fn hasToolResultForCall(
     result_messages: []const ChatMessage,
     call_id: []const u8,
@@ -228,10 +306,9 @@ pub fn prepareCapturedToolModelOutput(
     else
         false;
     if (!required_command_replay and
-        (config.session_child_capability != null or config.tool_result_dir != null) and
-        raw_output.len > result_store.large_result_threshold_bytes)
+        (config.session_child_capability != null or config.tool_result_dir != null))
     {
-        const redacted_output = try execution_memory_helpers.redactText(
+        const redacted_output = try tool_result_limits.prepareRedactedOutput(
             arena,
             raw_output,
         );
@@ -260,18 +337,18 @@ pub fn prepareCapturedToolModelOutput(
         config.max_tool_result_bytes -| command_replay_store.model_handle_notice_reserve_bytes
     else
         config.max_tool_result_bytes;
-    const safe_output = try tool_result_limits.prepareModelOutput(
+    const prepared = try tool_result_limits.prepareModelOutputWithTruncation(
         arena,
         tool_call.name,
         raw_output,
         model_output_budget,
     );
     return .{
-        .model_output = safe_output,
+        .model_output = prepared.model_output,
         .memory = .{
             .output_bytes = raw_output.len,
-            .stored_output_bytes = safe_output.len,
-            .truncated = safe_output.len < raw_output.len,
+            .stored_output_bytes = prepared.model_output.len,
+            .truncated = prepared.truncated,
         },
     };
 }
@@ -485,4 +562,705 @@ pub fn captureCommittedFilePresentation(
 
 fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {
     return .{ .id = id, .name = name, .arguments_json = args };
+}
+
+test "command sidebands merge without file-view metadata" {
+    var prepared: types.ToolResultMemory = .{};
+    applyToolResultMemory(&prepared, .{
+        .command_output_replay = .unavailable,
+        .command_process_presentation = .{ .signal = 9 },
+        .terminal_action_presentation = .{ .returned = .safety_ceiling },
+    });
+    switch (prepared.command_output_replay.?) {
+        .unavailable => {},
+        .available => return error.TestExpectedUnavailableReplay,
+    }
+    try std.testing.expectEqual(
+        types.CommandProcessPresentation{ .signal = 9 },
+        prepared.command_process_presentation.?,
+    );
+    try std.testing.expectEqual(
+        types.TerminalActionPresentation{ .returned = .safety_ceiling },
+        prepared.terminal_action_presentation.?,
+    );
+    try std.testing.expect(prepared.model_view_covers_full_file == null);
+}
+
+test "exact command sources delete replay and missing handles retain it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        display_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try command_replay_store.Capture.create(arena, 46, &capability);
+    capture.appendAccepted(arena, .stdout, "o");
+    capture.appendAccepted(arena, .stdout, "n");
+    capture.appendAccepted(arena, .stdout, "e");
+    capture.appendAccepted(arena, .stdout, "\n");
+    capture.seal(arena);
+    var before = try capability.iterate(alloc, .command_artifacts);
+    defer before.deinit();
+    try std.testing.expectEqual(@as(usize, 1), before.names.len);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var prepared = result_store.PreparedResult{
+        .model_output = "exit_code=0\n<stdout>\none\n</stdout>\n",
+        .memory = .{
+            .output_bytes = 42,
+            .stored_output_bytes = 42,
+        },
+    };
+    try finalizeCommandReplay(
+        arena,
+        toolCall("command_exact", "run_command", "{}"),
+        &prepared,
+        &capability,
+        capture,
+    );
+
+    try std.testing.expect(prepared.memory.command_output_replay == null);
+    var after = try capability.iterate(alloc, .command_artifacts);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after.names.len);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(arena);
+    try body.appendNTimes(arena, 'x', 80 * 1024);
+    const stored_source = try std.fmt.allocPrint(
+        arena,
+        "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
+        .{body.items},
+    );
+    const stored_capture = try command_replay_store.Capture.create(
+        arena,
+        1024,
+        &capability,
+    );
+    stored_capture.setComparisonLimit(body.items.len);
+    stored_capture.appendAccepted(arena, .stdout, body.items);
+    stored_capture.seal(arena);
+    var stored_prepared = try prepareCapturedToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .cancel_flag = &cancel_flag,
+            .session_child_capability = &capability,
+        },
+        toolCall("command_stored_exact", "run_command", "{}"),
+        stored_source,
+        stored_capture,
+    );
+    try std.testing.expect(stored_prepared.memory.output_handle != null);
+    try finalizeCommandReplay(
+        arena,
+        toolCall("command_stored_exact", "run_command", "{}"),
+        &stored_prepared,
+        &capability,
+        stored_capture,
+    );
+    try std.testing.expect(stored_prepared.memory.command_output_replay == null);
+    var after_stored = try capability.iterate(alloc, .command_artifacts);
+    defer after_stored.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_stored.names.len);
+
+    const TransformCase = struct {
+        raw: []const u8,
+        projected: []const u8,
+    };
+    const transform_cases = [_]TransformCase{
+        .{ .raw = "\x00\n", .projected = "\\x00" },
+        .{ .raw = "\xff\n", .projected = "\\xff" },
+        .{ .raw = "\xc2\x80\n", .projected = "\\u{0080}" },
+        .{ .raw = "\x1b[31mred\x1b[0m\n", .projected = "red" },
+        .{ .raw = "old\rnew\n", .projected = "new" },
+    };
+    for (transform_cases) |case| {
+        const transformed_capture = try command_replay_store.Capture.create(
+            arena,
+            256,
+            &capability,
+        );
+        transformed_capture.appendAccepted(arena, .stdout, case.raw);
+        transformed_capture.seal(arena);
+        const projected_source = try std.fmt.allocPrint(
+            arena,
+            "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
+            .{case.projected},
+        );
+        var transformed_prepared = result_store.PreparedResult{
+            .model_output = projected_source,
+            .memory = .{
+                .output_bytes = projected_source.len,
+                .stored_output_bytes = projected_source.len,
+            },
+        };
+        try finalizeCommandReplay(
+            arena,
+            toolCall("command_transformed", "run_command", "{}"),
+            &transformed_prepared,
+            &capability,
+            transformed_capture,
+        );
+        const transformed_replay = transformed_prepared.memory.command_output_replay orelse
+            return error.TestExpectedReplay;
+        switch (transformed_replay) {
+            .available => {},
+            .unavailable => return error.TestExpectedReplay,
+        }
+    }
+
+    var before_literal = try capability.iterate(alloc, .command_artifacts);
+    defer before_literal.deinit();
+    const literal_capture = try command_replay_store.Capture.create(
+        arena,
+        1,
+        &capability,
+    );
+    literal_capture.setComparisonLimit(256);
+    literal_capture.appendAccepted(arena, .stdout, "\\x00\n");
+    literal_capture.seal(arena);
+    var literal_prepared = result_store.PreparedResult{
+        .model_output = "exit_code=0\n<stdout>\n\\x00\n</stdout>\n",
+        .memory = .{
+            .output_bytes = 40,
+            .stored_output_bytes = 40,
+        },
+    };
+    try finalizeCommandReplay(
+        arena,
+        toolCall("command_literal", "run_command", "{}"),
+        &literal_prepared,
+        &capability,
+        literal_capture,
+    );
+    try std.testing.expect(literal_prepared.memory.command_output_replay == null);
+    var after_literal = try capability.iterate(alloc, .command_artifacts);
+    defer after_literal.deinit();
+    try std.testing.expectEqual(before_literal.names.len, after_literal.names.len);
+
+    const missing_capture = try command_replay_store.Capture.create(
+        arena,
+        64 * 1024,
+        &capability,
+    );
+    missing_capture.appendAccepted(arena, .stdout, "one\n");
+    missing_capture.seal(arena);
+    var missing_prepared = result_store.PreparedResult{
+        .model_output = "stored result preview",
+        .memory = .{
+            .output_handle = "result-run-command-missing.txt",
+            .output_bytes = 42,
+            .stored_output_bytes = 42,
+            .truncated = true,
+        },
+    };
+    try finalizeCommandReplay(
+        arena,
+        toolCall("command_missing", "run_command", "{}"),
+        &missing_prepared,
+        &capability,
+        missing_capture,
+    );
+    const retained = missing_prepared.memory.command_output_replay orelse
+        return error.TestExpectedReplay;
+    switch (retained) {
+        .available => {},
+        .unavailable => return error.TestExpectedReplay,
+    }
+    var after_missing = try capability.iterate(alloc, .command_artifacts);
+    defer after_missing.deinit();
+    try std.testing.expectEqual(transform_cases.len + 1, after_missing.names.len);
+}
+
+test "required terminal exec retains exact replay and publishes its handle" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        display_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try command_replay_store.Capture.create(arena, 64 * 1024, &capability);
+    capture.setPolicyBeforeCapture(.required);
+    capture.appendAccepted(arena, .stdout, "one\n");
+    capture.seal(arena);
+    var prepared = result_store.PreparedResult{
+        .model_output = "exit_code=0\n<stdout>\none\n</stdout>\n",
+        .memory = .{
+            .output_bytes = 42,
+            .stored_output_bytes = 42,
+        },
+    };
+
+    try finalizeCommandReplay(
+        arena,
+        toolCall(
+            "terminal_exact",
+            "terminal",
+            "{\"action\":\"exec\",\"command\":\"printf one\",\"timeout_ms\":600000}",
+        ),
+        &prepared,
+        &capability,
+        capture,
+    );
+
+    const replay = prepared.memory.command_output_replay orelse
+        return error.TestExpectedReplay;
+    const descriptor = switch (replay) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, descriptor.handle) != null);
+    capture.releaseRetained(arena);
+}
+
+test "required terminal exec stores large output only as replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        display_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const body = try arena.alloc(u8, result_store.large_result_threshold_bytes + 1024);
+    @memset(body, 'x');
+    const raw_output = try std.fmt.allocPrint(
+        arena,
+        "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
+        .{body},
+    );
+    const tool_call = toolCall(
+        "terminal_large",
+        "terminal",
+        "{}",
+    );
+    const capture = try command_replay_store.Capture.create(arena, 1024, &capability);
+    capture.setPolicyBeforeCapture(.required);
+    try capture.appendAcceptedRequired(arena, .stdout, body);
+    var prepared = try prepareCapturedToolModelOutput(arena, .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
+        .cancel_flag = &cancel,
+        .session_child_capability = &capability,
+    }, tool_call, raw_output, capture);
+    try std.testing.expect(prepared.memory.output_handle == null);
+    try finalizeCommandReplay(
+        arena,
+        tool_call,
+        &prepared,
+        &capability,
+        capture,
+    );
+    defer capture.releaseRetained(arena);
+    try std.testing.expect(
+        prepared.model_output.len <= tool_result_limits.min_configured_tool_result_bytes,
+    );
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "<command_output_handle>") != null);
+
+    var command_artifacts = try capability.iterate(alloc, .command_artifacts);
+    defer command_artifacts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), command_artifacts.names.len);
+    var tool_results = try capability.iterate(alloc, .tool_results);
+    defer tool_results.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tool_results.names.len);
+}
+
+test "saved preparation stores complete redacted output on sub-threshold cap loss" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const raw = "CUSTOM_API_KEY=abc123\n" ** 46;
+    try std.testing.expectEqual(@as(usize, 1012), raw.len);
+
+    const prepared = try prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .max_tool_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
+            .cancel_flag = &cancel,
+            .tool_result_dir = result_dir,
+        },
+        toolCall("call_expanded_secret", "read_file", "{}"),
+        raw,
+    );
+
+    const handle = prepared.memory.output_handle orelse
+        return error.TestExpectedStoredResult;
+    try std.testing.expect(prepared.memory.truncated);
+    const stored = try result_store.readByRange(
+        alloc,
+        result_dir,
+        handle,
+        1,
+        result_store.read_max_bytes,
+    );
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.find(u8, stored, "CUSTOM_API_KEY=[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, stored, "abc123") == null);
+}
+
+test "no-save preparation preserves capped success without a result handle" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const raw = "CUSTOM_API_KEY=abc123\n" ** 46;
+
+    const prepared = try prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .max_tool_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
+            .cancel_flag = &cancel,
+        },
+        toolCall("call_no_save_secret", "read_file", "{}"),
+        raw,
+    );
+
+    try std.testing.expect(prepared.memory.output_handle == null);
+    try std.testing.expect(prepared.memory.truncated);
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "tool result truncated") != null);
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "abc123") == null);
+}
+
+test "saved preparation keeps redaction shrink complete and inline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const raw = "AI_GATEWAY_API_KEY=abcdefghijklmnop end";
+
+    const prepared = try prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .max_tool_result_bytes = tool_result_limits.default_max_tool_result_bytes,
+            .cancel_flag = &cancel,
+            .tool_result_dir = result_dir,
+        },
+        toolCall("call_redaction_shrink", "read_file", "{}"),
+        raw,
+    );
+
+    try std.testing.expect(prepared.memory.output_handle == null);
+    try std.testing.expect(!prepared.memory.truncated);
+    try std.testing.expectEqualStrings(
+        "AI_GATEWAY_API_KEY=[redacted] end",
+        prepared.model_output,
+    );
+}
+
+test "common execution memory does not mark stored read previews as full" {
+    const session_runtime = @import("../../session/session.zig");
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    try raw.appendNTimes(
+        alloc,
+        'x',
+        result_store.large_result_threshold_bytes + 128,
+    );
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const prepared = try prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .cancel_flag = &cancel_flag,
+            .tool_result_dir = result_dir,
+        },
+        toolCall(
+            "call_large_read",
+            "read_file",
+            "{\"path\":\"large.txt\"}",
+        ),
+        raw.items,
+    );
+    try std.testing.expect(prepared.memory.output_handle != null);
+    try std.testing.expect(prepared.memory.truncated);
+
+    var calls = [_]ToolCall{.{
+        .id = "call_large_read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"large.txt\"}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..] },
+        .{
+            .role = .tool,
+            .content = prepared.model_output,
+            .tool_call_id = "call_large_read",
+            .tool_name = "read_file",
+            .tool_result_status = .success,
+            .tool_result_memory = prepared.memory,
+        },
+    };
+
+    const execution = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expect(execution.tool_steps[0].tool_results[0].truncated);
+    try std.testing.expectEqual(@as(usize, 1), execution.files.len);
+    try std.testing.expect(!execution.files[0].model_view_covers_full_file);
+
+    const replay = try session_runtime.formatExecutionFileContext(alloc, execution.files);
+    defer alloc.free(replay);
+    try std.testing.expect(std.mem.find(u8, replay, "model_view=full") == null);
+}
+
+test "execution memory redacts secret argument values without breaking JSON" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{.{
+        .id = "call_secret",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"echo ok\",\"api_key\":\"secret-value\"}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..] },
+        .{ .role = .tool, .content = "ok", .tool_call_id = "call_secret", .tool_name = "run_command", .tool_result_status = .success },
+    };
+
+    const memory = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, memory);
+    try std.testing.expectEqual(@as(usize, 1), memory.tool_steps.len);
+    const args = memory.tool_steps[0].tool_calls[0].arguments_json;
+    try std.testing.expect(std.mem.find(u8, args, "secret-value") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, args, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("[REDACTED]", parsed.value.object.get("api_key").?.string);
+    try std.testing.expectEqualStrings("echo ok", parsed.value.object.get("command").?.string);
+}
+
+test "execution memory redacts credentialed web_fetch url arguments" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{.{
+        .id = "call_fetch",
+        .name = "web_fetch",
+        .arguments_json = "{\"url\":\"https://user:pass@example.com/docs?token=QUERY_SECRET_SHOULD_NOT_PERSIST\"}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..] },
+        .{ .role = .tool, .content = "Web fetch result.", .tool_call_id = "call_fetch", .tool_name = "web_fetch", .tool_result_status = .success },
+    };
+
+    const memory = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, memory);
+    const args = memory.tool_steps[0].tool_calls[0].arguments_json;
+    try std.testing.expect(std.mem.find(u8, args, "user:pass") == null);
+    try std.testing.expect(std.mem.find(u8, args, "QUERY_SECRET_SHOULD_NOT_PERSIST") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, args, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("prompt") == null);
+    try std.testing.expectEqualStrings("https://[redacted]@example.com/docs?token=[redacted]", parsed.value.object.get("url").?.string);
+}
+
+test "large result storage redacts secret-bearing output before preview and disk persistence" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    try raw.appendSlice(alloc, "api_key=super-secret-value\n");
+    try raw.appendNTimes(alloc, 'x', result_store.large_result_threshold_bytes + 64);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const prepared = try prepareToolModelOutput(arena, .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .agent_step_limit = 1,
+        .cancel_flag = &cancel_flag,
+        .tool_result_dir = dir,
+    }, toolCall("call_secret_large", "run_command", "{}"), raw.items);
+
+    try std.testing.expect(prepared.memory.output_handle != null);
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "super-secret-value") == null);
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "api_key=[redacted]") != null);
+
+    const stored = try result_store.readByRange(alloc, dir, prepared.memory.output_handle.?, 1, 512);
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.find(u8, stored, "super-secret-value") == null);
+    try std.testing.expect(std.mem.find(u8, stored, "api_key=[redacted]") != null);
+}
+
+test "execution memory persists consumed steering without protocol wrappers" {
+    const alloc = std.testing.allocator;
+    const first = try steeringMessage(alloc, "focus on rendering");
+    defer alloc.free(first);
+    const second = try steeringMessage(alloc, "run the focused test");
+    defer alloc.free(second);
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "ordinary user context" },
+        .{ .role = .user, .content = first },
+        .{ .role = .assistant, .content = "continuing" },
+        .{ .role = .user, .content = second },
+    };
+
+    const execution = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+
+    try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+    try std.testing.expectEqualStrings("focus on rendering", execution.steering[0].text);
+    try std.testing.expectEqualStrings("run the focused test", execution.steering[1].text);
+    try std.testing.expectEqual(@as(usize, 0), execution.steering[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), execution.steering[1].after_tool_step_count);
+}
+
+test "execution memory records each steering tool boundary" {
+    const alloc = std.testing.allocator;
+    const first_steering = try steeringMessage(alloc, "after first");
+    defer alloc.free(first_steering);
+    const second_steering = try steeringMessage(alloc, "after second");
+    defer alloc.free(second_steering);
+    var first_calls = [_]ToolCall{.{
+        .id = "call_first",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"first\"}",
+    }};
+    var second_calls = [_]ToolCall{.{
+        .id = "call_second",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"second\"}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &first_calls },
+        .{ .role = .tool, .content = "first result", .tool_call_id = "call_first", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .user, .content = first_steering },
+        .{ .role = .assistant, .tool_calls = &second_calls },
+        .{ .role = .tool, .content = "second result", .tool_call_id = "call_second", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .user, .content = second_steering },
+    };
+
+    const execution = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+    try std.testing.expectEqualStrings("after first", execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("after second", execution.steering[1].text);
+    try std.testing.expectEqual(@as(usize, 2), execution.steering[1].after_tool_step_count);
+}
+
+test "transcript does not mark native web_search as provider resource placeholder" {
+    const alloc = std.testing.allocator;
+    const record = try execution_memory_helpers.makePersistedToolResult(
+        alloc,
+        "call_search",
+        "web_search",
+        .success,
+        "bounded search output",
+        null,
+    );
+    const records = try alloc.alloc(types.PersistedToolResult, 1);
+    records[0] = record;
+    defer types.freePersistedToolResults(alloc, records);
+
+    try std.testing.expect(!records[0].provider_native);
+    try std.testing.expectEqualStrings("bounded search output", records[0].output);
 }

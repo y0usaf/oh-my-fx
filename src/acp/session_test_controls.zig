@@ -41,3 +41,8 @@ fn pauseAtRequestedBoundary(
 
     while (true) io_mod.sleep(std.time.ns_per_s);
 }
+
+test "session boundary fault injection requires ready path" {
+    const options = logOptionsFromEnv("after_event_append", null);
+    try std.testing.expect(options.test_controls.boundary_fn == null);
+}

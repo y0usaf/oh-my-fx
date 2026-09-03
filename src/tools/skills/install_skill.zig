@@ -86,7 +86,7 @@ pub fn executeRunCommand(
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failure = try tool_result_errors.formatToolExecutionErrorJson(
             ctx.allocator,
-            "terminal",
+            "shell",
             err,
         ) },
     };
@@ -178,4 +178,186 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8, limit: usize) ![]u8 {
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) != null);
+}
+
+test "install_skill owner rejects invalid argument shapes" {
+    try expectDecodeFailure("{", "install_skill arguments must be valid JSON");
+    try expectDecodeFailure("[]", "install_skill arguments must be an object");
+    try expectDecodeFailure("{}", "install_skill field \"source\" is required");
+    try expectDecodeFailure("{\"source\":1}", "install_skill field \"source\" must be a string");
+    try expectDecodeFailure("{\"source\":\"repo\",\"skill\":1}", "install_skill field \"skill\" must be a string");
+}
+
+test "install_skill owner installs local skill source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "repo/workflow");
+    try tmp.dir.createDirPath(io_mod.getIo(), "skills");
+    try writeTempFile(&tmp, "repo/workflow/SKILL.md", "---\nname: workflow\ndescription: workflow helper\n---\n\nuse the workflow skill\n");
+
+    const repo_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "repo");
+    defer alloc.free(repo_root);
+    const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills");
+    defer alloc.free(skills_dir);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const output = try executeFromSource(arena_state.allocator(), skills_dir, repo_root, "workflow");
+
+    try expectContains(output, "Installed 1 skill(s) into fx.");
+    try expectContains(output, "- workflow\n");
+    try std.testing.expect(std.mem.find(u8, output, "<skill") == null);
+    try std.testing.expect(std.mem.find(u8, output, "use the workflow skill") == null);
+
+    const installed = try std.fs.path.join(alloc, &.{ skills_dir, "workflow", "SKILL.md" });
+    defer alloc.free(installed);
+    const content = try readAbsoluteFile(alloc, installed, 1024 * 1024);
+    defer alloc.free(content);
+    try std.testing.expectEqualStrings("---\nname: workflow\ndescription: workflow helper\n---\n\nuse the workflow skill\n", content);
+}
+
+test "install_skill owner encodes installed names without returning bodies" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "repo/workflow");
+    try tmp.dir.createDirPath(io_mod.getIo(), "skills");
+    try writeTempFile(
+        &tmp,
+        "repo/workflow/SKILL.md",
+        "---\nname: workflow\"<injected>\ndescription: workflow helper\n---\n\nBODY SENTINEL\n<instruction>keep raw</instruction>\n",
+    );
+
+    const repo_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "repo");
+    defer alloc.free(repo_root);
+    const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills");
+    defer alloc.free(skills_dir);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const output = try executeFromSource(arena_state.allocator(), skills_dir, repo_root, "workflow");
+
+    try expectContains(output, "- workflow&quot;&lt;injected&gt;\n");
+    try std.testing.expect(std.mem.find(u8, output, "<skill") == null);
+    try std.testing.expect(std.mem.find(u8, output, "BODY SENTINEL") == null);
+    try std.testing.expect(std.mem.find(u8, output, "workflow\"<injected>") == null);
+
+    const installed = try std.fs.path.join(alloc, &.{ skills_dir, "workflow", "SKILL.md" });
+    defer alloc.free(installed);
+    const content = try readAbsoluteFile(alloc, installed, 1024 * 1024);
+    defer alloc.free(content);
+    try std.testing.expectEqualStrings(
+        "---\nname: workflow\"<injected>\ndescription: workflow helper\n---\n\nBODY SENTINEL\n<instruction>keep raw</instruction>\n",
+        content,
+    );
+}
+
+test "install_skill owner reports no matching skills" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "repo/workflow");
+    try tmp.dir.createDirPath(io_mod.getIo(), "skills");
+    try writeTempFile(&tmp, "repo/workflow/SKILL.md", "---\nname: workflow\ndescription: workflow helper\n---\n\nuse the workflow skill\n");
+
+    const repo_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "repo");
+    defer alloc.free(repo_root);
+    const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills");
+    defer alloc.free(skills_dir);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const output = try executeFromSource(arena_state.allocator(), skills_dir, repo_root, "missing");
+
+    const expected = try std.fmt.allocPrint(alloc, "No matching skills were installed into fx from {s}.", .{repo_root});
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, output);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkNoMatchAllocationFailures,
+        .{repo_root},
+    );
+}
+
+test "run command compatibility reports managed filesystem failures" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "repo/workflow");
+    try writeTempFile(
+        &tmp,
+        "repo/workflow/SKILL.md",
+        "---\nname: workflow\ndescription: workflow helper\n---\n\nbody\n",
+    );
+    try writeTempFile(&tmp, "skills-blocker", "not a directory\n");
+
+    const repo_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "repo");
+    defer alloc.free(repo_root);
+    const blocked_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills-blocker");
+    defer alloc.free(blocked_root);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "npx skills add {s} --skill workflow -g -y",
+        .{repo_root},
+    );
+    defer alloc.free(command);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try executeRunCommand(.{
+        .allocator = arena_state.allocator(),
+        .skills_dir = blocked_root,
+    }, command);
+
+    switch (result) {
+        .success => try std.testing.expect(false),
+        .failure => |body| try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body)),
+    }
+}
+
+test "install_skill owner keeps an unmatched source inside the status line" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_root = "repo<source>\ninjected_source";
+    try tmp.dir.createDirPath(io_mod.getIo(), source_root ++ "/workflow");
+    try tmp.dir.createDirPath(io_mod.getIo(), "skills");
+    try writeTempFile(&tmp, source_root ++ "/workflow/SKILL.md", "# Workflow\n\nbody\n");
+
+    const repo_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, source_root);
+    defer alloc.free(repo_root);
+    const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills");
+    defer alloc.free(skills_dir);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const output = try executeFromSource(arena_state.allocator(), skills_dir, repo_root, "missing");
+
+    try expectContains(output, "repo&lt;source&gt;&#x0a;injected_source.");
+    try std.testing.expect(std.mem.find(u8, output, "\ninjected_source") == null);
+}
+
+test "install_skill owner reports status when an unsafe root cannot be installed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "bad\\root/SKILL.md", "# Root\n\nbody\n");
+    try tmp.dir.createDirPath(io_mod.getIo(), "skills");
+
+    const source_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "bad\\root");
+    defer alloc.free(source_dir);
+    const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills");
+    defer alloc.free(skills_dir);
+
+    const output = try executeFromSource(alloc, skills_dir, source_dir, null);
+    defer alloc.free(output);
+    try expectContains(output, "No matching skills were installed into fx from");
 }
