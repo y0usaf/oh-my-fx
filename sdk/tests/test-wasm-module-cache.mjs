@@ -13,7 +13,7 @@ if (!supportsJspi()) {
 }
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"));
+const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm"));
 const temp = await mkdtemp(join(tmpdir(), "libfx-wasm-cache-"));
 const secondPath = join(temp, "second.wasm");
 const retryPath = join(temp, "retry.wasm");

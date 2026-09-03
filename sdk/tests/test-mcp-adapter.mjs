@@ -119,7 +119,7 @@ try {
   agent = await createFxAgent({
     backend,
     nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
-    ...(backend === "wasm" ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) } : {}),
+    ...(backend === "wasm" ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm")) } : {}),
     tools: adapter.tools,
     instructions: adapter.instructions,
     fetch,

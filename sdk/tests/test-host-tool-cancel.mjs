@@ -31,7 +31,7 @@ const events = [];
 const agent = await createFxAgent({
   backend,
   nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
-  ...(backend === "wasm" ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) } : {}),
+  ...(backend === "wasm" ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm")) } : {}),
   fetch,
   traceWasi: process.env.LIBFX_TRACE_WASM === "1",
   onEvent(event) { events.push(event); },

@@ -49,7 +49,7 @@ let activeSample = 0;
 const agent = await createFxAgent({
   backend,
   nativeAddon: resolve(root, "zig-out/lib/libfx.node"),
-  ...(backend === "wasm" ? { wasm: await readFile(resolve(root, "zig-out/bin/fx-core.wasm")) } : {}),
+  ...(backend === "wasm" ? { wasm: await readFile(resolve(root, "zig-out/bin/omfx-core.wasm")) } : {}),
   fetch,
   tools: [{
     name: "bridge_echo",

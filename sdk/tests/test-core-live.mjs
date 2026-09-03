@@ -6,12 +6,9 @@ import { fileURLToPath } from "node:url";
 import { createFxAgent, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-core.wasm");
+const defaultWasm = resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm");
 const wasmPath = resolve(process.argv[2] || defaultWasm);
-const backend = process.env.LIBFX_LIVE_BACKEND || "wasm";
-const nativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const apiKey = process.env.AI_GATEWAY_API_KEY || process.env.FX_API_KEY;
-const model = process.env.FX_MODEL || "google/gemini-2.5-flash-lite";
 
 if (!supportsJspi()) {
   console.error("Node JSPI is disabled. Run with: node --experimental-wasm-jspi sdk/scripts/test-core-live.mjs");
@@ -72,37 +69,39 @@ const tracedFetch = async (url, init) => {
 };
 
 const agent = await Promise.race([
-  createFxAgent({ backend, nativeAddon, wasm: await readFile(wasmPath), fetch: tracedFetch, apiKey, model }),
+  createFxAgent({ wasm: await readFile(wasmPath), fetch: tracedFetch, env: { AI_GATEWAY_API_KEY: apiKey } }),
   new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for fx-core initialize")), 5000)),
 ]);
 
 try {
+  const session = await agent.createSession();
   const prompt = [
     `Begin your response with the exact token ${nonce}.`,
     "Then write four short, distinct sentences explaining why incremental token streaming improves an interactive coding assistant.",
     "Do not use tools or Markdown.",
   ].join(" ");
-  const turn = agent.prompt(prompt);
+  const turn = session.prompt(prompt);
   const chunks = [];
   let firstAcpChunkAt = null;
   const timeout = setTimeout(() => turn.cancel(), 45000);
   try {
     for await (const update of turn) {
-      if (update.type !== "text_delta") continue;
-      const text = update.delta;
+      if (update.sessionUpdate !== "agent_message_chunk") continue;
+      const text = update.content?.text;
+      if (!text || text.startsWith("[context]")) continue;
       if (firstAcpChunkAt === null) firstAcpChunkAt = performance.now();
       chunks.push(text);
     }
   } finally {
     clearTimeout(timeout);
   }
-  const stopReason = (await turn.result).stopReason;
+  const stopReason = await turn.stopReason;
   const text = chunks.join("").trim();
 
   if (responseStatus !== 200) throw new Error(`live gateway returned HTTP ${responseStatus}`);
   if (fetchCalls !== 1) throw new Error(`expected one live gateway fetch, got ${fetchCalls}`);
-  if (!requestedSessionId) throw new Error("live gateway request omitted session id");
-  if (requestedSessionAffinity !== requestedSessionId) throw new Error(`live gateway affinity disagreed with session id: ${requestedSessionAffinity}`);
+  if (requestedSessionId !== session.id) throw new Error(`live gateway request used unexpected session id: ${requestedSessionId}`);
+  if (requestedSessionAffinity !== session.id) throw new Error(`live gateway request used unexpected session affinity: ${requestedSessionAffinity}`);
   if (!text.includes(nonce)) {
     const responsePreview = new TextDecoder().decode(Buffer.concat(responsePreviewChunks.map((chunk) => Buffer.from(chunk))));
     throw new Error(`live model response did not include the per-run nonce; ACP text=${JSON.stringify(text.slice(0, 500))}; SSE preview=${JSON.stringify(responsePreview.slice(0, 1000))}`);
@@ -115,10 +114,10 @@ try {
   const elapsedMs = Math.round(performance.now() - startedAt);
   const firstBodyMs = firstResponseBodyChunkAt === null ? "n/a" : Math.round(firstResponseBodyChunkAt - startedAt);
   const firstAcpMs = firstAcpChunkAt === null ? "n/a" : Math.round(firstAcpChunkAt - startedAt);
-  console.log(`live core SDK ${backend} stream passed (${requestedSessionId})`);
+  console.log(`live core SDK ACP stream passed (${session.id})`);
   console.log(`gateway HTTP ${responseStatus}; body chunks=${responseBodyChunks}; ACP text chunks=${chunks.length}`);
   console.log(`first body chunk=${firstBodyMs}ms; first ACP chunk=${firstAcpMs}ms; total=${elapsedMs}ms`);
   console.log(`model echoed nonce ${nonce}; response bytes=${new TextEncoder().encode(text).length}`);
 } finally {
-  await agent.close();
+  agent.abort();
 }
