@@ -3505,17 +3505,23 @@ fn runRushEmbed(
     args: []const [*:0]const u8,
     env_block: std.process.Environ.Block,
 ) !u8 {
-    var env_list: [256][*:0]const u8 = undefined;
     var env_count: usize = 0;
     for (env_block.slice) |entry| {
-        if (env_count == env_list.len) break;
-        env_list[env_count] = entry orelse continue;
-        env_count += 1;
+        if (entry != null) env_count += 1;
     }
-    var session = try rush_embed.Session.init(allocator, env_list[0..env_count]);
+    const env_list = try allocator.alloc([*:0]const u8, env_count);
+    defer allocator.free(env_list);
+    var filled: usize = 0;
+    for (env_block.slice) |entry| {
+        if (entry) |value| {
+            env_list[filled] = value;
+            filled += 1;
+        }
+    }
+    var session = try rush_embed.Session.init(allocator, env_list);
     defer session.deinit();
 
-    var index: usize = 0;
+    var index: usize = 1; // args[0] is the re-exec'd executable path, not a flag
     while (index < args.len) : (index += 1) {
         const arg = std.mem.sliceTo(args[index], 0);
         if (std.mem.eql(u8, arg, "-c")) {
@@ -3525,6 +3531,16 @@ fn runRushEmbed(
             }
             const script = std.mem.sliceTo(args[index + 1], 0);
             return session.evalScript(script);
+        }
+        if (!std.mem.eql(u8, arg, "--login") and !std.mem.eql(u8, arg, "-i")) {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "omfx: unrecognized embed argument: {s}\n",
+                .{arg},
+            );
+            defer allocator.free(message);
+            std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), message) catch {};
+            return 2;
         }
     }
 
