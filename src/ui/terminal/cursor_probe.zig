@@ -513,3 +513,335 @@ fn classifyAnsiCandidate(bytes: []const u8) CandidateStatus {
     if (row == 0 or col == 0) return .invalid;
     return .{ .complete = .{ .row = row, .col = col } };
 }
+
+fn appendForwarded(
+    result: FeedResult,
+    forwarded: *std.ArrayList(u8),
+) !?Position {
+    return switch (result) {
+        .pending => null,
+        .position => |position| position,
+        .late_response => null,
+        .forward => |bytes| blk: {
+            try forwarded.appendSlice(std.testing.allocator, bytes.slice());
+            break :blk null;
+        },
+    };
+}
+
+test "private cursor probe preserves arbitrary backlog before the response" {
+    const backlog_sizes = [_]usize{ 255, 256, 257, 5_000_000 };
+
+    for (backlog_sizes) |backlog_size| {
+        var probe = Parser{};
+        try probe.begin(.private, 100);
+
+        var forwarded: std.ArrayList(u8) = .empty;
+        defer forwarded.deinit(std.testing.allocator);
+
+        var i: usize = 0;
+        while (i < backlog_size) : (i += 1) {
+            try std.testing.expectEqual(
+                @as(?Position, null),
+                try appendForwarded(probe.feed('x'), &forwarded),
+            );
+        }
+        for ("\x1b[?12;1R\x1b[?12;2R") |byte| {
+            if (try appendForwarded(probe.feed(byte), &forwarded)) |position| {
+                try std.testing.expectEqual(Position{ .row = 12, .col = 1 }, position);
+            }
+        }
+
+        try std.testing.expectEqual(backlog_size, forwarded.items.len);
+        for (forwarded.items) |byte| try std.testing.expectEqual(@as(u8, 'x'), byte);
+        try std.testing.expect(probe.canBegin());
+    }
+}
+
+test "private cursor probe survives a response split across reads" {
+    var probe = Parser{};
+    try probe.begin(.private, 100);
+
+    var forwarded: std.ArrayList(u8) = .empty;
+    defer forwarded.deinit(std.testing.allocator);
+
+    for ("\x1b[?7;") |byte| {
+        try std.testing.expectEqual(
+            @as(?Position, null),
+            try appendForwarded(probe.feed(byte), &forwarded),
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 0), forwarded.items.len);
+
+    var position: ?Position = null;
+    for ("1R") |byte| {
+        position = try appendForwarded(probe.feed(byte), &forwarded) orelse position;
+    }
+    try std.testing.expect(probe.hasPendingInput());
+    for ("\x1b[?7;2R") |byte| {
+        position = try appendForwarded(probe.feed(byte), &forwarded) orelse position;
+    }
+    try std.testing.expectEqual(@as(?Position, .{ .row = 7, .col = 1 }), position);
+    try std.testing.expectEqual(@as(usize, 0), forwarded.items.len);
+    try std.testing.expect(!probe.hasPendingInput());
+}
+
+test "private cursor probe forwards modified F3 and consumes only the private report" {
+    var probe = Parser{};
+    try probe.begin(.private, 100);
+
+    var forwarded: std.ArrayList(u8) = .empty;
+    defer forwarded.deinit(std.testing.allocator);
+
+    for ("\x1b[1;2R") |byte| {
+        _ = try appendForwarded(probe.feed(byte), &forwarded);
+    }
+    try std.testing.expectEqualStrings("\x1b[1;2R", forwarded.items);
+
+    var position: ?Position = null;
+    for ("\x1b[?5;1R\x1b[?5;2R") |byte| {
+        position = try appendForwarded(probe.feed(byte), &forwarded) orelse position;
+    }
+    try std.testing.expectEqual(@as(?Position, .{ .row = 5, .col = 1 }), position);
+}
+
+test "private cursor probe timeout replays a partial candidate and discards a late response" {
+    var probe = Parser{};
+    try probe.begin(.private, 100);
+
+    for ("\x1b[?12") |byte| {
+        try std.testing.expectEqual(FeedResult.pending, probe.feed(byte));
+    }
+    try std.testing.expect(probe.hasPendingInput());
+
+    try std.testing.expectEqual(PollResult.probe_timed_out, probe.poll(100));
+
+    var replay: [128]u8 = undefined;
+    var replay_len: usize = 0;
+    while (probe.takeDeferredByte()) |byte| {
+        try std.testing.expect(probe.hasPendingInput());
+        try std.testing.expect(probe.consumeDeferredInputDispatch());
+        try std.testing.expect(!probe.consumeDeferredInputDispatch());
+        replay[replay_len] = byte;
+        replay_len += 1;
+    }
+    try std.testing.expectEqualStrings("\x1b[?12", replay[0..replay_len]);
+    try std.testing.expect(!probe.canBegin());
+    try std.testing.expect(!probe.hasPendingInput());
+
+    var saw_late_response = false;
+    for ("\x1b[?8;1R\x1b[?8;2R") |byte| {
+        switch (probe.feed(byte)) {
+            .late_response => saw_late_response = true,
+            .pending => {},
+            .forward, .position => return error.UnexpectedProbeResult,
+        }
+    }
+    try std.testing.expect(saw_late_response);
+    try std.testing.expect(probe.canBegin());
+}
+
+test "private cursor probe supports consecutive measurements" {
+    var probe = Parser{};
+
+    try probe.begin(.private, 100);
+    for ("\x1b[?2;1R\x1b[?2;2R") |byte| {
+        const result = probe.feed(byte);
+        if (result == .position) {
+            try std.testing.expectEqual(FeedResult{ .position = .{ .row = 2, .col = 1 } }, result);
+        }
+    }
+
+    try probe.begin(.private, 200);
+    for ("\x9b?4;1R\x9b?4;2R") |byte| {
+        const result = probe.feed(byte);
+        if (result == .position) {
+            try std.testing.expectEqual(FeedResult{ .position = .{ .row = 4, .col = 1 } }, result);
+        }
+    }
+}
+
+test "tagged ANSI cursor probe forwards modified F3 before the response" {
+    var probe = Parser{};
+    try probe.begin(.ansi_tagged, 100);
+
+    var forwarded: std.ArrayList(u8) = .empty;
+    defer forwarded.deinit(std.testing.allocator);
+
+    for ("\x1b[1;2R") |byte| {
+        _ = try appendForwarded(probe.feed(byte), &forwarded);
+    }
+    try std.testing.expectEqualStrings("\x1b[1;2R", forwarded.items);
+
+    var position: ?Position = null;
+    for ("\x1b[12;1R\x1b[12;2R") |byte| {
+        position = try appendForwarded(probe.feed(byte), &forwarded) orelse position;
+    }
+    try std.testing.expectEqual(@as(?Position, .{ .row = 12, .col = 1 }), position);
+    try std.testing.expectEqualStrings("\x1b[1;2R", forwarded.items);
+}
+
+test "tagged ANSI cursor probe forwards every legacy F3 modifier parameter" {
+    var modifier: u8 = 2;
+    while (modifier <= 64) : (modifier += 1) {
+        var probe = Parser{};
+        try probe.begin(.ansi_tagged, 100);
+
+        var sequence_buf: [16]u8 = undefined;
+        const sequence = try std.fmt.bufPrint(&sequence_buf, "\x1b[1;{d}R", .{modifier});
+        var forwarded: std.ArrayList(u8) = .empty;
+        defer forwarded.deinit(std.testing.allocator);
+
+        for (sequence) |byte| {
+            _ = try appendForwarded(probe.feed(byte), &forwarded);
+        }
+        try std.testing.expectEqualStrings(sequence, forwarded.items);
+    }
+}
+
+test "tagged ANSI cursor probe forwards the modified F3 three and four pair" {
+    var probe = Parser{};
+    try probe.begin(.ansi_tagged, 100);
+
+    var forwarded: std.ArrayList(u8) = .empty;
+    defer forwarded.deinit(std.testing.allocator);
+    for ("\x1b[1;3R\x1b[1;4R") |byte| {
+        _ = try appendForwarded(probe.feed(byte), &forwarded);
+    }
+
+    try std.testing.expectEqualStrings("\x1b[1;3R\x1b[1;4R", forwarded.items);
+    var position: ?Position = null;
+    for ("\x1b[12;1R\x1b[12;2R") |byte| {
+        position = try appendForwarded(probe.feed(byte), &forwarded) orelse position;
+    }
+    try std.testing.expectEqual(@as(?Position, .{ .row = 12, .col = 1 }), position);
+}
+
+test "tagged ANSI cursor probe preserves CPR-shaped input after the terminal response" {
+    var probe = Parser{};
+    try probe.begin(.ansi_tagged, 100);
+
+    var forwarded: std.ArrayList(u8) = .empty;
+    defer forwarded.deinit(std.testing.allocator);
+
+    var position: ?Position = null;
+    for ("\x1b[12;1R\x1b[12;2R\x1b[1;2R") |byte| {
+        position = try appendForwarded(probe.feed(byte), &forwarded) orelse position;
+    }
+
+    try std.testing.expectEqual(@as(?Position, .{ .row = 12, .col = 1 }), position);
+    try std.testing.expectEqualStrings("\x1b[1;2R", forwarded.items);
+}
+
+test "tagged ANSI cursor probe forwards untagged cursor reports in order" {
+    var probe = Parser{};
+    try probe.begin(.ansi_tagged, 100);
+
+    var forwarded: std.ArrayList(u8) = .empty;
+    defer forwarded.deinit(std.testing.allocator);
+
+    for ("\x1b[1;2Rx") |byte| {
+        _ = try appendForwarded(probe.feed(byte), &forwarded);
+    }
+    try std.testing.expectEqualStrings("\x1b[1;2Rx", forwarded.items);
+
+    var position: ?Position = null;
+    for ("\x1b[7;1R\x1b[7;2R") |byte| {
+        position = try appendForwarded(probe.feed(byte), &forwarded) orelse position;
+    }
+    try std.testing.expectEqual(@as(?Position, .{ .row = 7, .col = 1 }), position);
+    try std.testing.expectEqualStrings("\x1b[1;2Rx", forwarded.items);
+}
+
+test "tagged ANSI cursor probe preserves CPR-shaped paste before the terminal response pair" {
+    var probe = Parser{};
+    try probe.begin(.ansi_tagged, 100);
+
+    try std.testing.expect(probe.suspendForPaste());
+    try std.testing.expect(probe.interceptsInput());
+    try std.testing.expectEqual(PollResult.none, probe.poll(1_000));
+
+    var forwarded: std.ArrayList(u8) = .empty;
+    defer forwarded.deinit(std.testing.allocator);
+    for ("\x1b[1;1R") |byte| {
+        _ = try appendForwarded(probe.feed(byte), &forwarded);
+    }
+    try std.testing.expectEqual(@as(usize, 0), forwarded.items.len);
+
+    var position: ?Position = null;
+    for ("x\x1b[12;1R\x1b[12;2R") |byte| {
+        position = try appendForwarded(probe.feed(byte), &forwarded) orelse position;
+    }
+    try std.testing.expectEqual(@as(?Position, .{ .row = 12, .col = 1 }), position);
+    try std.testing.expectEqualStrings("\x1b[1;1Rx", forwarded.items);
+    try std.testing.expect(probe.canBegin());
+}
+
+test "tagged ANSI late-response window suspends for paste and still discards the reply" {
+    var probe = Parser{};
+    try probe.begin(.ansi_tagged, 100);
+    try std.testing.expectEqual(PollResult.probe_timed_out, probe.poll(100));
+
+    try std.testing.expect(!probe.suspendForPaste());
+    try std.testing.expect(probe.interceptsInput());
+    try std.testing.expectEqual(PollResult.none, probe.poll(1_000));
+
+    var saw_late_response = false;
+    for ("\x1b[12;1R\x1b[12;2R") |byte| {
+        switch (probe.feed(byte)) {
+            .late_response => saw_late_response = true,
+            .pending => {},
+            .forward, .position => return error.UnexpectedProbeResult,
+        }
+    }
+    try std.testing.expect(saw_late_response);
+    try std.testing.expect(probe.canBegin());
+}
+
+test "tagged ANSI query synchronizes transient cursor moves" {
+    try std.testing.expectEqualStrings(
+        "\x1b[?2026h\x1b7\x1b[1G\x1b[6n\x1b[2G\x1b[6n\x1b8\x1b[?2026l",
+        queryBytes(.ansi_tagged),
+    );
+}
+
+test "private query synchronizes transient cursor moves" {
+    try std.testing.expectEqualStrings(
+        "\x1b[?2026h\x1b7\x1b[1G\x1b[?6n\x1b[2G\x1b[?6n\x1b8\x1b[?2026l",
+        queryBytes(.private),
+    );
+}
+
+test "one-shot cursor response parser finds a response with leading and trailing bytes" {
+    const position = try parsePositionResponse("noise\x1b[42;7Rtail");
+
+    try std.testing.expectEqual(Position{ .row = 42, .col = 7 }, position);
+}
+
+test "one-shot cursor response parser rejects invalid rows and columns" {
+    const invalid = [_][]const u8{
+        "",
+        "\x1b[0;1R",
+        "\x1b[1;0R",
+        "\x1b[;1R",
+        "\x1b[1;R",
+        "\x1b[1;1",
+        "\x1b[999999;1R",
+        "\x1b[1;999999R",
+        "\x9b1;1R",
+    };
+
+    for (invalid) |sample| {
+        try std.testing.expect(findPositionResponse(sample) == null);
+        try std.testing.expectError(error.CursorPositionUnavailable, parsePositionResponse(sample));
+    }
+}
+
+test "cursor probe timeout measures input silence rather than total backlog time" {
+    var probe = Parser{};
+    try probe.begin(.private, 100);
+
+    probe.noteInputActivity(90);
+    try std.testing.expectEqual(PollResult.none, probe.poll(189));
+    try std.testing.expectEqual(PollResult.probe_timed_out, probe.poll(190));
+}

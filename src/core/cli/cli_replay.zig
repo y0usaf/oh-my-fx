@@ -550,3 +550,388 @@ fn runCaptured(alloc: Allocator, args: []const [:0]const u8, capture: *CaptureOu
 }
 
 const testing = std.testing;
+
+test "parseArgs requires a positional tape path" {
+    try testing.expectError(Error.MissingTapePath, parseArgs(&.{}));
+    try testing.expectError(Error.MissingTapePath, parseArgs(&.{ "--frames", "--json" }));
+    const opts = try parseArgs(&.{"tape.fxtape"});
+    try testing.expectEqualStrings("tape.fxtape", opts.path);
+    try testing.expect(!opts.frames);
+}
+
+test "parseArgs accepts supported flags" {
+    const opts = try parseArgs(&.{ "--frames", "t.fxtape", "--json", "--golden", "out.txt", "--frames-dir", "frames-out" });
+    try testing.expectEqualStrings("t.fxtape", opts.path);
+    try testing.expect(opts.frames);
+    try testing.expect(opts.json);
+    try testing.expectEqualStrings("out.txt", opts.golden_path.?);
+    try testing.expectEqualStrings("frames-out", opts.frames_dir.?);
+}
+
+test "parseArgs rejects invalid forms" {
+    try testing.expectError(Error.TooManyArgs, parseArgs(&.{ "a.fxtape", "b.fxtape" }));
+    try testing.expectError(Error.UnknownFlag, parseArgs(&.{ "a.fxtape", "--unknown" }));
+    try testing.expectError(Error.MissingGoldenPath, parseArgs(&.{ "a.fxtape", "--golden" }));
+    try testing.expectError(Error.MissingFramesDirPath, parseArgs(&.{ "a.fxtape", "--frames-dir" }));
+}
+
+test "minimal stdout tape replays to final grid snapshot" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "stdout.fxtape");
+    defer alloc.free(tape_path);
+
+    const tape = try buildTape(alloc, 5, 2, "vtest", &.{
+        .{ .delta_ms = 0, .kind = .stdout, .payload = "hi" },
+    });
+    defer alloc.free(tape);
+    try writeTestFile(tape_path, tape);
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{tape_arg}, &capture);
+    try testing.expectEqual(@as(u8, 0), exit_code);
+    try testing.expectEqualStrings("|hi   |\n|     |\n", capture.stdout.written());
+    try testing.expectEqualStrings("", capture.stderr.written());
+}
+
+test "frames mode prints non-marker frame snapshots only" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "frames.fxtape");
+    defer alloc.free(tape_path);
+
+    const tape = try buildTape(alloc, 4, 1, "vtest", &.{
+        .{ .delta_ms = 3, .kind = .marker, .payload = "ignored" },
+        .{ .delta_ms = 7, .kind = .stdout, .payload = "ok" },
+    });
+    defer alloc.free(tape);
+    try writeTestFile(tape_path, tape);
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{ tape_arg, "--frames" }, &capture);
+    try testing.expectEqual(@as(u8, 0), exit_code);
+    try testing.expect(std.mem.find(u8, capture.stdout.written(), "\n--- frame 2 (stdout, +7ms) ---\n") != null);
+    try testing.expect(std.mem.find(u8, capture.stdout.written(), "marker") == null);
+    try testing.expect(std.mem.find(u8, capture.stdout.written(), "|ok  |\n") != null);
+}
+
+test "json summary reports frame resize and stdout metadata" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "summary.fxtape");
+    defer alloc.free(tape_path);
+
+    const resize = resizePayload(2, 2);
+    const tape = try buildTape(alloc, 4, 1, "vtest", &.{
+        .{ .delta_ms = 1, .kind = .stdout, .payload = "ab" },
+        .{ .delta_ms = 2, .kind = .resize, .payload = &resize },
+    });
+    defer alloc.free(tape);
+    try writeTestFile(tape_path, tape);
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{ tape_arg, "--json" }, &capture);
+    try testing.expectEqual(@as(u8, 0), exit_code);
+    try testing.expect(std.mem.find(u8, capture.stdout.written(), "\"frame_count\":2") != null);
+    try testing.expect(std.mem.find(u8, capture.stdout.written(), "\"resize_count\":1") != null);
+    try testing.expect(std.mem.find(u8, capture.stdout.written(), "\"stdout_bytes\":2") != null);
+}
+
+test "json output escapes metadata strings" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "escape.fxtape");
+    defer alloc.free(tape_path);
+
+    const version = "v\"\\\n\t" ++ [_]u8{1};
+    const tape = try buildTape(alloc, 3, 1, version, &.{
+        .{ .delta_ms = 0, .kind = .stdout, .payload = "x" },
+    });
+    defer alloc.free(tape);
+    try writeTestFile(tape_path, tape);
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{ tape_arg, "--json" }, &capture);
+    try testing.expectEqual(@as(u8, 0), exit_code);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trim(u8, capture.stdout.written(), " \t\r\n"), .{});
+    defer parsed.deinit();
+}
+
+test "json output includes unknown frame metadata without altering grid" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "unknown-json.fxtape");
+    defer alloc.free(tape_path);
+
+    const tape = try buildTape(alloc, 3, 1, "vtest", &.{
+        .{ .delta_ms = 5, .kind = unknownKind(200), .payload = "ignored" },
+    });
+    defer alloc.free(tape);
+    try writeTestFile(tape_path, tape);
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{ tape_arg, "--json" }, &capture);
+    try testing.expectEqual(@as(u8, 0), exit_code);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trim(u8, capture.stdout.written(), " \t\r\n"), .{});
+    defer parsed.deinit();
+    const frames = parsed.value.object.get("frames").?.array.items;
+    try testing.expectEqual(@as(usize, 1), frames.len);
+    try testing.expectEqualStrings("unknown", frames[0].object.get("kind").?.string);
+    try testing.expectEqualStrings("{\"cols\":3,\"rows\":1,\"epoch_ms\":123456789,\"version\":\"vtest\",\"frames\":[{\"delta_ms\":5,\"kind\":\"unknown\",\"len\":7}],\"frame_count\":1,\"resize_count\":0,\"stdout_bytes\":0}\n", capture.stdout.written());
+}
+
+test "json replay recovers an incomplete final frame through stderr" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "truncated-tail.fxtape");
+    defer alloc.free(tape_path);
+    const tape = try buildTape(alloc, 4, 1, "vtest", &.{
+        .{ .delta_ms = 0, .kind = .stdout, .payload = "ok" },
+    });
+    defer alloc.free(tape);
+
+    var truncated: std.ArrayList(u8) = .empty;
+    defer truncated.deinit(alloc);
+    try truncated.appendSlice(alloc, tape);
+    try truncated.appendSlice(alloc, &.{ 1, 2, 3 });
+    try writeTestFile(tape_path, truncated.items);
+
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{ tape_arg, "--json" }, &capture);
+    try testing.expectEqual(@as(u8, 0), exit_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trim(u8, capture.stdout.written(), " \t\r\n"), .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 1), parsed.value.object.get("frame_count").?.integer);
+    try testing.expectEqualStrings("fx replay: ignored incomplete final tape frame\n", capture.stderr.written());
+}
+
+test "frames mode prints unknown frame snapshots without trapping" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "unknown-frames.fxtape");
+    defer alloc.free(tape_path);
+
+    const tape = try buildTape(alloc, 3, 1, "vtest", &.{
+        .{ .delta_ms = 8, .kind = unknownKind(201), .payload = "ignored" },
+    });
+    defer alloc.free(tape);
+    try writeTestFile(tape_path, tape);
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{ tape_arg, "--frames" }, &capture);
+    try testing.expectEqual(@as(u8, 0), exit_code);
+    try testing.expectEqualStrings("\n--- frame 1 (unknown, +8ms) ---\n|   |\n", capture.stdout.written());
+}
+
+test "golden path writes final snapshot and suppresses final stdout" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "golden.fxtape");
+    defer alloc.free(tape_path);
+    const golden_path = try testPath(alloc, tmp.dir, "golden.txt");
+    defer alloc.free(golden_path);
+
+    const tape = try buildTape(alloc, 4, 1, "vtest", &.{
+        .{ .delta_ms = 0, .kind = .stdout, .payload = "ok" },
+    });
+    defer alloc.free(tape);
+    try writeTestFile(tape_path, tape);
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+    const golden_arg = try alloc.dupeZ(u8, golden_path);
+    defer alloc.free(golden_arg);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{ tape_arg, "--golden", golden_arg }, &capture);
+    try testing.expectEqual(@as(u8, 0), exit_code);
+    try testing.expectEqualStrings("", capture.stdout.written());
+
+    const golden = try readTestFile(alloc, golden_path);
+    defer alloc.free(golden);
+    try testing.expectEqualStrings("|ok  |\n", golden);
+}
+
+test "frames-dir writes manifest and per-frame grid artifacts" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "frames-dir.fxtape");
+    defer alloc.free(tape_path);
+    const frames_dir = try testPath(alloc, tmp.dir, "frames-dir-out");
+    defer alloc.free(frames_dir);
+
+    const resize = resizePayload(6, 2);
+    const tape = try buildTape(alloc, 5, 2, "vtest", &.{
+        .{ .delta_ms = 1, .kind = .stdout, .payload = "hello" },
+        .{ .delta_ms = 2, .kind = .marker, .payload = "hello" },
+        .{ .delta_ms = 3, .kind = .resize, .payload = &resize },
+    });
+    defer alloc.free(tape);
+    try writeTestFile(tape_path, tape);
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+    const frames_dir_arg = try alloc.dupeZ(u8, frames_dir);
+    defer alloc.free(frames_dir_arg);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{ tape_arg, "--frames-dir", frames_dir_arg }, &capture);
+    try testing.expectEqual(@as(u8, 0), exit_code);
+
+    const manifest_path = try std.fs.path.join(alloc, &.{ frames_dir, "manifest.json" });
+    defer alloc.free(manifest_path);
+    const frame_json_path = try std.fs.path.join(alloc, &.{ frames_dir, "frames", "0001.json" });
+    defer alloc.free(frame_json_path);
+    const frame_grid_path = try std.fs.path.join(alloc, &.{ frames_dir, "frames", "0001.grid.txt" });
+    defer alloc.free(frame_grid_path);
+
+    const manifest = try readTestFile(alloc, manifest_path);
+    defer alloc.free(manifest);
+    try testing.expect(std.mem.find(u8, manifest, "\"frame_count\":3") != null);
+    try testing.expect(std.mem.find(u8, manifest, "\"resize_count\":1") != null);
+    try testing.expect(std.mem.find(u8, manifest, "\"stdout_bytes\":5") != null);
+
+    const frame_json = try readTestFile(alloc, frame_json_path);
+    defer alloc.free(frame_json);
+    try testing.expect(std.mem.find(u8, frame_json, "\"index\":1") != null);
+    try testing.expect(std.mem.find(u8, frame_json, "\"kind\":\"stdout\"") != null);
+    try testing.expect(std.mem.find(u8, frame_json, "\"cursor\"") != null);
+    try testing.expect(std.mem.find(u8, frame_json, "\"footer_candidates\"") != null);
+    try testing.expect(std.mem.find(u8, frame_json, "\"visible_markers\"") != null);
+
+    const frame_grid = try readTestFile(alloc, frame_grid_path);
+    defer alloc.free(frame_grid);
+    try testing.expectEqualStrings("|hello|\n|     |\n", frame_grid);
+}
+
+test "run missing tape path returns current stderr" {
+    const alloc = testing.allocator;
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{}, &capture);
+    try testing.expectEqual(@as(u8, 1), exit_code);
+    try testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx replay: missing tape path\n"));
+}
+
+test "json failures use stdout for missing arguments files and malformed tapes" {
+    const alloc = std.testing.allocator;
+
+    var missing_arg = CaptureOutput.init(alloc);
+    defer missing_arg.deinit();
+    try testing.expectEqual(
+        @as(u8, 1),
+        try runCaptured(alloc, &.{"--json"}, &missing_arg),
+    );
+    try testing.expectEqual(@as(usize, 0), missing_arg.stderr.written().len);
+    try testing.expect(std.mem.find(u8, missing_arg.stdout.written(), "\"code\":\"MissingTapePath\"") != null);
+
+    var missing_file = CaptureOutput.init(alloc);
+    defer missing_file.deinit();
+    try testing.expectEqual(
+        @as(u8, 1),
+        try runCaptured(alloc, &.{ "/definitely/missing/fx-replay.fxtape", "--json" }, &missing_file),
+    );
+    try testing.expectEqual(@as(usize, 0), missing_file.stderr.written().len);
+    var missing_json = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        std.mem.trim(u8, missing_file.stdout.written(), " \t\r\n"),
+        .{},
+    );
+    defer missing_json.deinit();
+    try testing.expectEqualStrings("replay", missing_json.value.object.get("kind").?.string);
+    try testing.expectEqualStrings("FileNotFound", missing_json.value.object.get("code").?.string);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp.dir, "bad-json.fxtape");
+    defer alloc.free(path);
+    try writeTestFile(path, "not a tape");
+    const path_arg: [:0]u8 = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_arg);
+    var malformed = CaptureOutput.init(alloc);
+    defer malformed.deinit();
+    try testing.expectEqual(
+        @as(u8, 1),
+        try runCaptured(alloc, &.{ path_arg, "--json" }, &malformed),
+    );
+    try testing.expectEqual(@as(usize, 0), malformed.stderr.written().len);
+    var malformed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        std.mem.trim(u8, malformed.stdout.written(), " \t\r\n"),
+        .{},
+    );
+    defer malformed_json.deinit();
+    try testing.expectEqualStrings("replay", malformed_json.value.object.get("kind").?.string);
+}
+
+test "run malformed tape returns bad tape stderr" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tape_path = try testPath(alloc, tmp.dir, "malformed.fxtape");
+    defer alloc.free(tape_path);
+    try writeTestFile(tape_path, "not a tape");
+    const tape_arg = try alloc.dupeZ(u8, tape_path);
+    defer alloc.free(tape_arg);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const exit_code = try runCaptured(alloc, &.{tape_arg}, &capture);
+    try testing.expectEqual(@as(u8, 1), exit_code);
+    try testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx replay: bad tape"));
+}

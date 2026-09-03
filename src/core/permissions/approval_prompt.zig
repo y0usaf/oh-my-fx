@@ -203,3 +203,176 @@ pub const ApprovalPrompt = struct {
         self.review_request_id = 0;
     }
 };
+
+fn approvalPreview() diff_mod.FileChangePreview {
+    return .{
+        .path = "note.txt",
+        .lines = &.{
+            .{ .op = .deletion, .old_line = 2, .text = "before" },
+            .{ .op = .addition, .new_line = 2, .text = "after" },
+        },
+        .additions = 1,
+        .deletions = 1,
+        .truncated = false,
+    };
+}
+
+fn approvalFileRequest(
+    preview: diff_mod.FileChangePreview,
+) permission_request.FileApprovalRequest {
+    return .{
+        .kind = .edit,
+        .intent = .mutation,
+        .preview = preview,
+        .scope = .workspace_files,
+    };
+}
+
+test "approval prompt owns replaces and clears structured requests" {
+    const alloc = std.testing.allocator;
+    const request: permission_request.PermissionRequest = .{
+        .label = "edit_file note.txt",
+        .file = approvalFileRequest(approvalPreview()),
+    };
+
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(alloc);
+    try std.testing.expect(try prompt.syncRequest(alloc, request));
+    const stored = prompt.request.?;
+    try std.testing.expectEqualStrings(request.label, stored.label);
+    try std.testing.expect(diff_mod.FileChangePreview.eql(
+        request.file.?.preview,
+        stored.file.?.preview,
+    ));
+
+    prompt.decision.choice_index = 2;
+    const stored_label_ptr = prompt.request.?.label.ptr;
+    try std.testing.expect(!try prompt.syncRequest(alloc, request));
+    try std.testing.expectEqual(stored_label_ptr, prompt.request.?.label.ptr);
+    try std.testing.expectEqual(@as(u8, 2), prompt.decision.choice_index);
+
+    try std.testing.expect(try prompt.syncRequest(
+        alloc,
+        .{ .label = "shell.run npm test" },
+    ));
+    try std.testing.expectEqualStrings("shell.run npm test", prompt.request.?.label);
+    try std.testing.expect(prompt.request.?.file == null);
+    try std.testing.expectEqual(@as(u8, 0), prompt.decision.choice_index);
+
+    prompt.decision.choice_index = 1;
+    try std.testing.expect(try prompt.syncRequest(alloc, null));
+    try std.testing.expect(!prompt.isActive());
+    try std.testing.expectEqual(@as(u8, 0), prompt.decision.choice_index);
+    try std.testing.expect(!try prompt.syncRequest(alloc, null));
+}
+
+test "approval prompt treats byte-identical replacement ids as new requests" {
+    const alloc = std.testing.allocator;
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(alloc);
+
+    const request_a: permission_request.PermissionRequest = .{
+        .id = 10,
+        .label = "file_mutation",
+        .file = approvalFileRequest(approvalPreview()),
+    };
+    try std.testing.expect(try prompt.syncRequest(alloc, request_a));
+    prompt.decision.choice_index = 2;
+
+    var request_b = request_a;
+    request_b.id = 11;
+    try std.testing.expect(try prompt.syncRequest(alloc, request_b));
+    try std.testing.expectEqual(@as(u64, 11), prompt.request.?.id);
+    try std.testing.expectEqual(@as(u8, 0), prompt.decision.choice_index);
+}
+
+test "approval prompt keeps full review request-bound" {
+    const alloc = std.testing.allocator;
+    var review = try diff_mod.FileReview.init(alloc, "", "one\ntwo\n");
+    defer review.deinit(alloc);
+
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(alloc);
+
+    const request_a: permission_request.PermissionRequest = .{
+        .id = 10,
+        .label = "file_mutation",
+        .file = approvalFileRequest(approvalPreview()),
+    };
+    try std.testing.expect(try prompt.syncRequest(alloc, request_a));
+    try std.testing.expect(prompt.syncReview(&review));
+    try std.testing.expect(prompt.currentReview() == &review);
+
+    var request_b = request_a;
+    request_b.id = 11;
+    try std.testing.expect(try prompt.syncRequest(alloc, request_b));
+    try std.testing.expect(prompt.currentReview() == null);
+}
+
+test "approval projection borrows immutable active state" {
+    const alloc = std.testing.allocator;
+    var review = try diff_mod.FileReview.init(alloc, "", "one\ntwo\n");
+    defer review.deinit(alloc);
+
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(alloc);
+    try std.testing.expect(prompt.projection() == null);
+    try std.testing.expect(try prompt.syncRequest(alloc, .{
+        .id = 41,
+        .label = "edit_file note.txt",
+        .file = approvalFileRequest(approvalPreview()),
+    }));
+    try std.testing.expect(prompt.syncReview(&review));
+    _ = try prompt.decision.apply(alloc, .tab, true, null);
+    _ = try prompt.decision.apply(alloc, .{ .insert_ascii = 'y' }, true, null);
+    _ = try prompt.decision.apply(alloc, .{ .move_choice = .previous }, true, null);
+    _ = try prompt.decision.apply(alloc, .tab, true, null);
+    _ = try prompt.decision.apply(alloc, .{ .insert_ascii = 'n' }, true, null);
+
+    const projection = prompt.projection().?;
+    try std.testing.expectEqual(@as(u64, 41), projection.request.id);
+    try std.testing.expectEqualStrings("edit_file note.txt", projection.request.label);
+    try std.testing.expectEqual(prompt.request.?.label.ptr, projection.request.label.ptr);
+    try std.testing.expectEqual(@as(u8, 2), projection.choice_index);
+    try std.testing.expectEqual(@as(?u8, 2), projection.amendmentChoice());
+    try std.testing.expect(projection.can_amend_selected_choice());
+    try std.testing.expectEqualStrings("y", projection.draftForChoice(0));
+    try std.testing.expectEqualStrings("n", projection.draftForChoice(2));
+    try std.testing.expectEqual(@as(usize, 1), projection.draftCursorForChoice(0));
+    try std.testing.expectEqual(@as(usize, 1), projection.draftCursorForChoice(2));
+    try std.testing.expect(projection.currentReview() == &review);
+}
+
+test "command approval ignores absent file review" {
+    const alloc = std.testing.allocator;
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(alloc);
+    try std.testing.expect(try prompt.syncRequest(alloc, .{
+        .id = 21,
+        .label = "shell.run printf '%s' command-review",
+    }));
+
+    try std.testing.expect(!prompt.syncReview(null));
+    try std.testing.expect(prompt.review == null);
+    try std.testing.expectEqual(@as(u64, 0), prompt.review_request_id);
+}
+
+fn checkApprovalPromptCloneAllocationFailures(alloc: Allocator) !void {
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(alloc);
+
+    const request: permission_request.PermissionRequest = .{
+        .id = 7,
+        .label = "edit_file state.zig",
+        .file = approvalFileRequest(approvalPreview()),
+    };
+    try std.testing.expect(try prompt.syncRequest(alloc, request));
+}
+
+test "approval prompt frees partial cloned request allocations" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkApprovalPromptCloneAllocationFailures,
+        .{},
+    );
+}

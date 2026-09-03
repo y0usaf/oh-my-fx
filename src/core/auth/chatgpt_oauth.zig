@@ -842,3 +842,146 @@ fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
 fn writeStdout(text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
+
+test "ChatGPT E2E OAuth endpoint overrides accept only loopback HTTP" {
+    try std.testing.expect(isLoopbackHttpUrl("http://127.0.0.1:1234/token"));
+    try std.testing.expect(isLoopbackHttpUrl("http://localhost:1234/token"));
+    try std.testing.expect(!isLoopbackHttpUrl("https://127.0.0.1:1234/token"));
+    try std.testing.expect(!isLoopbackHttpUrl("http://example.com:1234/token"));
+}
+
+test "ChatGPT account id is extracted from the namespaced JWT claim" {
+    const alloc = std.testing.allocator;
+    const payload =
+        \\{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_test"}}
+    ;
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(payload.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
+    const token = try std.fmt.allocPrint(alloc, "header.{s}.signature", .{encoded});
+    defer alloc.free(token);
+
+    const account_id = try extractAccountId(alloc, token);
+    defer alloc.free(account_id);
+    try std.testing.expectEqualStrings("acct_test", account_id);
+}
+
+test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
+    const State = struct {
+        method: ?oauth_transport.Method = null,
+        payload: [512]u8 = undefined,
+        payload_len: usize = 0,
+
+        fn execute(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            request: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const payload = request.payload orelse &.{};
+            self.method = request.method;
+            self.payload_len = @min(payload.len, self.payload.len);
+            @memcpy(self.payload[0..self.payload_len], payload[0..self.payload_len]);
+            return .{
+                .disposition = .accepted,
+                .body = try alloc.dupe(u8, "{\"access_token\":\"header.payload.signature\"}"),
+            };
+        }
+    };
+    var state = State{};
+    var response = try requestRefreshToken(
+        std.testing.allocator,
+        .{ .context = &state, .execute_fn = State.execute },
+        "{\"client_id\":\"client\",\"grant_type\":\"refresh_token\",\"refresh_token\":\"refresh\"}",
+    );
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(oauth_transport.Method.post_json, state.method.?);
+    try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "\"grant_type\":\"refresh_token\"") != null);
+    try std.testing.expect(response.refresh_token == null);
+    try std.testing.expect(response.expires_in == null);
+}
+
+test "ChatGPT browser authorization URL uses PKCE without device authentication" {
+    const url = try buildBrowserAuthorizationUrl(
+        std.testing.allocator,
+        "https://auth.openai.com",
+        "http://localhost:1455/auth/callback",
+        "challenge-value",
+        "state-value",
+    );
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://auth.openai.com/oauth/authorize?"));
+    try std.testing.expect(std.mem.find(u8, url, "response_type=code") != null);
+    try std.testing.expect(std.mem.find(u8, url, "code_challenge=challenge-value") != null);
+    try std.testing.expect(std.mem.find(u8, url, "code_challenge_method=S256") != null);
+    try std.testing.expect(std.mem.find(u8, url, "state=state-value") != null);
+    try std.testing.expect(std.mem.find(u8, url, "originator=fx") != null);
+    try std.testing.expect(std.mem.find(u8, url, "device") == null);
+}
+
+test "ChatGPT browser callback classifier keeps stale callbacks unrelated" {
+    var context = BrowserCallbackParserContext{ .expected_state = "expected" };
+
+    const stale_success = classifyBrowserCallback(
+        &context,
+        std.testing.allocator,
+        "/auth/callback?code=stale&state=other",
+    );
+    switch (stale_success) {
+        .unrelated => {},
+        else => return error.ExpectedUnrelatedCallback,
+    }
+
+    const stale_denial = classifyBrowserCallback(
+        &context,
+        std.testing.allocator,
+        "/auth/callback?error=access_denied&state=other",
+    );
+    switch (stale_denial) {
+        .unrelated => {},
+        else => return error.ExpectedUnrelatedCallback,
+    }
+}
+
+test "ChatGPT browser callback classifier reports a current denial" {
+    var context = BrowserCallbackParserContext{ .expected_state = "expected" };
+    const denied = classifyBrowserCallback(
+        &context,
+        std.testing.allocator,
+        "/auth/callback?error=access_denied&state=expected",
+    );
+    switch (denied) {
+        .failed => |err| try std.testing.expectEqual(error.ChatGptAuthorizationFailed, err),
+        else => return error.ExpectedFailedCallback,
+    }
+}
+
+test "ChatGPT browser callback requires the exact path and state" {
+    var callback = try parseBrowserCallbackTarget(
+        std.testing.allocator,
+        "/auth/callback?code=auth%20code&state=expected",
+        "expected",
+    );
+    defer callback.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("auth code", callback.code);
+
+    try std.testing.expectError(
+        error.ChatGptOAuthStateMismatch,
+        parseBrowserCallbackTarget(
+            std.testing.allocator,
+            "/auth/callback?code=auth&state=other",
+            "expected",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidChatGptOAuthCallback,
+        parseBrowserCallbackTarget(
+            std.testing.allocator,
+            "/other?code=auth&state=expected",
+            "expected",
+        ),
+    );
+}

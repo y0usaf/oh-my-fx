@@ -1,0 +1,13 @@
+{
+  "name": "fx-evals",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "eval": "bun test",
+    "eval:matrix": "bun run run-matrix.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}

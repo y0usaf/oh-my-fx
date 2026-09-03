@@ -63,17 +63,25 @@ command requires all 36 training scenarios, all 53 behavior scenarios, and all
 
 ## Corpus
 
-[`corpus.json`](corpus.json) declares the training scenarios the compiler pipeline profiles. Following the removal of the E2E suite, the corpus contains only direct CLI commands (`help`, `--version`, `status --json`, `background --json`, `doctor --json`, `sessions --json`) that run the built binary in the repository root. A bounded `profile_runs` count can weight a direct training command without duplicating manifest entries.
+[`corpus.json`](corpus.json) references existing test owners instead of copying their behavior. Training contains six direct CLI commands and thirty deterministic E2E files covering CLI, configuration, tools, Gateway lifecycle, fake web and vision routes, ACP, modern and legacy MCP, sessions, terminal hosting, TUI startup, resizing, rendering, permissions, interruption, subagents, and recovery. A bounded `profile_runs` count can weight a direct training command without duplicating manifest entries or final behavior checks. Seventeen additional deterministic E2E files verify the final candidate without influencing LLVM's hot and cold classification.
 
-The loader still validates the manifest: required direct commands must be present, scenario names must be unique, `intentional_exclusions` must cover the policy-required files, and every scenario cwd must resolve inside the repository. Live-model and live-network scenarios are forbidden. Corpus processes receive per-scenario homes and isolated tmux sockets and cannot inherit model credentials, the caller's tmux session, an external LLVM profile destination, or caller-selected fx tracing.
+Every root `tests/e2e/*.test.ts` file must be classified as training, verification-only, or intentionally excluded. The corpus loader fails on missing, duplicate, stale, or unclassified files, so a new E2E owner cannot silently bypass release qualification. New tests added to an already classified file inherit that file's classification.
+
+Sound-bearing `notifications.test.ts` and `tui-command-permissions.test.ts` are explicitly excluded. The credential-dependent `tui-agent.test.ts` suite is replaced by deterministic fake-Gateway permission-error coverage. Live-model and live-network files are forbidden. Corpus processes receive per-scenario homes and isolated tmux sockets and cannot inherit model credentials, the caller's tmux session, an external LLVM profile destination, or caller-selected fx tracing. The CLI and MCP authentication suites explicitly link the host Keychains directory into only their scenario homes so their uniquely named fake macOS Keychain assertions can run; no other scenario receives that access.
 
 Each training scenario must create a new nonempty raw profile. The driver merges that batch into the accumulator atomically, deletes only the successfully merged raw files, and stops before profile use on any missing scenario, timeout, warning, merge failure, or cleanup failure.
+
+Tmux-backed E2E scenarios receive one bounded file-level retry, matching Full
+CI. Before that retry, the driver removes the failed scenario HOME, isolated
+tmux directory, debug trace, and every raw profile created by the failed
+attempt. A second failure remains terminal. Direct commands and non-tmux E2E
+scenarios are never retried.
 
 Candidate behavior qualification records each scenario's debug trace under `candidate-behavior/traces/` without restricting its trace scopes. A failed tmux case therefore preserves its internal startup subtype and cleanup evidence instead of retaining only the public protocol error, while tests that select their own trace path or scopes keep their intended behavior.
 
 ## Qualification policy
 
-Startup compares `help`, `--version`, `status --json`, `background --json`, `doctor --json`, and `sessions --json`. It first executes each verified immutable artifact once to require successful output and empty stderr. Timing then uses pinned Hyperfine with no intermediate shell, ten warmups per artifact in each of at least 100 alternating rounds, and at least 1,000 measured samples per artifact. No contiguous block exceeds ten measured runs, so short machine-noise bursts are distributed between control and candidate while p95 retains 50 tail observations. Startup measurement sets `FX_DISABLE_KEYCHAIN=1` so the compiler comparison cannot be dominated by host-global macOS Keychain subprocess latency; the deterministic behavior corpus remains responsible for exercising Keychain integration. No per-sample Python process management or evidence-file write is included in the timed boundary, and measurement never replaces `zig-out/bin/omfx`. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
+Startup compares `help`, `--version`, `status --json`, `doctor --json`, and `sessions --json`. It first executes each verified immutable artifact once to require successful output and empty stderr. Timing then uses pinned Hyperfine with no intermediate shell, ten warmups per artifact in each of at least 100 alternating rounds, and at least 1,000 measured samples per artifact. No contiguous block exceeds ten measured runs, so short machine-noise bursts are distributed between control and candidate while p95 retains 50 tail observations. Startup measurement sets `FX_DISABLE_KEYCHAIN=1` so the compiler comparison cannot be dominated by host-global macOS Keychain subprocess latency; the deterministic behavior corpus remains responsible for exercising Keychain integration. No per-sample Python process management or evidence-file write is included in the timed boundary, and measurement never replaces `zig-out/bin/fx`. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
 
 Heavy comparisons use at least 50 measured samples for each artifact and alternate pair order AB then BA. Command failures and timeouts fail qualification and are never replaced. A candidate fails when either p50 or p95 is more than 10% slower than its matching control. The existing Linux startup workflow remains the authority for the repository's absolute 2 ms command budget.
 
@@ -99,9 +107,9 @@ supplement, and binary hashes, and aggregation rejects any mismatch.
 The output root contains:
 
 ```text
-control/bin/omfx
-instrumented/omfx
-candidate/omfx
+control/bin/fx
+instrumented/fx
+candidate/fx
 profiles/merged.profdata
 profiles/supplements/
 heavy/
@@ -115,7 +123,7 @@ Generated binaries, bitcode, objects, profiles, caches, measurements, and logs a
 
 The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. JSON evidence retains at most the last 1,048,576 characters from each output stream per command and records the total character counts and truncation status; no environment variables are printed.
 
-Corpus scenarios inherit only a small operating-system environment allowlist. Credentials, live-test flags, tracing settings, and repository dotenv files are excluded unless a value is explicitly declared in the versioned corpus. The runner temporarily installs the assigned artifact at `zig-out/bin/omfx` for E2E compatibility, then restores the prior file (or prior absence) after success, failure, timeout, or cancellation.
+Corpus scenarios inherit only a small operating-system environment allowlist. Credentials, live-test flags, tracing settings, and repository dotenv files are excluded unless a value is explicitly declared in the versioned corpus. The runner temporarily installs the assigned artifact at `zig-out/bin/fx` for E2E compatibility, then restores the prior file (or prior absence) after success, failure, timeout, or cancellation.
 
 The native workflow uploads bounded phase evidence rather than caches or
 intermediate compiler objects. Pull requests and manual runs have read-only

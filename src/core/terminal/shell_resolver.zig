@@ -82,10 +82,7 @@ pub fn capturedSelfInvocation(
     // pathForReexec consults the OS for the on-disk executable; on macOS the
     // underlying query carries a wide error set, which collapses here so the
     // public resolver error set stays small.
-    const self_path = self_exe.pathForReexec(alloc) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.ExecutableNotFound => return error.UnsupportedShell,
-    };
+    const self_path = self_exe.pathForReexec(alloc) catch return error.UnsupportedShell;
     var invocation = try rushInvocation(self_path, clean_start);
     removeInteractiveFlag(&invocation);
     invocation.setCommand(command);
@@ -136,6 +133,21 @@ pub fn environment(
     return switch (selected) {
         .clean => .{ .clean = try alloc.dupe(u8, rush_executable_token) },
         .user => .{ .user = try alloc.dupe(u8, rush_executable_token) },
+    };
+}
+
+pub fn environmentForShellSpec(
+    alloc: Allocator,
+    configured_login_shell: ?[]const u8,
+    shell: contracts.ShellSpec,
+) (ResolveError || Allocator.Error)!Environment {
+    const invocation = try resolve(configured_login_shell, shell);
+    return switch (shell) {
+        .user_login => .{ .user = try alloc.dupe(u8, invocation.path) },
+        .executable => |value| if (value.clean_start)
+            .{ .clean = try alloc.dupe(u8, invocation.path) }
+        else
+            .{ .user = try alloc.dupe(u8, invocation.path) },
     };
 }
 
@@ -271,6 +283,49 @@ fn appendShellWord(
     try output.append(alloc, '\'');
 }
 
+test "bootstrap quotes private paths and separates command completion" {
+    const commandless = try buildBootstrap(
+        std.testing.allocator,
+        "/tmp/fx'bin",
+        "/tmp/control",
+        "nonce",
+        null,
+    );
+    defer std.testing.allocator.free(commandless);
+    try std.testing.expectEqualStrings(
+        "set +x; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
+            "'/tmp/control' 'nonce' 'shell-ready' || exit 125\n",
+        commandless,
+    );
+
+    const command = try buildBootstrap(
+        std.testing.allocator,
+        "/tmp/fx",
+        "/tmp/control",
+        "nonce",
+        "/tmp/command",
+    );
+    defer std.testing.allocator.free(command);
+    try std.testing.expect(
+        std.mem.find(u8, command, "'command-started'") != null,
+    );
+    try std.testing.expect(
+        std.mem.find(u8, command, "builtin eval --") != null,
+    );
+    try std.testing.expect(
+        std.mem.find(u8, command, "exit \"$fx_terminal_status\"") != null,
+    );
+
+    const source = try buildSourceCommand(
+        std.testing.allocator,
+        "/tmp/bootstrap'file",
+    );
+    defer std.testing.allocator.free(source);
+    try std.testing.expectEqualStrings(
+        ". '/tmp/bootstrap'\"'\"'file'\n",
+        source,
+    );
+}
 fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
     const bootstrap = try buildBootstrap(
         alloc,

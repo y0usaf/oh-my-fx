@@ -18,6 +18,7 @@ const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 const types = @import("../shared/types.zig");
@@ -87,7 +88,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn slashCompletionQueryActive(app: *App) bool {
-            if (app.input_runtime.picker.isInlinePickerDismissed(.slash)) return false;
+            if (app.input_runtime.picker.isInlinePickerSuppressed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
             // Model query always owns this slot. Mid-turn bare `/model` does too
             // (list stays hidden); idle bare `/model` still surfaces slash rows.
@@ -116,8 +117,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             return slashCompletionQueryActive(app);
         }
 
-        /// Returns selectable completions projected by the footer. The active
-        /// query can remain visible at zero so dismissal still owns Escape.
+        /// Returns selectable completions projected by the footer.
         pub fn visibleSlashCompletionCount(app: *App) usize {
             if (!visibleSlashCompletionQueryActive(app)) return 0;
             return slashCompletionCandidateCount(app);
@@ -125,6 +125,9 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         pub fn dismissVisibleInlinePicker(app: *App) bool {
             const kind = visibleInlinePickerKind(app) orelse return false;
+            // Escaping the picker abandons the columns it had opened, so the
+            // next `/provider` starts from the provider column again.
+            if (kind == .provider) provider_picker_runtime.Runtime(App).abandon(app);
             app.input_runtime.picker.dismissInlinePicker(kind);
             return true;
         }
@@ -142,11 +145,12 @@ pub fn CompletionRuntime(comptime App: type) type {
                         return if (hasFileQuery(app)) .file else null;
                     }
                     if (visibleInlineSlashCompletion(app) != null) return .slash;
-                    if (visibleSlashCompletionQueryActive(app)) return .slash;
+                    if (visibleSlashCompletionCount(app) > 0) return .slash;
                     return null;
                 }
             }
             if (hasModelQuery(app)) return .model;
+            if (provider_picker_runtime.Runtime(App).hasQuery(app)) return .provider;
             if (hasFileQuery(app)) return .file;
             if (visibleInlineCompletion(app)) |completion| {
                 return switch (completion) {
@@ -154,7 +158,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     .slash => .slash,
                 };
             }
-            if (visibleSlashCompletionQueryActive(app)) return .slash;
+            if (visibleSlashCompletionCount(app) > 0) return .slash;
             return null;
         }
 
@@ -379,6 +383,10 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
             if (hasModelQuery(app)) {
                 if (!app.stream.active) navigateModelPicker(app, delta);
+                return true;
+            }
+            if (provider_picker_runtime.Runtime(App).hasQuery(app)) {
+                if (!app.stream.active) provider_picker_runtime.Runtime(App).navigate(app, delta);
                 return true;
             }
             // Mid-turn bare `/model`: consume arrows without slash/skill navigation.
@@ -718,7 +726,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (app.input_runtime.help_menu.active or app.input_runtime.settings_menu.active) return true;
             if (comptime @hasField(App, "skills")) {
                 if (comptime @hasField(@TypeOf(app.skills), "menu")) {
-                    if (app.skills.menu.active) return true;
+                    if (app.skills.menuVisible()) return true;
                 }
             }
             if (comptime @hasField(App, "model_cache")) {
@@ -958,15 +966,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             return null;
         }
 
-        fn navigatePickerOptions(index: *usize, window_start: *usize, count: usize, delta: i32) void {
-            if (count == 0) return;
-            const current: i32 = @intCast(index.* % count);
-            var next = current + delta;
-            if (next < 0) next = @as(i32, @intCast(count)) - 1;
-            if (next >= @as(i32, @intCast(count))) next = 0;
-            index.* = @intCast(next);
-            window_start.* = list_window.updateEdgeStart(window_start.*, count, index.*, list_window.default_max_picker_rows);
-        }
+        const navigatePickerOptions = list_window.advanceSelection;
 
         fn setModelComposerText(app: *App, comptime fmt: []const u8, args: anytype) !void {
             const text = try std.fmt.allocPrint(app.alloc, fmt, args);
@@ -1278,6 +1278,179 @@ pub fn CompletionRuntime(comptime App: type) type {
     };
 }
 
+const FilePickerTestApp = struct {
+    alloc: std.mem.Allocator,
+    input_runtime: core_input_runtime.Runtime = .{},
+    pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+    queued_prompt_review: input_queue_runtime.State = .{},
+    stream: types.StreamState = .{},
+    shell: struct {} = .{},
+    file_completion_values: []const file_index.Candidate = &.{},
+
+    pub fn slashRegistry(_: *const FilePickerTestApp) command_specs.SlashRegistry {
+        return .{};
+    }
+
+    fn deinit(self: *FilePickerTestApp) void {
+        self.queued_prompt_review.deinit(self.alloc);
+        self.input_runtime.deinit(self.alloc);
+        self.pending_images.deinit(self.alloc);
+    }
+
+    pub fn fileCompletions(
+        self: *FilePickerTestApp,
+        _: []const u8,
+        out: *[file_picker_completion_cap]file_index.SearchResult,
+        _: *[file_picker_match_span_cap]file_index.MatchSpan,
+        _: *[file_picker_path_storage_cap]u8,
+    ) file_index.SearchError!usize {
+        const count = @min(self.file_completion_values.len, out.len);
+        for (self.file_completion_values[0..count], 0..) |value, index| {
+            out[index] = .{
+                .path = value.path,
+                .kind = value.kind,
+                .matched_spans = &.{},
+            };
+        }
+        return count;
+    }
+
+    pub fn isCurrentFileCompletion(_: *const FilePickerTestApp, _: []const u8, _: []const u8, _: file_index.CandidateKind) bool {
+        return true;
+    }
+};
+
+const FilesystemFilePickerTestApp = struct {
+    alloc: std.mem.Allocator,
+    workspace_root: []const u8,
+    workspace: app_workspace_runtime.State = .{},
+    file_index: file_index.FileIndex = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
+    pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+
+    fn deinit(self: *FilesystemFilePickerTestApp) void {
+        app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).deinit(self);
+        self.file_index.deinit(self.alloc);
+        self.input_runtime.deinit(self.alloc);
+        self.pending_images.deinit(self.alloc);
+    }
+
+    pub fn fileCompletions(
+        self: *FilesystemFilePickerTestApp,
+        query: []const u8,
+        out: []file_index.SearchResult,
+        match_spans: []file_index.MatchSpan,
+        path_storage: []u8,
+    ) app_workspace_runtime.FileCompletionError!usize {
+        return app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).fileCompletions(
+            self,
+            query,
+            out,
+            match_spans,
+            path_storage,
+        );
+    }
+
+    pub fn fileCompletionsDependOnIndex(self: *const FilesystemFilePickerTestApp, query: []const u8) bool {
+        return app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).fileCompletionsDependOnIndex(self, query);
+    }
+
+    pub fn isCurrentFileCompletion(
+        self: *const FilesystemFilePickerTestApp,
+        query: []const u8,
+        path: []const u8,
+        kind: file_index.CandidateKind,
+    ) bool {
+        return app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).isCurrentFileCompletion(
+            self,
+            query,
+            path,
+            kind,
+        );
+    }
+};
+
+const inline_completion_test_slash_specs = [_]command_specs.SlashSpec{
+    .{
+        .kind = .help,
+        .command = "/help",
+        .help_entry = "/help",
+    },
+    .{
+        .kind = .resume_session,
+        .command = "/resume",
+        .help_entry = "/resume",
+    },
+};
+const inline_completion_test_slash_registry = command_specs.SlashRegistry{
+    .commands = inline_completion_test_slash_specs[0..],
+};
+
+const InlineCompletionTestApp = struct {
+    alloc: std.mem.Allocator,
+    input_runtime: core_input_runtime.Runtime = .{},
+    pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+    queued_prompt_review: input_queue_runtime.State = .{},
+    skills: skill_runtime.Runtime = .{},
+    model_cache: struct {
+        menu: struct {
+            active: bool = false,
+        } = .{},
+    } = .{},
+    session_persistence: struct {
+        session_picker: struct {
+            active: bool = false,
+        } = .{},
+    } = .{},
+    shell: struct {
+        layout: struct {
+            cols: u16 = 80,
+        } = .{},
+    } = .{},
+
+    pub fn slashRegistry(_: *const InlineCompletionTestApp) command_specs.SlashRegistry {
+        return inline_completion_test_slash_registry;
+    }
+
+    fn deinit(self: *InlineCompletionTestApp) void {
+        self.queued_prompt_review.deinit(self.alloc);
+        self.input_runtime.deinit(self.alloc);
+        self.pending_images.deinit(self.alloc);
+    }
+};
+
+const SkillsNavigationTestWorker = struct {
+    fn queuePreview(_: *SkillsNavigationTestWorker) @import("../agent/worker_runtime.zig").QueuePreview {
+        return .{ .count = 2 };
+    }
+};
+
+const SkillsNavigationTestApp = struct {
+    alloc: std.mem.Allocator,
+    input_runtime: core_input_runtime.Runtime = .{},
+    pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+    queued_prompt_review: input_queue_runtime.State = .{},
+    worker: SkillsNavigationTestWorker = .{},
+    skills: skill_runtime.Runtime = .{},
+    shell: struct {
+        layout: types.Layout = .{
+            .rows = 24,
+            .cols = 40,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+    } = .{},
+
+    fn deinit(self: *SkillsNavigationTestApp) void {
+        self.queued_prompt_review.deinit(self.alloc);
+        self.input_runtime.deinit(self.alloc);
+        self.pending_images.deinit(self.alloc);
+    }
+};
+
 fn makeSkillsNavigationReviewEntry(
     alloc: std.mem.Allocator,
     turn_id: u64,
@@ -1289,4 +1462,391 @@ fn makeSkillsNavigationReviewEntry(
         .images = &.{},
         .skill_display_spans = &.{},
     } };
+}
+
+const ModelPickerCompletionTestApp = struct {
+    alloc: std.mem.Allocator,
+    input_runtime: core_input_runtime.Runtime = .{},
+
+    fn deinit(self: *ModelPickerCompletionTestApp) void {
+        self.input_runtime.deinit(self.alloc);
+    }
+
+    pub fn resolvedModelCapabilities(_: *const ModelPickerCompletionTestApp, _: []const u8) model_capabilities.Capabilities {
+        return .{
+            .reasoning_efforts = .fromSlice(&.{
+                types.ReasoningEffort.literal("future-tier"),
+                types.ReasoningEffort.literal("high"),
+            }),
+        };
+    }
+};
+
+noinline fn clobberCompletionStack() void {
+    var bytes: [8192]u8 = undefined;
+    @memset(&bytes, 0xa5);
+    std.mem.doNotOptimizeAway(&bytes);
+}
+
+test "model picker effort completion labels survive capability resolution" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(ModelPickerCompletionTestApp);
+    var app = ModelPickerCompletionTestApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.picker.beginModelPickerFlow(alloc, "test/model", 0, false, .effort);
+
+    var values: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
+    const count = rt.effortCompletionValues(&app, "", &values);
+    clobberCompletionStack();
+
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualStrings("default", values[0].displayLabel());
+    try std.testing.expectEqualStrings("future-tier", values[1].displayLabel());
+    try std.testing.expectEqualStrings("high", values[2].displayLabel());
+}
+
+test "command skills navigation measures a width-changed queued editor before frame commit" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(SkillsNavigationTestApp);
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "one", .description = "", .path = "/tmp/one", .source = .global_fx },
+        .{ .name = "two", .description = "", .path = "/tmp/two", .source = .global_fx },
+        .{ .name = "three", .description = "", .path = "/tmp/three", .source = .global_fx },
+        .{ .name = "four", .description = "", .path = "/tmp/four", .source = .global_fx },
+        .{ .name = "five", .description = "", .path = "/tmp/five", .source = .global_fx },
+        .{ .name = "six", .description = "", .path = "/tmp/six", .source = .global_fx },
+        .{ .name = "seven", .description = "", .path = "/tmp/seven", .source = .global_fx },
+    };
+    var app = SkillsNavigationTestApp{ .alloc = alloc };
+    defer app.deinit();
+    app.skills.items = @constCast(&skills);
+    app.skills.openMenu();
+    try app.input_runtime.textReplacementState().replace(alloc, "x" ** 60);
+
+    const entries = try alloc.alloc(input_queue_runtime.ReviewEntry, 2);
+    entries[0] = try makeSkillsNavigationReviewEntry(alloc, 1, "stored");
+    entries[1] = try makeSkillsNavigationReviewEntry(alloc, 2, "selected");
+    app.queued_prompt_review = .{
+        .entries = entries,
+        .selected_index = 1,
+        .reason = .manual,
+        .visible = true,
+    };
+
+    app.shell.layout.cols = 12;
+    try std.testing.expect(try rt.routeSkillsMenuMove(&app, 1));
+    try std.testing.expect(try rt.routeSkillsMenuMove(&app, 1));
+    try std.testing.expect(try rt.routeSkillsMenuMove(&app, 1));
+
+    try std.testing.expectEqual(@as(usize, 3), app.skills.menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
+}
+
+test "inline slash completion uses the shared visible suffix and acceptance path" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    var app = InlineCompletionTestApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "explain /he");
+
+    const completion = rt.visibleInlineCompletion(&app).?;
+    try std.testing.expectEqualStrings("lp", completion.suffix());
+    try std.testing.expectEqualStrings(
+        "lp",
+        rt.visibleInlineSlashCompletion(&app).?.suffix,
+    );
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.limit_exceeded,
+        try rt.autocompleteInlineCompletion(&app, app.input_runtime.edit_state.input.items.len),
+    );
+    try std.testing.expectEqualStrings("explain /he", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inserted,
+        try rt.autocompleteInlineCompletion(&app, 4096),
+    );
+    try std.testing.expectEqualStrings("explain /help", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(app.input_runtime.edit_state.input.items.len, app.input_runtime.edit_state.cursor);
+}
+
+test "inline slash completion stays inactive when its suffix cannot render" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    var app = InlineCompletionTestApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "x /he");
+
+    app.shell.layout.cols = 7;
+    try std.testing.expectEqual(
+        @as(?InlineSlashCompletion, null),
+        rt.visibleInlineSlashCompletion(&app),
+    );
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inactive,
+        try rt.autocompleteInlineCompletion(&app, 4096),
+    );
+    try std.testing.expectEqualStrings("x /he", app.input_runtime.edit_state.input.items);
+
+    app.shell.layout.cols = 8;
+    try std.testing.expectEqualStrings(
+        "lp",
+        rt.visibleInlineSlashCompletion(&app).?.suffix,
+    );
+}
+
+test "root slash query is dismissible only while candidates are visible" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    var app = InlineCompletionTestApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "/hezzzzz");
+
+    try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app));
+    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
+    try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.slash));
+
+    try app.input_runtime.textReplacementState().replace(alloc, "/he");
+    try std.testing.expect(rt.visibleSlashCompletionCount(&app) > 0);
+    try std.testing.expect(rt.dismissVisibleInlinePicker(&app));
+    try std.testing.expect(app.input_runtime.picker.isInlinePickerDismissed(.slash));
+}
+
+test "root slash completion follows multiline and command argument ownership" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "resume-helper",
+        .description = "resume a workflow",
+        .path = "/tmp/resume-helper/SKILL.md",
+        .source = .global_fx,
+    }};
+    var app = InlineCompletionTestApp{
+        .alloc = alloc,
+        .skills = .{ .items = @constCast(&skills) },
+    };
+    defer app.deinit();
+
+    try app.input_runtime.textReplacementState().replace(alloc, "\n   /");
+    try std.testing.expect(rt.visibleSlashCompletionCount(&app) > 0);
+
+    try app.input_runtime.textReplacementState().replace(alloc, "/resume ");
+    try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app));
+    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
+}
+
+test "inline skill completion stays inactive when its suffix cannot render" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "managed-menu",
+        .description = "",
+        .path = "/tmp/managed-menu/SKILL.md",
+        .source = .global_fx,
+    }};
+    var app = InlineCompletionTestApp{
+        .alloc = alloc,
+        .skills = .{ .items = @constCast(&skills) },
+    };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "x $man");
+
+    app.queued_prompt_review.visible = true;
+    try std.testing.expectEqual(
+        @as(?InlineSkillCompletion, null),
+        rt.visibleInlineSkillCompletion(&app),
+    );
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inactive,
+        try rt.autocompleteInlineSkillCompletion(&app, 4096),
+    );
+    try std.testing.expectEqualStrings("x $man", app.input_runtime.edit_state.input.items);
+
+    app.queued_prompt_review.visible = false;
+    app.shell.layout.cols = 8;
+    try std.testing.expectEqual(
+        @as(?InlineSkillCompletion, null),
+        rt.visibleInlineSkillCompletion(&app),
+    );
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inactive,
+        try rt.autocompleteInlineSkillCompletion(&app, 4096),
+    );
+    try std.testing.expectEqualStrings("x $man", app.input_runtime.edit_state.input.items);
+
+    app.shell.layout.cols = 9;
+    try std.testing.expectEqualStrings(
+        "aged-menu",
+        rt.visibleInlineSkillCompletion(&app).?.suffix,
+    );
+}
+
+test "model picker ownership suppresses inline skill completion" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "managed-menu",
+        .description = "",
+        .path = "/tmp/managed-menu/SKILL.md",
+        .source = .global_fx,
+    }};
+    var app = InlineCompletionTestApp{
+        .alloc = alloc,
+        .skills = .{ .items = @constCast(&skills) },
+    };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "/model anything $man");
+
+    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null);
+    try std.testing.expectEqual(
+        @as(?InlineSkillCompletion, null),
+        rt.visibleInlineSkillCompletion(&app),
+    );
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inactive,
+        try rt.autocompleteInlineSkillCompletion(&app, 4096),
+    );
+    try std.testing.expectEqualStrings("/model anything $man", app.input_runtime.edit_state.input.items);
+}
+
+test "dedicated catalog ownership suppresses inline skill completion" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "managed-menu",
+        .description = "",
+        .path = "/tmp/managed-menu/SKILL.md",
+        .source = .global_fx,
+    }};
+    var app = InlineCompletionTestApp{
+        .alloc = alloc,
+        .skills = .{ .items = @constCast(&skills) },
+    };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "x $man");
+
+    try std.testing.expect(rt.visibleInlineSkillCompletion(&app) != null);
+
+    app.input_runtime.help_menu.active = true;
+    try expectInlineSkillCompletionInactive(&app);
+    app.input_runtime.help_menu.active = false;
+
+    app.input_runtime.settings_menu.active = true;
+    try expectInlineSkillCompletionInactive(&app);
+    app.input_runtime.settings_menu.active = false;
+
+    app.model_cache.menu.active = true;
+    try expectInlineSkillCompletionInactive(&app);
+    app.model_cache.menu.active = false;
+
+    app.session_persistence.session_picker.active = true;
+    try expectInlineSkillCompletionInactive(&app);
+    app.session_persistence.session_picker.active = false;
+
+    app.skills.menu.active = true;
+    try expectInlineSkillCompletionInactive(&app);
+
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expectEqualStrings("x $man", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
+}
+
+fn expectInlineSkillCompletionInactive(app: *InlineCompletionTestApp) !void {
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    try std.testing.expectEqual(
+        @as(?InlineSkillCompletion, null),
+        rt.visibleInlineSkillCompletion(app),
+    );
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inactive,
+        try rt.autocompleteInlineSkillCompletion(app, 4096),
+    );
+}
+
+test "streaming suppresses file selection until queued review owns the composer" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app = FilePickerTestApp{
+        .alloc = alloc,
+        .file_completion_values = &.{.{ .path = "src/main.zig", .kind = .file }},
+    };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "review @src/mai");
+    app.stream.active = true;
+
+    try std.testing.expectEqual(
+        @as(?edit_contract.InsertResult, null),
+        try rt.submitFilePickerOnEnter(&app, 4096),
+    );
+    try std.testing.expectEqualStrings("review @src/mai", app.input_runtime.edit_state.input.items);
+
+    app.queued_prompt_review.visible = true;
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inserted,
+        (try rt.submitFilePickerOnEnter(&app, 4096)).?,
+    );
+    try std.testing.expectEqualStrings("review @src/main.zig ", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.queued_prompt_review.selected_dirty);
+}
+
+test "file picker rejects paths that would reopen quote grammar" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app = FilePickerTestApp{
+        .alloc = alloc,
+        .file_completion_values = &.{.{ .path = "\"weird", .kind = .file }},
+    };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "@we");
+
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inactive,
+        try rt.autocompleteFilePickerSelection(&app, 4096),
+    );
+    try std.testing.expectEqualStrings("@we", app.input_runtime.edit_state.input.items);
+}
+
+test "filesystem file picker pipeline drills into a directory and selects a file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/space dir");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "workspace/space dir/item.txt",
+        .data = "inside",
+    });
+
+    const io_mod = @import("../shared/io.zig");
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const rt = CompletionRuntime(FilesystemFilePickerTestApp);
+    var app = FilesystemFilePickerTestApp{
+        .alloc = alloc,
+        .workspace_root = workspace_root,
+    };
+    defer app.deinit();
+
+    try app.input_runtime.textReplacementState().replace(alloc, "@./space");
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inserted,
+        try rt.autocompleteFilePickerSelection(&app, 4096),
+    );
+    try std.testing.expectEqualStrings(
+        "@\"./space dir/",
+        app.input_runtime.edit_state.input.items,
+    );
+    try std.testing.expectEqualStrings(
+        "./space dir/",
+        app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state).?.query,
+    );
+
+    try app.input_runtime.edit_state.insertSlice(alloc, "item");
+    try std.testing.expectEqual(
+        edit_contract.InsertResult.inserted,
+        try rt.autocompleteFilePickerSelection(&app, 4096),
+    );
+    try std.testing.expectEqualStrings(
+        "@\"./space dir/item.txt\" ",
+        app.input_runtime.edit_state.input.items,
+    );
+    try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
 }

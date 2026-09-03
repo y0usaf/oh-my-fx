@@ -20,13 +20,14 @@ const fetchOperationApplied = 1;
 const fetchOperationBackpressure = 2;
 
 const require = createRequire(import.meta.url);
-const defaultCoreWasm = new URL("./omfx-core.wasm", import.meta.url);
-const defaultTermWasm = new URL("./omfx-term.wasm", import.meta.url);
+const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url);
+const defaultTermWasm = new URL("./fx-term.wasm", import.meta.url);
 const defaultNativeCandidates = [
   "./libfx.node",
   `./libfx.${process.platform}-${process.arch}.node`,
 ];
 let nativeBackendPromise;
+const wasmFilePromises = new Map();
 
 function jspiFallbackError(surface, nativeError) {
   const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found.";
@@ -66,9 +67,8 @@ function validateNativeBackend(backend) {
     const actualVersion = backend.libfxApiVersion ?? "missing";
     throw new Error(`native addon API version ${actualVersion} is incompatible with libfx API version ${libfxApiVersion}`);
   }
-  if (typeof backend.createFxAgent !== "function" && typeof backend.createCore !== "function" &&
-    typeof backend.createFxTerminal !== "function") {
-    throw new Error("native addon must export createFxAgent(), createCore(), or createFxTerminal()");
+  if (typeof backend.createCore !== "function" && typeof backend.createFxTerminal !== "function") {
+    throw new Error("native addon must export createCore() or createFxTerminal()");
   }
   return backend;
 }
@@ -104,32 +104,23 @@ async function resolveNativeBackend(nativeAddon) {
   return nativeBackendPromise;
 }
 
-async function wasmBytes(input) {
-  if (input instanceof URL && input.protocol === "file:") return readFile(input);
-  if (typeof input === "string" && !URL.canParse(input)) return readFile(input);
-  return input;
-}
-
-function validateGatewayChatUrl(value) {
-  if (value === undefined) return;
-  if (typeof value !== "string") throw new TypeError("FX_GATEWAY_CHAT_URL must be a string");
-  let url;
-  try { url = new URL(value); } catch { throw new TypeError("FX_GATEWAY_CHAT_URL must be a valid URL"); }
-  if (url.username || url.password || url.hash) {
-    throw new TypeError("FX_GATEWAY_CHAT_URL must not contain credentials or a fragment");
-  }
-  if (url.href === "https://ai-gateway.vercel.sh/v3/ai/language-model") return;
-  const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
-  if (url.protocol !== "http:" || !loopback || !url.port) {
-    throw new TypeError("FX_GATEWAY_CHAT_URL must use the canonical Gateway or explicit loopback HTTP");
-  }
+function wasmBytes(input) {
+  let path;
+  if (input instanceof URL && input.protocol === "file:") path = fileURLToPath(input);
+  else if (typeof input === "string" && !URL.canParse(input)) path = resolve(input);
+  else return input;
+  const cached = wasmFilePromises.get(path);
+  if (cached) return cached;
+  const pending = readFile(path);
+  wasmFilePromises.set(path, pending);
+  pending.catch(() => {
+    if (wasmFilePromises.get(path) === pending) wasmFilePromises.delete(path);
+  });
+  return pending;
 }
 
 function createNativeCoreRuntime(addon, options) {
-  const apiKey = options.env?.AI_GATEWAY_API_KEY;
-  const model = options.env?.FX_MODEL;
-  const gatewayChatUrl = options.env?.FX_GATEWAY_CHAT_URL;
-  validateGatewayChatUrl(gatewayChatUrl);
+  const { apiKey, model, gatewayChatUrl } = options;
   const core = addon.createCore({
     apiKey,
     home: options.home ?? homedir(),
@@ -218,7 +209,7 @@ function createNativeCoreRuntime(addon, options) {
           if (newline < 0) break;
           const line = lineBuffer.slice(0, newline);
           lineBuffer = lineBuffer.slice(newline + 1);
-          if (line) lineHandler(JSON.parse(line));
+          if (line) void Promise.resolve(lineHandler(JSON.parse(line))).catch(() => finish(1));
         }
       }
       if (addon.coreExited(core)) finish(addon.coreExitCode(core));
@@ -248,22 +239,20 @@ function createNativeAgent(addon, options) {
 
 async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWasm, options) {
   const { nativeAddon, backend = "auto", ...runtimeOptions } = options ?? {};
-  validateGatewayChatUrl(runtimeOptions.env?.FX_GATEWAY_CHAT_URL);
   if (!new Set(["auto", "native", "wasm"]).has(backend)) {
     throw new TypeError('backend must be "auto", "native", or "wasm"');
   }
 
   let nativeError;
+  let nativeAttempted = false;
   if (backend !== "wasm") {
     const native = await resolveNativeBackend(nativeAddon);
     nativeError = native.error;
-    if (typeof native.backend?.[nativeMethod] === "function" ||
-      (surface === "agent" && typeof native.backend?.createCore === "function")) {
+    if (typeof native.backend?.[nativeMethod] === "function") {
+      nativeAttempted = true;
       try {
-        if (typeof native.backend?.[nativeMethod] === "function") {
-          return await native.backend[nativeMethod](runtimeOptions);
-        }
-        return await createNativeAgent(native.backend, runtimeOptions);
+        if (surface === "agent") return await createNativeAgent(native.backend, runtimeOptions);
+        return await native.backend[nativeMethod](runtimeOptions);
       } catch (error) {
         nativeError = error;
         if (backend === "native") throw error;
@@ -276,15 +265,27 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
     }
   }
 
-  if (!supportsJspi()) throw jspiFallbackError(surface, nativeError);
+  if (!supportsJspi()) {
+    if (nativeAttempted) throw nativeError;
+    throw jspiFallbackError(surface, nativeError);
+  }
   return wasmFactory({
     ...runtimeOptions,
     wasm: await wasmBytes(runtimeOptions.wasm ?? defaultWasm),
   });
 }
 
-export function createFxAgent(options = {}) {
-  return createWithFallback("agent", "createFxAgent", createWasmAgent, defaultCoreWasm, options);
+export async function createFxAgent(options = {}) {
+  if (options != null && Object.hasOwn(Object(options), "env")) {
+    throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
+  }
+  return createWithFallback(
+    "agent",
+    "createCore",
+    createWasmAgent,
+    defaultCoreWasm,
+    options,
+  );
 }
 
 export function createFxTerminal(options = {}) {

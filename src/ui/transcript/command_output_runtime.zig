@@ -63,6 +63,15 @@ pub fn openCommandOutputDirtyEntryId(shell: anytype) ?u32 {
     return commandBlockDirtyEntryId(shell.command_output_blocks.items[index]);
 }
 
+pub fn commandOutputDirtyEntryIdForLifecycle(
+    shell: anytype,
+    lifecycle_id: ?types.ToolLifecycleId,
+) ?u32 {
+    const index = commandOutputBlockIndexForLifecycle(shell, lifecycle_id) orelse
+        return null;
+    return commandBlockDirtyEntryId(shell.command_output_blocks.items[index]);
+}
+
 pub const CommandOutputLine = struct {
     stream: command_output_content.Stream,
     text: []u8,
@@ -137,6 +146,10 @@ pub const CommandOutputRenderPolicy = struct {
         .red_style = "",
     },
 };
+
+test "command output render policy has no presentation mode" {
+    try std.testing.expect(!@hasField(CommandOutputRenderPolicy, "output_level"));
+}
 
 pub const compact_output_row_limit: usize = 5;
 
@@ -369,12 +382,12 @@ pub fn prepareCommandOutputMutation(
     text: []const u8,
     record: bool,
 ) !PreparedCommandOutputMutation {
-    const block_index = shell.command_output_display.open_command_block orelse
+    const block_index = commandOutputBlockIndexForLifecycle(
+        shell,
+        lifecycle_id,
+    ) orelse
         return .decode;
     const block = &shell.command_output_blocks.items[block_index];
-    if (!sameLifecycleId(block.lifecycle_id, lifecycle_id)) {
-        return error.CommandOutputLifecycleMismatch;
-    }
 
     const stream_index = commandStreamIndex(stream);
     if (record and
@@ -800,7 +813,7 @@ pub fn flushCommandOutputSummaryForLifecycle(
 ) !void {
     const Runtime = @TypeOf(shell.*);
     if (record and comptime @hasDecl(Runtime, "flushRecordedCommandOutputSummaryAtomic")) {
-        if (hasMatchingOpenCommandOutputBlock(shell, lifecycle_id)) {
+        if (commandOutputBlockIndexForLifecycle(shell, lifecycle_id) != null) {
             return shell.flushRecordedCommandOutputSummaryAtomic(
                 alloc,
                 metrics,
@@ -817,17 +830,6 @@ pub fn flushCommandOutputSummaryForLifecycle(
         styles,
         lifecycle_id,
         record,
-    );
-}
-
-fn hasMatchingOpenCommandOutputBlock(
-    shell: anytype,
-    lifecycle_id: ?types.ToolLifecycleId,
-) bool {
-    const index = shell.command_output_display.open_command_block orelse return false;
-    return sameLifecycleId(
-        shell.command_output_blocks.items[index].lifecycle_id,
-        lifecycle_id,
     );
 }
 
@@ -850,35 +852,34 @@ pub fn flushCommandOutputSummaryUncommitted(
     _ = metrics;
     setCommandOutputRenderPolicy(shell, styles);
 
+    const block_index = commandOutputBlockIndexForLifecycle(
+        shell,
+        lifecycle_id,
+    ) orelse return false;
+    const was_displayed = shell.command_output_display.open_command_block == block_index;
+    try finishCommandOutputBlock(
+        shell,
+        alloc,
+        block_index,
+        record,
+        null,
+    );
     var retention_changed = false;
-    if (shell.command_output_display.open_command_block) |block_index| {
-        const open_block = &shell.command_output_blocks.items[block_index];
-        if (!sameLifecycleId(open_block.lifecycle_id, lifecycle_id)) {
-            debug_trace.logf("command_output", "ignoring command output completion for mismatched lifecycle", .{});
-            return false;
+    if (record) {
+        // Completion makes the block pruneable; retention must not treat
+        // a terminal count-only block as still active.
+        if (was_displayed) {
+            shell.command_output_display.open_command_block = null;
         }
-        try finishCommandOutputBlock(
+        retention_changed = try consolidateCommandOutputBlock(
             shell,
             alloc,
             block_index,
-            record,
-            null,
         );
-        if (record) {
-            // Completion makes the block pruneable; retention must not treat
-            // a terminal count-only block as still active.
-            shell.command_output_display.open_command_block = null;
-            retention_changed = try consolidateCommandOutputBlock(
-                shell,
-                alloc,
-                block_index,
-            );
-        } else {
-            var block = shell.command_output_blocks.orderedRemove(block_index);
-            block.deinit(alloc);
-        }
+    } else {
+        removeCommandOutputBlock(shell, alloc, block_index);
     }
-    shell.command_output_display = .{};
+    if (was_displayed) shell.command_output_display = .{};
     return retention_changed;
 }
 
@@ -893,18 +894,15 @@ pub fn flushCommandOutputSummaryDetached(
     created_at_ms: i64,
 ) !void {
     setCommandOutputRenderPolicy(shell, styles);
-    const block_index = shell.command_output_display.open_command_block orelse {
-        shell.command_output_display = .{};
-        return;
-    };
-    const open_block = &shell.command_output_blocks.items[block_index];
-    if (!sameLifecycleId(open_block.lifecycle_id, lifecycle_id)) {
-        return error.CommandOutputLifecycleMismatch;
-    }
+    const block_index = commandOutputBlockIndexForLifecycle(
+        shell,
+        lifecycle_id,
+    ) orelse return;
+    const was_displayed = shell.command_output_display.open_command_block == block_index;
     try finishCommandOutputBlock(shell, alloc, block_index, true, created_at_ms);
-    shell.command_output_display.open_command_block = null;
+    if (was_displayed) shell.command_output_display.open_command_block = null;
     try sealCommandOutputBlock(shell, alloc, block_index);
-    shell.command_output_display = .{};
+    if (was_displayed) shell.command_output_display = .{};
 }
 
 fn finishCommandOutputBlock(
@@ -1058,29 +1056,16 @@ fn ensureOpenCommandOutputBlock(
     alloc: Allocator,
     lifecycle_id: ?types.ToolLifecycleId,
 ) !usize {
-    if (shell.command_output_display.open_command_block) |index| {
-        const block = &shell.command_output_blocks.items[index];
-        if (!sameLifecycleId(block.lifecycle_id, lifecycle_id)) {
-            debug_trace.logf("command_output", "refusing multiplexed command output block", .{});
-            return error.CommandOutputLifecycleMismatch;
-        }
-        return index;
-    }
-    if (lifecycle_id != null) {
-        var index = shell.command_output_blocks.items.len;
-        while (index > 0) {
-            index -= 1;
-            const block = &shell.command_output_blocks.items[index];
-            if (block.entry_id == null or
-                !sameLifecycleId(block.lifecycle_id, lifecycle_id)) continue;
-            shell.command_output_display.open_command_block = index;
+    if (commandOutputBlockIndexForLifecycle(shell, lifecycle_id)) |index| {
+        if (shell.command_output_display.open_command_block != index) {
             debug_trace.logf(
                 "command_output",
-                "reopening completed command output block for late lifecycle output",
+                "switching command output display to matching lifecycle",
                 .{},
             );
-            return index;
         }
+        shell.command_output_display.open_command_block = index;
+        return index;
     }
     const owned_lifecycle_id = try dupeLifecycleId(alloc, lifecycle_id);
     errdefer if (owned_lifecycle_id) |id| alloc.free(@constCast(id.call_id));
@@ -1088,6 +1073,28 @@ fn ensureOpenCommandOutputBlock(
     const index = shell.command_output_blocks.items.len - 1;
     shell.command_output_display.open_command_block = index;
     return index;
+}
+
+fn commandOutputBlockIndexForLifecycle(
+    shell: anytype,
+    lifecycle_id: ?types.ToolLifecycleId,
+) ?usize {
+    if (shell.command_output_display.open_command_block) |index| {
+        if (index < shell.command_output_blocks.items.len and sameLifecycleId(
+            shell.command_output_blocks.items[index].lifecycle_id,
+            lifecycle_id,
+        )) return index;
+    }
+    if (lifecycle_id == null) return null;
+    var index = shell.command_output_blocks.items.len;
+    while (index > 0) {
+        index -= 1;
+        if (sameLifecycleId(
+            shell.command_output_blocks.items[index].lifecycle_id,
+            lifecycle_id,
+        )) return index;
+    }
+    return null;
 }
 
 fn CommandOutputRecordSink(comptime Shell: type) type {
@@ -1333,6 +1340,26 @@ fn retainedCommandOutputBytes(shell: anytype, block_index: usize) usize {
         shell.retainedStructuredBytesForCommandOutput()
     else
         commandOutputBlockRetainedBytes(shell.command_output_blocks.items[block_index]);
+}
+
+test "unbounded command output admission does not scan retained state" {
+    const CountingShell = struct {
+        max_retained_transcript_bytes: usize = std.math.maxInt(usize),
+        command_output_blocks: std.ArrayList(CommandOutputBlock) = .empty,
+        retained_scan_count: usize = 0,
+
+        fn retainedStructuredBytesForCommandOutput(self: *@This()) usize {
+            self.retained_scan_count += 1;
+            return 123;
+        }
+    };
+
+    var shell: CountingShell = .{};
+    defer shell.command_output_blocks.deinit(std.testing.allocator);
+    try shell.command_output_blocks.append(std.testing.allocator, .{});
+
+    try std.testing.expectEqual(@as(usize, 0), retainedCommandOutputBytes(&shell, 0));
+    try std.testing.expectEqual(@as(usize, 0), shell.retained_scan_count);
 }
 
 fn commandStreamIndex(stream: command_output_content.Stream) usize {
@@ -1876,6 +1903,31 @@ fn appendDimmedCommandRowsWithGutterStyle(
     }
 }
 
+test "dimmed command rows frame physical lines independently" {
+    const alloc = std.testing.allocator;
+    const styles = Styles{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "<reset>",
+        .dim_style = "<dim>",
+        .red_style = "",
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try appendDimmedCommandRows(&out, alloc, styles, "│ one");
+    try std.testing.expectEqualStrings("<dim>│ one<reset>", out.items);
+
+    out.clearRetainingCapacity();
+    try appendDimmedCommandRows(&out, alloc, styles, "│ one\n\n│ three\n");
+    try std.testing.expectEqualStrings(
+        "<dim>│ one<reset>\n" ++
+            "<dim><reset>\n" ++
+            "<dim>│ three<reset>\n",
+        out.items,
+    );
+}
+
 fn foldedHint(alloc: Allocator, hidden_records: usize, cols: u16) ![]u8 {
     const noun = if (hidden_records == 1) "line" else "lines";
     const candidates = [_][]u8{
@@ -1944,6 +1996,302 @@ pub fn renderCommandOutputRecordWithPrimaryGutter(
     try appendDimmedCommandRowsWithPrimaryGutter(&out, alloc, styles, wrapped);
     try out.append(alloc, '\n');
     return out.toOwnedSlice(alloc);
+}
+
+test "compact and full command output style every wrapped row" {
+    const alloc = std.testing.allocator;
+    const text = "paragraph words\n\n\tvalue";
+    const styles = Styles{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "<reset>",
+        .dim_style = "<dim>",
+        .red_style = "",
+    };
+    const expected_rows =
+        "<dim>│ paragraph<reset>\n" ++
+        "<dim>│ words<reset>\n" ++
+        "<dim>│ <reset>\n" ++
+        "<dim>│       value<reset>";
+
+    var block: CommandOutputBlock = .{ .total_lines = 1 };
+    defer block.deinit(alloc);
+    try block.lines.append(alloc, .{
+        .stream = .stdout,
+        .text = try alloc.dupe(u8, text),
+        .entry_id = 10,
+        .terminated = true,
+    });
+
+    var compact = try renderCompactCommandOutput(alloc, block, .{
+        .styles = styles,
+    }, 16);
+    defer compact.deinit(alloc);
+    try std.testing.expectEqualStrings(expected_rows, compact.bytes.items);
+
+    const full = try renderFullCommandOutputRecord(alloc, styles, text, 16);
+    defer alloc.free(full);
+    try std.testing.expectEqualStrings(expected_rows ++ "\n", full);
+
+    const primary_gutter = try renderCommandOutputRecordWithPrimaryGutter(
+        alloc,
+        styles,
+        text,
+        16,
+    );
+    defer alloc.free(primary_gutter);
+    try std.testing.expectEqualStrings(
+        "<reset>│<dim> paragraph<reset>\n" ++
+            "<reset>│<dim> words<reset>\n" ++
+            "<reset>│<dim> <reset>\n" ++
+            "<reset>│<dim>       value<reset>\n",
+        primary_gutter,
+    );
+}
+
+test "compact command output caps physical rows" {
+    const alloc = std.testing.allocator;
+    var block: CommandOutputBlock = .{};
+    defer block.deinit(alloc);
+
+    for (0..7) |index| {
+        const text = try std.fmt.allocPrint(alloc, "line-{d}", .{index + 1});
+        try block.lines.append(alloc, .{
+            .stream = .stdout,
+            .text = text,
+            .entry_id = @intCast(index + 10),
+            .terminated = true,
+        });
+    }
+    block.total_lines = block.lines.items.len;
+    block.retained_text_bytes = 42;
+
+    const styles = Styles{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var compact = try renderCompactCommandOutput(alloc, block, .{
+        .styles = styles,
+    }, 40);
+    defer compact.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, compact.bytes.items, "\n") + 1);
+    try std.testing.expect(std.mem.find(u8, compact.bytes.items, "│ line-5") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes.items, "│ line-6") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes.items, "│ … 2 lines more (ctrl o to view)") != null);
+}
+
+test "compact command output stays bounded at one and two columns" {
+    const alloc = std.testing.allocator;
+    var block: CommandOutputBlock = .{ .total_lines = 1 };
+    defer block.deinit(alloc);
+    try block.lines.append(alloc, .{
+        .stream = .stdout,
+        .text = try alloc.dupe(u8, "abcdefghijklmnopqrst"),
+        .entry_id = 10,
+    });
+    const styles = Styles{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+
+    for ([_]u16{ 1, 2 }) |cols| {
+        var projection = try renderCompactCommandOutput(alloc, block, .{
+            .styles = styles,
+        }, cols);
+        defer projection.deinit(alloc);
+
+        try std.testing.expectEqual(
+            @as(usize, compact_output_row_limit + 1),
+            hardLineCount(projection.bytes.items),
+        );
+        var rows = std.mem.splitScalar(u8, projection.bytes.items, '\n');
+        while (rows.next()) |row| {
+            try std.testing.expect(
+                display_width.visibleWidthIgnoringAnsi(row) <= cols,
+            );
+        }
+    }
+}
+
+test "compact zero width prefix matches the first five full rows" {
+    const alloc = std.testing.allocator;
+    var block: CommandOutputBlock = .{ .total_lines = 1 };
+    defer block.deinit(alloc);
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    try text.append(alloc, 'a');
+    for (0..2000) |_| try text.appendSlice(alloc, "\xcc\x81");
+    const line_text = try text.toOwnedSlice(alloc);
+    var line_text_owned = true;
+    errdefer if (line_text_owned) alloc.free(line_text);
+    try block.lines.append(alloc, .{
+        .stream = .stdout,
+        .text = line_text,
+        .entry_id = 10,
+    });
+    line_text_owned = false;
+
+    const styles = Styles{
+        .system_notice_label_style = "",
+        .system_notice_text_style = "",
+        .reset_style = "",
+        .dim_style = "",
+        .red_style = "",
+    };
+    var compact = try renderCompactCommandOutput(alloc, block, .{
+        .styles = styles,
+    }, 4);
+    defer compact.deinit(alloc);
+    const full = try renderFullCommandOutputRecord(
+        alloc,
+        styles,
+        block.lines.items[0].text,
+        4,
+    );
+    defer alloc.free(full);
+
+    try std.testing.expectEqual(@as(usize, 6), hardLineCount(compact.bytes.items));
+    var compact_rows = std.mem.splitScalar(u8, compact.bytes.items, '\n');
+    var full_rows = std.mem.splitScalar(u8, full, '\n');
+    for (0..compact_output_row_limit) |_| {
+        try std.testing.expectEqualStrings(full_rows.next().?, compact_rows.next().?);
+    }
+    const hint = compact_rows.next() orelse return error.TestExpectedHint;
+    try std.testing.expect(std.mem.find(u8, hint, "…") != null);
+    try std.testing.expect(compact_rows.next() == null);
+    try std.testing.expectEqual(
+        @as(usize, compact_output_row_limit *
+            (assistant_wrap.literal_command_zero_width_row_byte_limit / 2)),
+        std.mem.count(u8, compact.bytes.items, "\xcc\x81"),
+    );
+}
+
+test "compact incomplete retained record shows one hidden line" {
+    const alloc = std.testing.allocator;
+    var block: CommandOutputBlock = .{
+        .total_lines = 1,
+        .retention_overflow = true,
+        .overflow_line_index = 0,
+    };
+    defer block.deinit(alloc);
+    try block.lines.append(alloc, .{
+        .stream = .stdout,
+        .text = try alloc.dupe(u8, "retained prefix"),
+        .entry_id = 10,
+    });
+
+    var compact = try renderCompactCommandOutput(alloc, block, .{
+        .styles = .{
+            .system_notice_label_style = "",
+            .system_notice_text_style = "",
+            .reset_style = "",
+            .dim_style = "",
+            .red_style = "",
+        },
+    }, 80);
+    defer compact.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "│ retained prefix\n│ … 1 line more (ctrl o to view)",
+        compact.bytes.items,
+    );
+}
+
+test "compact hint stays at the final owned source entry" {
+    const alloc = std.testing.allocator;
+    var block: CommandOutputBlock = .{ .total_lines = 2 };
+    defer block.deinit(alloc);
+    try block.lines.append(alloc, .{
+        .stream = .stdout,
+        .text = try alloc.dupe(u8, "one two three four five six seven eight nine ten"),
+        .entry_id = 10,
+    });
+    try block.lines.append(alloc, .{
+        .stream = .stdout,
+        .text = try alloc.dupe(u8, "later hidden record"),
+        .record_ordinal = 1,
+        .entry_id = 30,
+    });
+
+    var projection = try renderCompactCommandOutput(alloc, block, .{
+        .styles = .{
+            .system_notice_label_style = "",
+            .system_notice_text_style = "",
+            .reset_style = "",
+            .dim_style = "",
+            .red_style = "",
+        },
+    }, 12);
+    defer projection.deinit(alloc);
+
+    const first = projection.bytesForEntry(10).?;
+    const final = projection.bytesForEntry(30).?;
+    try std.testing.expect(std.mem.find(u8, first, "ctrl o") == null);
+    try std.testing.expect(std.mem.find(u8, final, "│ … 2 more") != null);
+}
+
+test "compact process row consumes payload budget before final hint" {
+    const alloc = std.testing.allocator;
+    var block: CommandOutputBlock = .{ .total_lines = 6 };
+    defer block.deinit(alloc);
+    for (0..6) |index| {
+        try block.lines.append(alloc, .{
+            .stream = .stdout,
+            .text = try std.fmt.allocPrint(alloc, "line-{d}", .{index + 1}),
+            .record_ordinal = index,
+            .entry_id = @intCast(index + 1),
+        });
+    }
+
+    var projection = try renderCompactCommandOutputWithProcessPresentation(
+        alloc,
+        block,
+        .{
+            .styles = .{
+                .system_notice_label_style = "",
+                .system_notice_text_style = "",
+                .reset_style = "",
+                .dim_style = "",
+                .red_style = "",
+            },
+        },
+        80,
+        .{ .exit_code = 7 },
+    );
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 6), hardLineCount(projection.bytes.items));
+    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-4") != null);
+    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-5") == null);
+    const final = projection.bytesForEntry(6).?;
+    const status_index = std.mem.find(u8, final, "│ exit code 7") orelse
+        return error.TestExpectedStatus;
+    const hint_index = std.mem.find(u8, final, "│ … 2 lines more") orelse
+        return error.TestExpectedHint;
+    try std.testing.expect(status_index < hint_index);
+}
+
+test "compact process row names timeout and output capture causes" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        presentation: types.CommandProcessPresentation,
+        expected: []const u8,
+    }{
+        .{ .presentation = .timed_out, .expected = "│ timed out" },
+        .{ .presentation = .output_capture_failed, .expected = "│ output capture failed" },
+    };
+    for (cases) |case| {
+        const row = try processStatusRow(alloc, case.presentation, 80);
+        defer alloc.free(row);
+        try std.testing.expectEqualStrings(case.expected, row);
+    }
 }
 
 pub fn syncCommandOutputBlockEntries(shell: anytype, alloc: Allocator) !bool {

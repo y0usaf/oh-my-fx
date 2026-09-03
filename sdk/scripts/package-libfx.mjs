@@ -22,8 +22,11 @@ const files = [
   ["sdk/browser.js", "browser.js"],
   ["sdk/node.js", "node.js"],
   ["sdk/fx-sdk.js", "fx-sdk.js"],
-  ["zig-out/bin/omfx-core.wasm", "omfx-core.wasm"],
-  ["zig-out/bin/omfx-term.wasm", "omfx-term.wasm"],
+  ["sdk/mcp.js", "mcp.js"],
+  ["sdk/skills.js", "skills.js"],
+  ["sdk/skills-node.js", "skills-node.js"],
+  ["zig-out/bin/fx-core.wasm", "fx-core.wasm"],
+  ["zig-out/bin/fx-term.wasm", "fx-term.wasm"],
 ];
 
 if (requestedNativeAddons.length) {

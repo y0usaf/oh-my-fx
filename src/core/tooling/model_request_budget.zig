@@ -23,3 +23,8 @@ fn addOptionalStrings(total: *usize, maybe_strings: ?[]const []const u8) !void {
 fn addBytes(total: *usize, count: usize) !void {
     total.* = try std.math.add(usize, total.*, count);
 }
+
+test "search worker input cap uses conservative serialized bytes" {
+    try std.testing.expect(searchWorkerInputFitsLimit("system".len, "query", &.{"allowed"}, null, 18));
+    try std.testing.expect(!searchWorkerInputFitsLimit("system".len, "query", &.{"allowed"}, null, 17));
+}

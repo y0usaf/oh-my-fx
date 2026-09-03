@@ -44,7 +44,7 @@ pub const State = struct {
         self.picker.clearModelPickerFlow();
         self.entities.discardPendingAutoSeparator();
         self.picker.reconcileInlinePickerAfterEdit(self.edit);
-        self.picker.resetActiveModelPickerIndex();
+        self.picker.resetActiveCompletionIndex();
         self.picker.resetFilePickerIndex();
         self.history.commit(alloc, &prepared);
         return true;
@@ -98,3 +98,135 @@ const Fixture = struct {
         };
     }
 };
+
+test "line continuation requires a backslash immediately before the cursor" {
+    try std.testing.expectEqual(@as(?usize, null), backslashIndexBeforeCursor("", 0));
+    try std.testing.expectEqual(@as(?usize, null), backslashIndexBeforeCursor("x", 0));
+    try std.testing.expectEqual(@as(?usize, null), backslashIndexBeforeCursor("x", 1));
+    try std.testing.expectEqual(@as(?usize, 1), backslashIndexBeforeCursor("x\\y", 2));
+    try std.testing.expectEqual(@as(?usize, null), backslashIndexBeforeCursor("x\\y", 4));
+}
+
+test "line continuation records one edit and reconciles transient state" {
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    defer fixture.deinit(alloc);
+
+    try fixture.edit.setText(alloc, "x \\");
+    _ = fixture.edit.beginSelection(0);
+    _ = fixture.edit.extendSelection(fixture.edit.input.items.len);
+    try fixture.picker.beginModelPickerFlow(
+        alloc,
+        "provider/model",
+        2,
+        true,
+        .effort,
+    );
+    fixture.picker.slash_completion_index = 3;
+    fixture.picker.file_completion_index = 4;
+    fixture.picker.file_completion_window_start = 2;
+    fixture.picker.dismissInlinePicker(.file);
+    fixture.entities.markFileCompletionSeparator(
+        fixture.edit.input.items,
+        2,
+        1,
+    );
+    fixture.vertical_navigation.preferred_column = 5;
+
+    try std.testing.expect(
+        fixture.state().replaceBackslashBeforeCursorWithNewline(alloc),
+    );
+
+    try std.testing.expectEqualStrings("x \n", fixture.edit.input.items);
+    try std.testing.expectEqual(@as(usize, 3), fixture.edit.cursor);
+    try std.testing.expect(fixture.edit.selectionRange() == null);
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        fixture.vertical_navigation.preferredColumn(),
+    );
+    try std.testing.expect(!fixture.picker.hasPendingModelPickerSelection());
+    try std.testing.expectEqual(@as(usize, 0), fixture.picker.slash_completion_index);
+    try std.testing.expectEqual(@as(usize, 0), fixture.picker.file_completion_index);
+    try std.testing.expectEqual(@as(usize, 0), fixture.picker.file_completion_window_start);
+    try std.testing.expect(!fixture.picker.isInlinePickerDismissed(.file));
+    try std.testing.expect(fixture.entities.pending_auto_separator == null);
+
+    const entry = fixture.history.peekUndo().?;
+    try std.testing.expectEqual(@as(usize, 2), entry.start);
+    try std.testing.expectEqualStrings("\\", entry.removed.items);
+    try std.testing.expectEqualStrings("\n", entry.inserted.items);
+    try std.testing.expectEqual(@as(usize, 3), entry.cursor_before);
+    try std.testing.expectEqual(@as(usize, 3), entry.cursor_after);
+}
+
+test "line continuation no-op only resets vertical navigation" {
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    defer fixture.deinit(alloc);
+
+    try fixture.edit.setText(alloc, "draft ");
+    _ = fixture.edit.beginSelection(0);
+    _ = fixture.edit.extendSelection(fixture.edit.input.items.len);
+    try fixture.picker.beginModelPickerFlow(
+        alloc,
+        "provider/model",
+        1,
+        false,
+        .effort,
+    );
+    fixture.picker.file_completion_index = 3;
+    fixture.entities.markFileCompletionSeparator(
+        fixture.edit.input.items,
+        fixture.edit.cursor,
+        fixture.edit.cursor - 1,
+    );
+    fixture.vertical_navigation.preferred_column = 4;
+    var prepared = try fixture.history.prepare(alloc, 0, "", "draft ", 0, 6);
+    defer prepared.deinit(alloc);
+    fixture.history.commit(alloc, &prepared);
+
+    try std.testing.expect(
+        !fixture.state().replaceBackslashBeforeCursorWithNewline(alloc),
+    );
+
+    try std.testing.expectEqualStrings("draft ", fixture.edit.input.items);
+    try std.testing.expectEqual(
+        editor_state.SelectionRange{ .start = 0, .end = 6 },
+        fixture.edit.selectionRange().?,
+    );
+    try std.testing.expect(fixture.history.peekUndo() != null);
+    try std.testing.expect(fixture.picker.hasPendingModelPickerSelection());
+    try std.testing.expectEqual(@as(usize, 3), fixture.picker.file_completion_index);
+    try std.testing.expect(fixture.entities.pending_auto_separator != null);
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        fixture.vertical_navigation.preferredColumn(),
+    );
+}
+
+test "line continuation history allocation failure preserves the primary edit" {
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    defer fixture.deinit(alloc);
+
+    try fixture.edit.setText(alloc, "draft\\");
+    var first = try fixture.history.prepare(alloc, 0, "", "draft", 0, 5);
+    defer first.deinit(alloc);
+    fixture.history.commit(alloc, &first);
+    try std.testing.expect(try fixture.history.prepareUndo(alloc));
+    fixture.history.commitUndo();
+
+    var failing = std.testing.FailingAllocator.init(
+        alloc,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expect(
+        fixture.state().replaceBackslashBeforeCursorWithNewline(
+            failing.allocator(),
+        ),
+    );
+
+    try std.testing.expectEqualStrings("draft\n", fixture.edit.input.items);
+    try std.testing.expect(fixture.history.peekUndo() == null);
+    try std.testing.expect(fixture.history.peekRedo() == null);
+}

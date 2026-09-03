@@ -677,3 +677,428 @@ fn shadowGrid(alloc: Allocator, cols: u16, rows: u16) !vt_emulator.Grid {
     try grid.feed("\x1b[1;1Hshell");
     return grid;
 }
+
+test "frame surface preserves shell rows from shadow" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.transcript), shadow);
+    defer surface.deinit();
+
+    try std.testing.expectEqual(@as(u21, 's'), surface.cellAt(1, 1).?.codepoint);
+    try std.testing.expectEqual(paint_plan.CellOwner.preserved_shell, surface.cellAt(1, 1).?.owner);
+}
+
+test "frame surface presentation neutralization preserves shell cells and fx geometry" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    try shadow.feed("\x1b[1;1H\x1b[31mS\x1b]8;;https://shell.example\x1b\\H\x1b]8;;\x1b\\\x1b[0m");
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.transcript), shadow);
+    defer surface.deinit();
+
+    _ = try surface.writeAnsiBand(
+        2,
+        1,
+        "\x1b[1;32mF\x1b]8;;https://fx.example\x1b\\X\x1b]8;;\x1b\\\x1b[0m",
+        .transcript,
+        .same_owner,
+    );
+    const preserved_before = surface.cellAt(1, 1).?;
+    const fx_before = surface.cellAt(2, 1).?;
+    try std.testing.expect(!fx_before.style.eql(.{}));
+
+    surface.neutralizeFxOwnedPresentation();
+
+    const preserved_after = surface.cellAt(1, 1).?;
+    const fx_after = surface.cellAt(2, 1).?;
+    try std.testing.expect(std.meta.eql(preserved_before, preserved_after));
+    try std.testing.expectEqual(fx_before.codepoint, fx_after.codepoint);
+    try std.testing.expectEqual(fx_before.width, fx_after.width);
+    try std.testing.expectEqual(fx_before.combining_suffix_id, fx_after.combining_suffix_id);
+    try std.testing.expectEqual(fx_before.owner, fx_after.owner);
+    try std.testing.expect(fx_after.style.eql(.{}));
+}
+
+test "frame surface initializes transcript footer and activity owners" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.activity), shadow);
+    defer surface.deinit();
+
+    try std.testing.expectEqual(paint_plan.CellOwner.transcript, surface.cellAt(2, 1).?.owner);
+    try std.testing.expectEqual(paint_plan.CellOwner.activity, surface.cellAt(4, 1).?.owner);
+    try std.testing.expectEqual(paint_plan.CellOwner.footer, surface.cellAt(5, 1).?.owner);
+}
+
+test "frame surface initializes owned gap rows as blank target cells" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    try shadow.feed("\x1b[3;1Hstale");
+
+    var plan = testPlan(.activity);
+    plan.transcript_band.bottom = 2;
+    plan.blank_band = .{ .top = 3, .bottom = 3, .owner = .gap };
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    defer surface.deinit();
+
+    try std.testing.expectEqual(paint_plan.CellOwner.gap, surface.cellAt(3, 1).?.owner);
+    try std.testing.expectEqual(@as(u21, ' '), surface.cellAt(3, 1).?.codepoint);
+}
+
+test "frame surface rejects preserved shell mutation" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.transcript), shadow);
+    defer surface.deinit();
+
+    try std.testing.expectError(error.PreservedShellMutation, surface.writeCell(1, 1, blankCell(.preserved_shell), .same_owner));
+}
+
+test "full-terminal scroll invalidation does not allow painting preserved shell rows" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    try plan.invalidation.append(.{ .reason = .terminal_scroll, .top = 1, .bottom = 6 });
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    defer surface.deinit();
+
+    try std.testing.expectError(error.WriteOutsideBand, surface.writeAnsiBand(1, 1, "fx", .transcript, .same_owner));
+    try std.testing.expectEqual(paint_plan.CellOwner.preserved_shell, surface.cellAt(1, 1).?.owner);
+}
+
+test "frame surface permits activity over transcript only for overlay policy" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, overlayPlan(), shadow);
+    defer surface.deinit();
+
+    const activity_cell = FrameCell{ .codepoint = '*', .width = 1, .style = .{}, .owner = .activity };
+    try std.testing.expectError(error.WriteOutsideBand, surface.writeCell(3, 1, activity_cell, .same_owner));
+    try surface.writeCell(3, 1, activity_cell, .activity_over_transcript);
+    try std.testing.expectEqual(paint_plan.CellOwner.activity, surface.cellAt(3, 1).?.owner);
+}
+
+test "frame surface traces owner violations without cell payloads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "frame_owner_violation");
+
+    var shadow = try shadowGrid(alloc, 8, 6);
+    defer shadow.deinit();
+    var plan = overlayPlan();
+    try plan.invalidation.append(.{ .reason = .resize, .top = 2, .bottom = 4 });
+    var surface = try FrameSurface.initFromShadow(alloc, plan, shadow);
+    defer surface.deinit();
+
+    const activity_cell = FrameCell{ .codepoint = '*', .width = 1, .style = .{}, .owner = .activity };
+    try surface.writeCell(3, 1, activity_cell, .activity_over_transcript);
+    const transcript_cell = FrameCell{ .codepoint = 's', .width = 1, .style = .{}, .owner = .transcript };
+    try std.testing.expectError(error.OwnerConflict, surface.writeCell(3, 1, transcript_cell, .same_owner));
+
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer file.close(std.testing.io);
+    const trace = try io_mod.readFileToEnd(alloc, &file, 8192);
+    defer alloc.free(trace);
+
+    try std.testing.expect(std.mem.find(u8, trace, "[frame_owner_violation]") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "row=3 col=1") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "previous_owner=activity next_owner=transcript") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "invalidation=resize") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "secret") == null);
+    try std.testing.expect(std.mem.find(u8, trace, "transcript text") == null);
+}
+
+test "frame surface rejects footer over activity" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.activity), shadow);
+    defer surface.deinit();
+
+    try std.testing.expectError(error.WriteOutsideBand, surface.writeCell(4, 1, blankCell(.footer), .same_owner));
+}
+
+test "frame surface validates band ownership before parsing ansi bytes" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.transcript), shadow);
+    defer surface.deinit();
+
+    try std.testing.expectError(
+        error.WriteOutsideBand,
+        surface.writeAnsiBand(4, 1, "a\nb\nc", .footer, .same_owner),
+    );
+    try std.testing.expectEqual(paint_plan.CellOwner.transcript, surface.cellAt(4, 1).?.owner);
+    try std.testing.expectEqual(@as(u21, ' '), surface.cellAt(4, 1).?.codepoint);
+}
+
+test "frame surface writeAnsiBand copies soft-wrapped continuation rows" {
+    var shadow = try shadowGrid(std.testing.allocator, 4, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 4;
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    defer surface.deinit();
+
+    const result = try surface.writeAnsiBand(2, 2, "abcdef", .transcript, .same_owner);
+    try std.testing.expectEqual(@as(u16, 2), result.rows_touched);
+    try std.testing.expectEqual(@as(u21, 'a'), surface.cellAt(2, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'e'), surface.cellAt(3, 1).?.codepoint);
+}
+
+test "frame surface writeAnsiBand fits decomposed text in its display width" {
+    var shadow = try shadowGrid(std.testing.allocator, 4, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 4;
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    defer surface.deinit();
+
+    const result = try surface.writeAnsiBand(
+        2,
+        1,
+        "e\u{0301}e\u{0301}e\u{0301}e\u{0301}",
+        .transcript,
+        .same_owner,
+    );
+    try std.testing.expectEqual(@as(u16, 1), result.rows_touched);
+
+    var target = try surface.copyToTargetGrid(std.testing.allocator);
+    defer target.deinit();
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(std.testing.allocator);
+    try target.rowTextTrimmed(2, &row_text);
+    try std.testing.expectEqualStrings(
+        "e\u{0301}e\u{0301}e\u{0301}e\u{0301}",
+        row_text.items,
+    );
+}
+
+test "frame surface preserves Unicode display-unit suffix bytes" {
+    var shadow = try shadowGrid(std.testing.allocator, 10, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 10;
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    defer surface.deinit();
+
+    const text = "\u{2600}\u{FE0E}\u{1F44D}\u{1F3FD}\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}\u{1F469}\u{200D}\u{1F4BB}";
+    const result = try surface.writeAnsiBand(2, 1, text, .transcript, .same_owner);
+    try std.testing.expectEqual(@as(u16, 1), result.rows_touched);
+
+    var target = try surface.copyToTargetGrid(std.testing.allocator);
+    defer target.deinit();
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(std.testing.allocator);
+    try target.rowTextTrimmed(2, &row_text);
+    try std.testing.expectEqualStrings(text, row_text.items);
+}
+
+test "frame surface writeAnsiBand preserves hard-newline rows" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.transcript), shadow);
+    defer surface.deinit();
+
+    const result = try surface.writeAnsiBand(2, 2, "a\nb", .transcript, .same_owner);
+    try std.testing.expectEqual(@as(u16, 2), result.rows_touched);
+    try std.testing.expectEqual(@as(u21, 'a'), surface.cellAt(2, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'b'), surface.cellAt(3, 1).?.codepoint);
+}
+
+test "frame surface materialized ANSI-only row matches one-row occupancy" {
+    const alloc = std.testing.allocator;
+    var shadow = try shadowGrid(alloc, 123, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 123;
+    var surface = try FrameSurface.initFromShadow(alloc, plan, shadow);
+    defer surface.deinit();
+
+    const band = try AnsiBandWritePlan.resolve(
+        surface,
+        2,
+        1,
+        .transcript,
+        .same_owner,
+        true,
+    );
+    var controls_only = try surface.feedAnsiBand(band, "\x1b[0m");
+    defer controls_only.grid.deinit();
+    try std.testing.expectEqual(@as(u16, 0), controls_only.stats.max_row_touched);
+    try std.testing.expectEqual(@as(u16, 1), controls_only.grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 1), controls_only.grid.cursor_col);
+    try std.testing.expect(!controls_only.grid.pending_wrap);
+    try std.testing.expect(!controls_only.stats.scrolled);
+
+    var materialized = try surface.feedAnsiBand(band, "\x1b[0m\x1b[2K");
+    defer materialized.grid.deinit();
+    try std.testing.expectEqual(@as(u16, 1), materialized.stats.max_row_touched);
+    try std.testing.expectEqual(@as(u16, 1), materialized.grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 1), materialized.grid.cursor_col);
+    try std.testing.expect(!materialized.grid.pending_wrap);
+    try std.testing.expect(!materialized.stats.scrolled);
+
+    const result = try surface.writeAnsiBand(
+        2,
+        1,
+        "\x1b[0m\x1b[2K",
+        .transcript,
+        .same_owner,
+    );
+    try std.testing.expectEqual(@as(u16, 1), result.rows_touched);
+    try std.testing.expectEqual(@as(u16, 2), result.first_row);
+    try std.testing.expectEqual(@as(u16, 2), result.last_row);
+}
+
+test "frame surface writeAnsiBand fails when footer text touches sentinel row" {
+    var shadow = try shadowGrid(std.testing.allocator, 4, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 4;
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    defer surface.deinit();
+
+    try std.testing.expectError(error.AnsiBandOverflow, surface.writeAnsiBand(5, 1, "abcdx", .footer, .same_owner));
+}
+
+test "frame surface writeAnsiBandNoWrap clamps printable footer overflow" {
+    var shadow = try shadowGrid(std.testing.allocator, 4, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 4;
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    defer surface.deinit();
+
+    _ = try surface.writeAnsiBandNoWrap(5, 1, "abcdx", .footer, .same_owner);
+    try std.testing.expectEqual(@as(u21, 'a'), surface.cellAt(5, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'x'), surface.cellAt(5, 4).?.codepoint);
+}
+
+test "frame surface writeAnsiBandNoWrap still rejects hard-newline footer overflow" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.transcript), shadow);
+    defer surface.deinit();
+
+    try std.testing.expectError(error.AnsiBandOverflow, surface.writeAnsiBandNoWrap(5, 1, "a\nb", .footer, .same_owner));
+}
+
+test "frame surface writeAnsiBand fails when temporary VT scrolls" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.transcript), shadow);
+    defer surface.deinit();
+
+    try std.testing.expectError(error.AnsiBandOverflow, surface.writeAnsiBand(5, 1, "a\nb\nc", .footer, .same_owner));
+}
+
+test "frame surface remaps OSC 8 hyperlink ids from temporary grid" {
+    var shadow = try shadowGrid(std.testing.allocator, 16, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 16;
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    defer surface.deinit();
+
+    _ = try surface.writeAnsiBand(2, 1, "\x1b]8;;https://example.com\x1b\\X\x1b]8;;\x1b\\", .transcript, .same_owner);
+    const cell = surface.cellAt(2, 1).?;
+    try std.testing.expect(cell.style.hyperlink_id != 0);
+    try std.testing.expectEqualStrings("https://example.com", surface.hyperlinkUrl(cell.style.hyperlink_id).?);
+
+    var target = try surface.copyToTargetGrid(std.testing.allocator);
+    defer target.deinit();
+    const target_cell = target.cellAt(2, 1).?;
+    try std.testing.expectEqualStrings("https://example.com", target.hyperlinkUrl(target_cell.style.hyperlink_id).?);
+}
+
+test "frame surface preserves authoritative hyperlink ids and unused pool slots" {
+    var shadow = try shadowGrid(std.testing.allocator, 16, 6);
+    defer shadow.deinit();
+    try shadow.feed("\x1b]8;;https://unused.example\x1b\\\x1b]8;;\x1b\\");
+    try shadow.feed("\x1b[2;1H\x1b]8;;https://active.example\x1b\\X\x1b]8;;\x1b\\");
+    try std.testing.expectEqual(@as(usize, 2), shadow.hyperlink_pool.items.len);
+    try std.testing.expectEqual(@as(u32, 2), shadow.cellAt(2, 1).?.style.hyperlink_id);
+
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 16;
+    var surface = try FrameSurface.initFromShadow(
+        std.testing.allocator,
+        plan,
+        shadow,
+    );
+    defer surface.deinit();
+    try surface.retainTranscriptBandFromGrid(shadow, .{ .top = 2, .bottom = 2 });
+
+    const retained = surface.cellAt(2, 1).?;
+    try std.testing.expectEqual(@as(u32, 2), retained.style.hyperlink_id);
+    try std.testing.expectEqualStrings("https://unused.example", surface.hyperlinkUrl(1).?);
+    try std.testing.expectEqualStrings("https://active.example", surface.hyperlinkUrl(2).?);
+
+    var target = try surface.copyToTargetGrid(std.testing.allocator);
+    defer target.deinit();
+    try std.testing.expectEqual(@as(u32, 2), target.cellAt(2, 1).?.style.hyperlink_id);
+    try std.testing.expectEqualStrings("https://unused.example", target.hyperlinkUrl(1).?);
+    try std.testing.expectEqualStrings("https://active.example", target.hyperlinkUrl(2).?);
+}
+
+test "frame surface rejects invalid authoritative hyperlink ids" {
+    var preserved = try shadowGrid(std.testing.allocator, 8, 6);
+    defer preserved.deinit();
+    preserved.cells[0].style.hyperlink_id = 1;
+    try std.testing.expectError(
+        error.MissingHyperlinkResource,
+        FrameSurface.initFromShadow(
+            std.testing.allocator,
+            testPlan(.transcript),
+            preserved,
+        ),
+    );
+
+    var retained = try shadowGrid(std.testing.allocator, 8, 6);
+    defer retained.deinit();
+    retained.cells[8].style.hyperlink_id = 1;
+    var surface = try FrameSurface.initFromShadow(
+        std.testing.allocator,
+        testPlan(.transcript),
+        retained,
+    );
+    defer surface.deinit();
+    try std.testing.expectError(
+        error.MissingHyperlinkResource,
+        surface.retainTranscriptBandFromGrid(retained, .{ .top = 2, .bottom = 2 }),
+    );
+}
+
+test "frame surface rejects invalid authoritative combining suffix ids" {
+    var preserved = try shadowGrid(std.testing.allocator, 8, 6);
+    defer preserved.deinit();
+    preserved.cells[0].combining_suffix_id = 1;
+
+    try std.testing.expectError(
+        error.MissingCombiningSuffixResource,
+        FrameSurface.initFromShadow(
+            std.testing.allocator,
+            testPlan(.transcript),
+            preserved,
+        ),
+    );
+}
+
+test "frame surface validates wide cell trailing cells" {
+    var shadow = try shadowGrid(std.testing.allocator, 8, 6);
+    defer shadow.deinit();
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, testPlan(.transcript), shadow);
+    defer surface.deinit();
+
+    _ = try surface.writeAnsiBand(2, 1, "漢", .transcript, .same_owner);
+    try std.testing.expectEqual(@as(u8, 2), surface.cellAt(2, 1).?.width);
+    try std.testing.expectEqual(@as(u8, 0), surface.cellAt(2, 2).?.width);
+    try surface.validate();
+}

@@ -1,0 +1,318 @@
+name: Publish libfx
+
+on:
+  workflow_run:
+    workflows: [CI, Release]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: npm channel to publish
+        required: true
+        type: choice
+        options:
+          - dev
+          - stable
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-libfx-${{ (github.event.workflow_run.name == 'Release' || inputs.channel == 'stable') && 'stable' || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.metadata.outputs.channel }}
+      npm_tag: ${{ steps.metadata.outputs.npm_tag }}
+      sha: ${{ steps.metadata.outputs.sha }}
+      should_publish: ${{ steps.metadata.outputs.should_publish }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.event.workflow_run.head_sha }}
+
+      - name: Resolve channel and version
+        id: metadata
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            CHANNEL="$REQUESTED_CHANNEL"
+            SHA=$(git rev-parse HEAD)
+          else
+            SHA="$WORKFLOW_SHA"
+            if [ "$WORKFLOW_NAME" = "Release" ]; then
+              CHANNEL=stable
+            else
+              CHANNEL=dev
+            fi
+          fi
+
+          BASE_VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if ! [[ "$BASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::src/main.zig version is not strict SemVer"
+            exit 1
+          fi
+          SHOULD_PUBLISH=true
+          if [ "$CHANNEL" = "stable" ]; then
+            TAG="v${BASE_VERSION}"
+            if git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null; then
+              TAG_SHA=$(git rev-list -n 1 "$TAG")
+              if [ "$TAG_SHA" != "$SHA" ]; then
+                if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+                  echo "::error::Stable tag ${TAG} points to ${TAG_SHA}, not ${SHA}"
+                  exit 1
+                fi
+                echo "Release workflow did not publish ${SHA}; skipping libfx stable publish"
+                SHOULD_PUBLISH=false
+              fi
+            else
+              if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+                echo "::error::Stable tag ${TAG} does not exist"
+                exit 1
+              fi
+              echo "Release workflow did not create ${TAG}; skipping libfx stable publish"
+              SHOULD_PUBLISH=false
+            fi
+            VERSION="$BASE_VERSION"
+            NPM_TAG=latest
+          else
+            SHORT_SHA=$(printf '%s' "$SHA" | cut -c1-12)
+            VERSION="${BASE_VERSION}-dev.${GITHUB_RUN_NUMBER}.g${SHORT_SHA}"
+            NPM_TAG=dev
+          fi
+
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "npm_tag=${NPM_TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "should_publish=${SHOULD_PUBLISH}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Publishing libfx@${VERSION} on the ${CHANNEL} channel (${NPM_TAG})"
+
+  native:
+    needs: metadata
+    if: needs.metadata.outputs.should_publish == 'true'
+    name: Native (${{ matrix.package_platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            package_platform: linux-x64
+          - runner: ubuntu-24.04-arm
+            package_platform: linux-arm64
+          - runner: macos-15-intel
+            package_platform: darwin-x64
+          - runner: macos-15
+            package_platform: darwin-arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: Build ReleaseSafe addon
+        run: zig build -Dnapi-surface=core -Doptimize=ReleaseSafe -Dupdate-channel=${{ needs.metadata.outputs.channel }}
+
+      - name: Test native addon
+        run: npm run --prefix sdk test:node-napi
+
+      - name: Name native addon for package discovery
+        shell: bash
+        run: |
+          mkdir -p native-addons
+          cp zig-out/lib/libfx.node native-addons/libfx.${{ matrix.package_platform }}.node
+
+      - name: Upload native addon
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-native-${{ matrix.package_platform }}
+          path: native-addons/libfx.${{ matrix.package_platform }}.node
+          if-no-files-found: error
+
+  wasm:
+    needs: metadata
+    if: needs.metadata.outputs.should_publish == 'true'
+    name: WebAssembly (ReleaseSmall)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: Build ReleaseSmall WebAssembly surfaces
+        run: |
+          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall -Dupdate-channel=${{ needs.metadata.outputs.channel }}
+          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall -Dupdate-channel=${{ needs.metadata.outputs.channel }}
+
+      - name: Install terminal test dependencies
+        run: npm ci --prefix sdk/node
+
+      - name: Test Node and WebAssembly
+        run: npm run --prefix sdk test:node-wasm
+
+      - name: Upload WebAssembly artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-wasm
+          path: |
+            zig-out/bin/fx-core.wasm
+            zig-out/bin/fx-term.wasm
+          if-no-files-found: error
+
+  publish:
+    needs: [metadata, native, wasm]
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.metadata.outputs.sha }}
+
+      - name: Setup Node for npm trusted publishing
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+
+      - name: Install OIDC-capable npm
+        run: npm install --global npm@11.15.0
+
+      - name: Download native addons
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: libfx-native-*
+          path: native-addons
+          merge-multiple: true
+
+      - name: Download WebAssembly artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: libfx-wasm
+          path: wasm-artifacts
+
+      - name: Restore package artifact layout
+        run: |
+          mkdir -p zig-out/bin
+          cp wasm-artifacts/fx-core.wasm zig-out/bin/fx-core.wasm
+          cp wasm-artifacts/fx-term.wasm zig-out/bin/fx-term.wasm
+
+      - name: Stage package without executing repository code
+        env:
+          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(find native-addons -type f -name '*.node' | wc -l | tr -d ' ')" = 4
+          for name in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            test -f "native-addons/libfx.${name}.node"
+          done
+
+          jq -e '
+            .name == "libfx" and
+            .type == "module" and
+            .scripts != null and
+            (.scripts | keys | all(startswith("test:"))) and
+            (.dependencies == null) and
+            (.devDependencies == null) and
+            (.optionalDependencies == null) and
+            (.peerDependencies == null) and
+            (.bin == null)
+          ' sdk/package.json >/dev/null
+
+          rm -rf sdk/dist/libfx
+          mkdir -p sdk/dist/libfx
+          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js sdk/mcp.js sdk/skills.js sdk/skills-node.js LICENSE sdk/dist/libfx/
+          cp wasm-artifacts/fx-core.wasm wasm-artifacts/fx-term.wasm sdk/dist/libfx/
+          cp native-addons/*.node sdk/dist/libfx/
+          jq --arg version "$LIBFX_VERSION" '.version = $version | del(.files)' \
+            sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
+          mv sdk/dist/libfx/package.json.tmp sdk/dist/libfx/package.json
+
+      - name: Run packed public API example
+        run: |
+          node sdk/tests/test-packed-example.mjs sdk/dist/libfx native
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs sdk/dist/libfx wasm
+
+      - name: Validate package archive
+        run: |
+          set -euo pipefail
+          npm pack --ignore-scripts --dry-run --json sdk/dist/libfx > /tmp/libfx-pack.json
+          node -e '
+            const report = require("/tmp/libfx-pack.json")[0];
+            const names = new Set(report.files.map(({ path }) => path));
+            const required = [
+              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
+              "mcp.js", "skills.js", "skills-node.js",
+              "fx-core.wasm", "fx-term.wasm",
+              "libfx.linux-x64.node", "libfx.linux-arm64.node",
+              "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
+            ];
+            if (names.size !== required.length) throw new Error(`unexpected package file count: ${names.size}`);
+            for (const name of required) {
+              if (!names.has(name)) throw new Error(`package is missing ${name}`);
+            }
+            console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed`);
+          '
+
+      - name: Confirm dev publish still targets main
+        if: needs.metadata.outputs.channel == 'dev'
+        env:
+          RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
+        run: |
+          MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::main advanced to ${MAIN_SHA}; refusing to move the dev channel to stale ${RELEASE_SHA}"
+            exit 1
+          fi
+
+      - name: Publish with npm trusted publishing
+        env:
+          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+          NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
+        run: |
+          set -euo pipefail
+          if npm view "libfx@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+            echo "libfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
+            exit 0
+          fi
+          npm publish sdk/dist/libfx --ignore-scripts --access public --tag "$NPM_TAG" --provenance

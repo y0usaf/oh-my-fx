@@ -313,3 +313,156 @@ pub fn protocolErrorSupportsVersionForRequest(
     }
     return found;
 }
+
+test "legacy initialization transitions are bounded and monotonic" {
+    const cases = [_]struct {
+        offered: LegacyStdioVersion,
+        observation: LegacyInitializeObservation,
+        expected: LegacyInitializeTransition,
+    }{
+        .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
+        .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2024_11_05 }, .expected = .{ .accept = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .accepted = .v2025_03_26 }, .expected = .{ .accept = .v2025_03_26 } },
+        .{ .offered = .v2025_11_25, .observation = .connection_closed, .expected = .{ .retry = .v2025_06_18 } },
+        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2024_11_05, .observation = .connection_closed, .expected = .fail },
+        .{ .offered = .v2025_11_25, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_06_18 } },
+        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2024_11_05, .observation = .{ .unsupported = null }, .expected = .fail },
+        .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2024_11_05 }, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2025_11_25 }, .expected = .fail },
+        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = .v2025_11_25 }, .expected = .fail },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            decideLegacyInitializeTransition(case.offered, case.observation),
+        );
+    }
+}
+
+test "MCP legacy stdio negotiation includes 2025-03-26" {
+    try std.testing.expectEqual(
+        LegacyStdioVersion.v2025_03_26,
+        LegacyStdioVersion.parse("2025-03-26").?,
+    );
+    try std.testing.expectEqual(
+        LegacyStdioVersion.v2025_03_26,
+        LegacyStdioVersion.v2025_06_18.older().?,
+    );
+    try std.testing.expectEqual(
+        LegacyStdioVersion.v2024_11_05,
+        LegacyStdioVersion.v2025_03_26.older().?,
+    );
+}
+
+test "method-not-found discovery begins fallback at the newest legacy version" {
+    const alloc = std.testing.allocator;
+    var response = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}",
+        .{},
+    );
+    defer response.deinit();
+
+    switch (try classifyDiscoveryResponse(response.value)) {
+        .legacy_fallback => |version| try std.testing.expectEqual(LegacyStdioVersion.v2025_11_25, version),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ordinary well-formed discovery errors begin legacy fallback independent of code" {
+    const responses = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32602,\"message\":\"Invalid params\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32000,\"message\":\"Server not initialized\"}}",
+    };
+    for (responses) |text| {
+        var response = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            text,
+            .{},
+        );
+        defer response.deinit();
+
+        switch (try classifyDiscoveryResponse(response.value)) {
+            .legacy_fallback => |version| try std.testing.expectEqual(
+                LegacyStdioVersion.v2025_11_25,
+                version,
+            ),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "recognized modern discovery errors never downgrade" {
+    const responses = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32021,\"message\":\"Missing required client capability\",\"data\":{\"capability\":\"roots\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2026-07-28\"],\"requested\":\"2026-07-28\"}}}",
+    };
+    for (responses) |text| {
+        var response = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            text,
+            .{},
+        );
+        defer response.deinit();
+
+        switch (try classifyDiscoveryResponse(response.value)) {
+            .modern_protocol_error => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "HTTP discovery state machine accepts stock SDK null-id errors as legacy fallback" {
+    const responses = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Server not initialized\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Bad Request: Unsupported protocol version\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}",
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"invalid request\"}}",
+    };
+    for (responses) |text| {
+        var response = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer response.deinit();
+        try std.testing.expectEqual(
+            HttpDiscoveryOutcome.legacy_fallback,
+            try classifyHttpDiscoveryResponse(response.value),
+        );
+    }
+}
+
+test "HTTP discovery retries modern only when the server explicitly supports it" {
+    var response = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2026-07-28\"],\"requested\":\"2026-07-28\"}}}",
+        .{},
+    );
+    defer response.deinit();
+    try std.testing.expectEqual(
+        HttpDiscoveryOutcome.retry_modern,
+        try classifyHttpDiscoveryResponse(response.value),
+    );
+}
+
+test "discovery selects the newest legacy version independent of server ordering" {
+    const responses = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2024-11-05\",\"2025-06-18\",\"2025-11-25\"],\"capabilities\":{}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2025-11-25\",\"2025-06-18\",\"2024-11-05\"],\"capabilities\":{}}}",
+    };
+    for (responses) |text| {
+        var response = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer response.deinit();
+
+        switch (try classifyDiscoveryResponse(response.value)) {
+            .legacy_fallback => |version| try std.testing.expectEqual(LegacyStdioVersion.v2025_11_25, version),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}

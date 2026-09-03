@@ -48,6 +48,7 @@ fn BootstrapDeps(comptime App: type) type {
             []const u8,
             types.ReasoningEffort,
             bool,
+            bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
         const StageRequestedResumeViewFn = *const fn (*App) app_session_runtime.ResumeViewStage;
@@ -83,7 +84,6 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
-            record_requested: bool,
             capability_providers: CapabilityProviders,
         ) !void {
             try bootstrapWithDeps(
@@ -92,7 +92,6 @@ pub fn Runtime(comptime App: type) type {
                 default_model,
                 default_agent_step_limit,
                 resize_handler,
-                record_requested,
                 defaultDeps(capability_providers),
             );
         }
@@ -144,6 +143,7 @@ pub fn Runtime(comptime App: type) type {
             selected_model: []const u8,
             effort: types.ReasoningEffort,
             fast_mode: bool,
+            fast_mode_model_bound: bool,
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
@@ -153,6 +153,7 @@ pub fn Runtime(comptime App: type) type {
                 selected_model,
                 effort,
                 fast_mode,
+                fast_mode_model_bound,
             );
         }
 
@@ -182,7 +183,6 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
-            record_requested: bool,
             deps: BootstrapDeps(App),
         ) !void {
             errdefer app.deinit();
@@ -201,9 +201,12 @@ pub fn Runtime(comptime App: type) type {
                     app.secretStore()
                 else
                     host.unavailable_secret_store,
+                .auth_mode = if (comptime @hasDecl(@TypeOf(app.auth), "authMode"))
+                    app.auth.authMode()
+                else
+                    .local,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
-                .record_requested = record_requested,
             });
             defer startup.deinit(app.alloc);
 
@@ -218,14 +221,15 @@ pub fn Runtime(comptime App: type) type {
             }
             app.auth.recordStartupStatus(
                 startup.stored_key_status,
+                startup.fx_login_status,
                 startup.credential_onboarding_skipped,
             );
-            if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
-                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
-                    debug_trace.logf("auth", "startup ChatGPT inventory refresh failed err={s}", .{@errorName(err)});
-                };
-            } else {
+            if (comptime @hasDecl(@TypeOf(app.auth), "refreshSourceInventory")) {
                 app.auth.refreshSourceInventory(app.alloc) catch |err| {
+                    debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
+                };
+            } else if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
+                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
                     debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
                 };
             }
@@ -280,6 +284,7 @@ pub fn Runtime(comptime App: type) type {
                 active_model,
                 startup.effort,
                 startup.fast_mode,
+                startup.fast_mode_model_bound,
             );
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
@@ -332,13 +337,15 @@ pub fn Runtime(comptime App: type) type {
                 app.mcp_runtime = profile_mcp;
             }
 
-            const loaded = try deps.load_skills(
+            var loaded = try deps.load_skills(
                 std.heap.c_allocator,
                 app.workspace_root,
                 deps.skill_root_policy,
             );
+            errdefer loaded.deinit(std.heap.c_allocator);
             skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
-            app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+            try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+            loaded = .{};
 
             if (app.requested_resume == null) {
                 const welcome_message = try deps.welcome_message(app.alloc);
@@ -389,6 +396,13 @@ pub fn Runtime(comptime App: type) type {
                         .body = "fx could not access " ++ credentials.stored_key_backend_label ++ ". Continuing without an API key.",
                     }, true);
                 }
+                if (auth_view.active_source == null and auth_view.fx_login_status == .unavailable) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "The saved fx login could not be loaded. No other credential was selected; run /login to repair this source.",
+                    }, true);
+                }
             }
             var recording = try record_tape.captureStatus(app.alloc);
             defer recording.deinit(app.alloc);
@@ -396,13 +410,14 @@ pub fn Runtime(comptime App: type) type {
                 const recording_body = try std.fmt.allocPrint(
                     app.alloc,
                     "visual terminal capture: {s}\nvisible terminal content, including typed prompt text, is recorded",
-                    .{recording.active},
+                    .{recording.active.path},
                 );
                 defer app.alloc.free(recording_body);
                 try app.writeDomainNotice(.{
                     .topic = "recording",
                     .tone = .warning,
                     .body = recording_body,
+                    .visibility = if (recording.active.show_inline_notice) .compact_and_full else .full_only,
                 }, true);
             }
             {
@@ -489,6 +504,7 @@ const TestCapture = struct {
     runtime_model_len: usize = 0,
     configured_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
+    configured_fast_mode_model_bound: bool = false,
     initialize_required: bool = false,
     load_skills_workspace: []const u8 = "",
     load_skills_workspace_root_count: usize = 0,
@@ -536,6 +552,14 @@ const TestCapture = struct {
 };
 
 var active_capture: ?*TestCapture = null;
+
+const test_workspace_skill_roots = [_]skill_contract.RootSpec{
+    .{ .source = .workspace_shared, .path = "skills" },
+};
+
+const test_global_skill_roots = [_]skill_contract.RootSpec{
+    .{ .source = .global_codex, .path = ".codex/skills" },
+};
 
 const TestApp = struct {
     pub const app_version = "0.2.10-test";
@@ -630,6 +654,200 @@ const TestApp = struct {
     }
 };
 
+fn testDeps() BootstrapDeps(TestApp) {
+    return .{
+        .bootstrap_interactive_app = bootstrapInteractiveAppForTest,
+        .configure_session_preferences = configureSessionPreferencesForTest,
+        .initialize_persistence = initializePersistenceForTest,
+        .stage_requested_resume_view = stageRequestedResumeViewForTest,
+        .publish_staged_resume_view = publishStagedResumeViewForTest,
+        .load_mcp_runtime = loadMcpRuntimeForTest,
+        .load_skills = loadSkillsForTest,
+        .skill_root_policy = .{
+            .workspace_roots = &test_workspace_skill_roots,
+            .managed_root_source = .global_fx,
+            .global_roots = &test_global_skill_roots,
+        },
+        .welcome_message = welcomeMessageForTest,
+        .begin_fresh_persisted_session = beginFreshPersistedSessionForTest,
+        .enable_session_stores = enableSessionStoresForTest,
+        .terminal_title = .{
+            .set_fn = setTerminalTitleLabelForTest,
+            .clear_fn = clearTerminalTitleForTest,
+        },
+    };
+}
+
+fn bootstrapInteractiveAppForTest(cfg: app_lifecycle.BootstrapConfig) !app_lifecycle.StartupState {
+    const capture = active_capture.?;
+    capture.bootstrap_calls += 1;
+    capture.footer_rows = cfg.footer_rows;
+    capture.default_model = cfg.default_model;
+    capture.default_agent_step_limit = cfg.default_agent_step_limit;
+    capture.fx_version = cfg.fx_version;
+    try std.testing.expect(cfg.terminal == &active_app_for_pointer_check.?.terminal);
+    active_app_for_pointer_check.?.shell.layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    };
+    if (capture.bootstrap_error) |err| {
+        if (capture.bootstrap_init_backing_before_error) {
+            try cfg.shell.initBacking(cfg.alloc);
+        }
+        return err;
+    }
+    return makeStartupState(capture.alloc);
+}
+
+var active_app_for_pointer_check: ?*TestApp = null;
+
+fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
+    var state = app_lifecycle.StartupState{ .agent_step_limit = 19 };
+    state.max_tool_result_bytes = 131072;
+    state.first_call_tool_choice = .none;
+    state.workspace_root = try alloc.dupe(u8, "/workspace");
+    errdefer alloc.free(state.workspace_root);
+    if (active_capture.?.startup_with_credential) {
+        const credential_token = try alloc.dupe(u8, "api-key");
+        errdefer alloc.free(credential_token);
+        const credential_team = try alloc.dupe(u8, "team_123");
+        errdefer alloc.free(credential_team);
+        state.credential = .{
+            .token = credential_token,
+            .source = .ai_gateway_api_key,
+            .team_id = credential_team,
+        };
+    }
+    state.stored_key_status = .not_found;
+    state.credential_onboarding_skipped = active_capture.?.onboarding_skipped;
+    state.selected_model = try alloc.dupe(u8, "model-x");
+    errdefer alloc.free(state.selected_model);
+    state.configured_model = try alloc.dupe(u8, "configured-model");
+    errdefer alloc.free(state.configured_model);
+    state.model_source = .process_override;
+    state.permission_mode = .auto;
+    state.context_enabled = false;
+    state.fast_mode = true;
+    state.fast_mode_model_bound = true;
+    state.auto_upgrade = false;
+    state.update_channel = .dev;
+    state.effort = types.ReasoningEffort.literal("high");
+    state.statusline_workspace = true;
+    if (active_capture.?.emit_config_diagnostics) {
+        const diagnostics = try alloc.alloc(config_runtime.ConfigDiagnostic, 2);
+        errdefer alloc.free(diagnostics);
+        diagnostics[0] = .{ .layer = .user, .cause = .malformed_settings };
+        diagnostics[1] = .{ .layer = .project, .cause = .settings_too_large };
+        state.config_diagnostics = diagnostics;
+    }
+    return state;
+}
+
+fn initializePersistenceForTest(
+    app: *TestApp,
+    required: bool,
+) !void {
+    _ = app;
+    active_capture.?.initialize_required = required;
+}
+
+fn stageRequestedResumeViewForTest(_: *TestApp) app_session_runtime.ResumeViewStage {
+    active_capture.?.recordEvent("resume_view_stage");
+    return .{ .ready = 1 };
+}
+
+fn publishStagedResumeViewForTest(_: *TestApp, entry_id: u32) !void {
+    try std.testing.expectEqual(@as(u32, 1), entry_id);
+    active_capture.?.recordEvent("resume_view_publish");
+}
+
+fn loadMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+    active_capture.?.recordEvent("load_mcp");
+    return null;
+}
+
+fn loadSkillsForTest(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    root_policy: skill_contract.RootPolicy,
+) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills {
+    active_capture.?.recordEvent("load_skills");
+    active_capture.?.load_skills_workspace = workspace_root;
+    active_capture.?.load_skills_workspace_root_count = root_policy.workspace_roots.len;
+    active_capture.?.load_skills_global_root_count = root_policy.global_roots.len;
+    if (active_capture.?.load_skills_error) |err| return err;
+
+    const dir = try alloc.dupe(u8, "/skills");
+    errdefer alloc.free(dir);
+    if (!active_capture.?.emit_skill_diagnostic) {
+        return .{ .dir = dir, .skills = &.{} };
+    }
+
+    const diagnostics = try alloc.alloc(skill_runtime.SkillDiagnostic, 1);
+    errdefer alloc.free(diagnostics);
+    diagnostics[0] = .{
+        .path = try alloc.dupe(u8, "/skills/hostile\npath/body-sentinel"),
+        .source = .global_fx,
+        .scope = .candidate,
+        .cause = .{ .invalid_metadata = .missing_name },
+    };
+    return .{ .dir = dir, .skills = &.{}, .diagnostics = diagnostics };
+}
+
+fn welcomeMessageForTest(alloc: Allocator) ![]u8 {
+    return alloc.dupe(u8, "welcome\n");
+}
+
+fn configureSessionPreferencesForTest(
+    _: *TestApp,
+    _: model_provider.ProviderId,
+    configured_model: []const u8,
+    model_source: config_runtime.ModelSource,
+    selected_model: []const u8,
+    effort: types.ReasoningEffort,
+    fast_mode: bool,
+    fast_mode_model_bound: bool,
+) !void {
+    const capture = active_capture.?;
+    capture.configured_model_len = @min(
+        configured_model.len,
+        capture.configured_model.len,
+    );
+    @memcpy(
+        capture.configured_model[0..capture.configured_model_len],
+        configured_model[0..capture.configured_model_len],
+    );
+    capture.configured_model_source = model_source;
+    capture.runtime_model_len = @min(
+        selected_model.len,
+        capture.runtime_model.len,
+    );
+    @memcpy(
+        capture.runtime_model[0..capture.runtime_model_len],
+        selected_model[0..capture.runtime_model_len],
+    );
+    capture.configured_effort = effort;
+    capture.configured_fast_mode = fast_mode;
+    capture.configured_fast_mode_model_bound = fast_mode_model_bound;
+}
+
+fn beginFreshPersistedSessionForTest(app: *TestApp) !void {
+    active_capture.?.begin_calls += 1;
+    active_capture.?.recordEvent("begin_fresh");
+    app.begin_fresh_called = true;
+}
+
+fn enableSessionStoresForTest(_: *TestApp) void {
+    const capture = active_capture.?;
+    capture.enable_calls += 1;
+    capture.recordEvent("enable_stores");
+}
+
 fn setTerminalTitleLabelForTest(_: ?*anyopaque, label: []const u8) void {
     const capture = active_capture.?;
     capture.title_len = @min(label.len, capture.title.len);
@@ -641,4 +859,231 @@ fn clearTerminalTitleForTest(_: ?*anyopaque) void {
     const capture = active_capture.?;
     capture.title_len = 0;
     capture.recordEvent("title_clear");
+}
+
+fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
+    active_capture = capture;
+    active_app_for_pointer_check = app;
+    defer {
+        active_capture = null;
+        active_app_for_pointer_check = null;
+    }
+
+    try Runtime(TestApp).bootstrapWithDeps(
+        app,
+        4,
+        "default-model",
+        24,
+        resizeHandlerForTest,
+        testDeps(),
+    );
+}
+
+fn tracePathForTest(alloc: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+    const io_mod = @import("../shared/io.zig");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    return std.fs.path.join(alloc, &.{ root, name });
+}
+
+fn readTraceForTest(alloc: Allocator, path: []const u8) ![]u8 {
+    const io_mod = @import("../shared/io.zig");
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
+    defer file.close(io_mod.getIo());
+    return io_mod.readFileToEnd(alloc, &file, 8192);
+}
+
+fn resizeHandlerForTest(_: std.posix.SIG) callconv(.c) void {}
+
+test "app_bootstrap_runtime transfers startup state and starts a fresh session" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapForTest(&app, &capture);
+
+    try std.testing.expectEqual(@as(usize, 1), capture.bootstrap_calls);
+    try std.testing.expectEqual(@as(u16, 4), capture.footer_rows);
+    try std.testing.expectEqualStrings("default-model", capture.default_model);
+    try std.testing.expectEqual(@as(usize, 24), capture.default_agent_step_limit);
+    try std.testing.expectEqualStrings(TestApp.app_version, capture.fx_version);
+    try std.testing.expectEqualStrings(
+        "configured-model",
+        capture.configuredModel(),
+    );
+    try std.testing.expectEqual(
+        config_runtime.ModelSource.process_override,
+        capture.configured_model_source,
+    );
+    try std.testing.expectEqualStrings("model-x", capture.runtimeModel());
+    try std.testing.expectEqual(
+        types.ReasoningEffort.literal("high"),
+        capture.configured_effort,
+    );
+    try std.testing.expect(capture.configured_fast_mode);
+    try std.testing.expect(capture.configured_fast_mode_model_bound);
+    try std.testing.expectEqual(
+        update_target.Channel.dev,
+        app.upgrader.channel(),
+    );
+    try std.testing.expect(!capture.initialize_required);
+    try std.testing.expectEqualStrings("/workspace", capture.load_skills_workspace);
+    try std.testing.expectEqual(@as(usize, 1), capture.load_skills_workspace_root_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.load_skills_global_root_count);
+    const events = capture.eventSlice();
+    try std.testing.expectEqual(@as(usize, 6), events.len);
+    try std.testing.expectEqualStrings("load_mcp", events[0]);
+    try std.testing.expectEqualStrings("load_skills", events[1]);
+    try std.testing.expectEqualStrings("welcome", events[2]);
+    try std.testing.expectEqualStrings("begin_fresh", events[3]);
+    try std.testing.expectEqualStrings("enable_stores", events[4]);
+    try std.testing.expectEqualStrings("title", events[5]);
+    try std.testing.expectEqual(@as(usize, 1), capture.begin_calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.enable_calls);
+    try std.testing.expectEqualStrings("workspace · model-x", capture.titleText());
+
+    try std.testing.expectEqualStrings("/workspace", app.workspace_root);
+    try std.testing.expectEqualStrings("api-key", app.auth.apiKey().?);
+    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, app.auth.credentialSource().?);
+    try std.testing.expectEqualStrings("team_123", app.auth.gatewayTeam().?);
+    const auth_view = app.auth.view();
+    try std.testing.expectEqual(credentials.StoredKeyReadStatus.not_found, auth_view.stored_key_status);
+    try std.testing.expect(auth_view.onboarding_skipped);
+    try std.testing.expectEqualStrings("model-x", app.selected_model.items);
+    try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
+    try std.testing.expectEqual(@as(usize, 19), app.agent_step_limit);
+    try std.testing.expectEqual(@as(usize, 131072), app.worker.agent_turn_settings.max_tool_result_bytes);
+    try std.testing.expectEqual(types.ToolChoice.none, app.worker.agent_turn_settings.first_call_tool_choice);
+    try std.testing.expect(app.worker.agent_turn_settings.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.worker.agent_turn_settings.effort);
+    try std.testing.expect(!app.context_enabled);
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expect(!app.auto_upgrade_enabled);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expect(app.workspace_identity.enabled);
+    try std.testing.expectEqualStrings("/skills", app.skills.dir);
+    try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
+    try std.testing.expect(app.transcript_recorded);
+    try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
+    try std.testing.expect(app.begin_fresh_called);
+}
+
+test "app_bootstrap_runtime opens onboarding before first frame without a credential" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    capture.startup_with_credential = false;
+    capture.onboarding_skipped = false;
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapForTest(&app, &capture);
+
+    const picker = app.auth.pickerView();
+    try std.testing.expect(picker.active);
+    try std.testing.expect(picker.include_skip);
+    try std.testing.expectEqual(auth_runtime.PickerStage.root, picker.stage);
+    try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
+}
+
+test "app_bootstrap_runtime stages requested sessions with the first frame pending" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    app.requested_resume = 1;
+    defer app.deinit();
+
+    try runBootstrapForTest(&app, &capture);
+
+    try std.testing.expect(capture.initialize_required);
+    try std.testing.expectEqual(@as(usize, 0), capture.begin_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.enable_calls);
+    try std.testing.expectEqualStrings("", capture.titleText());
+    try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
+    try std.testing.expectEqual(@as(?u8, 1), app.requested_resume);
+    try std.testing.expect(!app.begin_fresh_called);
+    try std.testing.expectEqualStrings("", app.transcript.items);
+    try std.testing.expect(!app.transcript_recorded);
+    const events = capture.eventSlice();
+    try std.testing.expectEqualStrings("resume_view_stage", events[0]);
+    try std.testing.expectEqualStrings("load_mcp", events[1]);
+    try std.testing.expectEqualStrings("load_skills", events[2]);
+    try std.testing.expectEqualStrings("resume_view_publish", events[3]);
+}
+
+test "app_bootstrap_runtime publishes a staged resume view after startup notices" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    capture.emit_skill_diagnostic = true;
+    var app = TestApp.init(alloc);
+    app.requested_resume = 1;
+    defer app.deinit();
+
+    try runBootstrapForTest(&app, &capture);
+
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{
+            "resume_view_stage",
+            "load_mcp",
+            "load_skills",
+            "welcome",
+            "welcome",
+            "resume_view_publish",
+        },
+        capture.eventSlice(),
+    );
+}
+
+test "app_bootstrap_runtime deinitializes app after bootstrap dependency failure" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    capture.bootstrap_error = error.LayoutFailed;
+    capture.bootstrap_init_backing_before_error = true;
+    var app = TestApp.init(alloc);
+
+    try std.testing.expectError(error.LayoutFailed, runBootstrapForTest(&app, &capture));
+    try std.testing.expectEqual(@as(usize, 1), app.deinit_calls);
+}
+
+test "app_bootstrap_runtime propagates skill discovery allocation failure" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    capture.load_skills_error = error.OutOfMemory;
+    var app = TestApp.init(alloc);
+
+    try std.testing.expectError(error.OutOfMemory, runBootstrapForTest(&app, &capture));
+    try std.testing.expectEqual(@as(usize, 1), app.deinit_calls);
+}
+
+test "app_bootstrap_runtime reports a bounded skill discovery warning" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    capture.emit_skill_diagnostic = true;
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapForTest(&app, &capture);
+
+    try std.testing.expectEqual(@as(usize, 1), app.skills.diagnostics.len);
+    try std.testing.expect(capture.early_notice_palette_initialized);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: 1 discovery issue; some skills may be missing (ctrl o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: skill discovery warning:") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "hostile&#x0a;path/body-sentinel") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "metadata is invalid (missing_name)") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, " [full-only]\n") != null);
+}
+
+test "app_bootstrap_runtime collapses config diagnostics into one neutral summary" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    capture.emit_config_diagnostics = true;
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapForTest(&app, &capture);
+
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Config: 2 configuration issues (ctrl o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "user: malformed_settings\nproject: settings_too_large [full-only]\n") != null);
 }

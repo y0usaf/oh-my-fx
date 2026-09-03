@@ -921,6 +921,376 @@ fn freeAnswers(alloc: Allocator, answers: [][]u8) void {
     alloc.free(answers);
 }
 
+test "interaction review shows every validated current value before submission" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{
+            "A1",           "Edit",
+            "Ada",          "0.5",
+            "42",           "True",
+            "[1] Red",      "Include",
+            "Exclude",      "Edit",
+            "Edit value",   "Bea",
+            "Keep current", "Keep current",
+            "Keep current", "Keep current",
+            "Edit value",   "Exclude",
+            "Include",      "Submit",
+        },
+        .expected_review_values = &.{
+            "- name: \"Bea\"",
+            "- ratio: 0.5",
+            "- age: 42",
+            "- active: true",
+            "- color: \"red\"",
+            "- tags: [\"b\"]",
+        },
+    };
+    const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Profile","requestedSchema":{"type":"object","properties":{"name":{"type":"string","minLength":3},"ratio":{"type":"number","minimum":0,"maximum":1},"age":{"type":"integer","minimum":18},"active":{"type":"boolean"},"color":{"type":"string","oneOf":[{"const":"red","title":"Red"},{"const":"blue","title":"Blue"}]},"tags":{"type":"array","items":{"type":"string","anyOf":[{"const":"a","title":"A"},{"const":"b","title":"B"}]},"minItems":1}},"required":["name","ratio","age","active","color","tags"]}}}}
+        ,
+    };
+    const response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true, .url = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"name\":\"Bea\",\"ratio\":0.5,\"age\":42,\"active\":true,\"color\":\"red\",\"tags\":[\"b\"]}}}",
+        response,
+    );
+    try std.testing.expect(fixture.review_contained_values);
+}
+
+test "URL interaction requires consent and does not open on decline" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{"Decline"},
+        .require_terminal_safe = true,
+        .expected_display_fragments = &.{
+            "Target host: xn--pple-43d.test",
+            "Warning: This host uses Punycode and may disguise its destination.",
+        },
+    };
+    const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
+        .input_requests_json =
+        \\{"url":{"method":"elicitation/create","params":{"mode":"url","message":"Authorize","url":"https://xn--pple-43d.test/full?state=opaque"}}}
+        ,
+    };
+    const response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .url = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings("{\"url\":{\"action\":\"decline\"}}", response);
+    try std.testing.expectEqual(@as(usize, 0), fixture.open_calls);
+    try std.testing.expect(fixture.saw_all_expected_display_fragments);
+}
+
+test "form interaction supports primitive defaults decline and cancellation" {
+    const alloc = std.testing.allocator;
+    const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Defaults","requestedSchema":{"type":"object","properties":{"note":{"type":"string","default":"default-note"},"enabled":{"type":"boolean","default":true},"tags":{"type":"array","items":{"type":"string","enum":["a","b"]},"default":["a"]}},"required":["note","enabled","tags"]}}}}
+        ,
+    };
+
+    var defaults = Fixture{
+        .answers = &.{ "Use default", "Use default", "Use default", "Submit" },
+    };
+    const accepted = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = defaults.questioner(),
+        .browser = defaults.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(accepted);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"note\":\"default-note\",\"enabled\":true,\"tags\":[\"a\"]}}}",
+        accepted,
+    );
+
+    var decline = Fixture{
+        .answers = &.{ "Use default", "Use default", "Use default", "Decline" },
+    };
+    const declined = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = decline.questioner(),
+        .browser = decline.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(declined);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"decline\"}}", declined);
+
+    var cancelled = Fixture{ .answers = &.{} };
+    const cancelled_response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = cancelled.questioner(),
+        .browser = cancelled.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(cancelled_response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"cancel\"}}", cancelled_response);
+}
+
+test "form controls are separate from literal Skip and Use default values" {
+    const alloc = std.testing.allocator;
+    const required = tool_mcp_runtime.InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Literal controls","requestedSchema":{"type":"object","properties":{"literalSkip":{"type":"string"},"literalDefault":{"type":"string","default":"fallback"}},"required":["literalDefault"]}}}}
+        ,
+    };
+    var fixture = Fixture{
+        .answers = &.{
+            "Enter value",
+            "Skip",
+            "Enter value",
+            "Use default",
+            "Submit",
+        },
+    };
+    const response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"literalSkip\":\"Skip\",\"literalDefault\":\"Use default\"}}}",
+        response,
+    );
+}
+
+test "single-select local identities preserve every colliding wire value" {
+    const alloc = std.testing.allocator;
+    const raw_titles = [_][]const u8{
+        "Skip",
+        "Use default",
+        "Duplicate",
+        "Duplicate",
+        "Collision\x1b[2J",
+        "Collision\\x1b[2J",
+    };
+    const wire_values = [_][]const u8{
+        "Skip",
+        "Use default",
+        "value-3",
+        "Duplicate",
+        "escape-raw",
+        "escape-literal",
+    };
+    var labels: [raw_titles.len][]u8 = undefined;
+    var label_count: usize = 0;
+    defer for (labels[0..label_count]) |label| alloc.free(label);
+    var choices: [raw_titles.len]PresentedChoice = undefined;
+    for (raw_titles, 0..) |title, index| {
+        labels[index] = try choiceLabelAlloc(alloc, index, title);
+        label_count += 1;
+        choices[index] = .{
+            .local_label = labels[index],
+            .wire_value = wire_values[index],
+        };
+    }
+
+    for (choices, 0..) |choice, index| {
+        try std.testing.expectEqualStrings(
+            wire_values[index],
+            selectedChoiceValue(&choices, choice.local_label).?,
+        );
+        for (choices[index + 1 ..]) |other| {
+            try std.testing.expect(!std.mem.eql(u8, choice.local_label, other.local_label));
+        }
+    }
+    try std.testing.expect(std.mem.endsWith(u8, labels[4], "Collision\\x1b[2J"));
+    try std.testing.expect(std.mem.endsWith(u8, labels[5], "Collision\\x1b[2J"));
+    try std.testing.expect(selectedChoiceValue(&choices, "Skip") == null);
+    try std.testing.expect(selectedChoiceValue(&choices, "Use default") == null);
+    try std.testing.expect(selectedChoiceValue(&choices, "Duplicate") == null);
+    try std.testing.expect(selectedChoiceValue(&choices, "escape-raw") == null);
+}
+
+test "URL browser failure supports manual continuation and bounded retry" {
+    const alloc = std.testing.allocator;
+    const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
+        .input_requests_json =
+        \\{"url":{"method":"elicitation/create","params":{"mode":"url","message":"Authorize","url":"https://example.test/full?state=opaque"}}}
+        ,
+    };
+
+    var manual = Fixture{
+        .answers = &.{ "Open URL", "Continue manually" },
+        .open_results = &.{false},
+    };
+    const manual_response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = manual.questioner(),
+        .browser = manual.browser(),
+        .capabilities = .{ .url = true },
+    });
+    defer alloc.free(manual_response);
+    try std.testing.expectEqualStrings("{\"url\":{\"action\":\"accept\"}}", manual_response);
+    try std.testing.expectEqual(@as(usize, 1), manual.open_calls);
+
+    var retry = Fixture{
+        .answers = &.{ "Open URL", "Retry browser" },
+        .open_results = &.{ false, true },
+    };
+    const retry_response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = retry.questioner(),
+        .browser = retry.browser(),
+        .capabilities = .{ .url = true },
+    });
+    defer alloc.free(retry_response);
+    try std.testing.expectEqualStrings("{\"url\":{\"action\":\"accept\"}}", retry_response);
+    try std.testing.expectEqual(@as(usize, 2), retry.open_calls);
+}
+
+test "legacy URL completion is separate from consent and supports bounded manual retry" {
+    const alloc = std.testing.allocator;
+    const required_json =
+        \\{"first":{"method":"elicitation/create","params":{"mode":"url","message":"One","url":"https://one.test/","elicitationId":"one"}},"second":{"method":"elicitation/create","params":{"mode":"url","message":"Two","url":"https://two.test/","elicitationId":"two"}}}
+    ;
+    var signal = tool_mcp_runtime.LegacyUrlCompletionSignal{};
+    var manual = Fixture{ .answers = &.{"I completed it / Retry"} };
+    const manual_response = try respond(
+        alloc,
+        Fixture.legacyOrigin(),
+        .{
+            .input_requests_json = required_json,
+            .legacy_retry_without_responses = true,
+            .legacy_url_phase = .await_completion,
+            .legacy_url_completion_signal = &signal,
+        },
+        .{
+            .questioner = manual.questioner(),
+            .browser = manual.browser(),
+            .capabilities = .{ .url = true },
+        },
+    );
+    defer alloc.free(manual_response);
+    try std.testing.expectEqualStrings(
+        "{\"first\":{\"action\":\"accept\"},\"second\":{\"action\":\"accept\"}}",
+        manual_response,
+    );
+    try std.testing.expectEqual(@as(usize, 0), manual.open_calls);
+
+    signal.status.store(.completed, .release);
+    signal.wake.store(true, .release);
+    var automatic = Fixture{ .answers = &.{} };
+    const automatic_response = try respond(
+        alloc,
+        Fixture.legacyOrigin(),
+        .{
+            .input_requests_json = required_json,
+            .legacy_retry_without_responses = true,
+            .legacy_url_phase = .await_completion,
+            .legacy_url_completion_signal = &signal,
+        },
+        .{
+            .questioner = automatic.questioner(),
+            .browser = automatic.browser(),
+            .capabilities = .{ .url = true },
+        },
+    );
+    defer alloc.free(automatic_response);
+    try std.testing.expectEqualStrings(manual_response, automatic_response);
+    try std.testing.expectEqual(@as(usize, 0), automatic.answer_index);
+}
+
+test "elicitation presentation terminal-safes every untrusted display value" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{
+            "value\x1b]52;c;answer\x07\nnext",
+            "[1] Choice\\x1b]52;c;option\\x07",
+            "Submit",
+        },
+        .require_terminal_safe = true,
+        .expected_display_fragments = &.{
+            "server\\x1b]52;c;name\\x07\\xff",
+            "Line\\x0aInjected",
+            "Field\\x1b]52;c;title\\x07",
+            "Choice\\x1b]52;c;option\\x07",
+            "\\u{0085}",
+        },
+    };
+    const required = tool_mcp_runtime.InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Line\nInjected\u001b]52;c;message\u0007\u0085","requestedSchema":{"type":"object","properties":{"value":{"type":"string","title":"Field\u001b]52;c;title\u0007","description":"Description\u001b[2J"},"choice":{"type":"string","oneOf":[{"const":"exact","title":"Choice\u001b]52;c;option\u0007"}]}} ,"required":["value","choice"]}}}}
+        ,
+    };
+    const origin = Fixture.originWithServer("server\x1b]52;c;name\x07\xff");
+    const response = try respond(alloc, origin, required, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqual(@as(u64, 0b1_1111), fixture.display_fragment_mask);
+    try std.testing.expect(fixture.saw_all_expected_display_fragments);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"value\":\"value\\u001b]52;c;answer\\u0007\\nnext\",\"choice\":\"exact\"}}}",
+        response,
+    );
+
+    const invalid = try terminalSafeAlloc(alloc, "bad\xff\x1b]52;c;x\x07\xc2\x85\nline");
+    defer alloc.free(invalid);
+    try std.testing.expectEqualStrings(
+        "bad\\xff\\x1b]52;c;x\\x07\\u{0085}\\x0aline",
+        invalid,
+    );
+}
+
+test "interaction maps generic callback failures to its concrete public errors" {
+    const alloc = std.testing.allocator;
+    const required = tool_mcp_runtime.InputRequired{
+        .input_requests_json =
+        \\{"url":{"method":"elicitation/create","params":{"mode":"url","message":"Authorize","url":"https://example.test/"}}}
+        ,
+    };
+    var question_failure = Fixture{ .answers = &.{}, .ask_error = true };
+    try std.testing.expectError(
+        error.QuestionFailed,
+        respond(alloc, Fixture.origin(), required, .{
+            .questioner = question_failure.questioner(),
+            .browser = question_failure.browser(),
+            .capabilities = .{ .url = true },
+        }),
+    );
+
+    var browser_failure = Fixture{
+        .answers = &.{"Open URL"},
+        .open_error = true,
+    };
+    try std.testing.expectError(
+        error.BrowserOpenFailed,
+        respond(alloc, Fixture.origin(), required, .{
+            .questioner = browser_failure.questioner(),
+            .browser = browser_failure.browser(),
+            .capabilities = .{ .url = true },
+        }),
+    );
+}
+
+test "form interaction releases an accepted response when review fails" {
+    const alloc = std.testing.allocator;
+    const required = tool_mcp_runtime.InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Review","requestedSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}}}
+        ,
+    };
+    var fixture = Fixture{
+        .answers = &.{"accepted"},
+        .ask_error_after = 1,
+    };
+    try std.testing.expectError(
+        error.QuestionFailed,
+        respond(alloc, Fixture.origin(), required, .{
+            .questioner = fixture.questioner(),
+            .browser = fixture.browser(),
+            .capabilities = .{ .form = true },
+        }),
+    );
+}
+
 fn checkAcceptedFormAllocationFailures(alloc: Allocator) !void {
     const required = tool_mcp_runtime.InputRequired{
         .input_requests_json =
@@ -939,6 +1309,14 @@ fn checkAcceptedFormAllocationFailures(alloc: Allocator) !void {
         else => return err,
     };
     alloc.free(response);
+}
+
+test "form interaction owns every accepted response allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkAcceptedFormAllocationFailures,
+        .{},
+    );
 }
 
 const Fixture = struct {

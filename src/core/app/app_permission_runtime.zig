@@ -340,3 +340,169 @@ const TestApp = struct {
         return self.yolo_acknowledgment_commit_succeeds;
     }
 };
+
+fn expectPersistentModeSelection(mode: types.PermissionMode) !void {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Runtime(TestApp).selectMode(&app, mode);
+
+    try std.testing.expectEqual(mode, app.permission_engine.mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, mode), app.worker.synced_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
+    try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, mode), app.last_preference_permission_mode);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    const snapshot = app.permission_commit_snapshot.?;
+    try std.testing.expectEqual(mode, snapshot.engine_mode);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.engine_grant_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, mode), snapshot.synced_mode);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.mode_sync_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, null), snapshot.synced_state_mode);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.state_sync_count);
+}
+
+test "app_permission_runtime selectMode persists ask after syncing queued prompts" {
+    try expectPersistentModeSelection(.ask);
+}
+
+test "app_permission_runtime selectMode persists auto after syncing queued prompts" {
+    try expectPersistentModeSelection(.auto);
+}
+
+test "app_permission_runtime selectMode persists yolo after syncing queued prompts" {
+    try expectPersistentModeSelection(.yolo);
+}
+
+test "yolo acknowledgment follows the first committed warning frame" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Runtime(TestApp).selectMode(&app, .yolo);
+    try std.testing.expect(app.permission_state.yolo_warning.active);
+    try std.testing.expect(!app.permission_state.yolo_acknowledged);
+
+    Runtime(TestApp).noteFrameCommitted(&app, 100, false);
+    try std.testing.expectEqual(@as(usize, 0), app.yolo_acknowledgment_commit_count);
+    try std.testing.expect(!app.permission_state.yolo_acknowledgment_attempted);
+
+    Runtime(TestApp).noteFrameCommitted(&app, 200, true);
+    try std.testing.expectEqual(@as(usize, 1), app.yolo_acknowledgment_commit_count);
+    try std.testing.expect(app.permission_state.yolo_acknowledgment_attempted);
+    try std.testing.expect(app.permission_state.yolo_acknowledged);
+    try std.testing.expectEqual(@as(?i64, 200), app.permission_state.yolo_warning.visible_since_ms);
+
+    Runtime(TestApp).noteFrameCommitted(&app, 300, true);
+    try std.testing.expectEqual(@as(usize, 1), app.yolo_acknowledgment_commit_count);
+    Runtime(TestApp).tick(&app, 4199);
+    try std.testing.expect(app.permission_state.yolo_warning.active);
+    Runtime(TestApp).tick(&app, 4200);
+    try std.testing.expect(!app.permission_state.yolo_warning.active);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "yolo warning counts only committed visible intervals" {
+    var warning = YoloWarning{};
+    warning.arm();
+
+    warning.frameCommitted(100, true);
+    warning.frameCommitted(1100, false);
+    try std.testing.expectEqual(@as(i64, 3000), warning.remaining_visible_ms);
+    try std.testing.expect(!warning.tick(10_000));
+
+    warning.frameCommitted(12_000, true);
+    try std.testing.expect(!warning.tick(14_999));
+    try std.testing.expect(warning.tick(15_000));
+}
+
+test "failed yolo acknowledgment is attempted at most once per process" {
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .yolo_acknowledgment_commit_succeeds = false,
+    };
+    defer app.deinit();
+
+    Runtime(TestApp).setMode(&app, .yolo);
+    Runtime(TestApp).noteFrameCommitted(&app, 100, true);
+    Runtime(TestApp).noteFrameCommitted(&app, 200, true);
+
+    try std.testing.expectEqual(@as(usize, 1), app.yolo_acknowledgment_commit_count);
+    try std.testing.expect(!app.permission_state.yolo_acknowledged);
+    try std.testing.expect(app.permission_state.yolo_warning.active);
+}
+
+test "app_permission_runtime toggleMode cycles ask auto yolo and persists" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Runtime(TestApp).toggleMode(&app);
+
+    try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.worker.synced_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
+    try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.last_preference_permission_mode);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 1), app.permission_commit_snapshot.?.mode_sync_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.permission_commit_snapshot.?.synced_mode);
+
+    app.shell.render_requests.clearReason(.footer);
+    try Runtime(TestApp).toggleMode(&app);
+
+    try std.testing.expectEqual(types.PermissionMode.yolo, app.permission_engine.mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .yolo), app.worker.synced_mode);
+    try std.testing.expectEqual(@as(usize, 2), app.permission_mode_preference_commit_count);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 2), app.permission_commit_snapshot.?.mode_sync_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .yolo), app.permission_commit_snapshot.?.synced_mode);
+
+    app.shell.render_requests.clearReason(.footer);
+    try Runtime(TestApp).toggleMode(&app);
+
+    try std.testing.expectEqual(types.PermissionMode.ask, app.permission_engine.mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.worker.synced_mode);
+    try std.testing.expectEqual(@as(usize, 3), app.permission_mode_preference_commit_count);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_permission_runtime setMode syncs queued prompts without persisting" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    Runtime(TestApp).setMode(&app, .auto);
+
+    try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.worker.synced_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
+    try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_permission_runtime reset clears grants before syncing permission state" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.permission_engine.mode = .auto;
+    try app.permission_engine.allow(std.testing.allocator, "run_command", "/tmp/workspace::git status");
+
+    try Runtime(TestApp).reset(&app);
+
+    try std.testing.expectEqual(types.PermissionMode.ask, app.permission_engine.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.permission_engine.grants.items.len);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.worker.synced_state_mode);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.synced_state_grant_count);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.state_sync_count);
+    try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.last_preference_permission_mode);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.mode_sync_count);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    const snapshot = app.permission_commit_snapshot.?;
+    try std.testing.expectEqual(types.PermissionMode.ask, snapshot.engine_mode);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.engine_grant_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, null), snapshot.synced_mode);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.mode_sync_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), snapshot.synced_state_mode);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.synced_state_grant_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.state_sync_count);
+}

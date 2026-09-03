@@ -126,3 +126,82 @@ fn checkpoint_reason(
         .resize_uncheckpointed => .resize_uncheckpointed,
     };
 }
+
+test "recovery never restarts and isolates invalid durable records" {
+    const evidences = [_]RecordEvidence{ .missing, .partial, .corrupt, .unsupported };
+    for (evidences) |record| {
+        const decision = reconcile(.{
+            .record = record,
+            .lifecycle = .running,
+            .termination_present = false,
+            .host = .present_same,
+            .process = .matched,
+            .checkpoint = .valid_contiguous,
+        });
+        try std.testing.expectEqual(Disposition.isolate_corrupt, decision.disposition);
+    }
+}
+
+test "recovery retains only a matching process behind the same host" {
+    const retained = reconcile(.{
+        .record = .valid,
+        .lifecycle = .running,
+        .termination_present = false,
+        .host = .present_same,
+        .process = .matched,
+        .checkpoint = .valid_contiguous,
+    });
+    try std.testing.expectEqual(Disposition.retain_live, retained.disposition);
+
+    const host_absent = reconcile(.{
+        .record = .valid,
+        .lifecycle = .running,
+        .termination_present = false,
+        .host = .absent,
+        .process = .matched,
+        .checkpoint = .missing,
+    });
+    try std.testing.expectEqual(Disposition.mark_lost, host_absent.disposition);
+    try std.testing.expectEqual(contracts.Lifecycle.lost, host_absent.lifecycle);
+
+    const mismatched = reconcile(.{
+        .record = .valid,
+        .lifecycle = .starting,
+        .termination_present = false,
+        .host = .present_same,
+        .process = .mismatched,
+        .checkpoint = .disconnected,
+    });
+    try std.testing.expectEqual(Disposition.mark_lost, mismatched.disposition);
+    try std.testing.expectEqual(
+        contracts.ScreenUnavailableReason.raw_gap,
+        mismatched.screen_unavailable.?,
+    );
+}
+
+test "recovery finalizes durable termination and preserves completed records" {
+    const exited = reconcile(.{
+        .record = .valid,
+        .lifecycle = .running,
+        .termination_present = true,
+        .host = .absent,
+        .process = .missing,
+        .checkpoint = .retention_evicted,
+    });
+    try std.testing.expectEqual(Disposition.finalize_exited, exited.disposition);
+    try std.testing.expectEqual(contracts.Lifecycle.exited, exited.lifecycle);
+    try std.testing.expectEqual(
+        contracts.ScreenUnavailableReason.retention_evicted,
+        exited.screen_unavailable.?,
+    );
+
+    const closed = reconcile(.{
+        .record = .valid,
+        .lifecycle = .closed,
+        .termination_present = false,
+        .host = .absent,
+        .process = .missing,
+        .checkpoint = .corrupt,
+    });
+    try std.testing.expectEqual(Disposition.retain_final, closed.disposition);
+}

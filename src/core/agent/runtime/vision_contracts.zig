@@ -954,3 +954,862 @@ fn unchanged_pending_transition(
         .disposition = disposition,
     };
 }
+
+fn test_ok_result(image_id: usize) VisionImageResult {
+    return .{
+        .image_id = image_id,
+        .outcome = .{ .ok = .{
+            .summary = @constCast("verified image evidence"),
+            .visible_text = &.{},
+            .details = &.{},
+        } },
+    };
+}
+
+const max_fuzz_input_bytes: usize = 20 * 1024;
+
+fn fuzz_vision_json(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_input_bytes + 1]u8 = undefined;
+    const len = smith.slice(&buffer);
+    const bytes = buffer[0..len];
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    if (parse_vision_request(arena, bytes)) |request| {
+        request.deinit(arena);
+    } else |_| {}
+    if (parse_vision_provider_result(arena, bytes, max_fuzz_input_bytes)) |result| {
+        result.deinit(arena);
+    } else |_| {}
+}
+
+test "Vision JSON parsers tolerate arbitrary bounded bytes" {
+    try std.testing.fuzz({}, fuzz_vision_json, .{
+        .corpus = &.{
+            "{\"image_ids\":[1],\"focus\":\"inspect\"}",
+            "{\"images\":[{\"image_id\":1,\"status\":\"failed\",\"error\":\"vision_unavailable\"}]}",
+            "{",
+        },
+    });
+}
+
+test "Vision request parsing preserves ordered ids and bounded focus" {
+    const request = try parse_vision_request(
+        std.testing.allocator,
+        "{\"image_ids\":[9,2,7],\"focus\":\"Read the highlighted error\"}",
+    );
+    defer request.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(usize, &.{ 9, 2, 7 }, request.image_ids().?);
+    try std.testing.expectEqualStrings("Read the highlighted error", request.focus);
+}
+
+test "Vision request parsing preserves ordered image paths" {
+    const request = try parse_vision_request(
+        std.testing.allocator,
+        "{\"paths\":[\"~/Desktop/test.png\",\"screenshots/result.webp\"],\"focus\":\"Read the error\"}",
+    );
+    defer request.deinit(std.testing.allocator);
+
+    const paths = request.paths().?;
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expectEqualStrings("~/Desktop/test.png", paths[0]);
+    try std.testing.expectEqualStrings("screenshots/result.webp", paths[1]);
+    try std.testing.expectEqualStrings("Read the error", request.focus);
+}
+
+test "Vision request parsing rejects duplicate malformed and nonexact arguments" {
+    try std.testing.expectError(
+        error.DuplicateImageId,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[1,1],\"focus\":\"compare\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidImageId,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[0],\"focus\":\"compare\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidVisionRequest,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[1],\"focus\":\"compare\",\"path\":\"/tmp/private.png\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidVisionJson,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[1],"),
+    );
+}
+
+test "Vision request parsing enforces nonempty ids and focus bounds" {
+    try std.testing.expectError(
+        error.EmptyImageIds,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[],\"focus\":\"compare\"}"),
+    );
+    try std.testing.expectError(
+        error.EmptyFocus,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[1],\"focus\":\"  \\n\\t\"}"),
+    );
+    try std.testing.expectError(
+        error.FocusTooLong,
+        parse_vision_request(
+            std.testing.allocator,
+            "{\"image_ids\":[1],\"focus\":\"" ++ ("x" ** (max_focus_bytes + 1)) ++ "\"}",
+        ),
+    );
+}
+
+test "Vision request parsing requires exactly one nonempty source" {
+    try std.testing.expectError(
+        error.EmptyPaths,
+        parse_vision_request(std.testing.allocator, "{\"paths\":[],\"focus\":\"inspect\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidImagePath,
+        parse_vision_request(std.testing.allocator, "{\"paths\":[\"  \"],\"focus\":\"inspect\"}"),
+    );
+    try std.testing.expectError(
+        error.DuplicateImagePath,
+        parse_vision_request(std.testing.allocator, "{\"paths\":[\"a.png\",\"a.png\"],\"focus\":\"inspect\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidVisionRequest,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[1],\"paths\":[\"a.png\"],\"focus\":\"inspect\"}"),
+    );
+}
+
+test "Vision provider parsing is strict and validates every evidence field" {
+    const provider_json =
+        "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"terminal screenshot\",\"visible_text\":[\"error: failed\"],\"details\":[\"red underline\"]},{\"image_id\":4,\"status\":\"failed\",\"error\":\"vision_unavailable\"}]}";
+    const parsed = try parse_vision_provider_result(
+        std.testing.allocator,
+        provider_json,
+        provider_json.len,
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.images.len);
+    try std.testing.expectEqual(@as(usize, 3), parsed.images[0].image_id);
+    try std.testing.expectEqualStrings("terminal screenshot", parsed.images[0].outcome.ok.summary);
+    try std.testing.expectEqual(
+        FailureCode.vision_unavailable,
+        parsed.images[1].outcome.failed.code(),
+    );
+
+    const path_json =
+        "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"ok\",\"visible_text\":[],\"details\":[],\"path\":\"/tmp/private.png\"}]}";
+    try std.testing.expectError(
+        error.InvalidVisionResult,
+        parse_vision_provider_result(
+            std.testing.allocator,
+            path_json,
+            path_json.len,
+        ),
+    );
+}
+
+test "Vision provider parsing accepts forty evidence items within the total byte limit" {
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.writeAll(
+        "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"dense screenshot\",\"visible_text\":[",
+    );
+    for (0..40) |index| {
+        if (index > 0) try json.writer.writeByte(',');
+        try json.writer.print("\"item-{d}\"", .{index});
+    }
+    try json.writer.writeAll("],\"details\":[]}]}");
+
+    const parsed = try parse_vision_provider_result(
+        std.testing.allocator,
+        json.written(),
+        json.written().len,
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 40), parsed.images[0].outcome.ok.visible_text.len);
+    try std.testing.expectEqualStrings("item-39", parsed.images[0].outcome.ok.visible_text[39]);
+}
+
+test "Vision provider parsing accepts one long evidence string within the total byte limit" {
+    const provider_json =
+        "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"long text\",\"visible_text\":[\"" ++
+        ("x" ** 5000) ++
+        "\"],\"details\":[]}]}";
+    const parsed = try parse_vision_provider_result(
+        std.testing.allocator,
+        provider_json,
+        provider_json.len,
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 5000), parsed.images[0].outcome.ok.visible_text[0].len);
+}
+
+test "Vision result serialization emits the five fx-owned diagnostics" {
+    const Case = struct {
+        failure: VisionFailure,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .failure = .image_unavailable,
+            .expected = "{\"images\":[{\"image_id\":7,\"status\":\"failed\",\"error\":{\"code\":\"image_unavailable\",\"message\":\"Vision could not safely load or verify this image.\",\"retryable\":false,\"suggestion\":\"Explain the local image failure; do not retry the same snapshot unchanged.\"}}]}",
+        },
+        .{
+            .failure = .provider_response_invalid,
+            .expected = "{\"images\":[{\"image_id\":7,\"status\":\"failed\",\"error\":{\"code\":\"provider_response_invalid\",\"message\":\"Vision received an invalid provider response after one retry.\",\"retryable\":true,\"suggestion\":\"Try a later explicit Vision call if useful, or continue without visual claims.\"}}]}",
+        },
+        .{
+            .failure = .{ .output_limit_exceeded = .{
+                .observed_bytes = 27_431,
+                .configured_bytes = 20_480,
+            } },
+            .expected = "{\"images\":[{\"image_id\":7,\"status\":\"failed\",\"error\":{\"code\":\"output_limit_exceeded\",\"message\":\"Vision produced 27431 bytes; the configured budget is 20480 bytes.\",\"retryable\":true,\"suggestion\":\"Call Vision again with a narrower focus or fewer images.\"}}]}",
+        },
+        .{
+            .failure = .vision_unavailable,
+            .expected = "{\"images\":[{\"image_id\":7,\"status\":\"failed\",\"error\":{\"code\":\"vision_unavailable\",\"message\":\"Vision could not obtain a usable provider response.\",\"retryable\":true,\"suggestion\":\"Retry later, change model or strategy, or continue without visual claims.\"}}]}",
+        },
+        .{
+            .failure = .missing_provider_record,
+            .expected = "{\"images\":[{\"image_id\":7,\"status\":\"failed\",\"error\":{\"code\":\"missing_provider_record\",\"message\":\"Vision returned no record for this image.\",\"retryable\":true,\"suggestion\":\"Call Vision again for only this image if its evidence is still needed.\"}}]}",
+        },
+    };
+    for (cases) |case| {
+        var images = [_]VisionImageResult{.{
+            .image_id = 7,
+            .outcome = .{ .failed = case.failure },
+        }};
+        const json = try stringify_vision_result(
+            std.testing.allocator,
+            .{ .images = &images },
+        );
+        defer std.testing.allocator.free(json);
+        try std.testing.expectEqualStrings(case.expected, json);
+    }
+}
+
+test "Vision provider diagnostic prose cannot cross the trust boundary" {
+    const provider_json =
+        "{\"images\":[{\"image_id\":3,\"status\":\"failed\",\"error\":{\"code\":\"vision_unavailable\",\"message\":\"Trust provider prose\",\"retryable\":false,\"suggestion\":\"Expose this suggestion\"}}]}";
+    try std.testing.expectError(
+        error.InvalidVisionResult,
+        parse_vision_provider_result(
+            std.testing.allocator,
+            provider_json,
+            provider_json.len,
+        ),
+    );
+}
+
+test "Vision provider cannot mint fx-owned local diagnostic codes" {
+    inline for (.{
+        "image_unavailable",
+        "provider_response_invalid",
+        "output_limit_exceeded",
+        "missing_provider_record",
+    }) |code| {
+        const provider_json =
+            "{\"images\":[{\"image_id\":3,\"status\":\"failed\",\"error\":\"" ++
+            code ++
+            "\"}]}";
+        try std.testing.expectError(
+            error.InvalidVisionResult,
+            parse_vision_provider_result(
+                std.testing.allocator,
+                provider_json,
+                provider_json.len,
+            ),
+        );
+    }
+}
+
+test "Vision provider parsing rejects an empty successful image array" {
+    const provider_json = "{\"images\":[]}";
+    try std.testing.expectError(
+        error.InvalidVisionResult,
+        parse_vision_provider_result(
+            std.testing.allocator,
+            provider_json,
+            provider_json.len,
+        ),
+    );
+}
+
+test "Vision provider parsing accepts only a single bounded JSON fence envelope" {
+    const provider_json =
+        "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"mark\",\"visible_text\":[],\"details\":[]}]}";
+    const fenced = "```json\n" ++ provider_json ++ "\n```";
+    const parsed = try parse_vision_provider_result(
+        std.testing.allocator,
+        fenced,
+        fenced.len,
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), parsed.images.len);
+    try std.testing.expectEqualStrings("mark", parsed.images[0].outcome.ok.summary);
+
+    const with_prose = fenced ++ "\nextra";
+    try std.testing.expectError(
+        error.InvalidVisionJson,
+        parse_vision_provider_result(
+            std.testing.allocator,
+            with_prose,
+            with_prose.len,
+        ),
+    );
+    try std.testing.expectError(
+        error.ProviderResultTooLarge,
+        parse_vision_provider_result(
+            std.testing.allocator,
+            fenced,
+            fenced.len - 1,
+        ),
+    );
+}
+
+test "Vision provider parsing obeys the supplied result byte limit" {
+    const provider_json =
+        "{\"images\":[{\"image_id\":3,\"status\":\"failed\",\"error\":\"vision_unavailable\"}]}";
+    const parsed = try parse_vision_provider_result(
+        std.testing.allocator,
+        provider_json,
+        provider_json.len,
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.ProviderResultTooLarge,
+        parse_vision_provider_result(
+            std.testing.allocator,
+            provider_json,
+            provider_json.len - 1,
+        ),
+    );
+}
+
+test "Vision provider parsing has no hidden twenty kibibyte ceiling" {
+    const evidence_chunk_bytes = 4096;
+    const large_provider_json =
+        "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"ok\",\"visible_text\":[\"" ++
+        ("x" ** evidence_chunk_bytes) ++
+        "\",\"" ++
+        ("x" ** evidence_chunk_bytes) ++
+        "\",\"" ++
+        ("x" ** evidence_chunk_bytes) ++
+        "\",\"" ++
+        ("x" ** evidence_chunk_bytes) ++
+        "\",\"" ++
+        ("x" ** evidence_chunk_bytes) ++
+        "\",\"" ++
+        ("x" ** evidence_chunk_bytes) ++
+        "\"],\"details\":[]}]}";
+    try std.testing.expect(large_provider_json.len > 20 * 1024);
+
+    const parsed = try parse_vision_provider_result(
+        std.testing.allocator,
+        large_provider_json,
+        large_provider_json.len,
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), parsed.images.len);
+}
+
+test "Vision omission preserves sibling evidence and synthesizes an ordered diagnostic" {
+    const provider_records = [_]VisionImageResult{
+        test_ok_result(3),
+        test_ok_result(1),
+    };
+    const merged = try merge_vision_results(
+        std.testing.allocator,
+        &.{ 1, 2, 3 },
+        &provider_records,
+    );
+    defer merged.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), merged.images.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.images[0].image_id);
+    try std.testing.expectEqualStrings(
+        "verified image evidence",
+        merged.images[0].outcome.ok.summary,
+    );
+    try std.testing.expectEqual(@as(usize, 2), merged.images[1].image_id);
+    try std.testing.expectEqual(
+        FailureCode.missing_provider_record,
+        merged.images[1].outcome.failed.code(),
+    );
+    try std.testing.expectEqual(@as(usize, 3), merged.images[2].image_id);
+}
+
+test "Vision merge preserves nineteen successes and one failure" {
+    var requested: [20]usize = undefined;
+    var provider_records: [20]VisionImageResult = undefined;
+    for (&requested, &provider_records, 0..) |*image_id, *record, index| {
+        image_id.* = index + 1;
+        record.* = if (index == 12)
+            .{ .image_id = index + 1, .outcome = .{ .failed = .vision_unavailable } }
+        else
+            test_ok_result(index + 1);
+    }
+
+    const merged = try merge_vision_results(std.testing.allocator, &requested, &provider_records);
+    defer merged.deinit(std.testing.allocator);
+
+    var successes: usize = 0;
+    var failures: usize = 0;
+    for (merged.images) |record| switch (record.outcome) {
+        .ok => successes += 1,
+        .failed => failures += 1,
+    };
+    try std.testing.expectEqual(@as(usize, 19), successes);
+    try std.testing.expectEqual(@as(usize, 1), failures);
+}
+
+test "Vision batching partitions twenty ids deterministically and merge keeps cardinality" {
+    var requested: [20]usize = undefined;
+    var provider_records: [20]VisionImageResult = undefined;
+    for (&requested, &provider_records, 0..) |*image_id, *record, index| {
+        image_id.* = index + 1;
+        record.* = test_ok_result(index + 1);
+    }
+
+    var batches = VisionBatchIterator.init(&requested);
+    try std.testing.expectEqualSlices(usize, requested[0..8], batches.next().?);
+    try std.testing.expectEqualSlices(usize, requested[8..16], batches.next().?);
+    try std.testing.expectEqualSlices(usize, requested[16..20], batches.next().?);
+    try std.testing.expect(batches.next() == null);
+
+    const merged = try merge_vision_results(std.testing.allocator, &requested, &provider_records);
+    defer merged.deinit(std.testing.allocator);
+    try std.testing.expectEqual(requested.len, merged.images.len);
+    for (merged.images, requested) |record, image_id| {
+        try std.testing.expectEqual(image_id, record.image_id);
+    }
+}
+
+test "Vision merge rejects duplicate and unauthorized provider ids" {
+    const duplicate = [_]VisionImageResult{ test_ok_result(1), test_ok_result(1) };
+    try std.testing.expectError(
+        error.DuplicateImageId,
+        merge_vision_results(std.testing.allocator, &.{ 1, 2 }, &duplicate),
+    );
+
+    const unauthorized = [_]VisionImageResult{test_ok_result(99)};
+    try std.testing.expectError(
+        error.UnauthorizedImageId,
+        merge_vision_results(std.testing.allocator, &.{ 1, 2 }, &unauthorized),
+    );
+}
+
+test "Vision references and result JSON expose ids without attachment paths" {
+    const catalog = [_]types.ImageAttachment{
+        .{ .id = 2, .path = @constCast("/tmp/private-two.png"), .media_type = @constCast("image/png") },
+        .{ .id = 7, .path = @constCast("/Users/private/seven.jpg"), .media_type = @constCast("image/jpeg") },
+    };
+    const references = try project_image_references(std.testing.allocator, &catalog);
+    defer std.testing.allocator.free(references);
+
+    try std.testing.expect(std.mem.find(u8, references, "[Image #2]") != null);
+    try std.testing.expect(std.mem.find(u8, references, "[Image #7]") != null);
+    try std.testing.expect(std.mem.find(u8, references, "/tmp/private-two.png") == null);
+    try std.testing.expect(std.mem.find(u8, references, "/Users/private/seven.jpg") == null);
+
+    const result = VisionResult{ .images = @constCast(&[_]VisionImageResult{test_ok_result(2)}) };
+    const json = try stringify_vision_result(std.testing.allocator, result);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"image_id\":2") != null);
+    try std.testing.expect(std.mem.find(u8, json, "path") == null);
+}
+
+test "text-only message projection removes raw images and exposes all authorized ids" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const catalog = [_]types.ImageAttachment{
+        .{ .id = 2, .path = @constCast("/tmp/private-two.png"), .media_type = @constCast("image/png") },
+        .{ .id = 7, .path = @constCast("/Users/private/seven.jpg"), .media_type = @constCast("image/jpeg") },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .system, .content = "system" },
+        .{ .role = .user, .content = "inspect", .images = &catalog },
+    };
+
+    const projected = try project_text_only_messages(arena, &messages, 1, &catalog);
+    try std.testing.expectEqual(messages.len, projected.len);
+    for (projected) |chat_message| try std.testing.expectEqual(@as(usize, 0), chat_message.images.len);
+    const content = projected[1].content.?;
+    try std.testing.expect(std.mem.find(u8, content, "[Image #2]") != null);
+    try std.testing.expect(std.mem.find(u8, content, "[Image #7]") != null);
+    try std.testing.expect(std.mem.find(u8, content, "/tmp/private-two.png") == null);
+    try std.testing.expect(std.mem.find(u8, content, "/Users/private/seven.jpg") == null);
+}
+
+test "text-only projection preserves typed permission feedback byte-exact" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const catalog = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/private.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    const feedback = "Do not modify any more files.";
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Make the requested changes.", .images = &catalog },
+        .{ .role = .assistant, .content = "I need permission." },
+        .{ .role = .tool, .content = "read result", .tool_call_id = "read", .tool_name = "read_file" },
+        .{ .role = .user, .content = feedback, .permission_feedback = true },
+    };
+
+    const projected = try project_text_only_messages(arena, &messages, 0, &catalog);
+
+    try std.testing.expectEqualStrings(feedback, projected[3].content.?);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, projected[0].content.?, "<available_images>"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(
+        u8,
+        projected[3].content.?,
+        "<available_images>",
+    ));
+    try std.testing.expectEqualStrings(feedback, messages[3].content.?);
+    try std.testing.expectEqualStrings("Make the requested changes.", messages[0].content.?);
+}
+
+test "native message projection retains only the current turn structured rejection" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const images = [_]types.ImageAttachment{.{
+        .id = 2,
+        .path = @constCast("/tmp/native.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    const historical_calls = [_]types.ToolCall{
+        .{ .id = "historical-success", .name = "vision", .arguments_json = "{}" },
+        .{ .id = "read-call", .name = "read_file", .arguments_json = "{}" },
+    };
+    const rejected_call = [_]types.ToolCall{
+        .{ .id = "reused-call-id", .name = "vision", .arguments_json = "{}" },
+    };
+    const reused_success_call = [_]types.ToolCall{
+        .{ .id = "reused-call-id", .name = "vision", .arguments_json = "{}" },
+    };
+    const rejection = try tool_result_errors.toolExecutionFailureJson(arena, .{
+        .tool_name = "vision",
+        .message = native_route_unavailable_message,
+        .suggestion = "Continue using the model's native image input without Vision.",
+    });
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "inspect", .images = &images },
+        .{ .role = .assistant, .tool_calls = &historical_calls },
+        .{ .role = .tool, .content = "historical vision evidence", .tool_call_id = "historical-success", .tool_name = "vision" },
+        .{ .role = .tool, .content = "file evidence", .tool_call_id = "read-call", .tool_name = "read_file" },
+        .{ .role = .user, .content = "recover now" },
+        .{ .role = .assistant, .tool_calls = &rejected_call },
+        .{ .role = .tool, .content = rejection, .tool_call_id = "reused-call-id", .tool_name = "vision" },
+        .{ .role = .assistant, .content = "recovered" },
+        .{ .role = .user, .content = "continue later" },
+        .{ .role = .assistant, .tool_calls = &reused_success_call },
+        .{ .role = .tool, .content = "current successful evidence", .tool_call_id = "reused-call-id", .tool_name = "vision" },
+        .{ .role = .assistant, .content = "later answer" },
+    };
+
+    const immediate = try project_native_messages(arena, messages[0..8], 4);
+    try std.testing.expectEqual(@as(usize, 7), immediate.len);
+    try std.testing.expectEqual(@as(usize, 1), immediate[0].images.len);
+    try std.testing.expectEqual(@as(usize, 1), immediate[1].tool_calls.len);
+    try std.testing.expectEqualStrings("read_file", immediate[1].tool_calls[0].name);
+    try std.testing.expectEqualStrings("read_file", immediate[2].tool_name.?);
+    try std.testing.expectEqualStrings("vision", immediate[4].tool_calls[0].name);
+    try std.testing.expectEqualStrings("reused-call-id", immediate[4].tool_calls[0].id);
+    try std.testing.expectEqualStrings("vision", immediate[5].tool_name.?);
+    try std.testing.expectEqualStrings("reused-call-id", immediate[5].tool_call_id.?);
+    try std.testing.expectEqualStrings(rejection, immediate[5].content.?);
+
+    const later = try project_native_messages(arena, &messages, 8);
+    try std.testing.expectEqual(@as(usize, 7), later.len);
+    try std.testing.expectEqual(@as(usize, 1), later[0].images.len);
+    try std.testing.expectEqualStrings("read_file", later[1].tool_calls[0].name);
+    try std.testing.expectEqualStrings("recover now", later[3].content.?);
+    try std.testing.expectEqualStrings("recovered", later[4].content.?);
+    try std.testing.expectEqualStrings("continue later", later[5].content.?);
+    try std.testing.expectEqualStrings("later answer", later[6].content.?);
+    for (later) |chat_message| {
+        try std.testing.expect(!std.mem.eql(u8, chat_message.tool_name orelse "", "vision"));
+        for (chat_message.tool_calls) |call| {
+            try std.testing.expect(!std.mem.eql(u8, call.name, "vision"));
+        }
+    }
+
+    const success_then_rejection_first_calls = [_]types.ToolCall{
+        .{ .id = "success-then-rejection", .name = "vision", .arguments_json = "{}" },
+        .{ .id = "first-read", .name = "read_file", .arguments_json = "{}" },
+    };
+    const success_then_rejection_second_calls = [_]types.ToolCall{
+        .{ .id = "success-then-rejection", .name = "vision", .arguments_json = "{}" },
+        .{ .id = "second-read", .name = "read_file", .arguments_json = "{}" },
+    };
+    const success_then_rejection_messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "inspect two steps" },
+        .{ .role = .assistant, .tool_calls = &success_then_rejection_first_calls },
+        .{ .role = .tool, .content = "successful evidence", .tool_call_id = "success-then-rejection", .tool_name = "vision" },
+        .{ .role = .tool, .content = "first file", .tool_call_id = "first-read", .tool_name = "read_file" },
+        .{ .role = .assistant, .tool_calls = &success_then_rejection_second_calls },
+        .{ .role = .tool, .content = rejection, .tool_call_id = "success-then-rejection", .tool_name = "vision" },
+        .{ .role = .tool, .content = "second file", .tool_call_id = "second-read", .tool_name = "read_file" },
+        .{ .role = .assistant, .content = "recovered after two steps" },
+    };
+    const success_then_rejection = try project_native_messages(
+        arena,
+        &success_then_rejection_messages,
+        0,
+    );
+    try std.testing.expectEqual(@as(usize, 7), success_then_rejection.len);
+    try std.testing.expectEqual(@as(usize, 1), success_then_rejection[1].tool_calls.len);
+    try std.testing.expectEqualStrings("first-read", success_then_rejection[1].tool_calls[0].id);
+    try std.testing.expectEqualStrings("first-read", success_then_rejection[2].tool_call_id.?);
+    try std.testing.expectEqual(@as(usize, 2), success_then_rejection[3].tool_calls.len);
+    try std.testing.expectEqualStrings("success-then-rejection", success_then_rejection[3].tool_calls[0].id);
+    try std.testing.expectEqualStrings("second-read", success_then_rejection[3].tool_calls[1].id);
+    try std.testing.expectEqualStrings("success-then-rejection", success_then_rejection[4].tool_call_id.?);
+    try std.testing.expectEqualStrings(rejection, success_then_rejection[4].content.?);
+    try std.testing.expectEqualStrings("second-read", success_then_rejection[5].tool_call_id.?);
+
+    const rejection_then_success_calls = [_]types.ToolCall{
+        .{ .id = "rejection-then-success", .name = "vision", .arguments_json = "{}" },
+    };
+    const rejection_then_success_messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "inspect both routes" },
+        .{ .role = .assistant, .tool_calls = &rejection_then_success_calls },
+        .{ .role = .tool, .content = rejection, .tool_call_id = "rejection-then-success", .tool_name = "vision" },
+        .{ .role = .assistant, .tool_calls = &rejection_then_success_calls },
+        .{ .role = .tool, .content = "successful evidence", .tool_call_id = "rejection-then-success", .tool_name = "vision" },
+        .{ .role = .assistant, .content = "recovered before success" },
+    };
+    const rejection_then_success = try project_native_messages(
+        arena,
+        &rejection_then_success_messages,
+        0,
+    );
+    try std.testing.expectEqual(@as(usize, 4), rejection_then_success.len);
+    try std.testing.expectEqualStrings("rejection-then-success", rejection_then_success[1].tool_calls[0].id);
+    try std.testing.expectEqualStrings("rejection-then-success", rejection_then_success[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("recovered before success", rejection_then_success[3].content.?);
+}
+
+test "native message projection rejects reversed and unmatched Vision evidence" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rejection = try tool_result_errors.toolExecutionFailureJson(arena, .{
+        .tool_name = "vision",
+        .message = native_route_unavailable_message,
+        .suggestion = "Continue using the model's native image input without Vision.",
+    });
+    const before_call = [_]types.ToolCall{
+        .{ .id = "before-call", .name = "vision", .arguments_json = "{}" },
+    };
+    const no_result = [_]types.ToolCall{
+        .{ .id = "no-result", .name = "vision", .arguments_json = "{}" },
+    };
+    const noncontiguous = [_]types.ToolCall{
+        .{ .id = "noncontiguous", .name = "vision", .arguments_json = "{}" },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "reject malformed evidence" },
+        .{ .role = .tool, .content = rejection, .tool_call_id = "before-call", .tool_name = "vision" },
+        .{ .role = .assistant, .tool_calls = &before_call },
+        .{ .role = .assistant, .content = "before-call separator" },
+        .{ .role = .assistant, .tool_calls = &no_result },
+        .{ .role = .assistant, .content = "no-result separator" },
+        .{ .role = .assistant, .tool_calls = &noncontiguous },
+        .{ .role = .assistant, .content = "noncontiguous separator" },
+        .{ .role = .tool, .content = rejection, .tool_call_id = "noncontiguous", .tool_name = "vision" },
+        .{ .role = .tool, .content = rejection, .tool_call_id = "unmatched", .tool_name = "vision" },
+        .{ .role = .assistant, .content = "finished" },
+    };
+
+    const projected = try project_native_messages(arena, &messages, 0);
+    try std.testing.expectEqual(@as(usize, 5), projected.len);
+    try std.testing.expectEqualStrings("reject malformed evidence", projected[0].content.?);
+    try std.testing.expectEqualStrings("before-call separator", projected[1].content.?);
+    try std.testing.expectEqualStrings("no-result separator", projected[2].content.?);
+    try std.testing.expectEqualStrings("noncontiguous separator", projected[3].content.?);
+    try std.testing.expectEqualStrings("finished", projected[4].content.?);
+    for (projected) |chat_message| {
+        try std.testing.expect(!std.mem.eql(u8, chat_message.tool_name orelse "", "vision"));
+        for (chat_message.tool_calls) |call| {
+            try std.testing.expect(!std.mem.eql(u8, call.name, "vision"));
+        }
+    }
+}
+
+test "Vision pending transition gates text routes and cancellation is neutral" {
+    const initial = try transition_pending_images(
+        std.testing.allocator,
+        .text_only,
+        &.{ 1, 2, 3 },
+        .start,
+    );
+    defer initial.deinit(std.testing.allocator);
+    try std.testing.expectEqual(VisionGate.vision_required, initial.gate);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, initial.pending_ids);
+
+    const partial = try transition_pending_images(
+        std.testing.allocator,
+        .text_only,
+        initial.pending_ids,
+        .{ .valid = &.{ 3, 1 } },
+    );
+    defer partial.deinit(std.testing.allocator);
+    try std.testing.expectEqual(VisionGate.vision_required, partial.gate);
+    try std.testing.expectEqualSlices(usize, &.{2}, partial.pending_ids);
+
+    const cancelled = try transition_pending_images(
+        std.testing.allocator,
+        .text_only,
+        partial.pending_ids,
+        .cancelled,
+    );
+    defer cancelled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(PendingTransitionDisposition.cancelled, cancelled.disposition);
+    try std.testing.expectEqualSlices(usize, partial.pending_ids, cancelled.pending_ids);
+
+    const complete = try transition_pending_images(
+        std.testing.allocator,
+        .text_only,
+        partial.pending_ids,
+        .{ .valid = &.{2} },
+    );
+    defer complete.deinit(std.testing.allocator);
+    try std.testing.expectEqual(VisionGate.unrestricted, complete.gate);
+    try std.testing.expectEqual(@as(usize, 0), complete.pending_ids.len);
+
+    const native = try transition_pending_images(
+        std.testing.allocator,
+        .native_images,
+        &.{ 1, 2, 3 },
+        .start,
+    );
+    defer native.deinit(std.testing.allocator);
+    try std.testing.expectEqual(VisionGate.unrestricted, native.gate);
+    try std.testing.expectEqual(PendingTransitionDisposition.not_applicable, native.disposition);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, native.pending_ids);
+}
+
+test "Vision malformed and unauthorized attempts settle no pending ids" {
+    inline for (.{ VisionAttempt.malformed, VisionAttempt.unauthorized }) |attempt| {
+        const transition = try transition_pending_images(
+            std.testing.allocator,
+            .text_only,
+            &.{ 4, 5 },
+            attempt,
+        );
+        defer transition.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(usize, &.{ 4, 5 }, transition.pending_ids);
+        try std.testing.expectEqual(VisionGate.vision_required, transition.gate);
+    }
+}
+
+test "Vision owned parsing and merge clean up every allocation failure" {
+    for ([_][]const u8{
+        "{\"image_ids\":[1,2],\"focus\":\"compare both images\"}",
+        "{\"paths\":[\"first.png\",\"second.png\"],\"focus\":\"compare both images\"}",
+    }) |request_json| {
+        var request_probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const probed_request = try parse_vision_request(request_probe.allocator(), request_json);
+        probed_request.deinit(request_probe.allocator());
+        for (0..request_probe.alloc_index) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(
+                std.testing.allocator,
+                .{ .fail_index = fail_index },
+            );
+            try std.testing.expectError(
+                error.OutOfMemory,
+                parse_vision_request(failing.allocator(), request_json),
+            );
+        }
+    }
+
+    const provider_json =
+        "{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"summary\",\"visible_text\":[\"visible\"],\"details\":[\"detail\"]}]}";
+    var provider_probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const probed_provider = try parse_vision_provider_result(
+        provider_probe.allocator(),
+        provider_json,
+        provider_json.len,
+    );
+    probed_provider.deinit(provider_probe.allocator());
+    for (0..provider_probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            parse_vision_provider_result(
+                failing.allocator(),
+                provider_json,
+                provider_json.len,
+            ),
+        );
+    }
+
+    const provider_records = [_]VisionImageResult{ test_ok_result(2), test_ok_result(1) };
+    var merge_probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const probed_merge = try merge_vision_results(
+        merge_probe.allocator(),
+        &.{ 1, 2 },
+        &provider_records,
+    );
+    probed_merge.deinit(merge_probe.allocator());
+    for (0..merge_probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            merge_vision_results(failing.allocator(), &.{ 1, 2 }, &provider_records),
+        );
+    }
+}
+
+test "Vision provider response schema matches the strict parser contract" {
+    const schema = try build_provider_response_schema(std.testing.allocator, 2);
+    defer std.testing.allocator.free(schema);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, schema, .{});
+    defer parsed.deinit();
+    const images = parsed.value.object.get("properties").?.object.get("images").?;
+    try std.testing.expectEqual(@as(i64, 2), images.object.get("minItems").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), images.object.get("maxItems").?.integer);
+
+    const alternatives = images.object.get("items").?.object.get("anyOf").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), alternatives.len);
+    const success = alternatives[0].object;
+    const failure = alternatives[1].object;
+    try std.testing.expectEqual(@as(usize, 5), success.get("required").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 3), failure.get("required").?.array.items.len);
+    try std.testing.expect(success.get("additionalProperties").?.bool == false);
+    try std.testing.expect(failure.get("additionalProperties").?.bool == false);
+    const success_image_id = success.get("properties").?.object.get("image_id").?.object;
+    const failure_image_id = failure.get("properties").?.object.get("image_id").?.object;
+    try std.testing.expect(success_image_id.get("enum") == null);
+    try std.testing.expect(failure_image_id.get("enum") == null);
+    const failure_error = failure.get("properties").?.object.get("error").?.object;
+    try std.testing.expectEqualStrings(
+        "vision_unavailable",
+        failure_error.get("enum").?.array.items[0].string,
+    );
+
+    try std.testing.expectError(
+        error.InvalidVisionResponseImageCount,
+        build_provider_response_schema(std.testing.allocator, 0),
+    );
+    try std.testing.expectError(
+        error.InvalidVisionResponseImageCount,
+        build_provider_response_schema(std.testing.allocator, max_provider_images_per_batch + 1),
+    );
+}

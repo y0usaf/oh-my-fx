@@ -300,3 +300,184 @@ fn currentExecutablePathForTest(
     @memcpy(executable_buf[0..executable_path.len], executable_path);
     return executable_buf[0..executable_path.len];
 }
+
+test "app_upgrade_runtime validates then requests normal relaunch handoff" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    var deps_state = TestDepsState{};
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps_state.deps());
+
+    try std.testing.expectEqual(ApplyOutcome.relaunch_requested, outcome);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 1), deps_state.path_count);
+    try std.testing.expectEqualStrings(
+        "/tmp/fx-upgraded",
+        app.relaunch_path[0..app.relaunch_path_len],
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.request_handoff_count);
+    try std.testing.expect(app.should_exit);
+}
+
+test "app_upgrade_runtime keeps running when the executable path is unavailable" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    var deps_state = TestDepsState{ .path_error = error.SelfExeNotFound };
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(
+        &app,
+        deps_state.deps(),
+    );
+
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 1), deps_state.path_count);
+    try std.testing.expectEqual(@as(usize, 0), app.relaunch_path_len);
+    try std.testing.expectEqual(@as(usize, 0), app.request_handoff_count);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.notices.items,
+        "executable path could not be resolved: SelfExeNotFound",
+    ) != null);
+}
+
+test "app_upgrade_runtime keeps running when relaunch preparation fails" {
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .relaunch_error = error.NameTooLong,
+    };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps_state.deps());
+
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expectEqual(@as(usize, 1), deps_state.path_count);
+    try std.testing.expectEqual(@as(usize, 0), app.request_handoff_count);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.notices.items,
+        "relaunch could not be prepared: NameTooLong",
+    ) != null);
+}
+
+test "app_upgrade_runtime keeps the app alive when the resume boundary is invalid" {
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .prepare_error = error.InvalidSessionFormat,
+    };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(
+        &app,
+        deps_state.deps(),
+    );
+
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
+    try std.testing.expectEqual(@as(usize, 0), app.request_handoff_count);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.notices.items,
+        "not safely resumable: InvalidSessionFormat",
+    ) != null);
+}
+
+test "app_upgrade_runtime consumes upgrade render facts" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.upgrader.render_dirty = true;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.shell.render_requests.footer_count);
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.render_requests.footer_count);
+}
+
+test "app_upgrade_runtime skips upgrade render facts when disabled" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.auto_upgrade_enabled = false;
+    app.upgrader.render_dirty = true;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+
+    try std.testing.expectEqual(@as(usize, 0), app.shell.render_requests.footer_count);
+}
+
+test "app_upgrade_runtime rejects ctrl+g while upgrade is not ready" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps_state.deps());
+
+    try std.testing.expectEqual(ApplyOutcome.not_ready, outcome);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "no installed upgrade is ready") != null);
+}
+
+test "app_upgrade_runtime requires an active session before reload" {
+    var app = TestApp{ .alloc = std.testing.allocator, .session_id = null };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps_state.deps());
+
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.notices.items,
+        "SessionPersistenceUnavailable",
+    ) != null);
+}
+
+test "app_upgrade_runtime rejects busy app state before reload" {
+    var stream_app = TestApp{ .alloc = std.testing.allocator };
+    defer stream_app.deinit();
+    stream_app.upgrader.state = .ready;
+    stream_app.stream.active = true;
+    var stream_deps = TestDepsState{};
+
+    const stream_outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&stream_app, stream_deps.deps());
+    try std.testing.expectEqual(ApplyOutcome.unavailable, stream_outcome);
+    try std.testing.expectEqual(@as(usize, 0), stream_deps.path_count);
+    try std.testing.expect(std.mem.find(u8, stream_app.notices.items, "response finishes") != null);
+
+    var composer_app = TestApp{ .alloc = std.testing.allocator };
+    defer composer_app.deinit();
+    composer_app.upgrader.state = .ready;
+    try composer_app.input_runtime.edit_state.input.appendSlice(std.testing.allocator, "draft prompt");
+    var composer_deps = TestDepsState{};
+
+    const composer_outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&composer_app, composer_deps.deps());
+    try std.testing.expectEqual(ApplyOutcome.unavailable, composer_outcome);
+    try std.testing.expectEqual(@as(usize, 0), composer_deps.path_count);
+    try std.testing.expect(std.mem.find(u8, composer_app.notices.items, "current prompt") != null);
+}
+
+test "app_upgrade_runtime rejects mid key sequence before reload" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.terminal_input_runtime.terminal_action_pending = true;
+    var deps = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps.deps());
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expectEqual(@as(usize, 0), deps.path_count);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "finish the key sequence") != null);
+}

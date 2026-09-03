@@ -1,16 +1,14 @@
 const std = @import("std");
-const session_child_store = @import("../session/session_child_store.zig");
-const session_store = @import("../session/session_store.zig");
-const types = @import("../shared/types.zig");
-const communication = @import("communication.zig");
-const communication_store = @import("communication_store.zig");
-const control_store = @import("control_store.zig");
+const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
+const permissions = @import("../permissions/permissions.zig");
+const session_child_store = @import("../session/session_child_store.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const session_store = @import("../session/session_store.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
-const max_ancestry_depth: usize = 1024;
 
 pub const PermissionAdmissionError = error{PermissionEscalation};
 
@@ -22,9 +20,6 @@ fn permissionRank(mode: types.PermissionMode) u2 {
     };
 }
 
-/// Resolves omitted child authority to the caller's current authority and
-/// rejects explicit elevation. This policy applies only to model tool calls;
-/// human manager commands retain their existing behavior.
 pub fn admitChildPermission(
     parent: types.PermissionMode,
     requested: ?types.PermissionMode,
@@ -39,15 +34,11 @@ pub fn admitChildPermission(
 pub const Error = error{
     OutOfMemory,
     ChildNotAttached,
-    RelationshipCycle,
-    GraphTooDeep,
     InvalidControlRecord,
     StoreUnavailable,
     HostAuthorityUnavailable,
 };
 
-/// Owned current authority supplied by the controlling root. It is host state,
-/// not child configuration, and must be freed with `deinit`.
 pub const HostAuthority = struct {
     generation: u64,
     tools: [][]u8,
@@ -130,64 +121,6 @@ pub const HostAuthority = struct {
     }
 };
 
-fn hostGeneration(
-    tools: []const []const u8,
-    integrations: []const []const u8,
-    rules: types.PermissionRuleSet,
-    grants: []const types.PermissionGrant,
-    permission_state: session_permission_state.State,
-    mcp_view: ?*const mcp_access.View,
-) u64 {
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("fx.subagent.host-authority.v2\x00");
-    hashU64(&hash, tools.len);
-    for (tools) |tool| hashString(&hash, tool);
-    hashU64(&hash, integrations.len);
-    for (integrations) |integration| hashString(&hash, integration);
-    hashU64(&hash, rules.rules.len);
-    for (rules.rules) |rule| {
-        hashString(&hash, rule.permission);
-        hashString(&hash, rule.pattern);
-        hashString(&hash, @tagName(rule.action));
-    }
-    hashU64(&hash, grants.len);
-    for (grants) |grant| {
-        hashString(&hash, grant.tool_name);
-        hashString(&hash, grant.target_path);
-    }
-    hashU64(&hash, permission_state.version);
-    hashU64(&hash, permission_state.next_generation);
-    hashU64(&hash, permission_state.rules.items.len);
-    for (permission_state.rules.items) |rule| {
-        hashU64(&hash, rule.id.value);
-        hashString(&hash, @tagName(rule.key.kind));
-        hashString(&hash, rule.key.canonical);
-        hashString(&hash, @tagName(rule.decision));
-        hashU64(&hash, rule.generation);
-    }
-    if (mcp_view) |view| {
-        hashU64(&hash, view.runtime_generation);
-        hashString(&hash, view.owner_id);
-        hashString(&hash, view.parent_id);
-        hashU64(&hash, @intFromBool(view.features_visible));
-        for (view.servers) |server_identity| {
-            hashString(&hash, server_identity.name);
-            hashString(&hash, @tagName(server_identity.source));
-            hashString(&hash, @tagName(server_identity.scope));
-            hashU64(&hash, server_identity.connection_generation);
-            hashU64(&hash, server_identity.catalog_generation);
-            hashU64(&hash, server_identity.auth_generation);
-        }
-        for (view.tools) |tool_identity| {
-            hashString(&hash, tool_identity.name);
-            hashString(&hash, tool_identity.server_name);
-        }
-    }
-    var digest: [32]u8 = undefined;
-    hash.final(&digest);
-    return std.mem.readInt(u64, digest[0..8], .little);
-}
-
 pub const HostResolver = struct {
     context: ?*anyopaque = null,
     resolve_fn: *const fn (
@@ -210,6 +143,16 @@ pub const HostResolveError = error{
     HostAuthorityUnavailable,
 };
 
+pub const LiveAuthority = struct {
+    generation: u64,
+    root_id: []const u8,
+    tools: []const []const u8,
+    integrations: []const []const u8,
+    rules: types.PermissionRuleSet,
+    grants: []const types.PermissionGrant,
+    permission_mode: types.PermissionMode,
+};
+
 pub const Snapshot = struct {
     child_id: []u8,
     root_id: []u8,
@@ -219,7 +162,7 @@ pub const Snapshot = struct {
     rules: types.PermissionRuleSet,
     grants: []types.PermissionGrant,
     permission_state: session_permission_state.State = .{},
-    permission_mode: types.PermissionMode = .yolo,
+    permission_mode: types.PermissionMode,
     mcp_view: ?mcp_access.View = null,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
@@ -234,7 +177,7 @@ pub const Snapshot = struct {
         self.* = undefined;
     }
 
-    pub fn view(self: *const Snapshot) communication.LiveAuthority {
+    pub fn view(self: *const Snapshot) LiveAuthority {
         return .{
             .generation = self.generation,
             .root_id = self.root_id,
@@ -242,7 +185,6 @@ pub const Snapshot = struct {
             .integrations = self.integrations,
             .rules = self.rules,
             .grants = self.grants,
-            .permission_state = &self.permission_state,
             .permission_mode = self.permission_mode,
         };
     }
@@ -250,121 +192,45 @@ pub const Snapshot = struct {
 
 pub const Resolver = struct {
     sessions: *session_store.Store,
+    root_id: []const u8 = "",
     host: HostResolver,
     child_store_options: session_child_store.Options = .{},
 
-    /// Resolves the canonical parent chain and current root authority on every
-    /// call. Callers may cache only together with `generation` and must resolve
-    /// again before the next child tool action.
     pub fn resolve(
         self: *Resolver,
         alloc: Allocator,
         child_id: []const u8,
     ) Error!Snapshot {
-        for (0..3) |_| {
-            return self.resolveOnce(alloc, child_id) catch |err| {
-                if (err == error.AuthorityChanged) continue;
-                return @errorCast(err);
-            };
-        }
-        return error.StoreUnavailable;
-    }
-
-    fn resolveOnce(
-        self: *Resolver,
-        alloc: Allocator,
-        child_id: []const u8,
-    ) (Error || error{AuthorityChanged})!Snapshot {
         domain.validateId(child_id) catch return error.ChildNotAttached;
-        var seen: std.ArrayList([]u8) = .empty;
-        defer freeStringsList(alloc, &seen);
-        var generations: std.ArrayList(u64) = .empty;
-        defer generations.deinit(alloc);
-        var current = try alloc.dupe(u8, child_id);
-        defer alloc.free(current);
-        var found_root = false;
-        var permission_mode: types.PermissionMode = .yolo;
-
-        var depth: usize = 0;
-        while (depth < max_ancestry_depth) : (depth += 1) {
-            for (seen.items) |id| {
-                if (std.mem.eql(u8, id, current)) return error.RelationshipCycle;
-            }
-            try seen.append(alloc, try alloc.dupe(u8, current));
-            var capability = self.sessions.openSubagentControlCapabilityReadOnly(
-                alloc,
-                current,
-                self.child_store_options,
-            ) catch |err| return mapOpen(err);
-            defer capability.deinit();
-            const store = control_store.Store{
-                .capability = &capability,
-                .expected_child_id = current,
-            };
-            const maybe_record = store.loadOptional(alloc) catch |err| return mapControl(err);
-            if (maybe_record) |loaded| {
-                var record = loaded;
-                defer record.deinit(alloc);
-                if (depth == 0) {
-                    permission_mode = record.configuration.permission_mode;
-                }
-                try generations.append(alloc, record.generation);
-                if (record.parent_id) |parent_id| {
-                    const next = try alloc.dupe(u8, parent_id);
-                    alloc.free(current);
-                    current = next;
-                    continue;
-                }
-            } else if (depth == 0) {
-                return error.ChildNotAttached;
-            }
-            found_root = true;
-            break;
-        }
-        if (!found_root) return error.GraphTooDeep;
-        const root: []const u8 = current;
-        var host = try self.host.resolve(alloc, root);
+        domain.validateId(self.root_id) catch return error.ChildNotAttached;
+        var store = child_state.Store{
+            .sessions = self.sessions,
+            .parent_id = self.root_id,
+            .options = self.child_store_options,
+        };
+        var lock = store.acquireLock(alloc) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.StoreUnavailable,
+        };
+        defer lock.release();
+        var registry = store.load(alloc) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.StoreUnavailable,
+        };
+        defer registry.deinit(alloc);
+        const child = registry.findById(child_id) orelse return error.ChildNotAttached;
+        const permission_mode = if (child.active) |active|
+            active.permission_mode
+        else
+            return error.ChildNotAttached;
+        var host = try self.host.resolve(alloc, self.root_id);
         defer host.deinit(alloc);
-        var durable_grants: []types.PermissionGrant = try alloc.alloc(types.PermissionGrant, 0);
-        defer types.freePermissionGrantSlice(alloc, durable_grants);
-        var durable_generation: u64 = 0;
-        var root_capability = self.sessions.openSubagentControlCapabilityReadOnly(
-            alloc,
-            root,
-            self.child_store_options,
-        ) catch |err| return mapOpen(err);
-        defer root_capability.deinit();
-        const durable_store = communication_store.Store{
-            .capability = &root_capability,
-            .expected_session_id = root,
-        };
-        const maybe_ledger = durable_store.loadOptional(alloc) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidCommunicationRecord,
-            error.UnsupportedCommunicationSchema,
-            => return error.InvalidControlRecord,
-            error.CommunicationRecordTooLarge,
-            error.CommunicationPathUnsafe,
-            error.PrivateStatePermissionsUnsupported,
-            error.CommunicationStoreFailed,
-            error.CommunicationNotFound,
-            => return error.StoreUnavailable,
-        };
-        if (maybe_ledger) |loaded| {
-            var ledger = loaded;
-            defer ledger.deinit(alloc);
-            types.freePermissionGrantSlice(alloc, durable_grants);
-            durable_grants = try types.dupePermissionGrantSlice(alloc, ledger.authority_grants);
-            durable_generation = ledger.authority_generation;
-        }
-        try self.validateAncestrySnapshot(alloc, seen.items, generations.items);
-        const grants = try mergeGrants(alloc, host.grants, durable_grants);
-        errdefer types.freePermissionGrantSlice(alloc, grants);
+
         const owned_child_id = try alloc.dupe(u8, child_id);
         errdefer alloc.free(owned_child_id);
-        const owned_root_id = try alloc.dupe(u8, root);
+        const owned_root_id = try alloc.dupe(u8, self.root_id);
         errdefer alloc.free(owned_root_id);
-        const tools = try cloneStrings(alloc, host.tools);
+        const tools = try cloneToolsWithoutSubagent(alloc, host.tools);
         errdefer freeStrings(alloc, tools);
         const integrations = try cloneStrings(alloc, host.integrations);
         errdefer freeStrings(alloc, integrations);
@@ -384,192 +250,171 @@ pub const Resolver = struct {
         var mcp_view = if (host.mcp_view) |view| try view.clone(alloc) else null;
         errdefer if (mcp_view) |*view| view.deinit(alloc);
         if (mcp_view) |*view| {
-            const parent_id = if (seen.items.len > 1) seen.items[1] else root;
-            try rebindMcpViewOwnership(alloc, view, child_id, parent_id);
+            try rebindMcpViewOwnership(alloc, view, child_id, self.root_id);
         }
         return .{
             .child_id = owned_child_id,
             .root_id = owned_root_id,
             .generation = authorityGeneration(
                 child_id,
-                root,
-                generations.items,
+                self.root_id,
+                registry.generation,
                 host.generation,
-                durable_generation,
             ),
             .tools = tools,
             .integrations = integrations,
             .rules = rules,
-            .grants = grants,
+            .grants = try types.dupePermissionGrantSlice(alloc, host.grants),
             .permission_state = permission_state,
             .permission_mode = permission_mode,
             .mcp_view = mcp_view,
         };
     }
-
-    fn validateAncestrySnapshot(
-        self: *Resolver,
-        alloc: Allocator,
-        ids: []const []u8,
-        generations: []const u64,
-    ) (Error || error{AuthorityChanged})!void {
-        if (ids.len == 0 or generations.len > ids.len or
-            ids.len - generations.len > 1)
-        {
-            return error.AuthorityChanged;
-        }
-        for (ids, 0..) |id, index| {
-            var capability = self.sessions.openSubagentControlCapabilityReadOnly(
-                alloc,
-                id,
-                self.child_store_options,
-            ) catch |err| return mapOpen(err);
-            defer capability.deinit();
-            const store = control_store.Store{
-                .capability = &capability,
-                .expected_child_id = id,
-            };
-            const maybe_record = store.loadOptional(alloc) catch |err|
-                return mapControl(err);
-            if (index >= generations.len) {
-                if (maybe_record != null or index + 1 != ids.len) {
-                    if (maybe_record) |loaded| {
-                        var record = loaded;
-                        record.deinit(alloc);
-                    }
-                    return error.AuthorityChanged;
-                }
-                continue;
-            }
-            var record = maybe_record orelse return error.AuthorityChanged;
-            defer record.deinit(alloc);
-            if (record.generation != generations[index]) {
-                return error.AuthorityChanged;
-            }
-            const expected_parent: ?[]const u8 = if (index + 1 < ids.len)
-                ids[index + 1]
-            else
-                null;
-            if (!optionalEqual(record.parent_id, expected_parent)) {
-                return error.AuthorityChanged;
-            }
-        }
-    }
 };
+
+pub const ToolAuthorityDecision = enum { allow, ask, deny, unavailable };
+
+pub fn decideToolAuthority(
+    alloc: Allocator,
+    live: LiveAuthority,
+    workspace_root: []const u8,
+    tool_name: []const u8,
+    target: []const u8,
+    target_kind: permissions.PermissionTargetKind,
+) !ToolAuthorityDecision {
+    if (!contains(live.tools, tool_name) and
+        !contains(live.integrations, tool_name))
+    {
+        return .unavailable;
+    }
+    if (live.permission_mode == .yolo) return .allow;
+    const permission_name = if (target_kind == .command_cwd and
+        std.mem.eql(u8, tool_name, "shell"))
+        "terminal"
+    else
+        tool_name;
+    return switch (try permissions.ruleDecisionFor(
+        alloc,
+        live.rules,
+        workspace_root,
+        permission_name,
+        target,
+        target_kind,
+    )) {
+        .allow => .allow,
+        .deny => .deny,
+        .ask, .none => if (permissions.sessionGrantAllowed(
+            live.grants,
+            permission_name,
+            target,
+        )) .allow else .ask,
+    };
+}
 
 fn rebindMcpViewOwnership(
     alloc: Allocator,
     view: *mcp_access.View,
-    owner_id: []const u8,
+    child_id: []const u8,
     parent_id: []const u8,
 ) !void {
-    const owned_owner = try alloc.dupe(u8, owner_id);
-    errdefer alloc.free(owned_owner);
-    const owned_parent = try alloc.dupe(u8, parent_id);
+    const owner = try alloc.dupe(u8, child_id);
+    errdefer alloc.free(owner);
+    const parent = try alloc.dupe(u8, parent_id);
     alloc.free(view.owner_id);
     alloc.free(view.parent_id);
-    view.owner_id = owned_owner;
-    view.parent_id = owned_parent;
+    view.owner_id = owner;
+    view.parent_id = parent;
+}
+
+fn hostGeneration(
+    tools: []const []const u8,
+    integrations: []const []const u8,
+    rules: types.PermissionRuleSet,
+    grants: []const types.PermissionGrant,
+    permission_state: session_permission_state.State,
+    mcp_view: ?*const mcp_access.View,
+) u64 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("fx.subagent.host-authority.v3\x00");
+    for (tools) |tool| hashString(&hash, tool);
+    for (integrations) |integration| hashString(&hash, integration);
+    for (rules.rules) |rule| {
+        hashString(&hash, rule.permission);
+        hashString(&hash, rule.pattern);
+        hashString(&hash, @tagName(rule.action));
+    }
+    for (grants) |grant| {
+        hashString(&hash, grant.tool_name);
+        hashString(&hash, grant.target_path);
+    }
+    hashU64(&hash, permission_state.version);
+    hashU64(&hash, permission_state.next_generation);
+    if (mcp_view) |view| {
+        hashU64(&hash, view.runtime_generation);
+        hashString(&hash, view.owner_id);
+        hashString(&hash, view.parent_id);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return std.mem.readInt(u64, digest[0..8], .little);
 }
 
 fn authorityGeneration(
     child_id: []const u8,
     root_id: []const u8,
-    relationship_generations: []const u64,
+    child_generation: u64,
     host_generation: u64,
-    durable_generation: u64,
 ) u64 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("fx.subagent.live-authority.v1\x00");
+    hash.update("fx.subagent.live-authority.v2\x00");
     hashString(&hash, child_id);
     hashString(&hash, root_id);
+    hashU64(&hash, child_generation);
     hashU64(&hash, host_generation);
-    hashU64(&hash, durable_generation);
-    for (relationship_generations) |generation| hashU64(&hash, generation);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     const value = std.mem.readInt(u64, digest[0..8], .little);
     return if (value == 0) 1 else value;
 }
 
-fn mergeGrants(
-    alloc: Allocator,
-    host: []const types.PermissionGrant,
-    durable: []const types.PermissionGrant,
-) ![]types.PermissionGrant {
-    var merged: std.ArrayList(types.PermissionGrant) = .empty;
-    errdefer {
-        for (merged.items) |grant| {
-            alloc.free(grant.tool_name);
-            alloc.free(grant.target_path);
-        }
-        merged.deinit(alloc);
+fn contains(values: []const []const u8, value: []const u8) bool {
+    for (values) |candidate| {
+        if (std.mem.eql(u8, candidate, value)) return true;
     }
-    for (host) |grant| try appendGrant(alloc, &merged, grant);
-    for (durable) |grant| {
-        var found = false;
-        for (merged.items) |existing| {
-            if (std.mem.eql(u8, existing.tool_name, grant.tool_name) and
-                std.mem.eql(u8, existing.target_path, grant.target_path))
-            {
-                found = true;
-                break;
-            }
-        }
-        if (!found) try appendGrant(alloc, &merged, grant);
-    }
-    return merged.toOwnedSlice(alloc);
-}
-
-fn appendGrant(
-    alloc: Allocator,
-    list: *std.ArrayList(types.PermissionGrant),
-    grant: types.PermissionGrant,
-) !void {
-    const tool_name = try alloc.dupe(u8, grant.tool_name);
-    errdefer alloc.free(tool_name);
-    const target_path = try alloc.dupe(u8, grant.target_path);
-    errdefer alloc.free(target_path);
-    try list.append(alloc, .{
-        .tool_name = tool_name,
-        .target_path = target_path,
-    });
-}
-
-fn mapOpen(err: session_store.OpenSubagentControlError) Error {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.InvalidSessionId, error.SessionNotFound => error.ChildNotAttached,
-        error.SessionPathUnsafe,
-        error.PrivateStatePermissionsUnsupported,
-        error.SessionChildStoreFailed,
-        error.SessionStoreUnavailable,
-        => error.StoreUnavailable,
-    };
-}
-
-fn mapControl(err: control_store.LoadError) Error {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.ControlNotFound => error.ChildNotAttached,
-        error.InvalidControlRecord,
-        error.UnsupportedControlSchema,
-        => error.InvalidControlRecord,
-        error.ControlRecordTooLarge,
-        error.ControlPathUnsafe,
-        error.PrivateStatePermissionsUnsupported,
-        error.ControlStoreFailed,
-        => error.StoreUnavailable,
-    };
+    return false;
 }
 
 fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     const out = try alloc.alloc([]u8, values.len);
-    errdefer alloc.free(out);
     var copied: usize = 0;
-    errdefer for (out[0..copied]) |value| alloc.free(value);
-    for (values, 0..) |value, index| {
-        out[index] = try alloc.dupe(u8, value);
+    errdefer {
+        for (out[0..copied]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[copied] = try alloc.dupe(u8, value);
+        copied += 1;
+    }
+    return out;
+}
+
+fn cloneToolsWithoutSubagent(
+    alloc: Allocator,
+    values: []const []const u8,
+) ![][]u8 {
+    var count: usize = 0;
+    for (values) |value| {
+        if (!std.mem.eql(u8, value, "subagent")) count += 1;
+    }
+    const out = try alloc.alloc([]u8, count);
+    var copied: usize = 0;
+    errdefer {
+        for (out[0..copied]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (values) |value| {
+        if (std.mem.eql(u8, value, "subagent")) continue;
+        out[copied] = try alloc.dupe(u8, value);
         copied += 1;
     }
     return out;
@@ -580,23 +425,38 @@ fn freeStrings(alloc: Allocator, values: [][]u8) void {
     alloc.free(values);
 }
 
-fn freeStringsList(alloc: Allocator, values: *std.ArrayList([]u8)) void {
-    for (values.items) |value| alloc.free(value);
-    values.deinit(alloc);
-}
-
 fn hashString(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
     hashU64(hash, value.len);
     hash.update(value);
-}
-
-fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn hashU64(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &bytes, value, .little);
     hash.update(&bytes);
+}
+
+test "child permission admission inherits without elevation" {
+    try std.testing.expectEqual(
+        types.PermissionMode.auto,
+        try admitChildPermission(.auto, null),
+    );
+    try std.testing.expectError(
+        error.PermissionEscalation,
+        admitChildPermission(.ask, .auto),
+    );
+}
+
+test "tool authority excludes nested subagents and preserves rules" {
+    const alloc = std.testing.allocator;
+    const decision = try decideToolAuthority(alloc, .{
+        .generation = 1,
+        .root_id = "root",
+        .tools = &.{"read_file"},
+        .integrations = &.{},
+        .rules = .{},
+        .grants = &.{},
+        .permission_mode = .yolo,
+    }, "/tmp", "subagent", "subagent", .none);
+    try std.testing.expectEqual(ToolAuthorityDecision.unavailable, decision);
 }

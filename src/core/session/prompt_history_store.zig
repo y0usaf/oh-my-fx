@@ -870,6 +870,36 @@ fn filterOtherWorkspaceRecords(
     return out.toOwnedSlice(alloc);
 }
 
+fn historyPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return profile_paths.promptHistoryPath(alloc, home);
+}
+
+fn ensureFixtureHome(home: []const u8) !void {
+    const fx_dir = try profile_paths.rootDir(std.testing.allocator, home);
+    defer std.testing.allocator.free(fx_dir);
+    std.Io.Dir.createDirAbsolute(
+        std.testing.io,
+        fx_dir,
+        std.Io.File.Permissions.fromMode(0o700),
+    ) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
+fn writeFixture(home: []const u8, bytes: []const u8) !void {
+    try ensureFixtureHome(home);
+    const path = try historyPath(std.testing.allocator, home);
+    defer std.testing.allocator.free(path);
+    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, bytes);
+    try file.sync(std.testing.io);
+}
+
 fn fixtureLine(
     alloc: Allocator,
     timestamp_ms: i64,
@@ -881,6 +911,289 @@ fn fixtureLine(
         "{{\"schema_version\":1,\"timestamp_ms\":{d},\"workspace_root\":\"{s}\",\"text\":\"{s}\"}}\n",
         .{ timestamp_ms, workspace_root, text },
     );
+}
+
+fn expectTexts(entries: []const LoadedPromptHistoryEntry, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, entries.len);
+    for (entries, expected) |entry, text| {
+        try std.testing.expectEqualStrings(text, entry.text);
+    }
+}
+
+test "reverse load filters workspace bounds results and preserves chronology" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+
+    for (0..105) |index| {
+        const text = try std.fmt.allocPrint(alloc, "a-{d}", .{index});
+        defer alloc.free(text);
+        try std.testing.expectEqual(
+            AppendOutcome.appended,
+            try store.append(alloc, @intCast(index), "/tmp/workspace-a", text),
+        );
+        _ = try store.append(alloc, @intCast(index), "/tmp/workspace-b", "other");
+    }
+
+    const all = try store.loadRecentForWorkspace(alloc, "/tmp/workspace-a", 200);
+    defer freeLoadedEntries(alloc, all);
+    try std.testing.expectEqual(@as(usize, 105), all.len);
+    try std.testing.expectEqualStrings("a-0", all[0].text);
+    try std.testing.expectEqualStrings("a-104", all[104].text);
+
+    const bounded = try store.loadRecentForWorkspace(alloc, "/tmp/workspace-a", 100);
+    defer freeLoadedEntries(alloc, bounded);
+    try std.testing.expectEqual(@as(usize, 100), bounded.len);
+    try std.testing.expectEqualStrings("a-5", bounded[0].text);
+    try std.testing.expectEqualStrings("a-104", bounded[99].text);
+
+    const other = try store.loadRecentForWorkspace(alloc, "/tmp/workspace-b", 100);
+    defer freeLoadedEntries(alloc, other);
+    try std.testing.expectEqual(@as(usize, 1), other.len);
+    try std.testing.expectEqualStrings("other", other[0].text);
+}
+
+test "reverse load scans beyond one mebibyte of newer interleaved workspace records" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+    for (0..100) |index| {
+        const text = try std.fmt.allocPrint(alloc, "kept-{d}", .{index});
+        defer alloc.free(text);
+        const line = try fixtureLine(alloc, @intCast(index), "/tmp/workspace-a", text);
+        defer alloc.free(line);
+        try bytes.appendSlice(alloc, line);
+    }
+    const filler = "x" ** 2048;
+    var index: usize = 0;
+    while (bytes.items.len < 1200 * 1024) : (index += 1) {
+        const line = try fixtureLine(
+            alloc,
+            @intCast(1000 + index),
+            "/tmp/workspace-b",
+            filler,
+        );
+        defer alloc.free(line);
+        try bytes.appendSlice(alloc, line);
+    }
+    try writeFixture(home, bytes.items);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace-a", 100);
+    defer freeLoadedEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 100), entries.len);
+    try std.testing.expectEqualStrings("kept-0", entries[0].text);
+    try std.testing.expectEqualStrings("kept-99", entries[99].text);
+}
+
+test "reverse load reconstructs block-spanning records and ignores malformed or incomplete tail" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    const long_text = "block-spanning-" ++ ("x" ** 160);
+    const first = try fixtureLine(alloc, 1, "/tmp/workspace", long_text);
+    defer alloc.free(first);
+    const second = try fixtureLine(alloc, 2, "/tmp/workspace", "newer");
+    defer alloc.free(second);
+    const bytes = try std.mem.concat(alloc, u8, &.{
+        first,
+        "{malformed}\n",
+        second,
+        "{\"schema_version\":1,\"timestamp_ms\":3",
+    });
+    defer alloc.free(bytes);
+    try writeFixture(home, bytes);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    store.setScanBlockBytesForTest(32);
+
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100);
+    defer freeLoadedEntries(alloc, entries);
+    try expectTexts(entries, &.{ long_text, "newer" });
+}
+
+test "reverse load excludes records appended after captured boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    _ = try store.append(alloc, 1, "/tmp/workspace", "before");
+    const boundary = try store.historyLengthForTest();
+    _ = try store.append(alloc, 2, "/tmp/workspace", "after");
+
+    const entries = try store.loadRecentAtBoundaryForTest(
+        alloc,
+        "/tmp/workspace",
+        100,
+        boundary,
+    );
+    defer freeLoadedEntries(alloc, entries);
+    try expectTexts(entries, &.{"before"});
+}
+
+test "invalid utf8 prompt bytes round trip and suppress exact decoded duplicate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const invalid = [_]u8{ 0xff, 0x00, 0xfe };
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 1, "/tmp/workspace", &invalid),
+    );
+    try std.testing.expectEqual(
+        AppendOutcome.duplicate,
+        try store.append(alloc, 2, "/tmp/workspace", &invalid),
+    );
+
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100);
+    defer freeLoadedEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualSlices(u8, &invalid, entries[0].text);
+}
+
+test "oversized prompt history record is skipped without creating durable state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const oversized = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(
+        AppendOutcome.record_too_large,
+        try store.append(alloc, 1, "/tmp/workspace", oversized),
+    );
+
+    const fx_path = try profile_paths.rootDir(alloc, home);
+    defer alloc.free(fx_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.openDirAbsolute(std.testing.io, fx_path, .{}),
+    );
+}
+
+test "compaction retains newest one thousand valid records within one mebibyte" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var fixture: std.ArrayList(u8) = .empty;
+    defer fixture.deinit(alloc);
+    for (0..1005) |index| {
+        const text = try std.fmt.allocPrint(
+            alloc,
+            "{d:0>4}-{s}",
+            .{ index, "x" ** 1024 },
+        );
+        defer alloc.free(text);
+        const line = try fixtureLine(alloc, @intCast(index), "/tmp/workspace", text);
+        defer alloc.free(line);
+        try fixture.appendSlice(alloc, line);
+    }
+    try writeFixture(home, fixture.items);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 2000, "/tmp/workspace", "newest"),
+    );
+    const retained_count = try store.validRecordCountForTest();
+    try std.testing.expect(retained_count > 0);
+    try std.testing.expect(retained_count <= 1000);
+    try std.testing.expect((try store.historyLengthForTest()) <= 1024 * 1024);
+
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100);
+    defer freeLoadedEntries(alloc, entries);
+    try std.testing.expectEqualStrings("newest", entries[entries.len - 1].text);
+}
+
+test "compaction failure after append reports stale while keeping appended record" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var fixture: std.ArrayList(u8) = .empty;
+    defer fixture.deinit(alloc);
+    for (0..5) |index| {
+        const line = try fixtureLine(
+            alloc,
+            @intCast(index),
+            "/tmp/other",
+            "x" ** (220 * 1024),
+        );
+        defer alloc.free(line);
+        try fixture.appendSlice(alloc, line);
+    }
+    try writeFixture(home, fixture.items);
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    store.failCompactionBeforeRenameForTest();
+
+    try std.testing.expectEqual(
+        AppendOutcome.compaction_stale,
+        try store.append(alloc, 10, "/tmp/workspace", "committed"),
+    );
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100);
+    defer freeLoadedEntries(alloc, entries);
+    try expectTexts(entries, &.{"committed"});
+}
+
+test "workspace clear preserves other workspaces and chronological order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    _ = try store.append(alloc, 1, "/tmp/a", "a-1");
+    _ = try store.append(alloc, 2, "/tmp/b", "b-1");
+    _ = try store.append(alloc, 3, "/tmp/a", "a-2");
+    _ = try store.append(alloc, 4, "/tmp/b", "b-2");
+
+    try store.clearWorkspace(alloc, "/tmp/a");
+
+    const cleared = try store.loadRecentForWorkspace(alloc, "/tmp/a", 100);
+    defer freeLoadedEntries(alloc, cleared);
+    try std.testing.expectEqual(@as(usize, 0), cleared.len);
+
+    const retained = try store.loadRecentForWorkspace(alloc, "/tmp/b", 100);
+    defer freeLoadedEntries(alloc, retained);
+    try expectTexts(retained, &.{ "b-1", "b-2" });
 }
 
 const LockFailureState = struct {
@@ -903,4 +1216,215 @@ fn lockNow(ctx: ?*anyopaque) i64 {
 fn lockSleep(ctx: ?*anyopaque, millis: u64) void {
     const state: *LockFailureState = @ptrCast(@alignCast(ctx.?));
     state.now_ms += @intCast(millis);
+}
+
+test "history writes fail closed when lock is busy or unsupported" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    var state = LockFailureState{};
+    store.setLockOpsForTest(.{
+        .ctx = &state,
+        .try_lock = alwaysBusy,
+        .now_ms = lockNow,
+        .sleep_ms = lockSleep,
+    });
+    try std.testing.expectError(
+        error.PromptHistoryLockBusy,
+        store.append(alloc, 1, "/tmp/workspace", "busy"),
+    );
+
+    store.setLockOpsForTest(.{ .try_lock = unsupported });
+    try std.testing.expectError(
+        error.PromptHistoryLockUnsupported,
+        store.append(alloc, 2, "/tmp/workspace", "unsupported"),
+    );
+}
+
+test "indeterminate clear preserves complete primary and next operation reopens it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    _ = try store.append(alloc, 1, "/tmp/a", "a");
+    _ = try store.append(alloc, 2, "/tmp/b", "b");
+    store.failClearAfterRenameForTest();
+
+    try std.testing.expectError(
+        error.PromptHistoryCommitIndeterminate,
+        store.clearWorkspace(alloc, "/tmp/a"),
+    );
+    store.clearFailureControlsForTest();
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 3, "/tmp/b", "after"),
+    );
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/b", 100);
+    defer freeLoadedEntries(alloc, entries);
+    try expectTexts(entries, &.{ "b", "after" });
+}
+
+test "indeterminate reopen rejects an incomplete current primary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    _ = try store.append(alloc, 1, "/tmp/workspace", "before");
+    store.failClearAfterRenameForTest();
+    try std.testing.expectError(
+        error.PromptHistoryCommitIndeterminate,
+        store.clearWorkspace(alloc, "/tmp/workspace"),
+    );
+    try writeFixture(home, "{\"schema_version\":1");
+    store.clearFailureControlsForTest();
+
+    try std.testing.expectError(
+        error.PromptHistoryWriteFailed,
+        store.append(alloc, 2, "/tmp/workspace", "after"),
+    );
+}
+
+test "indeterminate read rejects an incomplete current primary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    _ = try store.append(alloc, 1, "/tmp/workspace", "before");
+    store.failClearAfterRenameForTest();
+    try std.testing.expectError(
+        error.PromptHistoryCommitIndeterminate,
+        store.clearWorkspace(alloc, "/tmp/workspace"),
+    );
+    try writeFixture(home, "{\"schema_version\":1");
+    store.clearFailureControlsForTest();
+
+    try std.testing.expectError(
+        error.PromptHistoryWriteFailed,
+        store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100),
+    );
+}
+
+test "read-only empty home load creates no prompt history state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100);
+    defer freeLoadedEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+
+    const fx_path = try profile_paths.rootDir(alloc, home);
+    defer alloc.free(fx_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.openDirAbsolute(std.testing.io, fx_path, .{}),
+    );
+}
+
+test "first append creates only private prompt history layout and reports layout failures" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    _ = try store.append(alloc, 1, "/tmp/workspace", "first");
+
+    const fx_path = try profile_paths.rootDir(alloc, home);
+    defer alloc.free(fx_path);
+    var fx_dir = try std.Io.Dir.openDirAbsolute(
+        std.testing.io,
+        fx_path,
+        .{ .iterate = true },
+    );
+    defer fx_dir.close(std.testing.io);
+    const fx_stat = try fx_dir.stat(std.testing.io);
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o700),
+        fx_stat.permissions.toMode() & 0o777,
+    );
+    const history_stat = try fx_dir.statFile(std.testing.io, "history.jsonl", .{});
+    const lock_stat = try fx_dir.statFile(std.testing.io, "history.lock", .{});
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o600),
+        history_stat.permissions.toMode() & 0o777,
+    );
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o600),
+        lock_stat.permissions.toMode() & 0o777,
+    );
+
+    var failed_tmp = std.testing.tmpDir(.{});
+    defer failed_tmp.cleanup();
+    const failed_home = try io_mod.dirRealpathAlloc(alloc, failed_tmp.dir, ".");
+    defer alloc.free(failed_home);
+    var failed = try Store.initFromHome(alloc, failed_home);
+    defer failed.deinit(alloc);
+    failed.failLayoutCreationForTest();
+    try std.testing.expectError(
+        error.DurableLayoutFailed,
+        failed.append(alloc, 1, "/tmp/workspace", "nope"),
+    );
+    failed.failPrivateModeForTest();
+    try std.testing.expectError(
+        error.PrivateStatePermissionsUnsupported,
+        failed.append(alloc, 1, "/tmp/workspace", "nope"),
+    );
+
+    var sync_tmp = std.testing.tmpDir(.{});
+    defer sync_tmp.cleanup();
+    const sync_home = try io_mod.dirRealpathAlloc(alloc, sync_tmp.dir, ".");
+    defer alloc.free(sync_home);
+    var sync_failed = try Store.initFromHome(alloc, sync_home);
+    defer sync_failed.deinit(alloc);
+    sync_failed.failHistoryParentSyncForTest();
+    try std.testing.expectError(
+        error.DurableLayoutFailed,
+        sync_failed.append(alloc, 1, "/tmp/workspace", "nope"),
+    );
+}
+
+test "symlinked durable home is rejected before prompt history reads or writes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "outside");
+    tmp.dir.symLink(
+        io_mod.getIo(),
+        "../outside",
+        "home/.fx",
+        .{ .is_directory = true },
+    ) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    try std.testing.expectError(error.DurablePathUnsafe, Store.initFromHome(alloc, home));
 }

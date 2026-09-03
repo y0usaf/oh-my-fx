@@ -88,6 +88,25 @@ pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) to
     return null;
 }
 
+pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
+    const resource = if (args.get("resource")) |value| resource: {
+        if (value != .string or value.string.len == 0) return null;
+        break :resource value.string;
+    } else "SKILL.md";
+    const offset = if (args.get("offset")) |value| offset: {
+        if (value != .integer or value.integer < 0) return null;
+        break :offset std.math.cast(usize, value.integer) orelse return null;
+    } else 0;
+    if (offset == 0 and std.mem.eql(u8, resource, "SKILL.md")) return null;
+    return .{
+        .activity_kind = .read,
+        .action_label = "Reading skill resource",
+        .completed_action_label = "Read skill resource",
+        .label_arg_kind = .resource,
+        .label_arg_default = "SKILL.md",
+    };
+}
+
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
     const result = loadByIdentity(
@@ -200,6 +219,29 @@ fn expectDecodeFailure(args_json: []const u8, expected: []const u8) !void {
     }
 }
 
+test "skill tool decodes only valid argument shapes" {
+    try expectDecodeFailure("{", "skill arguments must be valid JSON");
+    try expectDecodeFailure("[]", "skill arguments must be an object");
+    try expectDecodeFailure("{}", "skill field \"name\" is required");
+    try expectDecodeFailure("{\"name\":1}", "skill field \"name\" must be a string");
+    try expectDecodeFailure("{\"name\":\"workflow\",\"location\":1}", "skill field \"location\" must be a string");
+
+    const alloc = std.testing.allocator;
+    const exact = try decode(.{ .allocator = alloc }, "{\"name\":\"workflow\",\"location\":\"/tmp/skills/workflow\"}");
+    switch (exact) {
+        .input => |input| {
+            defer input.deinit(alloc);
+            const typed = input.as(Input);
+            try std.testing.expectEqualStrings("workflow", typed.name);
+            try std.testing.expectEqualStrings("/tmp/skills/workflow", typed.location.?);
+        },
+        .failure => |body| {
+            defer alloc.free(body);
+            return error.TestExpectedEqual;
+        },
+    }
+}
+
 fn checkDecodeAllocationFailures(alloc: Allocator) !void {
     const decoded = try decode(
         .{ .allocator = alloc },
@@ -211,5 +253,56 @@ fn checkDecodeAllocationFailures(alloc: Allocator) !void {
             alloc.free(body);
             return error.TestExpectedDecodedInput;
         },
+    }
+}
+
+test "skill tool decode cleans allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkDecodeAllocationFailures,
+        .{},
+    );
+}
+
+test "skill presentation distinguishes the initial document from resource reads" {
+    const Case = struct {
+        args: []const u8,
+        expected: ?struct {
+            active: []const u8,
+            completed: []const u8,
+            value: []const u8,
+        },
+    };
+    const cases = [_]Case{
+        .{ .args = "{\"name\":\"workflow\"}", .expected = null },
+        .{ .args = "{\"name\":\"workflow\",\"resource\":\"SKILL.md\",\"offset\":0}", .expected = null },
+        .{ .args = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}", .expected = .{
+            .active = "Reading skill resource",
+            .completed = "Read skill resource",
+            .value = "references/contract-design.md",
+        } },
+        .{ .args = "{\"name\":\"workflow\",\"offset\":128}", .expected = .{
+            .active = "Reading skill resource",
+            .completed = "Read skill resource",
+            .value = "SKILL.md",
+        } },
+    };
+
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.args, .{});
+        defer parsed.deinit();
+        const resolved = presentation(parsed.value.object);
+        if (case.expected) |expected| {
+            const value = resolved orelse return error.TestExpectedEqual;
+            try std.testing.expectEqualStrings(expected.active, value.action_label);
+            try std.testing.expectEqualStrings(expected.completed, value.completed_action_label);
+            try std.testing.expectEqual(tool_dispatch.LabelArgKind.resource, value.label_arg_kind);
+            try std.testing.expectEqualStrings(
+                expected.value,
+                tool_dispatch.presentationLabelValue(value, parsed.value.object) orelse value.label_arg_default,
+            );
+        } else {
+            try std.testing.expect(resolved == null);
+        }
     }
 }

@@ -325,3 +325,170 @@ fn createFileAbsolute(path: []const u8, bytes: []const u8) !void {
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), bytes);
 }
+
+test "web_fetch binary artifact write is byte exact" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(session_dir);
+
+    var store = try Store.init(alloc, session_dir);
+    defer store.deinit();
+
+    const bytes = "\x00pdf bytes\xff";
+    var artifact = try store.write(alloc, "application/pdf", bytes);
+    defer artifact.deinit(alloc);
+
+    const read_back = try store.read(alloc, artifact.handle, 1024);
+    defer alloc.free(read_back);
+    try std.testing.expectEqualSlices(u8, bytes, read_back);
+}
+
+test "web_fetch artifact quota reconciles existing files on resume" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(session_dir);
+    const artifact_dir = try std.fs.path.join(alloc, &.{ session_dir, relative_dir });
+    defer alloc.free(artifact_dir);
+    try config_runtime.makeAbsolutePath(artifact_dir);
+    const existing_path = try std.fs.path.join(alloc, &.{ artifact_dir, "artifact-existing.bin" });
+    defer alloc.free(existing_path);
+    try createFileAbsolute(existing_path, "abc");
+
+    var store = try Store.initWithLimits(alloc, session_dir, .{ .max_bytes = 4, .max_files = 2 });
+    defer store.deinit();
+    try std.testing.expectEqual(@as(usize, 3), store.usedBytesForTest());
+    try std.testing.expectEqual(@as(usize, 1), store.fileCountForTest());
+    try std.testing.expectError(error.ArtifactQuotaExceeded, store.writeWithHandleForTest(alloc, "artifact-new.bin", "application/octet-stream", "xy"));
+}
+
+test "web_fetch concurrent artifact reservations cannot exceed byte or file caps" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(session_dir);
+    var store = try Store.initWithLimits(alloc, session_dir, .{ .max_bytes = 3, .max_files = 1 });
+    defer store.deinit();
+
+    try store.reserveForTest(2);
+    defer store.rollbackForTest(2);
+
+    try std.testing.expectError(error.ArtifactQuotaExceeded, store.reserveForTest(2));
+    try std.testing.expectEqual(@as(usize, 2), store.usedBytesForTest());
+    try std.testing.expectEqual(@as(usize, 1), store.fileCountForTest());
+}
+
+test "web_fetch failed artifact write rolls back quota reservation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(session_dir);
+    var store = try Store.initWithLimits(alloc, session_dir, .{ .max_bytes = 3, .max_files = 1 });
+    defer store.deinit();
+
+    const final_dir = try std.fs.path.join(alloc, &.{ store.dir, "artifact-conflict.bin" });
+    defer alloc.free(final_dir);
+    try config_runtime.makeAbsolutePath(final_dir);
+
+    try std.testing.expectError(error.IsDir, store.writeWithHandleForTest(alloc, "artifact-conflict.bin", "application/octet-stream", "ab"));
+    try std.testing.expectEqual(@as(usize, 0), store.usedBytesForTest());
+    try std.testing.expectEqual(@as(usize, 0), store.fileCountForTest());
+
+    var artifact = try store.writeWithHandleForTest(alloc, "artifact-ok.bin", "application/octet-stream", "ab");
+    defer artifact.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), store.usedBytesForTest());
+    try std.testing.expectEqual(@as(usize, 1), store.fileCountForTest());
+}
+
+test "web_fetch artifact store refuses symlinks and partial temp files deterministically" {
+    const alloc = std.testing.allocator;
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(session_dir);
+        const artifact_dir = try std.fs.path.join(alloc, &.{ session_dir, relative_dir });
+        defer alloc.free(artifact_dir);
+        try config_runtime.makeAbsolutePath(artifact_dir);
+        const temp_path = try std.fs.path.join(alloc, &.{ artifact_dir, ".artifact-leftover.tmp" });
+        defer alloc.free(temp_path);
+        try createFileAbsolute(temp_path, "partial");
+
+        var store = try Store.init(alloc, session_dir);
+        defer store.deinit();
+        try std.testing.expect(!try store.contains("artifact-leftover.bin"));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), temp_path));
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "artifacts/web-fetch");
+        tmp.dir.symLink(io_mod.getIo(), "target", "artifacts/web-fetch/artifact-link.bin", .{ .is_directory = false }) catch |err| switch (err) {
+            error.AccessDenied => return error.SkipZigTest,
+            else => return err,
+        };
+        const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(session_dir);
+        try std.testing.expectError(error.CorruptArtifactStore, Store.init(alloc, session_dir));
+    }
+}
+
+test "web_fetch artifact store rejects a symlinked store directory" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "artifacts");
+    try tmp.dir.createDirPath(io_mod.getIo(), "outside");
+    tmp.dir.symLink(io_mod.getIo(), "../outside", "artifacts/web-fetch", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(session_dir);
+
+    try std.testing.expectError(error.CorruptArtifactStore, Store.init(alloc, session_dir));
+}
+
+test "web_fetch artifact store creates private managed directories" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(session_dir);
+
+    var store = try Store.init(alloc, session_dir);
+    defer store.deinit();
+
+    const artifacts_stat = try tmp.dir.statFile(io_mod.getIo(), "artifacts", .{ .follow_symlinks = false });
+    const web_fetch_stat = try tmp.dir.statFile(io_mod.getIo(), "artifacts/web-fetch", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), artifacts_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), web_fetch_stat.permissions.toMode() & 0o777);
+}
+
+test "web_fetch corrupt durable artifact store fails instead of degrading to storeless metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(session_dir);
+    const artifact_dir = try std.fs.path.join(alloc, &.{ session_dir, relative_dir });
+    defer alloc.free(artifact_dir);
+    try config_runtime.makeAbsolutePath(artifact_dir);
+    const corrupt_path = try std.fs.path.join(alloc, &.{ artifact_dir, "not-managed.bin" });
+    defer alloc.free(corrupt_path);
+    try createFileAbsolute(corrupt_path, "corrupt");
+
+    try std.testing.expectError(error.InvalidArtifactHandle, Store.init(alloc, session_dir));
+}

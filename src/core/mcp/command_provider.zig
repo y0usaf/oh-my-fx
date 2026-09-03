@@ -214,3 +214,73 @@ pub const Provider = struct {
         return self.handle_fn(alloc, rest, request);
     }
 };
+
+test "MCP command provider delegates requests and returns owned display text" {
+    const Fixture = struct {
+        fn list(_: *anyopaque, alloc: Allocator) ![]u8 {
+            return alloc.dupe(u8, "servers\n");
+        }
+
+        fn handle(alloc: Allocator, rest: []const u8, request: Request) !Result {
+            try std.testing.expectEqualStrings("list", rest);
+            return .{
+                .display = .{
+                    .block = try request.list_servers_and_tools(request.list_ctx, alloc),
+                },
+            };
+        }
+    };
+
+    var list_context: u8 = 0;
+    const provider = Provider{ .handle_fn = Fixture.handle };
+    const result = try provider.handle(std.testing.allocator, "list", .{
+        .home = null,
+        .list_ctx = @ptrCast(&list_context),
+        .list_servers_and_tools = Fixture.list,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    switch (result.display) {
+        .block => |text| try std.testing.expectEqualStrings("servers\n", text),
+        .line => return error.TestExpectedEqual,
+    }
+    try std.testing.expect(!result.reload);
+}
+
+test "MCP add intent parses local and HTTP argv without allocation" {
+    const local = try parseAddIntent(&.{ "fixture", "node", "server.js", "--stdio" });
+    switch (local) {
+        .local => |intent| {
+            try std.testing.expectEqualStrings("fixture", intent.name);
+            try std.testing.expectEqualStrings("node", intent.command);
+            try std.testing.expectEqualSlices([]const u8, &.{ "server.js", "--stdio" }, intent.args);
+        },
+        .http => return error.TestUnexpectedResult,
+    }
+
+    const remote = try parseAddIntent(&.{ "--transport", "http", "docs", "https://example.test/mcp" });
+    switch (remote) {
+        .local => return error.TestUnexpectedResult,
+        .http => |intent| {
+            try std.testing.expectEqualStrings("docs", intent.name);
+            try std.testing.expectEqualStrings("https://example.test/mcp", intent.url);
+        },
+    }
+}
+
+test "MCP add intent rejects invalid syntax names and URLs" {
+    try std.testing.expectError(error.McpAddUsage, parseAddIntent(&.{}));
+    try std.testing.expectError(error.McpAddUsage, parseAddIntent(&.{"only-name"}));
+    try std.testing.expectError(
+        error.McpAddUsage,
+        parseAddIntent(&.{ "--transport", "sse", "docs", "https://example.test/mcp" }),
+    );
+    try std.testing.expectError(
+        error.McpInvalidServerName,
+        parseAddIntent(&.{ "bad/name", "node" }),
+    );
+    try std.testing.expectError(
+        error.McpConfigInvalidUrl,
+        parseAddIntent(&.{ "--transport", "http", "docs", "file:///tmp/socket" }),
+    );
+}

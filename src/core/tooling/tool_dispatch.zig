@@ -1,5 +1,4 @@
 const std = @import("std");
-const background_runtime = @import("../background/background_runtime.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
 const core_types = @import("../shared/types.zig");
@@ -15,6 +14,7 @@ const read_tracker_mod = @import("../workspace/read_tracker.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_runner = @import("../execution/command_runner.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
@@ -30,6 +30,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const tool_args = @import("tool_args.zig");
+const result_commit = @import("result_commit.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -51,11 +52,11 @@ pub const default_max_read_file_line_len: usize = 2000;
 pub const web_search_unavailable_message = "web_search is unavailable: no local runtime with a configured Gateway transport policy is installed";
 pub const web_fetch_unavailable_message = "web_fetch is unavailable: no local WebFetch runtime is installed";
 pub const terminal_unavailable_message =
-    "{\"error\":{\"tool\":\"terminal\",\"code\":\"unsupported_host\",\"retryable\":false}}";
+    "{\"error\":{\"tool\":\"shell\",\"code\":\"unsupported_host\",\"retryable\":false}}";
 const terminal_saved_session_required_message =
-    "Durable terminal actions require a saved fx session.";
+    "TTY shell actions require a saved fx session.";
 const terminal_saved_session_required_suggestion =
-    "Use terminal.exec, or rerun without --no-save.";
+    "Use shell.run with tty=false, or rerun without --no-save.";
 
 pub const ToolCapabilities = struct {
     web_search_runtime_ready: bool = false,
@@ -119,6 +120,10 @@ pub const SelectedDynamicToolSinkFn = *const fn (
 
 pub const ContextNoticeSinkFn = *const fn (?*anyopaque, []const u8) error{OutOfMemory}!void;
 
+pub const TurnControl = enum {
+    return_to_user,
+};
+
 /// Erased, owned typed input decoded by a concrete tool.
 pub const ToolInput = struct {
     ptr: *anyopaque,
@@ -146,6 +151,38 @@ pub const ToolResult = union(enum) {
             .success => |body| alloc.free(body),
             .failure => |body| alloc.free(body),
         }
+    }
+};
+
+pub const HostToolProviderFn = *const fn (
+    *anyopaque,
+    Allocator,
+    []const u8,
+    []const u8,
+    usize,
+    ?*std.atomic.Value(bool),
+) DispatchError!ToolResult;
+
+pub const HostToolProvider = struct {
+    context: *anyopaque,
+    call_fn: HostToolProviderFn,
+
+    pub fn call(
+        self: HostToolProvider,
+        alloc: Allocator,
+        name: []const u8,
+        arguments_json: []const u8,
+        max_result_bytes: usize,
+        cancel_flag: ?*std.atomic.Value(bool),
+    ) DispatchError!ToolResult {
+        return self.call_fn(
+            self.context,
+            alloc,
+            name,
+            arguments_json,
+            max_result_bytes,
+            cancel_flag,
+        );
     }
 };
 
@@ -208,6 +245,7 @@ pub const DispatchContext = struct {
     max_read_file_lines: usize = default_max_read_file_lines,
     max_read_file_line_len: usize = default_max_read_file_line_len,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    max_command_output_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     skills_dir: []const u8 = "",
     context_limits: context_limits.Values = .{},
     permission_ctx: ?*const PermissionContext = null,
@@ -217,23 +255,21 @@ pub const DispatchContext = struct {
     output_chunk_lifecycle_id: ?core_types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
-    background_ctx: ?*background_runtime.BackgroundRuntime = null,
-    background_url_ctx: ?*anyopaque = null,
-    on_background_url_ready: ?*const fn (*anyopaque, []const u8, []const u8) void = null,
-    background_log_dir: ?[]const u8 = null,
     command_artifact_dir: ?[]const u8 = null,
+    managed_executions: ?*managed_execution.Runtime = null,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     terminal_client: ?*terminal_client_runtime.Runtime = null,
     terminal_owner_session_id: ?[]const u8 = null,
     terminal_transport_role: terminal_contracts.TransportRole = .interactive,
-    background_lifecycle_allocator: Allocator = std.heap.c_allocator,
+    lifecycle_allocator: Allocator = std.heap.c_allocator,
     command_timeout_ms: ?usize = null,
     captured_command_host: command_environment.Host = .native,
     run_command_backend: ?RunCommandBackend = null,
     subagent_provider: ?subagent_tool_provider.Provider = null,
     vision_provider: ?VisionProvider = null,
+    host_tool_provider: ?HostToolProvider = null,
     ask_question_ctx: ?*anyopaque = null,
     ask_question_batch: ?AskQuestionBatchFn = null,
     tool_capabilities: ToolCapabilities = .{},
@@ -266,6 +302,9 @@ pub const DispatchContext = struct {
     web_search_completion_sink: ?*?core_types.WebSearchCompletion = null,
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
+    command_result_json_sink: ?*?[]const u8 = null,
+    turn_control_sink: ?*?TurnControl = null,
+    result_commit_sink: ?*?result_commit.Token = null,
 };
 
 /// Function pointer used by ask_user_question to request live user answers.
@@ -309,14 +348,15 @@ pub const AuthorizedCallAdapterFn = *const fn (
     DispatchContext,
     Registry,
     message.ToolCall,
-) DispatchError!DispatchResult;
+) DispatchError!AuthorizedDispatchResult;
 
 /// Optional Core mapper selected by a registered tool descriptor after an
 /// authorized call has produced its structured dispatch result.
 pub const AuthorizedResultMapperFn = *const fn (
     Allocator,
-    DispatchResult,
-) Allocator.Error!DispatchResult;
+    AuthorizedDispatchResult,
+    *?[]u8,
+) Allocator.Error!AuthorizedDispatchResult;
 
 pub const RunCommandCompatibility = struct {
     matches: *const fn ([]const u8) bool,
@@ -358,8 +398,10 @@ pub const LabelArgKind = enum {
     command,
     description,
     source,
+    resource,
     action,
     query,
+    server,
     selector,
     session_id,
 };
@@ -373,8 +415,6 @@ pub const ExecutorKind = enum {
     read_tool_result,
     write_file,
     edit_file,
-    ast_symbols,
-    memory,
     web_fetch,
     web_search,
     run_command,
@@ -382,11 +422,11 @@ pub const ExecutorKind = enum {
     skill,
     install_skill,
     subagent,
-    mcp_search_tools,
     mcp_select_tool,
     mcp_features,
     ask_user_question,
     vision,
+    host,
 };
 
 pub const ApprovalPolicy = enum {
@@ -403,6 +443,7 @@ pub const RuntimeProviderKind = enum {
 };
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
+pub const ProcessLocalFn = *const fn (ToolInput) bool;
 
 pub const CallPresentation = struct {
     activity_kind: core_types.ToolActivityKind,
@@ -444,6 +485,7 @@ pub const Tool = struct {
     captured_command_host: command_environment.Host = .native,
     captured_command_action: ?[]const u8 = null,
     captured_command_fn: ?CapturedCommandFn = null,
+    process_local_fn: ?ProcessLocalFn = null,
     authorized_call_adapter: ?AuthorizedCallAdapterFn = null,
     authorized_result_mapper: ?AuthorizedResultMapperFn = null,
     cancel_if_requested_after_call: bool = false,
@@ -578,8 +620,10 @@ fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
         .command => optionalStringArg(args, "command"),
         .description => optionalStringArg(args, "description"),
         .source => optionalStringArg(args, "source"),
+        .resource => optionalStringArg(args, "resource"),
         .action => optionalStringArg(args, "action"),
         .query => optionalStringArg(args, "query"),
+        .server => optionalStringArg(args, "server"),
         .selector => optionalStringArg(args, "selector"),
         .session_id => optionalStringArg(args, "session_id"),
     };
@@ -756,6 +800,7 @@ pub const DispatchResult = struct {
     web_search_completion: ?core_types.WebSearchCompletion = null,
     web_fetch_completion: ?core_types.WebFetchCompletion = null,
     tool_result_memory: ?core_types.ToolResultMemory = null,
+    command_result_json: ?[]const u8 = null,
 
     /// Tool-result status used only by tests and diagnostics.
     pub const Status = enum {
@@ -767,6 +812,25 @@ pub const DispatchResult = struct {
     pub fn deinit(self: DispatchResult, alloc: Allocator) void {
         alloc.free(self.body);
         if (self.status_detail) |detail| alloc.free(detail);
+        if (self.command_result_json) |json| alloc.free(@constCast(json));
+        if (self.tool_result_memory) |memory| {
+            if (memory.command_output_replay) |replay| switch (replay) {
+                .available => |descriptor| alloc.free(@constCast(descriptor.handle)),
+                .unavailable => {},
+            };
+        }
+    }
+};
+
+/// Owned authorized-dispatch result. Runtime metadata is published through
+/// the caller-provided sinks in `DispatchContext` instead of being copied into
+/// this transport result.
+pub const AuthorizedDispatchResult = struct {
+    status: DispatchResult.Status,
+    body: []u8,
+
+    pub fn deinit(self: AuthorizedDispatchResult, alloc: Allocator) void {
+        alloc.free(self.body);
     }
 };
 
@@ -776,11 +840,13 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
     var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
     var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
     var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
+    var captured_command_result_json: ?[]const u8 = null;
     var call_ctx = ctx;
     if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
     if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
     if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
     if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
+    if (call_ctx.command_result_json_sink == null) call_ctx.command_result_json_sink = &captured_command_result_json;
 
     const admission = try admitToolCall(call_ctx, registry, call);
     switch (admission) {
@@ -794,6 +860,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
             const web_search_completion = if (admitted.context.web_search_completion_sink) |slot| slot.* else captured_web_search_completion;
             const web_fetch_completion = if (admitted.context.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
             const tool_result_memory = if (admitted.context.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
+            const command_result_json = if (admitted.context.command_result_json_sink) |slot| slot.* else captured_command_result_json;
             return switch (result) {
                 .success => |body| .{
                     .status = .success,
@@ -802,6 +869,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
                     .web_search_completion = web_search_completion,
                     .web_fetch_completion = web_fetch_completion,
                     .tool_result_memory = tool_result_memory,
+                    .command_result_json = command_result_json,
                 },
                 .failure => |body| .{
                     .status = .failure,
@@ -810,6 +878,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
                     .web_search_completion = web_search_completion,
                     .web_fetch_completion = web_fetch_completion,
                     .tool_result_memory = tool_result_memory,
+                    .command_result_json = command_result_json,
                 },
             };
         },
@@ -817,16 +886,22 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
 }
 
 /// Runs one already-authorized registered tool call through lookup, validation, and call.
-pub fn dispatchAuthorizedToolCall(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!DispatchResult {
-    const tool = registry.lookup(call.name) orelse return failure(
-        try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}),
-    );
+pub fn dispatchAuthorizedToolCall(
+    ctx: DispatchContext,
+    registry: Registry,
+    call: message.ToolCall,
+    status_detail: *?[]u8,
+) DispatchError!AuthorizedDispatchResult {
+    const tool = registry.lookup(call.name) orelse return .{
+        .status = .failure,
+        .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}),
+    };
     const result = if (tool.authorized_call_adapter) |adapter|
         try adapter(ctx, registry, call)
     else
         try dispatchAuthorizedToolCallDefault(ctx, registry, call);
     if (tool.authorized_result_mapper) |mapper| {
-        return mapper(ctx.allocator, result) catch |err| {
+        return mapper(ctx.allocator, result, status_detail) catch |err| {
             result.deinit(ctx.allocator);
             return err;
         };
@@ -837,52 +912,30 @@ pub fn dispatchAuthorizedToolCall(ctx: DispatchContext, registry: Registry, call
 /// Runs the ordinary authorized decode/validate/call path without consulting a
 /// descriptor's lifecycle adapter. Focused adapters use this to wrap one call
 /// without recursively selecting themselves again.
-pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!DispatchResult {
-    var captured_usage: ?core_types.ToolUsage = null;
-    var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
-    var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
-    var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
-    var call_ctx = ctx;
-    if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
-    if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
-    if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
-    if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
-
-    const validated = try decodeAndValidateRegisteredToolCall(call_ctx, registry, call);
+pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!AuthorizedDispatchResult {
+    const validated = try decodeAndValidateRegisteredToolCall(ctx, registry, call);
     switch (validated) {
-        .not_registered => return failure(try std.fmt.allocPrint(call_ctx.allocator, "unknown tool: {s}", .{call.name})),
-        .failure => |reason| return failure(reason),
+        .not_registered => return .{ .status = .failure, .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}) },
+        .failure => |reason| return .{ .status = .failure, .body = reason },
         .input => |input| {
-            defer input.value.deinit(call_ctx.allocator);
+            defer input.value.deinit(ctx.allocator);
 
-            const result = try input.tool.call(call_ctx, input.value);
+            const result = try input.tool.call(ctx, input.value);
             if (input.tool.cancel_if_requested_after_call and
-                call_ctx.cancel_flag != null and
-                call_ctx.cancel_flag.?.load(.seq_cst))
+                ctx.cancel_flag != null and
+                ctx.cancel_flag.?.load(.seq_cst))
             {
-                result.deinit(call_ctx.allocator);
+                result.deinit(ctx.allocator);
                 return error.Cancelled;
             }
-            const inner_usage = if (call_ctx.inner_usage_sink) |slot| slot.* else captured_usage;
-            const web_search_completion = if (call_ctx.web_search_completion_sink) |slot| slot.* else captured_web_search_completion;
-            const web_fetch_completion = if (call_ctx.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
-            const tool_result_memory = if (call_ctx.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
             return switch (result) {
                 .success => |body| .{
                     .status = .success,
                     .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
                 },
                 .failure => |body| .{
                     .status = .failure,
                     .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
                 },
             };
         },
@@ -907,6 +960,21 @@ pub fn reportWebFetchCompletion(ctx: DispatchContext, completion: core_types.Web
 pub fn reportToolResultMemory(ctx: DispatchContext, memory: core_types.ToolResultMemory) void {
     const sink = ctx.tool_result_memory_sink orelse return;
     sink.* = memory;
+}
+
+pub fn reportCommandResultJson(ctx: DispatchContext, json: []const u8) void {
+    const sink = ctx.command_result_json_sink orelse return;
+    sink.* = json;
+}
+
+pub fn reportTurnControl(ctx: DispatchContext, control: TurnControl) void {
+    const sink = ctx.turn_control_sink orelse return;
+    sink.* = control;
+}
+
+pub fn reportResultCommit(ctx: DispatchContext, token: result_commit.Token) void {
+    const sink = ctx.result_commit_sink orelse return;
+    sink.* = token;
 }
 
 pub fn reportSelectedDynamicTool(
@@ -934,6 +1002,10 @@ pub fn localToolAvailabilityFailure(
         else
             try ctx.allocator.dupe(u8, web_search_unavailable_message),
         .terminal => if (tool.captured_command_fn != null and tool.captured_command_fn.?(input))
+            null
+        else if (tool.process_local_fn != null and
+            tool.process_local_fn.?(input) and
+            ctx.managed_executions != null)
             null
         else if (!ctx.tool_capabilities.terminalAvailable())
             try ctx.allocator.dupe(u8, terminal_unavailable_message)
@@ -1110,6 +1182,208 @@ const second_compatibility_tool = blk: {
     break :blk tool;
 };
 
+test "run command compatibility rejects overlapping matches" {
+    const registry = Registry{ .tools = &.{ first_compatibility_tool, second_compatibility_tool } };
+
+    try std.testing.expectError(
+        error.AmbiguousRunCommandCompatibility,
+        matchRunCommandCompatibility(registry, "matching command"),
+    );
+}
+
+test "Registry.lookup returns hit and miss" {
+    const registry = Registry{ .tools = &.{mock_tool} };
+
+    try std.testing.expect(registry.lookup("mock_tool") != null);
+    try std.testing.expect(registry.lookup("missing") == null);
+}
+
+test "classifyProgressLabel preserves registered order and label boundaries" {
+    const first_tool = blk: {
+        var tool = mock_tool;
+        tool.action_label = "Running mock";
+        tool.completed_action_label = "Shared label";
+        break :blk tool;
+    };
+    const second_tool = blk: {
+        var tool = mock_tool;
+        tool.name = "second_mock_tool";
+        tool.action_label = "Shared label";
+        tool.completed_action_label = "Ran mock";
+        break :blk tool;
+    };
+    const registry = Registry{ .tools = &.{ first_tool, second_tool } };
+
+    try std.testing.expectEqual(ProgressLabelKind.started, classifyProgressLabel(registry, "Running mock"));
+    try std.testing.expectEqual(ProgressLabelKind.started, classifyProgressLabel(registry, "Running mock value"));
+    try std.testing.expectEqual(ProgressLabelKind.completed, classifyProgressLabel(registry, "Shared label value"));
+    try std.testing.expectEqual(ProgressLabelKind.completed, classifyProgressLabel(registry, "Ran mock value"));
+    try std.testing.expectEqual(ProgressLabelKind.none, classifyProgressLabel(registry, "Running mockery"));
+    try std.testing.expectEqual(ProgressLabelKind.none, classifyProgressLabel(registry, "Unknown tool"));
+}
+
+test "toolLabelValue reads the label field named by registered metadata" {
+    const labeled_tool = Tool{
+        .name = "labeled_tool",
+        .description = "Labeled mock tool.",
+        .model_schema = .{
+            .name = "labeled_tool",
+            .description = "Labeled mock tool.",
+        },
+        .label_arg_kind = .command,
+        .decode = decodeMock,
+        .call = callMock,
+        .reads_only_fn = mockReadsOnly,
+        .irreversible_fn = mockIrreversible,
+    };
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"command\":\"zig build\",\"name\":\"ignored\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("zig build", toolLabelValue(labeled_tool, parsed.value.object).?);
+    try std.testing.expect(toolLabelValue(mock_tool, parsed.value.object) == null);
+}
+
+test "validateRegisteredToolCall distinguishes unregistered valid and rejected calls without execution" {
+    const rejecting_tool = Tool{
+        .name = "rejecting_tool",
+        .description = "Rejecting mock tool.",
+        .model_schema = .{
+            .name = "rejecting_tool",
+            .description = "Rejecting mock tool.",
+        },
+        .decode = decodeMock,
+        .validate = rejectMock,
+        .call = callMock,
+        .reads_only_fn = mockReadsOnly,
+        .irreversible_fn = mockIrreversible,
+    };
+    const registry = Registry{ .tools = &.{ mock_tool, rejecting_tool } };
+
+    try std.testing.expectEqual(.not_registered, try validateRegisteredToolCall(.{ .allocator = std.testing.allocator }, registry, .{
+        .id = "c1",
+        .name = "missing",
+        .arguments_json = "{}",
+    }));
+    try std.testing.expectEqual(.valid, try validateRegisteredToolCall(.{ .allocator = std.testing.allocator }, registry, .{
+        .id = "c2",
+        .name = "mock_tool",
+        .arguments_json = "{}",
+    }));
+
+    const rejected = try validateRegisteredToolCall(.{ .allocator = std.testing.allocator }, registry, .{
+        .id = "c3",
+        .name = "rejecting_tool",
+        .arguments_json = "{}",
+    });
+    defer switch (rejected) {
+        .failure => |reason| std.testing.allocator.free(reason),
+        else => {},
+    };
+    try std.testing.expectEqualStrings("validation rejected input", rejected.failure);
+}
+
+test "dispatchToolCall materializes unknown tool failure" {
+    const result = try dispatchToolCall(.{ .allocator = std.testing.allocator }, .{}, .{
+        .id = "c1",
+        .name = "missing",
+        .arguments_json = "{}",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.failure, result.status);
+    try std.testing.expectEqualStrings("unknown tool: missing", result.body);
+}
+
+test "dispatchToolCall materializes decode failure" {
+    const registry = Registry{ .tools = &.{mock_tool} };
+    const result = try dispatchToolCall(.{ .allocator = std.testing.allocator }, registry, .{
+        .id = "c1",
+        .name = "mock_tool",
+        .arguments_json = "decode_error",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.failure, result.status);
+    try std.testing.expectEqualStrings("invalid mock arguments", result.body);
+}
+
+test "dispatchToolCall propagates decode errors" {
+    const registry = Registry{ .tools = &.{mock_tool} };
+    try std.testing.expectError(error.InvalidToolArguments, dispatchToolCall(.{ .allocator = std.testing.allocator }, registry, .{
+        .id = "c1",
+        .name = "mock_tool",
+        .arguments_json = "invalid_args_error",
+    }));
+}
+
+test "dispatchToolCall materializes validate failure" {
+    const rejecting_tool = Tool{
+        .name = "rejecting_tool",
+        .description = "Rejecting mock tool.",
+        .model_schema = .{
+            .name = "rejecting_tool",
+            .description = "Rejecting mock tool.",
+        },
+        .decode = decodeMock,
+        .validate = rejectMock,
+        .call = callMock,
+        .reads_only_fn = mockReadsOnly,
+        .irreversible_fn = mockIrreversible,
+    };
+    const registry = Registry{ .tools = &.{rejecting_tool} };
+    const result = try dispatchToolCall(.{ .allocator = std.testing.allocator }, registry, .{
+        .id = "c1",
+        .name = "rejecting_tool",
+        .arguments_json = "{}",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.failure, result.status);
+    try std.testing.expectEqualStrings("validation rejected input", result.body);
+}
+
+test "dispatchToolCall allows and calls read-only tool" {
+    const registry = Registry{ .tools = &.{mock_tool} };
+    const result = try dispatchToolCall(.{ .allocator = std.testing.allocator }, registry, .{
+        .id = "c1",
+        .name = "mock_tool",
+        .arguments_json = "{}",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("mock ok", result.body);
+}
+
+test "dispatchToolCall denies non-read-only tool through gate" {
+    const registry = Registry{ .tools = &.{mock_tool} };
+    const result = try dispatchToolCall(.{ .allocator = std.testing.allocator }, registry, .{
+        .id = "c1",
+        .name = "mock_tool",
+        .arguments_json = "deny",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.failure, result.status);
+    try expectPermissionDeniedBody(result.body, "mock_tool", .permission_required);
+}
+
+test "dispatchToolCall downgrades ask decision to deny result" {
+    const registry = Registry{ .tools = &.{mock_tool} };
+    const result = try dispatchToolCall(.{
+        .allocator = std.testing.allocator,
+        .permission_decider = askDecision,
+    }, registry, .{
+        .id = "c1",
+        .name = "mock_tool",
+        .arguments_json = "{}",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.failure, result.status);
+    try expectPermissionDeniedBody(result.body, "mock_tool", .permission_required);
+}
+
 fn checkAdmitToolCallAskFailureAllocationFailures(alloc: Allocator) !void {
     const registry = Registry{ .tools = &.{mock_tool} };
     const admission = try admitToolCall(.{
@@ -1130,6 +1404,105 @@ fn checkAdmitToolCallAskFailureAllocationFailures(alloc: Allocator) !void {
     }
 }
 
+test "admitToolCall cleans decoded input across ask failure-body allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkAdmitToolCallAskFailureAllocationFailures,
+        .{},
+    );
+}
+
+test "dispatchToolCall rejects unavailable web_search before permission or execution" {
+    unavailable_web_search_permission_count = 0;
+    unavailable_web_search_execution_count = 0;
+    const web_search = Tool{
+        .name = "web_search",
+        .description = "Web search dispatch fixture.",
+        .model_schema = .{
+            .name = "web_search",
+            .description = "Web search dispatch fixture.",
+        },
+        .executor_kind = .web_search,
+        .decode = decodeMock,
+        .call = countWebSearchExecution,
+        .reads_only_fn = mockReadsOnly,
+        .irreversible_fn = mockIrreversible,
+    };
+    const registry = Registry{ .tools = &.{web_search} };
+
+    const result = try dispatchToolCall(.{
+        .allocator = std.testing.allocator,
+        .permission_decider = countWebSearchPermission,
+    }, registry, .{
+        .id = "c1",
+        .name = "web_search",
+        .arguments_json = "{}",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.failure, result.status);
+    try std.testing.expectEqualStrings(web_search_unavailable_message, result.body);
+    try std.testing.expectEqual(@as(usize, 0), unavailable_web_search_permission_count);
+    try std.testing.expectEqual(@as(usize, 0), unavailable_web_search_execution_count);
+}
+
+test "dispatchToolCall traces denied web_search query without secrets or execution" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "permission");
+
+    unavailable_web_search_permission_count = 0;
+    unavailable_web_search_execution_count = 0;
+    const web_search = Tool{
+        .name = "web_search",
+        .description = "Web search dispatch fixture.",
+        .model_schema = .{
+            .name = "web_search",
+            .description = "Web search dispatch fixture.",
+        },
+        .executor_kind = .web_search,
+        .decode = decodeMock,
+        .call = countWebSearchExecution,
+        .reads_only_fn = mockReadsOnly,
+        .irreversible_fn = mockIrreversible,
+    };
+    const registry = Registry{ .tools = &.{web_search} };
+
+    const result = try dispatchToolCall(.{
+        .allocator = alloc,
+        .permission_decider = denyWebSearchPermission,
+        .tool_capabilities = .{ .web_search_runtime_ready = true },
+    }, registry, .{
+        .id = "c1",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"latest AI_GATEWAY_API_KEY=secret-value news\"}",
+    });
+    defer result.deinit(alloc);
+    debug_trace.shutdown();
+
+    try expectPermissionDeniedBody(result.body, "web_search", .user_denied);
+    try std.testing.expectEqual(@as(usize, 1), unavailable_web_search_permission_count);
+    try std.testing.expectEqual(@as(usize, 0), unavailable_web_search_execution_count);
+
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer file.close(std.testing.io);
+    const trace = try io_mod.readFileToEnd(alloc, &file, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=web_search_denied") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "tool_name=web_search") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "query=latest AI_GATEWAY_API_KEY=[redacted] news") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "secret-value") == null);
+    try std.testing.expect(std.mem.find(u8, trace, "result body") == null);
+}
+
 fn expectPermissionDeniedBody(body: []const u8, tool_name: []const u8, reason: core_types.ToolPermissionDenialReason) !void {
     try std.testing.expect(tool_result_errors.isToolPermissionDeniedOutput(body));
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -1140,4 +1513,48 @@ fn expectPermissionDeniedBody(body: []const u8, tool_name: []const u8, reason: c
     try std.testing.expectEqualStrings(tool_name, error_obj.get("tool_name").?.string);
     try std.testing.expectEqualStrings(@tagName(reason), error_obj.get("reason").?.string);
     try std.testing.expect(error_obj.get("denied").?.bool);
+}
+
+test "ToolResult deinit frees owned success and failure bodies" {
+    var ok = ToolResult{ .success = try std.testing.allocator.dupe(u8, "ok") };
+    ok.deinit(std.testing.allocator);
+
+    var err = ToolResult{ .failure = try std.testing.allocator.dupe(u8, "err") };
+    err.deinit(std.testing.allocator);
+}
+test "DispatchContext command runner fields default to inactive values" {
+    const ctx = DispatchContext{ .allocator = std.testing.allocator };
+
+    try std.testing.expectEqual(permission_gate.PermissionMode.ask, ctx.permission_mode);
+    try std.testing.expect(ctx.cancel_flag == null);
+    try std.testing.expect(ctx.output_chunk_ctx == null);
+    try std.testing.expect(ctx.on_output_chunk == null);
+    try std.testing.expect(ctx.command_artifact_dir == null);
+    try std.testing.expect(ctx.command_timeout_ms == null);
+    try std.testing.expect(ctx.run_command_backend == null);
+    try std.testing.expect(ctx.subagent_provider == null);
+    try std.testing.expect(ctx.ask_question_ctx == null);
+    try std.testing.expect(ctx.ask_question_batch == null);
+    try std.testing.expect(!ctx.tool_capabilities.web_search_runtime_ready);
+    try std.testing.expectEqual(host.TerminalSupport.unsupported, ctx.tool_capabilities.terminal);
+}
+
+test "terminal tool capability facts follow the host support matrix" {
+    const os_tags = [_]std.Target.Os.Tag{
+        .macos,
+        .linux,
+        .windows,
+        .wasi,
+        .freebsd,
+        .emscripten,
+    };
+    for (os_tags) |os_tag| {
+        const expected = host.terminalSupportForOs(os_tag);
+        const capabilities = ToolCapabilities.for_host(host.nativeForOs(os_tag));
+        try std.testing.expectEqual(expected, capabilities.terminal);
+        try std.testing.expectEqual(
+            expected.isSupported(),
+            capabilities.terminalAvailable(),
+        );
+    }
 }

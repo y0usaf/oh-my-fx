@@ -25,6 +25,10 @@ const stripTrailingNewline = transcript_blocks.stripTrailingNewline;
 const tailVisibleBlockKind = transcript_blocks.tailVisibleBlockKind;
 const visualRowsForLine = transcript_blocks.visualRowsForLine;
 
+test {
+    _ = tool_group_projection;
+}
+
 const FinalityNominationKind = enum { mutation_pin, tool_turn, assistant_tail };
 
 const FinalityNomination = struct {
@@ -448,6 +452,41 @@ pub fn prepareFullTranscriptViewportSourceInterruptible(
         .welcome_boundary = null,
         .cols = self.layout.cols,
     };
+}
+
+/// Takes ownership of one bounded width-rendered full-transcript window and
+/// builds its reusable line index once on the page worker.
+pub fn prepareIndexedFullTranscriptWindowSourceInterruptible(
+    alloc: Allocator,
+    bytes: []u8,
+    cols: u16,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !TranscriptPreparationSource {
+    var source = TranscriptPreparationSource{
+        .bytes = bytes,
+        .folded_summary_indices = &.{},
+        .preview = .{ .natural_visual_rows = 0 },
+        .tail_kind = null,
+        .tracked_entry_id = null,
+        .tracked_entry_start_line = null,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 1,
+        .welcome_cut_line = null,
+        .welcome_boundary = null,
+        .cols = cols,
+    };
+    errdefer source.deinit(alloc);
+    try source.ensureLineIndexInterruptible(alloc, checkpoint);
+    const total_rows = if (source.transcript_visual_row_offsets.len > 0)
+        source.transcript_visual_row_offsets[source.transcript_visual_row_offsets.len - 1]
+    else
+        0;
+    source.preview.natural_visual_rows = @intCast(@min(
+        total_rows,
+        std.math.maxInt(u16),
+    ));
+    return source;
 }
 
 fn prepareTranscriptSourceInternal(
@@ -1080,4 +1119,65 @@ fn frameCommitted(self: anytype) bool {
         return self.has_committed_frame;
     }
     return false;
+}
+
+test "command output override preserves a hidden projection entry" {
+    const alloc = std.testing.allocator;
+    var overrides: CommandOutputOverrides = .{};
+    defer overrides.deinit(alloc);
+    try overrides.items.append(alloc, .{
+        .entry_id = 7,
+        .kind = .command_output,
+        .bytes = "replacement\n",
+    });
+    try overrides.entry_indices.put(alloc, 7, 0);
+
+    var actions = [_]transcript_blocks.EntryRenderAction{.hide};
+    applyCommandOutputOverrides(&actions, &overrides);
+    try std.testing.expect(actions[0] == .hide);
+}
+
+test "minimal projection does not take ownership of command output overrides" {
+    const alloc = std.testing.allocator;
+    const TestSource = struct {
+        entries: std.ArrayList(transcript_blocks.TranscriptEntry) = .empty,
+        tool_details: std.ArrayList(transcript_blocks.ToolDetailRecord) = .empty,
+        command_output_blocks: std.ArrayList(command_output_runtime.CommandOutputBlock) = .empty,
+        command_output_display: transcript_blocks.CommandOutputDisplayState = .{},
+        layout: struct { cols: u16 = 80 } = .{},
+        command_output_render: command_output_runtime.CommandOutputRenderPolicy = .{},
+
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            for (self.command_output_blocks.items) |*block| block.deinit(allocator);
+            self.command_output_blocks.deinit(allocator);
+            self.tool_details.deinit(allocator);
+            self.entries.deinit(allocator);
+        }
+
+        fn fullTranscriptActive(_: *const @This()) bool {
+            return false;
+        }
+    };
+
+    var source: TestSource = .{};
+    defer source.deinit(alloc);
+    try source.entries.append(alloc, .{ .raw_bytes = .{
+        .id = 1,
+        .bytes = @constCast("original\n"),
+    } });
+    var block = command_output_runtime.CommandOutputBlock{ .entry_id = 1 };
+    errdefer block.deinit(alloc);
+    try block.lines.append(alloc, .{
+        .stream = .stdout,
+        .text = try alloc.dupe(u8, "replacement\n"),
+        .entry_id = 1,
+        .terminated = true,
+    });
+    block.total_lines = 1;
+    block.retained_text_bytes = "replacement\n".len;
+    try source.command_output_blocks.append(alloc, block);
+
+    const bytes = try renderCompactTranscriptBytes(&source, alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "replacement") != null);
 }

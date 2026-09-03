@@ -359,6 +359,93 @@ fn reasonsAffectApproval(reasons: ReasonSet) bool {
     return relevant.count() > 0;
 }
 
+test "render request state exposes the transaction operations" {
+    try std.testing.expect(@hasDecl(RenderRequestState, "request"));
+    try std.testing.expect(@hasDecl(RenderRequestState, "requestInvalidation"));
+    try std.testing.expect(@hasDecl(RenderRequestState, "beginAttempt"));
+    try std.testing.expect(@hasDecl(FrameAttempt, "commit"));
+    try std.testing.expect(@hasDecl(FrameAttempt, "restore"));
+    try std.testing.expect(@hasDecl(FrameAttempt, "deinit"));
+}
+
+test "render request reasons coalesce and invalidations remain bounded" {
+    var state = RenderRequestState{};
+
+    state.request(.footer);
+    state.request(.footer);
+    state.request(.transcript);
+    try std.testing.expectEqual(@as(usize, 2), state.pendingReasonCount());
+    try std.testing.expect(state.hasReason(.footer));
+    try std.testing.expect(state.hasReason(.transcript));
+
+    var row: u16 = 1;
+    while (row <= paint_plan.max_frame_invalidation_ranges + 1) : (row += 1) {
+        state.requestInvalidation(.{
+            .reason = .external_clear,
+            .top = row,
+            .bottom = row,
+        });
+    }
+
+    try std.testing.expect(state.hasReason(.external_damage));
+    try std.testing.expectEqual(@as(u8, 1), state.pending_invalidations.len);
+    try std.testing.expectEqual(@as(u16, 1), state.pending_invalidations.ranges()[0].top);
+    try std.testing.expectEqual(
+        @as(u16, paint_plan.max_frame_invalidation_ranges + 1),
+        state.pending_invalidations.ranges()[0].bottom,
+    );
+}
+
+test "committing an attempt acknowledges only its captured work" {
+    var state = RenderRequestState{};
+    state.request(.footer);
+
+    var attempt = (try state.beginAttempt()).?;
+    try std.testing.expect(attempt.snapshot.reasons.contains(.footer));
+    try std.testing.expect(!state.hasPending());
+    try std.testing.expectError(error.AttemptInProgress, state.beginAttempt());
+
+    state.request(.transcript);
+    attempt.commit(1_000, 50, false);
+
+    try std.testing.expect(!state.hasReason(.footer));
+    try std.testing.expect(state.hasReason(.transcript));
+}
+
+test "retry restores captured work ahead of facts requested during the attempt" {
+    var state = RenderRequestState{};
+    state.request(.footer);
+    state.requestInvalidation(.{
+        .reason = .partial_write,
+        .top = 2,
+        .bottom = 3,
+    });
+
+    var attempt = (try state.beginAttempt()).?;
+    state.request(.modal);
+    attempt.restore();
+
+    try std.testing.expect(state.hasReason(.footer));
+    try std.testing.expect(state.hasReason(.modal));
+    try std.testing.expect(state.hasReason(.external_damage));
+    try std.testing.expectEqual(@as(u8, 1), state.pending_invalidations.len);
+    try std.testing.expectEqual(
+        paint_plan.FrameInvalidationReason.partial_write,
+        state.pending_invalidations.ranges()[0].reason,
+    );
+}
+
+test "input pending aborts have a deterministic starvation bound" {
+    var state = RenderRequestState{};
+    for (0..max_consecutive_input_pending_aborts) |_| {
+        try std.testing.expect(state.permitsInputPendingAbort());
+        state.noteInputPendingAbort();
+    }
+    try std.testing.expect(!state.permitsInputPendingAbort());
+    state.resetInputPendingAbortStreak();
+    try std.testing.expect(state.permitsInputPendingAbort());
+}
+
 fn failFramePreparation(
     state: *RenderRequestState,
     alloc: std.mem.Allocator,
@@ -369,4 +456,195 @@ fn failFramePreparation(
     state.request(.modal);
     const scratch = try alloc.alloc(u8, 1);
     defer alloc.free(scratch);
+}
+
+test "unfinished frame attempt restores captured work after preparation allocation failure" {
+    var state = RenderRequestState{};
+    state.request(.footer);
+    state.requestInvalidation(.{
+        .reason = .external_clear,
+        .top = 2,
+        .bottom = 4,
+    });
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failFramePreparation(&state, failing.allocator()),
+    );
+
+    try std.testing.expect(state.hasReason(.footer));
+    try std.testing.expect(state.hasReason(.modal));
+    try std.testing.expect(state.hasReason(.external_damage));
+    try std.testing.expectEqual(@as(u8, 1), state.pendingInvalidations().len);
+}
+
+test "committed frame attempt keeps a redraw requested while paint is active" {
+    var state = RenderRequestState{};
+    state.request(.footer);
+
+    var attempt = (try state.beginAttempt()).?;
+    defer attempt.deinit();
+    try std.testing.expect(attempt.snapshot.reasons.contains(.footer));
+
+    state.request(.transcript);
+    attempt.commit(1_000, 50, false);
+
+    try std.testing.expect(!state.hasReason(.footer));
+    try std.testing.expect(state.hasReason(.transcript));
+}
+
+test "resize signals extend the deadline and block frame attempts until cleared" {
+    var state = RenderRequestState{};
+    state.observeResizeSignal(100, 80);
+
+    try std.testing.expect(state.blocksFrameCommit());
+    try std.testing.expect(!state.shouldApplyDeferredResize(179));
+    try std.testing.expect(state.shouldApplyDeferredResize(180));
+
+    state.observeResizeSignal(170, 80);
+    try std.testing.expect(!state.shouldApplyDeferredResize(249));
+    try std.testing.expect(state.shouldApplyDeferredResize(250));
+    try std.testing.expect((try state.beginAttempt()) == null);
+
+    state.completeResizeGeometry(false);
+    try std.testing.expect(!state.blocksFrameCommit());
+    try std.testing.expect(state.hasReason(.resize));
+}
+
+test "resize signal does not create settled replay provenance" {
+    var state = RenderRequestState{};
+
+    state.observeResizeSignal(100, 80);
+
+    try std.testing.expect(state.resize_dirty);
+    try std.testing.expect(!state.pending_settled_width_reflow);
+}
+
+test "resize lifecycle stays pending until the settled reset commits" {
+    var state = RenderRequestState{};
+
+    state.observeResizeSignal(100, 80);
+    try std.testing.expect(state.resizeLifecyclePending());
+    try std.testing.expect(state.blocksFrameCommit());
+
+    state.completeResizeGeometry(true);
+    try std.testing.expect(state.resizeLifecyclePending());
+    try std.testing.expect(!state.blocksFrameCommit());
+
+    state.observeResizeSignal(170, 80);
+    try std.testing.expect(state.resizeLifecyclePending());
+    try std.testing.expect(state.blocksFrameCommit());
+
+    state.completeResizeGeometry(false);
+    try std.testing.expect(state.resizeLifecyclePending());
+    try std.testing.expect(!state.blocksFrameCommit());
+
+    state.acknowledgeSettledResizeCommit();
+    try std.testing.expect(!state.resizeLifecyclePending());
+}
+
+test "frame admission block defers attempts without dropping pending work" {
+    var state = RenderRequestState{};
+    state.request(.footer);
+
+    state.beginFrameAdmissionBlock();
+    try std.testing.expect(state.blocksFrameCommit());
+    try std.testing.expect((try state.beginAttempt()) == null);
+
+    state.request(.transcript);
+    state.endFrameAdmissionBlock();
+    try std.testing.expect(!state.blocksFrameCommit());
+
+    var attempt = (try state.beginAttempt()).?;
+    try std.testing.expect(attempt.snapshot.reasons.contains(.footer));
+    try std.testing.expect(attempt.snapshot.reasons.contains(.transcript));
+    attempt.restore();
+}
+
+test "approval settlement ignores animation and notification presentation work" {
+    var state = RenderRequestState{};
+    try std.testing.expect(state.settledForApproval());
+
+    state.request(.animation);
+    try std.testing.expect(state.settledForApproval());
+    state.clearReason(.animation);
+
+    state.request(.notification);
+    try std.testing.expect(state.settledForApproval());
+    state.clearReason(.notification);
+
+    state.request(.modal);
+    try std.testing.expect(!state.settledForApproval());
+    var attempt = (try state.beginAttempt()).?;
+    try std.testing.expect(!state.settledForApproval());
+    attempt.commit(1_000, 50, false);
+    try std.testing.expect(state.settledForApproval());
+
+    state.requestInvalidation(.{
+        .reason = .external_clear,
+        .top = 2,
+        .bottom = 4,
+    });
+    try std.testing.expect(!state.settledForApproval());
+    var invalidated = (try state.beginAttempt()).?;
+    try std.testing.expect(!state.settledForApproval());
+    invalidated.restore();
+    try std.testing.expect(!state.settledForApproval());
+
+    var retry = (try state.beginAttempt()).?;
+    retry.commit(1_100, 50, false);
+    try std.testing.expect(state.settledForApproval());
+
+    state.observeResizeSignal(1_200, 80);
+    try std.testing.expect(!state.settledForApproval());
+}
+
+test "animation phase and deadline publish only after a committed attempt" {
+    var state = RenderRequestState{
+        .animation_visible = true,
+        .animation_next_deadline_ms = 1_000,
+    };
+
+    try std.testing.expect(!state.requestAnimationDue(999));
+    try std.testing.expect(state.requestAnimationDue(1_000));
+    try std.testing.expectEqual(@as(i16, -8), state.visibleAnimationPhase());
+    try std.testing.expect(!state.requestAnimationDue(1_001));
+
+    var attempt = (try state.beginAttempt()).?;
+    const candidate = attempt.snapshot.animation_candidate.?;
+    try std.testing.expectEqual(@as(i16, -7), candidate.phase);
+    try std.testing.expect(!state.requestAnimationDue(1_050));
+
+    attempt.commit(1_200, 50, true);
+    try std.testing.expectEqual(candidate.phase, state.visibleAnimationPhase());
+    try std.testing.expectEqual(@as(i64, 1_250), state.animation_next_deadline_ms);
+}
+
+test "animation retry preserves the same candidate and later requests" {
+    var state = RenderRequestState{
+        .animation_visible = true,
+        .animation_next_deadline_ms = 1_000,
+    };
+    try std.testing.expect(state.requestAnimationDue(1_000));
+
+    var first = (try state.beginAttempt()).?;
+    state.request(.footer);
+    first.restore();
+
+    var retry = (try state.beginAttempt()).?;
+    try std.testing.expectEqual(
+        first.snapshot.animation_candidate.?.generation,
+        retry.snapshot.animation_candidate.?.generation,
+    );
+    try std.testing.expectEqual(
+        first.snapshot.animation_candidate.?.phase,
+        retry.snapshot.animation_candidate.?.phase,
+    );
+    try std.testing.expect(retry.snapshot.reasons.contains(.animation));
+    try std.testing.expect(retry.snapshot.reasons.contains(.footer));
+    retry.restore();
 }

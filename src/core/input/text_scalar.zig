@@ -142,3 +142,47 @@ pub fn advance(state: State, owner: Owner, byte: u8) Transition {
         .step = .{ .scalar = .{ .owner = owner, .bytes = next.bytes, .len = next.len } },
     };
 }
+
+test "text scalar admission completes utf8 atomically" {
+    var state = State{};
+    var transition = advance(state, .composer, 0xE2);
+    try std.testing.expect(transition.step.scalar == null);
+    try std.testing.expect(transition.step.dropped == null);
+    state = transition.next;
+
+    transition = advance(state, .composer, 0x82);
+    try std.testing.expect(transition.step.scalar == null);
+    state = transition.next;
+
+    transition = advance(state, .composer, 0xAC);
+    try std.testing.expectEqualStrings("€", transition.step.scalar.?.slice());
+    try std.testing.expectEqual(Owner.composer, transition.step.scalar.?.owner);
+    try std.testing.expect(!hasPending(transition.next));
+}
+
+test "text scalar admission rejects invalid utf8 without retaining bytes" {
+    var transition = advance(.{}, .composer, 0xE2);
+    transition = advance(transition.next, .composer, 0x28);
+    try std.testing.expectEqualStrings("(", transition.step.scalar.?.slice());
+    try std.testing.expectEqual(DropReason.invalid_utf8, transition.step.dropped.?.reason);
+    try std.testing.expectEqual(@as(usize, 1), transition.step.dropped.?.bytes);
+    try std.testing.expect(!hasPending(transition.next));
+}
+
+test "text scalar admission drops an incomplete scalar when its owner changes" {
+    var transition = advance(.{}, .composer, 0xE2);
+    transition = advance(transition.next, .question_freeform, 0xC3);
+    try std.testing.expectEqual(DropReason.owner_changed, transition.step.dropped.?.reason);
+    try std.testing.expectEqual(Owner.composer, transition.step.dropped.?.owner);
+    try std.testing.expectEqual(@as(usize, 1), transition.step.dropped.?.bytes);
+    try std.testing.expectEqual(Owner.question_freeform, transition.next.owner.?);
+    try std.testing.expectEqual(@as(usize, 1), transition.next.len);
+}
+
+test "text scalar reset reports pending ownership without mutating input" {
+    const pending = advance(.{}, .approval_amendment, 0xE2).next;
+    const transition = reset(pending);
+    try std.testing.expectEqual(Owner.approval_amendment, transition.dropped.?.owner);
+    try std.testing.expectEqual(@as(usize, 1), transition.dropped.?.bytes);
+    try std.testing.expect(!hasPending(transition.next));
+}

@@ -21,9 +21,16 @@ pub const State = enum(u8) {
 pub const RelaunchRequest = struct {
     executable_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     executable_path_len: usize = 0,
+    previous_revision_buf: [update_target.max_revision_bytes]u8 = undefined,
+    previous_revision_len: u8 = 0,
 
     pub fn executablePath(self: *const RelaunchRequest) []const u8 {
         return self.executable_path_buf[0..self.executable_path_len];
+    }
+
+    pub fn previousRevision(self: *const RelaunchRequest) ?[]const u8 {
+        if (self.previous_revision_len == 0) return null;
+        return self.previous_revision_buf[0..self.previous_revision_len];
     }
 };
 
@@ -47,6 +54,8 @@ pub const AutoUpgrade = struct {
     version_mutex: std.Io.Mutex = .init,
     latest_version_buf: [64]u8 = undefined,
     latest_version_len: u8 = 0,
+    previous_revision_buf: [update_target.max_revision_bytes]u8 = undefined,
+    previous_revision_len: u8 = 0,
 
     selected_channel: update_target.Channel = .stable,
 
@@ -65,6 +74,7 @@ pub const AutoUpgrade = struct {
         alloc: Allocator,
         current: update_target.CurrentBuild,
     ) void {
+        self.setPreviousRevision(current.revision);
         self.thread = std.Thread.spawn(.{}, runLoop, .{ self, alloc, current }) catch return;
     }
 
@@ -89,6 +99,15 @@ pub const AutoUpgrade = struct {
             request.executable_path_buf[0..executable_path.len],
             executable_path,
         );
+        self.version_mutex.lockUncancelable(io_mod.getIo());
+        defer self.version_mutex.unlock(io_mod.getIo());
+        if (self.selected_channel == .dev and self.previous_revision_len > 0) {
+            @memcpy(
+                request.previous_revision_buf[0..self.previous_revision_len],
+                self.previous_revision_buf[0..self.previous_revision_len],
+            );
+            request.previous_revision_len = self.previous_revision_len;
+        }
         self.relaunch_request = request;
     }
 
@@ -132,6 +151,15 @@ pub const AutoUpgrade = struct {
         if (previous != next) self.markRenderDirty();
     }
 
+    fn setPreviousRevision(self: *AutoUpgrade, revision: []const u8) void {
+        const valid = update_target.isValidRevision(revision);
+        const len: u8 = if (valid) @intCast(revision.len) else 0;
+        self.version_mutex.lockUncancelable(io_mod.getIo());
+        defer self.version_mutex.unlock(io_mod.getIo());
+        if (len > 0) @memcpy(self.previous_revision_buf[0..len], revision);
+        self.previous_revision_len = len;
+    }
+
     fn setLatestVersion(self: *AutoUpgrade, version: []const u8) void {
         const stripped = update_target.normalizeVersion(version);
         const len: u8 = @intCast(@min(stripped.len, 32));
@@ -171,8 +199,8 @@ pub const AutoUpgrade = struct {
         alloc: Allocator,
         current: update_target.CurrentBuild,
     ) void {
-        const release_base = helpers.resolveReleaseBase();
-        var target = helpers.fetchTarget(alloc, self.selected_channel, release_base) catch return;
+        const cdn_base = helpers.resolveCdnBase();
+        var target = helpers.fetchTarget(alloc, self.selected_channel, cdn_base) catch return;
         defer target.deinit(alloc);
 
         if (!target.shouldInstall(current)) return;
@@ -182,7 +210,7 @@ pub const AutoUpgrade = struct {
         self.setLatestVersion(label);
         self.setState(.downloading);
 
-        self.downloadAndInstall(alloc, target, release_base) catch {
+        self.downloadAndInstall(alloc, target, cdn_base) catch {
             self.setState(.failed);
             return;
         };
@@ -203,7 +231,7 @@ pub const AutoUpgrade = struct {
         self: *AutoUpgrade,
         alloc: Allocator,
         target: update_target.Target,
-        release_base: []const u8,
+        cdn_base: []const u8,
     ) InstallError!void {
         var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
         defer client.deinit();
@@ -221,14 +249,14 @@ pub const AutoUpgrade = struct {
         const archive_path = std.fmt.allocPrint(alloc, "{s}/fx.tar.gz", .{tmp_dir}) catch return error.AllocFailed;
         defer alloc.free(archive_path);
 
-        const archive_url = helpers.artifactUrl(alloc, release_base, target, "") catch return error.AllocFailed;
+        const archive_url = helpers.artifactUrl(alloc, cdn_base, target, "") catch return error.AllocFailed;
         defer alloc.free(archive_url);
 
         helpers.downloadFileStreaming(&client, archive_url, archive_path) catch return error.DownloadFailed;
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
-        const checksum_url = helpers.artifactUrl(alloc, release_base, target, ".sha256") catch return error.AllocFailed;
+        const checksum_url = helpers.artifactUrl(alloc, cdn_base, target, ".sha256") catch return error.AllocFailed;
         defer alloc.free(checksum_url);
 
         helpers.verifyChecksum(&client, archive_path, checksum_url) catch return error.ChecksumFailed;
@@ -256,3 +284,116 @@ pub const AutoUpgrade = struct {
         }
     }
 };
+
+test "statusLabel idle returns empty" {
+    var au = AutoUpgrade{};
+    var buf: [64]u8 = undefined;
+    const label = au.statusLabel(&buf);
+    try std.testing.expectEqual(@as(usize, 0), label.len);
+}
+
+test "selected release channel is owned by the upgrade runtime" {
+    var au = AutoUpgrade{};
+    try std.testing.expectEqual(update_target.Channel.stable, au.channel());
+
+    au.configure_channel(.dev);
+    try std.testing.expectEqual(update_target.Channel.dev, au.channel());
+}
+
+test "development build paths disable auto upgrade" {
+    try std.testing.expect(isDevelopmentBuildPath("/repo/zig-out/bin/fx"));
+    try std.testing.expect(isDevelopmentBuildPath("C:\\repo\\zig-out\\bin\\fx.exe"));
+    try std.testing.expect(!isDevelopmentBuildPath("/Users/me/.local/bin/fx"));
+}
+
+test "statusLabel downloading shows ellipsis" {
+    var au = AutoUpgrade{};
+    au.setLatestVersion("v0.3.0");
+    au.setState(.downloading);
+    var buf: [64]u8 = undefined;
+    const label = au.statusLabel(&buf);
+    try std.testing.expectEqualStrings("upgrading to 0.3.0...", label);
+}
+
+test "statusLabel ready explains ctrl+g reload" {
+    var au = AutoUpgrade{};
+    au.setState(.ready);
+    var buf: [64]u8 = undefined;
+    const label = au.statusLabel(&buf);
+    try std.testing.expectEqualStrings("update ready: ctrl+g to reload", label);
+}
+
+test "setLatestVersion stores normalized version" {
+    var au = AutoUpgrade{};
+    _ = au.takeRenderDirty();
+    au.setLatestVersion("v1.2.3");
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("1.2.3", au.getLatestVersion(&buf));
+    try std.testing.expect(au.takeRenderDirty());
+}
+
+test "relaunch request owns its path and previous revision and is consumed once" {
+    var au = AutoUpgrade{};
+    var path = [_]u8{ '/', 't', 'm', 'p', '/', 'f', 'x' };
+    var revision = [_]u8{'1'} ** 40;
+    au.configure_channel(.dev);
+    au.setPreviousRevision(&revision);
+    try au.requestRelaunch(&path);
+    path[1] = 'x';
+    revision[0] = '2';
+
+    const request = au.takeRelaunchRequest() orelse
+        return error.TestExpectedRelaunchRequest;
+    try std.testing.expectEqualStrings("/tmp/fx", request.executablePath());
+    try std.testing.expectEqualStrings(
+        "1111111111111111111111111111111111111111",
+        request.previousRevision().?,
+    );
+    try std.testing.expect(au.takeRelaunchRequest() == null);
+}
+
+test "statusLabel waiting returns empty" {
+    var au = AutoUpgrade{};
+    au.setState(.waiting);
+    var buf: [64]u8 = undefined;
+    const label = au.statusLabel(&buf);
+    try std.testing.expectEqual(@as(usize, 0), label.len);
+}
+
+test "statusLabel checking returns empty" {
+    var au = AutoUpgrade{};
+    au.setState(.checking);
+    var buf: [64]u8 = undefined;
+    const label = au.statusLabel(&buf);
+    try std.testing.expectEqual(@as(usize, 0), label.len);
+}
+
+test "statusLabel failed shows upgrade failed" {
+    var au = AutoUpgrade{};
+    au.setState(.failed);
+    var buf: [64]u8 = undefined;
+    const label = au.statusLabel(&buf);
+    try std.testing.expectEqualStrings("upgrade failed", label);
+}
+
+test "getState returns the current atomic state" {
+    var au = AutoUpgrade{};
+    try std.testing.expectEqual(State.idle, au.getState());
+    try std.testing.expect(!au.takeRenderDirty());
+    au.setState(.checking);
+    try std.testing.expectEqual(State.checking, au.getState());
+    try std.testing.expect(au.takeRenderDirty());
+    try std.testing.expect(!au.takeRenderDirty());
+    au.setState(.checking);
+    try std.testing.expect(!au.takeRenderDirty());
+}
+
+test "setLatestVersion truncates to stored capacity" {
+    var au = AutoUpgrade{};
+    au.setLatestVersion("v1234567890123456789012345678901234567890");
+
+    var buf: [40]u8 = undefined;
+    const latest = au.getLatestVersion(&buf);
+    try std.testing.expectEqual(@as(usize, 32), latest.len);
+    try std.testing.expectEqualStrings("12345678901234567890123456789012", latest);
+}

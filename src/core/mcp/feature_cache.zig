@@ -391,3 +391,289 @@ fn testMetadata(key: CacheKey, generation: u64, content: []const u8) SnapshotMet
         .content_digest = digest(content),
     };
 }
+
+test "duplicate notifications are idempotent" {
+    const subscription = SubscriptionIdentity{ .request_id = 17, .generation = 3 };
+    const notification = Notification{
+        .kind = .tools_list_changed,
+        .subscription_id = 17,
+    };
+    const expectation = SubscriptionExpectation{
+        .protocol = .modern,
+        .capability_advertised = true,
+        .connection_generation = 4,
+        .event_connection_generation = 4,
+        .subscription = subscription,
+        .acknowledged = true,
+    };
+    const classified = classifyNotification(expectation, notification);
+    try std.testing.expectEqual(NotificationDecision.invalidate, classified);
+    try std.testing.expectEqual(CoalesceDecision.enqueue, decideCoalesce(false, classified));
+    try std.testing.expectEqual(CoalesceDecision.already_pending, decideCoalesce(true, classified));
+}
+
+test "failed refresh preserves the last valid snapshot" {
+    const identity = authIdentity(&.{});
+    const key = buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .private,
+        .auth_identity = identity,
+    });
+    const current = testMetadata(key, 9, "valid snapshot");
+    const failed = failedRefresh(current, 250);
+    try std.testing.expectEqual(Freshness.failed_refresh, failed.freshness);
+    try std.testing.expectEqual(current.catalog_generation, failed.catalog_generation);
+    try std.testing.expectEqualSlices(u8, &current.content_digest, &failed.content_digest);
+    try std.testing.expect(failed.retry_at_ms > 250);
+}
+
+test "a stale generation cannot replace newer state" {
+    const key = buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .public,
+        .auth_identity = authIdentity(&.{}),
+    });
+    const current = testMetadata(key, 12, "newer");
+    try std.testing.expectEqual(
+        ReplacementDecision.reject_stale_generation,
+        authorizeReplacement(current, 4, 11, key, key, digest("older")),
+    );
+}
+
+test "private cache state cannot cross authentication identities" {
+    const first_identity = authIdentity(&.{.{ .name = "Authorization", .value = "first" }});
+    const second_identity = authIdentity(&.{.{ .name = "Authorization", .value = "second" }});
+    const first = buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .private,
+        .auth_identity = first_identity,
+    });
+    const second = buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .private,
+        .auth_identity = second_identity,
+    });
+    const decision = decideRefresh(testMetadata(first, 1, "private"), second, 101, false);
+    try std.testing.expectEqual(.refresh, decision.action);
+    try std.testing.expect(!decision.may_serve_snapshot);
+
+    const public_first = buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .public,
+        .auth_identity = first_identity,
+    });
+    const public_second = buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .public,
+        .auth_identity = second_identity,
+    });
+    try std.testing.expect(public_first.eql(public_second));
+    try std.testing.expectEqual(
+        ReplacementDecision.reject_cache_key,
+        authorizeReplacement(
+            testMetadata(first, 1, "private"),
+            4,
+            1,
+            second,
+            first,
+            digest("replacement"),
+        ),
+    );
+}
+
+test "equivalent validated refreshes do not replace snapshot content" {
+    const key = buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .public,
+        .auth_identity = authIdentity(&.{}),
+    });
+    const current = testMetadata(key, 2, "same schema");
+    try std.testing.expectEqual(
+        ReplacementDecision.metadata_only,
+        authorizeReplacement(current, 4, 2, key, key, digest("same schema")),
+    );
+}
+
+test "valid changed refresh authorizes one whole snapshot replacement" {
+    const key = buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .public,
+        .auth_identity = authIdentity(&.{}),
+    });
+    const current = testMetadata(key, 2, "old complete snapshot");
+    try std.testing.expectEqual(
+        ReplacementDecision.replace_snapshot,
+        authorizeReplacement(current, 4, 2, key, key, digest("new complete snapshot")),
+    );
+}
+
+test "expiry and retry arithmetic saturate" {
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        expiryFromTtl(std.math.maxInt(u64) - 1, 10),
+    );
+    var metadata = testMetadata(buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .public,
+        .auth_identity = authIdentity(&.{}),
+    }), 1, "snapshot");
+    metadata.refresh_attempt = retry_max_attempt;
+    const failed = failedRefresh(metadata, std.math.maxInt(u64) - 1);
+    try std.testing.expectEqual(std.math.maxInt(u64), failed.retry_at_ms);
+    try std.testing.expectEqual(retry_max_attempt, failed.refresh_attempt);
+}
+
+test "TTL defaults are version scoped and preserve clock boundaries" {
+    try std.testing.expectEqual(@as(u64, 0), snapshotTtl(.modern, true, 0));
+    try std.testing.expectEqual(@as(u64, 0), snapshotTtl(.modern, false, 99));
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        snapshotTtl(.modern, true, std.math.maxInt(u64)),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        snapshotTtl(.legacy, false, 0),
+    );
+
+    const key = buildCacheKey(.{
+        .server_identity = "server",
+        .protocol_version = "2026-07-28",
+        .capability = .tools_list,
+        .normalized_arguments = "{}",
+        .scope = .public,
+        .auth_identity = authIdentity(&.{}),
+    });
+    var metadata = testMetadata(key, 1, "boundary");
+    metadata.expires_at_ms = 500;
+    try std.testing.expectEqual(.hit, decideRefresh(metadata, key, 499, false).action);
+    try std.testing.expectEqual(.refresh, decideRefresh(metadata, key, 500, false).action);
+}
+
+test "paginated cache expiry uses each page receive time" {
+    const first_expiry = pageExpiry(.modern, 1_000, true, 100);
+    try std.testing.expectEqual(@as(u64, 1_100), first_expiry);
+
+    const later_expiry = pageExpiry(.modern, 1_050, true, 500);
+    try std.testing.expectEqual(
+        first_expiry,
+        earliestExpiry(first_expiry, later_expiry),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        pageExpiry(.modern, std.math.maxInt(u64) - 1, true, 100),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 2_000),
+        pageExpiry(.modern, 2_000, true, 0),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 3_000),
+        pageExpiry(.modern, 3_000, false, 99),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        pageExpiry(.legacy, 4_000, false, 0),
+    );
+}
+
+test "modern notification classification rejects malformed late and duplicate events" {
+    const subscription = SubscriptionIdentity{ .request_id = 8, .generation = 2 };
+    const base = SubscriptionExpectation{
+        .protocol = .modern,
+        .capability_advertised = true,
+        .connection_generation = 5,
+        .event_connection_generation = 5,
+        .subscription = subscription,
+        .acknowledged = false,
+    };
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_malformed,
+        classifyNotification(base, .{ .kind = .subscription_acknowledged }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_late_generation,
+        classifyNotification(base, .{
+            .kind = .subscription_acknowledged,
+            .subscription_id = 9,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.acknowledge,
+        classifyNotification(base, .{
+            .kind = .subscription_acknowledged,
+            .subscription_id = 8,
+        }),
+    );
+    var acknowledged = base;
+    acknowledged.acknowledged = true;
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_duplicate,
+        classifyNotification(acknowledged, .{
+            .kind = .subscription_acknowledged,
+            .subscription_id = 8,
+        }),
+    );
+    var late = acknowledged;
+    late.event_connection_generation = 4;
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_late_generation,
+        classifyNotification(late, .{
+            .kind = .tools_list_changed,
+            .subscription_id = 8,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.close_subscription,
+        classifyNotification(acknowledged, .{
+            .kind = .subscription_cancelled,
+            .cancelled_request_id = 8,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.close_unsupported,
+        classifyNotification(base, .{
+            .kind = .subscription_filter_unsupported,
+            .subscription_id = 8,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_malformed,
+        classifyNotification(base, .{
+            .kind = .subscription_filter_unsupported,
+        }),
+    );
+    try std.testing.expectEqual(
+        NotificationDecision.ignore_late_generation,
+        classifyNotification(acknowledged, .{
+            .kind = .subscription_cancelled,
+            .cancelled_request_id = 7,
+        }),
+    );
+}

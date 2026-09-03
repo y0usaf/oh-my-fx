@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "tui-direct-write-audit.test.ts",
+    "tui-render-lab.test.ts",
+    "render-lab/**/*.ts"
+  ]
+}

@@ -214,3 +214,59 @@ fn cursorAtColumn(
     }
     return last_owned;
 }
+
+test "vertical movement preserves preferred column across hard lines" {
+    const buffer = "abcd\nef\nghij";
+
+    const first = moveCursor(buffer, 11, 20, .up, null);
+    try std.testing.expectEqual(@as(usize, 7), first.cursor);
+    try std.testing.expectEqual(@as(usize, 3), first.preferred_column);
+
+    const second = moveCursor(buffer, first.cursor, 20, .up, first.preferred_column);
+    try std.testing.expectEqual(@as(usize, 3), second.cursor);
+
+    const third = moveCursor(buffer, second.cursor, 20, .down, second.preferred_column);
+    try std.testing.expectEqual(@as(usize, 7), third.cursor);
+}
+
+test "vertical movement follows soft wrapped rows" {
+    const buffer = "abcdefghijkl";
+
+    const first = moveCursor(buffer, 10, 4, .up, null);
+    try std.testing.expectEqual(@as(usize, 6), first.cursor);
+    const second = moveCursor(buffer, first.cursor, 4, .up, first.preferred_column);
+    try std.testing.expectEqual(@as(usize, 2), second.cursor);
+}
+
+test "vertical movement stays within utf8 display-unit boundaries" {
+    const buffer = "a🙂b\nxy";
+
+    const moved = moveCursor(buffer, buffer.len, 20, .up, null);
+    try std.testing.expectEqual(@as(usize, 1), moved.cursor);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(buffer[0..moved.cursor]));
+}
+
+test "vertical movement preserves a combining sequence boundary" {
+    const buffer = "e\u{301}x\nab";
+
+    const moved = moveCursor(buffer, buffer.len, 20, .up, null);
+    try std.testing.expectEqual(@as(usize, 4), moved.cursor);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(buffer[0..moved.cursor]));
+}
+
+test "vertical movement is inert beyond the first and last row" {
+    const buffer = "one\ntwo";
+
+    const up = moveCursor(buffer, 2, 20, .up, null);
+    try std.testing.expectEqual(@as(usize, 2), up.cursor);
+    try std.testing.expect(!up.moved);
+
+    const down = moveCursor(buffer, buffer.len, 20, .down, null);
+    try std.testing.expectEqual(buffer.len, down.cursor);
+    try std.testing.expect(!down.moved);
+}
+
+test "line count includes trailing and exact-width cursor rows" {
+    try std.testing.expectEqual(@as(usize, 2), lineCount("one\n", 4, 20));
+    try std.testing.expectEqual(@as(usize, 2), lineCount("four", 4, 4));
+}

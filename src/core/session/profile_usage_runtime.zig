@@ -268,3 +268,381 @@ fn buildSnapshot(
         incidents[0..incident_count],
     );
 }
+
+test "profile runtime snapshots only durable profile facts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try std.testing.expectEqual(
+        InitializeOutcome.available,
+        try runtime.initialize(alloc, home),
+    );
+
+    const now_ms = @max(io_mod.milliTimestamp(), 1);
+    const fact = usage_report.GenerationFact{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        .created_at_ms = now_ms - 1,
+        .model = @constCast("provider/model"),
+        .input_tokens = 5,
+        .output_tokens = 2,
+        .cache_read_tokens = 1,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = null,
+        .total_cost = 0.25,
+    };
+    const sink = runtime.publisherSink(alloc);
+    try sink.publish(sink.context, .{ .generation = fact });
+    const snapshot_time_ms = @max(io_mod.milliTimestamp(), now_ms) +| 1;
+
+    var snapshot = try runtime.snapshot(
+        alloc,
+        .hours_24,
+        snapshot_time_ms,
+        .{},
+    );
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(usage_report.Completeness.complete, snapshot.completeness);
+    try std.testing.expectEqual(@as(u64, 7), snapshot.totals.?.total_tokens);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.totals.?.request_count.?);
+
+    var rolling = try runtime.rollingSnapshots(alloc, snapshot_time_ms, .{});
+    defer for (&rolling) |*item| item.deinit(alloc);
+    const expected_scopes = [_]usage_report.Scope{ .days_30, .days_7, .hours_24 };
+    for (rolling, expected_scopes) |item, expected_scope| {
+        try std.testing.expectEqual(expected_scope, item.scope);
+        try std.testing.expectEqual(snapshot_time_ms, item.snapshot_time_ms);
+        try std.testing.expectEqual(@as(u64, 7), item.totals.?.total_tokens);
+    }
+}
+
+test "first recovered fact establishes partial profile coverage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try std.testing.expectEqual(
+        InitializeOutcome.available,
+        try runtime.initialize(alloc, home),
+    );
+
+    const snapshot_time_ms = @max(io_mod.milliTimestamp(), 2);
+    const recovered = usage_report.GenerationFact{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        .created_at_ms = snapshot_time_ms - 1,
+        .model = @constCast("provider/model"),
+        .input_tokens = 5,
+        .output_tokens = 2,
+        .cache_read_tokens = 1,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = null,
+        .total_cost = 0.25,
+    };
+
+    var snapshot = try runtime.snapshot(
+        alloc,
+        .hours_24,
+        snapshot_time_ms,
+        .{ .facts = &.{recovered} },
+    );
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(usage_report.Coverage.partial, snapshot.coverage);
+    try std.testing.expectEqual(
+        recovered.created_at_ms,
+        snapshot.coverage_started_at_ms.?,
+    );
+    try std.testing.expectEqual(
+        usage_report.Completeness.pending,
+        snapshot.completeness,
+    );
+    try std.testing.expectEqual(@as(u64, 7), snapshot.totals.?.total_tokens);
+    try std.testing.expectEqual(@as(f64, 0.25), snapshot.totals.?.total_cost);
+}
+
+test "recovered facts stay pending until the profile ledger accepts them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try std.testing.expectEqual(
+        InitializeOutcome.available,
+        try runtime.initialize(alloc, home),
+    );
+
+    const now_ms = @max(io_mod.milliTimestamp(), 2);
+    const durable = usage_report.GenerationFact{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        .created_at_ms = now_ms - 2,
+        .model = @constCast("provider/model"),
+        .input_tokens = 3,
+        .output_tokens = 1,
+        .cache_read_tokens = 0,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = null,
+        .total_cost = 0.1,
+    };
+    const sink = runtime.publisherSink(alloc);
+    try sink.publish(sink.context, .{ .generation = durable });
+    const snapshot_time_ms = @max(io_mod.milliTimestamp(), now_ms) +| 1;
+    const recovered = usage_report.GenerationFact{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+        .created_at_ms = snapshot_time_ms - 1,
+        .model = @constCast("provider/model"),
+        .input_tokens = 5,
+        .output_tokens = 2,
+        .cache_read_tokens = 1,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = null,
+        .total_cost = 0.25,
+    };
+
+    var pending = try runtime.snapshot(
+        alloc,
+        .hours_24,
+        snapshot_time_ms,
+        .{ .facts = &.{recovered} },
+    );
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(usage_report.Completeness.pending, pending.completeness);
+    try std.testing.expectEqual(@as(u64, 11), pending.totals.?.total_tokens);
+
+    try sink.publish(sink.context, .{ .generation = recovered });
+    var settled = try runtime.snapshot(
+        alloc,
+        .hours_24,
+        snapshot_time_ms,
+        .{ .facts = &.{recovered} },
+    );
+    defer settled.deinit(alloc);
+    try std.testing.expectEqual(usage_report.Completeness.complete, settled.completeness);
+    try std.testing.expectEqual(@as(u64, 11), settled.totals.?.total_tokens);
+    try std.testing.expectEqual(@as(u64, 2), settled.totals.?.request_count.?);
+}
+
+test "older recovery data extends durable profile coverage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try std.testing.expectEqual(
+        InitializeOutcome.available,
+        try runtime.initialize(alloc, home),
+    );
+
+    const now_ms = @max(io_mod.milliTimestamp(), std.time.ms_per_s);
+    const recovery_time_ms = now_ms - std.time.ms_per_s;
+    const durable = usage_report.GenerationFact{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        .created_at_ms = now_ms - 1,
+        .model = @constCast("provider/model"),
+        .input_tokens = 3,
+        .output_tokens = 1,
+        .cache_read_tokens = 0,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = null,
+        .total_cost = 0.1,
+    };
+    const sink = runtime.publisherSink(alloc);
+    try sink.publish(sink.context, .{ .generation = durable });
+    const snapshot_time_ms = @max(io_mod.milliTimestamp(), now_ms) +| 1;
+    const recovered = usage_report.GenerationFact{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+        .created_at_ms = recovery_time_ms,
+        .model = @constCast("provider/model"),
+        .input_tokens = 5,
+        .output_tokens = 2,
+        .cache_read_tokens = 1,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = null,
+        .total_cost = 0.25,
+    };
+    const marker = usage_report.PendingMarker{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAX"),
+        .observed_at_ms = recovery_time_ms + 1,
+    };
+
+    var pending = try runtime.snapshot(
+        alloc,
+        .hours_24,
+        snapshot_time_ms,
+        .{
+            .facts = &.{recovered},
+            .pending = &.{marker},
+        },
+    );
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(
+        recovery_time_ms,
+        pending.coverage_started_at_ms.?,
+    );
+    try std.testing.expectEqual(usage_report.Completeness.pending, pending.completeness);
+    try std.testing.expectEqual(@as(u64, 11), pending.totals.?.total_tokens);
+    try std.testing.expectEqual(@as(u64, 2), pending.totals.?.request_count.?);
+
+    const incident = usage_report.Incident{
+        .occurred_at_ms = recovery_time_ms + 2,
+        .completeness = .incomplete,
+    };
+    var incomplete = try runtime.snapshot(
+        alloc,
+        .hours_24,
+        snapshot_time_ms,
+        .{ .incidents = &.{incident} },
+    );
+    defer incomplete.deinit(alloc);
+    try std.testing.expectEqual(
+        incident.occurred_at_ms,
+        incomplete.coverage_started_at_ms.?,
+    );
+    try std.testing.expectEqual(
+        usage_report.Completeness.incomplete,
+        incomplete.completeness,
+    );
+}
+
+test "profile runtime resolves durable pending markers and preserves incidents" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try std.testing.expectEqual(
+        InitializeOutcome.available,
+        try runtime.initialize(alloc, home),
+    );
+
+    const now_ms = @max(io_mod.milliTimestamp(), 1);
+    const sink = runtime.publisherSink(alloc);
+    try sink.publish(sink.context, .{ .pending = .{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        .observed_at_ms = now_ms - 1,
+    } });
+    const snapshot_time_ms = @max(io_mod.milliTimestamp(), now_ms) +| 1;
+
+    var pending = try runtime.snapshot(alloc, .hours_24, snapshot_time_ms, .{});
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(usage_report.Completeness.pending, pending.completeness);
+    try std.testing.expectEqual(@as(u64, 0), pending.totals.?.total_tokens);
+
+    const fact = usage_report.GenerationFact{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        .created_at_ms = now_ms - 1,
+        .model = @constCast("provider/model"),
+        .input_tokens = 5,
+        .output_tokens = 2,
+        .cache_read_tokens = 1,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = null,
+        .billable_web_search_calls = 1,
+        .total_cost = 0.25,
+    };
+    try sink.publish(sink.context, .{ .generation = fact });
+
+    var settled = try runtime.snapshot(alloc, .hours_24, snapshot_time_ms, .{});
+    defer settled.deinit(alloc);
+    try std.testing.expectEqual(usage_report.Completeness.complete, settled.completeness);
+    try std.testing.expectEqual(@as(u64, 7), settled.totals.?.total_tokens);
+
+    const incident = usage_report.Incident{
+        .occurred_at_ms = now_ms,
+        .completeness = .incomplete,
+    };
+    try sink.publish(sink.context, .{ .incident = incident });
+    try sink.publish(sink.context, .{ .incident = incident });
+
+    var incomplete = try runtime.snapshot(alloc, .hours_24, snapshot_time_ms, .{});
+    defer incomplete.deinit(alloc);
+    try std.testing.expectEqual(
+        usage_report.Completeness.incomplete,
+        incomplete.completeness,
+    );
+    try std.testing.expectEqual(@as(u64, 7), incomplete.totals.?.total_tokens);
+}
+
+test "profile runtime serializes publication and snapshots" {
+    const alloc = std.testing.allocator;
+    const thread_alloc = std.heap.c_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var runtime: Runtime = .{};
+    defer runtime.deinit(thread_alloc);
+    try std.testing.expectEqual(
+        InitializeOutcome.available,
+        try runtime.initialize(thread_alloc, home),
+    );
+
+    const now_ms = @max(io_mod.milliTimestamp(), 1);
+    const fact = usage_report.GenerationFact{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        .created_at_ms = now_ms - 1,
+        .model = @constCast("provider/model"),
+        .input_tokens = 5,
+        .output_tokens = 2,
+        .cache_read_tokens = 1,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = null,
+        .total_cost = 0.25,
+    };
+    const snapshot_time_ms = now_ms +| std.time.ms_per_min;
+    const Worker = struct {
+        sink: session_usage.ProfilePublicationSink,
+        generation: usage_report.GenerationFact,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            for (0..3) |_| {
+                self.sink.publish(
+                    self.sink.context,
+                    .{ .generation = self.generation },
+                ) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            }
+        }
+    };
+    var worker = Worker{
+        .sink = runtime.publisherSink(thread_alloc),
+        .generation = fact,
+    };
+    {
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        defer thread.join();
+        for (0..3) |_| {
+            var current = try runtime.snapshot(
+                thread_alloc,
+                .hours_24,
+                snapshot_time_ms,
+                .{},
+            );
+            current.deinit(thread_alloc);
+        }
+    }
+
+    try std.testing.expect(worker.failure == null);
+    var final = try runtime.snapshot(
+        thread_alloc,
+        .hours_24,
+        snapshot_time_ms,
+        .{},
+    );
+    defer final.deinit(thread_alloc);
+    try std.testing.expectEqual(@as(u64, 7), final.totals.?.total_tokens);
+    try std.testing.expectEqual(@as(u64, 1), final.totals.?.request_count.?);
+}

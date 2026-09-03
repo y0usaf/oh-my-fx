@@ -235,6 +235,38 @@ fn requesterCancel(_: ?*anyopaque, _: Allocator, _: []const core_types.QuestionB
     return null;
 }
 
+const FakeRequester = struct {
+    called: bool = false,
+    saw_trimmed: bool = false,
+
+    fn request(raw_ctx: ?*anyopaque, alloc: Allocator, entries: []const core_types.QuestionBatchEntry) anyerror!?[][]u8 {
+        const self: *FakeRequester = @ptrCast(@alignCast(raw_ctx.?));
+        self.called = true;
+        if (entries.len == 1 and
+            std.mem.eql(u8, entries[0].question, "Choose?") and
+            entries[0].options.len == 2 and
+            std.mem.eql(u8, entries[0].options[0].label, "Yes") and
+            entries[0].options[0].description != null and
+            std.mem.eql(u8, entries[0].options[0].description.?, "Go ahead") and
+            entries[0].options[1].description == null)
+        {
+            self.saw_trimmed = true;
+        }
+
+        const answers = try alloc.alloc([]u8, entries.len);
+        errdefer alloc.free(answers);
+        var filled: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < filled) : (i += 1) alloc.free(answers[i]);
+        }
+        while (filled < entries.len) : (filled += 1) {
+            answers[filled] = try alloc.dupe(u8, entries[filled].options[0].label);
+        }
+        return answers;
+    }
+};
+
 const TerminalSafeRequester = struct {
     called: bool = false,
     saw_terminal_safe: bool = false,
@@ -266,3 +298,133 @@ const TerminalSafeRequester = struct {
         return answers;
     }
 };
+
+fn expectRequesterOutput(args_json: []const u8, expected: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var fake = FakeRequester{};
+    const output = try executeWithRequester(alloc, args_json, .{
+        .ctx = &fake,
+        .response_alloc = alloc,
+        .request = FakeRequester.request,
+    });
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(expected, output);
+}
+
+test "ask_user_question validates arguments and returns active sentinels" {
+    try expectRequesterOutput("not-json", invalid_args_sentinel);
+    try expectRequesterOutput("[]", invalid_args_sentinel);
+    try expectRequesterOutput("{}", "(ask_user_question: missing required array \"questions\")");
+    try expectRequesterOutput("{\"questions\":{}}", "(ask_user_question: \"questions\" must be an array)");
+    try expectRequesterOutput("{\"questions\":[]}", "(ask_user_question: provide 1 to 4 questions)");
+    try expectRequesterOutput("{\"questions\":[1]}", "(ask_user_question: each question must be an object with a \"question\" and \"options\")");
+    try expectRequesterOutput("{\"questions\":[{}]}", "(ask_user_question: each question requires a \"question\" string)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":1}]}", "(ask_user_question: question \"question\" must be a string)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"  \",\"options\":[]}]}", "(ask_user_question: question text must not be empty)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\"}]}", "(ask_user_question: each question requires an \"options\" array)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":1}]}", "(ask_user_question: \"options\" must be an array)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[]}]}", "(ask_user_question: provide 2 to 6 options per question)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[1,2]}]}", "(ask_user_question: each option must be an object with a \"label\")");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{},{}]}]}", "(ask_user_question: each option requires a \"label\" string)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":1},{\"label\":\"No\"}]}]}", "(ask_user_question: option \"label\" must be a string)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":\"\"},{\"label\":\"No\"}]}]}", "(ask_user_question: option labels must not be empty)");
+    try expectRequesterOutput("{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":\"Yes\"},{\"label\":\" yes \"}]}]}", "(ask_user_question: option labels must be unique within a question)");
+}
+
+test "ask_user_question normalizes descriptions and encodes ordered answers" {
+    const alloc = std.testing.allocator;
+    var fake = FakeRequester{};
+    const output = try executeWithRequester(
+        alloc,
+        "{\"questions\":[{\"question\":\" Choose? \",\"options\":[{\"label\":\" Yes \",\"description\":\" Go ahead \"},{\"label\":\"No\",\"description\":3}]}]}",
+        .{
+            .ctx = &fake,
+            .response_alloc = alloc,
+            .request = FakeRequester.request,
+        },
+    );
+    defer alloc.free(output);
+
+    try std.testing.expect(fake.called);
+    try std.testing.expect(fake.saw_trimmed);
+    try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", output);
+}
+
+test "ask_user_question encodes model-controlled prompt text for terminal display" {
+    const alloc = std.testing.allocator;
+    var requester = TerminalSafeRequester{};
+    const output = try executeWithRequester(
+        alloc,
+        "{\"questions\":[{\"question\":\"Q\\n\\u001b[31m?\",\"options\":[{\"label\":\"Alpha\\nFake\",\"description\":\"Desc\\tGap\"},{\"label\":\"\\u001b[31mRed\\u001b[0m\"}]}]}",
+        .{
+            .ctx = &requester,
+            .response_alloc = alloc,
+            .request = TerminalSafeRequester.request,
+        },
+    );
+    defer alloc.free(output);
+
+    try std.testing.expect(requester.called);
+    try std.testing.expect(requester.saw_terminal_safe);
+    try std.testing.expectEqualStrings(
+        "[{\"question\":\"Q\\\\x0a\\\\x1b[31m?\",\"answer\":\"Alpha\\\\x0aFake\"}]",
+        output,
+    );
+}
+
+test "ask_user_question cancellation returns sentinel" {
+    const alloc = std.testing.allocator;
+    const output = try executeWithRequester(
+        alloc,
+        "{\"questions\":[{\"question\":\"Q?\",\"options\":[{\"label\":\"Yes\"},{\"label\":\"No\"}]}]}",
+        .{
+            .ctx = null,
+            .response_alloc = alloc,
+            .request = requesterCancel,
+        },
+    );
+    defer alloc.free(output);
+
+    try std.testing.expectEqualStrings(cancel_sentinel, output);
+}
+
+test "ask_user_question validation rejects legacy permission references before prompting" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"permission_request_id\":\"legacy\",\"questions\":[]}",
+    );
+    const input = switch (decoded) {
+        .failure => |body| {
+            defer alloc.free(body);
+            return error.TestExpectedEqual;
+        },
+        .input => |owned| owned,
+    };
+    defer input.deinit(alloc);
+    const failure = (try validate(.{ .allocator = alloc }, input)) orelse
+        return error.TestExpectedEqual;
+    defer alloc.free(failure);
+    try std.testing.expectEqualStrings(legacy_permission_request_sentinel, failure);
+}
+
+test "ask_user_question noninteractive returns sentinel before parsing" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, "not-json");
+    const input = switch (decoded) {
+        .failure => |body| {
+            defer alloc.free(body);
+            return error.TestExpectedEqual;
+        },
+        .input => |owned| owned,
+    };
+    defer input.deinit(alloc);
+
+    const result = try call(.{ .allocator = alloc }, input);
+    defer result.deinit(alloc);
+
+    switch (result) {
+        .success => |body| try std.testing.expectEqualStrings(not_available_sentinel, body),
+        .failure => return error.TestExpectedEqual,
+    }
+}

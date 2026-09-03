@@ -9,19 +9,14 @@ const linux_self_exe = "/proc/self/exe";
 
 /// Returns an owned path that re-execs this process. Linux uses
 /// `/proc/self/exe` so replacing the on-disk binary does not break later spawns.
-pub const ReexecError = Allocator.Error || error{ExecutableNotFound};
-
-pub fn pathForReexec(alloc: Allocator) ReexecError![]u8 {
+pub fn pathForReexec(alloc: Allocator) ![]u8 {
     if (testProductExe()) |path| return alloc.dupe(u8, path);
     return productionPathForReexec(alloc);
 }
 
-fn productionPathForReexec(alloc: Allocator) ReexecError![]u8 {
+fn productionPathForReexec(alloc: Allocator) ![]u8 {
     if (comptime builtin.os.tag == .linux) return alloc.dupe(u8, linux_self_exe);
-    return std.process.executablePathAlloc(io_mod.getIo(), alloc) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.ExecutableNotFound,
-    };
+    return std.process.executablePathAlloc(io_mod.getIo(), alloc);
 }
 
 /// Returns an owned path another process can use to launch fx. Linux prefers
@@ -78,4 +73,70 @@ fn testProductExe() ?[]const u8 {
     const path_z = std.c.getenv("FX_TEST_PRODUCT_EXE") orelse return null;
     const path = std.mem.sliceTo(path_z, 0);
     return if (path.len == 0) null else path;
+}
+
+test "linux re-exec paths name the live inode, not the replaced on-disk file" {
+    if (builtin.os.tag != .linux) return;
+    const alloc = std.testing.allocator;
+
+    // Bypass the test override to cover the Linux production branch.
+    const same_process = try productionPathForReexec(alloc);
+    defer alloc.free(same_process);
+    try std.testing.expectEqualStrings(linux_self_exe, same_process);
+
+    const peer = try productionPathForPeerReexec(alloc);
+    defer alloc.free(peer);
+
+    const resolved = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch null;
+    defer if (resolved) |owned| alloc.free(owned);
+    if (resolved) |on_disk| {
+        try std.testing.expect(!std.mem.eql(u8, on_disk, same_process));
+        try std.testing.expect(try sameFile(same_process, on_disk));
+        if (onDiskPathIsExecutable(on_disk)) {
+            try std.testing.expectEqualStrings(on_disk, peer);
+        } else {
+            const expected_peer = try std.fmt.allocPrint(alloc, "/proc/{d}/exe", .{std.c.getpid()});
+            defer alloc.free(expected_peer);
+            try std.testing.expectEqualStrings(expected_peer, peer);
+        }
+    }
+}
+
+test "peer re-exec path prefers a name that outlives this process" {
+    if (builtin.os.tag != .linux) return;
+    const alloc = std.testing.allocator;
+    const path = try productionPathForPeerReexec(alloc);
+    defer alloc.free(path);
+    // Fall back to procfs only after the durable on-disk name disappears.
+    if (std.mem.startsWith(u8, path, "/proc/")) {
+        const resolved = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch return;
+        defer alloc.free(resolved);
+        try std.testing.expect(!onDiskPathIsExecutable(resolved));
+        return;
+    }
+    try std.testing.expect(onDiskPathIsExecutable(path));
+}
+
+test "on-disk probe rejects a replaced binary so the peer path falls back" {
+    if (builtin.os.tag != .linux) return;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir_path);
+    const victim = try std.fs.path.join(alloc, &.{ dir_path, "fx-probe" });
+    defer alloc.free(victim);
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), victim, .{});
+        file.close(io_mod.getIo());
+    }
+    try std.testing.expect(onDiskPathIsExecutable(victim));
+
+    try std.Io.Dir.cwd().deleteFile(io_mod.getIo(), victim);
+    try std.testing.expect(!onDiskPathIsExecutable(victim));
+
+    // Peer paths must be absolute.
+    try std.testing.expect(!onDiskPathIsExecutable("fx"));
 }

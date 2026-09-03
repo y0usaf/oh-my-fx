@@ -29,3 +29,18 @@ pub const StreamingEstimator = struct {
         return span_bytes / 4 + @intFromBool(span_bytes % 4 != 0);
     }
 };
+
+test "StreamingEstimator is invariant across chunk boundaries" {
+    const text = "split 你好 inside words";
+
+    var one_shot = StreamingEstimator{};
+    one_shot.consume(text);
+    const expected = one_shot.estimate();
+
+    for (0..text.len + 1) |split| {
+        var fragmented = StreamingEstimator{};
+        fragmented.consume(text[0..split]);
+        fragmented.consume(text[split..]);
+        try std.testing.expectEqual(expected, fragmented.estimate());
+    }
+}

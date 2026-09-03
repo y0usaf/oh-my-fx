@@ -500,3 +500,51 @@ fn keywordContainsSchemas(dialect: Dialect, keyword: []const u8) bool {
         std.mem.eql(u8, keyword, "not") or
         (dialect == .draft_2020_12 and std.mem.eql(u8, keyword, "contentSchema"));
 }
+
+test "resolver scopes anchors to resources and resolves RFC 3986 relative identifiers" {
+    const schema_json =
+        \\{
+        \\  "$id":"https://example.test/schemas/root.json",
+        \\  "$anchor":"value",
+        \\  "$defs":{
+        \\    "inner":{"$id":"nested/inner.json","$anchor":"value","type":"integer"},
+        \\    "other":{"$id":"nested/dir/other.json","$ref":"../inner.json#value"}
+        \\  }
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, schema_json, .{});
+    defer parsed.deinit();
+    var resolver = try Resolver.init(std.testing.allocator, parsed.value, .draft_2020_12, .{
+        .max_depth = 64,
+        .max_nodes = 1024,
+        .max_uri_bytes = 64 * 1024,
+    });
+    defer resolver.deinit();
+
+    const other = try resolver.resolve(0, "nested/dir/other.json");
+    const inner = try resolver.resolve(other.resource_index, "../inner.json#value");
+    try std.testing.expectEqual(AnchorKind.static, inner.anchor_kind.?);
+    try std.testing.expect(inner.schema.object.get("type") != null);
+    const root_anchor = try resolver.resolve(0, "#value");
+    try std.testing.expect(!sameObject(root_anchor.schema, inner.schema));
+}
+
+test "resolver rejects unregistered external documents without I/O" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"$id\":\"https://example.test/root\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    var resolver = try Resolver.init(std.testing.allocator, parsed.value, .draft_2020_12, .{
+        .max_depth = 64,
+        .max_nodes = 1024,
+        .max_uri_bytes = 64 * 1024,
+    });
+    defer resolver.deinit();
+    try std.testing.expectError(
+        error.ExternalReference,
+        resolver.resolve(0, "https://example.test/external"),
+    );
+}

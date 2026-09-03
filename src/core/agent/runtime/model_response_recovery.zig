@@ -6,6 +6,7 @@ pub const max_retry_after_seconds: u64 = 30;
 pub const FailureCause = enum {
     transport_interrupted,
     response_interrupted,
+    provider_stream_timeout,
     provider_unavailable,
     rate_limited,
     system_resumed,
@@ -112,6 +113,13 @@ pub noinline fn decide(evidence: Evidence) Decision {
         .content_filter => return .{
             .strategy = .stop,
             .required_action = .change_request,
+        },
+        .provider_stream_timeout => return .{
+            .strategy = .pause,
+            .required_action = if (evidence.tool == .uncertain)
+                .inspect_uncertain_tool
+            else
+                .continue_later,
         },
         .request_limit_reached => return .{
             .strategy = .pause,
@@ -270,4 +278,280 @@ pub fn exactContinuationOverlap(
         if (incoming[matched] == byte) matched += 1;
     }
     return matched;
+}
+
+test "model response recovery policy is deterministic and bounded" {
+    const base = Evidence{
+        .cause = .transport_interrupted,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+    };
+    const first = decide(base);
+    try std.testing.expectEqual(first, decide(base));
+    try std.testing.expectEqual(Strategy.retry_request, first.strategy);
+    try std.testing.expect(first.reserve_provider_attempt);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), first.delay_ns);
+
+    var partial = base;
+    partial.output = .partial;
+    try std.testing.expectEqual(Strategy.continue_response, decide(partial).strategy);
+
+    var unexecuted = partial;
+    unexecuted.tool = .proven_unexecuted;
+    try std.testing.expectEqual(Strategy.regenerate_tool, decide(unexecuted).strategy);
+
+    var uncertain = partial;
+    uncertain.tool = .uncertain;
+    try std.testing.expectEqual(Strategy.reconcile_tool, decide(uncertain).strategy);
+
+    var definitely_unsent = uncertain;
+    definitely_unsent.delivery = .definitely_unsent;
+    try std.testing.expectEqual(Strategy.retry_request, decide(definitely_unsent).strategy);
+
+    var exhausted = base;
+    exhausted.attempts.consumed = exhausted.attempts.limit;
+    const paused = decide(exhausted);
+    try std.testing.expectEqual(Strategy.pause, paused.strategy);
+    try std.testing.expect(!paused.reserve_provider_attempt);
+
+    var request_limit = base;
+    request_limit.cause = .request_limit_reached;
+    const request_limit_pause = decide(request_limit);
+    try std.testing.expectEqual(Strategy.pause, request_limit_pause.strategy);
+    try std.testing.expect(!request_limit_pause.reserve_provider_attempt);
+}
+
+test "gateway stream timeout pauses without reserving another attempt" {
+    const paused = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+    });
+    try std.testing.expectEqual(Strategy.pause, paused.strategy);
+    try std.testing.expectEqual(RequiredAction.continue_later, paused.required_action);
+    try std.testing.expect(!paused.reserve_provider_attempt);
+    try std.testing.expectEqual(@as(u64, 0), paused.delay_ns);
+
+    const uncertain_tool = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+        .tool = .uncertain,
+    });
+    try std.testing.expectEqual(Strategy.pause, uncertain_tool.strategy);
+    try std.testing.expectEqual(
+        RequiredAction.inspect_uncertain_tool,
+        uncertain_tool.required_action,
+    );
+    try std.testing.expect(!uncertain_tool.reserve_provider_attempt);
+
+    const cancelled = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+        .cancelled = true,
+    });
+    try std.testing.expectEqual(Strategy.stop, cancelled.strategy);
+}
+
+test "retry after and cancellation override automatic recovery" {
+    const base = Evidence{
+        .cause = .rate_limited,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 3 },
+    };
+
+    var bounded = base;
+    bounded.retry_after_seconds = 30;
+    const wait = decide(bounded);
+    try std.testing.expectEqual(Strategy.retry_request, wait.strategy);
+    try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_s), wait.delay_ns);
+
+    var over_cap = base;
+    over_cap.retry_after_seconds = 31;
+    const capped = decide(over_cap);
+    try std.testing.expectEqual(Strategy.retry_request, capped.strategy);
+    try std.testing.expectEqual(
+        @as(u64, max_retry_after_seconds * std.time.ns_per_s),
+        capped.delay_ns,
+    );
+    try std.testing.expect(capped.reserve_provider_attempt);
+
+    var overflow = base;
+    overflow.retry_after_seconds = std.math.maxInt(u64);
+    const overflow_capped = decide(overflow);
+    try std.testing.expectEqual(Strategy.retry_request, overflow_capped.strategy);
+    try std.testing.expectEqual(
+        @as(u64, max_retry_after_seconds * std.time.ns_per_s),
+        overflow_capped.delay_ns,
+    );
+    try std.testing.expect(overflow_capped.reserve_provider_attempt);
+
+    var cancelled = base;
+    cancelled.cancelled = true;
+    try std.testing.expectEqual(Strategy.stop, decide(cancelled).strategy);
+}
+
+test "retry schedule uses the approved cap" {
+    const expected = [_]u64{
+        250 * std.time.ns_per_ms,
+        1 * std.time.ns_per_s,
+        2 * std.time.ns_per_s,
+        4 * std.time.ns_per_s,
+        8 * std.time.ns_per_s,
+        16 * std.time.ns_per_s,
+        30 * std.time.ns_per_s,
+        30 * std.time.ns_per_s,
+        30 * std.time.ns_per_s,
+    };
+    var total: u64 = 0;
+    for (expected, 1..) |delay, attempt| {
+        try std.testing.expectEqual(delay, retryDelayNs(attempt));
+        total += delay;
+    }
+    try std.testing.expectEqual(
+        @as(u64, 121_250 * std.time.ns_per_ms),
+        total,
+    );
+}
+
+test "implicit retry pacing is independent from the shared attempt budget" {
+    const first_network = decide(.{
+        .cause = .transport_interrupted,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 6 },
+    });
+
+    try std.testing.expectEqual(Strategy.retry_request, first_network.strategy);
+    try std.testing.expectEqual(
+        @as(u64, 250 * std.time.ns_per_ms),
+        first_network.delay_ns,
+    );
+
+    const second_network = decide(.{
+        .cause = .transport_interrupted,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 7 },
+        .pacing = first_network.next_pacing,
+    });
+    try std.testing.expectEqual(
+        @as(u64, std.time.ns_per_s),
+        second_network.delay_ns,
+    );
+
+    const provider_failure = decide(.{
+        .cause = .provider_unavailable,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 8 },
+        .pacing = second_network.next_pacing,
+    });
+    try std.testing.expectEqual(
+        @as(u64, 250 * std.time.ns_per_ms),
+        provider_failure.delay_ns,
+    );
+
+    const explicitly_timed = decide(.{
+        .cause = .provider_unavailable,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 9 },
+        .pacing = provider_failure.next_pacing,
+        .retry_after_seconds = 0,
+    });
+    try std.testing.expectEqual(@as(u64, 0), explicitly_timed.delay_ns);
+    try std.testing.expectEqual(RetryPacingState.idle, explicitly_timed.next_pacing);
+}
+
+test "system resume strategy uses independent retry pacing" {
+    const retrying = decide(.{
+        .cause = .system_resumed,
+        .delivery = .definitely_unsent,
+        .attempts = .{ .consumed = 4 },
+    });
+    try std.testing.expectEqual(Strategy.retry_request, retrying.strategy);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), retrying.delay_ns);
+    try std.testing.expect(retrying.reserve_provider_attempt);
+
+    const continuing = decide(.{
+        .cause = .system_resumed,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 4 },
+        .output = .partial,
+    });
+    try std.testing.expectEqual(Strategy.continue_response, continuing.strategy);
+    try std.testing.expect(continuing.reserve_provider_attempt);
+
+    const exhausted = decide(.{
+        .cause = .system_resumed,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 10 },
+    });
+    try std.testing.expectEqual(Strategy.pause, exhausted.strategy);
+}
+
+test "fast fallback is limited to replay safe provider outages" {
+    try std.testing.expect(shouldDisableFastRoute(true, .provider_unavailable, true));
+    try std.testing.expect(!shouldDisableFastRoute(false, .provider_unavailable, true));
+    try std.testing.expect(!shouldDisableFastRoute(true, .provider_unavailable, false));
+    try std.testing.expect(!shouldDisableFastRoute(true, .rate_limited, true));
+    try std.testing.expect(!shouldDisableFastRoute(true, .transport_interrupted, true));
+}
+
+test "continuation overlap removes exact repetition only" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        existing: []const u8,
+        incoming: []const u8,
+        expected: usize,
+    }{
+        .{ .existing = "", .incoming = "next", .expected = 0 },
+        .{ .existing = "hello", .incoming = " world", .expected = 0 },
+        .{ .existing = "hello world", .incoming = "world again", .expected = 5 },
+        .{ .existing = "abcabc", .incoming = "abcX", .expected = 3 },
+        .{ .existing = "same", .incoming = "same", .expected = 4 },
+        .{ .existing = "caf\xc3\xa9", .incoming = "\xc3\xa9 noir", .expected = 2 },
+        .{ .existing = "almost", .incoming = "Almost", .expected = 0 },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            try exactContinuationOverlap(alloc, case.existing, case.incoming),
+        );
+    }
+}
+
+test "continuation overlap remains exact for a long repetitive no-match boundary" {
+    const alloc = std.testing.allocator;
+    const boundary_len = 32 * 1024;
+    const existing = try alloc.alloc(u8, boundary_len);
+    defer alloc.free(existing);
+    const incoming = try alloc.alloc(u8, boundary_len);
+    defer alloc.free(incoming);
+    @memset(existing, 'a');
+    @memset(incoming, 'a');
+    existing[existing.len - 1] = 'b';
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try exactContinuationOverlap(alloc, existing, incoming),
+    );
+}
+
+test "continuation extension probe never exceeds its comparison budget" {
+    const alloc = std.testing.allocator;
+    const boundary_len = 4096;
+    const existing = try alloc.alloc(u8, boundary_len);
+    defer alloc.free(existing);
+    const incoming = try alloc.alloc(u8, boundary_len - 1);
+    defer alloc.free(incoming);
+    @memset(existing, 'a');
+    @memset(incoming, 'a');
+    existing[existing.len - 1] = 'b';
+
+    const possible = probeContinuationExtension(existing, incoming, incoming.len);
+    try std.testing.expectEqual(ContinuationProbeOutcome.may_extend, possible.outcome);
+    try std.testing.expectEqual(incoming.len, possible.comparisons);
+
+    const exhausted = probeContinuationExtension(existing, incoming, 1);
+    try std.testing.expectEqual(ContinuationProbeOutcome.budget_exhausted, exhausted.outcome);
+    try std.testing.expectEqual(@as(usize, 1), exhausted.comparisons);
 }

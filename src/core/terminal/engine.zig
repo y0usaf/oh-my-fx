@@ -227,6 +227,13 @@ noinline fn failGridDynamic(err: anyerror) anyerror!Grid {
     return err;
 }
 
+test "grid failures preserve exact error types and identities" {
+    const invalid = failGrid(error.InvalidGridSize);
+    try std.testing.expect(@TypeOf(invalid) == error{InvalidGridSize}!Grid);
+    try std.testing.expectError(error.InvalidGridSize, invalid);
+    try std.testing.expectError(error.OutOfMemory, failGrid(error.OutOfMemory));
+}
+
 pub const Grid = struct {
     alloc: Allocator,
     rows: u16,
@@ -2949,100 +2956,6 @@ fn renderColor(color: Color) contracts.CellColor {
     };
 }
 
-/// Paint an immutable engine snapshot as the complete outer terminal
-/// viewport. This deliberately does not add fx chrome: every visible cell,
-/// cursor fact, and interactive terminal mode comes from the hosted child.
-pub fn writeFullSnapshot(
-    snapshot: contracts.RenderSnapshot,
-    out: *std.Io.Writer,
-) !void {
-    try snapshot.validate();
-    try out.writeAll(
-        "\x1b[?2026h\x1b[?25l\x1b[?6l\x1b[4l\x1b[?7l" ++
-            "\x1b[0m\x1b[H\x1b[2J",
-    );
-
-    var current_style = contracts.CellStyle{};
-    var row: u16 = 0;
-    while (row < snapshot.dimensions.rows) : (row += 1) {
-        try out.print("\x1b[{d};1H", .{row + 1});
-        var column: u16 = 0;
-        while (column < snapshot.dimensions.columns) : (column += 1) {
-            const index = @as(usize, row) * snapshot.dimensions.columns + column;
-            const cell = snapshot.cells[index];
-            if (cell.kind == .continuation) continue;
-            if (!std.meta.eql(current_style, cell.style)) {
-                try emitSnapshotStyle(out, cell.style);
-                current_style = cell.style;
-            }
-            switch (cell.kind) {
-                .blank => try out.writeByte(' '),
-                .single, .wide => try out.writeAll(cell.text),
-                .continuation => unreachable,
-            }
-        }
-    }
-
-    if (!std.meta.eql(current_style, contracts.CellStyle{})) {
-        try out.writeAll("\x1b[0m");
-    }
-    try out.print("\x1b[{d};{d}H", .{
-        snapshot.cursor.row + 1,
-        snapshot.cursor.column + 1,
-    });
-    try writeCursorShape(out, snapshot.cursor);
-    try writeSnapshotModes(out, snapshot.modes);
-    try out.writeAll(if (snapshot.cursor.visible) "\x1b[?25h" else "\x1b[?25l");
-    try out.writeAll("\x1b[?2026l");
-}
-
-fn emitSnapshotStyle(out: *std.Io.Writer, style: contracts.CellStyle) !void {
-    try emitSgrTransition(out, .{
-        .fg = snapshotColor(style.foreground),
-        .bg = snapshotColor(style.background),
-        .flags = .{
-            .bold = style.bold,
-            .dim = style.faint,
-            .italic = style.italic,
-            .underline = style.underline,
-            .reverse = style.inverse,
-            .strike = style.strikethrough,
-        },
-    });
-}
-
-fn snapshotColor(color: contracts.CellColor) Color {
-    return switch (color) {
-        .default => .default,
-        .indexed => |index| .{ .indexed = index },
-        .rgb => |rgb| .{ .rgb = .{ .r = rgb.red, .g = rgb.green, .b = rgb.blue } },
-    };
-}
-
-fn writeCursorShape(out: *std.Io.Writer, cursor: contracts.RenderCursor) !void {
-    const shape: u8 = switch (cursor.shape) {
-        .block => if (cursor.blinking) 1 else 2,
-        .underline => if (cursor.blinking) 3 else 4,
-        .bar => if (cursor.blinking) 5 else 6,
-    };
-    try out.print("\x1b[{d} q", .{shape});
-}
-
-fn writeSnapshotModes(out: *std.Io.Writer, modes: contracts.TerminalModes) !void {
-    try out.writeAll(if (modes.origin) "\x1b[?6h" else "\x1b[?6l");
-    try out.writeAll(if (modes.insert) "\x1b[4h" else "\x1b[4l");
-    try out.writeAll(if (modes.autowrap) "\x1b[?7h" else "\x1b[?7l");
-    try out.writeAll(if (modes.bracketed_paste) "\x1b[?2004h" else "\x1b[?2004l");
-    try out.writeAll(if (modes.mouse_tracking)
-        "\x1b[?1002h\x1b[?1006h"
-    else
-        "\x1b[?1000l\x1b[?1002l\x1b[?1006l");
-    try out.writeAll(if (modes.focus_tracking) "\x1b[?1004h" else "\x1b[?1004l");
-    try out.writeAll(if (modes.application_cursor_keys) "\x1b[?1h" else "\x1b[?1l");
-    try out.writeAll(if (modes.application_keypad) "\x1b=" else "\x1b>");
-    try out.writeAll(if (modes.keyboard_protocol) "\x1b[>1u" else "\x1b[<u");
-}
-
 fn physicalRowIndex(origin: u16, logical_row: u16, rows: u16) usize {
     std.debug.assert(rows > 0);
     std.debug.assert(origin < rows);
@@ -3267,6 +3180,716 @@ fn expectWideCellInvariant(grid: Grid) !void {
     }
 }
 
+test "plain writes land on the grid" {
+    var g = try Grid.init(testing.allocator, 10, 3);
+    defer g.deinit();
+    try g.feed("hello");
+    try expectRow(g, 1, "hello");
+    try testing.expectEqual(@as(u16, 6), g.cursor_col);
+    try testing.expectEqual(@as(u16, 1), g.cursor_row);
+}
+
+test "CUP moves the cursor" {
+    var g = try Grid.init(testing.allocator, 10, 4);
+    defer g.deinit();
+    try g.feed("\x1b[2;3Hab");
+    try expectRow(g, 2, "  ab");
+    try testing.expectEqual(@as(u16, 5), g.cursor_col);
+    try testing.expectEqual(@as(u16, 2), g.cursor_row);
+}
+
+test "LF advances to the next row at column 1" {
+    var g = try Grid.init(testing.allocator, 10, 3);
+    defer g.deinit();
+    try g.feed("a\nb\nc");
+    try expectRow(g, 1, "a");
+    try expectRow(g, 2, "b");
+    try expectRow(g, 3, "c");
+}
+
+test "CR returns to column 1 without advancing row" {
+    var g = try Grid.init(testing.allocator, 10, 2);
+    defer g.deinit();
+    try g.feed("abc\rXY");
+    try expectRow(g, 1, "XYc");
+}
+
+test "EL 2K clears the whole line" {
+    var g = try Grid.init(testing.allocator, 10, 2);
+    defer g.deinit();
+    try g.feed("hello world");
+    try g.feed("\x1b[1;1H\x1b[2K");
+    try expectRow(g, 1, "");
+}
+
+test "EL K clears cursor to end of line" {
+    var g = try Grid.init(testing.allocator, 10, 2);
+    defer g.deinit();
+    try g.feed("hello");
+    try g.feed("\x1b[1;3H\x1b[K");
+    try expectRow(g, 1, "he");
+}
+
+test "EL 0 expands a continuation boundary to the complete wide glyph" {
+    var g = try Grid.init(testing.allocator, 4, 1);
+    defer g.deinit();
+    try g.feed("ab界");
+    try g.feed("\x1b[1;4H\x1b[K");
+    try expectWideCellInvariant(g);
+    try expectRow(g, 1, "ab");
+}
+
+test "EL 1 expands a lead boundary to the complete wide glyph" {
+    var g = try Grid.init(testing.allocator, 4, 1);
+    defer g.deinit();
+    try g.feed("界xy");
+    try g.feed("\x1b[1;1H\x1b[1K");
+    try expectWideCellInvariant(g);
+    try expectRow(g, 1, "  xy");
+}
+
+test "ED J clears cursor to end of display" {
+    var g = try Grid.init(testing.allocator, 5, 3);
+    defer g.deinit();
+    try g.feed("\x1b[1;1Haaaaa\x1b[2;1Hbbbbb\x1b[3;1Hccccc");
+    try g.feed("\x1b[2;1H\x1b[J");
+    try expectRow(g, 1, "aaaaa");
+    try expectRow(g, 2, "");
+    try expectRow(g, 3, "");
+}
+
+test "ED 0 expands a continuation boundary to the complete wide glyph" {
+    var g = try Grid.init(testing.allocator, 4, 2);
+    defer g.deinit();
+    try g.feed("ab界");
+    try g.feed("\x1b[1;4H\x1b[J");
+    try expectWideCellInvariant(g);
+    try expectRow(g, 1, "ab");
+    try expectRow(g, 2, "");
+}
+
+test "ED 1 expands a lead boundary to the complete wide glyph" {
+    var g = try Grid.init(testing.allocator, 4, 2);
+    defer g.deinit();
+    try g.feed("\x1b[2;1H界xy");
+    try g.feed("\x1b[2;1H\x1b[1J");
+    try expectWideCellInvariant(g);
+    try expectRow(g, 1, "");
+    try expectRow(g, 2, "  xy");
+}
+
+test "ED 2J clears the entire display" {
+    var g = try Grid.init(testing.allocator, 4, 2);
+    defer g.deinit();
+    try g.feed("\x1b[1;1Hab\x1b[2;1Hcd");
+    try g.feed("\x1b[2J");
+    try expectRow(g, 1, "");
+    try expectRow(g, 2, "");
+}
+
+test "autowrap wraps past cols; ?7l disables wrap" {
+    var g = try Grid.init(testing.allocator, 4, 3);
+    defer g.deinit();
+    try g.feed("abcdef");
+    try expectRow(g, 1, "abcd");
+    try expectRow(g, 2, "ef");
+
+    try g.feed("\x1b[3;1H\x1b[?7lXXXXXYY");
+    try expectRow(g, 3, "XXXY");
+}
+
+test "horizontal tab clears pending wrap and uses the next absolute stop" {
+    var margin = try Grid.init(testing.allocator, 8, 2);
+    defer margin.deinit();
+    var stats: FeedStats = .{};
+    try margin.feedWithStats("12345678\tX", &stats);
+    try expectRow(margin, 1, "1234567X");
+    try expectRow(margin, 2, "");
+    try testing.expectEqual(@as(u16, 1), margin.cursor_row);
+    try testing.expectEqual(@as(u16, 8), margin.cursor_col);
+    try testing.expect(margin.pending_wrap);
+    try testing.expectEqual(@as(u16, 0), stats.scroll_rows);
+
+    var ordinary = try Grid.init(testing.allocator, 16, 1);
+    defer ordinary.deinit();
+    try ordinary.feed("a\tb");
+    try expectRow(ordinary, 1, "a       b");
+    try testing.expectEqual(@as(u16, 10), ordinary.cursor_col);
+}
+
+test "combining marks preserve base-character wrap geometry" {
+    var base = try Grid.init(testing.allocator, 4, 2);
+    defer base.deinit();
+    var base_stats: FeedStats = .{};
+    try base.feedWithStats("eeeee", &base_stats);
+
+    var decomposed = try Grid.init(testing.allocator, 4, 2);
+    defer decomposed.deinit();
+    var decomposed_stats: FeedStats = .{};
+    try decomposed.feedWithStats("e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}", &decomposed_stats);
+
+    try testing.expectEqual(base.cursor_row, decomposed.cursor_row);
+    try testing.expectEqual(base.cursor_col, decomposed.cursor_col);
+    try testing.expectEqual(base.pending_wrap, decomposed.pending_wrap);
+    try testing.expectEqual(base_stats.max_row_touched, decomposed_stats.max_row_touched);
+    try testing.expectEqual(base_stats.scrolled, decomposed_stats.scrolled);
+    try testing.expectEqual(base_stats.scroll_rows, decomposed_stats.scroll_rows);
+}
+
+test "combining marks remain attached to the base cell text" {
+    var g = try Grid.init(testing.allocator, 8, 1);
+    defer g.deinit();
+
+    try g.feed("e\u{0301}\u{0327}x");
+
+    try expectRow(g, 1, "e\u{0301}\u{0327}x");
+    try testing.expectEqual(@as(u16, 3), g.cursor_col);
+}
+
+test "repeated combining suffixes reuse grid storage" {
+    var g = try Grid.init(testing.allocator, 8, 1);
+    defer g.deinit();
+
+    try g.feed("e\u{0301}e\u{0301}e\u{0301}");
+
+    try testing.expectEqual(@as(usize, 1), g.combining_suffix_pool.items.len);
+}
+
+test "combining marks survive Grid clone" {
+    var source = try Grid.init(testing.allocator, 8, 1);
+    defer source.deinit();
+    try source.feed("e\u{0301}\u{0327}");
+
+    var cloned = try source.clone(testing.allocator);
+    defer cloned.deinit();
+
+    try expectRow(cloned, 1, "e\u{0301}\u{0327}");
+}
+
+test "combining suffix clears with overwritten and erased cells" {
+    var g = try Grid.init(testing.allocator, 8, 1);
+    defer g.deinit();
+
+    try g.feed("e\u{0301}");
+    try g.feed("\x1b[1;1Hx");
+    try expectRow(g, 1, "x");
+    try testing.expectEqual(@as(u32, 0), g.cellAt(1, 1).?.combining_suffix_id);
+
+    try g.feed("\x1b[1;1He\u{0301}\x1b[2K");
+    try expectRow(g, 1, "");
+    try testing.expectEqual(@as(u32, 0), g.cellAt(1, 1).?.combining_suffix_id);
+}
+
+test "combining marks attach to a wide lead at pending wrap" {
+    var g = try Grid.init(testing.allocator, 3, 1);
+    defer g.deinit();
+
+    try g.feed("a界\u{0301}");
+
+    try expectRow(g, 1, "a界\u{0301}");
+    try testing.expect(g.pending_wrap);
+    try testing.expectEqual(@as(u16, 3), g.cursor_col);
+    try testing.expect(g.cellAt(1, 2).?.combining_suffix_id != 0);
+    try testing.expectEqual(@as(u32, 0), g.cellAt(1, 3).?.combining_suffix_id);
+}
+
+test "Unicode display units preserve bytes and terminal geometry" {
+    const Case = struct {
+        text: []const u8,
+        width: u8,
+    };
+    const cases = [_]Case{
+        .{ .text = "\u{2600}\u{FE0E}", .width = 1 },
+        .{ .text = "\u{231A}\u{FE0E}", .width = 2 },
+        .{ .text = "\u{2600}\u{FE0F}", .width = 2 },
+        .{ .text = "\u{1F44D}\u{1F3FD}", .width = 2 },
+        .{ .text = "\u{1F1FA}\u{1F1F8}", .width = 2 },
+        .{ .text = "#\u{FE0F}\u{20E3}", .width = 2 },
+        .{ .text = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}", .width = 2 },
+        .{ .text = "\u{1F469}\u{200D}\u{1F4BB}", .width = 2 },
+    };
+
+    for (cases) |case| {
+        var grid = try Grid.init(testing.allocator, 16, 1);
+        defer grid.deinit();
+        try grid.feed("A");
+        try grid.feed(case.text);
+        try grid.feed("B");
+
+        var expected: std.ArrayList(u8) = .empty;
+        defer expected.deinit(testing.allocator);
+        try expected.append(testing.allocator, 'A');
+        try expected.appendSlice(testing.allocator, case.text);
+        try expected.append(testing.allocator, 'B');
+        try expectRow(grid, 1, expected.items);
+        try testing.expectEqual(@as(u16, case.width) + 3, grid.cursor_col);
+
+        const lead = grid.cellAt(1, 2).?;
+        try testing.expectEqual(case.width, lead.width);
+        const first = decodeUtf8(case.text, 0);
+        try testing.expectEqual(first.codepoint, lead.codepoint);
+        try testing.expectEqualStrings(
+            case.text[first.len..],
+            grid.combiningSuffix(lead.combining_suffix_id).?,
+        );
+
+        var cloned = try grid.clone(testing.allocator);
+        defer cloned.deinit();
+        try expectRow(cloned, 1, expected.items);
+    }
+}
+
+test "Unicode display-unit suffixes clear on overwrite and erase" {
+    const cases = [_][]const u8{
+        "\u{2600}\u{FE0E}",
+        "\u{1F44D}\u{1F3FD}",
+        "\u{1F469}\u{200D}\u{1F4BB}",
+    };
+
+    for (cases) |text| {
+        var grid = try Grid.init(testing.allocator, 8, 1);
+        defer grid.deinit();
+
+        try grid.feed(text);
+        try grid.feed("\x1b[1;1HX");
+        try expectRow(grid, 1, "X");
+        try testing.expectEqual(@as(u32, 0), grid.cellAt(1, 1).?.combining_suffix_id);
+
+        try grid.feed("\x1b[1;1H");
+        try grid.feed(text);
+        try grid.feed("\x1b[1;1H\x1b[2K");
+        try expectRow(grid, 1, "");
+        try testing.expectEqual(@as(u32, 0), grid.cellAt(1, 1).?.combining_suffix_id);
+    }
+}
+
+test "Unicode display units survive resize while intact and clear when clipped" {
+    const tag_flag = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+    var grid = try Grid.init(testing.allocator, 3, 1);
+    defer grid.deinit();
+    try grid.feed(tag_flag ++ "x");
+
+    try grid.resize(6, 2);
+    try expectRow(grid, 1, tag_flag ++ "x");
+    try grid.resize(3, 1);
+    try expectRow(grid, 1, tag_flag ++ "x");
+    try grid.resize(1, 1);
+    try expectRow(grid, 1, "");
+    try testing.expectEqual(@as(u32, 0), grid.cellAt(1, 1).?.combining_suffix_id);
+}
+
+test "SGR is swallowed, text content is preserved" {
+    var g = try Grid.init(testing.allocator, 8, 1);
+    defer g.deinit();
+    try g.feed("\x1b[38;5;240m[sys]\x1b[0m x");
+    try expectRow(g, 1, "[sys] x");
+}
+
+test "private keyboard mode does not alter SGR presentation" {
+    var g = try Grid.init(testing.allocator, 8, 1);
+    defer g.deinit();
+
+    try g.feed("\x1b[>4;2m");
+
+    try testing.expect(g.current_style.eql(.{}));
+}
+
+test "OSC title is discarded without affecting the grid" {
+    var g = try Grid.init(testing.allocator, 6, 1);
+    defer g.deinit();
+    try g.feed("\x1b]2;my title\x07text");
+    try expectRow(g, 1, "text");
+}
+
+test "OSC with ST (ESC backslash) terminator is discarded" {
+    var g = try Grid.init(testing.allocator, 6, 1);
+    defer g.deinit();
+    try g.feed("\x1b]11;rgb:0000/0000/0000\x1b\\hello");
+    try expectRow(g, 1, "hello");
+}
+
+test "DSR 6n is swallowed without side effects" {
+    var g = try Grid.init(testing.allocator, 6, 1);
+    defer g.deinit();
+    try g.feed("\x1b[6n");
+    try g.feed("ok");
+    try expectRow(g, 1, "ok");
+}
+
+test "resize grows keeping top-left content" {
+    var g = try Grid.init(testing.allocator, 4, 2);
+    defer g.deinit();
+    try g.feed("abcd\nef");
+    try g.resize(6, 3);
+    try expectRow(g, 1, "abcd");
+    try expectRow(g, 2, "ef");
+    try expectRow(g, 3, "");
+    try testing.expectEqual(@as(u16, 6), g.cols);
+    try testing.expectEqual(@as(u16, 3), g.rows);
+}
+
+test "resize shrinks clipping bottom/right without clearing" {
+    var g = try Grid.init(testing.allocator, 6, 3);
+    defer g.deinit();
+    try g.feed("\x1b[1;1Haaabbb\x1b[2;1Hxxxxxx\x1b[3;1Hyyyyyy");
+    try g.resize(4, 2);
+    try expectRow(g, 1, "aaab");
+    try expectRow(g, 2, "xxxx");
+    try testing.expectEqual(@as(u16, 4), g.cols);
+    try testing.expectEqual(@as(u16, 2), g.rows);
+}
+
+test "resize narrowing clears a wide glyph clipped at the right edge" {
+    var g = try Grid.init(testing.allocator, 4, 1);
+    defer g.deinit();
+    try g.feed("ab界");
+    try g.resize(3, 1);
+    try expectWideCellInvariant(g);
+    try expectRow(g, 1, "ab");
+}
+
+test "writes clear any complete wide glyph overlapping the destination" {
+    const Case = struct {
+        initial: []const u8,
+        col: u16,
+        replacement: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .initial = "界xy", .col = 1, .replacement = "a" },
+        .{ .initial = "界xy", .col = 2, .replacement = "a" },
+        .{ .initial = "界zz", .col = 2, .replacement = "界" },
+    };
+    for (cases) |case| {
+        var g = try Grid.init(testing.allocator, 4, 1);
+        defer g.deinit();
+        try g.feed(case.initial);
+        var cursor: [16]u8 = undefined;
+        const move = try std.fmt.bufPrint(&cursor, "\x1b[1;{d}H", .{case.col});
+        try g.feed(move);
+        try g.feed(case.replacement);
+        try expectWideCellInvariant(g);
+    }
+}
+
+test "scroll on LF at last row" {
+    var g = try Grid.init(testing.allocator, 4, 2);
+    defer g.deinit();
+    try g.feed("AAAA\nBBBB");
+    try g.feed("\nCCCC");
+    try expectRow(g, 1, "BBBB");
+    try expectRow(g, 2, "CCCC");
+}
+
+test "repeated scroll rotations preserve logical rows through clone resize and erase" {
+    var grid = try Grid.init(testing.allocator, 5, 3);
+    defer grid.deinit();
+    try grid.feed("one\ntwo\nthree\nfour\nfive");
+
+    try expectRow(grid, 1, "three");
+    try expectRow(grid, 2, "four");
+    try expectRow(grid, 3, "five");
+
+    var cloned = try grid.clone(testing.allocator);
+    defer cloned.deinit();
+    try testing.expect(gridsEqual(grid, cloned));
+
+    try cloned.feed("\x1b[2;2H\x1b[K");
+    try expectRow(cloned, 1, "three");
+    try expectRow(cloned, 2, "f");
+    try expectRow(cloned, 3, "five");
+
+    try grid.resize(7, 4);
+    try expectRow(grid, 1, "three");
+    try expectRow(grid, 2, "four");
+    try expectRow(grid, 3, "five");
+    try expectRow(grid, 4, "");
+    try testing.expectEqual(@as(u16, 0), grid.row_origin);
+}
+
+test "diff compares logical rows across different physical origins" {
+    var previous = try Grid.init(testing.allocator, 5, 3);
+    defer previous.deinit();
+    try previous.feed("one\ntwo\nthree\nfour");
+
+    var target = try Grid.init(testing.allocator, 5, 3);
+    defer target.deinit();
+    try target.feed("two\nthree\nfour");
+    try target.feed("\x1b[2;2HX");
+
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffTo(previous, target, &diff.writer);
+    try previous.feed(diff.written());
+
+    try testing.expect(gridsEqual(previous, target));
+}
+
+test "alternate screen restores a rotated normal grid" {
+    var grid = try Grid.init(testing.allocator, 5, 3);
+    defer grid.deinit();
+    try grid.feed("one\ntwo\nthree\nfour");
+
+    try grid.feed("\x1b[?1049h");
+    try grid.feed("alternate");
+    try grid.feed("\x1b[?1049l");
+
+    try expectRow(grid, 1, "two");
+    try expectRow(grid, 2, "three");
+    try expectRow(grid, 3, "four");
+}
+
+test "wide and combining cells survive repeated row rotations" {
+    var grid = try Grid.init(testing.allocator, 6, 2);
+    defer grid.deinit();
+    try grid.feed("界e\u{0301}\nplain\n界e\u{0301}");
+
+    try expectWideCellInvariant(grid);
+    try expectRow(grid, 1, "plain");
+    try expectRow(grid, 2, "界e\u{0301}");
+}
+
+test "snapshot renders full grid" {
+    var g = try Grid.init(testing.allocator, 3, 2);
+    defer g.deinit();
+    try g.feed("\x1b[1;1Hab\x1b[2;1Hcd");
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try g.snapshot(&buf);
+    try testing.expectEqualStrings("|ab |\n|cd |\n", buf.items);
+}
+
+test "sync updates buffer until DECRST" {
+    var g = try Grid.init(testing.allocator, 4, 2);
+    defer g.deinit();
+
+    try g.feed("\x1b[?2026h");
+    try g.feed("ab");
+    try expectRow(g, 1, "");
+
+    try g.feed("\x1b[?2026l");
+    try expectRow(g, 1, "ab");
+}
+
+test "alternate screen restores the normal grid after DECRST 1049" {
+    var g = try Grid.init(testing.allocator, 8, 2);
+    defer g.deinit();
+
+    try g.feed("normal");
+    try g.feed("\x1b[?25l\x1b[?1049h");
+    try testing.expect(!g.cursor_visible);
+    try g.feed("approval");
+    try expectRow(g, 1, "approval");
+
+    try g.feed("\x1b[?25h\x1b[?1049l");
+    try testing.expect(g.cursor_visible);
+    try expectRow(g, 1, "normal");
+}
+
+test "alternate screen preserves the resized normal grid after DECRST 1049" {
+    var g = try Grid.init(testing.allocator, 8, 2);
+    defer g.deinit();
+
+    try g.feed("normal");
+    try g.feed("\x1b[?1049h");
+    try g.feed("approval");
+    try g.resize(12, 3);
+    try g.feed("\x1b[2;1Hresized approval");
+
+    try g.feed("\x1b[?1049l");
+    try expectRow(g, 1, "normal");
+    try testing.expectEqual(@as(u16, 12), g.cols);
+    try testing.expectEqual(@as(u16, 3), g.rows);
+}
+
+test "partial CSI across feed boundaries" {
+    var g = try Grid.init(testing.allocator, 6, 2);
+    defer g.deinit();
+    try g.feed("\x1b[2;");
+    try g.feed("3Hx");
+    try expectRow(g, 2, "  x");
+}
+
+test "CAN and SUB cancel partial CSI and OSC parser state" {
+    var g = try Grid.init(testing.allocator, 12, 2);
+    defer g.deinit();
+
+    try g.feed("\x1b[2;");
+    try g.feed("\x18\x1b[1;1Hcsi");
+    try expectRow(g, 1, "csi");
+
+    try g.feed("\x1b]8;;https://bad.example");
+    try g.feed("\x1aplain");
+    try expectRow(g, 1, "csiplain");
+    try testing.expectEqual(@as(u32, 0), g.current_style.hyperlink_id);
+}
+
+test "SGR tracks indexed bg and applies it to written cells" {
+    var g = try Grid.init(testing.allocator, 6, 1);
+    defer g.deinit();
+    try g.feed("\x1b[48;5;236mhi\x1b[0m");
+    const c1 = g.cellAt(1, 1).?;
+    const c2 = g.cellAt(1, 2).?;
+    const c3 = g.cellAt(1, 3).?;
+    try testing.expect(c1.style.bg.eql(.{ .indexed = 236 }));
+    try testing.expect(c2.style.bg.eql(.{ .indexed = 236 }));
+    try testing.expect(c3.style.bg.eql(.default));
+}
+
+test "EL with active bg fills cleared cells with that bg" {
+    var g = try Grid.init(testing.allocator, 6, 1);
+    defer g.deinit();
+    try g.feed("\x1b[48;5;236mhi\x1b[K");
+    var col: u16 = 1;
+    while (col <= 6) : (col += 1) {
+        const c = g.cellAt(1, col).?;
+        try testing.expect(c.style.bg.eql(.{ .indexed = 236 }));
+    }
+}
+
+test "SGR 0 resets to default" {
+    var g = try Grid.init(testing.allocator, 4, 1);
+    defer g.deinit();
+    try g.feed("\x1b[1;4;48;5;236mhi\x1b[0mok");
+    const hi1 = g.cellAt(1, 1).?;
+    try testing.expect(hi1.style.flags.bold);
+    try testing.expect(hi1.style.flags.underline);
+    try testing.expect(hi1.style.bg.eql(.{ .indexed = 236 }));
+    const ok1 = g.cellAt(1, 3).?;
+    try testing.expect(!ok1.style.flags.bold);
+    try testing.expect(!ok1.style.flags.underline);
+    try testing.expect(ok1.style.bg.eql(.default));
+}
+
+test "SGR 9 and 29 apply and clear strikethrough" {
+    var g = try Grid.init(testing.allocator, 3, 1);
+    defer g.deinit();
+    try g.feed("\x1b[9mx\x1b[29my");
+
+    try testing.expect(g.cellAt(1, 1).?.style.flags.strike);
+    try testing.expect(!g.cellAt(1, 2).?.style.flags.strike);
+}
+
+test "presentation boundary resumes and steadies strikethrough" {
+    var source = try Grid.init(testing.allocator, 2, 1);
+    defer source.deinit();
+    try source.feed("\x1b[9mx");
+
+    var resume_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer resume_writer.deinit();
+    try source.writePresentationResume(&resume_writer.writer);
+    try testing.expectEqualStrings("\x1b[0m\x1b[9m", resume_writer.written());
+
+    var resumed = try Grid.init(testing.allocator, 2, 1);
+    defer resumed.deinit();
+    try resumed.feed(resume_writer.written());
+    try resumed.feed("y");
+    try testing.expect(resumed.cellAt(1, 1).?.style.flags.strike);
+
+    var steady_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer steady_writer.deinit();
+    try source.writePresentationSteady(&steady_writer.writer);
+    try testing.expectEqualStrings("\x1b[0m", steady_writer.written());
+
+    try resumed.feed(steady_writer.written());
+    try resumed.feed("z");
+    try testing.expect(!resumed.cellAt(1, 2).?.style.flags.strike);
+}
+
+test "presentation resume preserves OSC 8 parameters and close clears them" {
+    var source = try Grid.init(testing.allocator, 4, 1);
+    defer source.deinit();
+    try source.feed("\x1b]8;id=fx-42;https://example.com\x1b\\x");
+
+    var resume_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer resume_writer.deinit();
+    try source.writePresentationResume(&resume_writer.writer);
+    try testing.expectEqualStrings(
+        "\x1b]8;id=fx-42;https://example.com\x1b\\",
+        resume_writer.written(),
+    );
+
+    var steady_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer steady_writer.deinit();
+    try source.writePresentationSteady(&steady_writer.writer);
+    try testing.expectEqualStrings("\x1b]8;;\x1b\\", steady_writer.written());
+
+    try source.feed("\x1b]8;;\x1b\\");
+    var closed_writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer closed_writer.deinit();
+    try source.writePresentationResume(&closed_writer.writer);
+    try testing.expectEqualStrings("", closed_writer.written());
+}
+
+test "OSC 8 parameter replacement is atomic on allocation failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing.allocator();
+    var source = try Grid.init(alloc, 4, 1);
+    defer source.deinit();
+    try source.feed("\x1b]8;id=fx-old;https://example.com\x1b\\");
+    try source.osc_buffer.ensureTotalCapacity(alloc, 128);
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(
+        error.OutOfMemory,
+        source.feed("\x1b]8;id=fx-new;https://example.com\x1b\\"),
+    );
+    try testing.expect(source.atControlSequenceBoundary());
+
+    var old_resume_buf: [128]u8 = undefined;
+    var old_resume: std.Io.Writer = .fixed(&old_resume_buf);
+    try source.writePresentationResume(&old_resume);
+    try testing.expectEqualStrings(
+        "\x1b]8;id=fx-old;https://example.com\x1b\\",
+        old_resume.buffered(),
+    );
+
+    failing.fail_index = std.math.maxInt(usize);
+    try source.feed("\x1b]8;id=fx-new;https://example.com\x1b\\");
+    try testing.expectEqual(@as(usize, 1), source.hyperlink_pool.items.len);
+
+    var new_resume_buf: [128]u8 = undefined;
+    var new_resume: std.Io.Writer = .fixed(&new_resume_buf);
+    try source.writePresentationResume(&new_resume);
+    try testing.expectEqualStrings(
+        "\x1b]8;id=fx-new;https://example.com\x1b\\",
+        new_resume.buffered(),
+    );
+}
+
+test "SGR reset preserves active OSC 8 hyperlink until explicit close" {
+    var g = try Grid.init(testing.allocator, 4, 1);
+    defer g.deinit();
+    try g.feed("\x1b]8;;https://example.com\x1b\\\x1b[31mx\x1b[0my\x1b]8;;\x1b\\z");
+
+    const x = g.cellAt(1, 1).?;
+    const y = g.cellAt(1, 2).?;
+    const z = g.cellAt(1, 3).?;
+    try testing.expect(x.style.hyperlink_id != 0);
+    try testing.expectEqual(x.style.hyperlink_id, y.style.hyperlink_id);
+    try testing.expectEqual(@as(u32, 0), z.style.hyperlink_id);
+    try testing.expect(y.style.fg.eql(.default));
+}
+
+test "SGR truecolor 38;2;R;G;B" {
+    var g = try Grid.init(testing.allocator, 2, 1);
+    defer g.deinit();
+    try g.feed("\x1b[38;2;10;20;30mx");
+    const c = g.cellAt(1, 1).?;
+    try testing.expect(c.style.fg.eql(.{ .rgb = .{ .r = 10, .g = 20, .b = 30 } }));
+}
+
+test "empty SGR \\x1b[m resets like \\x1b[0m" {
+    var g = try Grid.init(testing.allocator, 3, 1);
+    defer g.deinit();
+    try g.feed("\x1b[1;31mx\x1b[my");
+    const x = g.cellAt(1, 1).?;
+    try testing.expect(x.style.flags.bold);
+    const y = g.cellAt(1, 2).?;
+    try testing.expect(!y.style.flags.bold);
+    try testing.expect(y.style.fg.eql(.default));
+}
+
 fn gridsEqual(a: Grid, b: Grid) bool {
     if (a.rows != b.rows or a.cols != b.cols) return false;
     var row: u16 = 1;
@@ -3306,6 +3929,442 @@ fn assertDiffRoundTrip(
     try testing.expect(gridsEqual(prev, next));
 }
 
+test "diffTo round-trip: single cell change" {
+    try assertDiffRoundTrip(10, 2, "hello\nworld", "\x1b[1;3HX");
+}
+
+test "diffTo round-trip: multi-row change" {
+    try assertDiffRoundTrip(6, 3, "aaa\nbbb\nccc", "\x1b[1;1HZZZ\x1b[3;2HYY");
+}
+
+test "diffTo round-trip: bg color added" {
+    try assertDiffRoundTrip(6, 1, "hello ", "\x1b[1;1H\x1b[48;5;236mHI\x1b[0m");
+}
+
+test "diffTo round-trip: no change yields empty-effect diff" {
+    try assertDiffRoundTrip(4, 2, "abcd\nefgh", "");
+}
+
+test "diffTo round-trip: full-row replacement" {
+    try assertDiffRoundTrip(8, 2, "oldline1\noldline2", "\x1b[1;1Hnewline1\x1b[2;1Hnewline2");
+}
+
+test "diffTo round-trip: wide cell replacement" {
+    try assertDiffRoundTrip(6, 1, "abcdef", "\x1b[1;2H\xe7\x95\x8c");
+}
+
+test "diffTo round-trips exact Unicode display-unit bytes" {
+    const cases = [_][]const u8{
+        "\u{2600}\u{FE0E}",
+        "\u{2600}\u{FE0F}",
+        "\u{1F44D}\u{1F3FD}",
+        "\u{1F1FA}\u{1F1F8}",
+        "#\u{FE0F}\u{20E3}",
+        "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+        "\u{1F469}\u{200D}\u{1F4BB}",
+    };
+    for (cases) |text| try assertDiffRoundTrip(8, 1, "", text);
+}
+
+test "Unicode display diff anchors vertical dividers at their grid columns" {
+    var prev = try Grid.init(testing.allocator, 12, 1);
+    defer prev.deinit();
+    var next = try prev.clone(testing.allocator);
+    defer next.deinit();
+    try next.feed("│ \u{231A}\u{FE0E}     │");
+
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffTo(prev, next, &diff.writer);
+    try testing.expect(std.mem.find(u8, diff.written(), "\x1b[10G│") != null);
+}
+
+test "diffBand emits combining suffix changes" {
+    var prev = try Grid.init(testing.allocator, 4, 1);
+    defer prev.deinit();
+    try prev.feed("e");
+
+    var next = try Grid.init(testing.allocator, 4, 1);
+    defer next.deinit();
+    try next.feed("e\u{0301}");
+
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffBand(prev, next, 1, 1, &diff.writer);
+    try testing.expect(std.mem.find(u8, diff.written(), "\u{0301}") != null);
+
+    try prev.feed(diff.written());
+    try expectRow(prev, 1, "e\u{0301}");
+}
+
+test "diffBand clears shifted wide-cell overlap before repaint" {
+    var prev = try Grid.init(testing.allocator, 8, 1);
+    defer prev.deinit();
+    prev.autowrap = false;
+    try prev.feed("\x1b[1;3HA🇺🇸B");
+
+    var next = try Grid.init(testing.allocator, 8, 1);
+    defer next.deinit();
+    next.autowrap = false;
+    try next.feed("\x1b[1;3H🇺🇸B ");
+
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffBand(prev, next, 1, 1, &diff.writer);
+    try testing.expect(std.mem.find(u8, diff.written(), "\x1b[1;3H\x1b[4X") != null);
+
+    var ascii = try Grid.init(testing.allocator, 8, 1);
+    defer ascii.deinit();
+    try ascii.feed("\x1b[1;3Htext");
+    var ascii_next = try Grid.init(testing.allocator, 8, 1);
+    defer ascii_next.deinit();
+    try ascii_next.feed("\x1b[1;3Hnext");
+
+    var ascii_diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer ascii_diff.deinit();
+    try Grid.diffBand(ascii, ascii_next, 1, 1, &ascii_diff.writer);
+    try testing.expect(std.mem.find(u8, ascii_diff.written(), "\x1b[4X") == null);
+
+    var stationary = try Grid.init(testing.allocator, 8, 1);
+    defer stationary.deinit();
+    try stationary.feed("\x1b[1;3H🇺🇸");
+    var stationary_next = try Grid.init(testing.allocator, 8, 1);
+    defer stationary_next.deinit();
+    try stationary_next.feed("\x1b[1;3H🇨🇦");
+
+    var stationary_diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stationary_diff.deinit();
+    try Grid.diffBand(stationary, stationary_next, 1, 1, &stationary_diff.writer);
+    try testing.expect(std.mem.find(u8, stationary_diff.written(), "X") == null);
+}
+
+test "diffBand temporarily enables autowrap for a suffixed wide cell at the margin" {
+    var prev = try Grid.init(testing.allocator, 6, 2);
+    defer prev.deinit();
+    prev.autowrap = false;
+
+    var next = try Grid.init(testing.allocator, 6, 2);
+    defer next.deinit();
+    next.autowrap = false;
+    try next.feed("\x1b[1;5H👩‍💻\x1b[2;1HZ");
+
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffBand(prev, next, 1, 2, &diff.writer);
+    try testing.expect(std.mem.find(u8, diff.written(), "\x1b[?7h👩‍💻\x1b[?7l") != null);
+
+    var non_margin_prev = try Grid.init(testing.allocator, 6, 1);
+    defer non_margin_prev.deinit();
+    non_margin_prev.autowrap = false;
+    var non_margin = try Grid.init(testing.allocator, 6, 1);
+    defer non_margin.deinit();
+    non_margin.autowrap = false;
+    try non_margin.feed("\x1b[1;4H👩‍💻");
+
+    var non_margin_diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer non_margin_diff.deinit();
+    try Grid.diffBand(non_margin_prev, non_margin, 1, 1, &non_margin_diff.writer);
+    try testing.expect(std.mem.find(u8, non_margin_diff.written(), "\x1b[?7h") == null);
+    try testing.expect(std.mem.find(u8, non_margin_diff.written(), "👩‍💻") != null);
+}
+
+test "diffTo emits \\x1b[0m at end when last style was non-default" {
+    var prev = try Grid.init(testing.allocator, 4, 1);
+    defer prev.deinit();
+    var next = try prev.clone(testing.allocator);
+    defer next.deinit();
+    try next.feed("\x1b[1;31mAB");
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer = std.Io.Writer.Allocating.fromArrayList(testing.allocator, &buf);
+    try Grid.diffTo(prev, next, &writer.writer);
+    buf = writer.toArrayList();
+    try testing.expect(std.mem.find(u8, buf.items, "\x1b[0m") != null);
+}
+
+test "OSC 8 hyperlink round-trips through diffBand" {
+    var prev = try Grid.init(testing.allocator, 16, 1);
+    defer prev.deinit();
+    var next = try prev.clone(testing.allocator);
+    defer next.deinit();
+    try next.feed("\x1b]8;;https://x.com/vercel_dev\x1b\\@vercel_dev\x1b]8;;\x1b\\");
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer = std.Io.Writer.Allocating.fromArrayList(testing.allocator, &buf);
+    try Grid.diffBand(prev, next, 1, 1, &writer.writer);
+    buf = writer.toArrayList();
+
+    try testing.expect(std.mem.find(u8, buf.items, "\x1b]8;;https://x.com/vercel_dev\x1b\\") != null);
+    try testing.expect(std.mem.endsWith(u8, buf.items, "\x1b]8;;\x1b\\"));
+}
+
+test "diffBand reopens an OSC 8 hyperlink for each emitted row" {
+    var prev = try Grid.init(testing.allocator, 4, 2);
+    defer prev.deinit();
+    var next = try prev.clone(testing.allocator);
+    defer next.deinit();
+    try next.feed("\x1b]8;;https://example.com\x1b\\abcd\x1b[2;1Hefgh\x1b]8;;\x1b\\");
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer = std.Io.Writer.Allocating.fromArrayList(testing.allocator, &buf);
+    try Grid.diffBand(prev, next, 1, 2, &writer.writer);
+    buf = writer.toArrayList();
+
+    const marker = "\x1b]8;;https://example.com\x1b\\";
+    var opens: usize = 0;
+    var start: usize = 0;
+    while (std.mem.indexOf(u8, buf.items[start..], marker)) |offset| {
+        opens += 1;
+        start += offset + marker.len;
+    }
+    try testing.expectEqual(@as(usize, 2), opens);
+}
+
+test "diffBand clears active presentation before plain repaint cells" {
+    var previous = try Grid.init(testing.allocator, 8, 2);
+    defer previous.deinit();
+    previous.defer_sync_updates = false;
+    try previous.feed("\x1b]8;;https://active.example\x1b\\\x1b[1m");
+
+    var target = try Grid.init(testing.allocator, 8, 2);
+    defer target.deinit();
+    target.defer_sync_updates = false;
+    try target.feed("q");
+
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffBand(previous, target, 1, 1, &diff.writer);
+    try previous.feed(diff.written());
+
+    const cell = previous.cellAt(1, 1).?;
+    try testing.expectEqual(@as(u21, 'q'), cell.codepoint);
+    try testing.expect(!cell.style.flags.bold);
+    try testing.expectEqual(@as(u32, 0), cell.style.hyperlink_id);
+    try testing.expect(previous.current_style.eql(.{}));
+}
+
+test "OSC 8 hyperlink survives Grid.clone" {
+    var src = try Grid.init(testing.allocator, 16, 1);
+    defer src.deinit();
+    try src.feed("\x1b]8;;https://example.com\x1b\\X\x1b]8;;\x1b\\");
+
+    var dup = try src.clone(testing.allocator);
+    defer dup.deinit();
+
+    const cell = dup.cellAt(1, 1).?;
+    try testing.expect(cell.style.hyperlink_id != 0);
+    const url = dup.hyperlinkUrl(cell.style.hyperlink_id).?;
+    try testing.expectEqualStrings("https://example.com", url);
+}
+
+test "production editing scroll region origin save restore and modes" {
+    var grid = try Grid.init(testing.allocator, 8, 4);
+    defer grid.deinit();
+
+    try grid.feed("abcdefgh\x1b[1;3H\x1b[2@XY\x1b[P\x1b[2X");
+    try expectRow(grid, 1, "abXY  f");
+
+    try grid.feed("\x1b[2;4r\x1b[?6h\x1b[1;1HA\nB\nC\nD");
+    try testing.expectEqual(@as(u16, 2), grid.scroll_top);
+    try testing.expectEqual(@as(u16, 4), grid.scroll_bottom);
+    try testing.expect(grid.origin_mode);
+    try expectRow(grid, 2, "B");
+    try expectRow(grid, 3, "C");
+    try expectRow(grid, 4, "D");
+
+    try grid.feed("\x1b7\x1b[4;5HZ\x1b8Q");
+    try testing.expectEqual(@as(u21, 'Q'), grid.cellAt(4, 2).?.codepoint);
+    try grid.feed("\x1b[?7l\x1b[4h\x1b[?2004h\x1b[?1000h\x1b[?1004h\x1b[>1u");
+    try testing.expect(!grid.autowrap);
+    try testing.expect(grid.insert_mode);
+    try testing.expect(grid.bracketed_paste);
+    try testing.expect(grid.mouse_modes != 0);
+    try testing.expect(grid.focus_tracking);
+    try testing.expect(grid.keyboard_protocol);
+}
+
+test "tabs alternate screen and fragmented UTF-8 preserve cell invariants" {
+    var grid = try Grid.init(testing.allocator, 12, 3);
+    defer grid.deinit();
+    try grid.feed("A\tB\x1bH\r\tC");
+    try testing.expectEqual(@as(u21, 'C'), grid.cellAt(1, 9).?.codepoint);
+    try grid.feed("\x1b[?1049hALT\x1b[?1049l");
+    try testing.expectEqual(@as(u21, 'A'), grid.cellAt(1, 1).?.codepoint);
+    try grid.feed("\xe7\x95");
+    try grid.feed("\x8ce");
+    try grid.feed("\xcc\x81");
+    try expectWideCellInvariant(grid);
+}
+
+test "fragmented native queries emit one ordered reply and observational modes emit none" {
+    var native = try Grid.init(testing.allocator, 80, 24);
+    defer native.deinit();
+    try native.feed("\x1b[3;7H");
+    var first = try native.feedMode("\x1b[6", .native_live);
+    defer first.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), first.replies.items.len);
+    var second = try native.feedMode("n\x1b[18t", .native_live);
+    defer second.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), second.replies.items.len);
+    try testing.expectEqualStrings("\x1b[3;7R", second.replies.items[0].bytes);
+    try testing.expectEqualStrings("\x1b[8;24;80t", second.replies.items[1].bytes);
+
+    var tmux = try Grid.init(testing.allocator, 80, 24);
+    defer tmux.deinit();
+    var tmux_result = try tmux.feedMode("\x1b[6n\x1b[18t", .tmux_live);
+    defer tmux_result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), tmux_result.replies.items.len);
+
+    var replay = try Grid.init(testing.allocator, 80, 24);
+    defer replay.deinit();
+    var replay_result = try replay.feedMode("\x1b[6n\x1b[18t", .journal_replay);
+    defer replay_result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), replay_result.replies.items.len);
+}
+
+test "render snapshot is immutable row-major styled state" {
+    var grid = try Grid.init(testing.allocator, 5, 2);
+    defer grid.deinit();
+    try grid.feed("\x1b[31;44;1mA\xe7\x95\x8c\x1b[?25l\x1b[5 q");
+    var snapshot = try grid.renderSnapshot(testing.allocator);
+    defer snapshot.deinit(testing.allocator);
+    try snapshot.view().validate();
+    try testing.expectEqual(contracts.CellKind.single, snapshot.cells[0].kind);
+    try testing.expect(snapshot.cells[0].style.bold);
+    try testing.expectEqual(contracts.CellKind.wide, snapshot.cells[1].kind);
+    try testing.expectEqual(contracts.CellKind.continuation, snapshot.cells[2].kind);
+    try testing.expect(!snapshot.cursor.visible);
+    try testing.expectEqual(contracts.CursorShape.bar, snapshot.cursor.shape);
+    try grid.feed("Z");
+    try testing.expectEqualStrings("A", snapshot.cells[0].text);
+}
+
+test "checkpoint round trip preserves complete fragmented parser state" {
+    var live = try Grid.init(testing.allocator, 12, 4);
+    defer live.deinit();
+    try live.feed("normal\x1b[?1049h\x1b[31mALT\x1b[2;4r\x1b[?6h");
+    try live.feed("\x1b]8;;https://example.com\x1b\\X");
+    try live.feed("\x1b[12;");
+
+    const payload = try live.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+    defer restored.deinit();
+    const repeated = try restored.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(repeated);
+    try testing.expectEqualSlices(u8, payload, repeated);
+
+    try live.feed("3H\xe7\x95");
+    try restored.feed("3H\xe7\x95");
+    const fragmented = try restored.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(fragmented);
+    var fragmented_restore = try Grid.restoreCheckpoint(
+        testing.allocator,
+        fragmented,
+    );
+    defer fragmented_restore.deinit();
+    try live.feed("\x8c\x1b[?1049l");
+    try restored.feed("\x8c\x1b[?1049l");
+    try fragmented_restore.feed("\x8c\x1b[?1049l");
+    const expected = try live.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(expected);
+    const actual = try restored.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(actual);
+    const fragmented_actual = try fragmented_restore.checkpointPayload(
+        testing.allocator,
+    );
+    defer testing.allocator.free(fragmented_actual);
+    try testing.expectEqualSlices(u8, expected, actual);
+    try testing.expectEqualSlices(u8, expected, fragmented_actual);
+}
+
+test "checkpoint rejects unsupported revision corruption and trailing bytes" {
+    var grid = try Grid.init(testing.allocator, 4, 2);
+    defer grid.deinit();
+    try grid.feed("ok");
+    const payload = try grid.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+
+    const unsupported = try testing.allocator.dupe(u8, payload);
+    defer testing.allocator.free(unsupported);
+    std.mem.writeInt(u16, unsupported[4..6], checkpoint_schema_revision + 1, .little);
+    try testing.expectError(
+        error.UnsupportedEngineRevision,
+        Grid.restoreCheckpoint(testing.allocator, unsupported),
+    );
+    try testing.expectError(
+        error.InvalidEngineCheckpoint,
+        Grid.restoreCheckpoint(testing.allocator, payload[0 .. payload.len - 1]),
+    );
+    const trailing = try std.mem.concat(testing.allocator, u8, &.{ payload, "x" });
+    defer testing.allocator.free(trailing);
+    try testing.expectError(
+        error.InvalidEngineCheckpoint,
+        Grid.restoreCheckpoint(testing.allocator, trailing),
+    );
+}
+
+test "checkpoint preserves fragmented OSC DCS and synchronized updates" {
+    var sync_live = try Grid.init(testing.allocator, 10, 2);
+    defer sync_live.deinit();
+    try sync_live.feed("\x1b[?2026hbuffered");
+    const sync_payload = try sync_live.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(sync_payload);
+    var sync_restored = try Grid.restoreCheckpoint(
+        testing.allocator,
+        sync_payload,
+    );
+    defer sync_restored.deinit();
+    try sync_live.feed("\x1b[?2026l");
+    try sync_restored.feed("\x1b[?2026l");
+    try expectRow(sync_restored, 1, "buffered");
+
+    var strings = try Grid.init(testing.allocator, 10, 2);
+    defer strings.deinit();
+    try strings.feed("\x1b]8;;https://partial");
+    const osc_payload = try strings.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(osc_payload);
+    var osc_restored = try Grid.restoreCheckpoint(testing.allocator, osc_payload);
+    defer osc_restored.deinit();
+    try osc_restored.feed(".example\x1b\\X\x1bP$q");
+    const dcs_payload = try osc_restored.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(dcs_payload);
+    var dcs_restored = try Grid.restoreCheckpoint(testing.allocator, dcs_payload);
+    defer dcs_restored.deinit();
+    var dcs_result = try dcs_restored.feedMode("m\x1b\\", .native_live);
+    defer dcs_result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), dcs_result.replies.items.len);
+    try testing.expectEqualStrings("\x1bP1$r0m\x1b\\", dcs_result.replies.items[0].bytes);
+}
+
+test "parser and reply collections enforce fixed bounds" {
+    var grid = try Grid.init(testing.allocator, 10, 2);
+    defer grid.deinit();
+    try testing.expectError(
+        error.TooManyCsiParameters,
+        grid.feed("\x1b[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1H"),
+    );
+
+    var replies = try Grid.init(testing.allocator, 10, 2);
+    defer replies.deinit();
+    try testing.expectError(
+        error.ReplyEffectCapacityExceeded,
+        replies.feedMode("\x1b[5n" ** 17, .native_live),
+    );
+
+    var osc = try Grid.init(testing.allocator, 10, 2);
+    defer osc.deinit();
+    const oversized = try testing.allocator.alloc(u8, max_string_bytes + 3);
+    defer testing.allocator.free(oversized);
+    oversized[0] = 0x1b;
+    oversized[1] = ']';
+    @memset(oversized[2..], 'x');
+    try testing.expectError(error.ControlStringTooLarge, osc.feed(oversized));
+}
+
 fn checkOwnedEngineAllocationFailures(alloc: Allocator) !void {
     var grid = try Grid.init(alloc, 12, 3);
     defer grid.deinit();
@@ -3317,4 +4376,74 @@ fn checkOwnedEngineAllocationFailures(alloc: Allocator) !void {
     defer alloc.free(payload);
     var restored = try Grid.restoreCheckpoint(alloc, payload);
     defer restored.deinit();
+}
+
+test "owned effects snapshots and checkpoints handle allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkOwnedEngineAllocationFailures,
+        .{},
+    );
+}
+
+test "bounded deterministic parser and checkpoint fuzz" {
+    var random = std.Random.DefaultPrng.init(0x46585445);
+    const source = random.random();
+    var bytes: [96]u8 = undefined;
+    for (0..256) |_| {
+        source.bytes(&bytes);
+        const length = source.uintLessThan(usize, bytes.len + 1);
+        var grid = try Grid.init(testing.allocator, 24, 8);
+        defer grid.deinit();
+        var offset: usize = 0;
+        while (offset < length) {
+            const fragment = @min(
+                length - offset,
+                source.uintLessThan(usize, 8) + 1,
+            );
+            var result = grid.feedMode(
+                bytes[offset .. offset + fragment],
+                .journal_replay,
+            ) catch break;
+            result.deinit(testing.allocator);
+            offset += fragment;
+        }
+        const payload = grid.checkpointPayload(testing.allocator) catch continue;
+        defer testing.allocator.free(payload);
+        var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+        defer restored.deinit();
+        const repeated = try restored.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(repeated);
+        try testing.expectEqualSlices(u8, payload, repeated);
+    }
+}
+
+test "bounded deterministic corrupt checkpoint fuzz" {
+    var base = try Grid.init(testing.allocator, 24, 8);
+    defer base.deinit();
+    try base.feed("\x1b[31mcheckpoint\xe7\x95\x8c\x1b[?1049hALT");
+    const payload = try base.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    var random = std.Random.DefaultPrng.init(0x46584350);
+    const source = random.random();
+    for (0..256) |_| {
+        const length = source.uintLessThan(usize, payload.len + 17);
+        const candidate = try testing.allocator.alloc(u8, length);
+        defer testing.allocator.free(candidate);
+        source.bytes(candidate);
+        const copied = @min(candidate.len, payload.len);
+        @memcpy(candidate[0..copied], payload[0..copied]);
+        if (candidate.len != 0) {
+            const changes = source.uintLessThan(usize, 4) + 1;
+            for (0..changes) |_| {
+                candidate[source.uintLessThan(usize, candidate.len)] ^=
+                    source.int(u8) | 1;
+            }
+        }
+        var restored = Grid.restoreCheckpoint(
+            testing.allocator,
+            candidate,
+        ) catch continue;
+        restored.deinit();
+    }
 }

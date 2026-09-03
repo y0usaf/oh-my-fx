@@ -310,3 +310,17 @@ fn writeInt(writer: *std.Io.Writer, comptime T: type, value: T) !void {
     std.mem.writeInt(T, &bytes, value, .little);
     try writer.writeAll(&bytes);
 }
+
+test "relationship index header preserves active occupancy and reads legacy counts as unknown" {
+    const alloc = std.testing.allocator;
+    const bytes = try encodeHeader(alloc, .{
+        .storage_epoch = 7,
+        .generation = 9,
+        .high_watermark = 4,
+        .active_count = 2,
+    });
+    defer alloc.free(bytes);
+    const decoded = try decodeHeader(bytes);
+    try std.testing.expect(decoded.active_count_known);
+    try std.testing.expectEqual(@as(u64, 2), decoded.active_count);
+}

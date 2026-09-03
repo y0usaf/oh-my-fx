@@ -7,7 +7,7 @@ import { createFxTerminal, supportsJspi, xtermAdapter } from "../node.js";
 
 const { Terminal } = xtermHeadless;
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/omfx-term.wasm"));
+const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/fx-term.wasm"));
 if (!supportsJspi()) process.exit(2);
 
 const terminal = new Terminal({ cols: 100, rows: 34, allowProposedApi: true, scrollback: 3000 });
@@ -73,12 +73,12 @@ function sse(events) {
 
 function toolCall(id, command) {
   return sse([
-    { type: "tool-call", toolCallId: id, toolName: "terminal", input: { action: "exec", command } },
+    { type: "tool-call", toolCallId: id, toolName: "shell", input: { action: "run", command } },
     { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
   ]);
 }
 
-function terminalToolCalls(calls) {
+function shellToolCalls(calls) {
   const events = calls.flatMap(({ id, input }) => {
     const serialized = JSON.stringify(input);
     const deltas = [];
@@ -86,10 +86,10 @@ function terminalToolCalls(calls) {
       deltas.push({ type: "tool-input-delta", id, delta: serialized.slice(offset, offset + 4096) });
     }
     return [
-      { type: "tool-input-start", id, toolName: "terminal" },
+      { type: "tool-input-start", id, toolName: "shell" },
       ...deltas,
       { type: "tool-input-end", id },
-      { type: "tool-call", toolCallId: id, toolName: "terminal" },
+      { type: "tool-call", toolCallId: id, toolName: "shell" },
     ];
   });
   const responseEvents = [
@@ -166,16 +166,16 @@ const fetch = async (_url, init = {}) => {
     checkedBrowserCapabilityContext = true;
   }
   if (!checkedToolProjection) {
-    if (body.tools?.length !== 1 || body.tools[0]?.name !== "terminal") {
+    if (body.tools?.length !== 1 || body.tools[0]?.name !== "shell") {
       throw new Error(`workspace advertised unexpected tools: ${JSON.stringify(body.tools)}`);
     }
     const schema = body.tools[0]?.inputSchema;
     if (JSON.stringify(schema?.required) !== JSON.stringify(["action", "command"]) ||
-        schema?.properties?.action?.enum?.[0] !== "exec" ||
+        schema?.properties?.action?.enum?.[0] !== "run" ||
         schema?.properties?.command?.maxLength !== 65_536 ||
         Object.keys(schema?.properties || {}).join(",") !== "action,command" ||
         schema?.additionalProperties !== false) {
-      throw new Error(`workspace advertised unexpected terminal schema: ${JSON.stringify(schema)}`);
+      throw new Error(`workspace advertised unexpected shell schema: ${JSON.stringify(schema)}`);
     }
     checkedToolProjection = true;
   }
@@ -200,9 +200,9 @@ const fetch = async (_url, init = {}) => {
   }
   if (toolResult(body, "workspace-oversized")) {
     requireResult(body, "workspace-oversized", ["exceeds 65536 bytes"]);
-    requireResult(body, "workspace-profile", ["accepts only the", "action", "command", "fields"]);
-    requireResult(body, "workspace-durable", ["action must be", "exec"]);
-    requireResult(body, "workspace-unknown", ["accepts only the", "action", "command", "fields"]);
+    requireResult(body, "workspace-profile", ["accepts only action and command"]);
+    requireResult(body, "workspace-durable", ["action must be run"]);
+    requireResult(body, "workspace-unknown", ["accepts only action and command"]);
     return textResponse("invalid boundaries checked");
   }
   const prompt = latestUserText(body);
@@ -211,11 +211,11 @@ const fetch = async (_url, init = {}) => {
   if (prompt.includes("workspace timeout")) return toolCall("workspace-timeout", "timeout-command");
   if (prompt.includes("workspace abort")) return toolCall("workspace-abort", "hold-command");
   if (prompt.includes("workspace invalid boundaries")) {
-    return terminalToolCalls([
-      { id: "workspace-oversized", input: { action: "exec", command: "x".repeat(65_537) } },
-      { id: "workspace-profile", input: { action: "exec", command: "must-not-run", profile: "clean" } },
-      { id: "workspace-durable", input: { action: "start", command: "must-not-run" } },
-      { id: "workspace-unknown", input: { action: "exec", command: "must-not-run", unexpected: true } },
+    return shellToolCalls([
+      { id: "workspace-oversized", input: { action: "run", command: "x".repeat(65_537) } },
+      { id: "workspace-profile", input: { action: "run", command: "must-not-run", profile: "clean" } },
+      { id: "workspace-durable", input: { action: "wait", session_id: "must-not-run" } },
+      { id: "workspace-unknown", input: { action: "run", command: "must-not-run", unexpected: true } },
     ]);
   }
   if (prompt.includes("unsupported web request")) {

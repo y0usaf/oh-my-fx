@@ -220,3 +220,35 @@ pub fn lineSafePrefixLength(bytes: []const u8, max_bytes: usize) usize {
     if (std.mem.lastIndexOfScalar(u8, bytes[0..utf8_end], '\n')) |newline| return newline + 1;
     return utf8_end;
 }
+
+test "defaults match the public context limit contract" {
+    const values = Values{};
+    inline for (std.meta.fields(Name)) |field| {
+        const name: Name = @enumFromInt(field.value);
+        try std.testing.expectEqual(name.defaultBytes(), values.get(name).effectiveBytes());
+        try std.testing.expectEqual(Source.compiled_default, values.get(name).source);
+    }
+}
+
+test "context limit overrides accept bytes and off" {
+    const bytes = try parseOverride("skill_chunk_bytes=4096");
+    try std.testing.expectEqual(Name.skill_chunk_bytes, bytes.name);
+    try std.testing.expectEqual(@as(usize, 4096), bytes.value.bytes);
+
+    const off = try parseOverride("mcp_description_bytes=off");
+    try std.testing.expectEqual(Name.mcp_description_bytes, off.name);
+    try std.testing.expectEqual(emergency_ceiling_bytes, off.value.effectiveBytes());
+}
+
+test "context limit overrides reject unknown names and malformed values" {
+    try std.testing.expectError(error.UnknownContextLimit, parseOverride("wat=1"));
+    try std.testing.expectError(error.InvalidContextLimitValue, parseOverride("skill_chunk_bytes=-1"));
+    try std.testing.expectError(error.InvalidContextLimitOverride, parseOverride("skill_chunk_bytes"));
+}
+
+test "line safe prefix preserves utf8 and complete lines when possible" {
+    try std.testing.expectEqual(@as(usize, 4), lineSafePrefixLength("one\ntwo\n", 7));
+    try std.testing.expectEqual(@as(usize, 0), lineSafePrefixLength("éclair", 1));
+    try std.testing.expectEqual(@as(usize, 2), lineSafePrefixLength("éclair", 2));
+    try std.testing.expectEqual(@as(usize, 3), lineSafePrefixLength(&.{ 'a', 'b', 'c', 0xe4 }, 4));
+}

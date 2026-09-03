@@ -244,3 +244,160 @@ fn test_awake_timestamp(milliseconds: i64) std.Io.Clock.Timestamp {
         .raw = .fromNanoseconds(@as(i96, milliseconds) * std.time.ns_per_ms),
     };
 }
+
+test "worker status projects route recovery and expires recovered state" {
+    var state: State = .none;
+    state.set_route_recovery(.{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 3,
+    }, 1_000);
+
+    switch (state.projection().?) {
+        .turn_thinking => |projection| {
+            try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.warning, projection.tone);
+            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request · attempt 1/3", projection.label);
+        },
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    state.set_route_recovery(.{
+        .kind = .auto_recovered,
+        .succeeded_attempt = 3,
+        .attempt_limit = 3,
+    }, 1_000);
+    try std.testing.expect(!state.expire_transient(2_499));
+    try std.testing.expect(state.expire_transient(2_500));
+    try std.testing.expect(state.projection() == null);
+}
+
+test "worker status refreshes retry countdown from awake deadline" {
+    var state: State = .none;
+    state.set_route_recovery(.{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 3,
+        .delay_seconds = 4,
+        .retry_deadline = test_awake_timestamp(4_000),
+    }, 0);
+
+    try std.testing.expect(!state.refresh_route_recovery(test_awake_timestamp(0)));
+    try std.testing.expect(state.refresh_route_recovery(test_awake_timestamp(1_000)));
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request in 3s · attempt 1/3",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(state.refresh_route_recovery(test_awake_timestamp(2_001)));
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request in 2s · attempt 1/3",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(state.refresh_route_recovery(test_awake_timestamp(3_750)));
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request in 1s · attempt 1/3",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(state.refresh_route_recovery(test_awake_timestamp(4_000)));
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request · attempt 1/3",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!state.refresh_route_recovery(test_awake_timestamp(4_250)));
+
+    state.set_route_recovery(.{
+        .kind = .auto_retry,
+        .failed_attempt = 2,
+        .attempt_limit = 3,
+    }, 0);
+    try std.testing.expect(!state.refresh_route_recovery(test_awake_timestamp(5_000)));
+}
+
+test "worker status API state is sticky until explicitly cleared" {
+    var state: State = .none;
+    state.set_api("⚠ API access denied · HTTP 403 · Provider: wafer", .danger);
+
+    try std.testing.expect(!state.expire_transient(std.math.maxInt(i64)));
+    switch (state.projection().?) {
+        .turn_thinking => |projection| {
+            try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.danger, projection.tone);
+            try std.testing.expectEqualStrings("⚠ API access denied · HTTP 403 · Provider: wafer", projection.label);
+        },
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(state.clear());
+    try std.testing.expect(state.projection() == null);
+}
+
+test "worker status route recovery labels expose required controls" {
+    var state: State = .none;
+    state.set_route_recovery(.{
+        .kind = .auto_retry,
+        .failed_attempt = 2,
+        .attempt_limit = 10,
+        .cause = .system_resumed,
+        .action = .waiting_for_connectivity,
+    }, 0);
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Mac woke from sleep · waiting for connection · attempt 2/10 · Esc to try later",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    state.set_route_recovery(.{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 2,
+        .attempt_limit = 10,
+        .cause = .system_resumed,
+        .action = .paused,
+        .required_action = .continue_later,
+    }, 0);
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    state.set_route_recovery(.{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 10,
+        .attempt_limit = 10,
+        .cause = .response_interrupted,
+        .action = .paused,
+        .required_action = .inspect_uncertain_tool,
+    }, 0);
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Response ended early · recovery paused after 10/10 attempts · inspect tool state before /continue",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    state.set_route_recovery(.{ .kind = .manual_recovered_without_fast }, 0);
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "✓ recovered · Fast disabled",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+}

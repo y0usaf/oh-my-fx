@@ -1018,3 +1018,559 @@ fn skipPacerDimReassertions(text: []const u8, start: usize) usize {
     while (std.mem.startsWith(u8, text[i..], reassert)) : (i += reassert.len) {}
     return i;
 }
+
+test "wrapAssistantText wraps plain ascii at cols" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "abcdefghij", 5);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("abcde\nfghij", out);
+}
+
+test "wrapAssistantText keeps paragraph words together and avoids a final orphan" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "alpha beta gamma delta", 16);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("alpha beta\ngamma delta", out);
+}
+
+test "wrapAssistantText avoids an orphan after a fitting separator" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "aaaa bbbb cccc dddd", 16);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("aaaa bbbb\ncccc dddd", out);
+}
+
+test "wrapAssistantText keeps word-aware list continuations aligned" {
+    const alloc = std.testing.allocator;
+    const input = "\x1b[2m\xe2\x80\xa2 \x1b[22malpha beta gamma delta";
+    const out = try wrapAssistantText(alloc, input, 18);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x80\xa2 \x1b[22malpha beta\n  gamma delta",
+        out,
+    );
+}
+
+test "wrapAssistantText repeats every styled nested blockquote rule on word-aware continuations" {
+    const alloc = std.testing.allocator;
+    const input = "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1malpha beta gamma delta\x1b[22m";
+    const out = try wrapAssistantText(alloc, input, 18);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1malpha beta\x1b[0m\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1mgamma delta\x1b[22m",
+        out,
+    );
+}
+
+test "wrapAssistantText repeats paced nested blockquote rules" {
+    const alloc = std.testing.allocator;
+    const paced_rule = "\x1b[2m\xe2\x94\x82\x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22m";
+    const input = paced_rule ++ paced_rule ++ "abcdefghijkl";
+    const out = try wrapAssistantText(alloc, input, 9);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        paced_rule ++ paced_rule ++ "abcde\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m\xe2\x94\x82 \x1b[22mfghij\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m\xe2\x94\x82 \x1b[22mkl",
+        out,
+    );
+}
+
+test "wrapAssistantText preserves bold SGR across wrap boundary" {
+    const alloc = std.testing.allocator;
+    const input = "\x1b[1mabcdef\x1b[22m";
+    const out = try wrapAssistantText(alloc, input, 3);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("\x1b[1mabc\x1b[0m\n\x1b[1mdef\x1b[22m", out);
+}
+
+test "wrapAssistantText preserves inline code foreground across wrap boundary" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { input: []const u8, expected: []const u8 }{
+        .{
+            .input = "\x1b[38;5;245mabcdef\x1b[39m",
+            .expected = "\x1b[38;5;245mabc\x1b[0m\n\x1b[38;5;245mdef\x1b[39m",
+        },
+        .{
+            .input = "\x1b[38;5;247mabcdef\x1b[39m",
+            .expected = "\x1b[38;5;247mabc\x1b[0m\n\x1b[38;5;247mdef\x1b[39m",
+        },
+    };
+
+    for (cases) |case| {
+        const out = try wrapAssistantText(alloc, case.input, 3);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(case.expected, out);
+    }
+}
+
+test "wrapAssistantText preserves heading underline across wrap boundary" {
+    const alloc = std.testing.allocator;
+    const input = "\x1b[1m\x1b[4mabcdef\x1b[24m\x1b[22m";
+    const out = try wrapAssistantText(alloc, input, 3);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b[1m\x1b[4mabc\x1b[0m\n\x1b[1m\x1b[4mdef\x1b[24m\x1b[22m",
+        out,
+    );
+}
+
+test "wrapAssistantText preserves an underlined OSC 8 link across a wrap" {
+    const alloc = std.testing.allocator;
+    const input =
+        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4mabcdef\x1b[24m\x1b]8;;\x1b\\ tail";
+    const out = try wrapAssistantText(alloc, input, 3);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4mabc\x1b[0m\x1b]8;;\x1b\\\n" ++
+            "\x1b[4m\x1b]8;id=fx-1;https://example.com\x1b\\def\x1b[24m\x1b]8;;\x1b\\\ntai\nl",
+        out,
+    );
+}
+
+test "wrapAssistantText reopens an OSC 8 link after a word-balanced wrap" {
+    const alloc = std.testing.allocator;
+    const input =
+        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4malpha beta\x1b[24m\x1b]8;;\x1b\\";
+    const out = try wrapAssistantText(alloc, input, 6);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4malpha\x1b[0m\x1b]8;;\x1b\\\n" ++
+            "\x1b[4m\x1b]8;id=fx-1;https://example.com\x1b\\beta\x1b[24m\x1b]8;;\x1b\\",
+        out,
+    );
+}
+
+test "wrapAssistantText honours hard newlines without extra reset" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "ab\ncd", 10);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("ab\ncd", out);
+}
+
+test "wrapAssistantText with cols=0 returns empty" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "foo", 0);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("", out);
+}
+
+test "wrapAssistantText with empty text returns empty" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "", 80);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("", out);
+}
+
+test "wrapAssistantText passes non-SGR ANSI through without counting for width" {
+    const alloc = std.testing.allocator;
+    const input = "a\x1b[Ab";
+    const out = try wrapAssistantText(alloc, input, 2);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("a\x1b[Ab", out);
+}
+
+test "wrapAssistantText indents unordered list continuations" {
+    const alloc = std.testing.allocator;
+    const input = "\x1b[2m\xe2\x80\xa2 \x1b[22mabcdefghijkl";
+    const out = try wrapAssistantText(alloc, input, 7);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("\x1b[2m\xe2\x80\xa2 \x1b[22mabcde\n  fghij\n  kl", out);
+}
+
+test "wrapAssistantText recognizes paced list markers" {
+    const alloc = std.testing.allocator;
+
+    const unordered = try wrapAssistantText(
+        alloc,
+        "\x1b[2m\xe2\x80\xa2\x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22mabcdefghij",
+        7,
+    );
+    defer alloc.free(unordered);
+    try std.testing.expectEqualStrings("\x1b[2m\xe2\x80\xa2\x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22mabcde\n  fghij", unordered);
+
+    const ordered = try wrapAssistantText(
+        alloc,
+        "\x1b[2m1\x1b[0m\x1b[2m2\x1b[0m\x1b[2m.\x1b[0m\x1b[2m\x1b[22m abcdefgh",
+        10,
+    );
+    defer alloc.free(ordered);
+    try std.testing.expectEqualStrings("\x1b[2m1\x1b[0m\x1b[2m2\x1b[0m\x1b[2m.\x1b[0m\x1b[2m\x1b[22m abcdef\n    gh", ordered);
+
+    const blockquote = try wrapAssistantText(
+        alloc,
+        "\x1b[2m\xe2\x94\x82\x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22mabcdefghij",
+        7,
+    );
+    defer alloc.free(blockquote);
+    try std.testing.expectEqualStrings("\x1b[2m\xe2\x94\x82\x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22mabcde\n\x1b[2m\xe2\x94\x82 \x1b[22mfghij", blockquote);
+}
+
+test "wrapAssistantText indents ordered and nested list continuations" {
+    const alloc = std.testing.allocator;
+
+    const ordered = try wrapAssistantText(alloc, "  \x1b[2m12.\x1b[22m abcdefghij", 10);
+    defer alloc.free(ordered);
+    try std.testing.expectEqualStrings("  \x1b[2m12.\x1b[22m abcd\n      efgh\n      ij", ordered);
+
+    const nested = try wrapAssistantText(alloc, "  \x1b[2m\xe2\x80\xa2 \x1b[22mabcdefgh", 8);
+    defer alloc.free(nested);
+    try std.testing.expectEqualStrings("  \x1b[2m\xe2\x80\xa2 \x1b[22mabcd\n    efgh", nested);
+}
+
+test "wrapAssistantText indents dim definition continuations" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "\x1b[2m  \x1b[22malpha beta gamma delta", 14);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m  \x1b[22malpha beta\n  gamma delta",
+        out,
+    );
+}
+
+test "wrapAssistantText recognizes paced dim definition prefixes" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(
+        alloc,
+        "\x1b[2m \x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22malpha beta gamma delta",
+        14,
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m \x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22malpha beta\n  gamma delta",
+        out,
+    );
+}
+
+test "wrapAssistantText indents dim footnote continuations" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "\x1b[2m[1] \x1b[22mabcdefghijkl", 8);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m[1] \x1b[22mabcd\n    efgh\n    ijkl",
+        out,
+    );
+}
+
+test "wrapAssistantText recognizes reset-closed dim footnote prefixes" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "\x1b[2m[1] \x1b[0mabcdefghijkl", 8);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m[1] \x1b[0mabcd\n    efgh\n    ijkl",
+        out,
+    );
+}
+
+test "wrapAssistantText recognizes paced dim footnote prefixes" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(
+        alloc,
+        "\x1b[2m[1] \x1b[0m\x1b[2mabcdefghijkl\x1b[22m",
+        8,
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m[1] \x1b[0m\x1b[2mabcd\x1b[0m\n" ++
+            "    \x1b[2mefgh\x1b[0m\n" ++
+            "    \x1b[2mijkl\x1b[22m",
+        out,
+    );
+}
+
+test "wrapAssistantText recognizes a leading paced footnote reassertion" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(
+        alloc,
+        "\x1b[0m\x1b[2m[2] \x1b[0mThis definition appears before its reference.",
+        32,
+    );
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\n    before its reference.") != null);
+}
+
+test "wrapTranscriptAssistantText retains reset-closed footnote indentation after prose" {
+    const alloc = std.testing.allocator;
+    const out = try wrapTranscriptAssistantTextInterruptible(
+        alloc,
+        "Forward reference.\n\n" ++
+            "\x1b[2m[2] \x1b[0mThis definition appears before its reference and ends with FOOTNOTE_DONE.",
+        32,
+        null,
+    );
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\n      before its reference") != null);
+}
+
+test "wrapTranscriptAssistantText retains footnote indentation through character-paced markers" {
+    const alloc = std.testing.allocator;
+    const input =
+        "Forward reference\n\n" ++
+        "\x1b[2m[\x1b[0m\x1b[2m1\x1b[0m\x1b[2m]\x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22m" ++
+        "The deferred body wraps through a narrow terminal.";
+    try std.testing.expect(footnotePrefix(input, "Forward reference\n\n".len) != null);
+    try std.testing.expect(assistantContinuation(input, "Forward reference\n\n".len) != null);
+    const out = try wrapTranscriptAssistantTextInterruptible(
+        alloc,
+        input,
+        32,
+        null,
+    );
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\n      through a narrow terminal.") != null);
+}
+
+test "wrapAssistantText elides infeasible dim footnote markers at narrow widths" {
+    const alloc = std.testing.allocator;
+    const ascii = "\x1b[2m[1] \x1b[22malphabet";
+    var cols: u16 = 1;
+    while (cols <= 7) : (cols += 1) {
+        const out = try wrapAssistantText(alloc, ascii, cols);
+        defer alloc.free(out);
+
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) > 0);
+        }
+        if (cols <= 4) {
+            try std.testing.expect(std.mem.indexOf(u8, out, "[1]") == null);
+        } else {
+            try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[2m[1] \x1b[22m"));
+        }
+    }
+
+    const wide = "\x1b[2m[1] \x1b[22m\xe6\xbc\xa2" ++ "\xe5\xad\x97" ++ "abc";
+    cols = 2;
+    while (cols <= 7) : (cols += 1) {
+        const out = try wrapAssistantText(alloc, wide, cols);
+        defer alloc.free(out);
+
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) > 0);
+        }
+    }
+}
+
+test "wrapAssistantText reopens a definition link after a wrap" {
+    const alloc = std.testing.allocator;
+    const link_open = "\x1b]8;id=fx-definition;https://example.com\x1b\\";
+    const link_close = "\x1b]8;;\x1b\\";
+    const input =
+        "\x1b[2m  \x1b[22m" ++
+        link_open ++ "\x1b[4malpha beta\x1b[24m" ++ link_close;
+    const out = try wrapAssistantText(alloc, input, 8);
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[2m  \x1b[22m" ++ link_open ++ "\x1b[4malpha"));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\x1b[0m" ++ link_close ++ "\n  \x1b[4m" ++ link_open ++ "beta\x1b[24m" ++ link_close,
+    ) != null);
+}
+
+test "wrapAssistantText indents pending and completed task list continuations" {
+    const alloc = std.testing.allocator;
+
+    const pending = try wrapAssistantText(alloc, "\x1b[2m\xe2\x98\x90 \x1b[22malpha beta gamma delta", 18);
+    defer alloc.free(pending);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x98\x90 \x1b[22malpha beta\n  gamma delta",
+        pending,
+    );
+
+    const completed = try wrapAssistantText(alloc, "\x1b[38;5;252m\xe2\x9c\x93\x1b[39m alpha beta gamma delta", 18);
+    defer alloc.free(completed);
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;252m\xe2\x9c\x93\x1b[39m alpha beta\n  gamma delta",
+        completed,
+    );
+
+    const ordered = try wrapAssistantText(alloc, "\x1b[2m12.\x1b[22m \x1b[2m\xe2\x98\x90 \x1b[22malpha beta gamma", 20);
+    defer alloc.free(ordered);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m12.\x1b[22m \x1b[2m\xe2\x98\x90 \x1b[22malpha\n      beta gamma",
+        ordered,
+    );
+
+    const nested = try wrapAssistantText(alloc, "  \x1b[38;5;252m\xe2\x9c\x93\x1b[39m abcdefghij", 10);
+    defer alloc.free(nested);
+    try std.testing.expectEqualStrings(
+        "  \x1b[38;5;252m\xe2\x9c\x93\x1b[39m abcdef\n    ghij",
+        nested,
+    );
+}
+
+test "wrapAssistantText keeps narrow task list rows within terminal width" {
+    const alloc = std.testing.allocator;
+    const task_rows = [_][]const u8{
+        "\x1b[2m\xe2\x98\x90 \x1b[22malphabet",
+        "\x1b[38;5;252m\xe2\x9c\x93\x1b[39m alphabet",
+    };
+
+    for (task_rows) |task_row| {
+        var cols: u16 = 1;
+        while (cols <= 5) : (cols += 1) {
+            const out = try wrapAssistantText(alloc, task_row, cols);
+            defer alloc.free(out);
+            var lines = std.mem.splitScalar(u8, out, '\n');
+            while (lines.next()) |line| {
+                try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+            }
+        }
+    }
+}
+
+test "wrapAssistantText keeps styled list continuations unstyled at indentation" {
+    const alloc = std.testing.allocator;
+    const input = "\x1b[2m\xe2\x80\xa2 \x1b[22m\x1b[1mabcdefghij\x1b[22m";
+    const out = try wrapAssistantText(alloc, input, 7);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("\x1b[2m\xe2\x80\xa2 \x1b[22m\x1b[1mabcde\x1b[0m\n  \x1b[1mfghij\x1b[22m", out);
+}
+
+test "wrapAssistantText keeps narrow list rows within terminal width" {
+    const alloc = std.testing.allocator;
+    const single_cell = "\x1b[2m\xe2\x80\xa2 \x1b[22mabcdefghijkl";
+    const two_cell = "\x1b[2m\xe2\x80\xa2 \x1b[22m\xe6\xbc\xa2\xe5\xad\x97abcdef";
+
+    var cols: u16 = 1;
+    while (cols <= 5) : (cols += 1) {
+        const out = try wrapAssistantText(alloc, single_cell, cols);
+        defer alloc.free(out);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+    }
+
+    cols = 2;
+    while (cols <= 5) : (cols += 1) {
+        const out = try wrapAssistantText(alloc, two_cell, cols);
+        defer alloc.free(out);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+    }
+}
+
+test "wrapAssistantText keeps Unicode display units intact at row boundaries" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "\u{2600}\u{FE0E}",
+        "\u{1F44D}\u{1F3FD}",
+        "\u{1F1FA}\u{1F1F8}",
+        "#\u{FE0F}\u{20E3}",
+        "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+        "\u{1F469}\u{200D}\u{1F4BB}",
+    };
+
+    for (cases) |unit| {
+        const input = try std.fmt.allocPrint(alloc, "a{s}b", .{unit});
+        defer alloc.free(input);
+        const out = try wrapAssistantText(alloc, input, 3);
+        defer alloc.free(out);
+
+        try std.testing.expect(std.mem.indexOf(u8, out, unit) != null);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 3);
+        }
+    }
+}
+
+test "wrapAssistantText keeps narrow blockquote rows within terminal width" {
+    const alloc = std.testing.allocator;
+    const prefix = "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m\xe2\x94\x82 \x1b[22m";
+    const single_cell = prefix ++ "abcdefghijkl";
+    const two_cell = prefix ++ "\xe6\xbc\xa2\xe5\xad\x97abcdef";
+
+    var cols: u16 = 1;
+    while (cols <= 7) : (cols += 1) {
+        const out = try wrapAssistantText(alloc, single_cell, cols);
+        defer alloc.free(out);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+    }
+
+    cols = 2;
+    while (cols <= 7) : (cols += 1) {
+        const out = try wrapAssistantText(alloc, two_cell, cols);
+        defer alloc.free(out);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+    }
+}
+
+test "wrapLiteralCommandOutput repeats gutters and uses absolute tab stops" {
+    const alloc = std.testing.allocator;
+    const out = try wrapLiteralCommandOutput(
+        alloc,
+        "paragraph words\n\n\tvalue",
+        16,
+    );
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings(
+        "│ paragraph\n" ++
+            "│ words\n" ++
+            "│ \n" ++
+            "│       value",
+        out,
+    );
+}
+
+test "wrapLiteralToolOutput repeats the tool detail rail on physical rows" {
+    const alloc = std.testing.allocator;
+    const out = try wrapLiteralToolOutput(
+        alloc,
+        "alpha beta gamma delta",
+        16,
+    );
+    defer alloc.free(out);
+
+    try std.testing.expectEqualStrings(
+        "│  alpha beta\n│  gamma delta",
+        out,
+    );
+}
+
+test "wrapLiteralCommandOutputPrefix bounds oversized record work" {
+    const alloc = std.testing.allocator;
+    const input = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(input);
+    @memset(input, 'x');
+
+    var prefix = try wrapLiteralCommandOutputPrefix(alloc, input, 20, 5);
+    defer prefix.deinit(alloc);
+    try std.testing.expect(prefix.has_more);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, prefix.bytes, "\n") + 1);
+    try std.testing.expect(prefix.bytes.len < 256);
+}
+
+test "wrapLiteralCommandOutput preserves and rows a pathological zero width run" {
+    const alloc = std.testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(alloc);
+    try input.append(alloc, 'a');
+    const combining_count = literal_command_zero_width_row_byte_limit + 512;
+    for (0..combining_count) |_| {
+        try input.appendSlice(alloc, "\xcc\x81");
+    }
+
+    const out = try wrapLiteralCommandOutput(alloc, input.items, 80);
+    defer alloc.free(out);
+    try std.testing.expectEqual(combining_count, std.mem.count(u8, out, "\xcc\x81"));
+    try std.testing.expect(std.mem.count(u8, out, "\n") > 1);
+}

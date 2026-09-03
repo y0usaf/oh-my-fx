@@ -2,11 +2,9 @@ const std = @import("std");
 const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
-const background_process_provider = @import("core/execution/background_process_provider.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
 const host = @import("core/hosts/host.zig");
-const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
@@ -157,18 +155,9 @@ const FetchBridge = struct {
     next_handle: fetch_state.Handle = 1,
     status: u16 = 0,
 
-    fn clearPendingRequest(self: *FetchBridge, reason: []const u8) void {
+    fn clearPendingRequest(self: *FetchBridge) void {
         if (self.request.items.len == 0) return;
-        debug_trace.logf("napi", "dropping pending host fetch reason={s} bytes={d}", .{ reason, self.request.items.len });
         self.request.clearRetainingCapacity();
-    }
-
-    fn trace_stale(operation: []const u8, handle: fetch_state.Handle, reason: fetch_state.StaleReason) void {
-        debug_trace.logf(
-            "napi",
-            "dropping stale host fetch operation={s} handle={d} reason={s}",
-            .{ operation, handle, @tagName(reason) },
-        );
     }
 
     fn advance_handle(self: *FetchBridge) void {
@@ -287,11 +276,8 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .close = handle });
-        if (decision.action == .stale) {
-            trace_stale("close", handle, decision.stale_reason.?);
-            return;
-        }
-        self.clearPendingRequest("stream_close");
+        if (decision.action == .stale) return;
+        self.clearPendingRequest();
         self.phase = decision.phase;
         self.status = 0;
         self.response.clearRetainingCapacity();
@@ -304,10 +290,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .start = handle });
-        if (decision.action == .stale) {
-            trace_stale("start", handle, decision.stale_reason.?);
-            return .stale;
-        }
+        if (decision.action == .stale) return .stale;
         self.status = status;
         self.phase = decision.phase;
         self.wake.broadcast(io);
@@ -319,10 +302,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .push = handle });
-        if (decision.action == .stale) {
-            trace_stale("push", handle, decision.stale_reason.?);
-            return .stale;
-        }
+        if (decision.action == .stale) return .stale;
         const queued = self.response.items.len - self.response_offset;
         if (data.len > max_fetch_response_bytes or queued > max_fetch_response_bytes - data.len) return .backpressure;
         if (self.response_offset > 0) {
@@ -340,10 +320,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .finish = handle });
-        if (decision.action == .stale) {
-            trace_stale("finish", handle, decision.stale_reason.?);
-            return .stale;
-        }
+        if (decision.action == .stale) return .stale;
         self.phase = decision.phase;
         self.wake.broadcast(io);
         return .applied;
@@ -354,10 +331,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .fail = handle });
-        if (decision.action == .stale) {
-            trace_stale("fail", handle, decision.stale_reason.?);
-            return .stale;
-        }
+        if (decision.action == .stale) return .stale;
         self.phase = decision.phase;
         self.wake.broadcast(io);
         return .applied;
@@ -375,7 +349,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .cancel);
-        self.clearPendingRequest("abort");
+        self.clearPendingRequest();
         self.phase = decision.phase;
         self.wake.broadcast(io);
     }
@@ -385,7 +359,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .shutdown);
-        self.clearPendingRequest("shutdown");
+        self.clearPendingRequest();
         self.phase = decision.phase;
         self.wake.broadcast(io);
     }
@@ -425,7 +399,6 @@ const Runtime = struct {
     fn writeOutput(context: ?*anyopaque, bytes: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(context.?));
         self.output.write(self.alloc, bytes) catch |err| {
-            debug_trace.logf("napi", "native output failed err={s}", .{@errorName(err)});
             self.exit_code.store(1, .seq_cst);
             return err;
         };
@@ -450,7 +423,6 @@ const Runtime = struct {
                 .gateway_models_path = builtin_gateway.models_path,
                 .gateway_provider = provider,
                 .provider_set = providers,
-                .background_process_provider = background_process_provider.unavailable_provider,
                 .secret_store = host.unavailable_secret_store,
                 .prompt_policy = builtin_context.prompt_policy,
                 .ignored_list_entries = &.{},
@@ -469,11 +441,11 @@ const Runtime = struct {
                 .workspace_root_override = self.workspace_root,
                 .allow_acp_mcp = false,
                 .allow_native_tools = false,
+                .minimal_kernel = true,
             },
             jsonrpc.Reader.initCallback(self, Runtime.readInput),
             jsonrpc.Writer.initCallback(self, Runtime.writeOutput),
-        ) catch |err| {
-            debug_trace.logf("napi", "native runtime failed err={s}", .{@errorName(err)});
+        ) catch {
             self.exit_code.store(1, .seq_cst);
         };
         self.exited.store(true, .seq_cst);
@@ -542,9 +514,6 @@ fn ensureThreadedIo() void {
         io_mod.setIo(threaded_io.?.io());
         const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
         io_mod.setRawEnviron(raw_environ);
-        const workspace_root = io_mod.realpathAlloc(std.heap.c_allocator, ".") catch null;
-        defer if (workspace_root) |path| std.heap.c_allocator.free(path);
-        debug_trace.configureFromEnv(std.heap.c_allocator, workspace_root orelse ".");
         threaded_io_state.store(2, .release);
         return;
     }
@@ -589,15 +558,28 @@ fn getNamedString(
     max_len: usize,
 ) !?[]u8 {
     var present = false;
-    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok or !present) return null;
+    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok) {
+        if (exceptionPending(env)) return error.JavaScriptException;
+        return error.InvalidArgument;
+    }
+    if (!present) return null;
     var value: c.napi_value = undefined;
-    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) return error.InvalidArgument;
+    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) {
+        if (exceptionPending(env)) return error.JavaScriptException;
+        return error.InvalidArgument;
+    }
     var value_type: c.napi_valuetype = undefined;
     if (c.napi_typeof(env, value, &value_type) != c.napi_ok or value_type != c.napi_string) return error.InvalidArgument;
     return try stringArg(env, value, alloc, max_len);
 }
 
+fn exceptionPending(env: c.napi_env) bool {
+    var pending = false;
+    return c.napi_is_exception_pending(env, &pending) == c.napi_ok and pending;
+}
+
 const CreateError = error{
+    JavaScriptException,
     TooManyRuntimes,
     InvalidApiKey,
     InvalidModel,
@@ -613,27 +595,32 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
     const credential = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidApiKey,
     };
     const api_key = credential orelse return error.InvalidApiKey;
     errdefer alloc.free(api_key);
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidModel,
     };
     errdefer if (model) |value| alloc.free(value);
     const home = (getNamedString(env, options, "home", alloc, max_path_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidHome,
     }) orelse return error.InvalidHome;
     errdefer alloc.free(home);
     const workspace_root = (getNamedString(env, options, "workspaceRoot", alloc, max_path_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidWorkspaceRoot,
     }) orelse return error.InvalidWorkspaceRoot;
     errdefer alloc.free(workspace_root);
     const gateway_chat_url = (getNamedString(env, options, "gatewayChatUrl", alloc, max_url_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidGatewayUrl,
     }) orelse (alloc.dupe(u8, builtin_gateway.default_chat_url) catch return error.OutOfMemory);
@@ -668,6 +655,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
 
 fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
     return switch (err) {
+        error.JavaScriptException => null,
         error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
         error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),

@@ -23,6 +23,7 @@ const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
+const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
@@ -90,6 +91,7 @@ pub const FooterPlannerInput = struct {
     show_picker: bool = false,
     picker_kind: input_presentation.PickerKind = .model_stage,
     picker_items: []const []const u8 = &.{},
+    picker_annotations: []const []const u8 = &.{},
     file_picker_items: []const file_index.SearchResult = &.{},
     picker_selection_index: usize = 0,
     picker_window_start: usize = 0,
@@ -97,6 +99,7 @@ pub const FooterPlannerInput = struct {
     picker_failed: bool = false,
     slash_completion_count: usize = 0,
     slash_menu_layout: ?picker_presentation.SlashMenuLayout = null,
+    prepared_slash_menu: ?*const picker_presentation.PreparedSlashMenu = null,
     picker_start_col: u16 = 1,
     transcript_state: ?FooterTranscriptState = null,
 };
@@ -169,6 +172,10 @@ fn plannerCursorCol(shell: *const TranscriptRuntime, input: FooterPlannerInput) 
 
 pub noinline fn composerTopChromeRows() u16 {
     return 0;
+}
+
+test "current composer suppresses top chrome" {
+    try std.testing.expectEqual(@as(u16, 0), composerTopChromeRows());
 }
 
 fn plannerFooterReservedBaseRows(input: FooterPlannerInput) u16 {
@@ -575,22 +582,46 @@ fn pushQueuedPromptBannerRows(
 
     if (ctx.queued_prompt_cards.len == 0) {
         var painted: u16 = 0;
-        var summary = try input_presentation.composeQueuedSummaryRow(
-            alloc,
-            ctx.queued_count,
-            ctx.steering_count,
-            ctx.queued_paused,
-            width,
-        );
-        try pushFooterBandRow(alloc, frame, plan, plan.footer.banner, &summary);
-        painted +|= 1;
+        if (ctx.steering_messages.len > 0) {
+            const visible_count = @min(
+                ctx.steering_messages.len,
+                @as(usize, plan.footer.banner_rows),
+            );
+            const visible_start = ctx.steering_messages.len - visible_count;
+            for (ctx.steering_messages[visible_start..], visible_start..) |message, index| {
+                if (painted >= plan.footer.banner_rows) break;
+                var row = try input_presentation.composeSteeringMessageRow(
+                    alloc,
+                    message,
+                    ctx.steering_waits_for_tool and
+                        index + 1 == ctx.steering_messages.len,
+                    width,
+                );
+                try pushFooterBandRow(
+                    alloc,
+                    frame,
+                    plan,
+                    plan.footer.banner +| painted,
+                    &row,
+                );
+                painted +|= 1;
+            }
+        } else {
+            var summary = try input_presentation.composeQueuedSummaryRow(
+                alloc,
+                ctx.queued_count,
+                ctx.queued_paused,
+                width,
+            );
+            try pushFooterBandRow(alloc, frame, plan, plan.footer.banner, &summary);
+            painted +|= 1;
+        }
         if (ctx.queued_paused and painted < plan.footer.banner_rows) {
             var hint = try input_presentation.composeQueueReviewHintRow(
                 alloc,
                 width,
                 false,
                 ctx.queued_cancel_all_available,
-                ctx.steering_count > 0,
             );
             try pushFooterBandRow(alloc, frame, plan, plan.footer.banner +| painted, &hint);
             painted +|= 1;
@@ -714,7 +745,6 @@ fn pushQueuedPromptBannerRows(
             width,
             empty_draft,
             ctx.queued_cancel_all_available,
-            ctx.steering_count > 0,
         );
         try pushFooterBandRow(alloc, frame, plan, hint_row, &hint);
     }
@@ -838,6 +868,18 @@ pub fn composeFooterFrame(
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
+        } else if (input.picker_kind == .mcp and ctx.mcp_menu.state.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try mcp_menu_presentation.composeMcpMenuRow(
+                    alloc,
+                    ctx.mcp_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
         } else if (input.picker_kind == .help and ctx.help_menu.active) {
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
@@ -915,7 +957,10 @@ pub fn composeFooterFrame(
             }
         } else if (input.picker_kind == .slash) {
             const slash_prefix = input_presentation.slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
-            const count = picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, slash_prefix, ctx.skills_menu.items);
+            const count = if (input.prepared_slash_menu) |prepared|
+                prepared.resultCount()
+            else
+                picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, slash_prefix, ctx.skills_menu.items);
             if (count > 0) {
                 if (input.slash_menu_layout) |layout| {
                     var row = rows.picker_start;
@@ -929,26 +974,44 @@ pub fn composeFooterFrame(
                         row += 1;
                     }
 
-                    const column_widths = picker_presentation.mixedSlashMenuColumnWidths(
-                        ctx.slash_registry,
-                        slash_prefix,
-                        ctx.skills_menu.items,
-                        layout.window,
-                        ctx.input.slash_menu_categories,
-                    );
-                    var match_idx = layout.window.start;
-                    while (match_idx < layout.window.end) : (match_idx += 1) {
-                        var slash_row = try picker_presentation.composeSlashMenuOptionRow(
-                            alloc,
+                    const column_widths = if (input.prepared_slash_menu) |prepared|
+                        picker_presentation.preparedSlashMenuColumnWidths(
+                            prepared,
+                            layout.window,
+                            ctx.input.slash_menu_categories,
+                        )
+                    else
+                        picker_presentation.mixedSlashMenuColumnWidths(
                             ctx.slash_registry,
                             slash_prefix,
                             ctx.skills_menu.items,
-                            match_idx,
-                            match_idx == layout.selected,
-                            column_widths,
-                            shell.layout.cols,
+                            layout.window,
                             ctx.input.slash_menu_categories,
                         );
+                    var match_idx = layout.window.start;
+                    while (match_idx < layout.window.end) : (match_idx += 1) {
+                        var slash_row = if (input.prepared_slash_menu) |prepared|
+                            try picker_presentation.composePreparedSlashMenuOptionRow(
+                                alloc,
+                                prepared,
+                                match_idx,
+                                match_idx == layout.selected,
+                                column_widths,
+                                shell.layout.cols,
+                                ctx.input.slash_menu_categories,
+                            )
+                        else
+                            try picker_presentation.composeSlashMenuOptionRow(
+                                alloc,
+                                ctx.slash_registry,
+                                slash_prefix,
+                                ctx.skills_menu.items,
+                                match_idx,
+                                match_idx == layout.selected,
+                                column_widths,
+                                shell.layout.cols,
+                                ctx.input.slash_menu_categories,
+                            );
                         try pushFooterBandRow(alloc, &frame, plan, row, &slash_row);
                         row += 1;
                     }
@@ -965,9 +1028,6 @@ pub fn composeFooterFrame(
                         row += 1;
                     }
                 }
-            } else {
-                var status_row = try picker_presentation.composePickerStatusRow(alloc, .slash, ctx.model_picker_stage, false, false, input.picker_start_col, shell.layout.cols);
-                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start, &status_row);
             }
         } else if (input.picker_kind == .file and input.file_picker_items.len > 0) {
             const selected = input.picker_selection_index % input.file_picker_items.len;
@@ -985,12 +1045,13 @@ pub fn composeFooterFrame(
             const window = picker_presentation.edgeScrollPickerWindowFromStart(input.picker_items.len, window_start, input.picker_rows);
             var row = rows.picker_start;
             for (input.picker_items[window.start..window.end], window.start..) |item, i| {
-                var picker_row = try picker_presentation.composePickerOptionRow(alloc, input.picker_kind, input.picker_start_col, item, i == selected, shell.layout.cols);
+                const annotation = if (i < input.picker_annotations.len) input.picker_annotations[i] else "";
+                var picker_row = try picker_presentation.composePickerOptionRowAnnotated(alloc, input.picker_kind, input.picker_start_col, item, annotation, i == selected, shell.layout.cols);
                 try pushFooterBandRow(alloc, &frame, plan, row, &picker_row);
                 row += 1;
             }
         } else {
-            var status_row = try picker_presentation.composePickerStatusRow(alloc, input.picker_kind, ctx.model_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
+            var status_row = try picker_presentation.composePickerStatusRowWithProvider(alloc, input.picker_kind, ctx.model_picker_stage, ctx.provider_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
             try pushFooterBandRow(alloc, &frame, plan, rows.picker_start, &status_row);
         }
     }
@@ -1015,6 +1076,13 @@ pub fn composeFooterFrame(
         try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .settings)
         try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .mcp)
+        try input_presentation.composeMcpMenuHintRow(
+            alloc,
+            shell.layout.cols,
+            ctx.ctrl_c_pending,
+            ctx.mcp_menu.state,
+        )
     else if (input.show_picker and input.picker_kind == .help)
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .sessions)
@@ -1254,11 +1322,6 @@ fn testContext(input: *const InputRuntime) render_input.RenderContext {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -1291,6 +1354,620 @@ fn expectFrameRowBackground(frame: *const footer_viewport.ComposedFooterFrame, r
 
 fn expectFrameRowDefaultBackground(frame: *const footer_viewport.ComposedFooterFrame, row_number: u16, width: u16) !void {
     try expectFrameRowBackground(frame, row_number, width, .default);
+}
+
+fn expectFrameRowTextTrimmed(frame: *const footer_viewport.ComposedFooterFrame, row_number: u16, width: u16, expected: []const u8) !void {
+    for (frame.rows.items) |row| {
+        if (row.row == row_number) {
+            var grid = try vt_emulator.Grid.init(std.testing.allocator, width, 1);
+            defer grid.deinit();
+            try grid.feed(row.text.items);
+
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(std.testing.allocator);
+            try grid.rowTextTrimmed(1, &text);
+            try std.testing.expectEqualStrings(expected, text.items);
+            return;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn expectFrameCellForeground(frame: *const footer_viewport.ComposedFooterFrame, row_number: u16, width: u16, col: u16, expected: vt_emulator.Color) !void {
+    for (frame.rows.items) |row| {
+        if (row.row == row_number) {
+            var grid = try vt_emulator.Grid.init(std.testing.allocator, width, 1);
+            defer grid.deinit();
+            try grid.feed(row.text.items);
+
+            const cell = grid.cellAt(1, col) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(cell.style.fg.eql(expected));
+            return;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "transcript viewer footer keeps navigation blank row and aligns main status" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 80,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+    var ctx = testContext(&input);
+    ctx.transcript_depth = .full;
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = false,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+    };
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    try expectFrameRowTextTrimmed(
+        &frame,
+        frame_plan.paint.footer.top_divider,
+        shell.layout.cols,
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
+    );
+    try expectFrameRowTextTrimmed(
+        &frame,
+        frame_plan.paint.footer.bottom_divider,
+        shell.layout.cols,
+        "",
+    );
+    try expectFrameRowTextTrimmed(
+        &frame,
+        frame_plan.paint.footer.hint,
+        shell.layout.cols,
+        "ask · gpt-5.1",
+    );
+    try std.testing.expect(!frame.cursor_visible);
+
+    ctx.transcript_depth = .full;
+    const full_input = FooterPlannerInput{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = false,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+    };
+    const full_plan = planFooterPaint(&shell, full_input);
+    var full_frame = try composeFooterFrame(alloc, &shell, full_input, full_plan.paint);
+    defer full_frame.deinit(alloc);
+    try expectFrameRowTextTrimmed(
+        &full_frame,
+        full_plan.paint.footer.top_divider,
+        shell.layout.cols,
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
+    );
+}
+
+test "footer paints an inline completion suffix without moving the composer cursor" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    try input.textReplacementState().replace(alloc, "explain $man");
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 18,
+            .cols = 40,
+            .content_bottom = 12,
+            .divider_top_row = 13,
+            .input_row = 14,
+            .divider_bottom_row = 15,
+            .hint_row = 16,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    var ctx = testContext(&input);
+    ctx.inline_completion_suffix = "aged-menu";
+    const geometry = input_presentation.measureRawInputGeometry(
+        ctx,
+        shell.layout.cols,
+        shell.layout.content_bottom,
+        true,
+        false,
+        false,
+        false,
+    );
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = geometry.input_extra,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .banner_active = false,
+        .input_summary = geometry.summary,
+        .input_window = geometry.window,
+        .total_lines = geometry.total_lines,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    try expectFrameRowTextTrimmed(
+        &frame,
+        frame_plan.paint.footer.input_base,
+        shell.layout.cols,
+        "┃ explain $managed-menu",
+    );
+    try std.testing.expectEqualStrings("explain $man", input.edit_state.input.items);
+    try std.testing.expectEqual(
+        visual_layout.terminalColumn(geometry.summary.cursor, shell.layout.cols),
+        frame.cursor.col,
+    );
+    try expectFrameCellForeground(
+        &frame,
+        frame_plan.paint.footer.input_base,
+        shell.layout.cols,
+        frame.cursor.col,
+        .{ .indexed = 245 },
+    );
+}
+
+test "queued prompts collapse to a single summary row until the review opens" {
+    const alloc = std.testing.allocator;
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 18,
+            .cols = 40,
+            .content_bottom = 12,
+            .divider_top_row = 13,
+            .input_row = 14,
+            .divider_bottom_row = 15,
+            .hint_row = 16,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    var ctx = testContext(&input);
+    ctx.queued_count = 2;
+    const banner_rows = render_input.queuedBannerRows(ctx);
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .footer_extra_rows = banner_rows,
+        .banner_active = true,
+        .banner_rows = banner_rows,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    try frame_plan.paint.validate();
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    const banner = frame_plan.paint.footer.banner;
+    try std.testing.expectEqual(@as(u16, 2), frame_plan.paint.footer.banner_rows);
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "2 queued messages · ↑ to edit");
+    try expectFrameRowTextTrimmed(&frame, banner + 1, shell.layout.cols, "");
+    try std.testing.expect(frame_plan.paint.footer.input_base >= banner + 2);
+}
+
+test "clamped steering banner keeps newest messages and escape hint" {
+    const alloc = std.testing.allocator;
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 48,
+            .content_bottom = 6,
+            .divider_top_row = 7,
+            .input_row = 8,
+            .divider_bottom_row = 9,
+            .hint_row = 10,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 4,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const messages = [_][]const u8{ "first hidden", "second hidden", "third visible", "fourth visible" };
+    var ctx = testContext(&input);
+    ctx.queued_count = messages.len;
+    ctx.steering_messages = &messages;
+    ctx.steering_waits_for_tool = true;
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .footer_extra_rows = 2,
+        .banner_active = true,
+        .banner_rows = 2,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    const banner = frame_plan.paint.footer.banner;
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "third visible");
+    try expectFrameRowTextTrimmed(
+        &frame,
+        banner + 1,
+        shell.layout.cols,
+        "fourth visible · Esc to steer now",
+    );
+}
+
+test "a hidden paused review keeps the summary row above its hint" {
+    const alloc = std.testing.allocator;
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 18,
+            .cols = 80,
+            .content_bottom = 12,
+            .divider_top_row = 13,
+            .input_row = 14,
+            .divider_bottom_row = 15,
+            .hint_row = 16,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    var ctx = testContext(&input);
+    ctx.queued_count = 1;
+    ctx.queued_paused = true;
+    ctx.queued_cancel_all_available = true;
+    const banner_rows = render_input.queuedBannerRows(ctx);
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .footer_extra_rows = banner_rows,
+        .banner_active = true,
+        .banner_rows = banner_rows,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    try frame_plan.paint.validate();
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    const banner = frame_plan.paint.footer.banner;
+    try std.testing.expectEqual(@as(u16, 3), frame_plan.paint.footer.banner_rows);
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "1 queued message");
+    try expectFrameRowTextTrimmed(
+        &frame,
+        banner + 1,
+        shell.layout.cols,
+        "paused · enter to send · press esc to cancel all queued",
+    );
+    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "");
+}
+
+test "queued prompt cards stack above the composer with a paused hint" {
+    const alloc = std.testing.allocator;
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 30,
+            .cols = 24,
+            .content_bottom = 20,
+            .divider_top_row = 25,
+            .input_row = 26,
+            .divider_bottom_row = 27,
+            .hint_row = 28,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const first = try user_message_card.buildUserPromptCard(alloc, "first queued", &.{}, shell.layout.cols);
+    defer alloc.free(first);
+    const second = try user_message_card.buildUserPromptCard(alloc, "second queued\ncontinued", &.{}, shell.layout.cols);
+    defer alloc.free(second);
+    const cards = [_]render_input.QueuedPromptCard{
+        .{ .bytes = first },
+        .{ .bytes = second },
+    };
+
+    var ctx = testContext(&input);
+    ctx.queued_count = 2;
+    ctx.queued_paused = true;
+    ctx.queued_prompt_cards = &cards;
+    ctx.queued_prompt_card_rows = 3;
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .footer_extra_rows = 7,
+        .banner_active = true,
+        .banner_rows = 7,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    try frame_plan.paint.validate();
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    const banner = frame_plan.paint.footer.banner;
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "┃ first queued");
+    try expectFrameRowTextTrimmed(&frame, banner + 1, shell.layout.cols, "");
+    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "┃ second queued");
+    try expectFrameRowTextTrimmed(&frame, banner + 3, shell.layout.cols, "┃ continued");
+    try expectFrameRowTextTrimmed(&frame, banner + 4, shell.layout.cols, "");
+    try expectFrameRowTextTrimmed(&frame, banner + 5, shell.layout.cols, "paused · enter to send");
+    try expectFrameRowTextTrimmed(&frame, banner + 6, shell.layout.cols, "");
+}
+
+test "queued editor paints and owns the cursor on its original card row" {
+    const alloc = std.testing.allocator;
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    try input.textReplacementState().replace(alloc, "second queued");
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 30,
+            .cols = 24,
+            .content_bottom = 20,
+            .divider_top_row = 25,
+            .input_row = 26,
+            .divider_bottom_row = 27,
+            .hint_row = 28,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const first = try user_message_card.buildUserPromptCard(alloc, "first queued", &.{}, shell.layout.cols);
+    defer alloc.free(first);
+    const editing_bytes = try alloc.dupe(u8, "");
+    defer alloc.free(editing_bytes);
+    const cards = [_]render_input.QueuedPromptCard{
+        .{ .bytes = first },
+        .{ .bytes = editing_bytes, .editing = true },
+    };
+
+    var ctx = testContext(&input);
+    ctx.queued_count = 2;
+    ctx.queued_paused = true;
+    ctx.queued_prompt_cards = &cards;
+    ctx.queued_prompt_card_rows = 2;
+    ctx.queued_editor_active = true;
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .footer_extra_rows = 6,
+        .banner_active = true,
+        .banner_rows = 6,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    try frame_plan.paint.validate();
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    const banner = frame_plan.paint.footer.banner;
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "┃ first queued");
+    try expectFrameRowTextTrimmed(&frame, banner + 1, shell.layout.cols, "");
+    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "┃ second queued");
+    try expectFrameRowTextTrimmed(&frame, banner + 3, shell.layout.cols, "");
+    try expectFrameRowTextTrimmed(&frame, banner + 4, shell.layout.cols, "paused · enter to send");
+    try expectFrameRowTextTrimmed(&frame, banner + 5, shell.layout.cols, "");
+    try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.input_base, shell.layout.cols, "┃");
+    try std.testing.expectEqual(banner + 2, frame.cursor.row);
+    try std.testing.expectEqual(@as(u16, 16), frame.cursor.col);
+    try std.testing.expect(frame.cursor_visible);
+    try std.testing.expect(frame.cursor.row != frame_plan.paint.footer.input_base);
+}
+
+test "queued editor follows the cursor when its draft exceeds the card budget" {
+    const alloc = std.testing.allocator;
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    try input.textReplacementState().replace(
+        alloc,
+        "first line\nsecond line\nthird line\nfourth line\nfifth line tail",
+    );
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 30,
+            .cols = 24,
+            .content_bottom = 20,
+            .divider_top_row = 25,
+            .input_row = 26,
+            .divider_bottom_row = 27,
+            .hint_row = 28,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const editing_bytes = try alloc.dupe(u8, "");
+    defer alloc.free(editing_bytes);
+    const cards = [_]render_input.QueuedPromptCard{
+        .{ .bytes = editing_bytes, .editing = true },
+    };
+
+    var ctx = testContext(&input);
+    ctx.queued_count = 1;
+    ctx.queued_paused = true;
+    ctx.queued_prompt_cards = &cards;
+    ctx.queued_prompt_card_rows = 5;
+    ctx.queued_editor_active = true;
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .footer_extra_rows = 5,
+        .banner_active = true,
+        .banner_rows = 5,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    try frame_plan.paint.validate();
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    // A clamped band drops the spacers and spends every row on queued content.
+    const banner = frame_plan.paint.footer.banner;
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "┃↑second line");
+    try expectFrameRowTextTrimmed(&frame, banner + 1, shell.layout.cols, "┃ third line");
+    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "┃ fourth line");
+    try expectFrameRowTextTrimmed(&frame, banner + 3, shell.layout.cols, "┃ fifth line tail");
+    try expectFrameRowTextTrimmed(&frame, banner + 4, shell.layout.cols, "paused · enter to send");
+    try std.testing.expectEqual(banner + 3, frame.cursor.row);
+    try std.testing.expectEqual(@as(u16, 18), frame.cursor.col);
+    try std.testing.expect(frame.cursor_visible);
+}
+
+test "current composer renders a white connected rail across its rows" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    try input.edit_state.input.appendSlice(alloc, "one\ntwo\nthree");
+    input.edit_state.cursor = input.edit_state.input.items.len;
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 18,
+            .cols = 12,
+            .content_bottom = 12,
+            .divider_top_row = 13,
+            .input_row = 14,
+            .divider_bottom_row = 15,
+            .hint_row = 16,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 10,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const ctx = testContext(&input);
+    const geometry = input_presentation.measureRawInputGeometry(ctx, shell.layout.cols, shell.layout.content_bottom, true, false, false, false);
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = geometry.input_extra,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .banner_active = false,
+        .input_summary = geometry.summary,
+        .input_window = geometry.window,
+        .total_lines = geometry.total_lines,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 0), frame_plan.paint.footer.composer_top_chrome_rows);
+    const first_input_row = frame_plan.paint.footer.input_base - 2;
+    try expectFrameRowTextTrimmed(&frame, first_input_row, shell.layout.cols, "┃ one");
+    try expectFrameRowTextTrimmed(&frame, first_input_row + 1, shell.layout.cols, "┃ two");
+    try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.input_base, shell.layout.cols, "┃ three");
+    try expectFrameCellForeground(&frame, first_input_row, shell.layout.cols, 1, .{ .indexed = 255 });
+    try expectFrameCellForeground(&frame, first_input_row + 1, shell.layout.cols, 1, .{ .indexed = 255 });
+    try expectFrameCellForeground(&frame, frame_plan.paint.footer.input_base, shell.layout.cols, 1, .{ .indexed = 255 });
+    try expectFrameCellForeground(&frame, first_input_row, shell.layout.cols, 3, .default);
+    try expectFrameRowDefaultBackground(&frame, frame_plan.paint.footer.input_base, shell.layout.cols);
+    try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.bottom_divider, shell.layout.cols, "");
+    try std.testing.expectEqual(@as(u16, 8), frame.cursor.col);
 }
 
 fn expectGenericPickerSelectionAtRow(
@@ -1377,4 +2054,556 @@ fn expectGenericPickerSelectionAtRow(
 
 fn expectGenericPickerSelectionAtBottom(kind: input_presentation.PickerKind) !void {
     try expectGenericPickerSelectionAtRow(kind, 5, 0, 5);
+}
+
+test "footer generic picker selection reaches bottom before scrolling" {
+    try expectGenericPickerSelectionAtBottom(.model_stage);
+    try expectGenericPickerSelectionAtBottom(.file);
+}
+
+test "footer generic picker selection moves up before reverse scrolling" {
+    try expectGenericPickerSelectionAtRow(.model_stage, 5, 1, 4);
+    try expectGenericPickerSelectionAtRow(.file, 5, 1, 4);
+}
+
+test "footer picker status frame owns unused reserved picker rows" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 14,
+            .cols = 80,
+            .content_bottom = 10,
+            .divider_top_row = 11,
+            .input_row = 12,
+            .divider_bottom_row = 13,
+            .hint_row = 14,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 10,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = testContext(&input),
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .picker_rows = input_presentation.max_model_picker_rows,
+        .footer_extra_rows = input_presentation.max_model_picker_rows + 1,
+        .banner_active = false,
+        .show_picker = true,
+        .picker_kind = .model_stage,
+        .picker_items = &.{},
+        .picker_loading = false,
+        .picker_failed = false,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    try frame_plan.paint.validate();
+
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    var shadow = try vt_emulator.Grid.init(alloc, shell.layout.cols, shell.layout.rows);
+    defer shadow.deinit();
+    try shadow.feed("\x1b[8;1Hstale picker row");
+
+    var surface = try render_engine.frame_surface.FrameSurface.initFromShadow(alloc, frame_plan.paint, shadow);
+    defer surface.deinit();
+    _ = try footer_viewport.paintFooterIntoSurface(&surface, &frame);
+
+    var target = try surface.copyToTargetGrid(alloc);
+    defer target.deinit();
+
+    var row_buf: std.ArrayList(u8) = .empty;
+    defer row_buf.deinit(alloc);
+
+    try target.rowTextTrimmed(frame_plan.paint.footer.picker_start, &row_buf);
+    try std.testing.expect(std.mem.find(u8, row_buf.items, "no matching models") != null);
+
+    var row = frame_plan.paint.footer.picker_start + 1;
+    while (row < frame_plan.paint.footer.bottom_divider) : (row += 1) {
+        row_buf.clearRetainingCapacity();
+        try target.rowTextTrimmed(row, &row_buf);
+        try std.testing.expectEqual(@as(usize, 0), row_buf.items.len);
+        const cell = surface.cellAt(row, 1) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(engine_paint_plan.CellOwner.footer, cell.owner);
+    }
+}
+
+test "footer paint plan keeps cursor visible during transient activity when input is visible" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 10,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(std.testing.allocator);
+
+    const ctx: render_input.RenderContext = .{
+        .stream = .{ .active = true },
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .queued_count = 0,
+        .input = &input,
+    };
+
+    const frame_plan = planFooterPaint(&shell, .{
+        .active_label = "thinking",
+        .activity_projection = .{ .turn_thinking = .{ .label = "thinking" } },
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .picker_rows = 0,
+        .banner_active = false,
+    });
+
+    switch (frame_plan.paint.activity) {
+        .transient_row => {},
+        .none, .overlay_entry => return error.TestUnexpectedResult,
+    }
+    try frame_plan.paint.validate();
+    try std.testing.expectEqual(frame_plan.paint.activity.transcriptReservationRows(), frame_plan.paint.bottom_reserved_rows);
+    try std.testing.expect(frame_plan.paint.cursor_target != null);
+    try std.testing.expect(frame_plan.paint.cursor_target.?.visible);
+}
+
+test "approval footer composition hides cursor while rendering command prompt" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var approval = ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try std.testing.expect(try approval.syncRequest(alloc, .{ .label = "shell.run echo permission test" }));
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 40,
+            .cols = 80,
+            .content_bottom = 36,
+            .divider_top_row = 37,
+            .input_row = 38,
+            .divider_bottom_row = 39,
+            .hint_row = 40,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 10,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const ctx: render_input.RenderContext = .{
+        .stream = .{},
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .queued_count = 0,
+        .input = &input,
+    };
+    const request = approval.request.?.view();
+    const picker_rows = try approval_ui.inlineApprovalPanelRowsForCommand(
+        alloc,
+        request.label,
+        request.command,
+        shell.layout.cols,
+        shell.layout.rows,
+    );
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = false,
+        .picker_rows = picker_rows,
+        .banner_active = false,
+        .approval = approval.projection(),
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    try frame_plan.paint.validate();
+
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    try std.testing.expect(!frame.cursor_visible);
+
+    var saw_prompt = false;
+    var saw_default_reason = false;
+    var saw_selected_choice = false;
+    var prompt_row: ?usize = null;
+    var command_row: ?usize = null;
+    var choice_three_row: ?u16 = null;
+    var controls_row: ?u16 = null;
+    var controls_count: u8 = 0;
+    for (frame.rows.items, 0..) |row, row_index| {
+        saw_prompt = saw_prompt or std.mem.find(u8, row.text.items, "Would you like to run the following command?") != null;
+        saw_default_reason = saw_default_reason or std.mem.find(u8, row.text.items, "fx needs your approval before running this shell command") != null;
+        saw_selected_choice = saw_selected_choice or std.mem.find(u8, row.text.items, "1. Yes") != null;
+        if (std.mem.find(u8, row.text.items, "Would you like to run the following command?") != null) {
+            prompt_row = row_index;
+        }
+        if (std.mem.find(u8, row.text.items, "$ echo permission test") != null) {
+            command_row = row_index;
+        }
+        if (std.mem.find(u8, row.text.items, "3. No") != null) {
+            choice_three_row = row.row;
+        }
+        if (std.mem.find(u8, row.text.items, "1–3 Choose") != null) {
+            controls_row = row.row;
+            controls_count += 1;
+            try std.testing.expect(std.mem.find(u8, row.text.items, "gpt-5.1") == null);
+        }
+    }
+    try std.testing.expect(saw_prompt);
+    try std.testing.expect(!saw_default_reason);
+    try std.testing.expect(saw_selected_choice);
+    try std.testing.expectEqual(prompt_row.? + 2, command_row.?);
+    try std.testing.expectEqual(@as(u8, 1), controls_count);
+    try std.testing.expectEqual(frame_plan.paint.footer.hint, controls_row.?);
+    try std.testing.expectEqual(choice_three_row.? + 2, frame_plan.paint.footer.bottom_divider);
+}
+
+test "footer paint plan keeps compact transient activity adjacent to footer" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 46,
+            .cols = 167,
+            .content_bottom = 42,
+            .divider_top_row = 43,
+            .input_row = 44,
+            .divider_bottom_row = 45,
+            .hint_row = 46,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 10,
+        .cursor_col = 1,
+        .last_visible_transcript_tail_kind = .user_turn,
+    };
+    defer shell.deinit(std.testing.allocator);
+    const prompt = try std.testing.allocator.dupe(u8, "tell me a story in 200 words\n");
+    try shell.entries.append(std.testing.allocator, .{
+        .raw_bytes = .{ .id = 1, .bytes = prompt, .class = .unknown_raw },
+    });
+
+    const ctx: render_input.RenderContext = .{
+        .stream = .{ .active = true },
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .queued_count = 0,
+        .input = &input,
+    };
+    const selection: ViewportSelection = .{
+        .top_row = 1,
+        .bottom_row = 9,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 9,
+        .last_visible_row = 9,
+        .last_visible_row_blank = false,
+        .tail_kind = .user_turn,
+    };
+
+    const frame_plan = planFooterPaint(&shell, .{
+        .active_label = "thinking",
+        .activity_projection = .{ .turn_thinking = .{ .label = "thinking" } },
+        .ctx = ctx,
+        .place_mid_line_active = true,
+        .input_extra = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+        .applied_bottom_reserved_rows = 2,
+        .transcript_state = .{
+            .selection = selection,
+            .cursor_row = 10,
+            .cursor_col = 1,
+            .replaceable_row = 10,
+            .bottom_reserved_rows = 2,
+        },
+    });
+
+    try frame_plan.paint.validate();
+    try std.testing.expectEqual(@as(u16, 9), frame_plan.paint.transcript_band.bottom);
+    try std.testing.expectEqual(@as(u16, 11), frame_plan.paint.activity_band.top);
+    try std.testing.expectEqual(@as(u16, 13), frame_plan.paint.footer_band.top);
+    try std.testing.expect(frame_plan.paint.invalidation.isEmpty());
+}
+
+test "footer paint plan owns reserved idle gap row without invalidation" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 45,
+            .cols = 168,
+            .content_bottom = 41,
+            .divider_top_row = 42,
+            .input_row = 43,
+            .divider_bottom_row = 44,
+            .hint_row = 45,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 41,
+        .cursor_col = 1,
+        .last_visible_transcript_last_row = 40,
+        .last_visible_transcript_tail_kind = .assistant_turn,
+        .last_viewport_selection = .{
+            .top_row = 1,
+            .bottom_row = 40,
+            .start_line = 3,
+            .partial_skip_rows = 0,
+            .line_count = 43,
+            .last_visible_row = 40,
+            .tail_kind = .assistant_turn,
+        },
+    };
+    defer shell.deinit(std.testing.allocator);
+
+    const ctx: render_input.RenderContext = .{
+        .stream = .{},
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .queued_count = 0,
+        .input = &input,
+    };
+
+    const frame_plan = planFooterPaint(&shell, .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+        .applied_bottom_reserved_rows = 1,
+    });
+
+    try frame_plan.paint.validate();
+    try std.testing.expectEqual(@as(u16, 40), frame_plan.paint.transcript_band.bottom);
+    try std.testing.expectEqual(
+        engine_paint_plan.FrameBand{ .top = 41, .bottom = 41, .owner = .gap },
+        frame_plan.paint.blank_band,
+    );
+    try std.testing.expectEqual(@as(u16, 42), frame_plan.paint.footer_band.top);
+    try std.testing.expect(frame_plan.paint.invalidation.isEmpty());
+}
+
+test "footer paint plan uses transcript preview for idle reservation" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 45,
+            .cols = 168,
+            .content_bottom = 41,
+            .divider_top_row = 42,
+            .input_row = 43,
+            .divider_bottom_row = 44,
+            .hint_row = 45,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 10,
+        .cursor_col = 1,
+        .last_visible_transcript_last_row = 10,
+        .last_visible_transcript_tail_kind = .user_turn,
+    };
+    defer shell.deinit(std.testing.allocator);
+
+    const ctx: render_input.RenderContext = .{
+        .stream = .{},
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .queued_count = 0,
+        .input = &input,
+    };
+
+    const preview_selection: ViewportSelection = .{
+        .top_row = 1,
+        .bottom_row = 41,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 41,
+        .last_visible_row = 41,
+        .last_visible_row_blank = false,
+        .tail_kind = .assistant_turn,
+    };
+    const frame_plan = planFooterPaint(&shell, .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+        .transcript_state = .{
+            .selection = preview_selection,
+            .cursor_row = 41,
+            .cursor_col = 1,
+            .replaceable_row = 41,
+            .bottom_reserved_rows = 0,
+        },
+    });
+
+    try frame_plan.paint.validate();
+    try std.testing.expectEqual(BottomReservationReason.idle_footer_gap, frame_plan.bottom_reservation_reason);
+    try std.testing.expectEqual(@as(u16, 1), frame_plan.paint.bottom_reserved_rows);
+    try std.testing.expectEqual(@as(u16, 41), frame_plan.paint.viewport.last_visible_row);
+}
+
+test "footer paint plan keeps active tool in the transient band" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 80,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    var metrics = Metrics{};
+    try shell.writeTranscript(alloc, &metrics, "one\ntwo\nthree\nfour\n", true);
+    const status_id = try shell.appendRawTranscriptEntryClassified(alloc, "running read-only tools\n", .tool_status);
+
+    const selection: ViewportSelection = .{
+        .top_row = 1,
+        .bottom_row = 8,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 8,
+        .last_visible_row = 8,
+        .tail_kind = .assistant_turn,
+    };
+    shell.last_viewport_selection = selection;
+
+    const ctx: render_input.RenderContext = .{
+        .stream = .{},
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .queued_count = 0,
+        .activity = .{ .tool_slot = .{
+            .entry_id = status_id,
+            .fallback_label = "running read-only tools",
+            .active = true,
+            .kind = .read,
+        } },
+        .input = &input,
+    };
+
+    const frame_plan = planFooterPaint(&shell, .{
+        .active_label = null,
+        .activity_projection = ctx.activity,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+        .applied_bottom_reserved_rows = 4,
+        .transcript_state = .{
+            .selection = selection,
+            .cursor_row = 8,
+            .cursor_col = 1,
+            .replaceable_row = 8,
+            .bottom_reserved_rows = 4,
+        },
+    });
+
+    switch (frame_plan.resolved_activity) {
+        .transient_row => {},
+        .none, .overlay_entry => return error.TestUnexpectedResult,
+    }
+    switch (frame_plan.paint.activity) {
+        .transient_row => {},
+        .none, .overlay_entry => return error.TestUnexpectedResult,
+    }
+    try frame_plan.paint.validate();
+}
+
+test "footer paint plan suppresses transient activity when footer clamps into its row" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 80,
+            .content_bottom = 5,
+            .divider_top_row = 6,
+            .input_row = 7,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 5,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(std.testing.allocator);
+
+    const ctx: render_input.RenderContext = .{
+        .stream = .{ .active = true },
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .queued_count = 0,
+        .input = &input,
+    };
+
+    const frame_plan = planFooterPaint(&shell, .{
+        .active_label = "thinking",
+        .activity_projection = .{ .turn_thinking = .{ .label = "thinking" } },
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+    });
+
+    try frame_plan.paint.validate();
+    switch (frame_plan.resolved_activity) {
+        .transient_row => |activity| try std.testing.expectEqual(@as(u16, 5), activity.row),
+        .none, .overlay_entry => return error.TestUnexpectedResult,
+    }
+    switch (frame_plan.paint.activity) {
+        .none => {},
+        .transient_row, .overlay_entry => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(frame_plan.paint.activity_band.isEmpty());
+    try std.testing.expectEqual(BottomReservationReason.transient_midline, frame_plan.bottom_reservation_reason);
+    try std.testing.expectEqual(@as(u16, 1), frame_plan.paint.bottom_reserved_rows);
 }

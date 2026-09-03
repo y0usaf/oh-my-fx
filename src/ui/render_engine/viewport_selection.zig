@@ -158,6 +158,41 @@ pub fn resolveTailOffset(request: TailOffsetRequest) TailOffsetResolution {
     };
 }
 
+test "tail viewport preserves an unpinned row across appended output" {
+    const initial = resolveTailOffset(.{
+        .total_rows = 40,
+        .visible_rows = 10,
+        .policy = .{ .rows_from_bottom = 8 },
+    });
+    try std.testing.expectEqual(@as(u32, 22), initial.start_visual_row);
+    try std.testing.expectEqual(@as(u32, 8), initial.rows_from_bottom);
+    try std.testing.expectEqual(@as(u32, 30), initial.max_rows_from_bottom);
+
+    const grown = resolveTailOffset(.{
+        .total_rows = 47,
+        .visible_rows = 10,
+        .policy = .{
+            .rows_from_bottom = 8,
+            .prior_total_rows = 40,
+            .preserve_after_append = true,
+        },
+    });
+    try std.testing.expectEqual(initial.start_visual_row, grown.start_visual_row);
+    try std.testing.expectEqual(@as(u32, 15), grown.rows_from_bottom);
+
+    const pinned = resolveTailOffset(.{
+        .total_rows = 47,
+        .visible_rows = 10,
+        .policy = .{
+            .rows_from_bottom = 0,
+            .prior_total_rows = 40,
+            .preserve_after_append = true,
+        },
+    });
+    try std.testing.expectEqual(@as(u32, 37), pinned.start_visual_row);
+    try std.testing.expectEqual(@as(u32, 0), pinned.rows_from_bottom);
+}
+
 pub const RowForLineInput = struct {
     selection: ViewportSelection,
     bytes: []const u8,
@@ -482,4 +517,184 @@ fn unusedRowsBudgetForSplit(line_visual_rows: []const u16, welcome_cut_line: usi
         if (used >= visible_rows) return 0;
     }
     return @intCast(@as(u32, visible_rows) - used);
+}
+
+test "hard-line EOF policy treats final newline position as cursor only" {
+    const alloc = std.testing.allocator;
+
+    const empty = try buildHardLineStarts(alloc, "");
+    defer empty.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty.len());
+    try std.testing.expect(!empty.ends_with_newline);
+
+    const no_newline = try buildHardLineStarts(alloc, "hello");
+    defer no_newline.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), no_newline.len());
+    try std.testing.expect(!no_newline.ends_with_newline);
+    try std.testing.expectEqualStrings("hello", hardLineAt("hello", 0));
+
+    const one_newline = try buildHardLineStarts(alloc, "hello\n");
+    defer one_newline.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), one_newline.len());
+    try std.testing.expect(one_newline.ends_with_newline);
+
+    const two_newlines = try buildHardLineStarts(alloc, "hello\n\n");
+    defer two_newlines.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), two_newlines.len());
+    try std.testing.expect(two_newlines.ends_with_newline);
+    try std.testing.expectEqualStrings("hello", hardLineAt("hello\n\n", 0));
+    try std.testing.expectEqualStrings("", hardLineAt("hello\n\n", 1));
+}
+
+test "hardLineIndexAt ignores only the final EOF newline position" {
+    try std.testing.expectEqual(@as(usize, 0), hardLineIndexAt("hello\n", 5));
+    try std.testing.expectEqual(@as(usize, 0), hardLineIndexAt("hello\n", 6));
+    try std.testing.expectEqual(@as(usize, 1), hardLineIndexAt("hello\n\n", 6));
+    try std.testing.expectEqual(@as(usize, 1), hardLineIndexAt("hello\n\n", 7));
+    try std.testing.expectEqual(@as(usize, 2), hardLineIndexAt("a\nb\nc", 4));
+}
+
+test "TranscriptRef resolves against captured snapshot buffer" {
+    const alloc = std.testing.allocator;
+    const bytes = "first line\nsecond line\n";
+    const snapshot_bytes = try alloc.dupe(u8, bytes);
+    defer alloc.free(snapshot_bytes);
+
+    var starts: std.ArrayList(usize) = .empty;
+    defer starts.deinit(alloc);
+    try starts.append(alloc, 0);
+    for (snapshot_bytes, 0..) |byte, i| {
+        if (byte == '\n') try starts.append(alloc, i + 1);
+    }
+
+    const snapshot = TranscriptBuffer{ .bytes = snapshot_bytes };
+    const ref = TranscriptRef{ .ref = transcriptLineAt(starts.items, snapshot.bytes.len, 0) };
+    try std.testing.expectEqualStrings("first line", ref.resolve(snapshot));
+}
+
+test "buildViewportSelection pins welcome prefix and remaps replaceable line" {
+    const rows = [_]u16{ 1, 1, 1, 1, 1, 1, 1, 1 };
+    const result = buildViewportSelection(.{
+        .top_row = 2,
+        .bottom_row = 6,
+        .line_visual_rows = rows[0..],
+        .visible_rows = 5,
+        .welcome_cut_line = 2,
+        .replaceable_line_index = 7,
+    });
+
+    try std.testing.expectEqual(WelcomeDecision.pinned_welcome, result.welcome_decision);
+    try std.testing.expect(result.selection.split_active);
+    try std.testing.expectEqual(@as(usize, 2), result.selection.split_prefix_lines);
+    try std.testing.expectEqual(@as(usize, 5), result.selection.split_suffix_start_line);
+    try std.testing.expectEqual(@as(usize, 5), result.selection.line_count);
+    try std.testing.expectEqual(@as(usize, 4), result.replaceable_line_index);
+}
+
+test "buildViewportSelection drops partial welcome when prefix cannot fit" {
+    const rows = [_]u16{ 2, 2, 1, 1 };
+    const result = buildViewportSelection(.{
+        .top_row = 2,
+        .bottom_row = 4,
+        .line_visual_rows = rows[0..],
+        .visible_rows = 3,
+        .welcome_cut_line = 2,
+        .replaceable_line_index = 3,
+    });
+
+    try std.testing.expectEqual(WelcomeDecision.dropped_partial_welcome, result.welcome_decision);
+    try std.testing.expect(!result.selection.split_active);
+    try std.testing.expectEqual(@as(usize, 2), result.selection.start_line);
+    try std.testing.expectEqual(@as(u16, 0), result.selection.partial_skip_rows);
+    try std.testing.expectEqual(@as(u16, 1), result.rows_budget_unused);
+    try std.testing.expectEqual(@as(usize, 3), result.replaceable_line_index);
+}
+
+test "buildViewportSelection drops partial welcome when no suffix row fits" {
+    const rows = [_]u16{ 1, 3, 5 };
+    const result = buildViewportSelection(.{
+        .top_row = 2,
+        .bottom_row = 4,
+        .line_visual_rows = rows[0..],
+        .visible_rows = 3,
+        .welcome_cut_line = 1,
+        .replaceable_line_index = 2,
+    });
+
+    try std.testing.expectEqual(WelcomeDecision.dropped_partial_welcome, result.welcome_decision);
+    try std.testing.expect(!result.selection.split_active);
+    try std.testing.expectEqual(@as(usize, 2), result.selection.start_line);
+    try std.testing.expectEqual(@as(u16, 2), result.selection.partial_skip_rows);
+    try std.testing.expectEqual(@as(u16, 0), result.rows_budget_unused);
+    try std.testing.expectEqual(@as(usize, 2), result.replaceable_line_index);
+}
+
+test "split selection maps selected indexes and hidden source lines" {
+    const selection: ViewportSelection = .{
+        .top_row = 3,
+        .bottom_row = 7,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 4,
+        .split_active = true,
+        .split_prefix_lines = 2,
+        .split_suffix_start_line = 5,
+    };
+
+    try std.testing.expectEqual(@as(usize, 0), selectedSourceLineIndex(selection, 0).?);
+    try std.testing.expectEqual(@as(usize, 1), selectedSourceLineIndex(selection, 1).?);
+    try std.testing.expectEqual(@as(usize, 5), selectedSourceLineIndex(selection, 2).?);
+    try std.testing.expectEqual(@as(usize, 6), selectedSourceLineIndex(selection, 3).?);
+    try std.testing.expectEqual(@as(?usize, null), SplitLineMapping.fromSelection(selection).selectedIndexForSource(3));
+    try std.testing.expectEqual(@as(usize, 3), SplitLineMapping.fromSelection(selection).selectedIndexForSource(6).?);
+}
+
+test "rowForLineIndex maps normal partial and split selections" {
+    const normal: ViewportSelection = .{
+        .top_row = 1,
+        .bottom_row = 2,
+        .start_line = 0,
+        .partial_skip_rows = 1,
+        .line_count = 2,
+    };
+    try std.testing.expectEqual(@as(u16, 1), rowForLineIndex(.{
+        .selection = normal,
+        .bytes = "abcdef\nstatus",
+        .line_index = 0,
+        .cols = 3,
+        .max_row = 2,
+    }).?);
+    try std.testing.expectEqual(@as(u16, 2), rowForLineIndex(.{
+        .selection = normal,
+        .bytes = "abcdef\nstatus",
+        .line_index = 1,
+        .cols = 3,
+        .max_row = 2,
+    }).?);
+
+    const split: ViewportSelection = .{
+        .top_row = 3,
+        .bottom_row = 7,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 4,
+        .split_active = true,
+        .split_prefix_lines = 2,
+        .split_suffix_start_line = 5,
+    };
+    const bytes = "w0\nw1\na\nb\nc\nd\nstatus";
+    try std.testing.expect(rowForLineIndex(.{
+        .selection = split,
+        .bytes = bytes,
+        .line_index = 3,
+        .cols = 80,
+        .max_row = 7,
+    }) == null);
+    try std.testing.expectEqual(@as(u16, 6), rowForLineIndex(.{
+        .selection = split,
+        .bytes = bytes,
+        .line_index = 6,
+        .cols = 80,
+        .max_row = 7,
+    }).?);
 }

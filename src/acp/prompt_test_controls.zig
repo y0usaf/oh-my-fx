@@ -56,3 +56,8 @@ fn pathExists(path: []const u8) bool {
     std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
     return true;
 }
+
+test "prompt terminal controls require every path" {
+    try std.testing.expect(controlsFromPaths("terminal", "reap", null) == null);
+    try std.testing.expect(controlsFromPaths("terminal", "reap", "release") != null);
+}

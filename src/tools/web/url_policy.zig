@@ -552,3 +552,172 @@ fn isPublicIpv6(bytes: [16]u8) bool {
     if (bytes[0] == 0x3f and (bytes[1] & 0xf0) == 0xf0) return false;
     return true;
 }
+
+test "web_fetch rejects non http schemes credentials single label hosts and overlong urls before services" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.UnsupportedScheme, normalize(alloc, "ftp://example.com/file"));
+    try std.testing.expectError(error.CredentialedUrl, normalize(alloc, "https://token@example.com/private"));
+    try std.testing.expectError(error.SingleLabelHost, normalize(alloc, "https://intranet/path"));
+
+    const overlong = try alloc.alloc(u8, 2001);
+    defer alloc.free(overlong);
+    @memset(overlong, 'a');
+    try std.testing.expectError(error.UrlTooLong, normalize(alloc, overlong));
+}
+
+test "web_fetch canonicalizes ascii hostname root dot and rejects malformed percent encoded and unicode host bytes" {
+    const alloc = std.testing.allocator;
+
+    var normalized = try normalize(alloc, "http://Example.COM./docs?q=1#frag");
+    defer normalized.deinit(alloc);
+
+    try std.testing.expectEqual(.https, normalized.scheme);
+    try std.testing.expectEqualStrings("example.com", normalized.canonical_host);
+    try std.testing.expectEqual(@as(u16, 443), normalized.port);
+    try std.testing.expectEqualStrings("/docs?q=1", normalized.path_query);
+    try std.testing.expectEqualStrings("https://example.com/docs?q=1", normalized.retrieval_url);
+
+    try std.testing.expectError(error.MalformedPercentEncoding, normalize(alloc, "https://example.com/%zz"));
+    try std.testing.expectError(error.PercentEncodedHost, normalize(alloc, "https://exa%6dple.com/"));
+    try std.testing.expectError(error.UnicodeHost, normalize(alloc, "https://éxample.com/"));
+}
+
+test "web_fetch rejects raw spaces in request targets and redirects" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.RequestTargetWhitespace, normalize(alloc, "https://example.com/a b"));
+    try std.testing.expectError(error.RequestTargetWhitespace, normalize(alloc, "https://example.com/search?q=a b"));
+
+    var current = try normalize(alloc, "https://example.com/docs");
+    defer current.deinit(alloc);
+    try std.testing.expectError(error.RequestTargetWhitespace, redirectTarget(alloc, current, "/a b"));
+}
+
+test "web_fetch fixtures every blocked ipv4 range ipv6 envelope exclusion and embedded ipv4 range" {
+    const blocked_ipv4 = [_][]const u8{
+        "0.1.2.3",
+        "10.0.0.1",
+        "100.64.0.1",
+        "127.0.0.1",
+        "169.254.169.254",
+        "172.16.0.1",
+        "192.0.0.1",
+        "192.0.2.1",
+        "192.88.99.1",
+        "192.168.0.1",
+        "198.18.0.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "224.0.0.1",
+        "240.0.0.1",
+    };
+    for (blocked_ipv4) |text| {
+        const addr = try std.Io.net.IpAddress.parse(text, 443);
+        try std.testing.expect(!isPublicAddress(addr));
+    }
+
+    const public_ipv4 = try std.Io.net.IpAddress.parse("93.184.216.34", 443);
+    try std.testing.expect(isPublicAddress(public_ipv4));
+
+    const blocked_ipv6 = [_][]const u8{
+        "::1",
+        "fc00::1",
+        "fe80::1",
+        "ff00::1",
+        "2001::1",
+        "2001:db8::1",
+        "2002::1",
+        "3fff::1",
+        "::ffff:127.0.0.1",
+        "::ffff:192.168.0.1",
+    };
+    for (blocked_ipv6) |text| {
+        const addr = try std.Io.net.IpAddress.parse(text, 443);
+        try std.testing.expect(!isPublicAddress(addr));
+    }
+
+    const public_ipv6 = try std.Io.net.IpAddress.parse("2606:4700:4700::1111", 443);
+    try std.testing.expect(isPublicAddress(public_ipv6));
+}
+
+test "web_fetch rejects public and private ipv4 mapped ipv6 literals" {
+    const alloc = std.testing.allocator;
+    const mapped = [_][]const u8{
+        "93.184.216.34",
+        "127.0.0.1",
+        "192.168.0.1",
+    };
+
+    for (mapped) |embedded| {
+        const literal = try std.fmt.allocPrint(alloc, "::ffff:{s}", .{embedded});
+        defer alloc.free(literal);
+        const address = try std.Io.net.IpAddress.parse(literal, 443);
+        try std.testing.expect(!isPublicAddress(address));
+
+        const url = try std.fmt.allocPrint(alloc, "https://[{s}]/", .{literal});
+        defer alloc.free(url);
+        try std.testing.expectError(error.NonPublicAddress, normalize(alloc, url));
+    }
+}
+
+test "web_fetch relative redirect resolves before admission and malformed location fails closed" {
+    const alloc = std.testing.allocator;
+
+    var current = try normalize(alloc, "https://example.com/a/b/page");
+    defer current.deinit(alloc);
+
+    var redirected = try redirectTarget(alloc, current, "../next?q=1");
+    defer redirected.deinit(alloc);
+    try std.testing.expectEqual(.follow, redirected.kind);
+    try std.testing.expectEqualStrings("https://example.com/a/next?q=1", redirected.target.?.retrieval_url);
+
+    try std.testing.expectError(error.UnsupportedScheme, redirectTarget(alloc, current, "javascript:alert(1)"));
+    try std.testing.expectError(error.MalformedLocation, redirectTarget(alloc, current, "https://exa mple.com/"));
+}
+
+test "web_fetch redirect normalization rejects credentials scope ids control bytes and port changes" {
+    const alloc = std.testing.allocator;
+
+    var current = try normalize(alloc, "https://example.com/docs");
+    defer current.deinit(alloc);
+
+    try std.testing.expectError(error.CredentialedUrl, redirectTarget(alloc, current, "https://token@example.com/"));
+    try std.testing.expectError(error.ScopeIdRejected, redirectTarget(alloc, current, "https://[2606:4700:4700::1111%25en0]/"));
+    try std.testing.expectError(error.ControlByte, redirectTarget(alloc, current, "https://example.com/a\nb"));
+    try std.testing.expectError(error.PortChanged, redirectTarget(alloc, current, "https://example.com:8443/docs"));
+}
+
+test "web_fetch scheme relative and fragment redirect behavior is deterministic" {
+    const alloc = std.testing.allocator;
+
+    var current = try normalize(alloc, "https://example.com/docs/index.html?x=1");
+    defer current.deinit(alloc);
+
+    var scheme_relative = try redirectTarget(alloc, current, "//example.com/next#frag");
+    defer scheme_relative.deinit(alloc);
+    try std.testing.expectEqual(.follow, scheme_relative.kind);
+    try std.testing.expectEqualStrings("https://example.com/next", scheme_relative.target.?.retrieval_url);
+
+    var fragment = try redirectTarget(alloc, current, "#section");
+    defer fragment.deinit(alloc);
+    try std.testing.expectEqual(.follow, fragment.kind);
+    try std.testing.expectEqualStrings("https://example.com/docs/index.html?x=1", fragment.target.?.retrieval_url);
+}
+
+test "web_fetch cross host redirect returns reinvocation result without following" {
+    const alloc = std.testing.allocator;
+
+    var current = try normalize(alloc, "https://example.com/docs");
+    defer current.deinit(alloc);
+
+    var cross = try redirectTarget(alloc, current, "https://example.org/docs");
+    defer cross.deinit(alloc);
+    try std.testing.expectEqual(.cross_host, cross.kind);
+    try std.testing.expectEqualStrings("https://example.org/docs", cross.cross_host_url.?);
+
+    var www = try redirectTarget(alloc, current, "https://www.example.com/docs");
+    defer www.deinit(alloc);
+    try std.testing.expectEqual(.follow, www.kind);
+    try std.testing.expectEqualStrings("www.example.com", www.target.?.canonical_host);
+}

@@ -20,7 +20,6 @@ pub const TopLevelKind = enum {
     models,
     provider,
     doctor,
-    background,
     teams,
     session,
     sessions,
@@ -43,12 +42,8 @@ pub const SlashKind = enum {
     help,
     login,
     logout,
-    setup,
+    provider,
     status,
-    background,
-    background_stop,
-    background_open,
-    background_logs,
     image,
     images,
     model,
@@ -1518,6 +1513,13 @@ fn isTopLevelTokenBoundary(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\n' or byte == ',' or byte == ':' or byte == '<' or byte == '>' or byte == '[' or byte == ']' or byte == '|';
 }
 
+fn expectAllLinesFit(text: []const u8, columns: usize) !void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidth(line) <= columns);
+    }
+}
+
 fn testSlashRegistry() SlashRegistry {
     const builtin_commands = @import("../../builtins/commands.zig");
     return builtin_commands.slash_registry;
@@ -1533,10 +1535,634 @@ fn testTopLevelHelpText(alloc: Allocator) ![]u8 {
     return builtin_commands.renderTopLevelHelp(alloc, top_level_help_default_width, "9.8.7");
 }
 
+fn stripAnsiForTest(alloc: Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == 0x1b) {
+            index = display_width.ansiSequenceEnd(text, index);
+            continue;
+        }
+        try out.writer.writeByte(text[index]);
+        index += 1;
+    }
+    return out.toOwnedSlice();
+}
+
 fn lineContainsBoth(text: []const u8, first: []const u8, second: []const u8) bool {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (std.mem.find(u8, line, first) != null and std.mem.find(u8, line, second) != null) return true;
     }
     return false;
+}
+
+test "top-level matcher recognizes help aliases" {
+    const registry = testTopLevelRegistry();
+    try std.testing.expect(matchesTopLevel(registry, "help", .help));
+    try std.testing.expect(matchesTopLevel(registry, "--help", .help));
+    try std.testing.expect(matchesTopLevel(registry, "-h", .help));
+    try std.testing.expect(!matchesTopLevel(registry, "wat", .help));
+}
+
+test "slash prefix matcher recognizes aliases and whitespace boundaries" {
+    try std.testing.expectEqualStrings("/image", matchedSlashPrefix(testSlashRegistry(), "/image screenshot.png", .image).?);
+    try std.testing.expectEqualStrings("/img", matchedSlashPrefix(testSlashRegistry(), "/img screenshot.png", .image).?);
+    try std.testing.expect(matchedSlashPrefix(testSlashRegistry(), "/imagesx", .images) == null);
+}
+
+test "rendered top-level help is a complete CLI navigation page" {
+    const text = try testTopLevelHelpText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "𝒇x v9.8.7\nFast, native coding agent for the terminal."));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "𝒇x"));
+    try std.testing.expect(std.mem.find(u8, text, "fx starts an interactive session by default.") != null);
+    try std.testing.expect(std.mem.find(u8, text, "fx <command> [...flags] [...args]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "ask <prompt>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Run one noninteractive request") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Draft or publish a GitHub issue") != null);
+    try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Sign in to a model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Sign out of a model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Choose a Vercel AI Gateway team") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Show Vercel AI Gateway credits") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Sign in to Vercel or a selected provider") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Flags:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--context-limit <spec>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Set name=bytes|off; repeatable") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--add-dir <path>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "-c, --continue") != null);
+    try std.testing.expect(std.mem.find(u8, text, "-r") != null);
+    try std.testing.expect(std.mem.find(u8, text, "-c, -r, --continue") == null);
+    try std.testing.expect(std.mem.find(u8, text, "--resume [last|<id>]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--resume-last") != null);
+    try std.testing.expect(std.mem.find(u8, text, "-v, --version") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Must appear before the command. Accepted names:") == null);
+    try std.testing.expect(std.mem.find(u8, text, "skill_description_bytes, skill_catalog_bytes") == null);
+    try std.testing.expect(std.mem.find(u8, text, "FX_EXPERIMENTAL_WORKSPACE_ACCESS=1") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Supported for interactive, resume, ask, ACP, PR, and issue launches") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Examples:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "fx ask \"Explain the changes in this repository\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "fx session resume last") != null);
+    try std.testing.expect(std.mem.find(u8, text, "session resume [last|id]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "fx status --json") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Run `fx <command> --help` for command-specific usage and options.") != null);
+    try std.testing.expect(std.mem.find(u8, text, "command-specific options and examples") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Run `/help` inside an interactive session for slash commands.") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Learn more about fx:  https://fx.sh/docs") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside fx\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\n\n\nRun `fx <command> --help`") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Start:") == null);
+    try std.testing.expect(std.mem.find(u8, text, "  Work      ") == null);
+    try std.testing.expect(std.mem.find(u8, text, "More:") == null);
+    try std.testing.expect(std.mem.find(u8, text, "resume [last|<id>] [--record]") == null);
+    try std.testing.expect(std.mem.find(u8, text, "session migrate <id>|--id <id>") == null);
+}
+
+test "top-level help summary overrides do not change command-specific help" {
+    const login = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .login);
+    defer std.testing.allocator.free(login);
+
+    try std.testing.expect(std.mem.find(u8, login, "Sign in to Vercel or a selected provider") != null);
+    try std.testing.expect(std.mem.find(u8, login, "Sign in to a model provider") == null);
+}
+
+test "terminal top-level help adds styling without changing visible content" {
+    const plain = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), top_level_help_default_width, "9.8.7");
+    defer std.testing.allocator.free(plain);
+    const terminal = try renderTopLevelHelpWithStyle(std.testing.allocator, testTopLevelRegistry(), top_level_help_default_width, "9.8.7", .ansi);
+    defer std.testing.allocator.free(terminal);
+    const stripped = try stripAnsiForTest(std.testing.allocator, terminal);
+    defer std.testing.allocator.free(stripped);
+
+    try std.testing.expect(std.mem.find(u8, plain, "\x1b[") == null);
+    try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1m𝒇x\x1b[0m"));
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[1mUsage:\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mask <prompt>\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mFast, native coding agent") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4mhttps://fx.sh/docs\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside fx\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252m") == null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;245m") == null);
+    try std.testing.expectEqualStrings(plain, stripped);
+}
+
+test "top-level help renders flags as compact aligned rows" {
+    const wide = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 120, "9.8.7");
+    defer std.testing.allocator.free(wide);
+    const narrow = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 60, "9.8.7");
+    defer std.testing.allocator.free(narrow);
+
+    try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
+    try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
+    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
+    try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
+    try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
+    try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));
+    try std.testing.expect(std.mem.find(u8, wide, "Print the fx version and exit\n\nExamples:") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "List available models\n\n  setup") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "Show Vercel AI Gateway credits\n\n  usage") != null);
+    try expectAllLinesFit(narrow, 60);
+}
+
+test "top-level help hides developer recording surfaces" {
+    const text = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 120, "9.8.7");
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "--record") == null);
+    try std.testing.expect(std.mem.find(u8, text, "replay <tape>") == null);
+
+    const replay = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .replay);
+    defer std.testing.allocator.free(replay);
+    try std.testing.expect(std.mem.find(u8, replay, "fx replay") != null);
+}
+
+test "default top-level help styles fit the startup buffer" {
+    const builtin_commands = @import("../../builtins/commands.zig");
+    for ([_]HelpStyle{ .plain, .ansi }) |style| {
+        const text = try renderTopLevelHelpWithStyle(std.testing.allocator, testTopLevelRegistry(), top_level_help_default_width, "9.8.7", style);
+        defer std.testing.allocator.free(text);
+
+        try std.testing.expect(text.len <= builtin_commands.top_level_help_fast_buffer_bytes);
+    }
+}
+
+test "per-command help renders header usage options and details" {
+    const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .permissions);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "fx permissions\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx permissions [--json]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--json") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Modes:") != null);
+}
+
+test "per-command help preserves long resume usage without debug recording" {
+    const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .@"resume");
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--record") == null);
+}
+
+test "ACP help documents accepted options" {
+    const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .acp);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "fx acp\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--log-file <path>]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--model <id>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--log-file <path>") != null);
+}
+
+test "hidden top-level commands do not reserve help usage width" {
+    const registry = testTopLevelRegistry();
+    var visible_width: usize = 0;
+    var all_width: usize = 0;
+    for (registry.help_groups) |group| {
+        for (group.entries) |entry| {
+            all_width = @max(all_width, entry.usage.len);
+            if (entry.kind) |kind| {
+                if (topLevelSpec(registry, kind).hidden_from_top_level_help) continue;
+            }
+            visible_width = @max(visible_width, entry.usage.len);
+        }
+    }
+    try std.testing.expectEqual(visible_width, maxTopLevelHelpUsageWidth(registry));
+    try std.testing.expect(all_width >= visible_width);
+}
+
+test "slash completion matches prefix and aliases" {
+    try std.testing.expectEqualStrings("/help", firstSlashCompletion(testSlashRegistry(), "/he").?);
+    try std.testing.expectEqualStrings("/clear", firstSlashCompletion(testSlashRegistry(), "/cl").?);
+    try std.testing.expectEqualStrings("/reset", firstSlashCompletion(testSlashRegistry(), "/res").?);
+    try std.testing.expect(firstSlashCompletion(testSlashRegistry(), "/help") == null);
+    try std.testing.expect(firstSlashCompletion(testSlashRegistry(), "hello") == null);
+    try std.testing.expect(firstSlashCompletion(testSlashRegistry(), "") == null);
+}
+
+test "slash completion ranks exact prefix and substring command matches" {
+    const specs = [_]SlashSpec{
+        .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename session", .presentation_category = .session },
+        .{ .kind = .model, .command = "/model", .help_entry = "/model <id>", .completion_description = "choose model", .presentation_category = .model },
+    };
+    const registry = SlashRegistry{ .commands = specs[0..] };
+
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/model"));
+    try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/model", 0).?);
+    try std.testing.expectEqualStrings("choose model", nthSlashCompletionDescription(registry, "/model", 0).?);
+
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/mo"));
+    try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/mo", 0).?);
+
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/name"));
+    try std.testing.expectEqualStrings("/rename", nthSlashCompletion(registry, "/name", 0).?);
+    try std.testing.expectEqual(SlashPresentationCategory.session, nthSlashCompletionCategory(registry, "/name", 0).?);
+
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(registry, "/missing"));
+    try std.testing.expect(nthSlashCompletion(registry, "/missing", 0) == null);
+}
+
+test "slash completion exposes interactive resume" {
+    try std.testing.expectEqualStrings("/resume", nthSlashCompletion(testSlashRegistry(), "/resume", 0).?);
+}
+
+test "top-level slash completion metadata is complete" {
+    const registry = testSlashRegistry();
+    for (registry.commands) |spec| {
+        if (spec.help_entry == null) continue;
+        try std.testing.expect(spec.completion_description != null);
+        try std.testing.expect(spec.completion_description.?.len > 0);
+        try std.testing.expect(spec.presentation_category != null);
+    }
+}
+
+test "slash completion categories follow canonical entries" {
+    const registry = testSlashRegistry();
+    try std.testing.expectEqual(SlashPresentationCategory.general, nthSlashCompletionCategory(registry, "/he", 0).?);
+    try std.testing.expectEqual(SlashPresentationCategory.account, nthSlashCompletionCategory(registry, "/us", 0).?);
+    try std.testing.expectEqualStrings("General", SlashPresentationCategory.general.label());
+    try std.testing.expect(nthSlashCompletionCategory(registry, "/permissions ", 0) == null);
+}
+
+test "help catalog groups visible commands and searches all command metadata" {
+    const registry = testSlashRegistry();
+
+    try std.testing.expectEqual(@as(usize, 35), helpCatalogCount(registry, ""));
+    try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
+    try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
+    try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
+    try std.testing.expectEqualStrings("/paste", helpCatalogSpecAt(registry, "clipboard", 0).?.command);
+}
+
+test "help menu selection follows the filtered catalog without executing commands" {
+    const registry = testSlashRegistry();
+    var menu: HelpMenu = .{};
+
+    menu.open();
+    try std.testing.expect(menu.active);
+    try std.testing.expect(menu.move(registry, "session", 1, 4));
+    try std.testing.expectEqual(@as(usize, 1), menu.selected_index);
+    try std.testing.expect(menu.selectedSpec(registry, "session") != null);
+
+    menu.resetForQuery();
+    try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
+    try std.testing.expect(menu.selectedSpec(registry, "no command can match this query") == null);
+
+    menu.close();
+    try std.testing.expect(!menu.active);
+}
+
+test "completion command matcher returns primary or alias" {
+    const help_spec = testSlashRegistry().commands[0];
+    try std.testing.expectEqualStrings("/help", matchedCompletionCommand(help_spec, "/").?);
+    try std.testing.expectEqualStrings("/help", matchedCompletionCommand(help_spec, "/he").?);
+    try std.testing.expect(matchedCompletionCommand(help_spec, "/cl") == null);
+}
+
+test "rendered slash summaries include aliases and welcome entries" {
+    const help_text = try renderSlashHelp(std.testing.allocator, testSlashRegistry());
+    defer std.testing.allocator.free(help_text);
+    try std.testing.expect(std.mem.find(u8, help_text, "/image <path> (/img)") != null);
+
+    const welcome_text = try renderSlashWelcome(std.testing.allocator, testSlashRegistry());
+    defer std.testing.allocator.free(welcome_text);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/quit") != null);
+}
+
+test "top-level specs cover every TopLevelKind" {
+    const registry = testTopLevelRegistry();
+    var seen = [_]bool{false} ** std.meta.fields(TopLevelKind).len;
+    for (registry.specs) |spec| {
+        const index = @intFromEnum(spec.kind);
+        try std.testing.expect(!seen[index]);
+        seen[index] = true;
+    }
+    inline for (std.meta.fields(TopLevelKind)) |field| {
+        const kind: TopLevelKind = @enumFromInt(field.value);
+        try std.testing.expect(seen[@intFromEnum(kind)]);
+        try std.testing.expect(topLevelUsage(registry, kind).len > 0);
+    }
+}
+
+test "slash specs cover every SlashKind" {
+    var seen = [_]bool{false} ** std.meta.fields(SlashKind).len;
+    const registry = testSlashRegistry();
+    for (registry.commands) |spec| {
+        const index = @intFromEnum(spec.kind);
+        try std.testing.expect(!seen[index]);
+        seen[index] = true;
+    }
+    inline for (std.meta.fields(SlashKind)) |field| {
+        const kind: SlashKind = @enumFromInt(field.value);
+        try std.testing.expect(seen[@intFromEnum(kind)]);
+        _ = slashSpec(registry, kind);
+    }
+}
+
+test "child chat slash registry exposes only locally handled commands" {
+    var storage: [child_chat_slash_command_count]SlashSpec = undefined;
+    const child = childChatSlashRegistry(testSlashRegistry(), &storage);
+
+    try std.testing.expectEqual(@as(usize, 3), child.commands.len);
+    try std.testing.expect(matchesSlashExact(child, "/quit", .quit));
+    try std.testing.expect(matchesSlashExact(child, "/model", .model));
+    try std.testing.expect(child.matchExact("/models") == null);
+    try std.testing.expect(matchesSlashExact(child, "/skills", .skills));
+    try std.testing.expect(child.matchExact("/help") == null);
+}
+
+test "interactive model command has no plural spelling" {
+    const registry = testSlashRegistry();
+    try std.testing.expect(registry.matchExact("/model") != null);
+    try std.testing.expect(registry.matchExact("/models") == null);
+}
+
+test "default slash registry resolves primary commands and aliases" {
+    const registry = testSlashRegistry();
+    const image = registry.lookup("/img") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(SlashKind.image, image.kind);
+
+    const quit = registry.matchExact("/exit\t") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(SlashKind.quit, quit.command.kind);
+    try std.testing.expectEqualStrings("/exit", quit.token);
+
+    const model = registry.matchEntryPrefix("/model\tmodel-id", slashSpecPtr(registry, .model)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/model", model);
+
+    try std.testing.expect(registry.matchEntryPrefix("/model\nmodel-id", slashSpecPtr(registry, .model)) == null);
+}
+
+test "top-level specs keep unique tokens and aliases" {
+    const registry = testTopLevelRegistry();
+    for (registry.specs) |spec| {
+        try std.testing.expectEqual(@as(usize, 1), topLevelTokenOccurrences(registry, spec.token));
+        for (spec.aliases) |alias| {
+            try std.testing.expectEqual(@as(usize, 1), topLevelTokenOccurrences(registry, alias));
+        }
+    }
+}
+
+test "top-level help index covers visible commands once" {
+    const registry = testTopLevelRegistry();
+    for (registry.specs) |spec| {
+        const expected: usize = if (spec.hidden_from_top_level_help) 0 else 1;
+        try std.testing.expectEqual(expected, topLevelIndexOccurrences(registry, spec.kind));
+    }
+}
+
+test "slash specs keep unique commands and aliases" {
+    const registry = testSlashRegistry();
+    for (registry.commands) |spec| {
+        try std.testing.expectEqual(@as(usize, 1), slashTokenOccurrences(registry, spec.command));
+        for (spec.aliases) |alias| {
+            try std.testing.expectEqual(@as(usize, 1), slashTokenOccurrences(registry, alias));
+        }
+    }
+}
+
+test "slash prefix matcher accepts tab boundary and rejects newline boundary" {
+    try std.testing.expectEqualStrings("/image", matchedSlashPrefix(testSlashRegistry(), "/image\tshot.png", .image).?);
+    try std.testing.expect(matchedSlashPrefix(testSlashRegistry(), "/image\nshot.png", .image) == null);
+}
+
+test "slash completion prefix normalizes leading whitespace and preserves argument queries" {
+    const registry = testSlashRegistry();
+
+    try std.testing.expectEqualStrings("/he", slashCompletionPrefix(registry, "\n   /he").?);
+    try std.testing.expectEqualStrings("/resume-helper", slashCompletionPrefix(registry, "/resume-helper").?);
+    try std.testing.expectEqualStrings("/not-a-command ", slashCompletionPrefix(registry, "/not-a-command ").?);
+}
+
+test "slash completion prefix yields to no-argument command submission" {
+    const registry = testSlashRegistry();
+
+    try std.testing.expectEqualStrings("/resume", slashCompletionPrefix(registry, "/resume").?);
+    try std.testing.expect(slashCompletionPrefix(registry, "/resume ") == null);
+    try std.testing.expect(slashCompletionPrefix(registry, "\n\t/resume\nignored") == null);
+    try std.testing.expect(slashCompletionPrefix(registry, "/exit\t") == null);
+}
+
+test "slash completions include allowlist staged arguments" {
+    try std.testing.expectEqual(@as(usize, 6), slashCompletionCount(testSlashRegistry(), "/allowlist "));
+    try std.testing.expectEqualStrings("/allowlist view", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 0).?);
+    try std.testing.expectEqualStrings("/allowlist add", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 1).?);
+    try std.testing.expectEqualStrings("/allowlist remove", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 2).?);
+    try std.testing.expectEqualStrings("/allowlist reset", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 3).?);
+    try std.testing.expectEqualStrings("/allowlist local", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 4).?);
+    try std.testing.expectEqualStrings("/allowlist user", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 5).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/allowlist a"));
+    try std.testing.expectEqualStrings("/allowlist add", nthSlashCompletion(testSlashRegistry(), "/allowlist a", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/allowlist v"));
+    try std.testing.expectEqualStrings("/allowlist view", nthSlashCompletion(testSlashRegistry(), "/allowlist v", 0).?);
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/allowlist re"));
+    try std.testing.expectEqualStrings("/allowlist remove", nthSlashCompletion(testSlashRegistry(), "/allowlist re", 0).?);
+    try std.testing.expectEqualStrings("/allowlist reset", nthSlashCompletion(testSlashRegistry(), "/allowlist re", 1).?);
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(testSlashRegistry(), "/allowlist nope "));
+
+    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(testSlashRegistry(), "/allowlist add "));
+    try std.testing.expectEqualStrings("/allowlist add command", nthSlashCompletion(testSlashRegistry(), "/allowlist add ", 0).?);
+    try std.testing.expectEqualStrings("/allowlist add tool", nthSlashCompletion(testSlashRegistry(), "/allowlist add ", 1).?);
+    try std.testing.expectEqualStrings("/allowlist add url", nthSlashCompletion(testSlashRegistry(), "/allowlist add ", 2).?);
+    try std.testing.expectEqualStrings("/allowlist add web-fetch-domain", nthSlashCompletion(testSlashRegistry(), "/allowlist add ", 3).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/allowlist add u"));
+    try std.testing.expectEqualStrings("/allowlist add url", nthSlashCompletion(testSlashRegistry(), "/allowlist add u", 0).?);
+    try std.testing.expectEqual(@as(usize, allowlist_add_tool_completions.len), slashCompletionCount(testSlashRegistry(), "/allowlist add tool "));
+    try std.testing.expectEqualStrings("/allowlist add tool read_file", nthSlashCompletion(testSlashRegistry(), "/allowlist add tool ", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/allowlist add tool write"));
+    try std.testing.expectEqualStrings("/allowlist add tool write_file", nthSlashCompletion(testSlashRegistry(), "/allowlist add tool write", 0).?);
+
+    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(testSlashRegistry(), "/allowlist remove "));
+    try std.testing.expectEqualStrings("/allowlist remove command", nthSlashCompletion(testSlashRegistry(), "/allowlist remove ", 0).?);
+    try std.testing.expectEqualStrings("/allowlist remove tool", nthSlashCompletion(testSlashRegistry(), "/allowlist remove ", 1).?);
+    try std.testing.expectEqualStrings("/allowlist remove url", nthSlashCompletion(testSlashRegistry(), "/allowlist remove ", 2).?);
+    try std.testing.expectEqualStrings("/allowlist remove web-fetch-domain", nthSlashCompletion(testSlashRegistry(), "/allowlist remove ", 3).?);
+    try std.testing.expectEqual(@as(usize, allowlist_remove_tool_completions.len), slashCompletionCount(testSlashRegistry(), "/allowlist remove tool "));
+    try std.testing.expectEqualStrings("/allowlist remove tool read_file", nthSlashCompletion(testSlashRegistry(), "/allowlist remove tool ", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/allowlist remove tool skill"));
+    try std.testing.expectEqualStrings("/allowlist remove tool skill", nthSlashCompletion(testSlashRegistry(), "/allowlist remove tool skill", 0).?);
+
+    try std.testing.expectEqual(@as(usize, 5), slashCompletionCount(testSlashRegistry(), "/allowlist reset "));
+    try std.testing.expectEqualStrings("/allowlist reset commands", nthSlashCompletion(testSlashRegistry(), "/allowlist reset ", 0).?);
+    try std.testing.expectEqualStrings("/allowlist reset tools", nthSlashCompletion(testSlashRegistry(), "/allowlist reset ", 1).?);
+    try std.testing.expectEqualStrings("/allowlist reset urls", nthSlashCompletion(testSlashRegistry(), "/allowlist reset ", 2).?);
+    try std.testing.expectEqualStrings("/allowlist reset web-fetch-domains", nthSlashCompletion(testSlashRegistry(), "/allowlist reset ", 3).?);
+    try std.testing.expectEqualStrings("/allowlist reset all", nthSlashCompletion(testSlashRegistry(), "/allowlist reset ", 4).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/allowlist reset c"));
+    try std.testing.expectEqualStrings("/allowlist reset commands", nthSlashCompletion(testSlashRegistry(), "/allowlist reset c", 0).?);
+
+    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/allowlist view "));
+    try std.testing.expectEqualStrings("/allowlist view effective", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 0).?);
+    try std.testing.expectEqualStrings("/allowlist view local", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 1).?);
+    try std.testing.expectEqualStrings("/allowlist view user", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 2).?);
+
+    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/allowlist user "));
+    try std.testing.expectEqualStrings("/allowlist user add", nthSlashCompletion(testSlashRegistry(), "/allowlist user ", 0).?);
+    try std.testing.expectEqualStrings("/allowlist user remove", nthSlashCompletion(testSlashRegistry(), "/allowlist user ", 1).?);
+    try std.testing.expectEqualStrings("/allowlist user reset", nthSlashCompletion(testSlashRegistry(), "/allowlist user ", 2).?);
+    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(testSlashRegistry(), "/allowlist user add "));
+    try std.testing.expectEqualStrings("/allowlist user add command", nthSlashCompletion(testSlashRegistry(), "/allowlist user add ", 0).?);
+    try std.testing.expectEqual(@as(usize, allowlist_user_add_tool_completions.len), slashCompletionCount(testSlashRegistry(), "/allowlist user add tool "));
+    try std.testing.expectEqualStrings("/allowlist user add tool read_file", nthSlashCompletion(testSlashRegistry(), "/allowlist user add tool ", 0).?);
+    try std.testing.expectEqual(@as(usize, 5), slashCompletionCount(testSlashRegistry(), "/allowlist local reset "));
+    try std.testing.expectEqualStrings("/allowlist local reset all", nthSlashCompletion(testSlashRegistry(), "/allowlist local reset ", 4).?);
+}
+
+test "slash completions include web_fetch allowlist domain forms" {
+    try std.testing.expectEqualStrings("/allowlist add web-fetch-domain", nthSlashCompletion(testSlashRegistry(), "/allowlist add web-", 0).?);
+    try std.testing.expectEqualStrings("web-fetch-domain", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist add web-", 0).?);
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist add web-fetch-domain"));
+
+    try std.testing.expectEqualStrings("/allowlist remove web-fetch-domain", nthSlashCompletion(testSlashRegistry(), "/allowlist remove web-", 0).?);
+    try std.testing.expectEqualStrings("web-fetch-domain", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist remove web-", 0).?);
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist remove web-fetch-domain"));
+
+    try std.testing.expectEqualStrings("/allowlist reset web-fetch-domains", nthSlashCompletion(testSlashRegistry(), "/allowlist reset web-", 0).?);
+    try std.testing.expectEqualStrings("web-fetch-domains", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist reset web-", 0).?);
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist reset web-fetch-domains"));
+}
+
+test "allowlist staged completions with more arguments append space on tab" {
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist add"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist remove"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist reset"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist add command"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist remove url"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist user"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist user add"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist local remove tool"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist view"));
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist view user"));
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist reset all"));
+}
+
+test "workspace completions expose actions and keep path actions open" {
+    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(testSlashRegistry(), "/workspace "));
+    try std.testing.expectEqualStrings("/workspace list", nthSlashCompletion(testSlashRegistry(), "/workspace ", 0).?);
+    try std.testing.expectEqualStrings("/workspace add", nthSlashCompletion(testSlashRegistry(), "/workspace a", 0).?);
+    try std.testing.expectEqualStrings("add", nthSlashCompletionLabel(testSlashRegistry(), "/workspace a", 0).?);
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/workspace add"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/workspace remove"));
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/workspace clear"));
+}
+
+test "slash completions include sound controls" {
+    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/sound "));
+    try std.testing.expectEqualStrings("/sound on", nthSlashCompletion(testSlashRegistry(), "/sound ", 0).?);
+    try std.testing.expectEqualStrings("/sound off", nthSlashCompletion(testSlashRegistry(), "/sound ", 1).?);
+    try std.testing.expectEqualStrings("/sound max", nthSlashCompletion(testSlashRegistry(), "/sound ", 2).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/sound of"));
+    try std.testing.expectEqualStrings("off", nthSlashCompletionLabel(testSlashRegistry(), "/sound of", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/sound ma"));
+    try std.testing.expectEqualStrings("max", nthSlashCompletionLabel(testSlashRegistry(), "/sound ma", 0).?);
+    try std.testing.expectEqual(@as(usize, "/sound ".len), argCompletionAnchor("/sound "));
+}
+
+test "slash completions list permission modes and rule management" {
+    try std.testing.expectEqual(@as(usize, 6), slashCompletionCount(testSlashRegistry(), "/permissions "));
+    try std.testing.expectEqualStrings("/permissions ask", nthSlashCompletion(testSlashRegistry(), "/permissions ", 0).?);
+    try std.testing.expectEqualStrings("/permissions auto", nthSlashCompletion(testSlashRegistry(), "/permissions ", 1).?);
+    try std.testing.expectEqualStrings("/permissions remember", nthSlashCompletion(testSlashRegistry(), "/permissions ", 2).?);
+    try std.testing.expectEqualStrings("/permissions revoke", nthSlashCompletion(testSlashRegistry(), "/permissions ", 3).?);
+    try std.testing.expectEqualStrings("/permissions yolo", nthSlashCompletion(testSlashRegistry(), "/permissions ", 4).?);
+    try std.testing.expectEqualStrings("/permissions reset", nthSlashCompletion(testSlashRegistry(), "/permissions ", 5).?);
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/permissions a"));
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions as"));
+    try std.testing.expectEqualStrings("/permissions ask", nthSlashCompletion(testSlashRegistry(), "/permissions as", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions au"));
+    try std.testing.expectEqualStrings("/permissions auto", nthSlashCompletion(testSlashRegistry(), "/permissions au", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions y"));
+    try std.testing.expectEqualStrings("/permissions yolo", nthSlashCompletion(testSlashRegistry(), "/permissions y", 0).?);
+    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/permissions r"));
+    try std.testing.expectEqualStrings("/permissions remember", nthSlashCompletion(testSlashRegistry(), "/permissions r", 0).?);
+    try std.testing.expectEqualStrings("/permissions revoke", nthSlashCompletion(testSlashRegistry(), "/permissions r", 1).?);
+    try std.testing.expectEqualStrings("/permissions reset", nthSlashCompletion(testSlashRegistry(), "/permissions r", 2).?);
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(testSlashRegistry(), "/permissions x"));
+}
+
+test "slash completion labels strip argument prefixes" {
+    try std.testing.expectEqualStrings("ask", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 0).?);
+    try std.testing.expectEqualStrings("auto", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 1).?);
+    try std.testing.expectEqualStrings("remember", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 2).?);
+    try std.testing.expectEqualStrings("revoke", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 3).?);
+    try std.testing.expectEqualStrings("yolo", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 4).?);
+    try std.testing.expectEqualStrings("reset", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 5).?);
+    try std.testing.expectEqualStrings("view", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 0).?);
+    try std.testing.expectEqualStrings("add", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 1).?);
+    try std.testing.expectEqualStrings("command", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist add ", 0).?);
+    try std.testing.expectEqualStrings("write_file", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist add tool write", 0).?);
+    try std.testing.expectEqualStrings("url", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist remove u", 0).?);
+    try std.testing.expectEqualStrings("read_file", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist remove tool ", 0).?);
+    try std.testing.expectEqualStrings("commands", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist reset c", 0).?);
+    try std.testing.expectEqualStrings("/help", nthSlashCompletionLabel(testSlashRegistry(), "/he", 0).?);
+}
+
+test "slash completion descriptions follow completion matches" {
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/mo"));
+    try std.testing.expectEqualStrings("/model", nthSlashCompletion(testSlashRegistry(), "/mo", 0).?);
+    try std.testing.expectEqualStrings("choose what model and reasoning effort to use", nthSlashCompletionDescription(testSlashRegistry(), "/mo", 0).?);
+    try std.testing.expectEqualStrings("start a fresh conversation while keeping managed processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
+    try std.testing.expectEqualStrings("undo the latest tracked file operation", nthSlashCompletionDescription(testSlashRegistry(), "/un", 0).?);
+    try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
+    try std.testing.expectEqualStrings("copy a private diagnostic trace", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
+    try std.testing.expectEqualStrings("summarize context into a fresh window", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
+    try std.testing.expectEqualStrings("show alias availability", nthSlashCompletionDescription(testSlashRegistry(), "/ali", 0).?);
+    try std.testing.expectEqualStrings("toggle Fast mode when supported", nthSlashCompletionDescription(testSlashRegistry(), "/fa", 0).?);
+}
+
+test "slash completion aliases participate in ranked order" {
+    try std.testing.expectEqualStrings("/balance", firstSlashCompletion(testSlashRegistry(), "/ba").?);
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/ba"));
+    try std.testing.expectEqualStrings("/balance", nthSlashCompletion(testSlashRegistry(), "/ba", 0).?);
+    try std.testing.expectEqualStrings("/feedback", nthSlashCompletion(testSlashRegistry(), "/ba", 1).?);
+    try std.testing.expectEqualStrings("/balance", firstSlashCompletion(testSlashRegistry(), "/bal").?);
+}
+
+test "rendered slash welcome excludes non-welcome help entries" {
+    const welcome_text = try renderSlashWelcome(std.testing.allocator, testSlashRegistry());
+    defer std.testing.allocator.free(welcome_text);
+
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/image") == null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/help") != null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/clear") != null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/new") != null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/status") != null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/background") == null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/pr") == null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/issue") == null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/permissions") != null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/allowlist") != null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/quit") != null);
+}
+
+test "top-level help renders every visible command token" {
+    const registry = testTopLevelRegistry();
+    const text = try testTopLevelHelpText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    for (registry.specs) |spec| {
+        if (spec.hidden_from_top_level_help) continue;
+        try std.testing.expect(topLevelHelpContainsCommandToken(text, spec.token));
+    }
+    for (registry.notes) |note| {
+        try std.testing.expect(std.mem.find(u8, text, note) != null);
+    }
+}
+
+test "top-level help lines fit representative terminal widths" {
+    const registry = testTopLevelRegistry();
+    const widths = [_]usize{ 60, 80, 120 };
+    for (widths) |width| {
+        const text = try renderTopLevelHelp(std.testing.allocator, registry, width, "9.8.7");
+        defer std.testing.allocator.free(text);
+        try expectAllLinesFit(text, width);
+    }
 }

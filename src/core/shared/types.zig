@@ -77,6 +77,16 @@ pub fn renderContextNoticeBody(alloc: std.mem.Allocator, text: []const u8) ![]u8
     return body.toOwnedSlice();
 }
 
+test "context notice body drops legacy markers from every line" {
+    const body = try renderContextNoticeBody(
+        std.testing.allocator,
+        "[context] first\n[context] second\nalready semantic\n[context]\n",
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expectEqualStrings("first\nsecond\nalready semantic\n\n", body);
+}
+
 pub const CredentialSource = enum {
     vercel_oidc_token,
     ai_gateway_api_key,
@@ -84,10 +94,88 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    host_managed,
 };
 
+pub const DirectCredentialLease = struct {
+    secret_bytes: []const u8 = "",
+    source: ?CredentialSource = null,
+    account_id: ?[]const u8 = null,
+    tenant_context: ?[]const u8 = null,
+};
+
+/// Borrowed authorization for one provider request. Host-managed requests
+/// cannot carry credential or account bytes into the embedded runtime.
+pub const CredentialLease = union(enum) {
+    direct: DirectCredentialLease,
+    host_managed,
+
+    pub fn secret(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| if (direct.secret_bytes.len > 0) direct.secret_bytes else null,
+            .host_managed => null,
+        };
+    }
+
+    pub fn credentialSource(self: CredentialLease) ?CredentialSource {
+        return switch (self) {
+            .direct => |direct| direct.source,
+            .host_managed => .host_managed,
+        };
+    }
+
+    pub fn accountId(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| direct.account_id,
+            .host_managed => null,
+        };
+    }
+
+    pub fn tenant(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| direct.tenant_context,
+            .host_managed => null,
+        };
+    }
+};
+
+test "host-managed credential lease carries no local authority bytes" {
+    const lease: CredentialLease = .host_managed;
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.accountId() == null);
+    try std.testing.expect(lease.tenant() == null);
+    try std.testing.expectEqual(CredentialSource.host_managed, lease.credentialSource().?);
+}
+
+test "empty direct credential lease preserves absent authority" {
+    const lease = CredentialLease{ .direct = .{} };
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.credentialSource() == null);
+}
+
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
+    const source = parseRuntimeCredentialSource(text) orelse return null;
+    return if (source == .host_managed) null else source;
+}
+
+pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
     return std.meta.stringToEnum(CredentialSource, text);
+}
+
+test "credential source round trips through its persisted name" {
+    for (std.meta.tags(CredentialSource)) |source| {
+        if (source == .host_managed) continue;
+        try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
+    }
+    try std.testing.expect(parseCredentialSource("keychain") == null);
+}
+
+test "host-managed authority is runtime-only and cannot be persisted" {
+    try std.testing.expect(parseCredentialSource("host_managed") == null);
+    try std.testing.expectEqual(
+        CredentialSource.host_managed,
+        parseRuntimeCredentialSource("host_managed").?,
+    );
 }
 
 pub const TurnPresentationOutcome = enum {
@@ -204,6 +292,7 @@ pub const RouteRecoveryStatusTone = enum {
 pub const ModelRecoveryCause = enum {
     network_interrupted,
     response_interrupted,
+    provider_stream_timeout,
     provider_unavailable,
     rate_limited,
     system_resumed,
@@ -238,6 +327,7 @@ pub const ModelFailureDiagnostic = struct {
         return switch (cause) {
             .network_interrupted => "NetworkInterrupted",
             .response_interrupted => "StreamInterrupted",
+            .provider_stream_timeout => "gateway_stream_timeout",
             .provider_unavailable => "provider_error",
             .rate_limited => "HTTP 429",
             .system_resumed => "SystemResumed",
@@ -384,6 +474,7 @@ pub const RouteRecoveryStatus = struct {
         const cause = switch (self.cause orelse .provider_unavailable) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -457,6 +548,20 @@ pub const RouteRecoveryStatus = struct {
                 .{ self.failed_attempt, self.attempt_limit },
             ) catch "⚠ Connection unavailable · recovery paused";
         }
+        if (cause == .provider_stream_timeout) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}/{d}",
+                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                ) catch "⚠ Gateway stream timed out · automatic retry paused";
+            }
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ Gateway stream timed out · automatic retry paused · attempt {d}/{d}",
+                .{ self.failed_attempt, self.attempt_limit },
+            ) catch "⚠ Gateway stream timed out · automatic retry paused";
+        }
         if (cause == .request_limit_reached) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
@@ -474,6 +579,7 @@ pub const RouteRecoveryStatus = struct {
         const name = switch (cause) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -502,6 +608,51 @@ pub const RouteRecoveryStatus = struct {
         ) catch "⚠ Model response recovery paused";
     }
 };
+
+test "route recovery reports the attempt owned by its state" {
+    try std.testing.expectEqual(@as(usize, 3), (RouteRecoveryStatus{
+        .kind = .auto_retry,
+        .failed_attempt = 3,
+        .attempt_limit = 10,
+    }).reportedAttempt());
+    try std.testing.expectEqual(@as(usize, 4), (RouteRecoveryStatus{
+        .kind = .auto_recovered,
+        .failed_attempt = 3,
+        .succeeded_attempt = 4,
+        .attempt_limit = 10,
+    }).reportedAttempt());
+}
+
+test "route recovery label includes a value-owned diagnostic" {
+    var status = RouteRecoveryStatus{
+        .kind = .auto_retry,
+        .failed_attempt = 4,
+        .attempt_limit = 10,
+        .cause = .provider_unavailable,
+        .action = .retrying_request,
+        .delay_seconds = 4,
+        .diagnostic = ModelFailureDiagnostic.init(
+            "HTTP 503 · no_available_providers: No providers are currently available",
+        ),
+    };
+    const copied = status;
+    status.diagnostic = null;
+
+    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · retrying request in 4s · attempt 4/10",
+        copied.label(&label_buf),
+    );
+}
+
+test "model failure diagnostic truncation is bounded and utf8 safe" {
+    const long = "provider_error: " ++ ("é" ** 200);
+    const diagnostic = ModelFailureDiagnostic.init(long);
+
+    try std.testing.expect(diagnostic.view().len <= ModelFailureDiagnostic.max_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(diagnostic.view()));
+    try std.testing.expect(std.mem.endsWith(u8, diagnostic.view(), "..."));
+}
 
 pub const ChatRole = enum {
     system,
@@ -727,7 +878,6 @@ pub const TerminalFailurePresentation = enum {
     lease_conflict,
     cursor_gap,
     screen_unavailable,
-    monitor_unavailable,
     protocol_incompatible,
     capacity_exceeded,
     cancelled,
@@ -749,7 +899,6 @@ pub const TerminalFailurePresentation = enum {
             .lease_conflict => "terminal control lease conflict",
             .cursor_gap => "terminal output cursor gap",
             .screen_unavailable => "terminal screen is unavailable",
-            .monitor_unavailable => "terminal monitor is unavailable",
             .protocol_incompatible => "terminal protocol is incompatible",
             .capacity_exceeded => "terminal capacity exceeded",
             .cancelled => "terminal action was cancelled",
@@ -779,7 +928,7 @@ pub const TerminalActionPresentation = union(enum) {
 
 pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
-pub const context_deferred_tool_status_label = "Context updated";
+pub const context_deferred_tool_status_label = "Not run — project instructions changed:";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -790,6 +939,38 @@ pub fn isDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
         (std.mem.eql(u8, result.output, deferred_tool_result_output) or
             std.mem.eql(u8, result.output, context_deferred_tool_result_output));
+}
+
+test "persisted deferred tool result classifier is exact" {
+    var result = PersistedToolResult{
+        .tool_call_id = @constCast("call_deferred"),
+        .tool_name = @constCast("read_file"),
+        .status = .failure,
+        .output = @constCast(deferred_tool_result_output),
+        .output_bytes = deferred_tool_result_output.len,
+        .stored_output_bytes = deferred_tool_result_output.len,
+    };
+
+    try std.testing.expect(isDeferredToolResult(result));
+    try std.testing.expect(!isContextDeferredToolResult(result));
+
+    result.status = .success;
+    try std.testing.expect(!isDeferredToolResult(result));
+    try std.testing.expect(!isContextDeferredToolResult(result));
+
+    result.status = .failure;
+    result.output = @constCast("Not executed\n");
+    try std.testing.expect(!isDeferredToolResult(result));
+
+    result.output = @constCast("not executed");
+    try std.testing.expect(!isDeferredToolResult(result));
+
+    result.output = @constCast("tool failed");
+    try std.testing.expect(!isDeferredToolResult(result));
+
+    result.output = @constCast(context_deferred_tool_result_output);
+    try std.testing.expect(isDeferredToolResult(result));
+    try std.testing.expect(isContextDeferredToolResult(result));
 }
 
 pub const ToolResultMemory = struct {
@@ -811,6 +992,12 @@ pub const ToolExecutionStep = struct {
     tool_results: []PersistedToolResult = &.{},
 };
 
+pub const PersistedSteering = struct {
+    text: []u8,
+    assistant_prefix: ?[]u8 = null,
+    after_tool_step_count: usize,
+};
+
 pub const FileEvidence = struct {
     path: []u8,
     new_path: ?[]u8 = null,
@@ -825,8 +1012,8 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
-    /// User guidance consumed between model steps, in presentation order.
-    steering: [][]u8 = &.{},
+    /// User guidance consumed between model steps, with its chronological tool boundary.
+    steering: []PersistedSteering = &.{},
     turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
@@ -952,6 +1139,10 @@ pub const ProviderFinishReason = enum {
     }
 };
 
+pub const ProviderFailureCause = enum {
+    gateway_stream_timeout,
+};
+
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
@@ -962,6 +1153,7 @@ pub const ModelCompletion = struct {
     /// An earlier delivery may have billed outside this generation identity.
     delivery_ambiguous: bool = false,
     provider_result_identity_failure: ?ProviderResultIdentityFailure = null,
+    provider_failure_cause: ?ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     /// Provider-owned opaque response items for the next stateless request in this turn.
     provider_state_json: ?[]const u8 = null,
@@ -1079,6 +1271,41 @@ pub fn validGatewayGenerationId(id: []const u8) bool {
     return true;
 }
 
+test "Gateway timestamps parse UTC fractions strictly" {
+    try std.testing.expectEqual(
+        @as(i64, 1_775_045_467_000),
+        try parseGatewayTimestamp("2026-04-01T12:11:07Z"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1_775_045_467_123),
+        try parseGatewayTimestamp("2026-04-01T12:11:07.123456Z"),
+    );
+    try std.testing.expectError(
+        error.InvalidGatewayTimestamp,
+        parseGatewayTimestamp("2026-02-30T12:11:07Z"),
+    );
+    try std.testing.expectError(
+        error.InvalidGatewayTimestamp,
+        parseGatewayTimestamp("2026-04-01T12:11:07+00:00"),
+    );
+}
+
+test "Gateway timestamp parser handles fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzGatewayTimestamp, .{
+        .corpus = &.{
+            "",
+            "2026-04-01T12:11:07Z",
+            "2026-04-01T12:11:07.123456789Z",
+        },
+    });
+}
+
+fn fuzzGatewayTimestamp(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [128]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    _ = parseGatewayTimestamp(buffer[0..len]) catch return;
+}
+
 /// Team identifiers reach the gateway as a query value, so reject anything that
 /// would need percent-encoding rather than build a malformed URL. Accepts both
 /// the `team_` id form and the slug form.
@@ -1088,6 +1315,14 @@ pub fn validGatewayTeam(team: []const u8) bool {
         'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
         else => return false,
     };
+    return true;
+}
+
+pub fn validCredentialAccountId(account_id: []const u8) bool {
+    if (account_id.len == 0 or account_id.len > 1024) return false;
+    for (account_id) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return false;
+    }
     return true;
 }
 
@@ -1116,6 +1351,112 @@ pub fn classifyProviderCompletion(completion: ModelCompletion) ProviderCompletio
         .stop => if (completion.tool_calls.len == 0 or allToolCallsProviderExecuted(completion.tool_calls)) .completed else .invalid_completion,
         .other => if (completion.tool_calls.len == 0) .completed else .invalid_completion,
     };
+}
+
+test "provider completion disposition classifies finish reason and tool presence" {
+    const call = ToolCall{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+    };
+    const cases = [_]struct {
+        finish_reason: ?ProviderFinishReason,
+        has_tool_calls: bool,
+        expected: ProviderCompletionDisposition,
+    }{
+        .{ .finish_reason = null, .has_tool_calls = false, .expected = .interrupted },
+        .{ .finish_reason = null, .has_tool_calls = true, .expected = .interrupted },
+        .{ .finish_reason = .provider_error, .has_tool_calls = false, .expected = .provider_failure },
+        .{ .finish_reason = .provider_error, .has_tool_calls = true, .expected = .provider_failure },
+        .{ .finish_reason = .content_filter, .has_tool_calls = false, .expected = .provider_failure },
+        .{ .finish_reason = .content_filter, .has_tool_calls = true, .expected = .provider_failure },
+        .{ .finish_reason = .length, .has_tool_calls = false, .expected = .length_limited },
+        .{ .finish_reason = .length, .has_tool_calls = true, .expected = .length_limited },
+        .{ .finish_reason = .tool_calls, .has_tool_calls = true, .expected = .completed },
+        .{ .finish_reason = .tool_calls, .has_tool_calls = false, .expected = .invalid_completion },
+        .{ .finish_reason = .stop, .has_tool_calls = true, .expected = .invalid_completion },
+        .{ .finish_reason = .other, .has_tool_calls = true, .expected = .invalid_completion },
+        .{ .finish_reason = .stop, .has_tool_calls = false, .expected = .completed },
+        .{ .finish_reason = .other, .has_tool_calls = false, .expected = .completed },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            classifyProviderCompletion(.{
+                .finish_reason = case.finish_reason,
+                .tool_calls = if (case.has_tool_calls) &.{call} else &.{},
+            }),
+        );
+    }
+}
+
+test "provider completion disposition allows terminal provider-executed tool calls" {
+    const provider_call = ToolCall{
+        .id = "provider_search",
+        .name = "perplexity_search",
+        .arguments_json = "{}",
+        .provider_result = "{\"results\":[]}",
+        .provenance = .provider_executed,
+    };
+    const local_call = ToolCall{
+        .id = "local_read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    };
+    const mixed_calls = [_]ToolCall{ provider_call, local_call };
+
+    try std.testing.expectEqual(
+        ProviderCompletionDisposition.completed,
+        classifyProviderCompletion(.{
+            .finish_reason = .stop,
+            .tool_calls = &.{provider_call},
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderCompletionDisposition.invalid_completion,
+        classifyProviderCompletion(.{
+            .finish_reason = .stop,
+            .tool_calls = &.{local_call},
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderCompletionDisposition.invalid_completion,
+        classifyProviderCompletion(.{
+            .finish_reason = .stop,
+            .tool_calls = &mixed_calls,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderCompletionDisposition.invalid_completion,
+        classifyProviderCompletion(.{
+            .finish_reason = .other,
+            .tool_calls = &.{provider_call},
+        }),
+    );
+}
+
+test "ProviderFinishReason accepts only the canonical provider domain" {
+    const cases = [_]struct {
+        raw: []const u8,
+        reason: ProviderFinishReason,
+    }{
+        .{ .raw = "stop", .reason = .stop },
+        .{ .raw = "length", .reason = .length },
+        .{ .raw = "content-filter", .reason = .content_filter },
+        .{ .raw = "tool-calls", .reason = .tool_calls },
+        .{ .raw = "error", .reason = .provider_error },
+        .{ .raw = "other", .reason = .other },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.reason, ProviderFinishReason.parse_unified(case.raw).?);
+        try std.testing.expectEqualStrings(case.raw, case.reason.label());
+    }
+    try std.testing.expect(ProviderFinishReason.parse_unified("") == null);
+    try std.testing.expect(ProviderFinishReason.parse_unified("future-reason") == null);
+    try std.testing.expectEqual(ProviderFinishReason.tool_calls, ProviderFinishReason.parse_legacy("tool_calls").?);
+    try std.testing.expectEqual(ProviderFinishReason.content_filter, ProviderFinishReason.parse_legacy("content_filter").?);
 }
 
 pub const AuthoritativeToolAdmission = union(enum) {
@@ -1172,6 +1513,77 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     return .admitted;
 }
 
+test "authoritative tool admission rejects duplicate final ids across provenance" {
+    const local_calls = [_]ToolCall{
+        .{ .id = "duplicate_1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
+        .{ .id = "duplicate_1", .name = "read_file", .arguments_json = "{\"path\":\"b\"}" },
+    };
+    const provider_calls = [_]ToolCall{
+        .{
+            .id = "duplicate_1",
+            .name = "parallel_search",
+            .arguments_json = "{}",
+            .provider_result = "{\"results\":[]}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "duplicate_1",
+            .name = "parallel_search",
+            .arguments_json = "{}",
+            .provider_result = "{\"results\":[]}",
+            .provenance = .provider_executed,
+        },
+    };
+    const mixed_calls = [_]ToolCall{
+        .{
+            .id = "duplicate_1",
+            .name = "parallel_search",
+            .arguments_json = "{}",
+            .provider_result = "{\"results\":[]}",
+            .provenance = .provider_executed,
+        },
+        .{ .id = "duplicate_1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
+    };
+    const cases = [_][]const ToolCall{
+        &local_calls,
+        &provider_calls,
+        &mixed_calls,
+    };
+
+    for (cases) |calls| {
+        switch (authoritativeToolAdmission(.{ .tool_calls = calls })) {
+            .reject_duplicate_identity => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "authoritative tool admission rejects malformed provider arguments but admits local recovery" {
+    const local_call = ToolCall{
+        .id = "local_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    };
+    try std.testing.expectEqual(
+        AuthoritativeToolAdmission.admitted,
+        authoritativeToolAdmission(.{ .tool_calls = &.{local_call} }),
+    );
+
+    const provider_call = ToolCall{
+        .id = "provider_1",
+        .name = "parallel_search",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+        .provider_result = "{\"results\":[]}",
+        .provenance = .provider_executed,
+    };
+    try std.testing.expectEqual(
+        AuthoritativeToolAdmission.reject_malformed_provider_arguments,
+        authoritativeToolAdmission(.{ .tool_calls = &.{provider_call} }),
+    );
+}
+
 pub const ConversationLanguage = struct {
     pub const max_len: usize = 24;
 
@@ -1212,18 +1624,6 @@ pub const AssistantHistoryTurn = struct {
     execution: ExecutionMemory = .{},
 };
 
-pub const StableBackgroundRecordId = [16]u8;
-
-pub const BackgroundCommandHistoryTurn = struct {
-    user: UserTurn,
-    assistant: ?[]u8 = null,
-    execution: ExecutionMemory = .{},
-    log_path: []u8,
-    expect_url: bool,
-    url: ?[]u8 = null,
-    background_record_id: ?StableBackgroundRecordId = null,
-};
-
 pub const InterruptedTerminalReason = enum {
     cancelled,
     failed,
@@ -1238,6 +1638,9 @@ pub const InterruptedHistoryTurn = struct {
     cancelled_command: ?CancelledCommandPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
 };
+
+pub const context_handoff_open = "<context_handoff>";
+pub const context_handoff_close = "</context_handoff>";
 
 pub const CompactedSummaryHistoryTurn = struct {
     summary: []u8,
@@ -1258,14 +1661,12 @@ pub const CompactedSummaryHistoryTurn = struct {
 pub const HistoryTurn = union(enum) {
     compacted_summary: CompactedSummaryHistoryTurn,
     assistant: AssistantHistoryTurn,
-    background_command: BackgroundCommandHistoryTurn,
     interrupted: InterruptedHistoryTurn,
 };
 
 pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
     switch (turn.*) {
         .assistant => |*entry| entry.execution.turn_summary = summary,
-        .background_command => |*entry| entry.execution.turn_summary = summary,
         .interrupted => |*entry| entry.execution.turn_summary = summary,
         .compacted_summary => {},
     }
@@ -1274,7 +1675,6 @@ pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
 pub fn historyTurnSummary(turn: HistoryTurn) ?TurnSummary {
     return switch (turn) {
         .assistant => |entry| entry.execution.turn_summary,
-        .background_command => |entry| entry.execution.turn_summary,
         .interrupted => |entry| entry.execution.turn_summary,
         .compacted_summary => null,
     };
@@ -1436,6 +1836,7 @@ pub const ToolPermissionDenialReason = enum {
     user_denied,
     auto_denied,
     review_caution,
+    review_evidence_incomplete,
     review_unavailable,
     policy_denied,
     permission_required,
@@ -1536,13 +1937,6 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             alloc.free(entry.assistant);
             freeExecutionMemory(alloc, entry.execution);
         },
-        .background_command => |entry| {
-            freeUserTurn(alloc, entry.user);
-            if (entry.assistant) |assistant| alloc.free(assistant);
-            freeExecutionMemory(alloc, entry.execution);
-            alloc.free(entry.log_path);
-            if (entry.url) |url| alloc.free(url);
-        },
         .interrupted => |entry| {
             freeUserTurn(alloc, entry.user);
             if (entry.assistant) |assistant| alloc.free(assistant);
@@ -1604,32 +1998,6 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
-            } };
-        },
-        .background_command => |entry| blk: {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-
-            const execution = try dupeExecutionMemory(alloc, entry.execution);
-            errdefer freeExecutionMemory(alloc, execution);
-
-            const log_path = try alloc.dupe(u8, entry.log_path);
-            errdefer alloc.free(log_path);
-
-            const url = if (entry.url) |src| try alloc.dupe(u8, src) else null;
-            errdefer if (url) |owned| alloc.free(owned);
-
-            break :blk .{ .background_command = .{
-                .user = user,
-                .assistant = assistant,
-                .execution = execution,
-                .log_path = log_path,
-                .expect_url = entry.expect_url,
-                .url = url,
-                .background_record_id = entry.background_record_id,
             } };
         },
         .interrupted => |entry| blk: {
@@ -1737,7 +2105,7 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
     errdefer freeFileEvidenceSlice(alloc, files);
-    const steering = try dupePermissionFeedback(alloc, memory.steering);
+    const steering = try dupePersistedSteering(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -1749,7 +2117,45 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
-    freePermissionFeedback(alloc, memory.steering);
+    freePersistedSteering(alloc, memory.steering);
+}
+
+pub fn dupePersistedSteering(
+    alloc: std.mem.Allocator,
+    steering: []const PersistedSteering,
+) ![]PersistedSteering {
+    if (steering.len == 0) return &.{};
+    const copy = try alloc.alloc(PersistedSteering, steering.len);
+    errdefer alloc.free(copy);
+    var copied: usize = 0;
+    errdefer for (copy[0..copied]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    for (steering, copy) |item, *dest| {
+        const text = try alloc.dupe(u8, item.text);
+        errdefer alloc.free(text);
+        const assistant_prefix = if (item.assistant_prefix) |prefix|
+            try alloc.dupe(u8, prefix)
+        else
+            null;
+        errdefer if (assistant_prefix) |prefix| alloc.free(prefix);
+        dest.* = .{
+            .text = text,
+            .assistant_prefix = assistant_prefix,
+            .after_tool_step_count = item.after_tool_step_count,
+        };
+        copied += 1;
+    }
+    return copy;
+}
+
+pub fn freePersistedSteering(alloc: std.mem.Allocator, steering: []PersistedSteering) void {
+    for (steering) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    }
+    if (steering.len > 0) alloc.free(steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
@@ -2092,6 +2498,61 @@ pub fn freeToolCall(alloc: std.mem.Allocator, call: ToolCall) void {
     if (call.provider_result) |provider_result| alloc.free(provider_result);
 }
 
+test "dupeToolCall preserves argument integrity" {
+    const source = ToolCall{
+        .id = "call_1",
+        .name = "ask_user_question",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    };
+
+    const copy = try dupeToolCall(std.testing.allocator, source);
+    defer freeToolCall(std.testing.allocator, copy);
+
+    try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
+}
+
+test "ToolArgumentIntegrity accepts complete serialized JSON roots" {
+    const cases = [_][]const u8{
+        "  {\"first\":1,\"second\":1e+02} \n",
+        "[1,{\"nested\":true}]",
+        "null",
+        "true",
+        "42",
+        "\"text\"",
+    };
+
+    for (cases) |serialized| {
+        try std.testing.expectEqual(
+            ToolArgumentIntegrity.valid,
+            try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, serialized),
+        );
+    }
+}
+
+test "ToolArgumentIntegrity rejects malformed trailing and duplicate-key JSON" {
+    const cases = [_][]const u8{
+        "{]",
+        "{} trailing",
+        "{\"depth\":1,\"depth\":2}",
+    };
+
+    for (cases) |serialized| {
+        try std.testing.expectEqual(
+            ToolArgumentIntegrity.malformed_json,
+            try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, serialized),
+        );
+    }
+}
+
+test "ToolArgumentIntegrity preserves parser allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ToolArgumentIntegrity.classifySerialized(failing.allocator(), "{\"path\":\"src/main.zig\"}"),
+    );
+}
+
 pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
     alloc.free(user.text);
     freeImageAttachmentSlice(alloc, user.images);
@@ -2251,4 +2712,285 @@ pub fn dupePermissionRuleSet(alloc: std.mem.Allocator, rules: PermissionRuleSet)
     return .{
         .rules = try dupePermissionRuleSlice(alloc, rules.rules),
     };
+}
+
+test "ConversationLanguage preserves core constructors" {
+    const default_lang = ConversationLanguage.default();
+    try std.testing.expectEqualStrings("und", default_lang.view());
+
+    const literal = ConversationLanguage.literal("en");
+    try std.testing.expectEqual(@as(u8, 2), literal.len);
+    try std.testing.expectEqualStrings("en", literal.view());
+
+    const parsed = try ConversationLanguage.fromSlice("  ja  ");
+    try std.testing.expectEqualStrings("ja", parsed.view());
+
+    try std.testing.expectError(error.InvalidConversationLanguage, ConversationLanguage.fromSlice(""));
+    try std.testing.expectError(error.InvalidConversationLanguage, ConversationLanguage.fromSlice(" \t\r\n "));
+    try std.testing.expectError(error.InvalidConversationLanguage, ConversationLanguage.fromSlice("this-is-way-too-long-for-a-language-tag"));
+}
+
+test "ReasoningEffort preserves default aliases and opaque names" {
+    const default_aliases = [_][]const u8{ "auto", "AUTO", "adaptive", "default" };
+    for (default_aliases) |alias| {
+        const parsed = ReasoningEffort.parseDisplayLabel(alias) orelse return error.ExpectedReasoningEffort;
+        try std.testing.expectEqual(ReasoningEffort.auto, parsed);
+        try std.testing.expectEqualStrings("auto", parsed.label());
+        try std.testing.expectEqualStrings("default", parsed.displayLabel());
+        try std.testing.expect(parsed.gatewayValue() == null);
+    }
+
+    const named_values = [_][]const u8{ "none", "low", "xhigh", "future-tier" };
+    for (named_values) |raw| {
+        const parsed = ReasoningEffort.parse(raw) orelse return error.ExpectedReasoningEffort;
+        try std.testing.expectEqualStrings(raw, parsed.label());
+        try std.testing.expectEqualStrings(raw, parsed.displayLabel());
+        try std.testing.expectEqualStrings(raw, parsed.gatewayValue().?);
+    }
+
+    try std.testing.expect(ReasoningEffort.parse("") == null);
+    try std.testing.expect(ReasoningEffort.parse("contains space") == null);
+    try std.testing.expect(ReasoningEffort.parse("this-effort-name-is-deliberately-longer-than-the-supported-wire-boundary-of-sixty-four-bytes") == null);
+}
+
+test "HistoryTurn helpers duplicate and free owned turns" {
+    const alloc = std.testing.allocator;
+
+    const assistant_original: HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = try alloc.dupe(u8, "hello") },
+        .assistant = try alloc.dupe(u8, "response"),
+    } };
+    const assistant_copy = try dupeHistoryTurn(alloc, assistant_original);
+    try std.testing.expectEqualStrings("hello", assistant_copy.assistant.user.text);
+    try std.testing.expectEqualStrings("response", assistant_copy.assistant.assistant);
+    try std.testing.expect(assistant_copy.assistant.user.text.ptr != assistant_original.assistant.user.text.ptr);
+    freeHistoryTurn(alloc, assistant_copy);
+    freeHistoryTurn(alloc, assistant_original);
+
+    var summary_root_messages = try alloc.alloc([]u8, 1);
+    summary_root_messages[0] = try alloc.dupe(u8, "exact root request");
+    var summary_feedback = try alloc.alloc([]u8, 1);
+    summary_feedback[0] = try alloc.dupe(u8, "deny writes outside the workspace");
+    const summary_original: HistoryTurn = .{ .compacted_summary = .{
+        .summary = try alloc.dupe(u8, "summary"),
+        .removed_turn_count = 3,
+        .compaction_count = 2,
+        .root_user_messages = summary_root_messages,
+        .root_user_messages_complete = false,
+        .permission_feedback = summary_feedback,
+        .permission_feedback_complete = false,
+    } };
+    const summary_copy = try dupeHistoryTurn(alloc, summary_original);
+    try std.testing.expectEqualStrings("summary", summary_copy.compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 3), summary_copy.compacted_summary.removed_turn_count);
+    try std.testing.expect(!summary_copy.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!summary_copy.compacted_summary.permission_feedback_complete);
+    try std.testing.expectEqualStrings(
+        "deny writes outside the workspace",
+        summary_copy.compacted_summary.permission_feedback[0],
+    );
+    try std.testing.expect(
+        summary_copy.compacted_summary.permission_feedback[0].ptr !=
+            summary_original.compacted_summary.permission_feedback[0].ptr,
+    );
+    try std.testing.expect(summary_copy.compacted_summary.summary.ptr != summary_original.compacted_summary.summary.ptr);
+    freeHistoryTurn(alloc, summary_copy);
+    freeHistoryTurn(alloc, summary_original);
+
+    const interrupted_original: HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = try alloc.dupe(u8, "stop") },
+        .execution = .{ .files = blk: {
+            const files = try alloc.alloc(FileEvidence, 1);
+            files[0] = .{
+                .path = try alloc.dupe(u8, "README.md"),
+                .tool_call_id = try alloc.dupe(u8, "call_2"),
+                .tool_name = try alloc.dupe(u8, "read_file"),
+                .action = .read,
+                .status = .failure,
+            };
+            break :blk files;
+        } },
+        .cancelled_command = .{
+            .output_replay = .{ .available = .{
+                .handle = try alloc.dupe(u8, "fx-command-replay.bin"),
+                .framed_bytes = 42,
+            } },
+            .command_artifact_handle = try alloc.dupe(u8, "fx-command.log"),
+        },
+        .terminal_reason = .failed,
+    } };
+    const interrupted_copy = try dupeHistoryTurn(alloc, interrupted_original);
+    try std.testing.expectEqualStrings("README.md", interrupted_copy.interrupted.execution.files[0].path);
+    try std.testing.expect(interrupted_copy.interrupted.execution.files[0].path.ptr != interrupted_original.interrupted.execution.files[0].path.ptr);
+    const copied_presentation = interrupted_copy.interrupted.cancelled_command.?;
+    const original_presentation = interrupted_original.interrupted.cancelled_command.?;
+    try std.testing.expectEqualStrings(
+        "fx-command-replay.bin",
+        copied_presentation.output_replay.?.available.handle,
+    );
+    try std.testing.expect(
+        copied_presentation.output_replay.?.available.handle.ptr !=
+            original_presentation.output_replay.?.available.handle.ptr,
+    );
+    try std.testing.expect(
+        copied_presentation.command_artifact_handle.?.ptr !=
+            original_presentation.command_artifact_handle.?.ptr,
+    );
+    try std.testing.expectEqual(
+        InterruptedTerminalReason.failed,
+        interrupted_copy.interrupted.terminal_reason,
+    );
+    freeHistoryTurn(alloc, interrupted_copy);
+    freeHistoryTurn(alloc, interrupted_original);
+
+    const finished_original = FinishedPrompt{
+        .turn = .{ .interrupted = .{
+            .user = .{ .text = try alloc.dupe(u8, "cancel") },
+            .assistant = try alloc.dupe(u8, "I stopped here."),
+        } },
+        .terminal_projection = .assistant_text,
+        .terminal_outcome = .completed,
+    };
+    const finished_copy = try dupeFinishedPrompt(alloc, finished_original);
+    try std.testing.expectEqual(FinishedPromptProjection.assistant_text, finished_copy.terminal_projection);
+    try std.testing.expectEqual(@as(?TurnPresentationOutcome, .completed), finished_copy.terminal_outcome);
+    freeFinishedPrompt(alloc, finished_copy);
+    freeFinishedPrompt(alloc, finished_original);
+}
+
+test "TurnSummary carries shared turn token progress" {
+    const progress: TurnTokenProgress = .{
+        .input_tokens = 50_000,
+        .output_tokens = 240,
+        .input_exact = true,
+        .output_exact = false,
+    };
+    const summary: TurnSummary = .{
+        .thinking_duration_ms = 15_000,
+        .turn_duration_ms = 130_000,
+        .token_progress = progress,
+    };
+    try std.testing.expectEqual(progress, summary.token_progress);
+}
+
+test "ImageAttachment helpers duplicate empty and populated slices" {
+    const alloc = std.testing.allocator;
+
+    const empty = try dupeImageAttachmentSlice(alloc, &.{});
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    freeImageAttachmentSlice(alloc, empty);
+
+    var originals = try alloc.alloc(ImageAttachment, 1);
+    originals[0] = .{
+        .path = try alloc.dupe(u8, "/tmp/image.png"),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    };
+
+    const copy = try dupeImageAttachmentSlice(alloc, originals);
+    try std.testing.expectEqualStrings("/tmp/image.png", copy[0].path);
+    try std.testing.expectEqualStrings("image/png", copy[0].media_type);
+    try std.testing.expect(copy[0].path.ptr != originals[0].path.ptr);
+
+    freeImageAttachmentSlice(alloc, copy);
+    freeImageAttachmentSlice(alloc, originals);
+}
+
+test "Permission helpers duplicate and free grants rules and rule sets" {
+    const alloc = std.testing.allocator;
+
+    const grants = [_]PermissionGrant{.{
+        .tool_name = @constCast("run_command"),
+        .target_path = @constCast("/tmp/workspace"),
+    }};
+    const grant_copy = try dupePermissionGrantSlice(alloc, &grants);
+    try std.testing.expectEqualStrings("run_command", grant_copy[0].tool_name);
+    try std.testing.expectEqualStrings("/tmp/workspace", grant_copy[0].target_path);
+    try std.testing.expect(grant_copy[0].tool_name.ptr != grants[0].tool_name.ptr);
+    freePermissionGrantSlice(alloc, grant_copy);
+
+    const expected_empty_grants = try alloc.alloc(PermissionGrant, 0);
+    const empty_grant_copy = try dupePermissionGrantSlice(alloc, &.{});
+    try std.testing.expectEqual(expected_empty_grants.ptr, empty_grant_copy.ptr);
+    alloc.free(expected_empty_grants);
+    freePermissionGrantSlice(alloc, empty_grant_copy);
+
+    var rules = [_]PermissionRule{.{
+        .permission = @constCast("write_file"),
+        .pattern = @constCast("src/**"),
+        .action = .allow,
+    }};
+    const rule_copy = try dupePermissionRuleSlice(alloc, &rules);
+    try std.testing.expectEqualStrings("write_file", rule_copy[0].permission);
+    try std.testing.expectEqualStrings("src/**", rule_copy[0].pattern);
+    try std.testing.expectEqual(PermissionAction.allow, rule_copy[0].action);
+    try std.testing.expect(rule_copy[0].permission.ptr != rules[0].permission.ptr);
+    freePermissionRuleSlice(alloc, rule_copy);
+
+    var ruleset = try dupePermissionRuleSet(alloc, .{ .rules = &rules });
+    try std.testing.expectEqual(@as(usize, 1), ruleset.rules.len);
+    ruleset.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), ruleset.rules.len);
+
+    var empty_ruleset = PermissionRuleSet{};
+    empty_ruleset.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty_ruleset.rules.len);
+}
+
+test "public types remain constructible" {
+    const layout: Layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    };
+    try std.testing.expectEqual(@as(u16, 80), layout.cols);
+
+    const metrics = Metrics{ .ansi_bytes = 1, .stream_chunks = 2 };
+    try std.testing.expectEqual(@as(usize, 2), metrics.stream_chunks);
+
+    const stream = StreamState{ .active = true, .last_activity_kind = .ask };
+    try std.testing.expect(stream.active);
+    try std.testing.expectEqual(ToolActivityKind.ask, stream.last_activity_kind.?);
+
+    const tool_call = ToolCall{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .provider_result = "ok",
+    };
+    const image = ImageAttachment{
+        .path = @constCast("/tmp/image.png"),
+        .media_type = @constCast("image/png"),
+    };
+    const chat = ChatMessage{
+        .role = .assistant,
+        .content = "content",
+        .images = &.{image},
+        .tool_calls = &.{tool_call},
+    };
+    try std.testing.expectEqual(ChatRole.assistant, chat.role);
+    try std.testing.expectEqualStrings("ok", chat.tool_calls[0].provider_result.?);
+
+    const completion = ModelCompletion{
+        .content = "done",
+        .tool_calls = &.{tool_call},
+        .finish_reason = .stop,
+    };
+    try std.testing.expectEqual(ProviderFinishReason.stop, completion.finish_reason.?);
+
+    const option = QuestionOption{ .label = "Yes", .description = "Proceed" };
+    const batch = QuestionBatchEntry{ .question = "Continue?", .options = &.{option} };
+    try std.testing.expectEqualStrings("Continue?", batch.question);
+
+    const mode = PermissionMode.ask;
+    const decision = ToolPermissionDecision.always;
+    const action = PermissionAction.deny;
+    const resolve_mode = ResolveMode.create;
+    _ = mode;
+    _ = decision;
+    _ = action;
+    _ = resolve_mode;
 }

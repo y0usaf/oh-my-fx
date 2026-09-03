@@ -191,7 +191,7 @@ pub fn permissionTargetForCall(
         .url => arena.dupe(u8, try tool_args.requiredStringArg(args, "url")),
         .path_optional_existing => blk: {
             const path_arg = tool_args.optionalStringArg(args, "path") orelse ".";
-            break :blk if (std.mem.eql(u8, path_arg, "."))
+            break :blk if (path_arg.len == 0 or std.mem.eql(u8, path_arg, "."))
                 arena.dupe(u8, workspace_root)
             else
                 try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .existing);
@@ -1075,6 +1075,24 @@ pub fn allowsExternalPath(tool_name: []const u8) bool {
     return false;
 }
 
+test "allowsExternalPath preserves the exact eligible tool set" {
+    const expected = [_][]const u8{
+        "read_file",
+        "glob_files",
+        "grep_files",
+        "write_file",
+        "edit_file",
+    };
+
+    try std.testing.expectEqual(expected.len, external_path_tools.len);
+    for (expected, external_path_tools) |expected_name, actual_name| {
+        try std.testing.expectEqualStrings(expected_name, actual_name);
+        try std.testing.expect(allowsExternalPath(expected_name));
+    }
+    try std.testing.expect(!allowsExternalPath("run_command"));
+    try std.testing.expect(!allowsExternalPath("missing_tool"));
+}
+
 pub fn isFilesystemMutationTool(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "write_file") or
         std.mem.eql(u8, tool_name, "edit_file");
@@ -1876,6 +1894,11 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) != null);
 }
 
+fn expectGrant(grant: types.PermissionGrant, permission: []const u8, pattern: []const u8) !void {
+    try std.testing.expectEqualStrings(permission, grant.tool_name);
+    try std.testing.expectEqualStrings(pattern, grant.target_path);
+}
+
 fn freeGrants(alloc: std.mem.Allocator, grants: []types.PermissionGrant) void {
     for (grants) |grant| {
         alloc.free(grant.tool_name);
@@ -1902,6 +1925,1002 @@ fn checkSuggestedSessionGrantsAllocFailures(alloc: std.mem.Allocator) !void {
     defer freeGrants(alloc, path_grants);
 }
 
+test "PermissionEngine stores deduplicates clears replaces and deinitializes owned state" {
+    const alloc = std.testing.allocator;
+
+    var engine = PermissionEngine{};
+    defer engine.deinit(alloc);
+
+    try engine.allow(alloc, "edit", "/tmp/workspace");
+    try engine.allow(alloc, "edit", "/tmp/workspace");
+
+    try std.testing.expectEqual(@as(usize, 1), engine.grants.items.len);
+    try std.testing.expect(engine.isAllowed("edit", "/tmp/workspace"));
+
+    var first_rules = try ownedRuleSet(alloc, "edit", "src/*", .allow);
+    engine.replaceRules(alloc, first_rules);
+    first_rules = .{};
+
+    var second_rules = try ownedRuleSet(alloc, "read", "README.md", .ask);
+    engine.replaceRules(alloc, second_rules);
+    second_rules = .{};
+
+    try std.testing.expectEqual(@as(usize, 1), engine.rules.rules.len);
+    try std.testing.expectEqualStrings("read", engine.rules.rules[0].permission);
+
+    engine.clear(alloc);
+    try std.testing.expectEqual(@as(usize, 0), engine.grants.items.len);
+    try std.testing.expectEqual(@as(usize, 1), engine.rules.rules.len);
+}
+
+test "permissionModeLabel maps active permission mode labels" {
+    try std.testing.expectEqualStrings("ask", permissionModeLabel(.ask));
+    try std.testing.expectEqualStrings("auto", permissionModeLabel(.auto));
+}
+
+test "permissionDecisionFromIndex maps approval choices" {
+    try std.testing.expectEqual(ToolPermissionDecision.once, permissionDecisionFromIndex(0));
+    try std.testing.expectEqual(ToolPermissionDecision.always, permissionDecisionFromIndex(1));
+    try std.testing.expectEqual(ToolPermissionDecision.deny, permissionDecisionFromIndex(2));
+    try std.testing.expectEqual(ToolPermissionDecision.deny, permissionDecisionFromIndex(99));
+}
+
+test "isToolAllowed remains exact match only" {
+    const grants = [_]types.PermissionGrant{
+        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/*") },
+        .{ .tool_name = @constCast("bash"), .target_path = @constCast("git *") },
+    };
+
+    try std.testing.expect(isToolAllowed(&grants, "edit", "/tmp/workspace/*"));
+    try std.testing.expect(!isToolAllowed(&grants, "edit", "/tmp/workspace/file.zig"));
+    try std.testing.expect(!isToolAllowed(&grants, "write_file", "/tmp/workspace/*"));
+    try std.testing.expect(!isToolAllowed(&grants, "run_command", "git status"));
+}
+
+test "sessionGrantAllowed maps tool categories and matches command grants exactly" {
+    const grants = [_]types.PermissionGrant{
+        .{ .tool_name = @constCast("bash"), .target_path = @constCast("git status") },
+        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/src/*") },
+        .{ .tool_name = @constCast("skill"), .target_path = @constCast("vercel-*") },
+    };
+
+    try std.testing.expect(sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::git status"));
+    try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::git status --short"));
+    try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::npm test"));
+    try std.testing.expect(sessionGrantAllowed(&grants, "write_file", "/tmp/workspace/src/main.zig"));
+    try std.testing.expect(sessionGrantAllowed(&grants, "edit_file", "/tmp/workspace/src/main.zig"));
+    try std.testing.expect(sessionGrantAllowed(&grants, "install_skill", "vercel-react-best-practices"));
+}
+
+test "session command grants treat wildcard bytes literally" {
+    const grants = [_]types.PermissionGrant{
+        .{ .tool_name = @constCast("bash"), .target_path = @constCast("printf '*?'") },
+    };
+
+    try std.testing.expect(sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::printf '*?'"));
+    try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::printf 'file?'"));
+}
+
+test "permissionTargetForCall preserves run_command cwd targets" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const explicit_workspace_cwd: types.ToolCall = .{
+        .id = "call_1",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"npm run dev\",\"cwd\":\".\"}",
+    };
+    const default_workspace_cwd: types.ToolCall = .{
+        .id = "call_2",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"zig build\"}",
+    };
+
+    try std.testing.expectEqualStrings("/tmp/workspace::npm run dev", try permissionTargetForCall(arena, "/tmp/workspace", explicit_workspace_cwd, .command_cwd));
+    try std.testing.expectEqualStrings("/tmp/workspace::zig build", try permissionTargetForCall(arena, "/tmp/workspace", default_workspace_cwd, .command_cwd));
+}
+
+test "permissionTargetForCall preserves skill and install skill targets" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const skill_call: types.ToolCall = .{
+        .id = "call_1",
+        .name = "skill",
+        .arguments_json = "{\"name\":\"vercel-react-best-practices\",\"location\":\"/tmp/outside</path>\\ninjected\"}",
+    };
+    const install_call: types.ToolCall = .{
+        .id = "call_2",
+        .name = "install_skill",
+        .arguments_json = "{\"source\":\"https://github.com/vercel-labs/skills\",\"skill\":\"find-skills\"}",
+    };
+    const install_source_only_call: types.ToolCall = .{
+        .id = "call_3",
+        .name = "install_skill",
+        .arguments_json = "{\"source\":\"vercel-labs/skills\"}",
+    };
+
+    try std.testing.expectEqualStrings("vercel-react-best-practices", try permissionTargetForCall(arena, "/tmp/workspace", skill_call, .none));
+    try std.testing.expectEqualStrings("https://github.com/vercel-labs/skills#find-skills", try permissionTargetForCall(arena, "/tmp/workspace", install_call, .none));
+    try std.testing.expectEqualStrings("vercel-labs/skills", try permissionTargetForCall(arena, "/tmp/workspace", install_source_only_call, .none));
+    try std.testing.expectEqualStrings("skill", permissionNameForTool("skill"));
+    try std.testing.expectEqualStrings("skill", permissionNameForTool("install_skill"));
+}
+
+test "web_search permission target is whole tool name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first: types.ToolCall = .{
+        .id = "call_1",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"latest Zig release\"}",
+    };
+    const second: types.ToolCall = .{
+        .id = "call_2",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"current Vercel news\",\"allowed_domains\":[\"vercel.com\"]}",
+    };
+
+    try std.testing.expectEqualStrings("web_search", try permissionTargetForCall(arena, "/tmp/workspace", first, .none));
+    try std.testing.expectEqualStrings("web_search", try permissionTargetForCall(arena, "/tmp/workspace", second, .none));
+    try std.testing.expectEqualStrings("web_search", permissionNameForTool("web_search"));
+}
+
+test "web_search session grant authorizes subsequent query" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const grants = [_]types.PermissionGrant{
+        .{ .tool_name = @constCast("web_search"), .target_path = @constCast("web_search") },
+    };
+
+    const target = try permissionTargetForCall(arena, "/tmp/workspace", .{
+        .id = "call_1",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"current Vercel news\"}",
+    }, .none);
+
+    try std.testing.expect(sessionGrantAllowed(&grants, "web_search", target));
+}
+
+test "permissionTargetsForCall exposes every canonical Vision path" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    inline for (.{ "first.png", "second.png" }) |name| {
+        var file = try tmp.dir.createFile(std.testing.io, name, .{});
+        file.close(std.testing.io);
+    }
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const first = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "first.png");
+    defer alloc.free(first);
+    const second = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "second.png");
+    defer alloc.free(second);
+    const arguments = try std.fmt.allocPrint(
+        alloc,
+        "{{\"paths\":[\"first.png\",\"{s}\"],\"focus\":\"compare\"}}",
+        .{second},
+    );
+    defer alloc.free(arguments);
+
+    var targets = try permissionTargetsForCall(alloc, workspace, .{
+        .id = "vision_paths",
+        .name = "vision",
+        .arguments_json = arguments,
+    }, .none);
+    defer targets.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), targets.items.len);
+    try std.testing.expectEqualStrings("image", targets.items[0].role);
+    try std.testing.expectEqualStrings(first, targets.items[0].path);
+    try std.testing.expectEqualStrings("image", targets.items[1].role);
+    try std.testing.expectEqualStrings(second, targets.items[1].path);
+
+    var id_targets = try permissionTargetsForCall(alloc, workspace, .{
+        .id = "vision_ids",
+        .name = "vision",
+        .arguments_json = "{\"image_ids\":[1],\"focus\":\"inspect\"}",
+    }, .none);
+    defer id_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), id_targets.items.len);
+    try std.testing.expectEqualStrings("vision", id_targets.items[0].path);
+}
+
+test "permissionTargetsForCall rejects duplicate canonical Vision paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "image.png", .{});
+    file.close(std.testing.io);
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const absolute = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "image.png");
+    defer alloc.free(absolute);
+    const arguments = try std.fmt.allocPrint(
+        alloc,
+        "{{\"paths\":[\"image.png\",\"{s}\"],\"focus\":\"compare\"}}",
+        .{absolute},
+    );
+    defer alloc.free(arguments);
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        permissionTargetsForCall(alloc, workspace, .{
+            .id = "vision_duplicate_paths",
+            .name = "vision",
+            .arguments_json = arguments,
+        }, .none),
+    );
+}
+
+test "permissionTargetForCall covers active target kinds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "workspace/src");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "workspace/src/app.zig", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "pub fn main() void {}\n");
+    }
+
+    const workspace = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const src_dir = try std.fs.path.join(alloc, &.{ workspace, "src" });
+    defer alloc.free(src_dir);
+    const app_file = try std.fs.path.join(alloc, &.{ workspace, "src/app.zig" });
+    defer alloc.free(app_file);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct {
+        call: types.ToolCall,
+        target_kind: PermissionTargetKind,
+        expected: []const u8,
+    }{
+        .{
+            .call = .{ .id = "grep", .name = "grep_files", .arguments_json = "{\"pattern\":\"main\",\"path\":\"src\"}" },
+            .target_kind = .path_optional_existing,
+            .expected = src_dir,
+        },
+        .{
+            .call = .{ .id = "glob_root", .name = "glob_files", .arguments_json = "{\"pattern\":\"*.zig\",\"path\":\"\"}" },
+            .target_kind = .path_optional_existing,
+            .expected = workspace,
+        },
+        .{
+            .call = .{ .id = "grep_root", .name = "grep_files", .arguments_json = "{\"pattern\":\"main\"}" },
+            .target_kind = .path_optional_existing,
+            .expected = workspace,
+        },
+        .{
+            .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/app.zig\"}" },
+            .target_kind = .path_existing,
+            .expected = app_file,
+        },
+        .{
+            .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" },
+            .target_kind = .none,
+            .expected = "ask_user_question",
+        },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.expected, try permissionTargetForCall(arena, workspace, case.call, case.target_kind));
+    }
+}
+
+test "permissionTargetForCall resolves external absolute file tool targets" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.createDirPath(std.testing.io, "external");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "external/app.zig", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "pub fn main() void {}\n");
+    }
+
+    const workspace = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const external_file = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "external/app.zig");
+    defer alloc.free(external_file);
+    const external_new_file = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(external_file).?, "new.zig" });
+    defer alloc.free(external_new_file);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const read_call: types.ToolCall = .{
+        .id = "read",
+        .name = "read_file",
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
+    };
+    try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, read_call, .path_existing));
+
+    const write_call: types.ToolCall = .{
+        .id = "write",
+        .name = "write_file",
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"\"}}", .{external_new_file}),
+    };
+    try std.testing.expectError(
+        error.TypedFileMutationTargetRequired,
+        permissionTargetForCall(arena, workspace, write_call, .none),
+    );
+
+    const edit_call: types.ToolCall = .{
+        .id = "edit",
+        .name = "edit_file",
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"old_string\":\"main\",\"new_string\":\"start\"}}", .{external_file}),
+    };
+    try std.testing.expectError(
+        error.TypedFileMutationTargetRequired,
+        permissionTargetForCall(arena, workspace, edit_call, .none),
+    );
+}
+
+test "command cwd and grep accept explicit external paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "shared/src");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
+    defer alloc.free(shared);
+    const active_entries = [_]workspace_access.Entry{.{
+        .path = @constCast(shared),
+        .saved = true,
+        .command_line = false,
+        .available = true,
+        .active = true,
+    }};
+    const active_scope = workspace_access.AccessScope{
+        .primary_directory = workspace,
+        .additional_directories = &active_entries,
+    };
+    const removed_scope = workspace_access.AccessScope.primaryOnly(workspace);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const call = types.ToolCall{
+        .id = "cwd",
+        .name = "run_command",
+        .arguments_json = try std.fmt.allocPrint(arena_state.allocator(), "{{\"command\":\"pwd\",\"cwd\":\"{s}\"}}", .{shared}),
+    };
+    const cwd = try resolveCommandCwdForCallInScope(alloc, active_scope, call);
+    defer alloc.free(cwd);
+    try std.testing.expectEqualStrings(shared, cwd);
+    const external_cwd = try resolveCommandCwdForCallInScope(alloc, removed_scope, call);
+    defer alloc.free(external_cwd);
+    try std.testing.expectEqualStrings(shared, external_cwd);
+
+    const search_call = types.ToolCall{
+        .id = "search",
+        .name = "grep_files",
+        .arguments_json = try std.fmt.allocPrint(arena_state.allocator(), "{{\"pattern\":\"needle\",\"path\":\"{s}\"}}", .{shared}),
+    };
+    const search_target = try permissionTargetForCallInScope(arena_state.allocator(), active_scope, search_call, .path_optional_existing);
+    try std.testing.expectEqualStrings(shared, search_target);
+    const external_search_target = try permissionTargetForCallInScope(arena_state.allocator(), removed_scope, search_call, .path_optional_existing);
+    try std.testing.expectEqualStrings(shared, external_search_target);
+}
+
+test "displayTargetForPolicy renders workspace-relative paths and command cwd" {
+    const alloc = std.testing.allocator;
+
+    const root_path = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace", .path_existing);
+    defer alloc.free(root_path);
+    try std.testing.expectEqualStrings(".", root_path);
+
+    const nested_path = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace/src/app.zig", .path_create_parent);
+    defer alloc.free(nested_path);
+    try std.testing.expectEqualStrings("src/app.zig", nested_path);
+
+    const root_command = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace::zig build test", .command_cwd);
+    defer alloc.free(root_command);
+    try std.testing.expectEqualStrings(".::zig build test", root_command);
+
+    const nested_command = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace/packages/app::npm test", .command_cwd);
+    defer alloc.free(nested_command);
+    try std.testing.expectEqualStrings("packages/app::npm test", nested_command);
+
+    const external_command = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/other::npm test", .command_cwd);
+    defer alloc.free(external_command);
+    try std.testing.expectEqualStrings("/tmp/other::npm test", external_command);
+
+    const unknown = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace/src/app.zig", .none);
+    defer alloc.free(unknown);
+    try std.testing.expectEqualStrings("/tmp/workspace/src/app.zig", unknown);
+}
+
+test "ruleDecisionForPermissionPattern matches direct inputs and fallback" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git *"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git push *"), .action = .deny },
+        .{ .permission = @constCast("edit"), .pattern = @constCast("src/?ain.zig"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = rules_buf[0..] };
+
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(rules, "bash", "git status", .none));
+    try std.testing.expectEqual(RuleDecision.deny, ruleDecisionForPermissionPattern(rules, "bash", "git push origin main", .none));
+    try std.testing.expectEqual(RuleDecision.ask, ruleDecisionForPermissionPattern(rules, "edit", "src/main.zig", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(rules, "read", "README.md", .none));
+    try std.testing.expectEqual(RuleDecision.ask, ruleDecisionForPermissionPattern(rules, "read", "README.md", .ask));
+}
+
+test "configured wildcard command allows only static command grammar" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("printf *"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(rules, "bash", "printf safe", .none));
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(rules, "bash", "printf 'safe value'", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(rules, "bash", "printf safe && touch /tmp/fx-marker", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(rules, "bash", "printf \"$(touch /tmp/fx-marker)\"", .none));
+}
+
+test "configured command rules require exact matching outside static grammar" {
+    var exact_rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf \"$(date)\""), .action = .allow },
+    };
+    const exact_rules: types.PermissionRuleSet = .{ .rules = &exact_rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(exact_rules, "bash", "printf \"$(date)\"", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(exact_rules, "bash", "printf \"$(touch /tmp/fx-marker)\"", .none));
+
+    var dynamic_pattern_rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf \"*\""), .action = .allow },
+    };
+    try std.testing.expectEqual(
+        RuleDecision.none,
+        ruleDecisionForPermissionPattern(.{ .rules = &dynamic_pattern_rules_buf }, "bash", "printf \"safe\"", .none),
+    );
+}
+
+test "configured command deny and ask retain generic wildcard matching" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf *"), .action = .deny },
+        .{ .permission = @constCast("custom"), .pattern = @constCast("printf *"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, ruleDecisionForPermissionPattern(rules, "bash", "printf safe && touch /tmp/fx-marker", .none));
+    try std.testing.expectEqual(RuleDecision.ask, ruleDecisionForPermissionPattern(rules, "custom", "printf \"$(touch /tmp/fx-marker)\"", .none));
+}
+
+test "static command grammar is an explicit allowlist" {
+    for ([_][]const u8{
+        "git status --short",
+        "printf 'safe value'",
+        "printf ''",
+        "tool foo/bar:baz,+qux=value%@host",
+        "printf 'Grüße'",
+    }) |command| {
+        try std.testing.expect(isStaticCommand(command, false));
+    }
+
+    for ([_][]const u8{
+        "",
+        " leading",
+        "trailing ",
+        "FOO=bar command",
+        "FOO='bar' command",
+        "echo \"dynamic\"",
+        "echo $HOME",
+        "echo `pwd`",
+        "echo ~",
+        "echo [ab]",
+        "echo #comment",
+        "echo foo\\bar",
+        "echo one && echo two",
+        "echo one | cat",
+        "echo one > out",
+        "(echo one)",
+        "echo one\necho two",
+        "echo 'unterminated",
+    }) |command| {
+        try std.testing.expect(!isStaticCommand(command, false));
+    }
+
+    try std.testing.expect(isStaticCommand("git * --?", true));
+    try std.testing.expect(!isStaticCommand("git * --?", false));
+    try std.testing.expect(isStaticCommand("printf '*'", false));
+}
+
+test "generic wildcard matching remains total for maximum command-sized input" {
+    const candidate = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(candidate);
+    @memset(candidate, 'x');
+    try std.testing.expect(wildcardMatch("*", candidate));
+    try std.testing.expect(!wildcardMatch("?", candidate));
+}
+
+test "rulesDenyAllTargetsForPermission honors last matching overrides" {
+    var later_allow_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("edit"), .pattern = @constCast("*"), .action = .deny },
+        .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .allow },
+    };
+    try std.testing.expect(!rulesDenyAllTargetsForPermission(.{ .rules = &later_allow_rules }, "edit"));
+
+    var later_deny_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .allow },
+        .{ .permission = @constCast("edit"), .pattern = @constCast("*"), .action = .deny },
+    };
+    try std.testing.expect(rulesDenyAllTargetsForPermission(.{ .rules = &later_deny_rules }, "edit"));
+
+    var target_deny_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .deny },
+    };
+    try std.testing.expect(!rulesDenyAllTargetsForPermission(.{ .rules = &target_deny_rules }, "edit"));
+}
+
+test "command permission target treats a textual null cwd as absent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const target = try permissionTargetForCall(arena, "/tmp/workspace", .{
+        .id = "terminal",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"ls\",\"cwd\":\" NULL \"}",
+    }, .command_cwd);
+
+    try std.testing.expectEqualStrings("/tmp/workspace::ls", target);
+}
+
+test "web_fetch permission target is canonical domain rather than full url" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const target = try permissionTargetForCall(arena, "/tmp/workspace", .{
+        .id = "fetch",
+        .name = "web_fetch",
+        .arguments_json = "{\"url\":\"https://Example.COM./docs?q=1\",\"prompt\":\"extract\"}",
+    }, .none);
+
+    try std.testing.expectEqualStrings("domain:example.com", target);
+}
+
+test "web_fetch permission target supports bracketed ipv6 literal urls" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const target = try permissionTargetForCall(arena, "/tmp/workspace", .{
+        .id = "fetch",
+        .name = "web_fetch",
+        .arguments_json = "{\"url\":\"https://[2606:4700:4700::1111]/dns-query\",\"prompt\":\"extract\"}",
+    }, .none);
+
+    try std.testing.expectEqualStrings("domain:[2606:4700:4700::1111]", target);
+    try std.testing.expect(isCanonicalWebFetchDomainPattern(target));
+}
+
+test "web_fetch exact matcher never calls generic url wildcard matcher" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const target = try permissionTargetForCall(arena, "/tmp/workspace", .{
+        .id = "fetch",
+        .name = "web_fetch",
+        .arguments_json = "{\"url\":\"https://example.com/docs\",\"prompt\":\"extract\"}",
+    }, .none);
+
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("url"), .pattern = @constCast("https://example.com/*"), .action = .allow },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:*.com"), .action = .allow },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com?"), .action = .allow },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    var generic_only = [_]types.PermissionRule{
+        .{ .permission = @constCast("url"), .pattern = @constCast("https://example.com/*"), .action = .allow },
+    };
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, .{ .rules = &generic_only }, "/tmp/workspace", "web_fetch", target, .none));
+    try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", target, .none));
+}
+
+test "web_fetch grants do not authorize other tools" {
+    const grants = [_]types.PermissionGrant{
+        .{ .tool_name = @constCast("web_fetch"), .target_path = @constCast("domain:example.com") },
+    };
+
+    try std.testing.expect(sessionGrantAllowed(&grants, "web_fetch", "domain:example.com"));
+    try std.testing.expect(!sessionGrantAllowed(&grants, "web_fetch", "domain:example.org"));
+    try std.testing.expect(!sessionGrantAllowed(&grants, "read_file", "https://example.com/docs"));
+    try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", "https://example.com/docs"));
+}
+
+test "web_fetch allowlist rejects wildcard and hand edited broad authorization" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .allow },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:*"), .action = .allow },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.?om"), .action = .allow },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("https://example.com/*"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch malformed hand edited rules warn without disabling unrelated permissions" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+    try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
+}
+
+test "permissionRulePatternForGrant preserves explicit command environment identity" {
+    const alloc = std.testing.allocator;
+
+    const command = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "bash", "/tmp/workspace::zig build");
+    defer alloc.free(command);
+    try std.testing.expectEqualStrings("zig build", command);
+
+    const explicit_identity = try command_environment.permissionCommandIdentity(
+        alloc,
+        .{ .user = "/opt/bin::zsh" },
+        "zig build",
+    );
+    defer alloc.free(explicit_identity);
+    const explicit_target = try std.fmt.allocPrint(alloc, "/tmp/workspace::{s}", .{explicit_identity});
+    defer alloc.free(explicit_target);
+    const explicit_command = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "bash", explicit_target);
+    defer alloc.free(explicit_command);
+    try std.testing.expectEqualStrings(explicit_identity, explicit_command);
+    const bare_explicit_command = try permissionRulePatternForGrant(
+        alloc,
+        "/tmp/workspace",
+        "bash",
+        explicit_identity,
+    );
+    defer alloc.free(bare_explicit_command);
+    try std.testing.expectEqualStrings(explicit_identity, bare_explicit_command);
+
+    const path = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "edit", "/tmp/workspace/src/*");
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("src/*", path);
+
+    const workspace = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "edit", "/tmp/workspace/**");
+    defer alloc.free(workspace);
+    try std.testing.expectEqualStrings("*", workspace);
+
+    const external = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "read", "/tmp/external/**");
+    defer alloc.free(external);
+    try std.testing.expectEqualStrings("/tmp/external/**", external);
+}
+
+test "configured command rules match explicit environments by command" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("zig *"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    const identity = try command_environment.permissionCommandIdentity(
+        alloc,
+        .{ .clean = "/bin/zsh" },
+        "zig build test",
+    );
+    defer alloc.free(identity);
+    const target = try std.fmt.allocPrint(alloc, "/tmp/workspace::{s}", .{identity});
+    defer alloc.free(target);
+
+    try std.testing.expectEqual(
+        RuleDecision.allow,
+        try ruleDecisionFor(alloc, rules, "/tmp/workspace", "run_command", target, .command_cwd),
+    );
+}
+
+test "directory tree permission patterns match directory and descendants only" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("read"), .pattern = @constCast("/tmp/external/**"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = rules_buf[0..] };
+
+    try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(std.testing.allocator, rules, "/tmp/workspace", "read_file", "/tmp/external", .path_existing));
+    try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(std.testing.allocator, rules, "/tmp/workspace", "read_file", "/tmp/external/file.txt", .path_existing));
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(std.testing.allocator, rules, "/tmp/workspace", "read_file", "/tmp/external-other/file.txt", .path_existing));
+}
+
+test "suggestedSessionGrants returns exact command suggestions with stripped cwd" {
+    const alloc = std.testing.allocator;
+
+    const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "run_command", "/tmp/workspace::git status --short", .command_cwd);
+    defer freeGrants(alloc, grants);
+
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try expectGrant(grants[0], "bash", "git status --short");
+}
+
+test "suggestedSessionGrants returns exact broad workspace path suggestions" {
+    const alloc = std.testing.allocator;
+
+    const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "write_file", "/tmp/workspace/src/main.zig", .path_create_parent);
+    defer freeGrants(alloc, grants);
+
+    try std.testing.expectEqual(@as(usize, path_always_permissions.len), grants.len);
+    for (path_always_permissions, 0..) |permission, i| {
+        try expectGrant(grants[i], permission, "/tmp/workspace/**");
+    }
+}
+
+test "suggestedSessionGrants uses registered path metadata for provider tools" {
+    const alloc = std.testing.allocator;
+    const grants = try suggestedSessionGrants(
+        alloc,
+        "/tmp/workspace",
+        "provider_list",
+        "/tmp/workspace/src",
+        .path_optional_existing,
+    );
+    defer freeGrants(alloc, grants);
+
+    try std.testing.expectEqual(@as(usize, path_always_permissions.len), grants.len);
+    for (path_always_permissions, 0..) |permission, i| {
+        try expectGrant(grants[i], permission, "/tmp/workspace/**");
+    }
+
+    const unknown = try suggestedSessionGrants(
+        alloc,
+        "/tmp/workspace",
+        "unknown_tool",
+        "/tmp/workspace/src",
+        .none,
+    );
+    defer freeGrants(alloc, unknown);
+    try std.testing.expectEqual(@as(usize, 1), unknown.len);
+    try expectGrant(unknown[0], "unknown_tool", "/tmp/workspace/src");
+}
+
+test "suggestedSessionGrants returns external directory tree read grant" {
+    const alloc = std.testing.allocator;
+
+    const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "read_file", "/tmp/external/hosts", .path_existing);
+    defer freeGrants(alloc, grants);
+
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try expectGrant(grants[0], "read", "/tmp/external/**");
+    try std.testing.expect(sessionGrantAllowed(grants, "read_file", "/tmp/external"));
+    try std.testing.expect(sessionGrantAllowed(grants, "read_file", "/tmp/external/hosts"));
+    try std.testing.expect(!sessionGrantAllowed(grants, "read_file", "/tmp/external-other/hosts"));
+}
+
+fn testFileTargets(
+    canonical_path: []const u8,
+    external: bool,
+    items: *[1]file_mutation_contract.EvaluatedPermissionTarget,
+) file_mutation_contract.PolicyEvaluatedFileTargets {
+    items.* = .{.{
+        .kind = .target,
+        .disposition = .target_entry,
+        .path_end = canonical_path.len,
+        .expected_identity = null,
+        .rule = .ask,
+        .session_grant_allowed = true,
+    }};
+    return .{
+        .canonical_target_path = canonical_path,
+        .anchor = .{
+            .scope = if (external) .external else .workspace,
+            .path_end = canonical_path.len,
+            .identity = .{
+                .device = 0,
+                .inode = 0,
+                .kind = .directory,
+            },
+            .relative_components = &.{},
+        },
+        .traversal_directories = &.{},
+        .items = items,
+        .prompt_required = true,
+    };
+}
+
+fn deinitTestFileGrantOffer(
+    alloc: std.mem.Allocator,
+    offer: file_mutation_contract.FileGrantOffer,
+) void {
+    types.freePermissionGrantSlice(alloc, @constCast(offer.grants));
+    switch (offer.scope) {
+        .workspace_files => {},
+        .external_tree => |root_tail| alloc.free(@constCast(root_tail)),
+    }
+}
+
+fn checkStructuredFileGrantOfferAllocationFailures(
+    alloc: std.mem.Allocator,
+) !void {
+    var items: [1]file_mutation_contract.EvaluatedPermissionTarget = undefined;
+    const offer = try structuredFileGrantOffer(
+        alloc,
+        "/tmp/workspace",
+        "write_file",
+        testFileTargets("/tmp/workspace/src/main.zig", false, &items),
+    );
+    defer deinitTestFileGrantOffer(alloc, offer);
+    try std.testing.expect(offer.scope == .workspace_files);
+}
+
+fn checkExternalStructuredFileGrantOfferAllocationFailures(
+    alloc: std.mem.Allocator,
+) !void {
+    var items: [1]file_mutation_contract.EvaluatedPermissionTarget = undefined;
+    const offer = try structuredFileGrantOffer(
+        alloc,
+        "/tmp/workspace",
+        "edit_file",
+        testFileTargets("/tmp/external/project/file.txt", true, &items),
+    );
+    defer deinitTestFileGrantOffer(alloc, offer);
+    try std.testing.expectEqualStrings(
+        "/tmp/external/project",
+        offer.scope.external_tree,
+    );
+}
+
+test "structured file grant offer cleans partial allocations" {
+    const alloc = std.testing.allocator;
+    var items: [1]file_mutation_contract.EvaluatedPermissionTarget = undefined;
+    const offer = try structuredFileGrantOffer(
+        alloc,
+        "/tmp/workspace",
+        "write_file",
+        testFileTargets("/tmp/workspace/src/main.zig", false, &items),
+    );
+    defer deinitTestFileGrantOffer(alloc, offer);
+
+    try std.testing.expect(offer.scope == .workspace_files);
+    try std.testing.expectEqual(path_always_permissions.len, offer.grants.len);
+    for (offer.grants) |grant| {
+        try std.testing.expectEqualStrings("/tmp/workspace/**", grant.target_path);
+    }
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        checkStructuredFileGrantOfferAllocationFailures,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        checkExternalStructuredFileGrantOfferAllocationFailures,
+        .{},
+    );
+}
+
+test "structured file grant offer rejects a scope that understates its grants" {
+    var items: [1]file_mutation_contract.EvaluatedPermissionTarget = undefined;
+    try std.testing.expectError(
+        error.UnsupportedFileGrantOffer,
+        structuredFileGrantOffer(
+            std.testing.allocator,
+            "/tmp/workspace",
+            "write_file",
+            testFileTargets("/tmp/external/file.txt", false, &items),
+        ),
+    );
+}
+
+test "structured file grant offer rejects wildcard-bearing literal roots" {
+    const Scope = enum { workspace, external };
+    const tools = [_]struct {
+        name: []const u8,
+        basename: []const u8,
+    }{
+        .{ .name = "write_file", .basename = "write.txt" },
+        .{ .name = "edit_file", .basename = "edit.txt" },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_]u8{ '*', '?' }) |wildcard| {
+        for ([_]Scope{ .workspace, .external }) |scope| {
+            const external = scope == .external;
+            const root_prefix = if (external) "external" else "workspace";
+            const literal_root = try std.fmt.allocPrint(
+                arena,
+                "/tmp/{s}{c}literal",
+                .{ root_prefix, wildcard },
+            );
+            const workspace_root = if (external) "/tmp/workspace" else literal_root;
+
+            for (tools) |tool| {
+                var items: [1]file_mutation_contract.EvaluatedPermissionTarget = undefined;
+                const target_path = try std.fs.path.join(
+                    arena,
+                    &.{ literal_root, tool.basename },
+                );
+                try std.testing.expectError(
+                    error.UnsupportedFileGrantOffer,
+                    structuredFileGrantOffer(
+                        arena,
+                        workspace_root,
+                        tool.name,
+                        testFileTargets(target_path, external, &items),
+                    ),
+                );
+            }
+        }
+    }
+}
+
+test "generic session matcher retains wildcard tree semantics" {
+    const grants = [_]types.PermissionGrant{.{
+        .tool_name = @constCast("edit"),
+        .target_path = @constCast("/tmp/workspace*literal/**"),
+    }};
+
+    try std.testing.expect(sessionGrantAllowed(
+        &grants,
+        "write_file",
+        "/tmp/workspaceZZliteral/escaped.txt",
+    ));
+}
+
+test "formatPermissionsStatus adapts core grants and rules without taking field ownership" {
+    const alloc = std.testing.allocator;
+
+    var grants = [_]types.PermissionGrant{.{
+        .tool_name = try alloc.dupe(u8, "edit"),
+        .target_path = try alloc.dupe(u8, "/tmp/workspace/src/main.zig"),
+    }};
+    defer {
+        alloc.free(grants[0].tool_name);
+        alloc.free(grants[0].target_path);
+    }
+
+    var rules = types.PermissionRuleSet{
+        .rules = try alloc.alloc(types.PermissionRule, 1),
+    };
+    defer rules.deinit(alloc);
+    rules.rules[0] = .{
+        .permission = try alloc.dupe(u8, "edit"),
+        .pattern = try alloc.dupe(u8, "src/*"),
+        .action = .allow,
+    };
+
+    const text = try formatPermissionsStatus(alloc, "/tmp/workspace", .ask, grants[0..], rules);
+    defer alloc.free(text);
+
+    try expectContains(text, "[permissions] mode=ask\n");
+    try expectContains(text, "[permissions] configured rules:\n");
+    try expectContains(text, " - allow edit -> src/*\n");
+    try expectContains(text, "[permissions] session grants:\n");
+    try expectContains(text, " - edit -> src/main.zig\n");
+}
+
+test "allowToolForSession cleans up all partial allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllowToolForSessionAllocFailures, .{});
+}
+
+test "suggestedSessionGrants cleans up all partial allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSuggestedSessionGrantsAllocFailures, .{});
+}
+
 fn testWriteMutationInput(path: []const u8) file_mutation_contract.FileMutationInput {
     return .{ .write = .{
         .path = @constCast(path),
@@ -1917,6 +2936,53 @@ fn testEditMutationInput(path: []const u8) file_mutation_contract.FileMutationIn
     } };
 }
 
+test "file target preparation owns a policy-neutral proof consumed by policy evaluation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/existing");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var prepared = switch (try prepareFileMutationTargets(
+        alloc,
+        workspace,
+        testWriteMutationInput("existing/nested/file.txt"),
+    )) {
+        .target_resolution_failure => return error.TestUnexpectedResult,
+        .prepared => |value| value,
+    };
+    defer prepared.deinit(alloc);
+
+    try std.testing.expect(prepared.proofValid());
+    try std.testing.expectEqualStrings(workspace, prepared.anchorPath());
+    try std.testing.expectEqual(@as(usize, 3), prepared.anchor.relative_components.len);
+    try std.testing.expectEqual(@as(usize, 2), prepared.traversal_directories.len);
+    try std.testing.expectEqual(@as(usize, 2), prepared.items.len);
+    const canonical_ptr = prepared.canonical_target_path.ptr;
+
+    const result = try evaluatePreparedFileMutationTargets(
+        alloc,
+        workspace,
+        .write,
+        &prepared,
+        .ask,
+        .{},
+        &.{},
+        &.{},
+    );
+    var evaluated = switch (result) {
+        .evaluated => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    defer evaluated.deinitOwned(alloc);
+
+    try std.testing.expect(!prepared.owns_memory);
+    try std.testing.expectEqual(canonical_ptr, evaluated.canonical_target_path.ptr);
+    try std.testing.expect(evaluated.prompt_required);
+    try std.testing.expect(evaluated.proofValid());
+}
+
 fn checkFileTargetPreparationAllocationFailures(alloc: std.mem.Allocator, workspace: []const u8) !void {
     var prepared = switch (try prepareFileMutationTargets(
         alloc,
@@ -1927,4 +2993,322 @@ fn checkFileTargetPreparationAllocationFailures(alloc: std.mem.Allocator, worksp
         .prepared => |value| value,
     };
     defer prepared.deinit(alloc);
+}
+
+test "file target preparation cleans every partial allocation failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/existing");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        checkFileTargetPreparationAllocationFailures,
+        .{workspace},
+    );
+}
+
+test "file target evaluator returns ordered complete workspace proof" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/existing");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    const result = try evaluateFileMutationTargets(
+        arena,
+        workspace,
+        testWriteMutationInput("existing/a/b/file.txt"),
+        .ask,
+        .{},
+        &.{},
+        &.{},
+    );
+
+    const evaluated = switch (result) {
+        .evaluated => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expectEqualStrings(workspace, evaluated.anchorPath());
+    try std.testing.expectEqual(.workspace, evaluated.anchor.scope);
+    try std.testing.expectEqual(.directory, evaluated.anchor.identity.kind);
+    try std.testing.expect(evaluated.anchor.identity.inode != 0);
+    try std.testing.expect(evaluated.anchor.identity.device != 0);
+    try std.testing.expectEqual(@as(usize, 4), evaluated.anchor.relative_components.len);
+    try std.testing.expectEqualStrings("existing", evaluated.component(evaluated.anchor.relative_components[0]));
+    try std.testing.expectEqualStrings("a", evaluated.component(evaluated.anchor.relative_components[1]));
+    try std.testing.expectEqualStrings("b", evaluated.component(evaluated.anchor.relative_components[2]));
+    try std.testing.expectEqualStrings("file.txt", evaluated.component(evaluated.anchor.relative_components[3]));
+
+    try std.testing.expectEqual(@as(usize, 3), evaluated.traversal_directories.len);
+    try std.testing.expectEqual(@as(usize, 0), evaluated.traversal_directories[0].component_index);
+    try std.testing.expectEqual(.directory, evaluated.traversal_directories[0].state.existing.kind);
+    try std.testing.expect(evaluated.traversal_directories[0].state.existing.inode != evaluated.anchor.identity.inode);
+    try std.testing.expectEqual(@as(usize, 2), evaluated.traversal_directories[1].state.create.permission_target_index);
+    try std.testing.expectEqual(@as(usize, 1), evaluated.traversal_directories[2].state.create.permission_target_index);
+
+    try std.testing.expectEqual(@as(usize, 3), evaluated.items.len);
+    try std.testing.expectEqual(.target, evaluated.items[0].kind);
+    try std.testing.expectEqual(.target_entry, evaluated.items[0].disposition);
+    try std.testing.expect(evaluated.items[0].expected_identity == null);
+    try std.testing.expectEqualStrings("existing/a/b/file.txt", evaluated.permissionPath(evaluated.items[0])[workspace.len + 1 ..]);
+    try std.testing.expectEqual(.parent, evaluated.items[1].kind);
+    try std.testing.expectEqual(.create_parent, evaluated.items[1].disposition);
+    try std.testing.expectEqualStrings("existing/a/b", evaluated.permissionPath(evaluated.items[1])[workspace.len + 1 ..]);
+    try std.testing.expectEqual(.parent, evaluated.items[2].kind);
+    try std.testing.expectEqual(.create_parent, evaluated.items[2].disposition);
+    try std.testing.expectEqualStrings("existing/a", evaluated.permissionPath(evaluated.items[2])[workspace.len + 1 ..]);
+    try std.testing.expect(evaluated.prompt_required);
+}
+
+test "file target evaluator scans immediate parent deny after target ask" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/existing");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("edit"), .pattern = @constCast("existing/a/b/file.txt"), .action = .ask },
+        .{ .permission = @constCast("edit"), .pattern = @constCast("existing/a/b"), .action = .deny },
+    };
+
+    const result = try evaluateFileMutationTargets(
+        arena,
+        workspace,
+        testWriteMutationInput("existing/a/b/file.txt"),
+        .ask,
+        .{ .rules = &rules },
+        &.{},
+        &.{},
+    );
+
+    switch (result) {
+        .policy_denied => |denied| try std.testing.expectEqual(@as(usize, 1), denied.target_index),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "file target evaluator scans intermediate deny before grants" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/existing");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("edit"), .pattern = @constCast("existing/a/b/file.txt"), .action = .ask },
+        .{ .permission = @constCast("edit"), .pattern = @constCast("existing/a"), .action = .deny },
+    };
+    const grants = [_]types.PermissionGrant{.{
+        .tool_name = @constCast("edit"),
+        .target_path = @constCast("/**"),
+    }};
+
+    const result = try evaluateFileMutationTargets(
+        arena,
+        workspace,
+        testWriteMutationInput("existing/a/b/file.txt"),
+        .ask,
+        .{ .rules = &rules },
+        &grants,
+        &.{},
+    );
+
+    switch (result) {
+        .policy_denied => |denied| try std.testing.expectEqual(@as(usize, 2), denied.target_index),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "file target evaluator records existing traversal and target identities" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/existing/deeper");
+    var file = try tmp.dir.createFile(io_mod.getIo(), "workspace/existing/deeper/file.txt", .{});
+    file.close(io_mod.getIo());
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const expected_target = try std.fs.path.join(arena, &.{ workspace, "existing", "deeper", "file.txt" });
+    const expected_target_stat = try std.Io.Dir.cwd().statFile(io_mod.getIo(), expected_target, .{ .follow_symlinks = false });
+
+    const result = try evaluateFileMutationTargets(
+        arena,
+        workspace,
+        testEditMutationInput("existing/deeper/file.txt"),
+        .auto,
+        .{},
+        &.{},
+        &.{},
+    );
+    const evaluated = switch (result) {
+        .evaluated => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expect(evaluated.prompt_required);
+    try std.testing.expectEqual(@as(usize, 2), evaluated.traversal_directories.len);
+    try std.testing.expectEqual(.directory, evaluated.traversal_directories[0].state.existing.kind);
+    try std.testing.expectEqual(.directory, evaluated.traversal_directories[1].state.existing.kind);
+    try std.testing.expectEqual(@as(usize, 2), evaluated.items.len);
+    try std.testing.expectEqual(.file, evaluated.items[0].expected_identity.?.kind);
+    try std.testing.expectEqual(@as(u64, @intCast(expected_target_stat.inode)), evaluated.items[0].expected_identity.?.inode);
+    try std.testing.expectEqual(.existing_parent, evaluated.items[1].disposition);
+    try std.testing.expectEqual(
+        evaluated.traversal_directories[1].state.existing.inode,
+        evaluated.items[1].expected_identity.?.inode,
+    );
+}
+
+test "file target evaluator binds external parent and grant state" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "external");
+    var file = try tmp.dir.createFile(io_mod.getIo(), "external/file.txt", .{});
+    file.close(io_mod.getIo());
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
+    defer alloc.free(external);
+    const target = try std.fs.path.join(arena, &.{ external, "file.txt" });
+    const grants = [_]types.PermissionGrant{.{
+        .tool_name = @constCast("edit"),
+        .target_path = @constCast("/**"),
+    }};
+
+    const result = try evaluateFileMutationTargets(
+        arena,
+        workspace,
+        testEditMutationInput(target),
+        .ask,
+        .{},
+        &grants,
+        &.{},
+    );
+    const evaluated = switch (result) {
+        .evaluated => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expectEqual(.external, evaluated.anchor.scope);
+    try std.testing.expectEqualStrings(external, evaluated.anchorPath());
+    try std.testing.expectEqual(.directory, evaluated.anchor.identity.kind);
+    try std.testing.expect(evaluated.anchor.identity.device != 0);
+    try std.testing.expectEqual(@as(usize, 1), evaluated.anchor.relative_components.len);
+    try std.testing.expectEqual(@as(usize, 0), evaluated.traversal_directories.len);
+    try std.testing.expectEqual(@as(usize, 2), evaluated.items.len);
+    try std.testing.expect(evaluated.items[0].session_grant_allowed);
+    try std.testing.expect(evaluated.items[1].session_grant_allowed);
+    try std.testing.expect(!evaluated.prompt_required);
+    try std.testing.expectEqual(
+        evaluated.anchor.identity.inode,
+        evaluated.items[1].expected_identity.?.inode,
+    );
+}
+
+test "file target evaluator requires approval for unconfigured external target in auto mode" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "external");
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
+    defer alloc.free(external);
+    const target = try std.fs.path.join(arena, &.{ external, "new", "file.txt" });
+
+    const result = try evaluateFileMutationTargets(
+        arena,
+        workspace,
+        testWriteMutationInput(target),
+        .auto,
+        .{},
+        &.{},
+        &.{},
+    );
+    const evaluated = switch (result) {
+        .evaluated => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expectEqual(.external, evaluated.anchor.scope);
+    try std.testing.expectEqualStrings(external, evaluated.anchorPath());
+    try std.testing.expectEqual(@as(usize, 2), evaluated.anchor.relative_components.len);
+    try std.testing.expectEqual(@as(usize, 1), evaluated.traversal_directories.len);
+    try std.testing.expectEqual(@as(usize, 1), evaluated.traversal_directories[0].state.create.permission_target_index);
+    try std.testing.expect(evaluated.prompt_required);
+}
+
+test "file target evaluator propagates only operational failures" {
+    try std.testing.expectError(error.Canceled, normalizeFileTargetResolverError(error.Canceled));
+    try std.testing.expectError(error.Unexpected, normalizeFileTargetResolverError(error.Unexpected));
+    try std.testing.expectError(error.SystemResources, normalizeDirOpenError(error.SystemResources));
+    try std.testing.expectError(error.ProcessFdQuotaExceeded, normalizeDirOpenError(error.ProcessFdQuotaExceeded));
+    try std.testing.expectError(error.SystemFdQuotaExceeded, normalizeStatFileError(error.SystemFdQuotaExceeded));
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        evaluateFileMutationTargets(
+            failing.allocator(),
+            workspace,
+            testWriteMutationInput("file.txt"),
+            .auto,
+            .{},
+            &.{},
+            &.{},
+        ),
+    );
+    try std.testing.expect(failing.has_induced_failure);
 }

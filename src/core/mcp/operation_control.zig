@@ -67,3 +67,60 @@ pub const DeadlineGate = struct {
 fn resumedDeadlineMs(now_ms: i64, timeout_ms: u32) i64 {
     return std.math.add(i64, now_ms, timeout_ms) catch std.math.maxInt(i64);
 }
+
+test "cancellation state preserves caller and runtime retirement signals" {
+    const Case = struct {
+        caller: bool,
+        runtime: bool,
+        expected: CancellationState,
+    };
+    const cases = [_]Case{
+        .{ .caller = false, .runtime = false, .expected = .active },
+        .{ .caller = true, .runtime = false, .expected = .caller_cancelled },
+        .{ .caller = false, .runtime = true, .expected = .runtime_retired },
+        .{ .caller = true, .runtime = true, .expected = .caller_cancelled_and_runtime_retired },
+    };
+    for (cases) |case| {
+        const state = cancellationState(case.caller, case.runtime);
+        try std.testing.expectEqual(case.expected, state);
+        try std.testing.expectEqual(case.expected != .active, state.cancelled());
+    }
+}
+
+test "cancellation sources do not rewrite either owner" {
+    var caller = std.atomic.Value(bool).init(false);
+    var runtime = std.atomic.Value(bool).init(false);
+    const sources = CancellationSources{ .caller = &caller, .runtime = &runtime };
+
+    try std.testing.expectEqual(CancellationState.active, sources.state());
+    runtime.store(true, .release);
+    try std.testing.expectEqual(CancellationState.runtime_retired, sources.state());
+    try std.testing.expect(!caller.load(.acquire));
+    caller.store(true, .release);
+    try std.testing.expectEqual(
+        CancellationState.caller_cancelled_and_runtime_retired,
+        sources.state(),
+    );
+}
+
+test "deadline gate pauses input and resumes with one fresh operation budget" {
+    var gate = DeadlineGate.init(1_000);
+    try std.testing.expect(!gate.expired(999));
+    try std.testing.expect(gate.expired(1_000));
+
+    gate.pauseUntil(31_000);
+    try std.testing.expect(!gate.expired(20_000));
+    try std.testing.expectEqual(@as(i64, 31_000), gate.currentDeadlineMs());
+    try std.testing.expect(gate.expired(31_000));
+
+    gate.resumeAt(20_000, 1_500);
+    try std.testing.expect(!gate.expired(21_499));
+    try std.testing.expect(gate.expired(21_500));
+}
+
+test "deadline gate saturates resumed deadlines" {
+    try std.testing.expectEqual(
+        std.math.maxInt(i64),
+        resumedDeadlineMs(std.math.maxInt(i64) - 1, 2),
+    );
+}

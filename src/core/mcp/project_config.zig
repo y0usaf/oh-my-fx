@@ -871,6 +871,25 @@ noinline fn failServerConfigDynamic(err: anyerror) anyerror!McpServerConfig {
     return err;
 }
 
+test "project config failures preserve exact error types and identities" {
+    const invalid = failServerConfig(error.McpConfigInvalidType);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{McpConfigInvalidType}!McpServerConfig,
+    );
+    try std.testing.expectError(error.McpConfigInvalidType, invalid);
+    try std.testing.expectError(
+        error.McpConfigServerMustBeObject,
+        failServerConfig(error.McpConfigServerMustBeObject),
+    );
+    try std.testing.expectError(error.OutOfMemory, failServerConfig(error.OutOfMemory));
+
+    const invalid_profile = failProfileParse(error.McpConfigInvalidJson);
+    try std.testing.expect(
+        @TypeOf(invalid_profile) == error{McpConfigInvalidJson}!ProfileParseResult,
+    );
+    try std.testing.expectError(error.McpConfigInvalidJson, invalid_profile);
+}
+
 fn parseServerEntry(
     alloc: Allocator,
     name: []const u8,
@@ -1077,6 +1096,7 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
     auth.client_secret_env = try parseOptionalOwnedString(alloc, auth_object, "client_secret_env");
     auth.client_metadata_url = try parseOptionalOwnedString(alloc, auth_object, "client_metadata_url");
     if (auth_object.get("scopes")) |field| auth.scopes = try parseStringArray(alloc, field);
+    auth.callback_port = try parseOptionalPort(auth_object, "callback_port");
     if (auth.client_secret_env) |field| {
         if (!isValidEnvName(field) or auth.client_id == null) return error.McpConfigInvalidOAuth;
     }
@@ -1086,6 +1106,13 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
     }
     if (auth.client_metadata_url) |field| mcp_auth.validateClientMetadataUrl(field) catch return error.McpConfigInvalidOAuth;
     return auth;
+}
+
+fn parseOptionalPort(object: std.json.ObjectMap, key: []const u8) !?u16 {
+    const value = object.get(key) orelse return null;
+    if (value != .integer) return error.McpConfigInvalidOAuth;
+    if (value.integer < 1 or value.integer > 65535) return error.McpConfigInvalidOAuth;
+    return @intCast(value.integer);
 }
 
 fn parseOptionalOwnedString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) !?[]u8 {
@@ -1310,4 +1337,550 @@ fn freeHttpHeaderEnvList(alloc: Allocator, headers: *std.ArrayList(McpHttpHeader
         alloc.free(header.env);
     }
     headers.deinit(alloc);
+}
+
+test "profile document accepts mcpServers alias and preserves strict entry parsing" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(
+        alloc,
+        "{\"mcpServers\":{\"local\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}",
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expectEqualStrings("local", result.configs.items[0].name);
+    try std.testing.expectEqualStrings("node", result.configs.items[0].command.?);
+    try std.testing.expect(result.diagnostic == null);
+    try std.testing.expect(result.mutation_allowed);
+}
+
+test "profile document keeps canonical mcp and reports ignored nonempty alias" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(
+        alloc,
+        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"mcpServers\":{\"ignored\":{\"command\":\"two\"}}}",
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expectEqualStrings("canonical", result.configs.items[0].name);
+    try std.testing.expectEqual(ProfileDiagnosticCause.ignored_mcp_servers_alias, result.diagnostic.?.cause);
+    try std.testing.expect(result.mutation_allowed);
+}
+
+test "profile document blocks suspicious sibling keys beside canonical mcp" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(
+        alloc,
+        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}",
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expectEqualStrings("canonical", result.configs.items[0].name);
+    try std.testing.expect(result.diagnostic != null);
+    try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, result.diagnostic.?.cause);
+    try std.testing.expectEqualStrings("MCP-Servers", result.diagnostic.?.key().?);
+    try std.testing.expect(!result.mutation_allowed);
+}
+
+test "profile document reports the first exact server-like unsupported key" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(
+        alloc,
+        "{\"metadata\":{\"entry\":{\"command\":\"ignored\"}},\"MCP-Servers\":{\"one\":{\"command\":\"node\"}},\"servers\":{\"two\":{\"url\":\"https://example.test/mcp\"}}}",
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), result.configs.items.len);
+    try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, result.diagnostic.?.cause);
+    try std.testing.expectEqualStrings("MCP-Servers", result.diagnostic.?.key().?);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostic.?.additional_matches);
+    try std.testing.expect(!result.mutation_allowed);
+}
+
+test "profile document bounds suspicious-key scans" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('{');
+    for (0..65) |index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try out.writer.print("\"metadata{d}\":{{}}", .{index});
+    }
+    try out.writer.writeByte('}');
+    const json = try out.toOwnedSlice();
+    defer alloc.free(json);
+
+    var result = try parseProfileDocument(alloc, json);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, result.diagnostic.?.cause);
+    try std.testing.expect(!result.mutation_allowed);
+}
+
+test "profile parser preserves validation precedence for multiply invalid entries" {
+    const cases = .{
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"type\":\"http\",\"startup_timeout_ms\":0,\"env\":3}}}",
+            .expected = error.McpConfigMissingUrl,
+        },
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"startup_timeout_ms\":0,\"env\":3}}}",
+            .expected = error.McpConfigInvalidStartupTimeout,
+        },
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"startup_timeout_ms\":0,\"restart_limit\":999,\"command\":3,\"env\":3}}}",
+            .expected = error.McpConfigInvalidStartupTimeout,
+        },
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"restart_limit\":999,\"command\":3,\"env\":3}}}",
+            .expected = error.McpConfigInvalidRestartLimit,
+        },
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"command\":3,\"env\":3}}}",
+            .expected = error.McpConfigInvalidCommand,
+        },
+    };
+    inline for (cases) |case| {
+        try std.testing.expectError(
+            case.expected,
+            parseProfileJson(std.testing.allocator, case.json),
+        );
+    }
+}
+
+test "workspace parsing stamps optional credential-isolated configs" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcpServers":{"local":{"command":"node","args":["server.js"],"required":true},"remote":{"type":"http","url":"https://example.test/mcp"}}}
+    ;
+    var result = try parseWorkspaceJson(alloc, json, .workspace, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.configs.items.len);
+    for (result.configs.items) |config| {
+        try std.testing.expectEqual(mcp_contract.ConfigSource.workspace, config.source);
+        try std.testing.expectEqual(mcp_contract.ConfigScope.workspace, config.scope);
+        try std.testing.expect(!config.required);
+        try std.testing.expect(!config.allow_stored_credentials);
+        try std.testing.expectEqual(mcp_contract.WorkspaceAdmission.pending, config.workspace_admission.?);
+    }
+}
+
+test "workspace template expansion is explicit bounded and deterministic" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("SET", "value");
+    try environment.put("EMPTY", "");
+
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "plain", .expected = "plain" },
+        .{ .input = "before-${SET}-after", .expected = "before-value-after" },
+        .{ .input = "${MISSING:-fallback}", .expected = "fallback" },
+        .{ .input = "${EMPTY:-fallback}", .expected = "" },
+        .{ .input = "${SET}/${SET}", .expected = "value/value" },
+    };
+    for (cases) |case| {
+        var budget = WorkspaceExpansionBudget.init();
+        var expansion = try expandWorkspaceTemplate(alloc, case.input, &environment, &budget);
+        defer expansion.deinit(alloc);
+        switch (expansion) {
+            .expanded => |value| try std.testing.expectEqualStrings(case.expected, value),
+            .missing, .invalid, .limit_exceeded => return error.TestUnexpectedResult,
+        }
+    }
+
+    var missing_budget = WorkspaceExpansionBudget.init();
+    var missing = try expandWorkspaceTemplate(alloc, "Bearer ${REQUIRED}", &environment, &missing_budget);
+    defer missing.deinit(alloc);
+    switch (missing) {
+        .missing => |name| try std.testing.expectEqualStrings("REQUIRED", name),
+        .expanded, .invalid, .limit_exceeded => return error.TestUnexpectedResult,
+    }
+
+    var malformed_budget = WorkspaceExpansionBudget.init();
+    var malformed = try expandWorkspaceTemplate(alloc, "${NOT-CLOSED", &environment, &malformed_budget);
+    defer malformed.deinit(alloc);
+    try std.testing.expect(malformed == .invalid);
+
+    var long_name: [129]u8 = undefined;
+    long_name[0] = 'A';
+    @memset(long_name[1..], 'B');
+    try environment.put(&long_name, "long-name-value");
+    const long_template = try std.fmt.allocPrint(alloc, "${{{s}}}", .{long_name});
+    defer alloc.free(long_template);
+    var long_budget = WorkspaceExpansionBudget.init();
+    var long_expansion = try expandWorkspaceTemplate(
+        alloc,
+        long_template,
+        &environment,
+        &long_budget,
+    );
+    defer long_expansion.deinit(alloc);
+    switch (long_expansion) {
+        .expanded => |value| try std.testing.expectEqualStrings("long-name-value", value),
+        .missing, .invalid, .limit_exceeded => return error.TestUnexpectedResult,
+    }
+}
+
+test "workspace environment diagnostics isolate entries and profile values stay literal" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("COMMAND", "node");
+    var approved_names = [_][]u8{ @constCast("good"), @constCast("bad") };
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"good\":{\"command\":\"${COMMAND}\"},\"bad\":{\"command\":\"${REQUIRED}\"}}}",
+        .workspace,
+        .{ .approved = &approved_names },
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), workspace.configs.items.len);
+    try std.testing.expectEqualStrings("node", workspace.configs.items[0].command.?);
+    try std.testing.expectEqual(@as(usize, 1), workspace.diagnostics.items.len);
+    const diagnostic = workspace.diagnostics.items[0];
+    try std.testing.expectEqual(WorkspaceDiagnosticCause.missing_environment_variable, diagnostic.cause);
+    try std.testing.expectEqual(WorkspaceEnvironmentField.command, diagnostic.environment_field.?);
+    try std.testing.expectEqualStrings("REQUIRED", diagnostic.environment_variable.?);
+
+    var profile = try parseProfileDocument(
+        alloc,
+        "{\"mcp\":{\"literal\":{\"command\":\"${COMMAND}\"}}}",
+    );
+    defer profile.deinit(alloc);
+    try std.testing.expectEqualStrings("${COMMAND}", profile.configs.items[0].command.?);
+}
+
+test "workspace environment expansion requires approved admission" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("COMMAND", "node");
+    try environment.put("VALUE", "expanded");
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"local\":{\"command\":\"${COMMAND}\",\"args\":[\"${VALUE}\"],\"env\":{\"TOKEN\":\"${VALUE}\"}},\"remote\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"Authorization\":\"Bearer ${VALUE}\"}}}}",
+        .workspace,
+        .{},
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), workspace.configs.items.len);
+    try std.testing.expectEqualStrings("${COMMAND}", workspace.configs.items[0].command.?);
+    try std.testing.expectEqualStrings("${VALUE}", workspace.configs.items[0].args[0]);
+    try std.testing.expectEqualStrings("${VALUE}", workspace.configs.items[0].env[0].value);
+    try std.testing.expectEqualStrings("Bearer ${VALUE}", workspace.configs.items[1].headers[0].value);
+    try std.testing.expectEqual(@as(usize, 0), workspace.diagnostics.items.len);
+}
+
+test "workspace environment expansion enforces one aggregate file budget" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    const large = try alloc.alloc(u8, 600 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'x');
+    try environment.put("LARGE", large);
+    var approved_names = [_][]u8{ @constCast("first"), @constCast("second") };
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"first\":{\"command\":\"${LARGE}\"},\"second\":{\"command\":\"${LARGE}\"}}}",
+        .workspace,
+        .{ .approved = &approved_names },
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), workspace.configs.items.len);
+    try std.testing.expectEqualStrings("first", workspace.configs.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), workspace.diagnostics.items.len);
+    try std.testing.expectEqual(
+        WorkspaceDiagnosticCause.environment_expansion_limit_exceeded,
+        workspace.diagnostics.items[0].cause,
+    );
+    try std.testing.expectEqualStrings("second", workspace.diagnostics.items[0].server_name.?);
+}
+
+test "workspace environment expansion never refunds rejected entry work" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    const large = try alloc.alloc(u8, 600 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'x');
+    try environment.put("LARGE", large);
+    var approved_names = [_][]u8{ @constCast("rejected_late"), @constCast("later") };
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"rejected_late\":{\"command\":\"${LARGE}\",\"args\":[\"${MISSING}\"]},\"later\":{\"command\":\"${LARGE}\"}}}",
+        .workspace,
+        .{ .approved = &approved_names },
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), workspace.configs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), workspace.diagnostics.items.len);
+    try std.testing.expectEqual(
+        WorkspaceDiagnosticCause.missing_environment_variable,
+        workspace.diagnostics.items[0].cause,
+    );
+    try std.testing.expectEqual(
+        WorkspaceDiagnosticCause.environment_expansion_limit_exceeded,
+        workspace.diagnostics.items[1].cause,
+    );
+}
+
+test "workspace environment expansion rejects exhausted budget before allocation" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("TOKEN", "secret");
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var value: []const u8 = "${TOKEN}";
+    var budget = WorkspaceExpansionBudget{ .remaining = 0 };
+    const failure = expandOwnedConstWorkspaceValue(
+        failing.allocator(),
+        &value,
+        &environment,
+        .command,
+        &budget,
+    ) catch |err| {
+        try std.testing.expect(err != error.OutOfMemory);
+        return;
+    };
+    try std.testing.expect(failure != null);
+    try std.testing.expect(failure.? == .limit_exceeded);
+}
+
+test "workspace Authorization header expansion does not broaden profile headers" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("TOKEN", "secret");
+    var approved_names = [_][]u8{@constCast("remote")};
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"remote\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"Authorization\":\"Bearer ${TOKEN}\"}}}}",
+        .workspace,
+        .{ .approved = &approved_names },
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), workspace.configs.items.len);
+    try std.testing.expectEqualStrings("Bearer secret", workspace.configs.items[0].headers[0].value);
+
+    try std.testing.expectError(
+        error.McpConfigInvalidHeaders,
+        parseProfileJson(
+            alloc,
+            "{\"mcp\":{\"remote\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"Authorization\":\"Bearer ${TOKEN}\"}}}}",
+        ),
+    );
+}
+
+test "workspace parsing isolates invalid entries" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcpServers":{"good":{"command":["node","server.js"]},"bad":{"command":3}}}
+    ;
+    var result = try parseWorkspaceJson(alloc, json, .workspace, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expectEqualStrings("good", result.configs.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
+    try std.testing.expectEqualStrings("bad", result.diagnostics.items[0].server_name.?);
+}
+
+test "choice transitions are normalized and reject precedence is stable" {
+    const alloc = std.testing.allocator;
+    var current = ProjectMcpChoices{
+        .enable_all = true,
+        .approved = try cloneStrings(alloc, &.{ "alpha", "beta" }),
+        .rejected = try cloneStrings(alloc, &.{"gamma"}),
+    };
+    defer current.deinit(alloc);
+    var rejected = try applyAction(alloc, current, .{ .reject = "alpha" });
+    defer rejected.choices.deinit(alloc);
+    try std.testing.expect(rejected.authority_reduced);
+    try std.testing.expectEqual(mcp_contract.WorkspaceAdmission.rejected, resolveAdmission("alpha", rejected.choices));
+    try std.testing.expectEqual(mcp_contract.WorkspaceAdmission.approved, resolveAdmission("beta", rejected.choices));
+
+    var approved = try applyAction(alloc, rejected.choices, .{ .approve = "alpha" });
+    defer approved.choices.deinit(alloc);
+    try std.testing.expect(!approved.authority_reduced);
+    try std.testing.expectEqual(mcp_contract.WorkspaceAdmission.approved, resolveAdmission("alpha", approved.choices));
+}
+
+test "native merge keeps the primary whole entry" {
+    const alloc = std.testing.allocator;
+    var primary: std.ArrayList(McpServerConfig) = .empty;
+    defer deinitConfigs(alloc, &primary);
+    try primary.append(alloc, .{ .name = try alloc.dupe(u8, "same"), .command = try alloc.dupe(u8, "profile") });
+    var workspace: std.ArrayList(McpServerConfig) = .empty;
+    defer deinitConfigs(alloc, &workspace);
+    try workspace.append(alloc, .{
+        .name = try alloc.dupe(u8, "same"),
+        .source = .workspace,
+        .scope = .workspace,
+        .command = try alloc.dupe(u8, "workspace"),
+        .workspace_admission = .approved,
+    });
+    try workspace.append(alloc, .{
+        .name = try alloc.dupe(u8, "only"),
+        .source = .workspace,
+        .scope = .workspace,
+        .command = try alloc.dupe(u8, "workspace"),
+        .workspace_admission = .approved,
+    });
+    var merged = try mergeNative(alloc, &primary, &workspace);
+    defer deinitConfigs(alloc, &merged);
+    try std.testing.expectEqual(@as(usize, 2), merged.items.len);
+    try std.testing.expectEqualStrings("profile", merged.items[0].command.?);
+    try std.testing.expectEqualStrings("only", merged.items[1].name);
+}
+
+test "ACP primary duplicates remain ordered while workspace collisions are excluded" {
+    const alloc = std.testing.allocator;
+    var output: std.ArrayList(McpServerConfig) = .empty;
+    defer deinitConfigs(alloc, &output);
+    try output.append(alloc, .{
+        .name = try alloc.dupe(u8, "same"),
+        .source = .acp,
+        .scope = .acp_session,
+        .command = try alloc.dupe(u8, "one"),
+    });
+    try output.append(alloc, .{
+        .name = try alloc.dupe(u8, "same"),
+        .source = .acp,
+        .scope = .acp_session,
+        .command = try alloc.dupe(u8, "two"),
+    });
+    var workspace: std.ArrayList(McpServerConfig) = .empty;
+    defer deinitConfigs(alloc, &workspace);
+    try workspace.append(alloc, .{
+        .name = try alloc.dupe(u8, "same"),
+        .source = .workspace,
+        .scope = .workspace,
+        .command = try alloc.dupe(u8, "workspace"),
+        .workspace_admission = .pending,
+    });
+    try workspace.append(alloc, .{
+        .name = try alloc.dupe(u8, "only"),
+        .source = .workspace,
+        .scope = .workspace,
+        .command = try alloc.dupe(u8, "workspace"),
+        .workspace_admission = .pending,
+    });
+    try appendWorkspaceAfterAcpPrimary(alloc, &output, &workspace);
+    try std.testing.expectEqual(@as(usize, 3), output.items.len);
+    try std.testing.expectEqualStrings("one", output.items[0].command.?);
+    try std.testing.expectEqualStrings("two", output.items[1].command.?);
+    try std.testing.expectEqualStrings("only", output.items[2].name);
+}
+
+test "authority projection detects only removed workspace names" {
+    const alloc = std.testing.allocator;
+    const configs = [_]McpServerConfig{
+        .{ .name = "approved", .source = .workspace, .scope = .workspace, .workspace_admission = .approved },
+        .{ .name = "pending", .source = .workspace, .scope = .workspace, .workspace_admission = .pending },
+        .{ .name = "profile", .source = .profile, .scope = .profile },
+    };
+    const interactive = try authorityNames(alloc, &configs, .all);
+    defer freeOwnedStrings(alloc, interactive);
+    try std.testing.expectEqual(@as(usize, 1), interactive.len);
+    try std.testing.expectEqualStrings("approved", interactive[0]);
+    const headless = try authorityNames(alloc, &configs, .acp_startup);
+    defer freeOwnedStrings(alloc, headless);
+    try std.testing.expectEqual(@as(usize, 1), headless.len);
+    try std.testing.expectEqualStrings("approved", headless[0]);
+}
+
+test "workspace parsing releases every partial allocation failure" {
+    const json =
+        \\{"mcpServers":{"bad":{"command":3},"remote":{"type":"http","url":"https://example.test/mcp","env":{"TOKEN":"value"},"header_env":{"X-Test":"TEST_ENV"}},"local":{"command":"node","args":["server.js"],"env":{"A":"B"}}}}
+    ;
+    var fail_index: usize = 0;
+    while (fail_index < 256) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var result = parseWorkspaceJson(failing.allocator(), json, .workspace, .{}) catch |err| switch (err) {
+            error.OutOfMemory => continue,
+        };
+        result.deinit(failing.allocator());
+        break;
+    }
+    try std.testing.expect(fail_index < 256);
+}
+
+test "choice parsing and mutation release every partial allocation failure" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"enabledMcpjsonServers\":[\"alpha\",\"overlap\"],\"disabledMcpjsonServers\":[\"overlap\",\"beta\"],\"enableAllProjectMcpServers\":true}",
+        .{},
+    );
+    defer parsed.deinit();
+    var fail_index: usize = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            alloc,
+            .{ .fail_index = fail_index },
+        );
+        var diagnostics: std.ArrayList(WorkspaceDiagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(failing.allocator());
+            diagnostics.deinit(failing.allocator());
+        }
+        var choices = parseChoices(
+            failing.allocator(),
+            parsed.value,
+            &diagnostics,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => continue,
+            else => return err,
+        };
+        choices.deinit(failing.allocator());
+        break;
+    }
+    try std.testing.expect(fail_index < 128);
+
+    var current = ProjectMcpChoices{
+        .enable_all = true,
+        .approved = try cloneStrings(alloc, &.{ "alpha", "beta" }),
+        .rejected = try cloneStrings(alloc, &.{ "gamma", "delta" }),
+    };
+    defer current.deinit(alloc);
+    fail_index = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            alloc,
+            .{ .fail_index = fail_index },
+        );
+        var transition = applyAction(
+            failing.allocator(),
+            current,
+            .{ .reject = "alpha" },
+        ) catch |err| switch (err) {
+            error.OutOfMemory => continue,
+        };
+        transition.choices.deinit(failing.allocator());
+        break;
+    }
+    try std.testing.expect(fail_index < 128);
 }

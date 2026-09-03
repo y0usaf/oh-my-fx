@@ -60,6 +60,110 @@ pub const PermissionRequest = struct {
     }
 };
 
+test "permission request exposes amendment capability" {
+    try std.testing.expect(@hasField(PermissionRequest, "amendment_allowed"));
+    try std.testing.expect(@hasField(OwnedPermissionRequest, "amendment_allowed"));
+}
+
+test "owned permission request carries an independent explanation" {
+    const request: PermissionRequest = .{
+        .label = "shell.run touch marker.txt",
+        .explanation = "Auto agent couldn’t approve because the action needs review",
+    };
+    var owned = try OwnedPermissionRequest.dupe(std.testing.allocator, request);
+    defer owned.deinit(std.testing.allocator);
+
+    const view = owned.view();
+    try std.testing.expectEqualStrings(request.explanation.?, view.explanation.?);
+    try std.testing.expect(request.explanation.?.ptr != view.explanation.?.ptr);
+    try std.testing.expect(PermissionRequest.eql(request, view));
+}
+
+test "owned permission request carries an independent tool arguments preview" {
+    const request: PermissionRequest = .{
+        .label = "mcp_fixture_echo",
+        .tool_arguments_preview = "{\"text\":\"sentinel\"}",
+    };
+    var owned = try OwnedPermissionRequest.dupe(std.testing.allocator, request);
+    defer owned.deinit(std.testing.allocator);
+
+    const view = owned.view();
+    try std.testing.expectEqualStrings(
+        request.tool_arguments_preview.?,
+        view.tool_arguments_preview.?,
+    );
+    try std.testing.expect(
+        request.tool_arguments_preview.?.ptr != view.tool_arguments_preview.?.ptr,
+    );
+    try std.testing.expect(PermissionRequest.eql(request, view));
+}
+
+test "owned permission request carries an independent subagent origin" {
+    const request: PermissionRequest = .{
+        .label = "shell.run touch marker.txt",
+        .origin = .{ .subagent = "approval-child" },
+    };
+    var owned = try OwnedPermissionRequest.dupe(std.testing.allocator, request);
+    defer owned.deinit(std.testing.allocator);
+
+    const view = owned.view();
+    switch (view.origin) {
+        .active_session => return error.TestExpectedSubagentOrigin,
+        .subagent => |child_name| {
+            try std.testing.expectEqualStrings("approval-child", child_name);
+            try std.testing.expect(
+                child_name.ptr != request.origin.subagent.ptr,
+            );
+        },
+    }
+    try std.testing.expect(PermissionRequest.eql(request, view));
+}
+
+test "permission request bounds the optional explanation" {
+    const explanation = try std.testing.allocator.alloc(u8, max_explanation_bytes + 1);
+    defer std.testing.allocator.free(explanation);
+    @memset(explanation, 'x');
+
+    try std.testing.expectError(
+        error.ExplanationTooLong,
+        OwnedPermissionRequest.dupe(std.testing.allocator, .{
+            .label = "shell.run touch marker.txt",
+            .explanation = explanation,
+        }),
+    );
+}
+
+test "permission request bounds the optional tool arguments preview" {
+    const preview = try std.testing.allocator.alloc(
+        u8,
+        max_tool_arguments_preview_bytes + 1,
+    );
+    defer std.testing.allocator.free(preview);
+    @memset(preview, 'x');
+
+    try std.testing.expectError(
+        error.ToolArgumentsPreviewTooLong,
+        OwnedPermissionRequest.dupe(std.testing.allocator, .{
+            .label = "mcp_fixture_echo",
+            .tool_arguments_preview = preview,
+        }),
+    );
+}
+
+test "permission request bounds the subagent origin" {
+    const child_name = try std.testing.allocator.alloc(u8, 129);
+    defer std.testing.allocator.free(child_name);
+    @memset(child_name, 'x');
+
+    try std.testing.expectError(
+        error.SubagentOriginTooLong,
+        OwnedPermissionRequest.dupe(std.testing.allocator, .{
+            .label = "shell.run touch marker.txt",
+            .origin = .{ .subagent = child_name },
+        }),
+    );
+}
+
 pub const PreviewCloneError = diff_mod.PreviewValidationError || error{
     OutOfMemory,
     RequestProjectionTooLarge,
@@ -474,4 +578,240 @@ fn checkOwnedRequestAllocFailures(alloc: Allocator) !void {
         },
     });
     defer owned.deinit(alloc);
+}
+
+test "owned permission request deep copies every byte range" {
+    const preview = samplePreview();
+    const request: PermissionRequest = .{
+        .id = 41,
+        .label = "file_mutation",
+        .file = .{
+            .kind = .edit,
+            .intent = .equality_disclosure,
+            .preview = preview,
+            .scope = .{ .external_tree = "/tmp/project" },
+        },
+    };
+    var owned = try OwnedPermissionRequest.dupe(std.testing.allocator, request);
+    defer owned.deinit(std.testing.allocator);
+
+    const view = owned.view();
+    try std.testing.expectEqual(request.id, view.id);
+    try std.testing.expectEqualStrings(request.label, view.label);
+    try std.testing.expect(request.label.ptr != view.label.ptr);
+    try std.testing.expectEqual(
+        file_mutation_contract.Kind.edit,
+        view.file.?.kind,
+    );
+    try std.testing.expectEqual(
+        FileApprovalIntent.equality_disclosure,
+        view.file.?.intent,
+    );
+    try std.testing.expect(diff_mod.FileChangePreview.eql(preview, view.file.?.preview));
+    try std.testing.expect(preview.path.ptr != view.file.?.preview.path.ptr);
+    try std.testing.expect(preview.lines.ptr != view.file.?.preview.lines.ptr);
+    for (preview.lines, view.file.?.preview.lines) |source, clone| {
+        try std.testing.expect(source.text.ptr != clone.text.ptr);
+    }
+    try std.testing.expectEqualStrings(
+        "/tmp/project",
+        view.file.?.scope.external_tree,
+    );
+    try std.testing.expect(
+        request.file.?.scope.external_tree.ptr !=
+            view.file.?.scope.external_tree.ptr,
+    );
+    try std.testing.expect(PermissionRequest.eql(request, view));
+}
+
+test "file request footprint counts root and owned backing exactly once" {
+    const request: PermissionRequest = .{
+        .id = 9,
+        .label = "file",
+        .file = .{
+            .kind = .write,
+            .intent = .mutation,
+            .preview = samplePreview(),
+            .scope = .{ .external_tree = "/tmp/project" },
+        },
+    };
+    const expected =
+        @sizeOf(OwnedPermissionRequest) +
+        request.label.len +
+        request.file.?.preview.path.len +
+        request.file.?.scope.external_tree.len +
+        request.file.?.preview.lines.len * @sizeOf(diff_mod.PreviewLine) +
+        request.file.?.preview.lines[0].text.len +
+        request.file.?.preview.lines[1].text.len;
+    try std.testing.expectEqual(expected, try fileRequestFootprint(request));
+}
+
+test "workspace scope has no separately owned backing" {
+    const request: PermissionRequest = .{
+        .label = "file",
+        .file = .{
+            .kind = .write,
+            .intent = .mutation,
+            .preview = samplePreview(),
+            .scope = .workspace_files,
+        },
+    };
+    const expected =
+        @sizeOf(OwnedPermissionRequest) +
+        request.label.len +
+        request.file.?.preview.path.len +
+        request.file.?.preview.lines.len * @sizeOf(diff_mod.PreviewLine) +
+        request.file.?.preview.lines[0].text.len +
+        request.file.?.preview.lines[1].text.len;
+    try std.testing.expectEqual(expected, try fileRequestFootprint(request));
+}
+
+test "file request accepts exact component and aggregate capacity" {
+    const alloc = std.testing.allocator;
+    const label = try alloc.alloc(u8, diff_mod.max_encoded_label_bytes);
+    defer alloc.free(label);
+    @memset(label, 'l');
+    const explanation = try alloc.alloc(u8, max_explanation_bytes);
+    defer alloc.free(explanation);
+    @memset(explanation, 'e');
+    const tool_arguments_preview = try alloc.alloc(
+        u8,
+        max_tool_arguments_preview_bytes,
+    );
+    defer alloc.free(tool_arguments_preview);
+    @memset(tool_arguments_preview, 'a');
+    const origin = try alloc.alloc(u8, max_subagent_origin_bytes);
+    defer alloc.free(origin);
+    @memset(origin, 'o');
+    const path = try alloc.alloc(u8, diff_mod.max_encoded_path_bytes);
+    defer alloc.free(path);
+    @memset(path, 'p');
+    const scope = try alloc.alloc(u8, max_external_scope_tail_bytes);
+    defer alloc.free(scope);
+    @memset(scope, 's');
+    const line_text = try alloc.alloc(u8, diff_mod.max_encoded_line_bytes);
+    defer alloc.free(line_text);
+    @memset(line_text, 'x');
+
+    const lines = [_]diff_mod.PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = line_text },
+        .{ .op = .addition, .new_line = 1, .text = line_text },
+        .{ .op = .deletion, .old_line = 2, .text = line_text },
+        .{ .op = .addition, .new_line = 2, .text = line_text },
+        .{ .op = .deletion, .old_line = 3, .text = line_text },
+        .{ .op = .addition, .new_line = 3, .text = line_text },
+    };
+    const request: PermissionRequest = .{
+        .label = label,
+        .origin = .{ .subagent = origin },
+        .explanation = explanation,
+        .tool_arguments_preview = tool_arguments_preview,
+        .file = .{
+            .kind = .edit,
+            .intent = .mutation,
+            .preview = .{
+                .path = path,
+                .path_basename_start = path.len - 1,
+                .lines = &lines,
+                .additions = 3,
+                .deletions = 3,
+                .truncated = false,
+            },
+            .scope = .{ .external_tree = scope },
+        },
+    };
+
+    try std.testing.expectEqual(
+        max_file_request_footprint_bytes,
+        try fileRequestFootprint(request),
+    );
+    var owned = try OwnedPermissionRequest.dupe(alloc, request);
+    owned.deinit(alloc);
+}
+
+test "file request rejects one byte over every owned component boundary" {
+    const alloc = std.testing.allocator;
+    const over_label = try alloc.alloc(u8, diff_mod.max_encoded_label_bytes + 1);
+    defer alloc.free(over_label);
+    @memset(over_label, 'l');
+    const over_path = try alloc.alloc(u8, diff_mod.max_encoded_path_bytes + 1);
+    defer alloc.free(over_path);
+    @memset(over_path, 'p');
+    const over_scope = try alloc.alloc(u8, max_external_scope_tail_bytes + 1);
+    defer alloc.free(over_scope);
+    @memset(over_scope, 's');
+    const over_line = try alloc.alloc(u8, diff_mod.max_encoded_line_bytes + 1);
+    defer alloc.free(over_line);
+    @memset(over_line, 'x');
+
+    const base = samplePreview();
+    try std.testing.expectError(
+        error.LabelTooLong,
+        fileRequestFootprint(.{
+            .label = over_label,
+            .file = .{
+                .kind = .write,
+                .intent = .mutation,
+                .preview = base,
+                .scope = .workspace_files,
+            },
+        }),
+    );
+
+    var over_path_preview = base;
+    over_path_preview.path = over_path;
+    over_path_preview.path_basename_start = over_path.len - 1;
+    try std.testing.expectError(
+        error.PathTooLong,
+        fileRequestFootprint(.{
+            .label = "file",
+            .file = .{
+                .kind = .write,
+                .intent = .mutation,
+                .preview = over_path_preview,
+                .scope = .workspace_files,
+            },
+        }),
+    );
+
+    try std.testing.expectError(
+        error.ScopeProjectionTooLarge,
+        fileRequestFootprint(.{
+            .label = "file",
+            .file = .{
+                .kind = .write,
+                .intent = .mutation,
+                .preview = base,
+                .scope = .{ .external_tree = over_scope },
+            },
+        }),
+    );
+
+    const lines = [_]diff_mod.PreviewLine{
+        .{ .op = .addition, .new_line = 1, .text = over_line },
+    };
+    var over_line_preview = base;
+    over_line_preview.lines = &lines;
+    over_line_preview.additions = 1;
+    over_line_preview.deletions = 0;
+    try std.testing.expectError(
+        error.LineTooLong,
+        fileRequestFootprint(.{
+            .label = "file",
+            .file = .{
+                .kind = .write,
+                .intent = .mutation,
+                .preview = over_line_preview,
+                .scope = .workspace_files,
+            },
+        }),
+    );
+}
+
+test "owned permission request cleans up partial allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkOwnedRequestAllocFailures,
+        .{},
+    );
 }

@@ -57,3 +57,31 @@ pub fn handleMatchesContentDigest(
     const expected = std.fmt.bytesToHex(digest[0..8].*, .lower);
     return std.mem.eql(u8, encoded, &expected);
 }
+
+test "content addressed artifact handles authenticate exact bytes" {
+    const alloc = std.testing.allocator;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash("saved output", &digest, .{});
+    const handle = try contentAddressedHandle(
+        alloc,
+        "fx-command-123.log",
+        ".log",
+        digest,
+    );
+    defer alloc.free(handle);
+    try std.testing.expectEqualStrings(
+        "fx-command-123-1b2a9cb5a0298dcb.log",
+        handle,
+    );
+    try std.testing.expect(handleMatchesContentDigest(
+        handle,
+        ".log",
+        digest,
+    ));
+    Sha256.hash("xaved output", &digest, .{});
+    try std.testing.expect(!handleMatchesContentDigest(
+        handle,
+        ".log",
+        digest,
+    ));
+}

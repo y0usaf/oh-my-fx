@@ -15,16 +15,13 @@ const agent = await createFxAgent({
     error.name = "AbortError";
     throw error;
   },
-  env: {
-    AI_GATEWAY_API_KEY: "native-core-fetch-failure-key",
-    FX_MODEL: "native/test-model",
-  },
+  apiKey: "native-core-fetch-failure-key",
+  model: "native/test-model",
 });
 
 let closed = false;
 try {
-  const session = await agent.createSession();
-  const turn = session.prompt("fail host fetch");
+  const turn = agent.prompt("fail host fetch");
   const timeout = new Promise((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error("native host-fetch failure hung")), 5000);
   });
@@ -32,11 +29,10 @@ try {
     Promise.race([turn.result, timeout]),
     (error) => error.message !== "native host-fetch failure hung",
   );
-  await session.close();
-  assert.equal(await agent.close(), 0);
+  assert.equal(await agent.close(), undefined);
   closed = true;
   console.log("native host-fetch failure passed: independent AbortError fails without hanging");
 } finally {
   clearTimeout(timeoutId);
-  if (!closed) agent.abort();
+  if (!closed) await agent.close().catch(() => {});
 }

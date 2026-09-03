@@ -69,3 +69,96 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
     }
     return false;
 }
+
+test "mode registry looks up modes by id" {
+    const modes = [_]ModeSpec{
+        .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
+        .{ .id = "code", .name = "Code", .permission_mode = .auto },
+    };
+    const registry = Registry{ .default_mode_id = "ask", .modes = modes[0..] };
+
+    try std.testing.expectEqualStrings("ask", registry.default_mode_id);
+    const found = registry.lookup("code") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Code", found.name);
+    try std.testing.expectEqual(@as(@TypeOf(found.permission_mode), .auto), found.permission_mode);
+    try std.testing.expect(registry.lookup("missing") == null);
+}
+
+test "mode registry applies tool policy to the supplied tool set" {
+    const Fixture = struct {
+        fn decode(ctx: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+            return .{ .failure = try ctx.allocator.dupe(u8, "unused") };
+        }
+
+        fn call(ctx: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+            return .{ .failure = try ctx.allocator.dupe(u8, "unused") };
+        }
+
+        fn readsOnly(_: tool_dispatch.ToolInput) bool {
+            return true;
+        }
+
+        fn irreversible(_: tool_dispatch.ToolInput) bool {
+            return false;
+        }
+
+        const tools = [_]tool_dispatch.Tool{
+            .{
+                .name = "inspect",
+                .description = "Inspect",
+                .model_schema = .{
+                    .name = "inspect",
+                    .description = "Inspect",
+                    .input_schema = .{},
+                },
+                .decode = decode,
+                .call = call,
+                .reads_only_fn = readsOnly,
+                .irreversible_fn = irreversible,
+            },
+            .{
+                .name = "mutate",
+                .description = "Mutate",
+                .model_schema = .{
+                    .name = "mutate",
+                    .description = "Mutate",
+                    .input_schema = .{},
+                },
+                .decode = decode,
+                .call = call,
+                .reads_only_fn = readsOnly,
+                .irreversible_fn = irreversible,
+            },
+        };
+    };
+    const modes = [_]ModeSpec{
+        .{ .id = "full", .name = "Full" },
+        .{
+            .id = "inspect",
+            .name = "Inspect",
+            .tool_policy = .read_only,
+            .tool_policy_denial_message = "Inspection mode blocks mutations.",
+        },
+    };
+    const registry = Registry{ .default_mode_id = "full", .modes = modes[0..] };
+    const tool_set = tool_set_contract.ToolSet{
+        .registry = .{ .tools = Fixture.tools[0..] },
+        .order = &.{ "inspect", "mutate" },
+        .read_only_tool_names = &.{"inspect"},
+    };
+
+    try std.testing.expect(registry.toolAllowed(tool_set, "full", "mutate"));
+    try std.testing.expect(registry.toolAllowed(tool_set, "inspect", "inspect"));
+    try std.testing.expect(!registry.toolAllowed(tool_set, "inspect", "mutate"));
+    try std.testing.expect(registry.toolAllowed(tool_set, "missing", "mutate"));
+    try std.testing.expect(registry.toolAllowed(tool_set, "inspect", "dynamic_tool"));
+
+    const denied = try registry.toolPolicyDeniedJson(
+        std.testing.allocator,
+        tool_set,
+        "inspect",
+        "mutate",
+    ) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(denied);
+    try std.testing.expect(std.mem.find(u8, denied, "Inspection mode blocks mutations.") != null);
+}

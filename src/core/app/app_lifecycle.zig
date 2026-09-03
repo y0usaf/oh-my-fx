@@ -41,7 +41,6 @@ const normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m";
 const tmux_normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[>4;0m";
 const alternate_screen_enter = "\x1b[?1049h";
 const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
-const terminal_takeover_reset = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[4l\x1b[?6l\x1b[?7h\x1b[0m\x1b[?25h";
 
 /// Original handlers, written at bootstrap and restored at shutdown.
 /// Signal context never mutates them.
@@ -117,8 +116,11 @@ pub const StartupState = struct {
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
     credential: ?credentials.Credential = null,
+    auth_mode: credentials.AuthMode = .local,
+    credential_source_preference: ?credentials.Source = null,
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
     provider: model_provider.ProviderId = .gateway,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
@@ -131,6 +133,7 @@ pub const StartupState = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
+    fast_mode_model_bound: bool = false,
     fast_mode_source: config_runtime.ConfigSource = .compiled_default,
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
@@ -183,7 +186,12 @@ pub const StartupState = struct {
     }
 
     pub fn modelCatalogAccess(self: *const StartupState) credentials.CatalogAccess {
-        return credentials.catalogAccessAt(self.credential, io_mod.milliTimestamp());
+        if (self.auth_mode == .host_managed) return .host_managed;
+        const access = credentials.catalogAccessAt(self.credential, io_mod.milliTimestamp());
+        return if (self.credential_source_preference == null)
+            access
+        else
+            access.withExplicitAuthority();
     }
 
     pub fn gatewayTeam(self: *const StartupState) ?[]const u8 {
@@ -250,9 +258,9 @@ pub const BootstrapConfig = struct {
     default_model: []const u8,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
+    auth_mode: credentials.AuthMode = .local,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
-    record_requested: bool = false,
 };
 
 pub fn loadStartupState(
@@ -262,13 +270,31 @@ pub fn loadStartupState(
     default_model: []const u8,
     default_agent_step_limit: usize,
 ) !StartupState {
+    return loadStartupStateWithAuthMode(
+        alloc,
+        transport,
+        secret_store,
+        default_model,
+        default_agent_step_limit,
+        .local,
+    );
+}
+
+pub fn loadStartupStateWithAuthMode(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, null, .refresh_if_needed);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null);
 }
 
 pub fn loadEmbeddedStartupState(
@@ -286,9 +312,34 @@ pub fn loadEmbeddedStartupState(
         owned_workspace_root,
         default_model,
         default_agent_step_limit,
+        .local,
         home_dir,
         null,
     );
+}
+
+pub fn loadLibfxStartupState(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    model: []const u8,
+    default_agent_step_limit: usize,
+) Allocator.Error!StartupState {
+    const owned_workspace = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(owned_workspace);
+    const selected_model = try alloc.dupe(u8, model);
+    errdefer alloc.free(selected_model);
+    const configured_model = try alloc.dupe(u8, model);
+    return .{
+        .workspace_root = owned_workspace,
+        .selected_model = selected_model,
+        .configured_model = configured_model,
+        .permission_mode = .auto,
+        .agent_step_limit = default_agent_step_limit,
+        .context_enabled = false,
+        .auto_upgrade = false,
+        .prompt_history_enabled = false,
+        .prompt_history_store_allowed = false,
+    };
 }
 
 pub fn loadCatalogStartupState(
@@ -297,8 +348,24 @@ pub fn loadCatalogStartupState(
     default_model: []const u8,
     default_agent_step_limit: usize,
 ) !StartupState {
+    return loadCatalogStartupStateWithAuthMode(
+        alloc,
+        secret_store,
+        default_model,
+        default_agent_step_limit,
+        .local,
+    );
+}
+
+pub fn loadCatalogStartupStateWithAuthMode(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, null, .stored);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored);
 }
 
 pub fn loadStartupStatus(
@@ -306,6 +373,22 @@ pub fn loadStartupStatus(
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
+) !StartupStatus {
+    return loadStartupStatusWithAuthMode(
+        alloc,
+        secret_store,
+        default_model,
+        default_agent_step_limit,
+        .local,
+    );
+}
+
+pub fn loadStartupStatusWithAuthMode(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
 ) !StartupStatus {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     errdefer alloc.free(workspace_root);
@@ -319,12 +402,20 @@ pub fn loadStartupStatus(
     const selected_model = try loadStartupStatusModel(alloc, configured_selection.model, null);
     errdefer if (selected_model.owned) |model| alloc.free(model);
 
-    var auth_status = try auth_runtime.loadStatusSnapshotForProvider(
-        alloc,
-        secret_store,
-        configured_selection.provider,
-        settings.credential_source,
-    );
+    var auth_status = if (auth_mode == .host_managed)
+        auth_runtime.StatusSnapshot{
+            .active_source = .host_managed,
+            .gateway_connected = true,
+            .chatgpt_connected = true,
+            .grok_connected = true,
+        }
+    else
+        try auth_runtime.loadStatusSnapshotForProvider(
+            alloc,
+            secret_store,
+            configured_selection.provider,
+            settings.credential_source,
+        );
     errdefer auth_status.deinit(alloc);
 
     const result = StartupStatus{
@@ -359,7 +450,7 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -371,10 +462,14 @@ fn loadStartupStateFromOwnedWorkspace(
     owned_workspace_root: []u8,
     default_model: []const u8,
     default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
     profile_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
 ) !StartupState {
-    var state = StartupState{ .agent_step_limit = default_agent_step_limit };
+    var state = StartupState{
+        .agent_step_limit = default_agent_step_limit,
+        .auth_mode = auth_mode,
+    };
     errdefer state.deinit(alloc);
 
     state.workspace_root = owned_workspace_root;
@@ -404,17 +499,21 @@ fn loadStartupStateFromOwnedWorkspace(
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
-    if (credential_mode) |mode| {
-        const resolution = try credentials.resolveForProvider(
-            alloc,
-            transport,
-            secret_store,
-            mode,
-            state.provider,
-            settings.credential_source,
-        );
-        state.credential = resolution.credential;
-        state.stored_key_status = resolution.stored_key_status;
+    state.credential_source_preference = settings.credential_source;
+    if (auth_mode == .local) {
+        if (credential_mode) |mode| {
+            const resolution = try credentials.resolveForProvider(
+                alloc,
+                transport,
+                secret_store,
+                mode,
+                state.provider,
+                settings.credential_source,
+            );
+            state.credential = resolution.credential;
+            state.stored_key_status = resolution.stored_key_status;
+            state.fx_login_status = resolution.fx_login_status;
+        }
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
@@ -423,8 +522,16 @@ fn loadStartupStateFromOwnedWorkspace(
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
-    state.fast_mode = settings.fast_mode orelse
-        (state.provider == .gateway and state.model_source == .compiled_default);
+    const fast_mode = resolveStartupFastMode(
+        state.provider,
+        state.model_source,
+        settings.fast_mode,
+        detailed.sources.fast_mode,
+        settings.fast_mode_model_bound,
+        detailed.sources.fast_mode_model_bound,
+    );
+    state.fast_mode = fast_mode.enabled;
+    state.fast_mode_model_bound = fast_mode.model_bound;
     state.fast_mode_source = detailed.sources.fast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
@@ -446,6 +553,32 @@ fn loadStartupStateFromOwnedWorkspace(
     return state;
 }
 
+const StartupFastMode = struct {
+    enabled: bool,
+    model_bound: bool,
+};
+
+fn resolveStartupFastMode(
+    provider: model_provider.ProviderId,
+    model_source: config_runtime.ModelSource,
+    configured_fast_mode: ?bool,
+    fast_mode_source: config_runtime.ConfigSource,
+    model_bound: ?bool,
+    binding_source: config_runtime.ConfigSource,
+) StartupFastMode {
+    if (configured_fast_mode) |enabled| {
+        return .{
+            .enabled = enabled,
+            .model_bound = enabled and
+                model_bound == true and
+                model_source == fast_mode_source and
+                fast_mode_source == binding_source,
+        };
+    }
+    const enabled = provider == .gateway and model_source == .compiled_default;
+    return .{ .enabled = enabled, .model_bound = enabled };
+}
+
 pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     try cfg.terminal.ensureInteractive();
     try cfg.terminal.captureOriginalTermios();
@@ -455,15 +588,16 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = try loadCatalogStartupState(
+    var state = try loadCatalogStartupStateWithAuthMode(
         cfg.alloc,
         cfg.secret_store,
         cfg.default_model,
         cfg.default_agent_step_limit,
+        cfg.auth_mode,
     );
     errdefer state.deinit(cfg.alloc);
 
-    state.credential_onboarding_skipped = credentialOnboardingDisabled();
+    state.credential_onboarding_skipped = cfg.auth_mode == .host_managed or credentialOnboardingDisabled();
 
     errdefer shutdownInteractiveShell(
         cfg.terminal,
@@ -479,11 +613,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
 
     record_tape.configureFromEnv(
         cfg.alloc,
-        state.workspace_root,
         cfg.shell.layout.cols,
         cfg.shell.layout.rows,
         cfg.fx_version,
-        cfg.record_requested,
     ) catch |err| {
         debug_trace.logf("record", "startup recording failed err={s}", .{@errorName(err)});
         return error.RecordingStartFailed;
@@ -627,8 +759,6 @@ fn leaveAlternateScreens(terminal: *TerminalState, shell: *TranscriptRuntime, me
         .file_approval => _ = leaveApprovalScreen(terminal, shell, metrics) catch {},
         .full_transcript => _ = leaveFullTranscriptScreen(terminal, shell, metrics) catch {},
         .catalog_menu => _ = leaveCatalogMenuScreen(terminal, shell, metrics) catch {},
-        .subagent_manager => _ = leaveSubagentManagerScreen(terminal, shell, metrics) catch {},
-        .terminal_session => _ = leaveTerminalSessionScreen(terminal, shell, metrics) catch {},
     }
 }
 
@@ -804,93 +934,6 @@ pub fn enterCatalogMenuScreen(terminal: *TerminalState, shell: *TranscriptRuntim
 
 pub fn leaveCatalogMenuScreen(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) !void {
     try leaveAlternateScreen(terminal, shell, metrics, .catalog_menu);
-}
-
-pub fn handoffCatalogMenuToSubagentManager(terminal: *TerminalState) !void {
-    if (!terminal.catalogMenuScreenActive()) return error.CatalogMenuScreenNotActive;
-    terminal.alternate_screen_owner = .subagent_manager;
-    terminal.alternate_frame_layout = .{};
-}
-
-pub fn handoffApprovalToSubagentManager(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    if (!terminal.fileApprovalScreenActive()) return error.ApprovalScreenNotActive;
-    try setAlternateScreenMouseTracking(
-        terminal,
-        shell,
-        metrics,
-        .file_approval,
-        false,
-    );
-    terminal.alternate_screen_owner = .subagent_manager;
-    terminal.alternate_frame_layout = .{};
-}
-
-pub fn enterSubagentManagerScreen(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    try enterAlternateScreen(terminal, shell, metrics, .subagent_manager);
-}
-
-pub fn leaveSubagentManagerScreen(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    try leaveAlternateScreen(terminal, shell, metrics, .subagent_manager);
-}
-
-pub fn enterTerminalSessionScreen(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    try enterAlternateScreen(terminal, shell, metrics, .terminal_session);
-    try writeLifecycleTerminalBytes(shell, metrics, terminal_takeover_reset ++ "\x1b[2J\x1b[H");
-}
-
-pub fn leaveTerminalSessionScreen(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    if (!terminal.terminalSessionScreenActive()) return;
-    try writeLifecycleTerminalBytes(
-        shell,
-        metrics,
-        terminal_takeover_reset ++ ui_terminal.alternate_screen_leave_sequence,
-    );
-    try enableInteractiveTerminalModes(shell, metrics);
-    terminal.alternate_mouse_tracking_active = false;
-    terminal.alternate_screen_owner = .none;
-    terminal.alternate_frame_layout = .{};
-}
-
-/// Transfer the existing alternate buffer directly back to the manager.
-/// The child modes are removed before ownership changes, so a failed write
-/// leaves terminal-session cleanup armed.
-pub fn handoffTerminalSessionToSubagentManager(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    if (!terminal.terminalSessionScreenActive()) {
-        return error.TerminalSessionScreenNotActive;
-    }
-    try writeLifecycleTerminalBytes(
-        shell,
-        metrics,
-        terminal_takeover_reset ++ "\x1b[2J\x1b[H",
-    );
-    try enableInteractiveTerminalModes(shell, metrics);
-    terminal.alternate_mouse_tracking_active = false;
-    terminal.alternate_screen_owner = .subagent_manager;
-    terminal.alternate_frame_layout = .{};
 }
 
 pub fn openFullTranscript(
@@ -1125,6 +1168,34 @@ fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8
     return if (trimmed.len > 0) trimmed else configured orelse default_model;
 }
 
+test "startup provider chooses only its provider-scoped model" {
+    var gateway_settings = config_runtime.Settings{ .provider = .gateway };
+    gateway_settings.models.values[@intFromEnum(model_provider.ProviderId.gateway)] = @constCast("gateway/model");
+    gateway_settings.models.values[@intFromEnum(model_provider.ProviderId.codex)] = @constCast("gpt-model");
+    const gateway = try configuredProviderSelection("default/model", &gateway_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
+    try std.testing.expectEqualStrings("gateway/model", gateway.model);
+
+    var codex_settings = config_runtime.Settings{ .provider = .codex };
+    codex_settings.models.values[@intFromEnum(model_provider.ProviderId.gateway)] = @constCast("gateway/model");
+    codex_settings.models.values[@intFromEnum(model_provider.ProviderId.codex)] = @constCast("gpt-model");
+    const codex = try configuredProviderSelection("default/model", &codex_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
+    try std.testing.expectEqualStrings("gpt-model", codex.model);
+
+    const missing_codex = config_runtime.Settings{ .provider = .codex };
+    try std.testing.expectError(
+        error.CodexModelNotSelected,
+        configuredProviderSelection("default/model", &missing_codex),
+    );
+
+    var grok_settings = config_runtime.Settings{ .provider = .grok };
+    grok_settings.models.values[@intFromEnum(model_provider.ProviderId.grok)] = @constCast("grok-model");
+    const grok = try configuredProviderSelection("default/model", &grok_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
+    try std.testing.expectEqualStrings("grok-model", grok.model);
+}
+
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
     return alloc.dupe(u8, initialModelId(default_model, configured));
 }
@@ -1210,6 +1281,39 @@ const TestEnv = struct {
     }
 };
 
+test "permission mode parser accepts known modes" {
+    try std.testing.expectEqual(PermissionMode.ask, config_runtime.parsePermissionMode("ask").?);
+    try std.testing.expectEqual(PermissionMode.auto, config_runtime.parsePermissionMode("auto").?);
+    try std.testing.expectEqual(PermissionMode.yolo, config_runtime.parsePermissionMode("yolo").?);
+    try std.testing.expect(config_runtime.parsePermissionMode("weird") == null);
+}
+
+test "permission mode loader defaults to auto" {
+    var env = try TestEnv.install(std.testing.allocator, &.{});
+    defer env.deinit();
+
+    try std.testing.expectEqual(PermissionMode.auto, loadPermissionMode(null));
+    try std.testing.expectEqual(PermissionMode.ask, loadPermissionMode(.ask));
+}
+
+test "permission mode environment accepts yolo without changing fallback" {
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "FX_PERMISSION_MODE", .value = "yolo" },
+    });
+    defer env.deinit();
+
+    try std.testing.expectEqual(PermissionMode.yolo, loadPermissionMode(.ask));
+}
+
+test "agent step limit loader distinguishes missing and explicit zero" {
+    var env = try TestEnv.install(std.testing.allocator, &.{});
+    defer env.deinit();
+
+    try std.testing.expectEqual(agent_steps.default_max_agent_steps, loadAgentStepLimit(agent_steps.default_max_agent_steps, null));
+    try std.testing.expectEqual(@as(usize, 0), loadAgentStepLimit(agent_steps.default_max_agent_steps, 0));
+    try std.testing.expectEqual(@as(usize, 50), loadAgentStepLimit(agent_steps.default_max_agent_steps, 50));
+}
+
 fn minimalLayout() types.Layout {
     return .{
         .rows = 1,
@@ -1220,6 +1324,928 @@ fn minimalLayout() types.Layout {
         .divider_bottom_row = 1,
         .hint_row = 1,
     };
+}
+
+test "minimal layout is safe for shutdown fallback" {
+    const layout = minimalLayout();
+    try std.testing.expectEqual(@as(u16, 1), layout.rows);
+    try std.testing.expectEqual(@as(u16, 1), layout.cols);
+    try std.testing.expectEqual(@as(u16, 1), layout.input_row);
+}
+
+test "lifecycle terminal writer updates bytes metrics and shadow" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "lifecycle.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 4,
+            .cols = 8,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+    };
+    defer shell.deinit(alloc);
+    try shell.enableShadowVt(alloc);
+
+    var metrics = Metrics{};
+    try writeLifecycleTerminalBytes(&shell, &metrics, "x");
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 32);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqualStrings("x", bytes);
+    try std.testing.expectEqual(@as(usize, 1), metrics.ansi_bytes);
+    try std.testing.expectEqual(@as(u21, 'x'), shell.shadow_vt.?.cellAt(1, 1).?.codepoint);
+}
+
+test "approval alternate screen lifecycle restores the shadow terminal once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "approval-screen.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 4,
+            .cols = 16,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+    };
+    defer shell.deinit(alloc);
+    try shell.enableShadowVt(alloc);
+
+    var metrics = Metrics{};
+    var terminal = TerminalState{};
+    try writeLifecycleTerminalBytes(&shell, &metrics, "normal");
+
+    try enterApprovalScreen(&terminal, &shell, &metrics);
+    try enterApprovalScreen(&terminal, &shell, &metrics);
+    try setApprovalScreenMouseTracking(&terminal, &shell, &metrics, true);
+    try setApprovalScreenMouseTracking(&terminal, &shell, &metrics, true);
+    try writeLifecycleTerminalBytes(&shell, &metrics, "approval");
+    try leaveApprovalScreen(&terminal, &shell, &metrics);
+    try leaveApprovalScreen(&terminal, &shell, &metrics);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 256);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006l"));
+    try std.testing.expect(!terminal.fileApprovalScreenActive());
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+    try std.testing.expectEqual(@as(u21, 'n'), shell.shadow_vt.?.cellAt(1, 1).?.codepoint);
+}
+
+test "approval inline restore keeps ownership armed until frame commit" {
+    var terminal = TerminalState{
+        .alternate_screen_owner = .file_approval,
+        .alternate_mouse_tracking_active = true,
+        .alternate_frame_layout = .{ .layout_id = 51 },
+    };
+
+    switch (approvalInlineRestoreTransition(&terminal)) {
+        .none => return error.TestExpectedApprovalRestore,
+        .restore_normal_screen => |restore| {
+            try std.testing.expect(restore.mouse_tracking_active);
+        },
+    }
+    try std.testing.expect(terminal.fileApprovalScreenActive());
+    try std.testing.expect(terminal.alternate_mouse_tracking_active);
+    try std.testing.expectEqual(@as(u64, 51), terminal.alternate_frame_layout.layout_id);
+
+    commitApprovalInlineRestore(&terminal);
+    try std.testing.expect(!terminal.fileApprovalScreenActive());
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+    try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
+    try std.testing.expectEqual(
+        terminal_diff.FrameTerminalTransition.none,
+        approvalInlineRestoreTransition(&terminal),
+    );
+}
+
+test "full transcript alternate screen preserves native selection and restores the shadow terminal once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "full-transcript-screen.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 4,
+            .cols = 16,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+    };
+    defer shell.deinit(alloc);
+    try shell.enableShadowVt(alloc);
+
+    var metrics = Metrics{};
+    var terminal = TerminalState{
+        .alternate_frame_layout = .{ .layout_id = 41 },
+    };
+    try enterFullTranscriptScreen(&terminal, &shell, &metrics);
+    try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
+    try enterFullTranscriptScreen(&terminal, &shell, &metrics);
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+    terminal.alternate_frame_layout.layout_id = 42;
+    try leaveFullTranscriptScreen(&terminal, &shell, &metrics);
+    try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
+    try leaveFullTranscriptScreen(&terminal, &shell, &metrics);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 256);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006l"));
+    try std.testing.expect(!terminal.fullTranscriptScreenActive());
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+}
+
+test "skills menu alternate screen lifecycle restores the shadow terminal once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "skills-menu-screen.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 4,
+            .cols = 16,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+    };
+    defer shell.deinit(alloc);
+    try shell.enableShadowVt(alloc);
+
+    var metrics = Metrics{};
+    var terminal = TerminalState{};
+    try enterCatalogMenuScreen(&terminal, &shell, &metrics);
+    try enterCatalogMenuScreen(&terminal, &shell, &metrics);
+    try writeLifecycleTerminalBytes(&shell, &metrics, "skills");
+    try leaveCatalogMenuScreen(&terminal, &shell, &metrics);
+    try leaveCatalogMenuScreen(&terminal, &shell, &metrics);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 256);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049l"));
+    try std.testing.expect(!terminal.catalogMenuScreenActive());
+    try std.testing.expectEqual(@as(u21, ' '), shell.shadow_vt.?.cellAt(1, 1).?.codepoint);
+}
+
+test "full transcript handoff to approval reuses the alternate screen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "full-transcript-to-approval-screen.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 4,
+            .cols = 16,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+    };
+    defer shell.deinit(alloc);
+    try shell.enableShadowVt(alloc);
+
+    var metrics = Metrics{};
+    var terminal = TerminalState{};
+    try writeLifecycleTerminalBytes(&shell, &metrics, "normal");
+    try openFullTranscript(alloc, &terminal, &shell, &metrics);
+    try writeLifecycleTerminalBytes(&shell, &metrics, "viewer");
+    try std.testing.expect(shell.fullTranscriptActive());
+    terminal.alternate_frame_layout.layout_id = 43;
+    try handoffFullTranscriptToApproval(alloc, &terminal, &shell, &metrics);
+    try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
+    try std.testing.expect(terminal.fileApprovalScreenActive());
+    try std.testing.expect(!shell.fullTranscriptActive());
+    try std.testing.expect(terminal.alternate_mouse_tracking_active);
+    try writeLifecycleTerminalBytes(&shell, &metrics, "approval");
+    try leaveApprovalScreen(&terminal, &shell, &metrics);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 256);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006l"));
+    try std.testing.expect(!terminal.fileApprovalScreenActive());
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+    try std.testing.expectEqual(@as(u21, 'n'), shell.shadow_vt.?.cellAt(1, 1).?.codepoint);
+}
+
+test "full transcript transitions own terminal and projection together" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "full-transcript-transition.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 4,
+            .cols = 16,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+    };
+    defer shell.deinit(alloc);
+    try shell.enableShadowVt(alloc);
+
+    var metrics = Metrics{};
+    var terminal = TerminalState{};
+
+    try openFullTranscript(alloc, &terminal, &shell, &metrics);
+    try openFullTranscript(alloc, &terminal, &shell, &metrics);
+    try std.testing.expectEqual(
+        FullTranscriptLifecycleState.active,
+        fullTranscriptLifecycleState(&terminal, &shell),
+    );
+    try std.testing.expect(terminal.fullTranscriptScreenActive());
+    try std.testing.expect(shell.fullTranscriptActive());
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+
+    try handoffFullTranscriptToApproval(alloc, &terminal, &shell, &metrics);
+    try std.testing.expectEqual(
+        FullTranscriptLifecycleState.inactive,
+        fullTranscriptLifecycleState(&terminal, &shell),
+    );
+    try std.testing.expect(terminal.fileApprovalScreenActive());
+    try std.testing.expect(!shell.fullTranscriptActive());
+    try std.testing.expect(terminal.alternate_mouse_tracking_active);
+    try leaveApprovalScreen(&terminal, &shell, &metrics);
+    try std.testing.expect(!terminal.fileApprovalScreenActive());
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+
+    try openFullTranscript(alloc, &terminal, &shell, &metrics);
+    try std.testing.expect(terminal.fullTranscriptScreenActive());
+    try std.testing.expect(shell.fullTranscriptActive());
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+    shell.render_requests.clearReason(.footer);
+    try closeFullTranscript(alloc, &terminal, &shell, &metrics);
+    try closeFullTranscript(alloc, &terminal, &shell, &metrics);
+    try std.testing.expect(!terminal.fullTranscriptScreenActive());
+    try std.testing.expect(!shell.fullTranscriptActive());
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
+    try std.testing.expect(!shell.transcript_band_dirty);
+    try std.testing.expect(!shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(shell.render_requests.hasReason(.footer));
+
+    try openFullTranscript(alloc, &terminal, &shell, &metrics);
+    shell.layout.cols += 1;
+    shell.terminal_reset_pending = true;
+    shell.resize_history_row_delta = 12;
+    try closeFullTranscript(alloc, &terminal, &shell, &metrics);
+    try std.testing.expect(shell.transcript_band_dirty);
+    try std.testing.expect(shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(!shell.terminal_reset_pending);
+    try std.testing.expectEqual(@as(?i32, null), shell.resize_history_row_delta);
+    shell.layout.cols -= 1;
+    shell.transcript_band_dirty = false;
+    shell.render_requests.clearReason(.transcript);
+
+    try openFullTranscript(alloc, &terminal, &shell, &metrics);
+    shell.markTranscriptContentDirty();
+    try closeFullTranscript(alloc, &terminal, &shell, &metrics);
+    try std.testing.expect(shell.transcript_band_dirty);
+    try std.testing.expect(shell.render_requests.hasReason(.transcript));
+
+    shell.stdout_file.close(io_mod.getIo());
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 512);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\x1b[?1049h"));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\x1b[?1049l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006l"));
+}
+
+test "full transcript drift recovery is explicit and scoped to lifecycle" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const terminal_only_path = "terminal-only.out";
+    const terminal_only_file = try tmp.dir.createFile(io_mod.getIo(), terminal_only_path, .{ .truncate = true });
+    var terminal_only_shell = TranscriptRuntime{
+        .stdout_file = terminal_only_file,
+        .layout = .{
+            .rows = 4,
+            .cols = 16,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+    };
+    defer terminal_only_shell.deinit(alloc);
+    try terminal_only_shell.enableShadowVt(alloc);
+
+    var metrics = Metrics{};
+    var terminal_only = TerminalState{ .alternate_screen_owner = .full_transcript };
+    try std.testing.expectEqual(
+        FullTranscriptLifecycleState.terminal_only,
+        fullTranscriptLifecycleState(&terminal_only, &terminal_only_shell),
+    );
+    try std.testing.expect(try recoverFullTranscriptDriftBeforeRender(
+        alloc,
+        &terminal_only,
+        &terminal_only_shell,
+        &metrics,
+    ));
+    try std.testing.expectEqual(
+        FullTranscriptLifecycleState.inactive,
+        fullTranscriptLifecycleState(&terminal_only, &terminal_only_shell),
+    );
+    terminal_only_shell.stdout_file.close(io_mod.getIo());
+
+    var terminal_only_read = try tmp.dir.openFile(io_mod.getIo(), terminal_only_path, .{});
+    defer terminal_only_read.close(io_mod.getIo());
+    const terminal_only_bytes = try io_mod.readFileToEnd(alloc, &terminal_only_read, 64);
+    defer alloc.free(terminal_only_bytes);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(
+            u8,
+            terminal_only_bytes,
+            ui_terminal.alternate_screen_leave_sequence,
+        ),
+    );
+
+    const projection_only_path = "projection-only.out";
+    const projection_only_file = try tmp.dir.createFile(io_mod.getIo(), projection_only_path, .{ .truncate = true });
+    var projection_only_shell = TranscriptRuntime{
+        .stdout_file = projection_only_file,
+        .layout = terminal_only_shell.layout,
+    };
+    defer projection_only_shell.deinit(alloc);
+    try setFullTranscriptProjection(alloc, &projection_only_shell, .full);
+
+    var projection_only = TerminalState{};
+    try std.testing.expectEqual(
+        FullTranscriptLifecycleState.projection_only,
+        fullTranscriptLifecycleState(&projection_only, &projection_only_shell),
+    );
+    try std.testing.expect(try recoverFullTranscriptDriftBeforeRender(
+        alloc,
+        &projection_only,
+        &projection_only_shell,
+        &metrics,
+    ));
+    try std.testing.expectEqual(
+        FullTranscriptLifecycleState.inactive,
+        fullTranscriptLifecycleState(&projection_only, &projection_only_shell),
+    );
+    projection_only_shell.stdout_file.close(io_mod.getIo());
+
+    var projection_only_read = try tmp.dir.openFile(io_mod.getIo(), projection_only_path, .{});
+    defer projection_only_read.close(io_mod.getIo());
+    const projection_only_bytes = try io_mod.readFileToEnd(alloc, &projection_only_read, 64);
+    defer alloc.free(projection_only_bytes);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        std.mem.count(
+            u8,
+            projection_only_bytes,
+            ui_terminal.alternate_screen_leave_sequence,
+        ),
+    );
+}
+
+test "abnormal exit restoration leaves the alternate screen" {
+    try std.testing.expect(std.mem.startsWith(u8, abnormal_exit_restore, "\x1b[?2026l"));
+    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?2026l").? <
+        std.mem.indexOf(u8, abnormal_exit_restore, ui_terminal.alternate_screen_leave_sequence).?);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        normal_exit_restore,
+        ui_terminal.theme_notification_disable_sequence ++ "\x1b[?2026l",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1000l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1006l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1049l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?2031l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normal_exit_restore, "\x1b[?2031l") != null);
+}
+
+test "terminal keyboard stack restore stays paired with enable policy" {
+    try std.testing.expect(std.mem.find(u8, normalExitRestoreSequence(null), "\x1b[<u") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[<u") != null);
+
+    const tmux_restore = normalExitRestoreSequence("");
+    try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[<u") == null);
+    try std.testing.expect(std.mem.find(u8, tmux_abnormal_exit_restore, "\x1b[<u") == null);
+    try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[?2004l") != null);
+    try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[>4;0m") != null);
+}
+
+test "launch scrollback push creates top-of-viewport space" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "launch.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+    };
+    defer shell.deinit(alloc);
+
+    var metrics = Metrics{};
+    try pushLaunchRowsIntoScrollback(&shell, &metrics, 3);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 1024);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqualStrings("\x1b[24;1H\n\n\n", bytes);
+}
+
+test "prepare startup viewport uses scrollback setting for launch push only" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const enabled_path = "enabled.out";
+    const enabled_file = try tmp.dir.createFile(io_mod.getIo(), enabled_path, .{ .truncate = true });
+    var enabled_shell = TranscriptRuntime{
+        .stdout_file = enabled_file,
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+    };
+    defer enabled_shell.deinit(alloc);
+
+    var metrics = Metrics{};
+    var enabled_launch_row: u16 = 6;
+    const enabled_reservation = try prepareStartupViewport(&enabled_shell, &metrics, &enabled_launch_row, 11, true);
+    enabled_shell.stdout_file.close(io_mod.getIo());
+
+    var enabled_read = try tmp.dir.openFile(io_mod.getIo(), enabled_path, .{});
+    defer enabled_read.close(io_mod.getIo());
+    const enabled_bytes = try io_mod.readFileToEnd(alloc, &enabled_read, 1024);
+    defer alloc.free(enabled_bytes);
+
+    try std.testing.expectEqual(@as(u16, 1), enabled_launch_row);
+    try std.testing.expectEqual(@as(u16, 11), enabled_reservation);
+    try std.testing.expectEqualStrings("\x1b[24;1H\n\n\n\n\n", enabled_bytes);
+
+    const disabled_path = "disabled.out";
+    const disabled_file = try tmp.dir.createFile(io_mod.getIo(), disabled_path, .{ .truncate = true });
+    var disabled_shell = TranscriptRuntime{
+        .stdout_file = disabled_file,
+        .layout = enabled_shell.layout,
+    };
+    defer disabled_shell.deinit(alloc);
+
+    var disabled_launch_row: u16 = 6;
+    const disabled_reservation = try prepareStartupViewport(&disabled_shell, &metrics, &disabled_launch_row, 11, false);
+    disabled_shell.stdout_file.close(io_mod.getIo());
+
+    var disabled_read = try tmp.dir.openFile(io_mod.getIo(), disabled_path, .{});
+    defer disabled_read.close(io_mod.getIo());
+    const disabled_bytes = try io_mod.readFileToEnd(alloc, &disabled_read, 1024);
+    defer alloc.free(disabled_bytes);
+
+    try std.testing.expectEqual(@as(u16, 6), disabled_launch_row);
+    try std.testing.expectEqual(@as(u16, 11), disabled_reservation);
+    try std.testing.expectEqualStrings("", disabled_bytes);
+}
+
+test "shutdown cleanup erases from footer frame top after frame commit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "shutdown.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .sync_updates_enabled = false,
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .cursor_row = 6,
+        .cursor_col = 1,
+        .has_committed_frame = true,
+    };
+    defer shell.deinit(alloc);
+    shell.footer_viewport.has_frame = true;
+    shell.footer_viewport.geometry = .{
+        .top = 21,
+        .top_divider = 21,
+        .input_base = 22,
+        .bottom_divider = 23,
+        .hint = 24,
+    };
+
+    var metrics = Metrics{};
+    emitShutdownCleanupAndResume(&shell, &metrics);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 1024);
+    defer alloc.free(bytes);
+
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[6;1H\x1b[J") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[21;1H\x1b[J") != null);
+}
+
+test "startup credential modes select a refresh policy, never a narrower source set" {
+    const modes = std.meta.fields(CredentialLoadMode);
+    try std.testing.expectEqual(@as(usize, 2), modes.len);
+    try std.testing.expectEqualStrings("stored", modes[0].name);
+    try std.testing.expectEqualStrings("refresh_if_needed", modes[1].name);
+}
+
+test "loadStartupState applies core env overrides" {
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "FX_MODEL", .value = "  env-model  " },
+        .{ .key = "AI_GATEWAY_API_KEY", .value = "gateway-key" },
+        .{ .key = "FX_PERMISSION_MODE", .value = "auto" },
+        .{ .key = "FX_MAX_AGENT_STEPS", .value = "37" },
+    });
+    defer env.deinit();
+
+    var state = try loadStartupState(
+        std.testing.allocator,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        "default-model",
+        12,
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expect(state.workspace_root.len > 0);
+    try std.testing.expectEqualStrings("env-model", state.selected_model);
+    try std.testing.expectEqualStrings("default-model", state.configured_model);
+    try std.testing.expectEqual(config_runtime.ModelSource.process_override, state.model_source);
+    try std.testing.expect(!state.fast_mode);
+    try std.testing.expectEqualStrings("gateway-key", state.apiKey().?);
+    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
+    try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
+    try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
+}
+
+test "host-managed startup skips every local credential source" {
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "AI_GATEWAY_API_KEY", .value = "must-not-load" },
+    });
+    defer env.deinit();
+
+    var state = try loadStartupStateWithAuthMode(
+        std.testing.allocator,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        "default-model",
+        12,
+        .host_managed,
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(credentials.AuthMode.host_managed, state.auth_mode);
+    try std.testing.expect(state.credential == null);
+    try std.testing.expect(state.apiKey() == null);
+    try std.testing.expectEqual(credentials.CatalogAccess.host_managed, state.modelCatalogAccess());
+}
+
+test "loadStartupState defaults fast mode on only for the compiled Gateway default and requires bound explicit preferences" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "absent");
+    try tmp.dir.createDirPath(io_mod.getIo(), "configured");
+    try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
+    try tmp.dir.createDirPath(io_mod.getIo(), "legacy-fast");
+    try tmp.dir.createDirPath(io_mod.getIo(), "bound-fast");
+    try tmp.dir.createDirPath(io_mod.getIo(), "codex");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
+    defer std.testing.allocator.free(absent_root);
+    const configured_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "configured");
+    defer std.testing.allocator.free(configured_root);
+    const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
+    defer std.testing.allocator.free(disabled_root);
+    const legacy_fast_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "legacy-fast");
+    defer std.testing.allocator.free(legacy_fast_root);
+    const bound_fast_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "bound-fast");
+    defer std.testing.allocator.free(bound_fast_root);
+    const codex_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "codex");
+    defer std.testing.allocator.free(codex_root);
+
+    const fixture = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"model\":\"zai/glm-5.3\",\"fast_mode\":true}},\"{s}\":{{\"model\":\"provider/fast-toggle\",\"fast_mode\":true,\"fast_mode_model_bound\":true}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
+        .{ configured_root, disabled_root, legacy_fast_root, bound_fast_root, codex_root },
+    );
+    defer std.testing.allocator.free(fixture);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+
+    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+
+    var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "zai/glm-5.2", 25);
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("zai/glm-5.2", absent.selected_model);
+    try std.testing.expectEqualStrings("zai/glm-5.2", absent.configured_model);
+    try std.testing.expect(absent.fast_mode);
+    try std.testing.expect(absent.fast_mode_model_bound);
+
+    var configured = try loadStartupStateForWorkspace(std.testing.allocator, configured_root, "zai/glm-5.2", 25);
+    defer configured.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai/gpt-5", configured.selected_model);
+    try std.testing.expectEqualStrings("openai/gpt-5", configured.configured_model);
+    try std.testing.expect(!configured.fast_mode);
+    try std.testing.expect(!configured.fast_mode_model_bound);
+
+    var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "zai/glm-5.2", 25);
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expect(!disabled.fast_mode);
+    try std.testing.expect(!disabled.fast_mode_model_bound);
+
+    var legacy_fast = try loadStartupStateForWorkspace(std.testing.allocator, legacy_fast_root, "zai/glm-5.2", 25);
+    defer legacy_fast.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("zai/glm-5.3", legacy_fast.selected_model);
+    try std.testing.expect(legacy_fast.fast_mode);
+    try std.testing.expect(!legacy_fast.fast_mode_model_bound);
+
+    var bound_fast = try loadStartupStateForWorkspace(std.testing.allocator, bound_fast_root, "zai/glm-5.2", 25);
+    defer bound_fast.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("provider/fast-toggle", bound_fast.selected_model);
+    try std.testing.expect(bound_fast.fast_mode);
+    try std.testing.expect(bound_fast.fast_mode_model_bound);
+
+    var codex = try loadStartupStateForWorkspace(std.testing.allocator, codex_root, "zai/glm-5.2", 25);
+    defer codex.deinit(std.testing.allocator);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", codex.selected_model);
+    try std.testing.expect(!codex.fast_mode);
+}
+
+test "loadStartupState resolves startup scrollback default and explicit false" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "absent");
+    try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
+    defer std.testing.allocator.free(absent_root);
+    const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
+    defer std.testing.allocator.free(disabled_root);
+
+    const fixture = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n",
+        .{disabled_root},
+    );
+    defer std.testing.allocator.free(fixture);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+
+    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+
+    var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "default-model", 25);
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(absent.startup_scrollback);
+
+    var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "default-model", 25);
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expect(!disabled.startup_scrollback);
+}
+
+test "loadStartupState resolves slash menu categories default and explicit false" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+
+    var initial = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
+    defer initial.deinit(std.testing.allocator);
+    try std.testing.expect(initial.slash_menu_categories);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"slash_menu_categories\":false}\n");
+    var hidden = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
+    defer hidden.deinit(std.testing.allocator);
+    try std.testing.expect(!hidden.slash_menu_categories);
+}
+
+test "loadStartupState resolves max_agent_steps default zero and positive values" {
+    var env = try TestEnv.install(std.testing.allocator, &.{});
+    defer env.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "absent");
+    try tmp.dir.createDirPath(io_mod.getIo(), "zero");
+    try tmp.dir.createDirPath(io_mod.getIo(), "positive");
+    try writeFixtureFile(tmp.dir, "zero/.fx.json", "{\"max_agent_steps\":0}");
+    try writeFixtureFile(tmp.dir, "positive/.fx.json", "{\"max_agent_steps\":50}");
+
+    const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
+    defer std.testing.allocator.free(absent_root);
+    const zero_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "zero");
+    defer std.testing.allocator.free(zero_root);
+    const positive_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "positive");
+    defer std.testing.allocator.free(positive_root);
+
+    var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "default-model", agent_steps.default_max_agent_steps);
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expectEqual(agent_steps.default_max_agent_steps, absent.agent_step_limit);
+
+    var zero = try loadStartupStateForWorkspace(std.testing.allocator, zero_root, "default-model", agent_steps.default_max_agent_steps);
+    defer zero.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), zero.agent_step_limit);
+
+    var positive = try loadStartupStateForWorkspace(std.testing.allocator, positive_root, "default-model", agent_steps.default_max_agent_steps);
+    defer positive.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 50), positive.agent_step_limit);
+}
+
+test "loadStartupState resolves max_tool_result_bytes default and explicit values" {
+    var env = try TestEnv.install(std.testing.allocator, &.{});
+    defer env.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "absent");
+    try tmp.dir.createDirPath(io_mod.getIo(), "explicit");
+    try writeFixtureFile(tmp.dir, "explicit/.fx.json", "{\"max_tool_result_bytes\":131072}");
+
+    const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
+    defer std.testing.allocator.free(absent_root);
+    const explicit_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "explicit");
+    defer std.testing.allocator.free(explicit_root);
+
+    var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "default-model", 25);
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expectEqual(tool_result_limits.default_max_tool_result_bytes, absent.max_tool_result_bytes);
+
+    var explicit = try loadStartupStateForWorkspace(std.testing.allocator, explicit_root, "default-model", 25);
+    defer explicit.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 131072), explicit.max_tool_result_bytes);
+}
+
+test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
+    var env = try TestEnv.install(std.testing.allocator, &.{});
+    defer env.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"first_call_tool_choice\":\"required\"}");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var state = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(types.ToolChoice.auto, state.first_call_tool_choice);
+}
+
+test "loadStartupState diagnoses the retired fuzzy skill setting" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"skill_match_fuzzy\":true}");
+
+    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
+
+    var state = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), state.config_diagnostics.len);
+    try std.testing.expectEqual(config_runtime.ConfigDiagnosticCause.retired_skill_match_fuzzy, state.config_diagnostics[0].cause);
+}
+
+test "credential onboarding can be skipped independently from Keychain" {
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "FX_SKIP_ONBOARDING", .value = "1" },
+        .{ .key = "FX_DISABLE_KEYCHAIN", .value = "1" },
+    });
+    defer env.deinit();
+
+    const onboarding_skipped = credentialOnboardingDisabled();
+    try std.testing.expect(onboarding_skipped);
 }
 
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {

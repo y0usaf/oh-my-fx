@@ -59,6 +59,7 @@ pub const Boundary = enum {
     before_recovery_prior_validation,
     after_recovery_latest_snapshot,
     before_recovery_latest_publication,
+    before_read_boundary_validation,
     latest_barrier_contended,
     latest_barrier_completed,
 };
@@ -98,6 +99,10 @@ pub const OpenMode = enum {
 };
 
 pub const CommitPosition = session_replay.CommitPosition;
+
+test {
+    _ = session_replay;
+}
 
 pub const FailedTailDisposition = enum {
     retry_expected_tail,
@@ -454,6 +459,23 @@ pub const CommitLifecycle = struct {
         }
     }
 
+    fn prepareRequired(
+        self: *CommitLifecycle,
+        alloc: Allocator,
+        session_id: []const u8,
+        workspace_root: []const u8,
+        commit_lock_deadline_ms: u64,
+    ) !bool {
+        try self.prepare(
+            alloc,
+            session_id,
+            workspace_root,
+            workspace_root,
+            commit_lock_deadline_ms,
+        );
+        return false;
+    }
+
     fn prepareOpportunistic(
         self: *CommitLifecycle,
         alloc: Allocator,
@@ -686,10 +708,12 @@ pub const LoadedWritableSession = struct {
         failed_tail: FailedTailDisposition,
         options: Options,
     ) !CommitPosition {
-        const usage_sidecar_bytes = if (state.usage) |usage|
+        var replacement = state;
+        replacement.subagent_child = self.state.subagent_child;
+        const usage_sidecar_bytes = if (replacement.usage) |usage|
             encodeUsageSidecarBestEffort(
                 alloc,
-                state.id,
+                replacement.id,
                 usage,
             )
         else
@@ -699,7 +723,7 @@ pub const LoadedWritableSession = struct {
         const same_workspace = std.mem.eql(
             u8,
             self.state.workspace_root,
-            state.workspace_root,
+            replacement.workspace_root,
         );
         const may_defer_cache = same_workspace and switch (reason) {
             .compaction, .log_compaction => true,
@@ -708,13 +732,13 @@ pub const LoadedWritableSession = struct {
         const cache_deferred = if (may_defer_cache)
             try self.prepareCommitLifecycleOpportunistic(alloc, options)
         else blk: {
-            try self.prepareCommitLifecycle(alloc, state.workspace_root, options);
+            try self.prepareCommitLifecycle(alloc, replacement.workspace_root, options);
             break :blk false;
         };
         _ = commitStateReplacementImpl(
             self,
             alloc,
-            state,
+            replacement,
             reason,
             failed_tail,
             options,
@@ -989,6 +1013,14 @@ noinline fn failLoadedWritableSessionDynamic(err: anyerror) anyerror!LoadedWrita
     return err;
 }
 
+test "large session errors preserve their exact error type and identity" {
+    const result = failLoadedWritableSession(error.NoSavedSessions);
+    try std.testing.expect(
+        @TypeOf(result) == error{NoSavedSessions}!LoadedWritableSession,
+    );
+    try std.testing.expectError(error.NoSavedSessions, result);
+}
+
 pub const Root = struct {
     sessions: ?io_mod.VerifiedDir,
     display_root: []u8,
@@ -1170,14 +1202,23 @@ pub const Root = struct {
         };
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(alloc);
+        var cache_deferred = false;
         if (lifecycle_value) |*value| {
-            value.prepare(
-                alloc,
-                initial_state.id,
-                initial_state.workspace_root,
-                initial_state.workspace_root,
-                options.commit_lock_deadline_ms,
-            ) catch |err| {
+            const preparation = if (initial_state.history.len == 0)
+                value.prepareOpportunistic(
+                    alloc,
+                    initial_state.id,
+                    initial_state.workspace_root,
+                    options.commit_lock_deadline_ms,
+                )
+            else
+                value.prepareRequired(
+                    alloc,
+                    initial_state.id,
+                    initial_state.workspace_root,
+                    options.commit_lock_deadline_ms,
+                );
+            cache_deferred = preparation catch |err| {
                 writable.deinit(alloc);
                 writable_owned = false;
                 sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
@@ -1206,11 +1247,38 @@ pub const Root = struct {
             options,
         );
         writable_owned = false;
-        errdefer created.deinit(alloc);
+        var created_owned = true;
+        errdefer if (created_owned) created.deinit(alloc);
         if (lifecycle_value) |value| {
             try created.installCommitLifecycle(value);
             lifecycle_value = null;
-            if (!created.publishCommitLifecycle(alloc)) {
+            if (cache_deferred) {
+                created.writeDeferredCommitLifecycle(
+                    alloc,
+                    created.position,
+                ) catch |err| {
+                    created.deinit(alloc);
+                    created_owned = false;
+                    sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=deferred_session_cleanup_failed err={s}",
+                            .{@errorName(cleanup_err)},
+                        );
+                        return cleanup_err;
+                    };
+                    io_mod.syncVerifiedDir(sessions.dir) catch |cleanup_err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=deferred_session_cleanup_sync_failed err={s}",
+                            .{@errorName(cleanup_err)},
+                        );
+                        return cleanup_err;
+                    };
+                    return err;
+                };
+                created.state_replacement_pending = true;
+            } else if (!created.publishCommitLifecycle(alloc)) {
                 created.state_replacement_pending = true;
             }
         }
@@ -1266,7 +1334,8 @@ pub const Root = struct {
             },
             else => return err,
         };
-        defer lock.release();
+        var lock_held = true;
+        defer if (lock_held) lock.release();
         try requireIntentAbsent(alloc, &session_dir, authority_intent_file);
         var marker = try loadAuthority(alloc, &session_dir, session_id);
         defer marker.deinit(alloc);
@@ -1274,17 +1343,24 @@ pub const Root = struct {
         var log_file = try openManagedFile(&session_dir, events_file, .read_only);
         errdefer log_file.close(io_mod.getIo());
         const generation = try session_replay.readFirstGeneration(alloc, log_file);
-        const position = try loadAndValidateWatermark(
+        const position = try loadWatermarkPosition(
             alloc,
             &session_dir,
             session_id,
             generation,
-            log_file,
         );
-        const usage_sidecar = try session_usage_sidecar.capture(
+        var usage_sidecar = try session_usage_sidecar.capture(
             alloc,
             &session_dir,
         );
+        errdefer usage_sidecar.deinit(alloc);
+        // The watermark and open handle preserve the committed prefix across
+        // later appends or a generation rename. Validate it without blocking writers.
+        lock.release();
+        lock_held = false;
+
+        try options.test_controls.boundary(.before_read_boundary_validation);
+        _ = try session_replay.scanCommitPosition(alloc, log_file, position);
         return .{
             .log_file = log_file,
             .position = position,
@@ -1317,6 +1393,30 @@ pub const Root = struct {
             );
         }
         return state;
+    }
+
+    /// Reads the immutable child-privacy bit from the first event without
+    /// replaying history or acquiring the commit lock. State replacement and
+    /// compaction preserve this bit for the lifetime of the session.
+    pub fn loadSubagentChildIdentity(
+        self: *const Root,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !bool {
+        var sessions = self.sessions orelse return error.SessionNotFound;
+        try session_layout.validateSessionId(session_id);
+        var session_dir = openSessionDir(
+            &sessions,
+            session_id,
+            .read_only,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.SessionNotFound,
+            else => return err,
+        };
+        defer session_dir.close();
+        var log_file = try openManagedFile(&session_dir, events_file, .read_only);
+        defer log_file.close(io_mod.getIo());
+        return session_replay.readSubagentChildIdentity(alloc, log_file);
     }
 
     pub fn admitResumeView(
@@ -2162,6 +2262,7 @@ fn createNativeSession(
             .conversation_language = initial_state.conversation_language,
             .preferences = initial_state.preferences,
             .usage = initial_state.usage orelse synthesized_usage.?,
+            .subagent_child = initial_state.subagent_child,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -4154,6 +4255,7 @@ fn compactCanonicalLog(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
+            .subagent_child = loaded.state.subagent_child,
         } },
     };
     const first_line = try session_event.encodeFrame(alloc, session_started);
@@ -4322,6 +4424,7 @@ fn makeCleanupCandidatesForTest(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
+            .subagent_child = loaded.state.subagent_child,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -4562,6 +4665,19 @@ fn validateOrphanTemp(
     );
 }
 
+const BoundaryFailure = struct {
+    target: Boundary,
+
+    fn hit(raw: ?*anyopaque, point: Boundary) !void {
+        const self: *BoundaryFailure = @ptrCast(@alignCast(raw.?));
+        if (point == self.target) return error.InjectedBoundaryFailure;
+    }
+
+    fn test_controls(self: *BoundaryFailure) TestControls {
+        return .{ .context = self, .boundary_fn = hit };
+    }
+};
+
 const LockTrace = struct {
     items: [16]LockKind = undefined,
     len: usize = 0,
@@ -4576,6 +4692,80 @@ const LockTrace = struct {
         return .{ .context = self, .lock_fn = record };
     }
 };
+
+const TempRoot = struct {
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    root: Root,
+
+    fn init(alloc: Allocator) !TempRoot {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        errdefer alloc.free(home);
+        var root = try Root.initFromHome(alloc, home, .writable);
+        errdefer root.deinit(alloc);
+        return .{ .tmp = tmp, .home = home, .root = root };
+    }
+
+    fn deinit(self: *TempRoot, alloc: Allocator) void {
+        self.root.deinit(alloc);
+        alloc.free(self.home);
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+};
+
+test "root init rejects symlinked durable and sessions roots" {
+    const alloc = std.testing.allocator;
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home");
+        try tmp.dir.createDirPath(io_mod.getIo(), "outside");
+        tmp.dir.symLink(
+            io_mod.getIo(),
+            "../outside",
+            "home/.fx",
+            .{ .is_directory = true },
+        ) catch |err| switch (err) {
+            error.AccessDenied => return error.SkipZigTest,
+            else => return err,
+        };
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+
+        try std.testing.expectError(
+            error.SessionPathUnsafe,
+            Root.initFromHome(alloc, home, .writable),
+        );
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        try tmp.dir.createDirPath(io_mod.getIo(), "outside");
+        tmp.dir.symLink(
+            io_mod.getIo(),
+            "../../outside",
+            "home/.fx/sessions",
+            .{ .is_directory = true },
+        ) catch |err| switch (err) {
+            error.AccessDenied => return error.SkipZigTest,
+            else => return err,
+        };
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+
+        try std.testing.expectError(
+            error.SessionPathUnsafe,
+            Root.initFromHome(alloc, home, .writable),
+        );
+    }
+}
 
 fn testState(alloc: Allocator, id: []const u8, updated_at_ms: i64) !session_codec.DurableSessionState {
     return .{
@@ -4594,6 +4784,14 @@ fn testState(alloc: Allocator, id: []const u8, updated_at_ms: i64) !session_code
         .total_input_tokens = 0,
         .total_output_tokens = 0,
     };
+}
+
+fn stateWithTurn(
+    alloc: Allocator,
+    prior: session_codec.DurableSessionState,
+    updated_at_ms: i64,
+) !session_codec.DurableSessionState {
+    return stateWithPrompt(alloc, prior, updated_at_ms, "hello", "world");
 }
 
 fn stateWithPrompt(
@@ -4616,6 +4814,1028 @@ fn stateWithPrompt(
     return next;
 }
 
+const PendingReplacementTestPositions = struct {
+    prior: CommitPosition,
+    proposed: CommitPosition,
+};
+
+fn leavePendingReplacementForTest(
+    alloc: Allocator,
+    loaded: *LoadedWritableSession,
+    updated_at_ms: i64,
+) !PendingReplacementTestPositions {
+    var replacement = try stateWithTurn(alloc, loaded.state, updated_at_ms);
+    defer replacement.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_target_namespace_sync };
+    try std.testing.expectError(
+        error.SessionCommitIndeterminate,
+        loaded.commitStateReplacement(
+            alloc,
+            replacement,
+            .recovery,
+            .retry_expected_tail,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+    const failed = loaded.degradedTail() orelse return error.TestUnexpectedResult;
+    return .{ .prior = failed.prior, .proposed = failed.proposed };
+}
+
+fn replaceFrameByteForTest(
+    alloc: Allocator,
+    log: std.Io.File,
+    frame_offset: u64,
+    boundary: u64,
+    needle: []const u8,
+    replacement: u8,
+) !void {
+    const line = try session_replay.readLineAt(
+        alloc,
+        log,
+        frame_offset,
+        boundary,
+    ) orelse return error.TestUnexpectedResult;
+    defer alloc.free(line.bytes);
+    const match = std.mem.find(u8, line.bytes, needle) orelse
+        return error.TestUnexpectedResult;
+    line.bytes[match + needle.len - 1] = replacement;
+    try log.writePositionalAll(io_mod.getIo(), line.bytes, frame_offset);
+    try log.sync(io_mod.getIo());
+}
+
+fn corruptReplacementCommitTimestampForTest(
+    alloc: Allocator,
+    loaded: *LoadedWritableSession,
+    positions: PendingReplacementTestPositions,
+) !void {
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
+    defer log.close(io_mod.getIo());
+    var offset = positions.prior.through_event_log_bytes;
+    while (offset < positions.proposed.through_event_log_bytes) {
+        const line = try session_replay.readLineAt(
+            alloc,
+            log,
+            offset,
+            positions.proposed.through_event_log_bytes,
+        ) orelse return error.TestUnexpectedResult;
+        defer alloc.free(line.bytes);
+        var envelope = try session_event.decodeFrame(alloc, line.bytes);
+        defer envelope.deinit(alloc);
+        if (envelope.kind() == .state_replacement_committed) {
+            const needle = "\"timestamp_ms\":20";
+            const match = std.mem.find(u8, line.bytes, needle) orelse
+                return error.TestUnexpectedResult;
+            line.bytes[match + needle.len - 1] = '1';
+            try log.writePositionalAll(io_mod.getIo(), line.bytes, offset);
+            try log.sync(io_mod.getIo());
+            return;
+        }
+        offset = line.next_offset;
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptReplacementChunkSchemaForTest(
+    alloc: Allocator,
+    loaded: *LoadedWritableSession,
+    positions: PendingReplacementTestPositions,
+) !void {
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
+    defer log.close(io_mod.getIo());
+    const start = try session_replay.readLineAt(
+        alloc,
+        log,
+        positions.prior.through_event_log_bytes,
+        positions.proposed.through_event_log_bytes,
+    ) orelse return error.TestUnexpectedResult;
+    defer alloc.free(start.bytes);
+    try replaceFrameByteForTest(
+        alloc,
+        log,
+        start.next_offset,
+        positions.proposed.through_event_log_bytes,
+        "\"schema_version\":1",
+        '9',
+    );
+}
+
+const PublicationBytesSnapshot = struct {
+    events: []u8,
+    watermark: []u8,
+    intent: []u8,
+
+    fn deinit(self: *PublicationBytesSnapshot, alloc: Allocator) void {
+        alloc.free(self.events);
+        alloc.free(self.watermark);
+        alloc.free(self.intent);
+        self.* = undefined;
+    }
+
+    fn expectEqual(self: PublicationBytesSnapshot, other: PublicationBytesSnapshot) !void {
+        try std.testing.expectEqualSlices(u8, self.events, other.events);
+        try std.testing.expectEqualSlices(u8, self.watermark, other.watermark);
+        try std.testing.expectEqualSlices(u8, self.intent, other.intent);
+    }
+};
+
+fn capturePublicationBytesForTest(
+    alloc: Allocator,
+    root: *Root,
+    session_id: []const u8,
+    generation: Identifier,
+) !PublicationBytesSnapshot {
+    var dir = try openSessionDir(&root.sessions.?, session_id, .read_only);
+    defer dir.close();
+    var log = try openManagedFile(&dir, events_file, .read_only);
+    defer log.close(io_mod.getIo());
+    const events = try io_mod.readFileToEnd(alloc, &log, 16 * 1024 * 1024);
+    errdefer alloc.free(events);
+    const name = try watermarkName(alloc, generation);
+    defer alloc.free(name);
+    const watermark = try readManagedFileAlloc(alloc, &dir, name, watermark_max_bytes);
+    errdefer alloc.free(watermark);
+    const intent = try readManagedFileAlloc(
+        alloc,
+        &dir,
+        publication_intent_file,
+        publication_intent_max_bytes,
+    );
+    return .{ .events = events, .watermark = watermark, .intent = intent };
+}
+
+test "state replacement uses the durable state timestamp for every frame" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-replacement-timestamp", 10);
+    defer initial.deinit(alloc);
+
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const first_replacement_byte = loaded.position.through_event_log_bytes;
+    var replacement = try stateWithTurn(alloc, loaded.state, 4242);
+    defer replacement.deinit(alloc);
+
+    const committed = try loaded.commitStateReplacement(
+        alloc,
+        replacement,
+        .recovery,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expectEqual(@as(i64, 4242), loaded.state.updated_at_ms);
+
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_only);
+    defer log.close(io_mod.getIo());
+    var offset = first_replacement_byte;
+    var frame_count: usize = 0;
+    while (offset < committed.through_event_log_bytes) {
+        const line = try session_replay.readLineAt(
+            alloc,
+            log,
+            offset,
+            committed.through_event_log_bytes,
+        ) orelse return error.TestUnexpectedResult;
+        defer alloc.free(line.bytes);
+        var envelope = try session_event.decodeFrame(alloc, line.bytes);
+        defer envelope.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, 4242), envelope.timestamp_ms);
+        offset = line.next_offset;
+        frame_count += 1;
+    }
+    try std.testing.expect(frame_count >= 3);
+
+    var replayed = try session_replay.replayBoundary(alloc, log, committed);
+    defer replayed.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 4242), replayed.updated_at_ms);
+}
+
+test "usage sidecar restores exact optional metrics after read-only and writable resume" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-usage-sidecar-resume", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    const sequence = try usage.reserveInvocation();
+    try usage.finishObservedInvocation(
+        alloc,
+        sequence,
+        7,
+        .observed_generation,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    try usage.applyGeneration(alloc, .{
+        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .model = "provider/model",
+        .total_cost = 0.02,
+        .input_tokens = 20,
+        .output_tokens = 5,
+        .cache_read_tokens = 4,
+        .cache_write_tokens = 1,
+        .reasoning_tokens = 3,
+        .billable_web_search_calls = 0,
+    });
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .usage_checkpointed = .{ .usage = snapshot } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        21,
+        .retry_expected_tail,
+        .{},
+    );
+    loaded.deinit(alloc);
+
+    var read_only = try temp.root.loadReadOnly(
+        alloc,
+        initial.id,
+        .{},
+    );
+    defer read_only.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 1), read_only.usage.?.request_count);
+    try std.testing.expectEqual(@as(?u64, 3), read_only.usage.?.reasoning_tokens);
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        read_only.usage.?.models[0].request_count,
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 3),
+        read_only.usage.?.models[0].reasoning_tokens,
+    );
+
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 1), resumed.state.usage.?.request_count);
+    try std.testing.expectEqual(@as(?u64, 3), resumed.state.usage.?.reasoning_tokens);
+}
+
+test "failed canonical append leaves the previous usage sidecar unchanged" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-usage-sidecar-append-failure", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const before = try readManagedFileAlloc(
+        alloc,
+        &loaded.log.dir,
+        session_usage_sidecar.sidecar_file,
+        session_usage_sidecar.max_sidecar_bytes,
+    );
+    defer alloc.free(before);
+
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    const sequence = try usage.reserveInvocation();
+    usage.finishInvocation(sequence, 1, .unbilled);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_event_append };
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.appendEvent(
+            alloc,
+            .{ .usage_checkpointed = .{ .usage = snapshot } },
+            20,
+            .rollback_before_adapter_continue,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+
+    const after = try readManagedFileAlloc(
+        alloc,
+        &loaded.log.dir,
+        session_usage_sidecar.sidecar_file,
+        session_usage_sidecar.max_sidecar_bytes,
+    );
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "usage sidecar publication stays inside the canonical commit boundary" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-usage-sidecar-commit-pair", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    const Probe = struct {
+        root: *Root,
+        alloc: Allocator,
+        session_id: []const u8,
+        read_blocked: bool = false,
+        read_succeeded: bool = false,
+
+        fn boundary(raw: ?*anyopaque, point: Boundary) !void {
+            if (point != .before_usage_sidecar_write) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            var state = self.root.loadReadOnly(
+                self.alloc,
+                self.session_id,
+                .{ .commit_lock_deadline_ms = 0 },
+            ) catch |err| {
+                self.read_blocked =
+                    err == error.SessionCommitBoundaryUnavailable;
+                return;
+            };
+            state.deinit(self.alloc);
+            self.read_succeeded = true;
+        }
+    };
+    var probe = Probe{
+        .root = &temp.root,
+        .alloc = alloc,
+        .session_id = initial.id,
+    };
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    const sequence = try usage.reserveInvocation();
+    usage.finishInvocation(sequence, 1, .unbilled);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .usage_checkpointed = .{ .usage = snapshot } },
+        20,
+        .retry_expected_tail,
+        .{ .test_controls = .{
+            .context = &probe,
+            .boundary_fn = Probe.boundary,
+        } },
+    );
+    try std.testing.expect(probe.read_blocked);
+    try std.testing.expect(!probe.read_succeeded);
+
+    var read_only = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer read_only.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), read_only.usage.?.next_sequence);
+    try std.testing.expectEqual(@as(usize, 0), read_only.usage.?.incidents.len);
+}
+
+test "torn exact settlement restores stale sidecar backlog over settled rollback" {
+    const Checkpoint = struct {
+        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
+    };
+    const RejectPublication = struct {
+        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            if (event == .generation) return error.InjectedPublicationFailure;
+        }
+    };
+    const PublicationProbe = struct {
+        generations: usize = 0,
+
+        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .generation) self.generations += 1;
+        }
+    };
+    const TearSidecar = struct {
+        dir: *io_mod.VerifiedDir,
+        torn: bool = false,
+        const stale_file = "usage-v2.stale-test";
+
+        fn boundary(raw: ?*anyopaque, point: Boundary) !void {
+            if (point != .before_usage_sidecar_write) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.dir.dir.rename(
+                session_usage_sidecar.sidecar_file,
+                self.dir.dir,
+                stale_file,
+                io_mod.getIo(),
+            );
+            try self.dir.dir.createDir(
+                io_mod.getIo(),
+                session_usage_sidecar.sidecar_file,
+                std.Io.File.Permissions.fromMode(0o700),
+            );
+            self.torn = true;
+        }
+
+        fn restore(self: *@This()) !void {
+            try self.dir.dir.deleteDir(
+                io_mod.getIo(),
+                session_usage_sidecar.sidecar_file,
+            );
+            try self.dir.dir.rename(
+                stale_file,
+                self.dir.dir,
+                session_usage_sidecar.sidecar_file,
+                io_mod.getIo(),
+            );
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-usage-torn-exact", 10);
+    defer initial.deinit(alloc);
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        const completion: types.ModelCompletion = .{
+            .generation_id = "response-torn-log",
+            .billing = .{
+                .created_at_ms = 100,
+                .model = "codex/gpt-test",
+                .total_cost = 0,
+                .input_tokens = 17,
+                .output_tokens = 7,
+                .cache_read_tokens = 2,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = 1,
+                .billable_web_search_calls = 0,
+            },
+        };
+
+        var checkpoint_context: u8 = 0;
+        var publication_context: u8 = 0;
+        var bridge = session_usage.Usage.initFresh();
+        defer bridge.deinit(alloc);
+        bridge.configureCheckpointSink(.{
+            .context = &checkpoint_context,
+            .allocator = alloc,
+            .persist = Checkpoint.persist,
+        });
+        bridge.configurePublicationSink(.{
+            .context = &publication_context,
+            .allocator = alloc,
+            .publish = RejectPublication.publish,
+        });
+        const bridge_observation = try session_usage.InvocationObservation.begin(&bridge);
+        try bridge_observation.complete(alloc, completion, .{ .exact = .codex });
+        var bridge_snapshot = try bridge.snapshot(alloc);
+        defer bridge_snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), bridge_snapshot.pending.len);
+        try std.testing.expectEqual(@as(usize, 1), bridge_snapshot.publication_backlog.len);
+        _ = try loaded.appendEvent(
+            alloc,
+            .{ .usage_checkpointed = .{ .usage = bridge_snapshot } },
+            20,
+            .retry_expected_tail,
+            .{},
+        );
+
+        var settled = session_usage.Usage.initFresh();
+        defer settled.deinit(alloc);
+        const settled_observation = try session_usage.InvocationObservation.begin(&settled);
+        try settled_observation.complete(alloc, completion, .{ .exact = .codex });
+        var settled_snapshot = try settled.snapshot(alloc);
+        defer settled_snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 17), settled_snapshot.input_tokens);
+        try std.testing.expectEqual(@as(usize, 0), settled_snapshot.pending.len);
+
+        var tear = TearSidecar{ .dir = &loaded.log.dir };
+        _ = try loaded.appendEvent(
+            alloc,
+            .{ .usage_checkpointed = .{ .usage = settled_snapshot } },
+            30,
+            .retry_expected_tail,
+            .{ .test_controls = .{
+                .context = &tear,
+                .boundary_fn = TearSidecar.boundary,
+            } },
+        );
+        try std.testing.expect(tear.torn);
+        try tear.restore();
+    }
+
+    var read_only = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer read_only.deinit(alloc);
+    const recovered = read_only.usage.?;
+    try std.testing.expectEqual(@as(u64, 17), recovered.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), recovered.output_tokens);
+    try std.testing.expectEqual(@as(?u64, null), recovered.request_count);
+    try std.testing.expectEqual(@as(usize, 0), recovered.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.publication_backlog.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.incidents.len);
+
+    var publication = PublicationProbe{};
+    var resumed = session_usage.Usage.initFresh();
+    defer resumed.deinit(alloc);
+    resumed.configurePublicationSink(.{
+        .context = &publication,
+        .allocator = alloc,
+        .publish = PublicationProbe.publish,
+    });
+    try resumed.restore(alloc, recovered, 1);
+    var final = try resumed.snapshot(alloc);
+    defer final.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), publication.generations);
+    try std.testing.expectEqual(@as(u64, 17), final.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), final.output_tokens);
+    try std.testing.expectEqual(@as(?u64, null), final.request_count);
+    try std.testing.expectEqual(@as(usize, 0), final.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), final.publication_backlog.len);
+}
+
+test "indeterminate canonical usage retry repairs the rich sidecar" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-usage-sidecar-retry", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    const sequence = try usage.reserveInvocation();
+    try usage.finishObservedInvocation(
+        alloc,
+        sequence,
+        7,
+        .observed_generation,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    try usage.applyGeneration(alloc, .{
+        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .model = "provider/model",
+        .total_cost = 0.02,
+        .input_tokens = 20,
+        .output_tokens = 5,
+        .cache_read_tokens = 4,
+        .cache_write_tokens = 1,
+        .reasoning_tokens = 3,
+        .billable_web_search_calls = 0,
+    });
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    var current = try loaded.state.dupe(alloc);
+    defer current.deinit(alloc);
+    if (current.usage) |*prior| prior.deinit(alloc);
+    current.usage = try session_usage.dupeSnapshotOwned(alloc, snapshot);
+    current.updated_at_ms = 20;
+
+    var failure = BoundaryFailure{ .target = .after_target_namespace_sync };
+    try std.testing.expectError(
+        error.SessionCommitIndeterminate,
+        loaded.appendEvent(
+            alloc,
+            .{ .usage_checkpointed = .{ .usage = snapshot } },
+            20,
+            .retry_expected_tail,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+    try loaded.retryDegradedWithStateReplacement(alloc, current, .{});
+    try std.testing.expectEqual(@as(?u64, 1), loaded.state.usage.?.request_count);
+    try std.testing.expectEqual(@as(?u64, 3), loaded.state.usage.?.reasoning_tokens);
+    loaded.deinit(alloc);
+
+    var read_only = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer read_only.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 1), read_only.usage.?.request_count);
+    try std.testing.expectEqual(@as(?u64, 3), read_only.usage.?.reasoning_tokens);
+    try std.testing.expectEqual(@as(usize, 0), read_only.usage.?.incidents.len);
+}
+
+test "unwritable usage sidecar keeps canonical usage resumable and incomplete" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-usage-sidecar-failure", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+
+    try loaded.log.dir.dir.deleteFile(
+        io_mod.getIo(),
+        session_usage_sidecar.sidecar_file,
+    );
+    try loaded.log.dir.dir.createDir(
+        io_mod.getIo(),
+        session_usage_sidecar.sidecar_file,
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    const sequence = try usage.reserveInvocation();
+    try usage.finishObservedInvocation(
+        alloc,
+        sequence,
+        7,
+        .observed_generation,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    try usage.applyGeneration(alloc, .{
+        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .model = "provider/model",
+        .total_cost = 0.02,
+        .input_tokens = 20,
+        .output_tokens = 5,
+        .cache_read_tokens = 4,
+        .cache_write_tokens = 1,
+        .reasoning_tokens = 3,
+        .billable_web_search_calls = 0,
+    });
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .usage_checkpointed = .{ .usage = snapshot } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    loaded.deinit(alloc);
+
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0.02),
+        resumed.state.usage.?.total_cost,
+        1e-12,
+    );
+    try std.testing.expect(resumed.state.usage.?.request_count == null);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        resumed.state.usage.?.incidents.len,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 20),
+        resumed.state.usage.?.incidents[0].occurred_at_ms,
+    );
+}
+
+test "writable recovery rolls an invalid replacement back to its valid prior" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-invalid-replacement-recovery", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    var loaded_owned = true;
+    defer if (loaded_owned) loaded.deinit(alloc);
+    const positions = try leavePendingReplacementForTest(alloc, &loaded, 20);
+    try corruptReplacementCommitTimestampForTest(alloc, &loaded, positions);
+    loaded.deinit(alloc);
+    loaded_owned = false;
+
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    try std.testing.expect(positionsEqual(positions.prior, resumed.position));
+    try std.testing.expectEqual(@as(usize, 0), resumed.state.history.len);
+    try std.testing.expectEqual(
+        positions.prior.through_event_log_bytes,
+        try resumed.log.eventLogLengthForTest(),
+    );
+    try std.testing.expect(!(try resumed.log.entryExistsForTest(publication_intent_file)));
+    resumed.deinit(alloc);
+
+    var repeated = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer repeated.deinit(alloc);
+    try std.testing.expect(positionsEqual(positions.prior, repeated.position));
+    try std.testing.expectEqual(@as(usize, 0), repeated.state.history.len);
+}
+
+test "publication recovery preserves bytes on reader and resource failures" {
+    const RecoveryFailure = struct {
+        target: Boundary,
+        failure: anyerror,
+
+        fn hit(raw: ?*anyopaque, point: Boundary) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (point == self.target) return self.failure;
+        }
+
+        fn testControls(self: *@This()) TestControls {
+            return .{ .context = self, .boundary_fn = hit };
+        }
+    };
+    const rows = [_]struct {
+        id: []const u8,
+        target: Boundary,
+        failure: anyerror,
+        current_at_prior: bool = false,
+    }{
+        .{
+            .id = "session-proposed-read-failure",
+            .target = .before_recovery_proposed_validation,
+            .failure = error.ReadFailed,
+        },
+        .{
+            .id = "session-prior-read-failure",
+            .target = .before_recovery_prior_validation,
+            .failure = error.ReadFailed,
+        },
+        .{
+            .id = "session-proposed-resource-failure",
+            .target = .before_recovery_proposed_validation,
+            .failure = error.OutOfMemory,
+        },
+        .{
+            .id = "session-current-prior-read-failure",
+            .target = .before_recovery_prior_validation,
+            .failure = error.ReadFailed,
+            .current_at_prior = true,
+        },
+    };
+
+    for (rows) |row| {
+        const alloc = std.testing.allocator;
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, row.id, 10);
+        defer initial.deinit(alloc);
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded_owned = true;
+        defer if (loaded_owned) loaded.deinit(alloc);
+        const positions = try leavePendingReplacementForTest(alloc, &loaded, 20);
+        if (row.current_at_prior) {
+            const watermark = try encodeWatermark(alloc, initial.id, positions.prior);
+            defer alloc.free(watermark);
+            const name = try watermarkName(alloc, positions.prior.log_generation);
+            defer alloc.free(name);
+            try durableReplace(alloc, &loaded.log.dir, name, watermark);
+        } else {
+            try corruptReplacementCommitTimestampForTest(alloc, &loaded, positions);
+        }
+        loaded.deinit(alloc);
+        loaded_owned = false;
+        var before = try capturePublicationBytesForTest(
+            alloc,
+            &temp.root,
+            initial.id,
+            positions.proposed.log_generation,
+        );
+        defer before.deinit(alloc);
+        var failure = RecoveryFailure{ .target = row.target, .failure = row.failure };
+
+        try std.testing.expectError(
+            row.failure,
+            temp.root.resumeForWrite(
+                alloc,
+                initial.id,
+                .{ .test_controls = failure.testControls() },
+            ),
+        );
+        var after = try capturePublicationBytesForTest(
+            alloc,
+            &temp.root,
+            initial.id,
+            positions.proposed.log_generation,
+        );
+        defer after.deinit(alloc);
+        try before.expectEqual(after);
+    }
+}
+
+test "publication recovery preserves unsupported and invalid prior transactions" {
+    const Case = enum {
+        unsupported_proposed,
+        unsupported_replacement_chunk,
+        invalid_prior,
+    };
+    const cases = [_]Case{
+        .unsupported_proposed,
+        .unsupported_replacement_chunk,
+        .invalid_prior,
+    };
+    for (cases) |case| {
+        const alloc = std.testing.allocator;
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        const session_id = switch (case) {
+            .unsupported_proposed => "session-unsupported-proposed",
+            .unsupported_replacement_chunk => "session-unsupported-replacement-chunk",
+            .invalid_prior => "session-invalid-prior",
+        };
+        var initial = try testState(alloc, session_id, 10);
+        defer initial.deinit(alloc);
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var loaded_owned = true;
+        defer if (loaded_owned) loaded.deinit(alloc);
+        const initial_position = loaded.position;
+        if (case == .invalid_prior) {
+            _ = try loaded.appendEvent(
+                alloc,
+                .{ .preferences_changed = .{ .fast_mode = true } },
+                15,
+                .retry_expected_tail,
+                .{},
+            );
+        }
+        const positions = try leavePendingReplacementForTest(alloc, &loaded, 20);
+        switch (case) {
+            .unsupported_proposed => {
+                var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
+                defer log.close(io_mod.getIo());
+                try replaceFrameByteForTest(
+                    alloc,
+                    log,
+                    positions.prior.through_event_log_bytes,
+                    positions.proposed.through_event_log_bytes,
+                    "\"schema_version\":1",
+                    '9',
+                );
+            },
+            .unsupported_replacement_chunk => {
+                try corruptReplacementChunkSchemaForTest(alloc, &loaded, positions);
+            },
+            .invalid_prior => {
+                try corruptReplacementCommitTimestampForTest(alloc, &loaded, positions);
+                var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
+                defer log.close(io_mod.getIo());
+                try replaceFrameByteForTest(
+                    alloc,
+                    log,
+                    initial_position.through_event_log_bytes,
+                    positions.prior.through_event_log_bytes,
+                    "\"seq\":2",
+                    '3',
+                );
+            },
+        }
+        loaded.deinit(alloc);
+        loaded_owned = false;
+        var before = try capturePublicationBytesForTest(
+            alloc,
+            &temp.root,
+            initial.id,
+            positions.proposed.log_generation,
+        );
+        defer before.deinit(alloc);
+
+        const expected_error = switch (case) {
+            .unsupported_proposed,
+            .unsupported_replacement_chunk,
+            => error.UnsupportedSessionSchema,
+            .invalid_prior => error.InvalidSessionFormat,
+        };
+        try std.testing.expectError(
+            expected_error,
+            temp.root.resumeForWrite(alloc, initial.id, .{}),
+        );
+        var after = try capturePublicationBytesForTest(
+            alloc,
+            &temp.root,
+            initial.id,
+            positions.proposed.log_generation,
+        );
+        defer after.deinit(alloc);
+        try before.expectEqual(after);
+    }
+}
+
+test "publication recovery preserves a watermark outside the intent pair" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-mismatched-intent-watermark", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    var loaded_owned = true;
+    defer if (loaded_owned) loaded.deinit(alloc);
+    const initial_position = loaded.position;
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        15,
+        .retry_expected_tail,
+        .{},
+    );
+    const positions = try leavePendingReplacementForTest(alloc, &loaded, 20);
+    const watermark = try encodeWatermark(alloc, initial.id, initial_position);
+    defer alloc.free(watermark);
+    const name = try watermarkName(alloc, initial_position.log_generation);
+    defer alloc.free(name);
+    try durableReplace(alloc, &loaded.log.dir, name, watermark);
+    loaded.deinit(alloc);
+    loaded_owned = false;
+    var before = try capturePublicationBytesForTest(
+        alloc,
+        &temp.root,
+        initial.id,
+        positions.proposed.log_generation,
+    );
+    defer before.deinit(alloc);
+
+    try std.testing.expectError(
+        error.SessionCommitIndeterminate,
+        temp.root.resumeForWrite(alloc, initial.id, .{}),
+    );
+    var after = try capturePublicationBytesForTest(
+        alloc,
+        &temp.root,
+        initial.id,
+        positions.proposed.log_generation,
+    );
+    defer after.deinit(alloc);
+    try before.expectEqual(after);
+}
+
+test "display projection waits for first prompt and preserves derived title" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-display-title-freeze", 10);
+    defer initial.deinit(alloc);
+
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    var initial_display = try session_display_metadata.readSidecarOrFallback(alloc, &loaded.log.dir);
+    defer initial_display.deinit(alloc);
+    try std.testing.expect(!initial_display.present);
+
+    var first_state = try stateWithPrompt(
+        alloc,
+        loaded.state,
+        20,
+        "first prompt title should freeze after this",
+        "first response",
+    );
+    defer first_state.deinit(alloc);
+    _ = try loaded.commitStateReplacement(
+        alloc,
+        first_state,
+        .recovery,
+        .retry_expected_tail,
+        .{},
+    );
+
+    var first_display = try session_display_metadata.readSidecarOrFallback(alloc, &loaded.log.dir);
+    defer first_display.deinit(alloc);
+    try std.testing.expect(first_display.present);
+    try std.testing.expectEqualStrings(
+        "first prompt title should freeze after this",
+        first_display.title,
+    );
+
+    var replacement_state = try stateWithPrompt(
+        alloc,
+        loaded.state,
+        30,
+        "replacement prompt must not become the title",
+        "replacement response",
+    );
+    defer replacement_state.deinit(alloc);
+    _ = try loaded.commitStateReplacement(
+        alloc,
+        replacement_state,
+        .recovery,
+        .retry_expected_tail,
+        .{},
+    );
+
+    var preserved_display = try session_display_metadata.readSidecarOrFallback(alloc, &loaded.log.dir);
+    defer preserved_display.deinit(alloc);
+    try std.testing.expect(preserved_display.present);
+    try std.testing.expectEqualStrings(
+        "first prompt title should freeze after this",
+        preserved_display.title,
+    );
+}
+
+test "state replacement preserves subagent child identity" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-subagent-child", 10);
+    defer initial.deinit(alloc);
+    initial.subagent_child = true;
+
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        var replacement = try loaded.state.dupe(alloc);
+        defer replacement.deinit(alloc);
+        replacement.updated_at_ms = 20;
+        replacement.subagent_child = false;
+        _ = try loaded.commitStateReplacement(
+            alloc,
+            replacement,
+            .recovery,
+            .retry_expected_tail,
+            .{},
+        );
+        try std.testing.expect(loaded.state.subagent_child);
+    }
+
+    var reloaded = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer reloaded.deinit(alloc);
+    try std.testing.expect(reloaded.subagent_child);
+}
+
 fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {
     return .{ .history_turn_committed = .{
         .conversation_language = state.conversation_language,
@@ -4623,4 +5843,1895 @@ fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {
         .total_output_tokens = state.total_output_tokens,
         .turn = state.history[state.history.len - 1],
     } };
+}
+
+test "schema v3 exact operations accept dotted session IDs" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session.v3.branch", 10);
+    defer initial.deinit(alloc);
+
+    var started = try temp.root.startWritableSession(alloc, initial, .{});
+    started.deinit(alloc);
+
+    var read_only = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer read_only.deinit(alloc);
+    try std.testing.expectEqualStrings(initial.id, read_only.id);
+
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings(initial.id, resumed.state.id);
+}
+
+test "schema v3 exact operations accept 255 byte session IDs" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var session_id: [255]u8 = undefined;
+    @memset(&session_id, 'a');
+    var initial = try testState(alloc, &session_id, 10);
+    defer initial.deinit(alloc);
+
+    var started = try temp.root.startWritableSession(alloc, initial, .{});
+    started.deinit(alloc);
+
+    var read_only = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer read_only.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &session_id, read_only.id);
+
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &session_id, resumed.state.id);
+}
+
+test "schema v3 exact operations reject unsafe session IDs" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+
+    const invalid_ids = [_][]const u8{
+        ".",
+        "..",
+        "nested/session",
+        "nested\\session",
+    };
+    for (invalid_ids) |session_id| {
+        try std.testing.expectError(
+            error.InvalidSessionId,
+            temp.root.loadReadOnly(alloc, session_id, .{}),
+        );
+        try std.testing.expectError(
+            error.InvalidSessionId,
+            temp.root.resumeForWrite(alloc, session_id, .{}),
+        );
+    }
+
+    const unsupported = [_]u8{ 0xff, 'a' };
+    try std.testing.expectError(
+        error.InvalidSessionId,
+        temp.root.loadReadOnly(alloc, &unsupported, .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidSessionId,
+        temp.root.resumeForWrite(alloc, &unsupported, .{}),
+    );
+
+    var too_long: [256]u8 = undefined;
+    @memset(&too_long, 'a');
+    try std.testing.expectError(
+        error.InvalidSessionId,
+        temp.root.loadReadOnly(alloc, &too_long, .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidSessionId,
+        temp.root.resumeForWrite(alloc, &too_long, .{}),
+    );
+}
+
+test "authority creation resolves marker absence as an uncommitted orphan" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var state = try testState(alloc, "session-authority-absent", 10);
+    defer state.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_authority_intent_sync };
+
+    try std.testing.expectError(
+        error.SessionStartIndeterminate,
+        temp.root.startWritableSession(alloc, state, .{ .test_controls = failure.test_controls() }),
+    );
+    try std.testing.expectError(
+        error.SessionNotFound,
+        temp.root.resumeForWrite(alloc, state.id, .{}),
+    );
+    try std.testing.expect(!(try temp.root.entryExistsForTest(
+        alloc,
+        state.id,
+        "authority.pending.json",
+    )));
+    try std.testing.expect(!(try temp.root.entryExistsForTest(
+        alloc,
+        state.id,
+        "authority.json",
+    )));
+}
+
+test "authority creation resolves an exact proposed marker and canonical pair" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var state = try testState(alloc, "session-authority-proposed", 10);
+    defer state.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_authority_marker_rename };
+
+    try std.testing.expectError(
+        error.SessionStartIndeterminate,
+        temp.root.startWritableSession(alloc, state, .{ .test_controls = failure.test_controls() }),
+    );
+    var loaded = try temp.root.resumeForWrite(alloc, state.id, .{});
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings(state.id, loaded.state.id);
+    try std.testing.expect(try temp.root.entryExistsForTest(
+        alloc,
+        state.id,
+        "authority.json",
+    ));
+    try std.testing.expect(!(try temp.root.entryExistsForTest(
+        alloc,
+        state.id,
+        "authority.pending.json",
+    )));
+}
+
+test "commit boundary hides synced bytes until watermark publication" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-commit-boundary", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+
+    var observed_history_len: usize = std.math.maxInt(usize);
+    const PauseReader = struct {
+        root: *Root,
+        alloc: Allocator,
+        session_id: []const u8,
+        observed: *usize,
+
+        fn hit(raw: ?*anyopaque, point: Boundary) !void {
+            if (point != .after_event_sync) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            var state = try self.root.loadReadOnly(self.alloc, self.session_id, .{});
+            defer state.deinit(self.alloc);
+            self.observed.* = state.history.len;
+        }
+    };
+    var pause = PauseReader{
+        .root = &temp.root,
+        .alloc = alloc,
+        .session_id = initial.id,
+        .observed = &observed_history_len,
+    };
+    _ = try loaded.appendEvent(
+        alloc,
+        historyEvent(next),
+        20,
+        .retry_expected_tail,
+        .{ .test_controls = .{ .context = &pause, .boundary_fn = PauseReader.hit } },
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), observed_history_len);
+    var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer replayed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replayed.history.len);
+}
+
+test "publication intent remains a read fence until writable resolution" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-publication-intent", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_commit_intent_sync };
+
+    try std.testing.expectError(
+        error.SessionCommitIndeterminate,
+        loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .retry_expected_tail,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+    loaded.deinit(alloc);
+    try std.testing.expectError(
+        error.SessionCommitBoundaryUnavailable,
+        temp.root.loadReadOnly(alloc, initial.id, .{}),
+    );
+    var resolved = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), resolved.state.history.len);
+}
+
+test "publication indeterminacy blocks later append until explicit retry" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-publication-same-writer", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_target_namespace_sync };
+
+    try std.testing.expectError(
+        error.SessionCommitIndeterminate,
+        loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .retry_expected_tail,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+
+    const ConfirmationTrace = struct {
+        commit_locks: usize = 0,
+
+        fn lock(raw: ?*anyopaque, kind: LockKind) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (kind == .commit) self.commit_locks += 1;
+        }
+    };
+    var trace: ConfirmationTrace = .{};
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.appendEvent(
+            alloc,
+            .{ .preferences_changed = .{ .fast_mode = true } },
+            30,
+            .retry_expected_tail,
+            .{ .test_controls = .{
+                .context = &trace,
+                .lock_fn = ConfirmationTrace.lock,
+            } },
+        ),
+    );
+    try loaded.retryDegradedWithStateReplacement(alloc, next, .{
+        .test_controls = .{
+            .context = &trace,
+            .lock_fn = ConfirmationTrace.lock,
+        },
+    });
+    try std.testing.expect(trace.commit_locks > 0);
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        30,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), loaded.state.history.len);
+    try std.testing.expect(loaded.state.preferences.fast_mode);
+}
+
+test "intent cleanup pending confirms the namespace before a later append" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-intent-cleanup", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_commit_intent_remove };
+
+    _ = try loaded.appendEvent(
+        alloc,
+        historyEvent(next),
+        20,
+        .retry_expected_tail,
+        .{ .test_controls = failure.test_controls() },
+    );
+
+    const ConfirmationTrace = struct {
+        commit_locks: usize = 0,
+        confirmed_before_append: bool = false,
+
+        fn lock(raw: ?*anyopaque, kind: LockKind) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (kind == .commit) self.commit_locks += 1;
+        }
+
+        fn boundary(raw: ?*anyopaque, point: Boundary) !void {
+            if (point != .after_event_append) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.confirmed_before_append = self.commit_locks > 0;
+        }
+    };
+    var trace: ConfirmationTrace = .{};
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        30,
+        .retry_expected_tail,
+        .{ .test_controls = .{
+            .context = &trace,
+            .boundary_fn = ConfirmationTrace.boundary,
+            .lock_fn = ConfirmationTrace.lock,
+        } },
+    );
+    try std.testing.expect(trace.confirmed_before_append);
+}
+
+test "writable recovery truncates a complete provisional tail without resetting compaction accounting" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-provisional-tail", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        15,
+        .retry_expected_tail,
+        .{},
+    );
+    try loaded.writeCheckpointIfDue(alloc, true, .{});
+    const generation_base_seq = loaded.generation_base_seq;
+    const generation_base_bytes = loaded.generation_base_bytes;
+    const committed_bytes = loaded.position.through_event_log_bytes;
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_event_sync };
+
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .retry_expected_tail,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+    loaded.deinit(alloc);
+    var read_only = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer read_only.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), read_only.history.len);
+
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(
+        committed_bytes,
+        try resumed.log.eventLogLengthForTest(),
+    );
+    try std.testing.expectEqual(generation_base_seq, resumed.generation_base_seq);
+    try std.testing.expectEqual(generation_base_bytes, resumed.generation_base_bytes);
+
+    var manifest = try loadManifest(alloc, &resumed.log.dir);
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqual(generation_base_seq, manifest.generation_base_seq);
+    try std.testing.expectEqual(generation_base_bytes, manifest.generation_base_bytes);
+}
+
+test "writable resume preserves the event log when the watermark is invalid" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-invalid-watermark-preserves-log", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    var loaded_owned = true;
+    defer if (loaded_owned) loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_event_sync };
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .retry_expected_tail,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+
+    var invalid_position = loaded.position;
+    invalid_position.through_event_log_bytes -= 1;
+    const watermark = try encodeWatermark(alloc, initial.id, invalid_position);
+    defer alloc.free(watermark);
+    const watermark_name = try watermarkName(alloc, invalid_position.log_generation);
+    defer alloc.free(watermark_name);
+    try durableReplace(alloc, &loaded.log.dir, watermark_name, watermark);
+    const before_events = try readManagedFileAlloc(
+        alloc,
+        &loaded.log.dir,
+        events_file,
+        16 * 1024 * 1024,
+    );
+    defer alloc.free(before_events);
+    const before_watermark = try readManagedFileAlloc(
+        alloc,
+        &loaded.log.dir,
+        watermark_name,
+        watermark_max_bytes,
+    );
+    defer alloc.free(before_watermark);
+    loaded.deinit(alloc);
+    loaded_owned = false;
+
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        temp.root.resumeForWrite(alloc, initial.id, .{}),
+    );
+    var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
+    defer dir.close();
+    const after_events = try readManagedFileAlloc(
+        alloc,
+        &dir,
+        events_file,
+        16 * 1024 * 1024,
+    );
+    defer alloc.free(after_events);
+    const after_watermark = try readManagedFileAlloc(
+        alloc,
+        &dir,
+        watermark_name,
+        watermark_max_bytes,
+    );
+    defer alloc.free(after_watermark);
+    try std.testing.expectEqualSlices(u8, before_events, after_events);
+    try std.testing.expectEqualSlices(u8, before_watermark, after_watermark);
+}
+
+test "retry eligible failure captures the exact expected event tail" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-failed-tail-capture", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    const prior = loaded.position;
+    var failure = BoundaryFailure{ .target = .after_event_sync };
+
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .retry_expected_tail,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+
+    const failed = loaded.degradedTail() orelse return error.TestExpectedEqual;
+    try std.testing.expect(positionsEqual(prior, failed.prior));
+    try std.testing.expectEqual(
+        prior.through_event_log_bytes + failed.bytes.len,
+        failed.proposed.through_event_log_bytes,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &session_projection.sha256(failed.bytes),
+        &failed.sha256,
+    );
+    switch (failed.kind) {
+        .event => |event_id| try std.testing.expectEqualSlices(
+            u8,
+            &failed.proposed.through_event_id,
+            &event_id,
+        ),
+        .state_replacement => return error.TestExpectedEqual,
+    }
+}
+
+test "degraded retry publishes only the exact expected event tail" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-expected-tail-retry", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_event_sync };
+
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .retry_expected_tail,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+    const expected = loaded.degradedTail().?.proposed;
+
+    try loaded.retryDegradedWithStateReplacement(alloc, next, .{});
+
+    try std.testing.expect(loaded.degradedTail() == null);
+    try std.testing.expect(positionsEqual(expected, loaded.position));
+    try std.testing.expectEqual(@as(usize, 1), loaded.state.history.len);
+    var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer replayed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replayed.history.len);
+}
+
+test "degraded retry replaces current state when the expected tail is not exact" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-replacement-fallback", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_event_sync };
+
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .retry_expected_tail,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+    const failed = loaded.degradedTail().?;
+    const prior = failed.prior;
+    const failed_proposed = failed.proposed;
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
+    try log.writePositionalAll(
+        io_mod.getIo(),
+        "!",
+        prior.through_event_log_bytes,
+    );
+    try log.sync(io_mod.getIo());
+    log.close(io_mod.getIo());
+
+    try loaded.retryDegradedWithStateReplacement(alloc, next, .{});
+
+    try std.testing.expect(loaded.degradedTail() == null);
+    try std.testing.expect(loaded.position.through_seq > failed_proposed.through_seq);
+    try std.testing.expectEqual(@as(usize, 1), loaded.state.history.len);
+    var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer replayed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replayed.history.len);
+    try std.testing.expectEqualStrings(
+        "world",
+        replayed.history[0].assistant.assistant,
+    );
+}
+
+test "rollback required failure is excluded from generic degraded retry" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-commit-first-exclusion", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    const prior = loaded.position;
+    var failure = BoundaryFailure{ .target = .after_event_sync };
+
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .rollback_before_adapter_continue,
+            .{ .test_controls = failure.test_controls() },
+        ),
+    );
+
+    try std.testing.expect(loaded.degradedTail() == null);
+    try std.testing.expect(positionsEqual(prior, loaded.position));
+    try std.testing.expectEqual(
+        prior.through_event_log_bytes,
+        try loaded.log.eventLogLengthForTest(),
+    );
+}
+
+test "checkpoint scheduling publishes an exact committed checkpoint" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-checkpoint", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(
+        alloc,
+        initial,
+        .{ .checkpoint_interval = 1 },
+    );
+    defer loaded.deinit(alloc);
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+
+    _ = try loaded.appendEvent(
+        alloc,
+        historyEvent(next),
+        20,
+        .retry_expected_tail,
+        .{ .checkpoint_interval = 1 },
+    );
+    try std.testing.expect(try temp.root.entryExistsForTest(
+        alloc,
+        initial.id,
+        "checkpoint.json",
+    ));
+    try loaded.validateCheckpointForTest(alloc);
+}
+
+test "checkpoint clean shutdown publishes when missing" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-checkpoint-shutdown", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    try std.testing.expect(!(try temp.root.entryExistsForTest(
+        alloc,
+        initial.id,
+        "checkpoint.json",
+    )));
+    try loaded.writeCheckpointIfDue(alloc, true, .{});
+    try std.testing.expect(try temp.root.entryExistsForTest(
+        alloc,
+        initial.id,
+        "checkpoint.json",
+    ));
+    try loaded.validateCheckpointForTest(alloc);
+}
+
+test "checkpoint clean shutdown preserves a valid bounded tail" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-checkpoint-bounded-tail", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    try loaded.writeCheckpointIfDue(alloc, true, .{});
+    const checkpoint_seq = loaded.checkpoint_seq.?;
+    const checkpoint_sha256 = loaded.checkpoint_sha256.?;
+    const checkpoint_bytes = loaded.position.through_event_log_bytes;
+
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    try loaded.writeCheckpointIfDue(alloc, true, .{});
+    try std.testing.expectEqual(checkpoint_seq, loaded.checkpoint_seq.?);
+    try std.testing.expectEqualSlices(
+        u8,
+        &checkpoint_sha256,
+        &loaded.checkpoint_sha256.?,
+    );
+
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_only);
+    defer log.close(io_mod.getIo());
+    var opened = try loadOpenState(
+        alloc,
+        &loaded.log.dir,
+        loaded.active_id,
+        loaded.authority_id,
+        log,
+        loaded.position,
+    );
+    defer opened.state.deinit(alloc);
+    try std.testing.expectEqual(ReplaySource.checkpoint, opened.source);
+    try std.testing.expectEqual(
+        loaded.position.through_event_log_bytes - checkpoint_bytes,
+        opened.tail_bytes,
+    );
+    try std.testing.expect(opened.state.preferences.fast_mode);
+}
+
+test "final replacement policy tracks mutations after the last replacement" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-final-replacement-policy", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    try std.testing.expect(!loaded.needsFinalStateReplacement(false));
+    var replacement = try loaded.state.dupe(alloc);
+    defer replacement.deinit(alloc);
+    _ = try loaded.commitStateReplacement(
+        alloc,
+        replacement,
+        .compaction,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expect(!loaded.needsFinalStateReplacement(false));
+
+    const generation_before_rebind = loaded.position.log_generation;
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .workspace_rebound = .{
+            .previous_workspace_root = loaded.state.workspace_root,
+            .workspace_root = @constCast("/tmp/session-final-replacement-policy-b"),
+        } },
+        20,
+        .retry_expected_tail,
+        .{
+            .compaction_frame_threshold = 1,
+            .compaction_byte_threshold = 1,
+        },
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &generation_before_rebind,
+        &loaded.position.log_generation,
+    ));
+    try std.testing.expect(!loaded.needsFinalStateReplacement(false));
+
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        30,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expect(!loaded.needsFinalStateReplacement(false));
+
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .workspace_rebound = .{
+            .previous_workspace_root = loaded.state.workspace_root,
+            .workspace_root = @constCast("/tmp/session-final-replacement-policy-c"),
+        } },
+        40,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expect(!loaded.needsFinalStateReplacement(false));
+
+    loaded.state_replacement_pending = true;
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = false } },
+        45,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expect(loaded.needsFinalStateReplacement(false));
+
+    var current = try loaded.state.dupe(alloc);
+    defer current.deinit(alloc);
+    _ = try loaded.commitStateReplacement(
+        alloc,
+        current,
+        .compaction,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expect(!loaded.needsFinalStateReplacement(false));
+
+    var append_failure = BoundaryFailure{ .target = .after_event_append };
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.appendEvent(
+            alloc,
+            .{ .workspace_rebound = .{
+                .previous_workspace_root = loaded.state.workspace_root,
+                .workspace_root = @constCast("/tmp/session-final-replacement-policy-failed"),
+            } },
+            50,
+            .rollback_before_adapter_continue,
+            .{ .test_controls = append_failure.test_controls() },
+        ),
+    );
+    try std.testing.expect(loaded.needsFinalStateReplacement(false));
+
+    _ = try loaded.commitStateReplacement(
+        alloc,
+        current,
+        .compaction,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expect(!loaded.needsFinalStateReplacement(false));
+
+    var replacement_failure = BoundaryFailure{ .target = .after_event_append };
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        loaded.commitStateReplacement(
+            alloc,
+            current,
+            .compaction,
+            .rollback_before_adapter_continue,
+            .{ .test_controls = replacement_failure.test_controls() },
+        ),
+    );
+    try std.testing.expect(loaded.needsFinalStateReplacement(false));
+}
+
+test "event append rejects a truncated committed prefix without extending it" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-truncated-commit-prefix", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const prior = loaded.position;
+    const truncated_length = prior.through_event_log_bytes - 1;
+
+    {
+        var log = try openManagedFile(
+            &loaded.log.dir,
+            events_file,
+            .read_write,
+        );
+        defer log.close(io_mod.getIo());
+        try log.setLength(io_mod.getIo(), truncated_length);
+        try log.sync(io_mod.getIo());
+    }
+
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        loaded.appendEvent(
+            alloc,
+            .{ .preferences_changed = .{ .fast_mode = true } },
+            20,
+            .retry_expected_tail,
+            .{},
+        ),
+    );
+    try std.testing.expect(positionsEqual(prior, loaded.position));
+    try std.testing.expect(!loaded.state.preferences.fast_mode);
+    try std.testing.expect(loaded.needsFinalStateReplacement(false));
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_only);
+    defer log.close(io_mod.getIo());
+    try std.testing.expectEqual(truncated_length, try log.length(io_mod.getIo()));
+}
+
+test "writable open state replays only the committed tail after a checkpoint" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-checkpoint-tail-open", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    try loaded.writeCheckpointIfDue(alloc, true, .{});
+    const checkpoint_position = loaded.position;
+
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_only);
+    defer log.close(io_mod.getIo());
+    var exact = try loadOpenState(
+        alloc,
+        &loaded.log.dir,
+        loaded.active_id,
+        loaded.authority_id,
+        log,
+        loaded.position,
+    );
+    defer exact.state.deinit(alloc);
+    try std.testing.expectEqual(ReplaySource.checkpoint, exact.source);
+    try std.testing.expectEqual(@as(u64, 0), exact.tail_bytes);
+
+    const AllocationCheck = struct {
+        fn run(
+            failing_alloc: Allocator,
+            dir: *io_mod.VerifiedDir,
+            session_id: []const u8,
+            authority_id: Identifier,
+            event_log: std.Io.File,
+            position: CommitPosition,
+        ) !void {
+            var opened = try loadOpenState(
+                failing_alloc,
+                dir,
+                session_id,
+                authority_id,
+                event_log,
+                position,
+            );
+            defer opened.state.deinit(failing_alloc);
+            try std.testing.expectEqual(ReplaySource.checkpoint, opened.source);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        AllocationCheck.run,
+        .{
+            &loaded.log.dir,
+            loaded.active_id,
+            loaded.authority_id,
+            log,
+            loaded.position,
+        },
+    );
+
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    var tailed = try loadOpenState(
+        alloc,
+        &loaded.log.dir,
+        loaded.active_id,
+        loaded.authority_id,
+        log,
+        loaded.position,
+    );
+    defer tailed.state.deinit(alloc);
+    try std.testing.expectEqual(ReplaySource.checkpoint, tailed.source);
+    try std.testing.expectEqual(
+        loaded.position.through_event_log_bytes -
+            checkpoint_position.through_event_log_bytes,
+        tailed.tail_bytes,
+    );
+    try std.testing.expect(tailed.state.preferences.fast_mode);
+    try std.testing.expectEqual(checkpoint_position.through_seq, tailed.checkpoint_seq.?);
+}
+
+test "writable open state falls back when the checkpoint is corrupt" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-corrupt-checkpoint-open", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    try loaded.writeCheckpointIfDue(alloc, true, .{});
+    try durableReplace(alloc, &loaded.log.dir, checkpoint_file, "{bad");
+
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_only);
+    defer log.close(io_mod.getIo());
+    var opened = try loadOpenState(
+        alloc,
+        &loaded.log.dir,
+        loaded.active_id,
+        loaded.authority_id,
+        log,
+        loaded.position,
+    );
+    defer opened.state.deinit(alloc);
+    try std.testing.expectEqual(ReplaySource.event_log, opened.source);
+    try std.testing.expectEqual(ProjectionStatus.stale, opened.projection_status);
+    try std.testing.expect(opened.checkpoint_seq == null);
+    try std.testing.expectEqualStrings(initial.id, opened.state.id);
+}
+
+test "writable open state preserves compaction accounting after a stale event file fingerprint" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-stale-manifest-open", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    try loaded.writeCheckpointIfDue(alloc, true, .{});
+    const generation_base_seq = loaded.generation_base_seq;
+    const generation_base_bytes = loaded.generation_base_bytes;
+
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
+    defer log.close(io_mod.getIo());
+    var first: [1]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try log.readPositionalAll(io_mod.getIo(), &first, 0),
+    );
+    try log.writePositionalAll(io_mod.getIo(), &first, 0);
+    try log.sync(io_mod.getIo());
+
+    var opened = try loadOpenState(
+        alloc,
+        &loaded.log.dir,
+        loaded.active_id,
+        loaded.authority_id,
+        log,
+        loaded.position,
+    );
+    defer opened.state.deinit(alloc);
+    try std.testing.expectEqual(ReplaySource.event_log, opened.source);
+    try std.testing.expectEqual(ProjectionStatus.stale, opened.projection_status);
+    try std.testing.expectEqual(generation_base_seq, opened.generation_base_seq);
+    try std.testing.expectEqual(generation_base_bytes, opened.generation_base_bytes);
+    try std.testing.expect(opened.checkpoint_seq == null);
+    try std.testing.expectEqualStrings(initial.id, opened.state.id);
+}
+
+test "manifest fingerprint captures the native event device" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-manifest-device", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var file = try openManagedFile(&loaded.log.dir, events_file, .read_only);
+    defer file.close(io_mod.getIo());
+    const native_device = try eventDevice(file);
+
+    const captured = try eventStat(file, loaded.position.through_event_log_bytes);
+    try std.testing.expectEqual(native_device, captured.device);
+}
+
+test "log compaction replaces the generation without changing durable state" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-log-compaction", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const old_generation = loaded.position.log_generation;
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    _ = try loaded.appendEvent(
+        alloc,
+        historyEvent(next),
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+
+    try loaded.compactCanonicalLogIfDue(alloc, .{
+        .compaction_frame_threshold = 1,
+        .compaction_byte_threshold = 1,
+    });
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &old_generation,
+        &loaded.position.log_generation,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), loaded.state.history.len);
+    var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer replayed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replayed.history.len);
+    try std.testing.expectEqualStrings("world", replayed.history[0].assistant.assistant);
+}
+
+test "specialized history survives event replacement checkpoint and canonical compaction" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-specialized-history", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    var calls = [_]session.ToolCall{.{
+        .id = "call_read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"src/main.zig\"}",
+    }};
+    var results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_read"),
+        .tool_name = @constCast("read_file"),
+        .status = .failure,
+        .output = @constCast("typed failure"),
+        .output_bytes = 13,
+        .stored_output_bytes = 13,
+    }};
+    var steps = [_]session.ToolExecutionStep{.{
+        .assistant = @constCast("Inspecting."),
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    const historical_template = session.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("run dev") },
+        .assistant = @constCast("The historical command is inert."),
+        .execution = .{ .tool_steps = steps[0..] },
+    } };
+    const interrupted_template = session.HistoryTurn{ .interrupted = .{
+        .user = .{ .text = @constCast("inspect") },
+        .assistant = @constCast("I inspected the entry point."),
+        .execution = .{ .tool_steps = steps[0..] },
+    } };
+
+    var append_state = try loaded.state.dupe(alloc);
+    defer append_state.deinit(alloc);
+    const append_history = try alloc.alloc(session.HistoryTurn, 1);
+    var owns_append_history = true;
+    errdefer if (owns_append_history) alloc.free(append_history);
+    append_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
+    var append_history_initialized = true;
+    errdefer if (owns_append_history and append_history_initialized) {
+        session.freeHistoryTurn(alloc, append_history[0]);
+    };
+    session.freeHistoryTurnSlice(alloc, append_state.history);
+    append_state.history = append_history;
+    owns_append_history = false;
+    append_history_initialized = false;
+    append_state.updated_at_ms = 20;
+    _ = try loaded.appendEvent(
+        alloc,
+        historyEvent(append_state),
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    try std.testing.expectEqualStrings(
+        "The historical command is inert.",
+        loaded.state.history[0].assistant.assistant,
+    );
+
+    var replacement = try loaded.state.dupe(alloc);
+    defer replacement.deinit(alloc);
+    const replacement_history = try alloc.alloc(session.HistoryTurn, 2);
+    var owns_replacement_history = true;
+    var copied_replacement_turns: usize = 0;
+    errdefer if (owns_replacement_history) {
+        for (replacement_history[0..copied_replacement_turns]) |turn| {
+            session.freeHistoryTurn(alloc, turn);
+        }
+        alloc.free(replacement_history);
+    };
+    replacement_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
+    copied_replacement_turns += 1;
+    replacement_history[1] = try session.dupeHistoryTurn(alloc, interrupted_template);
+    copied_replacement_turns += 1;
+    session.freeHistoryTurnSlice(alloc, replacement.history);
+    replacement.history = replacement_history;
+    owns_replacement_history = false;
+    replacement.updated_at_ms = 30;
+    _ = try loaded.commitStateReplacement(
+        alloc,
+        replacement,
+        .recovery,
+        .retry_expected_tail,
+        .{},
+    );
+    try loaded.writeCheckpointIfDue(alloc, true, .{});
+    try loaded.compactCanonicalLogIfDue(alloc, .{
+        .compaction_frame_threshold = 1,
+        .compaction_byte_threshold = 1,
+    });
+
+    var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer replayed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), replayed.history.len);
+    const historical = replayed.history[0].assistant;
+    try std.testing.expectEqualStrings("The historical command is inert.", historical.assistant);
+    try std.testing.expectEqual(@as(usize, 1), historical.execution.tool_steps.len);
+    try std.testing.expectEqual(.failure, historical.execution.tool_steps[0].tool_results[0].status);
+    const interrupted = replayed.history[1].interrupted;
+    try std.testing.expectEqualStrings("I inspected the entry point.", interrupted.assistant.?);
+    try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
+    try std.testing.expectEqualStrings(
+        "typed failure",
+        interrupted.execution.tool_steps[0].tool_results[0].output,
+    );
+}
+
+test "typed history above the context limit survives checkpoint and canonical compaction" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-typed-history-growth", 10);
+    defer initial.deinit(alloc);
+
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+
+        var calls = [_]session.ToolCall{.{
+            .id = "call_first",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"src/main.zig\"}",
+        }};
+        var results = [_]session.PersistedToolResult{.{
+            .tool_call_id = @constCast("call_first"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("const main = true;"),
+            .output_bytes = 18,
+            .stored_output_bytes = 18,
+        }};
+        var steps = [_]session.ToolExecutionStep{.{
+            .assistant = @constCast("Inspecting the entry point."),
+            .tool_calls = calls[0..],
+            .tool_results = results[0..],
+        }};
+        var files = [_]session.FileEvidence{.{
+            .path = @constCast("src/main.zig"),
+            .tool_call_id = @constCast("call_first"),
+            .tool_name = @constCast("read_file"),
+            .action = .read,
+            .status = .success,
+            .model_view_covers_full_file = true,
+        }};
+        const typed_turn = session.HistoryTurn{ .assistant = .{
+            .user = .{ .text = @constCast("inspect the entry point") },
+            .assistant = @constCast("The entry point is intact."),
+            .execution = .{
+                .tool_steps = steps[0..],
+                .files = files[0..],
+            },
+        } };
+        _ = try loaded.appendEvent(
+            alloc,
+            .{ .history_turn_committed = .{
+                .conversation_language = loaded.state.conversation_language,
+                .total_input_tokens = 1,
+                .total_output_tokens = 1,
+                .turn = typed_turn,
+            } },
+            20,
+            .retry_expected_tail,
+            .{},
+        );
+
+        var index: usize = 1;
+        while (index < 9) : (index += 1) {
+            const turn = try session.makeAssistantTurn(alloc, "follow-up", "acknowledged");
+            defer session.freeHistoryTurn(alloc, turn);
+            _ = try loaded.appendEvent(
+                alloc,
+                .{ .history_turn_committed = .{
+                    .conversation_language = loaded.state.conversation_language,
+                    .total_input_tokens = index + 1,
+                    .total_output_tokens = index + 1,
+                    .turn = turn,
+                } },
+                @intCast(20 + index),
+                .retry_expected_tail,
+                .{},
+            );
+        }
+
+        try std.testing.expectEqual(@as(usize, 9), loaded.state.history.len);
+        const first = loaded.state.history[0].assistant;
+        try std.testing.expectEqualStrings("call_first", first.execution.tool_steps[0].tool_calls[0].id);
+        try std.testing.expectEqualStrings(
+            "const main = true;",
+            first.execution.tool_steps[0].tool_results[0].output,
+        );
+        try std.testing.expectEqualStrings("src/main.zig", first.execution.files[0].path);
+
+        try loaded.writeCheckpointIfDue(alloc, true, .{});
+        try loaded.compactCanonicalLogIfDue(alloc, .{
+            .compaction_frame_threshold = 1,
+            .compaction_byte_threshold = 1,
+        });
+        try std.testing.expectEqual(@as(usize, 9), loaded.state.history.len);
+    }
+
+    var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer replayed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 9), replayed.history.len);
+    const first = replayed.history[0].assistant;
+    try std.testing.expectEqualStrings("call_first", first.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqual(.success, first.execution.tool_steps[0].tool_results[0].status);
+    try std.testing.expectEqualStrings(
+        "const main = true;",
+        first.execution.tool_steps[0].tool_results[0].output,
+    );
+    try std.testing.expectEqualStrings("src/main.zig", first.execution.files[0].path);
+    try std.testing.expect(first.execution.files[0].model_view_covers_full_file);
+}
+
+test "successful semantic commit automatically compacts when due" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-log-auto-compaction", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const old_generation = loaded.position.log_generation;
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+
+    _ = try loaded.appendEvent(
+        alloc,
+        historyEvent(next),
+        20,
+        .retry_expected_tail,
+        .{
+            .compaction_frame_threshold = 1,
+            .compaction_byte_threshold = 1,
+        },
+    );
+
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &old_generation,
+        &loaded.position.log_generation,
+    ));
+    var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer replayed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replayed.history.len);
+    try std.testing.expectEqualStrings("world", replayed.history[0].assistant.assistant);
+}
+
+test "automatic compaction honors an immediate commit lock deadline" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-log-compaction-lock-deadline", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    const Contention = struct {
+        dir: *io_mod.VerifiedDir,
+        commit_attempts: usize = 0,
+        commit_lock: ?io_mod.TimedAdvisoryLock = null,
+
+        fn lock(raw: ?*anyopaque, kind: LockKind) void {
+            if (kind != .commit) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.commit_attempts += 1;
+            if (self.commit_attempts != 2) return;
+            self.commit_lock = io_mod.acquireTimedAdvisoryLock(
+                self.dir,
+                commit_lock_file,
+                2000,
+            ) catch return;
+        }
+    };
+    var contention = Contention{ .dir = &loaded.log.dir };
+    defer if (contention.commit_lock) |*lock| lock.release();
+
+    const started_at_ms = io_mod.milliTimestamp();
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .retry_expected_tail,
+        .{
+            .test_controls = .{
+                .context = &contention,
+                .lock_fn = Contention.lock,
+            },
+            .commit_lock_deadline_ms = 0,
+            .compaction_frame_threshold = 1,
+            .compaction_byte_threshold = 1,
+        },
+    );
+    try std.testing.expectEqual(@as(usize, 2), contention.commit_attempts);
+    try std.testing.expect(contention.commit_lock != null);
+    try std.testing.expect(loaded.compaction_warning_active);
+    try std.testing.expect(io_mod.milliTimestamp() - started_at_ms < 1000);
+}
+
+test "automatic compaction leaves post-rename uncertainty fenced" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-log-auto-compaction-fence", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_compaction_log_rename };
+    loaded.resume_view_stale = false;
+
+    try std.testing.expectError(
+        error.SessionLogCompactionIndeterminate,
+        loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .retry_expected_tail,
+            .{
+                .test_controls = failure.test_controls(),
+                .compaction_frame_threshold = 1,
+                .compaction_byte_threshold = 1,
+            },
+        ),
+    );
+
+    try std.testing.expect(loaded.namespace_confirmation_required);
+    try std.testing.expect(loaded.resume_view_stale);
+    try std.testing.expectError(
+        error.SessionCommitBoundaryUnavailable,
+        temp.root.loadReadOnly(alloc, initial.id, .{}),
+    );
+    loaded.deinit(alloc);
+
+    var resolved = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resolved.state.history.len);
+    try std.testing.expectEqualStrings(
+        "world",
+        resolved.state.history[0].assistant.assistant,
+    );
+}
+
+test "automatic compaction recovers every injected transaction boundary" {
+    const boundaries = [_]Boundary{
+        .after_compaction_temp_sync,
+        .after_compaction_watermark_sync,
+        .after_compaction_intent_sync,
+        .after_compaction_log_rename,
+        .after_compaction_namespace_sync,
+        .after_compaction_live_confirmation,
+        .after_compaction_intent_remove,
+    };
+    for (boundaries, 0..) |boundary, index| {
+        const alloc = std.testing.allocator;
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        const session_id = try std.fmt.allocPrint(
+            alloc,
+            "session-log-compaction-boundary-{d}",
+            .{index},
+        );
+        defer alloc.free(session_id);
+        var initial = try testState(alloc, session_id, 10);
+        defer initial.deinit(alloc);
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        var next = try stateWithTurn(alloc, loaded.state, 20);
+        defer next.deinit(alloc);
+        var failure = BoundaryFailure{ .target = boundary };
+
+        const result = loaded.appendEvent(
+            alloc,
+            historyEvent(next),
+            20,
+            .retry_expected_tail,
+            .{
+                .test_controls = failure.test_controls(),
+                .compaction_frame_threshold = 1,
+                .compaction_byte_threshold = 1,
+            },
+        );
+        switch (boundary) {
+            .after_compaction_temp_sync,
+            .after_compaction_watermark_sync,
+            .after_compaction_intent_remove,
+            => _ = try result,
+            .after_compaction_intent_sync,
+            .after_compaction_log_rename,
+            .after_compaction_namespace_sync,
+            .after_compaction_live_confirmation,
+            => try std.testing.expectError(
+                error.SessionLogCompactionIndeterminate,
+                result,
+            ),
+            else => unreachable,
+        }
+        loaded.deinit(alloc);
+
+        var resumed = try temp.root.resumeForWrite(alloc, session_id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
+        try std.testing.expectEqualStrings(
+            "world",
+            resumed.state.history[0].assistant.assistant,
+        );
+    }
+}
+
+test "log compaction rename remains fenced until writable resolution" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-log-compaction-fence", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    var next = try stateWithTurn(alloc, loaded.state, 20);
+    defer next.deinit(alloc);
+    _ = try loaded.appendEvent(
+        alloc,
+        historyEvent(next),
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    var failure = BoundaryFailure{ .target = .after_compaction_log_rename };
+    loaded.resume_view_stale = false;
+
+    try std.testing.expectError(
+        error.SessionLogCompactionIndeterminate,
+        loaded.compactCanonicalLogIfDue(alloc, .{
+            .test_controls = failure.test_controls(),
+            .compaction_frame_threshold = 1,
+            .compaction_byte_threshold = 1,
+        }),
+    );
+    try std.testing.expect(loaded.resume_view_stale);
+    loaded.deinit(alloc);
+    try std.testing.expectError(
+        error.SessionCommitBoundaryUnavailable,
+        temp.root.loadReadOnly(alloc, initial.id, .{}),
+    );
+    var resolved = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resolved.state.history.len);
+    try std.testing.expectEqualStrings(
+        "world",
+        resolved.state.history[0].assistant.assistant,
+    );
+}
+
+test "orphan cleanup removes only validated noncurrent generated files" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-orphan-cleanup", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    const candidates = try loaded.createCleanupCandidatesForTest(alloc);
+    defer {
+        alloc.free(candidates.temp_name);
+        alloc.free(candidates.watermark_name);
+    }
+    const report = try loaded.cleanupOrphans(alloc, .delete);
+    try std.testing.expectEqual(@as(usize, 2), report.removed);
+    try std.testing.expect(!(try loaded.log.entryExistsForTest(candidates.temp_name)));
+    try std.testing.expect(!(try loaded.log.entryExistsForTest(candidates.watermark_name)));
+    try std.testing.expect(try loaded.log.entryExistsForTest("authority.json"));
+}
+
+test "orphan cleanup preserves a generated temp with malformed trailing bytes" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-orphan-malformed", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    const candidates = try loaded.createCleanupCandidatesForTest(alloc);
+    defer {
+        alloc.free(candidates.temp_name);
+        alloc.free(candidates.watermark_name);
+    }
+    var malformed = try openManagedFile(
+        &loaded.log.dir,
+        candidates.temp_name,
+        .read_write,
+    );
+    defer malformed.close(io_mod.getIo());
+    const length = try malformed.length(io_mod.getIo());
+    try malformed.writePositionalAll(io_mod.getIo(), "not-json\n", length);
+    try malformed.sync(io_mod.getIo());
+
+    const report = try loaded.cleanupOrphans(alloc, .delete);
+    try std.testing.expectEqual(@as(usize, 1), report.removed);
+    try std.testing.expectEqual(@as(usize, 2), report.ignored);
+    try std.testing.expect(try loaded.log.entryExistsForTest(candidates.temp_name));
+    try std.testing.expect(!(try loaded.log.entryExistsForTest(candidates.watermark_name)));
+}
+
+test "lock ordering is session before commit and read boundary uses commit only" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-lock-order", 10);
+    defer initial.deinit(alloc);
+    var create_trace: LockTrace = .{};
+    var loaded = try temp.root.startWritableSession(
+        alloc,
+        initial,
+        .{ .test_controls = create_trace.test_controls() },
+    );
+    loaded.deinit(alloc);
+    try std.testing.expect(create_trace.len >= 2);
+    try std.testing.expectEqual(LockKind.session, create_trace.items[0]);
+    try std.testing.expectEqual(LockKind.commit, create_trace.items[1]);
+
+    var read_trace: LockTrace = .{};
+    var boundary = try temp.root.captureReadBoundary(
+        alloc,
+        initial.id,
+        .{ .test_controls = read_trace.test_controls() },
+    );
+    boundary.deinit();
+    try std.testing.expectEqual(@as(usize, 1), read_trace.len);
+    try std.testing.expectEqual(LockKind.commit, read_trace.items[0]);
+}
+
+test "read boundary validation does not block a concurrent append" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "read-boundary-concurrent-append", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const captured_position = loaded.position;
+
+    const AppendDuringValidation = struct {
+        loaded: *LoadedWritableSession,
+        alloc: Allocator,
+        attempted: bool = false,
+        failure: ?anyerror = null,
+
+        fn hit(raw: ?*anyopaque, point: Boundary) !void {
+            if (point != .before_read_boundary_validation) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.attempted = true;
+            _ = self.loaded.appendEvent(
+                self.alloc,
+                .{ .preferences_changed = .{ .fast_mode = true } },
+                20,
+                .retry_expected_tail,
+                .{ .commit_lock_deadline_ms = 0 },
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var append = AppendDuringValidation{
+        .loaded = &loaded,
+        .alloc = alloc,
+    };
+
+    var boundary = try temp.root.captureReadBoundary(
+        alloc,
+        initial.id,
+        .{ .test_controls = .{
+            .context = &append,
+            .boundary_fn = AppendDuringValidation.hit,
+        } },
+    );
+    defer boundary.deinit();
+
+    try std.testing.expect(append.attempted);
+    try std.testing.expectEqual(@as(?anyerror, null), append.failure);
+    try std.testing.expect(std.meta.eql(captured_position, boundary.position));
+    try std.testing.expect(loaded.state.preferences.fast_mode);
+    var captured = try session_replay.replayBoundary(
+        alloc,
+        boundary.log_file,
+        boundary.position,
+    );
+    defer captured.deinit(alloc);
+    try std.testing.expect(!captured.preferences.fast_mode);
+}
+
+test "read boundary validation still rejects a corrupt committed prefix" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "read-boundary-corrupt-prefix", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var usage_snapshot = try usage.snapshot(alloc);
+    defer usage_snapshot.deinit(alloc);
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .usage_checkpointed = .{ .usage = usage_snapshot } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    const corrupt_frame_start = loaded.position.through_event_log_bytes;
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        21,
+        .retry_expected_tail,
+        .{},
+    );
+
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
+    defer log.close(io_mod.getIo());
+    try replaceFrameByteForTest(
+        alloc,
+        log,
+        corrupt_frame_start,
+        loaded.position.through_event_log_bytes,
+        "preferences_changed",
+        'X',
+    );
+
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        temp.root.captureReadBoundary(alloc, initial.id, .{}),
+    );
+}
+
+test "writable resume can fail immediately at a contended commit boundary" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-commit-lock-deadline", 10);
+    defer initial.deinit(alloc);
+
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    loaded.log.park();
+
+    var contender = try io_mod.acquireTimedAdvisoryLock(
+        &loaded.log.dir,
+        commit_lock_file,
+        2000,
+    );
+    defer contender.release();
+
+    const started_at_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.SessionCommitBoundaryUnavailable,
+        temp.root.resumeForWrite(alloc, initial.id, .{
+            .session_lock_deadline_ms = 0,
+            .commit_lock_deadline_ms = 0,
+        }),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - started_at_ms < 1000);
+}
+
+test "read boundary can fail immediately at a contended commit boundary" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "read-commit-lock-deadline", 10);
+    defer initial.deinit(alloc);
+
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    loaded.log.park();
+
+    var contender = try io_mod.acquireTimedAdvisoryLock(
+        &loaded.log.dir,
+        commit_lock_file,
+        2000,
+    );
+    defer contender.release();
+
+    const started_at_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.SessionCommitBoundaryUnavailable,
+        temp.root.captureReadBoundary(alloc, initial.id, .{
+            .commit_lock_deadline_ms = 0,
+        }),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - started_at_ms < 1000);
+}
+
+test "namespace confirmation honors an immediate commit lock deadline" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "confirmation-commit-lock-deadline", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_commit_intent_remove };
+
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .rollback_before_adapter_continue,
+        .{ .test_controls = failure.test_controls() },
+    );
+    try std.testing.expect(loaded.namespace_confirmation_required);
+
+    var contender = try io_mod.acquireTimedAdvisoryLock(
+        &loaded.log.dir,
+        commit_lock_file,
+        2000,
+    );
+    defer contender.release();
+
+    const started_at_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.SessionCommitBoundaryUnavailable,
+        loaded.appendEvent(
+            alloc,
+            .{ .preferences_changed = .{ .fast_mode = false } },
+            30,
+            .rollback_before_adapter_continue,
+            .{ .commit_lock_deadline_ms = 0 },
+        ),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - started_at_ms < 1000);
+}
+
+test "park releases session.lock and unpark reacquires or fails busy" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-park-lock", 10);
+    defer initial.deinit(alloc);
+
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+
+    try std.testing.expect(!loaded.log.isParked());
+    loaded.log.park();
+    try std.testing.expect(loaded.log.isParked());
+
+    var contender = try io_mod.acquireTimedAdvisoryLock(
+        &loaded.log.dir,
+        session_lock_file,
+        2000,
+    );
+    try std.testing.expectError(error.SessionBusy, loaded.log.unpark());
+    contender.release();
+
+    try loaded.log.unpark();
+    try std.testing.expect(!loaded.log.isParked());
+
+    try std.testing.expectError(
+        error.LockBusy,
+        io_mod.acquireTimedAdvisoryLock(
+            &loaded.log.dir,
+            session_lock_file,
+            50,
+        ),
+    );
+}
+
+test "watermark decoder rejects malformed object keys and required strings" {
+    const unknown_key =
+        "{\"schema_version\":1,\"session_id\":\"session\",\"log_generation\":\"00000000000000000000000000000000\",\"through_seq\":0,\"through_event_id\":\"00000000000000000000000000000000\",\"through_event_log_bytes\":0,\"unexpected\":true}";
+    const non_string_session_id =
+        "{\"schema_version\":1,\"session_id\":1,\"log_generation\":\"00000000000000000000000000000000\",\"through_seq\":0,\"through_event_id\":\"00000000000000000000000000000000\",\"through_event_log_bytes\":0}";
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        unknown_key,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        session_codec.exactObject(parsed.value, &.{
+            "schema_version",
+            "session_id",
+            "log_generation",
+            "through_seq",
+            "through_event_id",
+            "through_event_log_bytes",
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseWatermark(std.testing.allocator, unknown_key),
+    );
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseWatermark(std.testing.allocator, non_string_session_id),
+    );
 }

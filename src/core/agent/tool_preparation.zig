@@ -35,7 +35,6 @@ pub const Classifiers = struct {
     idempotent: ClassifierFn,
     validation: ClassifierFn,
     availability: ClassifierFn,
-    stop_policy: ClassifierFn,
     deferred_dynamic: ?CandidateClassifierFn = null,
 };
 
@@ -58,7 +57,6 @@ pub const TerminalKind = enum {
     validation_failure,
     availability_failure,
     unsupported,
-    stop_policy,
     file_mutation_failure,
 };
 
@@ -183,15 +181,6 @@ pub fn prepareReadyCall(alloc: Allocator, call: ToolCall, config: Config) !Resul
             )) |terminal| {
                 return .{ .terminal = terminalFromCallback(.availability_failure, terminal) };
             }
-            if (try classifyWithCallback(
-                alloc,
-                config.cancel_flag,
-                config.classifiers,
-                config.classifiers.stop_policy,
-                call,
-            )) |terminal| {
-                return .{ .terminal = terminalFromCallback(.stop_policy, terminal) };
-            }
             return .{ .candidate = .{ .kind = .advertised_dynamic } };
         }
         if (config.classifiers.deferred_dynamic) |classify| {
@@ -231,16 +220,6 @@ pub fn prepareReadyCall(alloc: Allocator, call: ToolCall, config: Config) !Resul
     )) |terminal| {
         return .{ .terminal = terminalFromCallback(.availability_failure, terminal) };
     }
-    if (try classifyWithCallback(
-        alloc,
-        config.cancel_flag,
-        config.classifiers,
-        config.classifiers.stop_policy,
-        call,
-    )) |terminal| {
-        return .{ .terminal = terminalFromCallback(.stop_policy, terminal) };
-    }
-
     const targets = if (file_mutation_contract.isToolName(call.name)) blk: {
         var projection = try tool_admission.prepareFileMutationCall(alloc, call, .{
             .tool_registry = config.tool_registry,
@@ -497,4 +476,475 @@ fn dupeSingleApplicableTarget(
 fn freeApplicableTargets(alloc: Allocator, targets: []context_contract.ApplicableTarget) void {
     for (targets) |target| alloc.free(@constCast(target.path));
     if (targets.len > 0) alloc.free(targets);
+}
+
+fn testNoClassification(_: ?*anyopaque, _: Allocator, _: ToolCall) anyerror!?CallbackTerminal {
+    return null;
+}
+
+const test_classifiers: Classifiers = .{
+    .idempotent = testNoClassification,
+    .validation = testNoClassification,
+    .availability = testNoClassification,
+};
+
+test "advertised dynamic calls stay opaque while unsupported calls are terminal" {
+    const alloc = std.testing.allocator;
+    const empty_registry = tool_dispatch.Registry{ .tools = &.{} };
+    const advertised = [_][]const u8{"mcp_filesystem"};
+
+    var dynamic = try prepareReadyCall(alloc, .{
+        .id = "dynamic",
+        .name = "mcp_filesystem",
+        .arguments_json = "{not parsed by Fx",
+    }, .{
+        .tool_registry = empty_registry,
+        .workspace_root = "/tmp/workspace",
+        .advertised_dynamic_tool_names = &advertised,
+        .classifiers = test_classifiers,
+    });
+    defer dynamic.deinit(alloc);
+    try std.testing.expectEqual(CandidateKind.advertised_dynamic, dynamic.candidate.kind);
+    try std.testing.expectEqual(@as(usize, 0), dynamic.candidate.applicable_targets.len);
+    try std.testing.expect(try ordinaryApplicableTargetsFresh(
+        alloc,
+        .{ .id = "dynamic", .name = "mcp_filesystem", .arguments_json = "{not parsed by Fx" },
+        empty_registry,
+        "/tmp/workspace",
+        &dynamic.candidate,
+    ));
+
+    var unsupported = try prepareReadyCall(alloc, .{
+        .id = "unsupported",
+        .name = "not_advertised",
+        .arguments_json = "{}",
+    }, .{
+        .tool_registry = empty_registry,
+        .workspace_root = "/tmp/workspace",
+        .classifiers = test_classifiers,
+    });
+    defer unsupported.deinit(alloc);
+    try std.testing.expectEqual(TerminalKind.unsupported, unsupported.terminal.kind);
+    try std.testing.expect(unsupported.terminal.model_output == null);
+}
+
+test "live deferred dynamic calls reach dispatch while true unknown calls stay terminal" {
+    const Fixture = struct {
+        fn classify(_: ?*anyopaque, _: Allocator, call: ToolCall) anyerror!bool {
+            return std.mem.eql(u8, call.name, "mcp_reload_tool");
+        }
+    };
+    var classifiers = test_classifiers;
+    classifiers.deferred_dynamic = Fixture.classify;
+    const config = Config{
+        .tool_registry = .{ .tools = &.{} },
+        .workspace_root = "/tmp/workspace",
+        .classifiers = classifiers,
+    };
+
+    var deferred = try prepareReadyCall(std.testing.allocator, .{
+        .id = "deferred",
+        .name = "mcp_reload_tool",
+        .arguments_json = "{}",
+    }, config);
+    defer deferred.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CandidateKind.deferred_dynamic, deferred.candidate.kind);
+
+    var unknown = try prepareReadyCall(std.testing.allocator, .{
+        .id = "unknown",
+        .name = "unknown_tool",
+        .arguments_json = "{}",
+    }, config);
+    defer unknown.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TerminalKind.unsupported, unknown.terminal.kind);
+}
+
+test "classifiers are ordered" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    const Fixture = struct {
+        var idempotent_calls: usize = 0;
+        var validation_calls: usize = 0;
+        var availability_calls: usize = 0;
+
+        fn idempotent(_: ?*anyopaque, callback_alloc: Allocator, call: ToolCall) anyerror!?CallbackTerminal {
+            idempotent_calls += 1;
+            if (!std.mem.eql(u8, call.name, "skill")) return null;
+            return .{ .model_output = try callback_alloc.dupe(u8, "already loaded") };
+        }
+
+        fn validation(_: ?*anyopaque, _: Allocator, _: ToolCall) anyerror!?CallbackTerminal {
+            validation_calls += 1;
+            return null;
+        }
+
+        fn availability(_: ?*anyopaque, callback_alloc: Allocator, call: ToolCall) anyerror!?CallbackTerminal {
+            availability_calls += 1;
+            if (!std.mem.eql(u8, call.name, "web_search")) return null;
+            return .{ .model_output = try callback_alloc.dupe(u8, "search unavailable"), .status = .failure };
+        }
+    };
+    var test_web_search = builtin_tools.read_file;
+    test_web_search.name = "web_search";
+    test_web_search.model_schema.name = "web_search";
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.skill,
+        test_web_search,
+        builtin_tools.shell,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const classifiers: Classifiers = .{
+        .idempotent = Fixture.idempotent,
+        .validation = Fixture.validation,
+        .availability = Fixture.availability,
+    };
+
+    Fixture.idempotent_calls = 0;
+    Fixture.validation_calls = 0;
+    Fixture.availability_calls = 0;
+    var skipped = try prepareReadyCall(alloc, .{
+        .id = "skill",
+        .name = "skill",
+        .arguments_json = "{\"name\":\"demo\",\"location\":\"/tmp/demo\"}",
+    }, .{ .tool_registry = registry, .workspace_root = "/tmp/workspace", .classifiers = classifiers });
+    defer skipped.deinit(alloc);
+    try std.testing.expectEqual(TerminalKind.idempotent_skip, skipped.terminal.kind);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.idempotent_calls);
+    try std.testing.expectEqual(@as(usize, 0), Fixture.validation_calls);
+    try std.testing.expectEqual(@as(usize, 0), Fixture.availability_calls);
+
+    var unavailable = try prepareReadyCall(alloc, .{
+        .id = "search",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"fx context\"}",
+    }, .{ .tool_registry = registry, .workspace_root = "/tmp/workspace", .classifiers = classifiers });
+    defer unavailable.deinit(alloc);
+    try std.testing.expectEqual(TerminalKind.availability_failure, unavailable.terminal.kind);
+    try std.testing.expectEqual(@as(usize, 2), Fixture.idempotent_calls);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.validation_calls);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.availability_calls);
+}
+
+test "classifier validation failures remain terminal before execution" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const Fixture = struct {
+        fn validation(_: ?*anyopaque, alloc: Allocator, _: ToolCall) anyerror!?CallbackTerminal {
+            return .{
+                .model_output = try alloc.dupe(u8, "invalid read arguments"),
+                .status = .failure,
+            };
+        }
+    };
+
+    var result = try prepareReadyCall(std.testing.allocator, .{
+        .id = "invalid-read",
+        .name = "read_file",
+        .arguments_json = "{}",
+    }, .{
+        .tool_registry = registry,
+        .workspace_root = "/tmp/workspace",
+        .classifiers = .{
+            .idempotent = testNoClassification,
+            .validation = Fixture.validation,
+            .availability = testNoClassification,
+        },
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TerminalKind.validation_failure, result.terminal.kind);
+    try std.testing.expect(result.terminal.model_output.?.len > 0);
+}
+
+test "registered candidates expose only authoritative canonical targets" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/build/pkg");
+    try tmp.dir.createDirPath(std.testing.io, "workspace/segment::scope");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "workspace/build/pkg/existing.txt", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "old contents");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const existing_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/build/pkg/existing.txt");
+    defer alloc.free(existing_path);
+    const build_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/build");
+    defer alloc.free(build_path);
+    const delimiter_cwd_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "workspace/segment::scope",
+    );
+    defer alloc.free(delimiter_cwd_path);
+    const new_path = try std.fs.path.join(alloc, &.{ workspace, "build/pkg/new.txt" });
+    defer alloc.free(new_path);
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.read_file,
+        builtin_tools.write_file,
+        builtin_tools.edit_file,
+        builtin_tools.shell,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+
+    var read = try prepareReadyCall(alloc, .{
+        .id = "read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"build/pkg/existing.txt\"}",
+    }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
+    defer read.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), read.candidate.applicable_targets.len);
+    try std.testing.expectEqual(context_contract.TargetKind.file, read.candidate.applicable_targets[0].kind);
+    try std.testing.expectEqualStrings(existing_path, read.candidate.applicable_targets[0].path);
+
+    var missing = try prepareReadyCall(alloc, .{
+        .id = "missing",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"build/pkg/missing.txt\"}",
+    }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(
+        CandidateKind.legacy_target_resolution,
+        missing.candidate.kind,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        missing.candidate.applicable_targets.len,
+    );
+    try std.testing.expect(try ordinaryApplicableTargetsFresh(
+        alloc,
+        .{ .id = "missing", .name = "read_file", .arguments_json = "{\"path\":\"build/pkg/missing.txt\"}" },
+        registry,
+        workspace,
+        &missing.candidate,
+    ));
+
+    var command = try prepareReadyCall(alloc, .{
+        .id = "command",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"cat unrelated/AGENTS.md\",\"cwd\":\"build\"}",
+    }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
+    defer command.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), command.candidate.applicable_targets.len);
+    try std.testing.expectEqual(context_contract.TargetKind.directory, command.candidate.applicable_targets[0].kind);
+    try std.testing.expectEqualStrings(build_path, command.candidate.applicable_targets[0].path);
+
+    var delimiter_command = try prepareReadyCall(alloc, .{
+        .id = "delimiter-command",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"segment::scope\"}",
+    }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
+    defer delimiter_command.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        delimiter_command.candidate.applicable_targets.len,
+    );
+    try std.testing.expectEqual(
+        context_contract.TargetKind.directory,
+        delimiter_command.candidate.applicable_targets[0].kind,
+    );
+    try std.testing.expectEqualStrings(
+        delimiter_cwd_path,
+        delimiter_command.candidate.applicable_targets[0].path,
+    );
+
+    var write = try prepareReadyCall(alloc, .{
+        .id = "write",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"build/pkg/new.txt\",\"content\":\"new contents\"}",
+    }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
+    defer write.deinit(alloc);
+    try std.testing.expectEqualStrings(new_path, write.candidate.applicable_targets[0].path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, new_path, .{}));
+
+    var edit = try prepareReadyCall(alloc, .{
+        .id = "edit",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"build/pkg/existing.txt\",\"old_string\":\"old\",\"new_string\":\"new\"}",
+    }, .{ .tool_registry = registry, .workspace_root = workspace, .classifiers = test_classifiers });
+    defer edit.deinit(alloc);
+    try std.testing.expectEqualStrings(existing_path, edit.candidate.applicable_targets[0].path);
+    var unchanged_file = try std.Io.Dir.openFileAbsolute(std.testing.io, existing_path, .{});
+    defer unchanged_file.close(std.testing.io);
+    const unchanged = try io_mod.readFileToEnd(alloc, &unchanged_file, 1024);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings("old contents", unchanged);
+}
+
+test "ordinary applicable target freshness detects retarget and resolution failure" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/old");
+    try tmp.dir.createDirPath(std.testing.io, "workspace/new");
+    {
+        var old_file = try tmp.dir.createFile(std.testing.io, "workspace/old/input.txt", .{});
+        defer old_file.close(std.testing.io);
+        try old_file.writeStreamingAll(std.testing.io, "old");
+        var new_file = try tmp.dir.createFile(std.testing.io, "workspace/new/input.txt", .{});
+        defer new_file.close(std.testing.io);
+        try new_file.writeStreamingAll(std.testing.io, "new");
+    }
+    try tmp.dir.symLink(std.testing.io, "old", "workspace/link", .{ .is_directory = true });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.read_file,
+        builtin_tools.shell,
+    };
+    const config: Config = .{
+        .tool_registry = .{ .tools = &tools },
+        .workspace_root = workspace,
+        .classifiers = test_classifiers,
+    };
+
+    var read = try prepareReadyCall(alloc, .{
+        .id = "read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"link/input.txt\"}",
+    }, config);
+    defer read.deinit(alloc);
+    var command = try prepareReadyCall(alloc, .{
+        .id = "command",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"link\"}",
+    }, config);
+    defer command.deinit(alloc);
+    try std.testing.expect(try ordinaryApplicableTargetsFresh(
+        alloc,
+        .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"link/input.txt\"}" },
+        config.tool_registry,
+        config.workspace_root,
+        &read.candidate,
+    ));
+    try std.testing.expect(try ordinaryApplicableTargetsFresh(
+        alloc,
+        .{ .id = "command", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"link\"}" },
+        config.tool_registry,
+        config.workspace_root,
+        &command.candidate,
+    ));
+    try tmp.dir.deleteFile(std.testing.io, "workspace/link");
+    try tmp.dir.symLink(std.testing.io, "new", "workspace/link", .{ .is_directory = true });
+    try std.testing.expect(!try ordinaryApplicableTargetsFresh(
+        alloc,
+        .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"link/input.txt\"}" },
+        config.tool_registry,
+        config.workspace_root,
+        &read.candidate,
+    ));
+    try std.testing.expect(!try ordinaryApplicableTargetsFresh(
+        alloc,
+        .{ .id = "command", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"link\"}" },
+        config.tool_registry,
+        config.workspace_root,
+        &command.candidate,
+    ));
+    var missing = try prepareReadyCall(alloc, .{
+        .id = "missing",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"new/input.txt\"}",
+    }, config);
+    defer missing.deinit(alloc);
+    try tmp.dir.deleteFile(std.testing.io, "workspace/new/input.txt");
+    try std.testing.expect(!try ordinaryApplicableTargetsFresh(
+        alloc,
+        .{ .id = "missing", .name = "read_file", .arguments_json = "{\"path\":\"new/input.txt\"}" },
+        config.tool_registry,
+        config.workspace_root,
+        &missing.candidate,
+    ));
+}
+
+test "legacy ordinary applicable target freshness detects newly resolvable scope" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+    const config: Config = .{
+        .tool_registry = .{ .tools = &tools },
+        .workspace_root = workspace,
+        .classifiers = test_classifiers,
+    };
+    const call: ToolCall = .{
+        .id = "missing",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"nested/later.txt\"}",
+    };
+
+    var missing = try prepareReadyCall(alloc, call, config);
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(
+        CandidateKind.legacy_target_resolution,
+        missing.candidate.kind,
+    );
+    try std.testing.expect(try ordinaryApplicableTargetsFresh(
+        alloc,
+        call,
+        config.tool_registry,
+        config.workspace_root,
+        &missing.candidate,
+    ));
+
+    var file = try tmp.dir.createFile(std.testing.io, "workspace/nested/later.txt", .{});
+    file.close(std.testing.io);
+    try std.testing.expect(!try ordinaryApplicableTargetsFresh(
+        alloc,
+        call,
+        config.tool_registry,
+        config.workspace_root,
+        &missing.candidate,
+    ));
+}
+
+fn checkPreparationAllocationFailures(alloc: Allocator, workspace: []const u8) !void {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{builtin_tools.write_file};
+    var result = try prepareReadyCall(alloc, .{
+        .id = "write",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"build/new.txt\",\"content\":\"contents\"}",
+    }, .{
+        .tool_registry = .{ .tools = &tools },
+        .workspace_root = workspace,
+        .classifiers = test_classifiers,
+    });
+    defer result.deinit(alloc);
+    try std.testing.expect(result == .candidate);
+}
+
+test "preparation cancellation and allocation failures clean owned state" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, prepareReadyCall(alloc, .{
+        .id = "cancelled",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    }, .{
+        .tool_registry = .{ .tools = &tools },
+        .workspace_root = "/tmp/workspace",
+        .cancel_flag = &cancelled,
+        .classifiers = test_classifiers,
+    }));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/build");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        checkPreparationAllocationFailures,
+        .{workspace},
+    );
 }

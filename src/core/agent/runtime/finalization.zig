@@ -39,6 +39,7 @@ pub const TurnFinalizationGuard = struct {
     turn_id: u64,
     lifecycle: LifecycleContext,
     state: State = .open,
+    outcome: ?types.TurnPresentationOutcome = null,
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
 
@@ -130,6 +131,7 @@ pub const TurnFinalizationGuard = struct {
             return err;
         };
         self.state = .emitted;
+        self.outcome = outcome;
 
         defer lifecycle_runtime.dispatchPostTurnEndCheckpoint(self.lifecycle, .{
             .turn_id = self.turn_id,

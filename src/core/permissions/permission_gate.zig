@@ -143,6 +143,89 @@ const MockContext = struct {
     permission_decider: ?*const fn (*const MockTool, MockInput, MockContext) Decision = null,
 };
 
+test "decide allows read-only non-destructive invocation in ask mode" {
+    const tool = MockTool{};
+    const decision = decideOrdinary(&tool, MockInput{}, MockContext{ .permission_mode = .ask });
+
+    try std.testing.expectEqual(.allow, decision.action);
+    try std.testing.expectEqualStrings("read-only invocation allowed", decision.reason);
+}
+
+test "decide allows read-only non-destructive invocation in auto mode" {
+    const tool = MockTool{};
+    const decision = decideOrdinary(&tool, MockInput{}, MockContext{ .permission_mode = .auto });
+
+    try std.testing.expectEqual(.allow, decision.action);
+}
+
+test "decide denies non-read-only invocation" {
+    const tool = MockTool{};
+    const decision = decideOrdinary(&tool, MockInput{ .read_only = false }, MockContext{ .permission_mode = .ask });
+
+    try std.testing.expectEqual(.deny, decision.action);
+    try std.testing.expectEqualStrings("tool invocation is not read-only", decision.reason);
+}
+
+test "decide denies irreversible invocation" {
+    const tool = MockTool{};
+    const decision = decideOrdinary(&tool, MockInput{ .destructive = true }, MockContext{ .permission_mode = .auto });
+
+    try std.testing.expectEqual(.deny, decision.action);
+    try std.testing.expectEqualStrings("tool invocation is irreversible", decision.reason);
+}
+
+test "decide allows irreversible invocation in yolo mode without consulting a decider" {
+    const tool = MockTool{};
+    const decision = decideOrdinary(
+        &tool,
+        MockInput{ .read_only = false, .destructive = true },
+        MockContext{
+            .permission_mode = .yolo,
+            .permission_decider = struct {
+                fn deny(_: *const MockTool, _: MockInput, _: MockContext) Decision {
+                    return .{ .action = .deny, .reason = "must not be called" };
+                }
+            }.deny,
+        },
+    );
+
+    try std.testing.expectEqual(.allow, decision.action);
+    try std.testing.expectEqualStrings("allowed by yolo mode", decision.reason);
+}
+
+test "Decision deinit leaves static reason and grant suggestions alone" {
+    var decision = Decision{
+        .action = .allow,
+        .reason = "allowed",
+    };
+    decision.deinit(std.testing.allocator);
+}
+
+test "Decision deinit frees owned grant suggestions" {
+    const alloc = std.testing.allocator;
+    var grants = try alloc.alloc(core_types.PermissionGrant, 1);
+    errdefer alloc.free(grants);
+
+    const tool_name = try alloc.dupe(u8, "bash");
+    errdefer alloc.free(tool_name);
+    const target_path = try alloc.dupe(u8, "npm*");
+    errdefer alloc.free(target_path);
+
+    grants[0] = .{
+        .tool_name = tool_name,
+        .target_path = target_path,
+    };
+
+    var decision = Decision{
+        .action = .deny,
+        .reason = "denied",
+        .grant_suggestions = grants,
+        .grant_suggestions_owned = true,
+        .grant_suggestions_alloc = alloc,
+    };
+    decision.deinit(alloc);
+}
+
 var injected_permission_error: PermissionDecisionError = error.OutOfMemory;
 
 const RunMockContext = struct {
@@ -160,4 +243,27 @@ fn failRunDecision(
     _: RunMockContext,
 ) PermissionDecisionError!Decision {
     return injected_permission_error;
+}
+
+test "fallible permission gate preserves operational errors" {
+    const tool = MockTool{};
+    const errors = [_]PermissionDecisionError{
+        error.OutOfMemory,
+        error.Canceled,
+        error.Unexpected,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+    };
+    for (errors) |err| {
+        injected_permission_error = err;
+        try std.testing.expectError(err, decide(
+            &tool,
+            MockInput{},
+            RunMockContext{
+                .permission_mode = .ask,
+                .permission_decider = failRunDecision,
+            },
+        ));
+    }
 }

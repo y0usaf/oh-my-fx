@@ -1,5 +1,5 @@
 const std = @import("std");
-const lexical_relevance = @import("../shared/lexical_relevance.zig");
+const capability_retrieval = @import("capability_retrieval.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const elicitation = @import("../mcp/elicitation.zig");
@@ -11,8 +11,8 @@ const Allocator = std.mem.Allocator;
 pub const HasToolFn = *const fn (*anyopaque, []const u8, Access) bool;
 pub const ValidateToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, Access) anyerror!ValidationResult;
 pub const CallToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, usize, CallOptions) anyerror!?CallResult;
-pub const PreparedQuery = lexical_relevance.PreparedQuery;
-pub const SearchToolsFn = *const fn (*anyopaque, Allocator, *const PreparedQuery, usize, types.PermissionRuleSet, context_limits.Values, Access) anyerror!SearchResult;
+pub const SearchRequest = capability_retrieval.Request;
+pub const SearchToolsFn = *const fn (*anyopaque, Allocator, SearchRequest, types.PermissionRuleSet, context_limits.Values, Access) anyerror!SearchResult;
 pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.PermissionRuleSet, context_limits.Values, Access) anyerror!?ToolSchemaResult;
 pub const FeatureCallFn = *const fn (
     *anyopaque,
@@ -371,6 +371,36 @@ pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
         "Dynamic MCP tool not selected for this model step: {s}. Use capability_search and mcp_select_tool first; the selected tool can be called on the next model step after its schema is advertised.",
         .{name},
     );
+}
+test "MCP advertised dynamic tool executes only through its supplied capability" {
+    var fixture = Fixture.CountingContext{};
+    const advertised = [_][]const u8{"mcp_fs_read"};
+    const input = CallInput{
+        .advertised_dynamic_tool_names = &advertised,
+        .runtime = .{
+            .context = @ptrCast(&fixture),
+            .call_tool = Fixture.callCounting,
+        },
+        .max_tool_result_bytes = 1024,
+    };
+
+    const result = (try callAdvertisedDynamicTool(
+        input,
+        std.testing.allocator,
+        "mcp_fs_read",
+        "{}",
+    )).?;
+    defer std.testing.allocator.free(result.model_output);
+
+    try std.testing.expectEqualStrings("mcp ok", result.model_output);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect((try callAdvertisedDynamicTool(
+        input,
+        std.testing.allocator,
+        "mcp_other",
+        "{}",
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
 const Fixture = struct {

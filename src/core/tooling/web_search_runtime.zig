@@ -510,6 +510,188 @@ fn fakeRuntime(fake: *FakeProvider) Runtime {
     });
 }
 
+test "runtime routes configured inputs and backend selection through provider" {
+    const alloc = std.testing.allocator;
+    const secondary_only = [_]web_search_contract.SearchBackendId{test_secondary_backend};
+    var fake = FakeProvider{ .preferred_backends = &secondary_only };
+    var runtime = Runtime.init(.{
+        .provider = fake.provider(),
+        .api_key = "provider-key",
+        .worker_model = "provider/private-worker",
+        .gateway_retry_count = 2,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    var output = try runtime.execute(alloc, input, &cancel_flag);
+    defer output.deinit(alloc);
+
+    try std.testing.expect(fake.configured_inputs_seen);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(test_secondary_backend.eql(fake.last_backend.?));
+}
+
+test "runtime invokes primary backend after allow" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    var output = try runtime.execute(alloc, input, &cancel_flag);
+    defer output.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(test_primary_backend.eql(fake.last_backend.?));
+}
+
+test "runtime invokes secondary backend after allow" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    runtime.policy.preferred_backends = &.{test_secondary_backend};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    var output = try runtime.execute(alloc, input, &cancel_flag);
+    defer output.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(test_secondary_backend.eql(fake.last_backend.?));
+}
+
+test "runtime falls back before request when first backend cannot satisfy strict filter" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    var unsupported = test_backend_policies[0];
+    unsupported.features.allowed_domains = .unsupported;
+    const backends = [_]web_search_policy.BackendPolicy{
+        unsupported,
+        test_backend_policies[1],
+    };
+    runtime.policy.backend_policies = &backends;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const allowed_domains = [_][]const u8{"ziglang.org"};
+    const input = web_search_contract.Request{
+        .query = "latest Zig release",
+        .allowed_domains = &allowed_domains,
+    };
+
+    var output = try runtime.execute(alloc, input, &cancel_flag);
+    defer output.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(test_secondary_backend.eql(fake.last_backend.?));
+}
+
+test "unsupported strict filters perform zero backend search requests" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    var unsupported = test_backend_policies[0];
+    unsupported.features.allowed_domains = .unsupported;
+    runtime.policy.preferred_backends = &.{test_primary_backend};
+    runtime.policy.backend_policies = &.{unsupported};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const allowed_domains = [_][]const u8{"ziglang.org"};
+    const input = web_search_contract.Request{
+        .query = "latest Zig release",
+        .allowed_domains = &allowed_domains,
+    };
+
+    try std.testing.expectError(error.UnsupportedWebSearchFeatures, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "oversized worker request performs zero backend search requests" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    runtime.policy.max_input_bytes = 8;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    try std.testing.expectError(error.WebSearchRequestTooLarge, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "cancelled runtime performs zero backend search requests" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    var cancel_flag = std.atomic.Value(bool).init(true);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    try std.testing.expectError(error.Cancelled, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "missing provider records no network request" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    var runtime = Runtime.init(.{ .policy = test_policy });
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    try std.testing.expectError(error.MissingWebSearchProvider, runtime.execute(alloc, input, &cancel_flag));
+    var calls: [diagnostics.network_ring_capacity]diagnostics.NetworkCall = undefined;
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotNetworkCalls(&calls));
+}
+
+test "runtime normalizes source usage and terminal incomplete state" {
+    const alloc = std.testing.allocator;
+    var source_fake = FakeProvider{ .response_kind = .source };
+    var source_runtime = fakeRuntime(&source_fake);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    var source = try source_runtime.execute(alloc, input, &cancel_flag);
+    defer source.deinit(alloc);
+    try std.testing.expectEqualStrings("Zig release", source.output.results[0].search.content[0].title);
+    try std.testing.expectEqual(@as(u32, 1), source.inner_usage.?.web_search_requests);
+
+    var incomplete_fake = FakeProvider{ .response_kind = .incomplete };
+    var incomplete_runtime = fakeRuntime(&incomplete_fake);
+    var incomplete = try incomplete_runtime.execute(alloc, input, &cancel_flag);
+    defer incomplete.deinit(alloc);
+    try std.testing.expect(incomplete.output.incomplete);
+    try std.testing.expectEqualStrings("max_tokens", incomplete.output.results[1].terminal_incomplete.stop_reason);
+}
+
+test "runtime preserves ordered commentary search errors sources and terminal incomplete state" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{ .response_kind = .interleaved_incomplete };
+    var runtime = fakeRuntime(&fake);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    var output = try runtime.execute(alloc, input, &cancel_flag);
+    defer output.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 6), output.output.results.len);
+    try std.testing.expectEqualStrings("commentary A", output.output.results[0].commentary);
+    try std.testing.expectEqualStrings("search_1", output.output.results[1].search.tool_use_id);
+    try std.testing.expectEqualStrings("too_many_requests", output.output.results[2].error_text);
+    try std.testing.expectEqualStrings("commentary B", output.output.results[3].commentary);
+    try std.testing.expectEqualStrings("search_2", output.output.results[4].search.tool_use_id);
+    try std.testing.expectEqualStrings("max_tokens", output.output.results[5].terminal_incomplete.stop_reason);
+    try std.testing.expect(output.output.incomplete);
+}
+
+test "runtime reports bounded backend timeout" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{ .transport_error = .timeout };
+    var runtime = fakeRuntime(&fake);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const input = web_search_contract.Request{ .query = "latest Zig release" };
+
+    try std.testing.expectError(error.TimeoutExpired, runtime.execute(alloc, input, &cancel_flag));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
 var permission_decider_calls: usize = 0;
 
 fn denyPermission(_: *const tool_dispatch.Tool, _: tool_dispatch.ToolInput, _: tool_dispatch.DispatchContext) @import("../permissions/permission_gate.zig").Decision {
@@ -522,6 +704,124 @@ fn allowPermission(_: *const tool_dispatch.Tool, _: tool_dispatch.ToolInput, _: 
     return .{ .action = .allow, .reason = "test allow" };
 }
 
+test "denied web_search performs zero backend search requests" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.web_search} };
+
+    permission_decider_calls = 0;
+    var result = try tool_dispatch.dispatchToolCall(.{
+        .allocator = alloc,
+        .permission_decider = denyPermission,
+        .tool_capabilities = .{ .web_search_runtime_ready = true },
+        .web_search_backend = runtime.dispatchBackend(),
+    }, registry, .{
+        .id = "search",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"latest Zig release\"}",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), permission_decider_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "invalid web_search performs zero backend search requests" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.web_search} };
+
+    permission_decider_calls = 0;
+    var result = try tool_dispatch.dispatchToolCall(.{
+        .allocator = alloc,
+        .permission_decider = allowPermission,
+        .tool_capabilities = .{ .web_search_runtime_ready = true },
+        .web_search_backend = runtime.dispatchBackend(),
+    }, registry, .{
+        .id = "search",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"x\"}",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), permission_decider_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "missing runtime web_search performs zero backend search requests" {
+    const alloc = std.testing.allocator;
+    const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.web_search} };
+
+    permission_decider_calls = 0;
+    var result = try tool_dispatch.dispatchToolCall(.{
+        .allocator = alloc,
+        .permission_decider = allowPermission,
+    }, registry, .{
+        .id = "search",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"latest Zig release\"}",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), permission_decider_calls);
+}
+
+test "allowed web_search invokes selected backend exactly once" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{ .response_kind = .source };
+    var runtime = fakeRuntime(&fake);
+    const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.web_search} };
+
+    permission_decider_calls = 0;
+    var result = try tool_dispatch.dispatchToolCall(.{
+        .allocator = alloc,
+        .permission_decider = allowPermission,
+        .tool_capabilities = .{ .web_search_runtime_ready = true },
+        .web_search_backend = runtime.dispatchBackend(),
+    }, registry, .{
+        .id = "search",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"latest Zig release\"}",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), permission_decider_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "Zig release") != null);
+    try std.testing.expectEqual(@as(u32, 1), result.inner_usage.?.web_search_requests);
+    try std.testing.expectEqual(@as(u32, 1), result.web_search_completion.?.searches);
+}
+
+test "cancelled registered web_search performs zero backend requests" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.web_search} };
+    var cancel_flag = std.atomic.Value(bool).init(true);
+
+    permission_decider_calls = 0;
+    var result = try tool_dispatch.dispatchToolCall(.{
+        .allocator = alloc,
+        .cancel_flag = &cancel_flag,
+        .permission_decider = allowPermission,
+        .tool_capabilities = .{ .web_search_runtime_ready = true },
+        .web_search_backend = runtime.dispatchBackend(),
+    }, registry, .{
+        .id = "search",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"latest Zig release\"}",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), permission_decider_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(.failure, result.status);
+    try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(result.body));
+}
+
 const SearchConfigStress = struct {
     runtime: *Runtime,
     inputs: Inputs,
@@ -530,3 +830,70 @@ const SearchConfigStress = struct {
         for (0..2000) |_| self.runtime.configure(self.inputs);
     }
 };
+
+test "web_search runtime updates its worker model during configuration" {
+    var runtime = Runtime.init(.{});
+    runtime.configure(.{
+        .api_key = "key",
+        .worker_model = "provider/model",
+        .gateway_retry_count = 2,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+
+    try std.testing.expectEqualStrings("provider/model", runtime.worker_model);
+    try std.testing.expectEqualStrings("key", runtime.api_key);
+    try std.testing.expectEqual(@as(usize, 2), runtime.gateway_retry_count);
+    try std.testing.expectEqualStrings("https://gateway.test/chat", runtime.gateway_chat_url);
+}
+
+test "web_search runtime preserves session usage through worker input snapshots" {
+    const alloc = std.testing.allocator;
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var runtime = Runtime.init(.{
+        .usage = &usage,
+        .usage_allocator = alloc,
+    });
+
+    var inputs = try runtime.inputsSnapshot(alloc);
+    defer inputs.deinit(alloc);
+
+    try std.testing.expect(inputs.usage.? == &usage);
+    try std.testing.expect(std.meta.eql(alloc, inputs.usage_allocator));
+}
+
+test "web_search input snapshots stay coherent during parallel reconfiguration" {
+    var runtime = Runtime.init(.{});
+    const inputs_a = Inputs{
+        .api_key = "key-a",
+        .worker_model = "model-a",
+        .gateway_retry_count = 1,
+        .gateway_chat_url = "https://a.invalid/chat",
+    };
+    const inputs_b = Inputs{
+        .api_key = "key-b",
+        .worker_model = "model-b",
+        .gateway_retry_count = 2,
+        .gateway_chat_url = "https://b.invalid/chat",
+    };
+    runtime.configure(inputs_a);
+
+    const thread_a = try std.Thread.spawn(.{}, SearchConfigStress.run, .{SearchConfigStress{ .runtime = &runtime, .inputs = inputs_a }});
+    defer thread_a.join();
+    const thread_b = try std.Thread.spawn(.{}, SearchConfigStress.run, .{SearchConfigStress{ .runtime = &runtime, .inputs = inputs_b }});
+    defer thread_b.join();
+
+    for (0..2000) |_| {
+        var snapshot = try runtime.inputsSnapshot(std.testing.allocator);
+        defer snapshot.deinit(std.testing.allocator);
+        const matches_a = std.mem.eql(u8, snapshot.api_key, inputs_a.api_key) and
+            std.mem.eql(u8, snapshot.worker_model, inputs_a.worker_model) and
+            snapshot.gateway_retry_count == inputs_a.gateway_retry_count and
+            std.mem.eql(u8, snapshot.gateway_chat_url, inputs_a.gateway_chat_url);
+        const matches_b = std.mem.eql(u8, snapshot.api_key, inputs_b.api_key) and
+            std.mem.eql(u8, snapshot.worker_model, inputs_b.worker_model) and
+            snapshot.gateway_retry_count == inputs_b.gateway_retry_count and
+            std.mem.eql(u8, snapshot.gateway_chat_url, inputs_b.gateway_chat_url);
+        try std.testing.expect(matches_a or matches_b);
+    }
+}

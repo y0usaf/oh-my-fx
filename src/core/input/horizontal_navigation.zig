@@ -139,3 +139,103 @@ fn moveWordRight(
     }
     return edit.moveCursorTo(raw_offset, extend_selection);
 }
+
+test "horizontal character motion collapses selections at the matching edge" {
+    const alloc = std.testing.allocator;
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "abcdef");
+
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var vertical: vertical_navigation.State = .{ .preferred_column = 4 };
+
+    _ = edit.beginSelection(2);
+    _ = edit.extendSelection(5);
+    try std.testing.expect(moveIntent(.{ .kind = .character_left }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, 2), edit.cursor);
+    try std.testing.expect(edit.selectionRange() == null);
+    try std.testing.expectEqual(@as(?usize, null), vertical.preferredColumn());
+
+    _ = edit.beginSelection(2);
+    _ = edit.extendSelection(5);
+    try std.testing.expect(moveIntent(.{ .kind = .character_right }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, 5), edit.cursor);
+    try std.testing.expect(edit.selectionRange() == null);
+}
+
+test "horizontal character motion preserves display units and registered entities" {
+    const alloc = std.testing.allocator;
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "Ae\u{301}[Image #2]B");
+
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    try entities.image_tokens.append(alloc, .{
+        .id = 2,
+        .span = .{ .raw_start = "Ae\u{301}".len, .raw_end = "Ae\u{301}[Image #2]".len },
+    });
+    var vertical: vertical_navigation.State = .{};
+
+    _ = edit.setCursor(edit.input.items.len);
+    try std.testing.expect(moveIntent(.{ .kind = .character_left }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, "Ae\u{301}[Image #2]".len), edit.cursor);
+    try std.testing.expect(moveIntent(.{ .kind = .character_left }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, "Ae\u{301}".len), edit.cursor);
+    try std.testing.expect(moveIntent(.{ .kind = .character_left }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, "A".len), edit.cursor);
+}
+
+test "horizontal word motion preserves punctuation unicode and entity boundaries" {
+    const alloc = std.testing.allocator;
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "h\u{e9}llo.a_b [Image #1] next");
+
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    try entities.image_tokens.append(alloc, .{
+        .id = 1,
+        .span = .{
+            .raw_start = "h\u{e9}llo.a_b ".len,
+            .raw_end = "h\u{e9}llo.a_b [Image #1]".len,
+        },
+    });
+    var vertical: vertical_navigation.State = .{};
+
+    _ = edit.setCursor(0);
+    try std.testing.expect(moveIntent(.{ .kind = .word_right }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, "h\u{e9}llo".len), edit.cursor);
+    try std.testing.expect(moveIntent(.{ .kind = .word_right }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, "h\u{e9}llo.a_b".len), edit.cursor);
+    try std.testing.expect(moveIntent(.{ .kind = .word_right }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, "h\u{e9}llo.a_b [Image #1]".len), edit.cursor);
+    try std.testing.expect(moveIntent(.{ .kind = .word_left }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, "h\u{e9}llo.a_b ".len), edit.cursor);
+}
+
+test "horizontal line and input motions keep distinct boundaries" {
+    const alloc = std.testing.allocator;
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "FIRST\nSECOND\nTHIRD");
+
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var vertical: vertical_navigation.State = .{ .preferred_column = 3 };
+
+    _ = edit.setCursor("FIRST\nSEC".len);
+    try std.testing.expect(moveIntent(.{ .kind = .line_start }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, "FIRST\n".len), edit.cursor);
+    try std.testing.expect(moveIntent(.{ .kind = .line_end }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, "FIRST\nSECOND".len), edit.cursor);
+    try std.testing.expect(moveIntent(.{ .kind = .draft_start }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(usize, 0), edit.cursor);
+    try std.testing.expect(moveIntent(.{ .kind = .draft_end }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(edit.input.items.len, edit.cursor);
+
+    vertical.preferred_column = 7;
+    try std.testing.expect(!moveIntent(.{ .kind = .character_right }, &edit, &entities, &vertical));
+    try std.testing.expectEqual(@as(?usize, null), vertical.preferredColumn());
+}

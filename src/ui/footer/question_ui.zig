@@ -530,3 +530,524 @@ fn writeTruncated(writer: *std.Io.Writer, text: []const u8, budget: usize) !void
     try writer.writeAll(prefix);
     try writer.writeAll("…");
 }
+
+test "question footer composes prompt inside decision panel" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = "go ahead" },
+        .{ .label = "No", .description = null },
+        .{ .label = "Maybe", .description = "decide later" },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 80);
+    defer std.testing.allocator.free(text);
+
+    const question_hint = "Use numbers, Up/Down, or tab to choose, enter to confirm, esc to cancel";
+    try std.testing.expect(std.mem.find(u8, text, "Should we proceed?") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Yes") != null);
+    try std.testing.expect(std.mem.find(u8, text, "go ahead") != null);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    _ = lines.next();
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(lines.next().?) == 0);
+    try std.testing.expect(std.mem.find(u8, text, question_hint) == null);
+}
+
+test "long question text wraps into measured continuation rows" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Run tests", .description = null },
+        .{ .label = "Skip tests", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{
+            .question = "Which verification steps should run before this branch is pushed?",
+            .options = &options,
+        },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    const width: u16 = 42;
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, width);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "Which verification steps should run") != null);
+    try expectVisibleIndentBefore(text, "before this branch is pushed?", 2);
+    try std.testing.expect(std.mem.find(u8, text, "Which verification steps should run…") == null);
+    try expectQuestionPanelRowsMatch(&prompt, width);
+}
+
+test "question footer clips composed rows to solved footer band" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Inspect repository state", .description = "Look around the workspace and report back" },
+        .{ .label = "Run unit tests", .description = "Execute zig build test" },
+        .{ .label = "Build binary", .description = "Execute zig build" },
+        .{ .label = "Review branch", .description = "Check the local diff" },
+        .{ .label = "Ship branch", .description = "Push and open a PR" },
+        .{ .label = "Something else", .description = "Use freeform input" },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "What should happen first?", .options = &options },
+        .{ .question = "What should happen second?", .options = &options },
+        .{ .question = "What should happen third?", .options = &options },
+        .{ .question = "What should happen fourth?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 80);
+    defer std.testing.allocator.free(text);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 80);
+    }
+}
+
+test "compose question panel renders only the current paginated entry" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "One", .description = null },
+        .{ .label = "Two", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Q0?", .options = &options },
+        .{ .question = "Q1?", .options = &options },
+        .{ .question = "Q2?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    _ = try prompt.apply(std.testing.allocator, .submit);
+    try std.testing.expectEqual(@as(u8, 1), prompt.current_index);
+
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 60);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "Question 2 of 3") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Input needed") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Q0?") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Q1?") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Q2?") == null);
+    // No caret: the selected option is the one carrying the white style.
+    try std.testing.expect(std.mem.find(u8, text, "❯") == null);
+    try std.testing.expect(std.mem.find(u8, text, "[✓]") == null);
+    var sel_buf: [64]u8 = undefined;
+    const selected_one = try std.fmt.bufPrint(&sel_buf, "{s}    1) One", .{ui_render.selected_completion_style});
+    try std.testing.expect(std.mem.find(u8, text, selected_one) != null);
+    var unsel_buf: [64]u8 = undefined;
+    const unselected_two = try std.fmt.bufPrint(&unsel_buf, "{s}    2) Two", .{ui_render.dim_style});
+    try std.testing.expect(std.mem.find(u8, text, unselected_two) != null);
+}
+
+test "question panel row measurement matches serialized panel rows" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "One", .description = null },
+        .{ .label = "Two", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Q0?", .options = &options },
+        .{ .question = "Q1?", .options = &options },
+        .{ .question = "Q2?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    try expectQuestionPanelRowsMatch(&prompt, 50);
+
+    _ = try prompt.apply(std.testing.allocator, .submit);
+    try expectQuestionPanelRowsMatch(&prompt, 50);
+
+    prompt.moveChoice(-1);
+    _ = try prompt.apply(std.testing.allocator, .{ .insert_ascii = 'x' });
+    try expectQuestionPanelRowsMatch(&prompt, 16);
+
+    _ = try prompt.apply(std.testing.allocator, .submit);
+    _ = try prompt.apply(std.testing.allocator, .submit);
+    try expectQuestionPanelRowsMatch(&prompt, 50);
+}
+
+fn expectQuestionPanelRowsMatch(
+    prompt: *const question_prompt.QuestionPrompt,
+    width: u16,
+) !void {
+    const projection = prompt.projection().?;
+    const text = try composeQuestionPanelText(std.testing.allocator, projection, width);
+    defer std.testing.allocator.free(text);
+
+    var line_start: usize = 0;
+    var serialized_rows: u16 = 0;
+    while (line_start < text.len) {
+        _ = nextPanelLine(text, &line_start);
+        serialized_rows += 1;
+    }
+
+    const measured_rows = try questionPanelRowsForLayout(std.testing.allocator, projection, width);
+    try std.testing.expectEqual(serialized_rows, measured_rows);
+}
+
+test "compose question resolutions emits answered summary block" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Alpha", .description = null },
+        .{ .label = "Beta", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Q0?", .options = &options },
+        .{ .question = "Q1?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    _ = try prompt.apply(std.testing.allocator, .submit);
+    prompt.moveChoice(1);
+    _ = try prompt.apply(std.testing.allocator, .submit);
+
+    const text = try composeQuestionResolutions(std.testing.allocator, &prompt, false, 60);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "  1) Q0?\n"));
+    try std.testing.expect(std.mem.find(u8, text, "     Alpha") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\n  2) Q1?\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "     Beta") != null);
+    try std.testing.expect(std.mem.find(u8, text, "User answered") == null);
+
+    const cancelled_text = try composeQuestionResolutions(std.testing.allocator, &prompt, true, 60);
+    defer std.testing.allocator.free(cancelled_text);
+    const expected_cancelled = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}■{s} Cancelled\n",
+        .{ ui_render.red_style, ui_render.reset_style },
+    );
+    defer std.testing.allocator.free(expected_cancelled);
+    try std.testing.expectEqualStrings(expected_cancelled, cancelled_text);
+}
+
+test "resolved question answers use the live resolution layout at every width" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Thorough", .description = null },
+        .{ .label = "Fast", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Which verification depth should I use?", .options = &options },
+        .{ .question = "Should I ship it?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    _ = try prompt.apply(std.testing.allocator, .submit);
+    _ = try prompt.apply(std.testing.allocator, .submit);
+
+    const answers = [_]types.QuestionAnswer{
+        .{ .question = "Which verification depth should I use?", .answer = "Thorough" },
+        .{ .question = "Should I ship it?", .answer = "Thorough" },
+    };
+    for ([_]u16{ 60, 12 }) |cols| {
+        const live = try composeQuestionResolutions(std.testing.allocator, &prompt, false, cols);
+        defer std.testing.allocator.free(live);
+        const replay = try composeResolvedQuestionAnswers(std.testing.allocator, &answers, cols);
+        defer std.testing.allocator.free(replay);
+        try std.testing.expectEqualStrings(live, replay);
+    }
+}
+
+test "resolved multiline question fields keep every row inside the transcript rail" {
+    const answers = [_]types.QuestionAnswer{.{
+        .question = "Choose one\ncarefully",
+        .answer = "line-one\nline-two\nline-three",
+    }};
+    const text = try composeResolvedQuestionAnswers(std.testing.allocator, &answers, 60);
+    defer std.testing.allocator.free(text);
+
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "  1) Choose one\n" ++
+            "     carefully\n" ++
+            "{s}     line-one{s}\n" ++
+            "{s}     line-two{s}\n" ++
+            "{s}     line-three{s}\n",
+        .{
+            ui_render.statusline_style, ui_render.reset_style,
+            ui_render.statusline_style, ui_render.reset_style,
+            ui_render.statusline_style, ui_render.reset_style,
+        },
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, text);
+}
+
+test "resolved multiline answers use the same live and replay layout" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Alpha", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Choose one?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    prompt.moveChoice(-1);
+    try std.testing.expectEqual(
+        question_prompt.FreeformInsertResult.inserted,
+        try prompt.insertFreeformSlice(std.testing.allocator, "line-one\nline-two", 64),
+    );
+    try std.testing.expectEqual(
+        question_prompt.QuestionInputEvent.all_decided,
+        try prompt.apply(std.testing.allocator, .submit),
+    );
+
+    const answers = [_]types.QuestionAnswer{.{
+        .question = "Choose one?",
+        .answer = "line-one\nline-two",
+    }};
+    for ([_]u16{ 60, 12 }) |cols| {
+        const live = try composeQuestionResolutions(std.testing.allocator, &prompt, false, cols);
+        defer std.testing.allocator.free(live);
+        const replay = try composeResolvedQuestionAnswers(std.testing.allocator, &answers, cols);
+        defer std.testing.allocator.free(replay);
+        try std.testing.expectEqualStrings(live, replay);
+    }
+}
+
+test "compose question panel hides placeholder when freeform slot is selected" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = "go ahead" },
+        .{ .label = "No", .description = null },
+        .{ .label = "Maybe", .description = "decide later" },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    prompt.moveChoice(-1);
+
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 60);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, question_prompt.freeform_option_label) == null);
+    try std.testing.expect(std.mem.find(u8, text, "\x1b[7m") != null);
+}
+
+test "compose question panel shows dim placeholder when freeform slot is not selected" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = "go ahead" },
+        .{ .label = "No", .description = null },
+        .{ .label = "Maybe", .description = "decide later" },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 60);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, question_prompt.freeform_option_label) != null);
+    try std.testing.expect(std.mem.find(u8, text, ui_render.dim_style) != null);
+}
+
+test "compose question panel renders typed buffer in place of placeholder" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = "go ahead" },
+        .{ .label = "No", .description = null },
+        .{ .label = "Maybe", .description = "decide later" },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    prompt.moveChoice(-1);
+    _ = try prompt.apply(std.testing.allocator, .{ .insert_ascii = 'h' });
+    _ = try prompt.apply(std.testing.allocator, .{ .insert_ascii = 'i' });
+
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 60);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "hi") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\x1b[7m") != null);
+}
+
+test "selected freeform answer wraps into measured continuation rows" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = "go ahead" },
+        .{ .label = "No", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    prompt.moveChoice(-1);
+
+    const answer = "abcdefghijklmnopqrstuvwxyz0123456789";
+    for (answer) |byte| _ = try prompt.apply(std.testing.allocator, .{ .insert_ascii = byte });
+
+    const width: u16 = 24;
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, width);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "abcdefghijklmnopq") != null);
+    try std.testing.expect(std.mem.find(u8, text, "rstuvwxyz01234567") != null);
+    try std.testing.expect(std.mem.find(u8, text, "89") != null);
+    try std.testing.expect(std.mem.find(u8, text, "…") == null);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= width);
+    }
+
+    const measured_rows = try questionPanelRowsForLayout(std.testing.allocator, prompt.projection().?, width);
+    try std.testing.expectEqual(@as(u16, 9), measured_rows);
+    try expectQuestionPanelRowsMatch(&prompt, width);
+}
+
+test "long predefined answer labels wrap into measured continuation rows" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Run the complete verification suite before pushing", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Which action should I take?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    const width: u16 = 32;
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, width);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "  1) Run the complete") != null);
+    try std.testing.expect(std.mem.find(u8, text, "❯") == null);
+    try expectVisibleIndentBefore(text, "verification suite", 7);
+    try expectVisibleIndentBefore(text, "before pushing", 7);
+    try std.testing.expect(std.mem.find(u8, text, "Run the complete…") == null);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= width);
+    }
+
+    try expectQuestionPanelRowsMatch(&prompt, width);
+}
+
+test "long answer descriptions wrap in their measured column" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{
+            .label = "Thorough",
+            .description = "Run the complete verification suite before pushing this branch",
+        },
+        .{ .label = "Skip", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Which action should I take?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    const width: u16 = 60;
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, width);
+    defer std.testing.allocator.free(text);
+    const description_indent = questionDescriptionColumn(width) - 1;
+
+    try expectVisibleIndentBefore(text, "Run the complete verification", description_indent);
+    try expectVisibleIndentBefore(text, "suite before pushing this", description_indent);
+    try expectVisibleIndentBefore(text, "branch", description_indent);
+    try std.testing.expect(std.mem.find(u8, text, "Run the complete verification…") == null);
+    try expectQuestionPanelRowsMatch(&prompt, width);
+}
+
+fn expectVisibleIndentBefore(text: []const u8, needle: []const u8, expected: usize) !void {
+    const needle_start = std.mem.find(u8, text, needle) orelse return error.TestExpectedEqual;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..needle_start], '\n')) |newline|
+        newline + 1
+    else
+        0;
+    try std.testing.expectEqual(
+        expected,
+        display_width.visibleWidthIgnoringAnsi(text[line_start..needle_start]),
+    );
+}
+
+test "freeform cursor moves to a continuation row at an exact wrap boundary" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = null },
+        .{ .label = "No", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    prompt.moveChoice(-1);
+
+    // Exactly the freeform content width at 24 cols (24 - 7 prefix), so the
+    // cursor lands on a synthetic continuation row.
+    const answer = "abcdefghijklmnopq";
+    for (answer) |byte| _ = try prompt.apply(std.testing.allocator, .{ .insert_ascii = byte });
+
+    const width: u16 = 24;
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, width);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "\n       \x1b[7m ") != null);
+    try std.testing.expectEqual(@as(u16, 7), try questionPanelRowsForLayout(std.testing.allocator, prompt.projection().?, width));
+    try expectQuestionPanelRowsMatch(&prompt, width);
+}
+
+test "pasted freeform newlines render as measured continuation rows" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = null },
+        .{ .label = "No", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    prompt.moveChoice(-1);
+    try std.testing.expectEqual(
+        question_prompt.FreeformInsertResult.inserted,
+        try prompt.insertFreeformSlice(std.testing.allocator, "first line\nsecond line", 128),
+    );
+
+    const width: u16 = 24;
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, width);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "first line") != null);
+    try std.testing.expect(std.mem.find(u8, text, "second line") != null);
+    try std.testing.expectEqual(@as(u16, 7), try questionPanelRowsForLayout(std.testing.allocator, prompt.projection().?, width));
+    try expectQuestionPanelRowsMatch(&prompt, width);
+}

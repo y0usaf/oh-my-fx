@@ -101,7 +101,7 @@
     };
     testState.stage = "creating-runtime";
     runtime = await createFxTerminal({
-      wasm: "../zig-out/bin/omfx-term.wasm",
+      wasm: "../zig-out/bin/fx-term.wasm",
       terminal,
       env: { AI_GATEWAY_API_KEY: "browser-terminal-test-key" },
       fetch: mockFetch,

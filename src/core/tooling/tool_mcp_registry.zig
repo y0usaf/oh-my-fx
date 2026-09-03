@@ -119,6 +119,52 @@ fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
 
+test "dynamic MCP resolution preserves selected and unselected states" {
+    var fixture: u8 = 0;
+    const advertised = [_][]const u8{"mcp_fs_read"};
+    const runtime = tool_mcp_runtime.RuntimeCapabilities{
+        .context = @ptrCast(&fixture),
+        .call_tool = callFixture,
+    };
+
+    try std.testing.expect(resolve(&advertised, runtime, "mcp_other") == .not_selected);
+    try std.testing.expect(resolve(&advertised, .{}, "mcp_fs_read") == .unsupported);
+    try std.testing.expect(resolve(&advertised, runtime, "mcp_fs_read") == .registered);
+}
+
+test "dynamic MCP descriptor executes through registered dispatch" {
+    var fixture: u8 = 0;
+    const advertised = [_][]const u8{"mcp_fs_read"};
+    const runtime = tool_mcp_runtime.RuntimeCapabilities{
+        .context = @ptrCast(&fixture),
+        .call_tool = callFixture,
+    };
+    const tool = switch (resolve(&advertised, runtime, "mcp_fs_read")) {
+        .registered => |registered| registered,
+        else => return error.TestUnexpectedResult,
+    };
+    const tools = [_]tool_dispatch.Tool{tool};
+    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
+    var execution_error: ?anyerror = null;
+    var status_detail: ?[]u8 = null;
+    defer if (status_detail) |detail| std.testing.allocator.free(detail);
+    const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
+        .allocator = std.testing.allocator,
+        .tool_call_name = "mcp_fs_read",
+        .mcp_ctx = @ptrCast(&fixture),
+        .mcp_call_tool = callFixture,
+        .mcp_execution_error_sink = &execution_error,
+    }, registry, .{
+        .id = "dynamic-test",
+        .name = "mcp_fs_read",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    }, &status_detail);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(execution_error == null);
+    try std.testing.expectEqualStrings("mcp ok", result.body);
+}
+
 fn callFixture(
     _: *anyopaque,
     alloc: Allocator,

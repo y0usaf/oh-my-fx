@@ -82,7 +82,7 @@ The adapter checks fetch control and drains ACP output on its existing timer. Wh
 
 This ABI is internal. Consumers should use `createFxAgent()` from `sdk/node.js`; exposing the primitive functions keeps the native boundary small and testable.
 
-Response operations return numeric outcomes: `0` means the operation was stale and ignored, `1` means it was applied, and `2` means a response push encountered bounded backpressure. Stale callbacks never mutate a newer fetch. They emit one payload-free `napi` trace containing only the operation, numeric fetch handle, and drop reason.
+Response operations return numeric outcomes: `0` means the operation was stale and ignored, `1` means it was applied, and `2` means a response push encountered bounded backpressure. Stale callbacks never mutate a newer fetch. The addon does not write ambient diagnostics for these outcomes; the JavaScript adapter observes the numeric result and owns any explicit host reporting.
 
 Each handle is a JavaScript object wrapped around a `RuntimeHandle`. It is branded with `napi_type_tag` and checked before every operation. A structurally similar object cannot be substituted for a real handle. The wrapper owns a finalizer, so garbage collection invokes the same destruction path as explicit `destroyCore()`.
 
@@ -101,7 +101,7 @@ Creating a core performs these steps:
 
 The runtime thread never calls N-API. It blocks on the fetch bridge while the Node event-loop poller owns `fetch`, response-body iteration, and `AbortController`. Destruction marks the bridge shutting down and wakes every wait before joining the runtime thread, so worker teardown does not depend on further JavaScript callbacks.
 
-The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state protects one-time initialization when the addon is loaded in multiple Node worker environments. The same initialization installs the inherited process environment and configures the existing `debug_trace` owner before any runtime thread starts; individual runtimes do not shut global tracing down.
+The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state protects one-time initialization when the addon is loaded in multiple Node worker environments. The same initialization installs inherited process-environment access before any runtime thread starts. It does not configure fx product tracing from ambient `FX_TRACE_*` variables; libfx remains silent unless its JavaScript host explicitly requests SDK observability.
 
 Input and output queues have independent `std.Io.Mutex` protection. The input queue also has a condition variable so the ACP reader sleeps while no input is available. Closing input broadcasts the condition and allows the server thread to terminate.
 
@@ -133,7 +133,7 @@ This restriction is a security boundary. New tools or host effects must not be e
 
 ## Gateway endpoint policy
 
-The Gateway URL is validated independently in JavaScript and Zig. This duplication is intentional defense in depth because callers can load and call `libfx.node` directly, bypassing `sdk/node.js`.
+The Gateway URL is validated independently in JavaScript and Zig. This duplication is intentional defense in depth because callers can load and call `libfx.node` directly, bypassing `sdk/fx-sdk.js`.
 
 Accepted endpoints are:
 
@@ -142,7 +142,7 @@ Accepted endpoints are:
 
 URLs with embedded credentials or fragments are rejected. Arbitrary HTTPS hosts, non-loopback HTTP hosts, and other schemes are rejected. Loopback HTTP exists only for local development and deterministic tests.
 
-Keep the validation in `sdk/node.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. Loosening only one layer creates inconsistent behavior and may create a server-side request forgery path for callers using the low-level addon directly.
+Keep the validation in `sdk/fx-sdk.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. Loosening only one layer creates inconsistent behavior and may create a server-side request forgery path for callers using the low-level addon directly.
 
 ## Resource limits and backpressure
 
@@ -256,6 +256,7 @@ The lane covers:
 
 - malformed arguments, oversized values, fake handles, and use after close;
 - input backpressure and the process-wide runtime cap;
+- ambient fx trace isolation for stdout, stderr, and trace files;
 - repeated failed construction without file descriptor leakage;
 - blocked ACP MCP servers and absent native tool advertisement;
 - same-environment concurrency and Node worker isolation;

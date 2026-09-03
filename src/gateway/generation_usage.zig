@@ -231,3 +231,198 @@ fn parseOptionalNonNegativeInteger(value: ?std.json.Value) !?u64 {
     if (actual == .null) return null;
     return try parseNonNegativeInteger(actual);
 }
+
+test "generation lookup status policy preserves retry and auth outcomes" {
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.retry,
+        classifyStatus(.not_found),
+    );
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.retry,
+        classifyStatus(.request_timeout),
+    );
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.retry,
+        classifyStatus(.too_early),
+    );
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.retry,
+        classifyStatus(.too_many_requests),
+    );
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.retry,
+        classifyStatus(.internal_server_error),
+    );
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.preserve_pending,
+        classifyStatus(.unauthorized),
+    );
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.preserve_pending,
+        classifyStatus(.forbidden),
+    );
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.reject,
+        classifyStatus(.bad_request),
+    );
+}
+
+test "generation lookup rejects untrusted origins before transport" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const outcome = try provider.lookup(std.testing.allocator, .{
+        .credential = "unused",
+        .tenant = null,
+        .origin = "https://example.com",
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .cancel_flag = &cancel,
+    });
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.reject,
+        outcome,
+    );
+}
+
+test "generation record parser accepts authoritative response fields" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"data":{"id":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV","total_cost":0.00123,
+        \\"upstream_inference_cost":0,"usage":0.00123,"created_at":"2026-05-22T00:00:00.000Z",
+        \\"model":"provider/model","is_byok":false,"provider_name":"provider",
+        \\"streamed":true,"finish_reason":"stop","latency":200,"generation_time":1500,
+        \\"tokens_prompt":100,"tokens_completion":50,"native_tokens_prompt":100,
+        \\"native_tokens_completion":50,"native_tokens_reasoning":0,"native_tokens_cached":20,
+        \\"native_tokens_cache_creation":10,"billable_web_search_calls":2}}
+    ;
+
+    var record = try parseGenerationRecord(
+        alloc,
+        body,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    );
+    defer freeGenerationRecord(alloc, &record);
+    try std.testing.expectEqualStrings("provider/model", record.model);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00123), record.total_cost, 1e-12);
+    try std.testing.expectEqual(@as(u64, 130), record.input_tokens);
+    try std.testing.expectEqual(@as(u64, 50), record.output_tokens);
+    try std.testing.expectEqual(@as(u64, 20), record.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 10), record.cache_write_tokens);
+    try std.testing.expectEqual(@as(u64, 2), record.billable_web_search_calls);
+}
+
+test "generation response allocation failure remains a terminal rejection" {
+    const body =
+        \\{"data":{"id":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV","total_cost":0.00123,
+        \\"created_at":"2026-05-22T00:00:00.000Z","model":"provider/model",
+        \\"native_tokens_prompt":100,"native_tokens_completion":50,
+        \\"native_tokens_reasoning":0,"native_tokens_cached":20,
+        \\"native_tokens_cache_creation":10,"billable_web_search_calls":2}}
+    ;
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    var outcome = parseLookupOutcome(
+        failing.allocator(),
+        body,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    );
+    defer outcome.deinit(failing.allocator());
+
+    try std.testing.expectEqual(
+        generation_usage_provider.LookupOutcome.reject,
+        outcome,
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "generation record parser includes cached tokens in total input" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"data":{"id":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV","total_cost":0.00340723,
+        \\"created_at":"2026-07-28T05:27:02.000Z","model":"provider/model",
+        \\"is_byok":false,"native_tokens_prompt":11,"native_tokens_completion":4,
+        \\"native_tokens_reasoning":3,"native_tokens_cached":15513,
+        \\"native_tokens_cache_creation":0,"billable_web_search_calls":0}}
+    ;
+
+    var record = try parseGenerationRecord(
+        alloc,
+        body,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    );
+    defer freeGenerationRecord(alloc, &record);
+    try std.testing.expectEqual(@as(u64, 15524), record.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), record.output_tokens);
+    try std.testing.expectEqual(@as(u64, 15513), record.cache_read_tokens);
+}
+
+test "generation record parser rejects wrong identity and invalid billing" {
+    const alloc = std.testing.allocator;
+    const wrong_id =
+        \\{"data":{"id":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAW","total_cost":1,
+        \\"created_at":"2026-05-22T00:00:00.000Z","model":"provider/model",
+        \\"native_tokens_prompt":1,"native_tokens_completion":1,
+        \\"native_tokens_cached":0,"native_tokens_cache_creation":0,
+        \\"billable_web_search_calls":0}}
+    ;
+    try std.testing.expectError(
+        error.GenerationIdentityMismatch,
+        parseGenerationRecord(
+            alloc,
+            wrong_id,
+            "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ),
+    );
+
+    const negative_cost =
+        \\{"data":{"id":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV","total_cost":-1,
+        \\"created_at":"2026-05-22T00:00:00.000Z","model":"provider/model",
+        \\"native_tokens_prompt":1,"native_tokens_completion":1,
+        \\"native_tokens_cached":0,"native_tokens_cache_creation":0,
+        \\"billable_web_search_calls":0}}
+    ;
+    try std.testing.expectError(
+        error.InvalidGenerationRecord,
+        parseGenerationRecord(
+            alloc,
+            negative_cost,
+            "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ),
+    );
+
+    const unsafe_model =
+        \\{"data":{"id":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV","model":"provider/model\ninjected"}}
+    ;
+    try std.testing.expectError(
+        error.InvalidModel,
+        parseGenerationRecord(
+            alloc,
+            unsafe_model,
+            "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ),
+    );
+}
+
+test "generation record parser handles fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzGenerationRecord, .{
+        .corpus = &.{
+            "",
+            "{}",
+            "{\"data\":{}}",
+            "{\"data\":{\"id\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\"}}",
+        },
+    });
+}
+
+fn fuzzGenerationRecord(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var record = parseGenerationRecord(
+        std.testing.allocator,
+        buffer[0..len],
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    ) catch return;
+    defer freeGenerationRecord(std.testing.allocator, &record);
+}

@@ -127,3 +127,179 @@ fn resolveAllocated(input: Input, requested_rows: u16) FooterRows {
         .composer_top_chrome_rows = 1,
     };
 }
+
+test "footer rows anchor to transcript cursor" {
+    const rows = resolve(.{
+        .footer_top_for_extra = 8,
+        .terminal_rows = 24,
+        .activity_offset = 0,
+        .extra_input_rows = 0,
+        .input_extra = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+    });
+    try std.testing.expectEqual(@as(u16, 8), rows.top);
+    try std.testing.expectEqual(@as(u16, 8), rows.top_divider);
+    try std.testing.expectEqual(@as(u16, 9), rows.input_base);
+    try std.testing.expectEqual(@as(u16, 10), rows.picker_divider);
+    try std.testing.expectEqual(@as(u16, 10), rows.bottom_divider);
+    try std.testing.expectEqual(@as(u16, 11), rows.hint);
+}
+
+test "footer rows clamp near window bottom" {
+    const rows = resolve(.{
+        .footer_top_for_extra = 19,
+        .terminal_rows = 24,
+        .activity_offset = 0,
+        .extra_input_rows = 2,
+        .input_extra = 2,
+        .picker_rows = 0,
+        .banner_active = false,
+    });
+    try std.testing.expectEqual(@as(u16, 19), rows.top);
+    try std.testing.expectEqual(@as(u16, 19), rows.top_divider);
+    try std.testing.expectEqual(@as(u16, 22), rows.input_base);
+    try std.testing.expectEqual(@as(u16, 23), rows.picker_divider);
+    try std.testing.expectEqual(@as(u16, 23), rows.bottom_divider);
+    try std.testing.expectEqual(@as(u16, 24), rows.hint);
+}
+
+test "footer rows reserve vertical picker block below input" {
+    const rows = resolve(.{
+        .footer_top_for_extra = 17,
+        .terminal_rows = 24,
+        .activity_offset = 0,
+        .extra_input_rows = 4,
+        .input_extra = 0,
+        .picker_rows = 3,
+        .banner_active = false,
+    });
+    try std.testing.expectEqual(@as(u16, 17), rows.top);
+    try std.testing.expectEqual(@as(u16, 17), rows.top_divider);
+    try std.testing.expectEqual(@as(u16, 18), rows.input_base);
+    try std.testing.expectEqual(@as(u16, 19), rows.picker_divider);
+    try std.testing.expectEqual(@as(u16, 20), rows.picker_start);
+    try std.testing.expectEqual(@as(u16, 23), rows.bottom_divider);
+    try std.testing.expectEqual(@as(u16, 24), rows.hint);
+}
+
+test "footer rows collapse visible tint top chrome" {
+    const rows = resolve(.{
+        .footer_top_for_extra = 20,
+        .terminal_rows = 24,
+        .activity_offset = 0,
+        .extra_input_rows = 0,
+        .input_extra = 0,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+    });
+    try std.testing.expectEqual(@as(u16, 20), rows.top);
+    try std.testing.expectEqual(@as(u16, 20), rows.top_divider);
+    try std.testing.expectEqual(@as(u16, 20), rows.input_base);
+    try std.testing.expectEqual(@as(u16, 21), rows.bottom_divider);
+    try std.testing.expectEqual(@as(u16, 22), rows.hint);
+    try std.testing.expectEqual(@as(u16, 3), rows.total_rows);
+    try std.testing.expectEqual(@as(u16, 0), rows.composer_top_chrome_rows);
+}
+
+test "footer rows keep tint multiline and picker offsets coherent" {
+    const rows = resolve(.{
+        .footer_top_for_extra = 18,
+        .terminal_rows = 24,
+        .activity_offset = 0,
+        .extra_input_rows = 5,
+        .input_extra = 1,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 3,
+        .banner_active = false,
+    });
+    try std.testing.expectEqual(@as(u16, 17), rows.top);
+    try std.testing.expectEqual(@as(u16, 17), rows.top_divider);
+    try std.testing.expectEqual(@as(u16, 18), rows.input_base);
+    try std.testing.expectEqual(@as(u16, 19), rows.picker_divider);
+    try std.testing.expectEqual(@as(u16, 20), rows.picker_start);
+    try std.testing.expectEqual(@as(u16, 23), rows.bottom_divider);
+    try std.testing.expectEqual(@as(u16, 24), rows.hint);
+}
+
+test "footer rows keep tint queued banner above input" {
+    const rows = resolve(.{
+        .footer_top_for_extra = 20,
+        .terminal_rows = 24,
+        .activity_offset = 0,
+        .extra_input_rows = 1,
+        .input_extra = 0,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .banner_active = true,
+        .banner_rows = 1,
+    });
+    try std.testing.expectEqual(@as(u16, 20), rows.top);
+    try std.testing.expectEqual(@as(u16, 20), rows.banner);
+    try std.testing.expectEqual(@as(u16, 21), rows.top_divider);
+    try std.testing.expectEqual(@as(u16, 21), rows.input_base);
+    try std.testing.expectEqual(@as(u16, 22), rows.bottom_divider);
+    try std.testing.expectEqual(@as(u16, 23), rows.hint);
+}
+
+test "footer rows can replace input row with picker panel" {
+    const rows = resolve(.{
+        .footer_top_for_extra = 17,
+        .terminal_rows = 24,
+        .activity_offset = 0,
+        .extra_input_rows = 7,
+        .input_extra = 0,
+        .input_visible = false,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 7,
+        .banner_active = false,
+    });
+    try std.testing.expectEqual(@as(u16, 14), rows.top);
+    try std.testing.expectEqual(@as(u16, 14), rows.top_divider);
+    try std.testing.expectEqual(@as(u16, 14), rows.input_base);
+    try std.testing.expectEqual(@as(u16, 14), rows.picker_divider);
+    try std.testing.expectEqual(@as(u16, 15), rows.picker_start);
+    try std.testing.expectEqual(@as(u16, 22), rows.bottom_divider);
+    try std.testing.expectEqual(@as(u16, 23), rows.hint);
+}
+
+test "footer rows reserve a banner row when queued prompt is active" {
+    const rows = resolve(.{
+        .footer_top_for_extra = 8,
+        .terminal_rows = 24,
+        .activity_offset = 0,
+        .extra_input_rows = 1,
+        .input_extra = 0,
+        .picker_rows = 0,
+        .banner_active = true,
+    });
+    try std.testing.expectEqual(@as(u16, 8), rows.top);
+    try std.testing.expectEqual(@as(u16, 8), rows.banner);
+    try std.testing.expect(rows.banner_active);
+    try std.testing.expectEqual(@as(u16, 9), rows.top_divider);
+    try std.testing.expectEqual(@as(u16, 10), rows.input_base);
+    try std.testing.expectEqual(@as(u16, 11), rows.bottom_divider);
+    try std.testing.expectEqual(@as(u16, 12), rows.hint);
+}
+
+test "footer rows reserve explicit multi-row banner" {
+    const rows = resolve(.{
+        .footer_top_for_extra = 8,
+        .terminal_rows = 24,
+        .activity_offset = 0,
+        .extra_input_rows = 6,
+        .input_extra = 0,
+        .picker_rows = 0,
+        .banner_active = true,
+        .banner_rows = 6,
+    });
+    try std.testing.expectEqual(@as(u16, 8), rows.top);
+    try std.testing.expectEqual(@as(u16, 8), rows.banner);
+    try std.testing.expect(rows.banner_active);
+    try std.testing.expectEqual(@as(u16, 6), rows.banner_rows);
+    try std.testing.expectEqual(@as(u16, 14), rows.top_divider);
+    try std.testing.expectEqual(@as(u16, 15), rows.input_base);
+    try std.testing.expectEqual(@as(u16, 16), rows.bottom_divider);
+    try std.testing.expectEqual(@as(u16, 17), rows.hint);
+}

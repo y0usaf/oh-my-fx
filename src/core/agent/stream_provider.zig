@@ -148,12 +148,15 @@ pub const ToolSelection = struct {
     }
 };
 
-pub const CredentialLease = struct {
-    secret: []const u8,
-    source: ?types.CredentialSource = null,
-    account_id: ?[]const u8 = null,
-    tenant: ?[]const u8 = null,
-};
+pub const CredentialLease = types.CredentialLease;
+
+test "host-managed credential lease exposes no secret or account metadata" {
+    const lease: CredentialLease = .host_managed;
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.accountId() == null);
+    try std.testing.expect(lease.tenant() == null);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, lease.credentialSource().?);
+}
 
 /// Pure provider input used by request serializers and permission reviewers.
 /// Every slice and JSON value is borrowed for the call.
@@ -173,7 +176,7 @@ pub const RequestData = struct {
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
-    credential: CredentialLease,
+    credential: types.CredentialLease,
     session_id: ?[]const u8 = null,
     model: []const u8,
     retry_count: usize,
@@ -186,6 +189,9 @@ pub const ModelRequest = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
+    /// Exact provider body already built for capacity measurement. Borrowed
+    /// for this call and valid until `stream` returns.
+    prepared_request_body: ?[]const u8 = null,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
     /// Optional absolute provider deadline. Transports that support bounded
@@ -307,19 +313,44 @@ noinline fn failResultDynamic(err: anyerror) anyerror!Result {
     return err;
 }
 
+test "result failure writer preserves exact error type and identity" {
+    const failure = failResult(error.Cancelled);
+    try std.testing.expect(@TypeOf(failure) == error{Cancelled}!Result);
+    try std.testing.expectError(error.Cancelled, failure);
+}
+
 pub const StreamFn = *const fn (
     context: ?*anyopaque,
     alloc: Allocator,
     request: ModelRequest,
 ) anyerror!Result;
 
+pub const BuildRequestFn = *const fn (
+    context: ?*anyopaque,
+    alloc: Allocator,
+    request: RequestData,
+) anyerror![]u8;
+
 pub const Provider = struct {
     /// When set, context must remain valid until every in-flight `stream` returns.
     context: ?*anyopaque = null,
     stream_fn: StreamFn,
+    /// Optional exact provider serializer used for request-capacity decisions.
+    build_request_fn: ?BuildRequestFn = null,
 
     pub fn stream(self: Provider, alloc: Allocator, request: ModelRequest) !Result {
         return self.stream_fn(self.context, alloc, request);
+    }
+
+    /// Returns an owned provider request body when this provider exposes its
+    /// serializer. The caller owns the returned allocation.
+    pub fn buildRequest(
+        self: Provider,
+        alloc: Allocator,
+        request: RequestData,
+    ) !?[]u8 {
+        const build = self.build_request_fn orelse return null;
+        return try build(self.context, alloc, request);
     }
 };
 
@@ -330,3 +361,136 @@ fn unavailableStream(_: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Res
 pub const unavailable_provider = Provider{
     .stream_fn = unavailableStream,
 };
+
+test "stream provider accepts one typed request and emits ordered neutral events" {
+    const Fake = struct {
+        calls: usize = 0,
+        attempt_owner: ?ProviderAttemptOwner = null,
+
+        fn stream(raw: ?*anyopaque, _: Allocator, request: ModelRequest) anyerror!Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            self.attempt_owner = request.provider_attempt_owner;
+            try request.admission.admit();
+            request.events.emit(.{ .content_delta = "first" });
+            request.events.emit(.{ .reasoning_delta = "second" });
+            return .{ .completed = .{
+                .completion = .{ .content = "done" },
+                .usage = .{ .exact = .gateway },
+            } };
+        }
+    };
+    const Capture = struct {
+        chunks: std.ArrayList(u8) = .empty,
+        failed: bool = false,
+
+        fn emit(raw: *anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const chunk = switch (event) {
+                .content_delta => |value| value,
+                .reasoning_delta => |value| value,
+                else => return,
+            };
+            self.chunks.appendSlice(std.testing.allocator, chunk) catch {
+                self.failed = true;
+            };
+        }
+    };
+    const AdmissionCapture = struct {
+        calls: usize = 0,
+
+        fn admit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+
+    var fake: Fake = .{};
+    var capture: Capture = .{};
+    defer capture.chunks.deinit(std.testing.allocator);
+    var admission_capture: AdmissionCapture = .{};
+    var delivery = DeliveryCertainty.init();
+    var attempt_evidence: AttemptEvidence = .{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    var result = try (Provider{
+        .context = &fake,
+        .stream_fn = Fake.stream,
+    }).stream(std.testing.allocator, .{
+        .credential = .{ .direct = .{ .secret_bytes = "key" } },
+        .model = "model",
+        .retry_count = 1,
+        .messages = &.{},
+        .tools = .{},
+        .tool_choice = .auto,
+        .vision_mode = .unavailable,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &attempt_evidence,
+        .events = .{ .context = &capture, .emit_fn = Capture.emit },
+        .admission = .{ .context = &admission_capture, .admit_fn = AdmissionCapture.admit },
+        .cancel_flag = &cancelled,
+        .provider_attempt_owner = .agent,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), admission_capture.calls);
+    try std.testing.expectEqual(ProviderAttemptOwner.agent, fake.attempt_owner.?);
+    try std.testing.expect(!capture.failed);
+    try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
+    try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
+    try std.testing.expect(std.meta.activeTag(result.completed.usage) == .exact);
+}
+
+test "stream provider exposes its exact request serializer without streaming" {
+    const Builder = struct {
+        calls: usize = 0,
+
+        fn build(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            request: RequestData,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return std.fmt.allocPrint(
+                alloc,
+                "model={s};messages={d};tools={d}",
+                .{ request.model, request.messages.len, request.tools.advertised_names.len },
+            );
+        }
+
+        fn stream(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ModelRequest,
+        ) anyerror!Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+
+    var builder: Builder = .{};
+    const provider = Provider{
+        .context = &builder,
+        .stream_fn = Builder.stream,
+        .build_request_fn = Builder.build,
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hello" }};
+    const names = [_][]const u8{"terminal"};
+    const body = (try provider.buildRequest(std.testing.allocator, .{
+        .model = "test/model",
+        .messages = &messages,
+        .tools = .{ .advertised_names = &names },
+        .tool_choice = .auto,
+        .provider_options = .{},
+    })).?;
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expectEqual(@as(usize, 1), builder.calls);
+    try std.testing.expectEqualStrings(
+        "model=test/model;messages=1;tools=1",
+        body,
+    );
+}

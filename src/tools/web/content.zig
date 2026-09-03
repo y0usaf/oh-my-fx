@@ -56,3 +56,36 @@ fn declaredKind(mime: []const u8) Kind {
     if (std.mem.startsWith(u8, mime, "application/") and std.mem.endsWith(u8, mime, "+xml")) return .text;
     return .binary;
 }
+
+test "web_fetch classifies declared mime and missing content type deterministically" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        content_type: ?[]const u8,
+        body: []const u8 = "hello",
+        kind: Kind,
+        mime_type: []const u8,
+        declared: bool = true,
+    }{
+        .{ .content_type = "Text/HTML; Charset=UTF-8", .kind = .html, .mime_type = "text/html" },
+        .{ .content_type = "TEXT/PLAIN", .kind = .text, .mime_type = "text/plain" },
+        .{ .content_type = "application/json; charset=utf-8", .kind = .text, .mime_type = "application/json" },
+        .{ .content_type = "application/activity+json", .kind = .text, .mime_type = "application/activity+json" },
+        .{ .content_type = "application/xml", .kind = .text, .mime_type = "application/xml" },
+        .{ .content_type = "application/rss+xml", .kind = .text, .mime_type = "application/rss+xml" },
+        .{ .content_type = "application/javascript", .kind = .text, .mime_type = "application/javascript" },
+        .{ .content_type = "application/x-javascript", .kind = .text, .mime_type = "application/x-javascript" },
+        .{ .content_type = "application/pdf", .kind = .binary, .mime_type = "application/pdf" },
+        .{ .content_type = null, .kind = .text, .mime_type = "text/plain", .declared = false },
+        .{ .content_type = null, .body = "bad\x00text", .kind = .binary, .mime_type = "application/octet-stream", .declared = false },
+    };
+
+    for (cases) |case| {
+        var classification = try classify(alloc, case.content_type, case.body);
+        defer classification.deinit(alloc);
+
+        try std.testing.expectEqual(case.kind, classification.kind);
+        try std.testing.expectEqualStrings(case.mime_type, classification.mime_type);
+        try std.testing.expectEqual(case.declared, classification.declared);
+    }
+}

@@ -90,3 +90,73 @@ fn admittedFeatures() BackendCapabilities {
 
 const test_primary_backend = SearchBackendId{ .value = "test.primary" };
 const test_secondary_backend = SearchBackendId{ .value = "test.secondary" };
+
+test "core policy has no implicit provider backend" {
+    try std.testing.expect(selectBackend(.{}, .{}) == null);
+}
+
+test "backend feature support is explicit and strict filters cannot silently weaken" {
+    var features = admittedFeatures();
+    features.allowed_domains = .unsupported;
+    const unsupported = BackendPolicy{
+        .id = test_primary_backend,
+        .features = features,
+    };
+
+    try std.testing.expect(!backendCanSatisfy(unsupported, .{ .has_allowed_domains = true }));
+    try std.testing.expect(backendCanSatisfy(unsupported, .{ .has_blocked_domains = true }));
+}
+
+test "backend selection skips backend that cannot satisfy strict filters" {
+    var unsupported_features = admittedFeatures();
+    unsupported_features.allowed_domains = .unsupported;
+    const backends = [_]BackendPolicy{
+        .{
+            .id = test_primary_backend,
+            .features = unsupported_features,
+        },
+        .{
+            .id = test_secondary_backend,
+            .features = admittedFeatures(),
+        },
+    };
+    const selected = selectBackend(.{
+        .preferred_backends = &.{
+            test_primary_backend,
+            test_secondary_backend,
+        },
+        .backend_policies = &backends,
+    }, .{
+        .has_allowed_domains = true,
+    }) orelse return error.TestExpectedEqual;
+
+    try std.testing.expect(test_secondary_backend.eql(selected.id));
+}
+
+test "backend selection rejects unsupported strict filters before search" {
+    var features = admittedFeatures();
+    features.allowed_domains = .unsupported;
+    const backends = [_]BackendPolicy{.{
+        .id = test_primary_backend,
+        .features = features,
+    }};
+
+    try std.testing.expect(selectBackend(.{
+        .preferred_backends = &.{test_primary_backend},
+        .backend_policies = &backends,
+    }, .{
+        .has_allowed_domains = true,
+    }) == null);
+}
+
+test "post filter marker cannot silently admit strict domain filtering" {
+    var features = admittedFeatures();
+    features.blocked_domains = .post_filter;
+
+    try std.testing.expect(!backendCanSatisfy(.{
+        .id = test_secondary_backend,
+        .features = features,
+    }, .{
+        .has_blocked_domains = true,
+    }));
+}

@@ -1,13 +1,12 @@
 const std = @import("std");
 const contracts = @import("contracts.zig");
-const monitor_core = @import("monitor.zig");
 const operation = @import("operation.zig");
 const recovery = @import("recovery.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_layout = @import("../session/session_layout.zig");
-const process_supervisor = @import("../background/process_supervisor.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
+const process_identity = @import("../execution/process_identity.zig");
+const process_provider_mod = @import(
+    "../execution/process_provider.zig",
 );
 const profile_paths = @import("../shared/profile_paths.zig");
 const io_mod = @import("../shared/io.zig");
@@ -21,19 +20,11 @@ pub const profile_payload_limit: u64 = 512 * 1024 * 1024;
 const default_segment_bytes: u64 = 1024 * 1024;
 const max_record_bytes: usize = 1024 * 1024;
 const max_event_bytes: usize = 64 * 1024;
-pub const monitor_set_bytes_limit: usize = max_record_bytes;
-pub const monitor_runtime_headroom: usize = max_event_bytes;
-pub const monitor_admission_bytes_limit: usize =
-    monitor_set_bytes_limit - monitor_runtime_headroom;
-pub const monitor_event_transaction_headroom: usize = max_event_bytes;
-pub const monitor_transaction_bytes_limit: usize =
-    monitor_set_bytes_limit + monitor_event_transaction_headroom;
 const event_retention_limit: u64 = 256;
 const record_schema_version: u16 = 1;
 const authority_schema_version: u16 = 2;
 const owner_catalog_authority_schema_version: u16 = 2;
 const event_schema_version: u16 = 1;
-const monitor_transaction_schema_version: u16 = 1;
 const close_transaction_schema_version: u16 = 2;
 const checkpoint_schema_version: u16 = 1;
 const checkpoint_magic = "FXCP";
@@ -55,23 +46,11 @@ pub const FailurePoint = enum {
     after_close_authority_write,
     after_close_record_write,
     after_close_authority_event,
-    after_close_monitor_transaction_prepare,
-    after_close_monitor_event,
-    after_close_monitor_state_write,
-    after_close_monitor_record_write,
-    after_close_monitor_cleanup,
     after_close_lifecycle_record,
     after_close_lifecycle_event,
     after_close_cleanup,
     before_close_recovery_oom,
     before_close_recovery_capability,
-    after_monitor_write,
-    after_monitor_state_write,
-    after_monitor_record,
-    after_monitor_event_record,
-    after_monitor_transaction_prepare,
-    after_monitor_transaction_commit,
-    after_monitor_event_indeterminate,
     after_journal_sync,
     after_checkpoint_write,
     after_checkpoint_record,
@@ -80,35 +59,15 @@ pub const FailurePoint = enum {
     after_eviction_record,
 };
 
-const MonitorReconciliationFailure = enum {
-    allocation,
-    io,
-    indeterminate,
-};
-
-pub const MonitorReconciliationControl = struct {
-    max_attempts: u8 = 3,
-    retry_delay_ms: u16 = 5,
-    cancelled: ?*const std.atomic.Value(bool) = null,
-    observed_attempts: ?*std.atomic.Value(u8) = null,
-
-    fn is_cancelled(self: MonitorReconciliationControl) bool {
-        return if (self.cancelled) |value| value.load(.acquire) else false;
-    }
-};
-
 const Options = struct {
     per_session_limit: u64 = per_session_payload_limit,
     profile_limit: u64 = profile_payload_limit,
     segment_bytes: u64 = default_segment_bytes,
     fail_at: ?FailurePoint = null,
-    fail_monitor_reconciliation_once: ?MonitorReconciliationFailure = null,
-    fail_monitor_reconciliation_count: u8 = 1,
 
     fn validate(self: Options) error{InvalidStoreOptions}!void {
         if (self.per_session_limit == 0 or self.profile_limit == 0 or
-            self.segment_bytes == 0 or self.per_session_limit > self.profile_limit or
-            self.fail_monitor_reconciliation_count == 0)
+            self.segment_bytes == 0 or self.per_session_limit > self.profile_limit)
         {
             return error.InvalidStoreOptions;
         }
@@ -134,17 +93,10 @@ pub const DurableEvent = struct {
     lifecycle: contracts.Lifecycle,
     cursor: contracts.RawCursor,
     created_at_ms: i64,
-    monitor_sequence: ?u64 = null,
-    monitor_reason: ?monitor_core.EventReason = null,
 
     pub fn validate(self: DurableEvent) error{InvalidDurableEvent}!void {
         if (self.id == 0) return error.InvalidDurableEvent;
         self.cursor.validate() catch return error.InvalidDurableEvent;
-        if ((self.monitor_sequence == null) != (self.monitor_reason == null) or
-            if (self.monitor_sequence) |sequence| sequence == 0 else false)
-        {
-            return error.InvalidDurableEvent;
-        }
     }
 };
 
@@ -170,28 +122,6 @@ const EventWire = struct {
     event: DurableEvent,
 };
 
-const MonitorTransaction = struct {
-    schema_version: u16 = monitor_transaction_schema_version,
-    committed: bool = false,
-    updated_at_ms: i64,
-    candidate: monitor_core.PersistedSet,
-    event: ?DurableEvent = null,
-
-    fn validate(self: MonitorTransaction) !void {
-        if (self.schema_version != monitor_transaction_schema_version) {
-            return error.InvalidMonitorTransaction;
-        }
-        if (self.updated_at_ms < 0) return error.InvalidMonitorTransaction;
-        try validate_monitor_set(self.candidate);
-        if (self.event) |event| {
-            try event.validate();
-            if (event.monitor_sequence == null or event.kind != .monitor) {
-                return error.InvalidMonitorTransaction;
-            }
-        }
-    }
-};
-
 const CloseTransaction = struct {
     schema_version: u16 = close_transaction_schema_version,
     updated_at_ms: i64,
@@ -210,26 +140,18 @@ const CloseTransaction = struct {
             return error.InvalidCloseTransaction;
         self.authority_event.validate() catch
             return error.InvalidCloseTransaction;
-        if (self.authority_event.kind != .authority_revoked or
-            self.authority_event.monitor_sequence != null)
-        {
+        if (self.authority_event.kind != .authority_revoked) {
             return error.InvalidCloseTransaction;
         }
         if (self.lifecycle_event) |event| {
             event.validate() catch return error.InvalidCloseTransaction;
             if (event.kind != .lifecycle or event.lifecycle != .closed or
-                event.monitor_sequence != null or
                 event.id <= self.authority_event.id)
             {
                 return error.InvalidCloseTransaction;
             }
         }
     }
-};
-
-const MonitorCommitContext = enum {
-    ordinary,
-    close,
 };
 
 const CloseRecoveryErrorClass = enum {
@@ -252,6 +174,9 @@ pub const Record = struct {
     shell: []u8,
     cwd: []u8,
     command: ?[]u8,
+    timeout_ms: ?u64,
+    timeout_at_ms: ?i64,
+    timed_out: bool,
     backend: contracts.Backend,
     lifecycle: contracts.Lifecycle,
     attention: contracts.AttentionState,
@@ -307,6 +232,16 @@ pub const Record = struct {
         if (self.host_identity.len == 0 or self.backend_identity.len == 0 or
             self.shell.len == 0 or self.cwd.len == 0 or
             !std.fs.path.isAbsolute(self.cwd))
+        {
+            return error.InvalidTerminalRecord;
+        }
+        if ((self.timed_out and
+            (self.timeout_ms == null or self.timeout_at_ms == null)) or
+            (self.timeout_at_ms != null and self.timeout_ms == null) or
+            if (self.timeout_at_ms) |deadline|
+                deadline < self.created_at_ms
+            else
+                false)
         {
             return error.InvalidTerminalRecord;
         }
@@ -446,7 +381,7 @@ pub const Record = struct {
         }
         if (self.termination) |termination| try termination.validate();
         if (self.process_token) |token| {
-            _ = process_supervisor.ProcessInstanceToken.parse(token) catch
+            _ = process_identity.ProcessInstanceToken.parse(token) catch
                 return error.InvalidTerminalRecord;
         }
         if ((self.takeover_owner_pid == null) !=
@@ -462,7 +397,7 @@ pub const Record = struct {
         if (self.takeover_owner_pid) |pid| {
             _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch
                 return error.InvalidTerminalRecord;
-            _ = process_supervisor.ProcessInstanceToken.parse(
+            _ = process_identity.ProcessInstanceToken.parse(
                 self.takeover_owner_process_token.?,
             ) catch return error.InvalidTerminalRecord;
         }
@@ -486,6 +421,9 @@ const RecordWire = struct {
     shell: []const u8,
     cwd: []const u8,
     command: ?[]const u8,
+    timeout_ms: ?u64 = null,
+    timeout_at_ms: ?i64 = null,
+    timed_out: bool = false,
     backend: contracts.Backend,
     lifecycle: contracts.Lifecycle,
     attention: contracts.AttentionState,
@@ -536,18 +474,17 @@ const OwnerCatalogAuthorityWire = struct {
 
 pub const ProfileStore = struct {
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     sessions_dir: io_mod.VerifiedDir,
     display_sessions_path: []u8,
     options: Options,
     mutex: std.Io.Mutex = .init,
     residents: std.ArrayList(*DurableSession) = .empty,
-    monitor_reconciliation_failure_count: u8 = 0,
 
     pub fn init(
         alloc: Allocator,
         home: []const u8,
-        process_provider: background_process_provider.Provider,
+        process_provider: process_provider_mod.Provider,
     ) !ProfileStore {
         return init_with_options(alloc, home, process_provider, .{});
     }
@@ -555,7 +492,7 @@ pub const ProfileStore = struct {
     fn init_with_options(
         alloc: Allocator,
         home: []const u8,
-        process_provider: background_process_provider.Provider,
+        process_provider: process_provider_mod.Provider,
         options: Options,
     ) !ProfileStore {
         try options.validate();
@@ -1096,23 +1033,6 @@ pub const ProfileStore = struct {
                         @errorName(err),
                     );
                 };
-                const repaired_monitors = session.reconcile_monitor_transaction() catch |err| blk: {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        entry.name,
-                        terminal_id,
-                        @errorName(err),
-                    );
-                    break :blk false;
-                };
-                if (repaired_monitors) {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        entry.name,
-                        terminal_id,
-                        "MonitorTransactionReconciled",
-                    );
-                }
                 const repaired_events = session.reconcile_events() catch |err| blk: {
                     try recovered.append_diagnostic(
                         self.alloc,
@@ -1130,18 +1050,6 @@ pub const ProfileStore = struct {
                         "CorruptEventChain",
                     );
                 }
-                var monitors: ?MonitorDefinitions = session.load_monitor_definitions(
-                    self.alloc,
-                ) catch |err| blk: {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        entry.name,
-                        terminal_id,
-                        @errorName(err),
-                    );
-                    break :blk null;
-                };
-                if (monitors) |*definitions| definitions.deinit();
                 if (session.record.backend == .tmux and
                     (session.record.lifecycle == .starting or
                         session.record.lifecycle == .running))
@@ -1296,12 +1204,12 @@ pub const RecoveredList = struct {
 
 fn process_evidence_for(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     record: Record,
 ) recovery.ProcessEvidence {
     const pid = record.pid orelse return .missing;
     const token_text = record.process_token orelse return .missing;
-    const token = process_supervisor.ProcessInstanceToken.parse(token_text) catch
+    const token = process_identity.ProcessInstanceToken.parse(token_text) catch
         return .mismatched;
     return switch (process_provider.matchToken(
         alloc,
@@ -1335,13 +1243,13 @@ fn takeover_owner_matches(
 
 fn takeover_owner_evidence(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     record: Record,
-) process_supervisor.TokenMatch {
+) process_identity.TokenMatch {
     const pid = record.takeover_owner_pid orelse return .mismatched;
     const token_text = record.takeover_owner_process_token orelse
         return .mismatched;
-    const token = process_supervisor.ProcessInstanceToken.parse(token_text) catch
+    const token = process_identity.ProcessInstanceToken.parse(token_text) catch
         return .mismatched;
     return process_provider.matchToken(
         alloc,
@@ -1352,7 +1260,7 @@ fn takeover_owner_evidence(
 
 fn reconcile_takeover_owner_record(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     capability: *session_child_store.SessionChildCapability,
     record: *Record,
     now_ms: i64,
@@ -1662,6 +1570,9 @@ fn record_wire(record: Record) RecordWire {
         .shell = record.shell,
         .cwd = record.cwd,
         .command = record.command,
+        .timeout_ms = record.timeout_ms,
+        .timeout_at_ms = record.timeout_at_ms,
+        .timed_out = record.timed_out,
         .backend = record.backend,
         .lifecycle = record.lifecycle,
         .attention = record.attention,
@@ -1741,6 +1652,9 @@ fn clone_record(alloc: Allocator, wire: RecordWire) Allocator.Error!Record {
         .shell = shell,
         .cwd = cwd,
         .command = command,
+        .timeout_ms = wire.timeout_ms,
+        .timeout_at_ms = wire.timeout_at_ms,
+        .timed_out = wire.timed_out,
         .backend = wire.backend,
         .lifecycle = wire.lifecycle,
         .attention = wire.attention,
@@ -1832,17 +1746,6 @@ fn checkpoint_name(
         "checkpoint-{s}-{d}.bin",
         .{ session_id, generation },
     );
-}
-
-fn monitors_name(alloc: Allocator, session_id: []const u8) Allocator.Error![]u8 {
-    return make_name(alloc, "monitors", session_id, ".json");
-}
-
-fn monitor_transaction_name(
-    alloc: Allocator,
-    session_id: []const u8,
-) Allocator.Error![]u8 {
-    return make_name(alloc, "monitor-transaction", session_id, ".json");
 }
 
 fn close_transaction_name(
@@ -2102,6 +2005,9 @@ fn catalog_authorization(
     };
 }
 
+// Retained only to verify authority records written by versions that allowed
+// repeated monitor probes. The upgraded runtime never evaluates or creates
+// these grants.
 fn hash_monitor_notify(
     hash: *std.crypto.hash.sha2.Sha256,
     schedule: contracts.NotifySchedule,
@@ -2149,10 +2055,10 @@ pub const CreateInput = struct {
     shell: []const u8,
     cwd: []const u8,
     command: ?[]const u8,
+    timeout_ms: ?u64 = null,
     backend: contracts.Backend,
     dimensions: contracts.Dimensions,
     persistence: contracts.StartPersistence,
-    initial_monitors: []const contracts.MonitorDefinition,
     now_ms: i64,
 };
 
@@ -2167,77 +2073,10 @@ pub const ReadPage = struct {
     }
 };
 
-pub const MonitorDefinitions = struct {
-    alloc: Allocator,
-    parsed: std.json.Parsed(monitor_core.PersistedSet),
-    definitions: []contracts.MonitorDefinition,
-
-    pub fn view(self: *const MonitorDefinitions) []const contracts.MonitorDefinition {
-        return self.definitions;
-    }
-
-    pub fn deinit(self: *MonitorDefinitions) void {
-        self.alloc.free(self.definitions);
-        self.parsed.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const MonitorSet = struct {
-    parsed: std.json.Parsed(monitor_core.PersistedSet),
-
-    pub fn clone(
-        alloc: Allocator,
-        set: monitor_core.PersistedSet,
-    ) !MonitorSet {
-        try validate_monitor_set(set);
-        const bytes = try render_json(alloc, set);
-        defer alloc.free(bytes);
-        var parsed = std.json.parseFromSlice(
-            monitor_core.PersistedSet,
-            alloc,
-            bytes,
-            .{ .allocate = .alloc_always },
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidMonitorRecord,
-        };
-        errdefer parsed.deinit();
-        try validate_monitor_set(parsed.value);
-        return .{ .parsed = parsed };
-    }
-
-    pub fn view(self: *MonitorSet) *monitor_core.PersistedSet {
-        return &self.parsed.value;
-    }
-
-    pub fn deinit(self: *MonitorSet) void {
-        self.parsed.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const MonitorCommitOutcome = enum {
-    previous,
-    candidate,
-};
-
-pub const MonitorTransitionOutcome = union(enum) {
-    previous: anyerror,
-    candidate,
-    cancelled,
-    indeterminate: anyerror,
-};
-
 pub const CloseCommitOutcome = union(enum) {
     previous: anyerror,
     candidate: ?anyerror,
     indeterminate: anyerror,
-};
-
-pub const MonitorNotification = struct {
-    sequence: u64,
-    reason: monitor_core.EventReason,
 };
 
 pub const EventReplay = struct {
@@ -2525,6 +2364,18 @@ noinline fn failReloadedAuthorityClaimDynamic(err: anyerror) anyerror!operation.
     return err;
 }
 
+test "reloaded authority failures preserve exact error types and identities" {
+    const revoked = failReloadedAuthorityClaim(error.AuthorityRevoked);
+    try std.testing.expect(
+        @TypeOf(revoked) == error{AuthorityRevoked}!operation.OwnedAuthorityClaim,
+    );
+    try std.testing.expectError(error.AuthorityRevoked, revoked);
+    try std.testing.expectError(
+        error.InvalidHolderProof,
+        failReloadedAuthorityClaim(error.InvalidHolderProof),
+    );
+}
+
 pub const RecoveredExecutionScope = struct {
     workspace_root: []u8,
 
@@ -2547,13 +2398,6 @@ pub const DurableSession = struct {
         defer profile.mutex.unlock(zio);
         try contracts.validate_session_id(input.session_id);
         try input.dimensions.validate();
-        for (input.initial_monitors) |definition| {
-            try monitor_core.validate_definition(definition);
-            try validate_repeated_probe_authority(
-                input.persistence.grant,
-                definition,
-            );
-        }
         var state = try profile.open_capability(
             input.persistence.grant.principal.durable_session_id,
             false,
@@ -2620,6 +2464,9 @@ pub const DurableSession = struct {
             .shell = shell,
             .cwd = cwd,
             .command = command,
+            .timeout_ms = input.timeout_ms,
+            .timeout_at_ms = null,
+            .timed_out = false,
             .backend = input.backend,
             .lifecycle = .starting,
             .attention = .{},
@@ -2643,7 +2490,7 @@ pub const DurableSession = struct {
             .acknowledged_event_id = 0,
             .event_gap_through = 0,
             .event_cleanup_through = 0,
-            .monitor_count = @intCast(input.initial_monitors.len),
+            .monitor_count = 0,
             .authority_generation = input.persistence.grant.generation,
             .authority_revoked = false,
             .direct_human_model_read_only = input.persistence.direct_human_model_read_only,
@@ -2682,16 +2529,6 @@ pub const DurableSession = struct {
             false,
         );
         if (profile.options.fail_at == .after_authority_write) {
-            return error.InjectedCrash;
-        }
-        try write_initial_monitors(
-            alloc,
-            &state,
-            input.session_id,
-            input.initial_monitors,
-            input.now_ms,
-        );
-        if (profile.options.fail_at == .after_monitor_write) {
             return error.InjectedCrash;
         }
         if (profile.options.fail_at == .start) return error.InjectedFailure;
@@ -2816,7 +2653,7 @@ pub const DurableSession = struct {
     pub fn mark_started(
         self: *DurableSession,
         pid: []const u8,
-        token: process_supervisor.ProcessInstanceToken,
+        token: process_identity.ProcessInstanceToken,
         now_ms: i64,
     ) !void {
         const zio = io_mod.getIo();
@@ -2834,9 +2671,16 @@ pub const DurableSession = struct {
         const previous_pid = self.record.pid;
         const previous_token = self.record.process_token;
         const previous_lifecycle = self.record.lifecycle;
+        const previous_timeout_at_ms = self.record.timeout_at_ms;
         const previous_updated_at_ms = self.record.updated_at_ms;
+        const timeout_at_ms = if (self.record.timeout_ms) |timeout_ms|
+            std.math.add(i64, now_ms, @intCast(timeout_ms)) catch
+                return error.CapacityExceeded
+        else
+            null;
         self.record.pid = pid_owned;
         self.record.process_token = token_owned;
+        self.record.timeout_at_ms = timeout_at_ms;
         self.record.lifecycle = try contracts.transition_lifecycle(
             self.record.lifecycle,
             .child_started,
@@ -2846,12 +2690,34 @@ pub const DurableSession = struct {
             self.record.pid = previous_pid;
             self.record.process_token = previous_token;
             self.record.lifecycle = previous_lifecycle;
+            self.record.timeout_at_ms = previous_timeout_at_ms;
             self.record.updated_at_ms = previous_updated_at_ms;
             return err;
         };
         if (previous_pid) |value| alloc.free(value);
         if (previous_token) |value| alloc.free(value);
         _ = try self.append_event_locked(.lifecycle, now_ms);
+    }
+
+    pub fn mark_timed_out(self: *DurableSession, now_ms: i64) !void {
+        const zio = io_mod.getIo();
+        self.profile.mutex.lockUncancelable(zio);
+        defer self.profile.mutex.unlock(zio);
+        if (self.record.timed_out) return;
+        if (self.record.timeout_at_ms == null) return error.InvalidLifecycle;
+        const previous_timed_out = self.record.timed_out;
+        const previous_updated_at_ms = self.record.updated_at_ms;
+        self.record.timed_out = true;
+        self.record.updated_at_ms = now_ms;
+        save_record(
+            self.profile.alloc,
+            try self.state_capability(),
+            self.record,
+        ) catch |err| {
+            self.record.timed_out = previous_timed_out;
+            self.record.updated_at_ms = previous_updated_at_ms;
+            return err;
+        };
     }
 
     pub fn append(self: *DurableSession, bytes: []const u8, now_ms: i64) !void {
@@ -3574,7 +3440,7 @@ pub const DurableSession = struct {
         now_ms: i64,
     ) !u64 {
         const event_id = self.record.next_event_id;
-        try self.write_event_locked(kind, null, null, now_ms);
+        try self.write_event_locked(kind, now_ms);
         if (self.profile.options.fail_at == .after_event_write) {
             return error.InjectedCrash;
         }
@@ -3606,8 +3472,6 @@ pub const DurableSession = struct {
     fn write_event_locked(
         self: *DurableSession,
         kind: contracts.HostEvent,
-        monitor_sequence_value: ?u64,
-        monitor_reason: ?monitor_core.EventReason,
         now_ms: i64,
     ) !void {
         const event_id = self.record.next_event_id;
@@ -3617,8 +3481,6 @@ pub const DurableSession = struct {
             .lifecycle = self.record.lifecycle,
             .cursor = self.record.output_cursor,
             .created_at_ms = now_ms,
-            .monitor_sequence = monitor_sequence_value,
-            .monitor_reason = monitor_reason,
         };
         try self.write_event_value_locked(
             try self.state_capability(),
@@ -3747,510 +3609,6 @@ pub const DurableSession = struct {
             .gap_through = self.record.event_gap_through,
             .next_event_id = @min(id, self.record.next_event_id),
         };
-    }
-
-    pub fn load_monitor_definitions(
-        self: *DurableSession,
-        alloc: Allocator,
-    ) !MonitorDefinitions {
-        var set = try self.load_monitor_set(alloc);
-        errdefer set.deinit();
-        const definitions = try alloc.alloc(
-            contracts.MonitorDefinition,
-            set.parsed.value.monitors.len,
-        );
-        for (set.parsed.value.monitors, 0..) |monitor, index| {
-            definitions[index] = monitor.definition;
-        }
-        return .{
-            .alloc = alloc,
-            .parsed = set.parsed,
-            .definitions = definitions,
-        };
-    }
-
-    pub fn load_monitor_set(
-        self: *DurableSession,
-        alloc: Allocator,
-    ) !MonitorSet {
-        const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
-        defer self.profile.mutex.unlock(zio);
-        _ = try self.reconcile_monitor_transaction_locked();
-        return self.load_monitor_set_locked(alloc, true);
-    }
-
-    pub fn authorize_monitor_definition(
-        self: *DurableSession,
-        claim: contracts.AuthorityClaim,
-        definition: contracts.MonitorDefinition,
-    ) !Authorization {
-        const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
-        defer self.profile.mutex.unlock(zio);
-        const authorization = try self.authorize_locked(claim, .monitor);
-        try monitor_core.validate_definition(definition);
-        var authority = try load_authority(
-            self.profile.alloc,
-            try self.state_capability(),
-            self.record.session_id,
-        );
-        defer authority.deinit();
-        try validate_repeated_probe_authority(authority.value.grant, definition);
-        return authorization;
-    }
-
-    fn load_monitor_set_locked(
-        self: *DurableSession,
-        alloc: Allocator,
-        require_count_match: bool,
-    ) !MonitorSet {
-        const name = try monitors_name(alloc, self.record.session_id);
-        defer alloc.free(name);
-        var file = try (try self.state_capability()).openFileReadOnly(
-            alloc,
-            .terminal_state,
-            name,
-        );
-        defer file.deinit();
-        const bytes = try file.readToEnd(alloc, monitor_set_bytes_limit);
-        defer alloc.free(bytes);
-        var parsed = std.json.parseFromSlice(
-            monitor_core.PersistedSet,
-            alloc,
-            bytes,
-            .{ .allocate = .alloc_always },
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidMonitorRecord,
-        };
-        errdefer parsed.deinit();
-        if (parsed.value.schema_version != monitor_core.schema_version or
-            parsed.value.next_monitor_id == 0 or
-            parsed.value.monitors.len > contracts.max_monitor_definitions or
-            (require_count_match and
-                parsed.value.monitors.len != self.record.monitor_count))
-        {
-            return error.InvalidMonitorRecord;
-        }
-        var previous_sequence: u64 = 0;
-        for (parsed.value.monitors) |monitor| {
-            monitor_core.validate_runtime(monitor) catch
-                return error.InvalidMonitorRecord;
-            const sequence = monitor_sequence(monitor.monitor_id) orelse
-                return error.InvalidMonitorRecord;
-            if (sequence <= previous_sequence or
-                sequence >= parsed.value.next_monitor_id)
-            {
-                return error.InvalidMonitorRecord;
-            }
-            previous_sequence = sequence;
-        }
-        return .{ .parsed = parsed };
-    }
-
-    pub fn persist_monitor_set(
-        self: *DurableSession,
-        set: monitor_core.PersistedSet,
-        now_ms: i64,
-    ) !void {
-        const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
-        defer self.profile.mutex.unlock(zio);
-        try self.reject_close_intent_locked();
-        return self.persist_monitor_set_locked(set, now_ms, .ordinary);
-    }
-
-    fn persist_monitor_set_locked(
-        self: *DurableSession,
-        set: monitor_core.PersistedSet,
-        now_ms: i64,
-        context: MonitorCommitContext,
-    ) !void {
-        _ = try self.reconcile_monitor_transaction_locked();
-        const capability = try self.state_capability();
-        var transaction = MonitorTransaction{
-            .updated_at_ms = now_ms,
-            .candidate = set,
-        };
-        try ensure_monitor_set_fits(self.profile.alloc, set);
-        try ensure_monitor_transaction_fits(self.profile.alloc, transaction);
-        try write_monitor_transaction(
-            self.profile.alloc,
-            capability,
-            self.record.session_id,
-            transaction,
-        );
-        if (context == .close and closeFailureAt(
-            self.profile,
-            .after_close_monitor_transaction_prepare,
-        )) return error.InjectedCrash;
-        if (monitorFailureAt(
-            self.profile,
-            .after_monitor_transaction_prepare,
-        )) return error.SessionChildCommitIndeterminate;
-        transaction.committed = true;
-        try write_monitor_transaction(
-            self.profile.alloc,
-            capability,
-            self.record.session_id,
-            transaction,
-        );
-        if (context == .close and closeFailureAt(
-            self.profile,
-            .after_close_monitor_event,
-        )) return error.InjectedCrash;
-        if (monitorFailureAt(
-            self.profile,
-            .after_monitor_transaction_commit,
-        )) return error.SessionChildCommitIndeterminate;
-        try apply_monitor_transaction_record(&self.record, transaction);
-        write_monitor_set(
-            self.profile.alloc,
-            capability,
-            self.record.session_id,
-            set,
-        ) catch |err| {
-            if (context == .close) return err;
-            debug_trace.logf(
-                "terminal_store",
-                "committed monitor state deferred id={s} err={s}",
-                .{ self.record.session_id, @errorName(err) },
-            );
-            return;
-        };
-        if (context == .close and closeFailureAt(
-            self.profile,
-            .after_close_monitor_state_write,
-        )) return error.InjectedCrash;
-        if (monitorFailureAt(
-            self.profile,
-            .after_monitor_state_write,
-        )) {
-            return error.InjectedCrash;
-        }
-        save_record(
-            self.profile.alloc,
-            capability,
-            self.record,
-        ) catch |err| {
-            if (context == .close) return err;
-            debug_trace.logf(
-                "terminal_store",
-                "committed monitor record deferred id={s} err={s}",
-                .{ self.record.session_id, @errorName(err) },
-            );
-            return;
-        };
-        if (context == .close and closeFailureAt(
-            self.profile,
-            .after_close_monitor_record_write,
-        )) return error.InjectedCrash;
-        if (monitorFailureAt(
-            self.profile,
-            .after_monitor_record,
-        )) return error.InjectedCrash;
-        if (context == .close) {
-            try delete_monitor_transaction(
-                self.profile.alloc,
-                capability,
-                self.record.session_id,
-            );
-            if (closeFailureAt(
-                self.profile,
-                .after_close_monitor_cleanup,
-            )) return error.InjectedCrash;
-        } else {
-            delete_monitor_transaction(
-                self.profile.alloc,
-                capability,
-                self.record.session_id,
-            ) catch |err| debug_trace.logf(
-                "terminal_store",
-                "committed monitor transaction cleanup deferred id={s} err={s}",
-                .{ self.record.session_id, @errorName(err) },
-            );
-        }
-    }
-
-    pub fn ensure_monitor_admission(
-        self: *DurableSession,
-        set: monitor_core.PersistedSet,
-    ) !void {
-        try ensure_monitor_set_admissible(self.profile.alloc, set);
-    }
-
-    pub fn commit_monitor_event(
-        self: *DurableSession,
-        set: monitor_core.PersistedSet,
-        sequence: u64,
-        reason: monitor_core.EventReason,
-        now_ms: i64,
-    ) !u64 {
-        const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
-        defer self.profile.mutex.unlock(zio);
-        try self.reject_close_intent_locked();
-        return self.commit_monitor_event_locked(
-            set,
-            sequence,
-            reason,
-            now_ms,
-            .ordinary,
-        );
-    }
-
-    fn commit_monitor_event_locked(
-        self: *DurableSession,
-        set: monitor_core.PersistedSet,
-        sequence: u64,
-        reason: monitor_core.EventReason,
-        now_ms: i64,
-        context: MonitorCommitContext,
-    ) !u64 {
-        _ = try self.reconcile_monitor_transaction_locked();
-        const event_id = self.record.next_event_id;
-        var previous = try self.load_monitor_set_locked(self.profile.alloc, true);
-        defer previous.deinit();
-        const candidate_monitor = find_monitor_by_sequence_mut(set.monitors, sequence);
-        const previous_monitor = find_monitor_by_sequence(
-            previous.parsed.value.monitors,
-            sequence,
-        );
-        if (candidate_monitor == null and previous_monitor == null) {
-            return error.MonitorNotFound;
-        }
-        if (candidate_monitor) |persisted| {
-            try monitor_core.note_notification(persisted, event_id, reason);
-        }
-        const event = DurableEvent{
-            .id = event_id,
-            .kind = .monitor,
-            .lifecycle = self.record.lifecycle,
-            .cursor = self.record.output_cursor,
-            .created_at_ms = now_ms,
-            .monitor_sequence = sequence,
-            .monitor_reason = reason,
-        };
-        const transaction = MonitorTransaction{
-            .updated_at_ms = now_ms,
-            .candidate = set,
-            .event = event,
-        };
-        try ensure_monitor_set_fits(self.profile.alloc, set);
-        try ensure_monitor_transaction_fits(self.profile.alloc, transaction);
-        const capability = try self.state_capability();
-        try write_monitor_transaction(
-            self.profile.alloc,
-            capability,
-            self.record.session_id,
-            transaction,
-        );
-        if (context == .close and closeFailureAt(
-            self.profile,
-            .after_close_monitor_transaction_prepare,
-        )) return error.InjectedCrash;
-        if (monitorFailureAt(
-            self.profile,
-            .after_monitor_transaction_prepare,
-        )) return error.SessionChildCommitIndeterminate;
-        try self.write_event_locked(.monitor, sequence, reason, now_ms);
-        if (context == .close and closeFailureAt(
-            self.profile,
-            .after_close_monitor_event,
-        )) return error.InjectedCrash;
-        if (monitorFailureAt(
-            self.profile,
-            .after_monitor_event_indeterminate,
-        )) return error.SessionChildCommitIndeterminate;
-        if (monitorFailureAt(
-            self.profile,
-            .after_event_write,
-        )) {
-            return error.InjectedCrash;
-        }
-        try apply_monitor_transaction_record(&self.record, transaction);
-        write_monitor_set(
-            self.profile.alloc,
-            capability,
-            self.record.session_id,
-            set,
-        ) catch |err| {
-            if (context == .close) return err;
-            debug_trace.logf(
-                "terminal_store",
-                "committed monitor event state deferred id={s} err={s}",
-                .{ self.record.session_id, @errorName(err) },
-            );
-            return event_id;
-        };
-        if (context == .close and closeFailureAt(
-            self.profile,
-            .after_close_monitor_state_write,
-        )) return error.InjectedCrash;
-        if (monitorFailureAt(
-            self.profile,
-            .after_monitor_state_write,
-        )) {
-            return error.InjectedCrash;
-        }
-        save_record(
-            self.profile.alloc,
-            capability,
-            self.record,
-        ) catch |err| {
-            if (context == .close) return err;
-            debug_trace.logf(
-                "terminal_store",
-                "committed monitor event record deferred id={s} err={s}",
-                .{ self.record.session_id, @errorName(err) },
-            );
-            return event_id;
-        };
-        if (context == .close and closeFailureAt(
-            self.profile,
-            .after_close_monitor_record_write,
-        )) return error.InjectedCrash;
-        if (monitorFailureAt(
-            self.profile,
-            .after_monitor_event_record,
-        )) {
-            return error.InjectedCrash;
-        }
-        if (context == .close) {
-            try delete_monitor_transaction(
-                self.profile.alloc,
-                capability,
-                self.record.session_id,
-            );
-            if (closeFailureAt(
-                self.profile,
-                .after_close_monitor_cleanup,
-            )) return error.InjectedCrash;
-        } else {
-            delete_monitor_transaction(
-                self.profile.alloc,
-                capability,
-                self.record.session_id,
-            ) catch |err| debug_trace.logf(
-                "terminal_store",
-                "committed monitor event cleanup deferred id={s} err={s}",
-                .{ self.record.session_id, @errorName(err) },
-            );
-        }
-        try self.retry_event_cleanup_locked();
-        return event_id;
-    }
-
-    pub fn reconcile_monitor_commit(
-        self: *DurableSession,
-        candidate: monitor_core.PersistedSet,
-    ) !MonitorCommitOutcome {
-        const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
-        defer self.profile.mutex.unlock(zio);
-        try inject_monitor_reconciliation_failure(self.profile);
-        _ = try self.reconcile_monitor_transaction_locked();
-        var current = try self.load_monitor_set_locked(self.profile.alloc, true);
-        defer current.deinit();
-        return if (try monitor_sets_equal(
-            self.profile.alloc,
-            current.parsed.value,
-            candidate,
-        ))
-            .candidate
-        else
-            .previous;
-    }
-
-    pub fn commit_monitor_transition(
-        self: *DurableSession,
-        candidate: monitor_core.PersistedSet,
-        notification: ?MonitorNotification,
-        now_ms: i64,
-    ) MonitorTransitionOutcome {
-        return self.commit_monitor_transition_controlled(
-            candidate,
-            notification,
-            now_ms,
-            .{},
-        );
-    }
-
-    pub fn commit_monitor_transition_controlled(
-        self: *DurableSession,
-        candidate: monitor_core.PersistedSet,
-        notification: ?MonitorNotification,
-        now_ms: i64,
-        control: MonitorReconciliationControl,
-    ) MonitorTransitionOutcome {
-        if (notification) |event| {
-            _ = self.commit_monitor_event(
-                candidate,
-                event.sequence,
-                event.reason,
-                now_ms,
-            ) catch |err| {
-                if (err == error.CloseIntentCommitted) {
-                    return .{ .previous = err };
-                }
-                return self.prove_monitor_commit(candidate, err, control);
-            };
-        } else {
-            self.persist_monitor_set(candidate, now_ms) catch |err| {
-                if (err == error.CloseIntentCommitted) {
-                    return .{ .previous = err };
-                }
-                return self.prove_monitor_commit(candidate, err, control);
-            };
-        }
-        return .candidate;
-    }
-
-    fn prove_monitor_commit(
-        self: *DurableSession,
-        candidate: monitor_core.PersistedSet,
-        commit_error: anyerror,
-        control: MonitorReconciliationControl,
-    ) MonitorTransitionOutcome {
-        if (control.max_attempts == 0) {
-            return .{ .indeterminate = error.InvalidReconciliationBound };
-        }
-        var attempt: u8 = 0;
-        while (attempt < control.max_attempts) : (attempt += 1) {
-            if (control.is_cancelled()) return .cancelled;
-            const outcome = self.reconcile_monitor_commit(candidate) catch |err| {
-                if (control.observed_attempts) |observed| {
-                    observed.store(attempt + 1, .release);
-                }
-                debug_trace.logf(
-                    "terminal_store",
-                    "monitor reconciliation attempt={d}/{d} id={s} err={s}",
-                    .{
-                        attempt + 1,
-                        control.max_attempts,
-                        self.record.session_id,
-                        @errorName(err),
-                    },
-                );
-                if (attempt + 1 == control.max_attempts) {
-                    return .{ .indeterminate = err };
-                }
-                if (control.is_cancelled()) return .cancelled;
-                if (control.retry_delay_ms != 0) {
-                    io_mod.getIo().sleep(
-                        .fromMilliseconds(control.retry_delay_ms),
-                        .awake,
-                    ) catch |sleep_err| {
-                        return .{ .indeterminate = sleep_err };
-                    };
-                }
-                continue;
-            };
-            if (outcome == .previous) return .{ .previous = commit_error };
-            return .candidate;
-        }
-        unreachable;
     }
 
     pub fn resize(
@@ -4527,9 +3885,6 @@ pub const DurableSession = struct {
         if (self.record.lifecycle == .closed) {
             return .{ .previous = error.AuthorityRevoked };
         }
-        _ = self.reconcile_monitor_transaction_locked() catch |err| {
-            return .{ .previous = err };
-        };
         _ = self.authorize_locked(claim, .close) catch |err| {
             return .{ .previous = err };
         };
@@ -4609,7 +3964,6 @@ pub const DurableSession = struct {
         )) orelse return false;
         defer parsed.deinit();
         try self.reconcile_close_authority_locked(capability, parsed.value);
-        try self.finalize_close_monitors_locked(now_ms);
 
         if (parsed.value.lifecycle_event == null) {
             parsed.value.lifecycle_event = .{
@@ -4663,66 +4017,6 @@ pub const DurableSession = struct {
             return error.InjectedCrash;
         }
         return true;
-    }
-
-    fn finalize_close_monitors_locked(
-        self: *DurableSession,
-        now_ms: i64,
-    ) !void {
-        while (true) {
-            _ = try self.reconcile_monitor_transaction_locked();
-            var current = try self.load_monitor_set_locked(
-                self.profile.alloc,
-                true,
-            );
-            defer current.deinit();
-            if (current.parsed.value.monitors.len == 0) return;
-
-            const monitor = current.parsed.value.monitors[0];
-            var candidate = try MonitorSet.clone(
-                self.profile.alloc,
-                current.parsed.value,
-            );
-            defer candidate.deinit();
-            const monitors = candidate.parsed.value.monitors;
-            std.mem.copyForwards(
-                monitor_core.PersistedMonitor,
-                monitors[0 .. monitors.len - 1],
-                monitors[1..],
-            );
-            candidate.parsed.value.monitors = monitors[0 .. monitors.len - 1];
-
-            var reason: ?monitor_core.EventReason = null;
-            if (monitor.definition.notify_schedule == .on_exit and
-                monitor.runtime.last_event_reason != .session_exit)
-            {
-                var observed = monitor;
-                const decision = try monitor_core.observe(
-                    &observed,
-                    .session_exit,
-                    false,
-                    now_ms,
-                );
-                reason = decision.notify;
-            }
-            if (reason) |event_reason| {
-                const sequence = monitor_sequence(monitor.monitor_id) orelse
-                    return error.InvalidMonitorRecord;
-                _ = try self.commit_monitor_event_locked(
-                    candidate.parsed.value,
-                    sequence,
-                    event_reason,
-                    now_ms,
-                    .close,
-                );
-            } else {
-                try self.persist_monitor_set_locked(
-                    candidate.parsed.value,
-                    now_ms,
-                    .close,
-                );
-            }
-        }
     }
 
     fn isolate_invalid_close_transaction(
@@ -5479,6 +4773,20 @@ pub const DurableSession = struct {
         const capability = try self.state_capability();
         var names = try capability.iterate(self.profile.alloc, .terminal_state);
         defer names.deinit();
+        const legacy_monitors_name = try make_name(
+            self.profile.alloc,
+            "monitors",
+            self.record.session_id,
+            ".json",
+        );
+        defer self.profile.alloc.free(legacy_monitors_name);
+        const legacy_monitor_transaction_name = try make_name(
+            self.profile.alloc,
+            "monitor-transaction",
+            self.record.session_id,
+            ".json",
+        );
+        defer self.profile.alloc.free(legacy_monitor_transaction_name);
         var repaired = false;
         for (names.names) |name| {
             if (indexed_artifact_id(
@@ -5502,13 +4810,20 @@ pub const DurableSession = struct {
                 ".bin",
             )) |generation| {
                 if (generation == self.record.checkpoint_generation) continue;
-            } else {
+            } else if (!std.mem.eql(u8, name, legacy_monitors_name) and
+                !std.mem.eql(u8, name, legacy_monitor_transaction_name))
+            {
                 continue;
             }
             capability.delete(.terminal_state, name) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => return err,
             };
+            repaired = true;
+        }
+        if (self.record.monitor_count != 0) {
+            self.record.monitor_count = 0;
+            try save_record(self.profile.alloc, capability, self.record);
             repaired = true;
         }
         return repaired;
@@ -5562,71 +4877,6 @@ pub const DurableSession = struct {
             try self.retry_event_cleanup_locked();
         }
         return repaired;
-    }
-
-    fn reconcile_monitor_transaction(self: *DurableSession) !bool {
-        const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
-        defer self.profile.mutex.unlock(zio);
-        return self.reconcile_monitor_transaction_locked();
-    }
-
-    fn reconcile_monitor_transaction_locked(self: *DurableSession) !bool {
-        const capability = try self.state_capability();
-        var transaction = (try load_monitor_transaction(
-            self.profile.alloc,
-            capability,
-            self.record.session_id,
-        )) orelse {
-            var set = try self.load_monitor_set_locked(self.profile.alloc, false);
-            defer set.deinit();
-            if (set.parsed.value.monitors.len == self.record.monitor_count) {
-                return false;
-            }
-            self.record.monitor_count = @intCast(set.parsed.value.monitors.len);
-            try save_record(self.profile.alloc, capability, self.record);
-            return true;
-        };
-        defer transaction.deinit();
-
-        var committed = transaction.value.committed;
-        if (transaction.value.event) |expected| {
-            const actual = load_event(
-                self.profile.alloc,
-                capability,
-                self.record.session_id,
-                expected.id,
-            ) catch |err| switch (err) {
-                error.MissingDurableEvent => null,
-                else => return err,
-            };
-            if (actual) |event| {
-                if (!std.meta.eql(expected, event)) {
-                    return error.InvalidMonitorTransaction;
-                }
-                committed = true;
-            }
-        }
-
-        if (committed) {
-            try write_monitor_set(
-                self.profile.alloc,
-                capability,
-                self.record.session_id,
-                transaction.value.candidate,
-            );
-            try apply_monitor_transaction_record(
-                &self.record,
-                transaction.value,
-            );
-            try save_record(self.profile.alloc, capability, self.record);
-        }
-        try delete_monitor_transaction(
-            self.profile.alloc,
-            capability,
-            self.record.session_id,
-        );
-        return true;
     }
 
     fn reconcile_journals(self: *DurableSession) !bool {
@@ -5941,11 +5191,12 @@ fn facts_from_record(record: Record, session_id: []const u8) contracts.SessionFa
         .lifecycle = record.lifecycle,
         .attention = record.attention,
         .backend = record.backend,
+        .model_managed = !record.direct_human_model_read_only,
+        .timed_out = record.timed_out,
         .output_cursor = record.output_cursor,
         .unread_range = unread_range,
         .raw_gap = record.raw_gap,
         .screen_recovery = record.screen_recovery,
-        .active_monitor_count = record.monitor_count,
     };
 }
 
@@ -6027,6 +5278,15 @@ inline fn failRecord(err: anytype) @TypeOf(err)!Record {
 
 noinline fn failRecordDynamic(err: anyerror) anyerror!Record {
     return err;
+}
+
+test "terminal record failures preserve exact error types and identities" {
+    const missing = failRecord(error.TerminalRecordNotFound);
+    try std.testing.expect(
+        @TypeOf(missing) == error{TerminalRecordNotFound}!Record,
+    );
+    try std.testing.expectError(error.TerminalRecordNotFound, missing);
+    try std.testing.expectError(error.OutOfMemory, failRecord(error.OutOfMemory));
 }
 
 fn load_record(
@@ -6317,246 +5577,8 @@ fn validate_recovery_authority(
     }
 }
 
-fn validate_repeated_probe_authority(
-    grant: contracts.AuthorityGrant,
-    definition: contracts.MonitorDefinition,
-) !void {
-    if (definition.condition != .custom_probe) return;
-    for (grant.repeated_probes) |authority| {
-        if (authority.matches(definition)) return;
-    }
-    return error.ProbeAuthorityDenied;
-}
-
-fn write_initial_monitors(
-    alloc: Allocator,
-    capability: *session_child_store.SessionChildCapability,
-    session_id: []const u8,
-    monitors: []const contracts.MonitorDefinition,
-    now_ms: i64,
-) !void {
-    if (monitors.len > contracts.max_monitor_definitions) {
-        return error.InvalidMonitor;
-    }
-    var id_buffers: [contracts.max_monitor_definitions][64]u8 = undefined;
-    var persisted: [contracts.max_monitor_definitions]monitor_core.PersistedMonitor = undefined;
-    for (monitors, 0..) |definition, index| {
-        try monitor_core.validate_definition(definition);
-        const sequence: u64 = @intCast(index + 1);
-        persisted[index] = .{
-            .monitor_id = try monitor_core.stable_id(&id_buffers[index], sequence),
-            .definition = definition,
-            .runtime = try monitor_core.initial_runtime(definition, now_ms),
-        };
-    }
-    const next_monitor_id = std.math.add(u64, @intCast(monitors.len), 1) catch
-        return error.MonitorIdExhausted;
-    const set = monitor_core.PersistedSet{
-        .next_monitor_id = next_monitor_id,
-        .monitors = persisted[0..monitors.len],
-    };
-    try ensure_monitor_set_admissible(alloc, set);
-    const bytes = try render_json(alloc, set);
-    defer alloc.free(bytes);
-    const name = try monitors_name(alloc, session_id);
-    defer alloc.free(name);
-    var entry = try capability.atomicReplace(
-        alloc,
-        .terminal_state,
-        name,
-        bytes,
-    );
-    entry.deinit(alloc);
-}
-
-fn ensure_monitor_set_fits(
-    alloc: Allocator,
-    set: monitor_core.PersistedSet,
-) !void {
-    try validate_monitor_set(set);
-    const bytes = try render_json(alloc, set);
-    defer alloc.free(bytes);
-    try ensure_monitor_set_bytes_fit(bytes);
-}
-
-fn ensure_monitor_set_admissible(
-    alloc: Allocator,
-    set: monitor_core.PersistedSet,
-) !void {
-    try validate_monitor_set(set);
-    const bytes = try render_json(alloc, set);
-    defer alloc.free(bytes);
-    if (bytes.len > monitor_admission_bytes_limit) {
-        return error.MonitorStateTooLarge;
-    }
-}
-
-fn ensure_monitor_transaction_fits(
-    alloc: Allocator,
-    transaction: MonitorTransaction,
-) !void {
-    try transaction.validate();
-    const bytes = try render_json(alloc, transaction);
-    defer alloc.free(bytes);
-    try ensure_monitor_transaction_bytes_fit(bytes);
-}
-
-fn monitor_sets_equal(
-    alloc: Allocator,
-    left: monitor_core.PersistedSet,
-    right: monitor_core.PersistedSet,
-) !bool {
-    const left_bytes = try render_json(alloc, left);
-    defer alloc.free(left_bytes);
-    const right_bytes = try render_json(alloc, right);
-    defer alloc.free(right_bytes);
-    return std.mem.eql(u8, left_bytes, right_bytes);
-}
-
-fn ensure_monitor_set_bytes_fit(bytes: []const u8) !void {
-    if (bytes.len > monitor_set_bytes_limit) {
-        return error.MonitorStateTooLarge;
-    }
-}
-
-fn ensure_monitor_transaction_bytes_fit(bytes: []const u8) !void {
-    if (bytes.len > monitor_transaction_bytes_limit) {
-        return error.MonitorStateTooLarge;
-    }
-}
-
-fn inject_monitor_reconciliation_failure(profile: *ProfileStore) !void {
-    const failure = profile.options.fail_monitor_reconciliation_once orelse
-        return;
-    if (profile.monitor_reconciliation_failure_count >=
-        profile.options.fail_monitor_reconciliation_count)
-    {
-        return;
-    }
-    profile.monitor_reconciliation_failure_count += 1;
-    const requested = @tagName(failure);
-    if (std.mem.eql(u8, requested, "allocation")) return error.OutOfMemory;
-    if (std.mem.eql(u8, requested, "io")) return error.SessionChildStoreFailed;
-    if (std.mem.eql(u8, requested, "indeterminate")) {
-        return error.SessionChildCommitIndeterminate;
-    }
-}
-
-fn monitorFailureAt(
-    profile: *ProfileStore,
-    point: FailurePoint,
-) bool {
-    return profile.options.fail_at == point;
-}
-
 fn closeFailureAt(profile: *ProfileStore, point: FailurePoint) bool {
     return profile.options.fail_at == point;
-}
-
-fn write_monitor_set(
-    alloc: Allocator,
-    capability: *session_child_store.SessionChildCapability,
-    session_id: []const u8,
-    set: monitor_core.PersistedSet,
-) !void {
-    try validate_monitor_set(set);
-    const bytes = try render_json(alloc, set);
-    defer alloc.free(bytes);
-    try ensure_monitor_set_bytes_fit(bytes);
-    const name = try monitors_name(alloc, session_id);
-    defer alloc.free(name);
-    var entry = try capability.atomicReplace(
-        alloc,
-        .terminal_state,
-        name,
-        bytes,
-    );
-    entry.deinit(alloc);
-}
-
-fn validate_monitor_set(set: monitor_core.PersistedSet) !void {
-    if (set.schema_version != monitor_core.schema_version or
-        set.next_monitor_id == 0 or
-        set.monitors.len > contracts.max_monitor_definitions)
-    {
-        return error.InvalidMonitorRecord;
-    }
-    var previous_sequence: u64 = 0;
-    for (set.monitors) |persisted| {
-        try monitor_core.validate_runtime(persisted);
-        const sequence = monitor_sequence(persisted.monitor_id) orelse
-            return error.InvalidMonitorRecord;
-        if (sequence <= previous_sequence or sequence >= set.next_monitor_id) {
-            return error.InvalidMonitorRecord;
-        }
-        previous_sequence = sequence;
-    }
-}
-
-fn write_monitor_transaction(
-    alloc: Allocator,
-    capability: *session_child_store.SessionChildCapability,
-    session_id: []const u8,
-    transaction: MonitorTransaction,
-) !void {
-    try transaction.validate();
-    const bytes = try render_json(alloc, transaction);
-    defer alloc.free(bytes);
-    try ensure_monitor_transaction_bytes_fit(bytes);
-    const name = try monitor_transaction_name(alloc, session_id);
-    defer alloc.free(name);
-    var entry = try capability.atomicReplace(
-        alloc,
-        .terminal_state,
-        name,
-        bytes,
-    );
-    entry.deinit(alloc);
-}
-
-fn load_monitor_transaction(
-    alloc: Allocator,
-    capability: *session_child_store.SessionChildCapability,
-    session_id: []const u8,
-) !?std.json.Parsed(MonitorTransaction) {
-    const name = try monitor_transaction_name(alloc, session_id);
-    defer alloc.free(name);
-    var file = capability.openFileReadOnly(
-        alloc,
-        .terminal_state,
-        name,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer file.deinit();
-    const bytes = try file.readToEnd(alloc, monitor_transaction_bytes_limit);
-    defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
-        MonitorTransaction,
-        alloc,
-        bytes,
-        .{ .allocate = .alloc_always },
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidMonitorTransaction,
-    };
-    errdefer parsed.deinit();
-    parsed.value.validate() catch return error.InvalidMonitorTransaction;
-    return parsed;
-}
-
-fn delete_monitor_transaction(
-    alloc: Allocator,
-    capability: *session_child_store.SessionChildCapability,
-    session_id: []const u8,
-) !void {
-    const name = try monitor_transaction_name(alloc, session_id);
-    defer alloc.free(name);
-    capability.delete(.terminal_state, name) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
 }
 
 fn write_close_transaction(
@@ -6623,65 +5645,6 @@ fn delete_close_transaction(
         error.FileNotFound => {},
         else => return err,
     };
-}
-
-fn apply_monitor_transaction_record(
-    record: *Record,
-    transaction: MonitorTransaction,
-) !void {
-    record.monitor_count = std.math.cast(
-        u16,
-        transaction.candidate.monitors.len,
-    ) orelse return error.InvalidMonitorTransaction;
-    record.updated_at_ms = transaction.updated_at_ms;
-    if (transaction.event) |event| {
-        const next_event_id = std.math.add(u64, event.id, 1) catch
-            return error.EventIdExhausted;
-        if (record.next_event_id > event.id) {
-            if (record.next_event_id != next_event_id) {
-                return error.InvalidMonitorTransaction;
-            }
-            return;
-        }
-        if (record.next_event_id != event.id) {
-            return error.InvalidMonitorTransaction;
-        }
-        record.next_event_id = next_event_id;
-        if (event.id > event_retention_limit) {
-            record.event_gap_through = @max(
-                record.event_gap_through,
-                event.id - event_retention_limit,
-            );
-        }
-    }
-}
-
-fn monitor_sequence(monitor_id: []const u8) ?u64 {
-    const prefix = "monitor-";
-    if (!std.mem.startsWith(u8, monitor_id, prefix)) return null;
-    const raw = monitor_id[prefix.len..];
-    if (raw.len == 0 or raw[0] == '0') return null;
-    return std.fmt.parseInt(u64, raw, 10) catch null;
-}
-
-fn find_monitor_by_sequence(
-    monitors: []const monitor_core.PersistedMonitor,
-    sequence: u64,
-) ?*const monitor_core.PersistedMonitor {
-    for (monitors) |*monitor| {
-        if (monitor_sequence(monitor.monitor_id) == sequence) return monitor;
-    }
-    return null;
-}
-
-fn find_monitor_by_sequence_mut(
-    monitors: []monitor_core.PersistedMonitor,
-    sequence: u64,
-) ?*monitor_core.PersistedMonitor {
-    for (monitors) |*monitor| {
-        if (monitor_sequence(monitor.monitor_id) == sequence) return monitor;
-    }
-    return null;
 }
 
 fn encode_checkpoint(
@@ -6759,27 +5722,93 @@ fn checkpoint_envelopes_equal(
         std.mem.eql(u8, &left.checksum, &right.checksum);
 }
 
-const test_process_provider = background_process_provider.Provider{
-    .spawn_prepared_fn = testSpawnPrepared,
+test "checkpoint load classification passes transient failures through" {
+    try std.testing.expectEqual(
+        contracts.ScreenUnavailableReason.missing,
+        checkpoint_load_unavailable_reason(error.MissingCheckpoint).?,
+    );
+    try std.testing.expectEqual(
+        contracts.ScreenUnavailableReason.unsupported_schema,
+        checkpoint_load_unavailable_reason(error.UnsupportedCheckpointSchema).?,
+    );
+    try std.testing.expectEqual(
+        contracts.ScreenUnavailableReason.corrupt,
+        checkpoint_load_unavailable_reason(error.CheckpointChecksumMismatch).?,
+    );
+    try std.testing.expect(
+        checkpoint_load_unavailable_reason(error.OutOfMemory) == null,
+    );
+    try std.testing.expect(
+        checkpoint_load_unavailable_reason(error.AccessDenied) == null,
+    );
+}
+
+test "recovery authority classification isolates only definitive evidence" {
+    const definitive = [_]anyerror{
+        error.AuthorityNotFound,
+        error.InvalidAuthorityRecord,
+        error.HolderProofNotFound,
+        error.InvalidHolderProof,
+        error.AuthorityRevoked,
+        error.SessionPathUnsafe,
+        error.StreamTooLong,
+    };
+    for (definitive) |err| {
+        try std.testing.expect(is_definitive_recovery_authority_error(err));
+    }
+
+    const transient = [_]anyerror{
+        error.OutOfMemory,
+        error.AccessDenied,
+        error.SessionChildStoreFailed,
+        error.PrivateStatePermissionsUnsupported,
+        error.InjectedFailure,
+        error.InjectedSyncFailure,
+        error.UnclassifiedRecoveryFailure,
+    };
+    for (transient) |err| {
+        try std.testing.expect(!is_definitive_recovery_authority_error(err));
+    }
+}
+
+test "close recovery classification isolates only malformed durable evidence" {
+    for ([_]anyerror{
+        error.InvalidCloseTransaction,
+        error.StreamTooLong,
+    }) |err| {
+        try std.testing.expectEqual(
+            CloseRecoveryErrorClass.isolate,
+            classify_close_recovery_error(err),
+        );
+    }
+    for ([_]anyerror{
+        error.OutOfMemory,
+        error.AccessDenied,
+        error.PrivateStatePermissionsUnsupported,
+        error.SessionChildStoreFailed,
+        error.InjectedCrash,
+        error.TmuxCommandFailed,
+        error.UnclassifiedRecoveryFailure,
+    }) |err| {
+        try std.testing.expectEqual(
+            CloseRecoveryErrorClass.propagate,
+            classify_close_recovery_error(err),
+        );
+    }
+}
+
+const test_process_provider = process_provider_mod.Provider{
     .capture_token_fn = testCaptureToken,
     .match_token_fn = testMatchToken,
     .signal_process_fn = testSignalProcess,
 };
 
-fn testSpawnPrepared(
-    _: ?*anyopaque,
-    _: Allocator,
-    _: background_process_provider.SpawnRequest,
-) background_process_provider.ProviderError!background_process_provider.PreparedProcess {
-    return error.Unsupported;
-}
-
 fn testCaptureToken(
     _: ?*anyopaque,
     _: Allocator,
     _: []const u8,
-) background_process_provider.ProviderError!process_supervisor.ProcessInstanceToken {
-    return process_supervisor.ProcessInstanceToken.parse(
+) process_provider_mod.ProviderError!process_identity.ProcessInstanceToken {
+    return process_identity.ProcessInstanceToken.parse(
         "macos:00000000000000000000000000000000:1:2",
     ) catch unreachable;
 }
@@ -6788,8 +5817,8 @@ fn testMatchToken(
     _: ?*anyopaque,
     _: Allocator,
     _: []const u8,
-    _: process_supervisor.ProcessInstanceToken,
-) process_supervisor.TokenMatch {
+    _: process_identity.ProcessInstanceToken,
+) process_identity.TokenMatch {
     return .matched;
 }
 
@@ -6797,8 +5826,8 @@ fn testSignalProcess(
     _: ?*anyopaque,
     _: Allocator,
     _: []const u8,
-    _: process_supervisor.ProcessInstanceToken,
-) background_process_provider.ProviderError!void {
+    _: process_identity.ProcessInstanceToken,
+) process_provider_mod.ProviderError!void {
     return error.Unsupported;
 }
 
@@ -6902,19 +5931,9 @@ const TestStoreFixture = struct {
         session_id: []const u8,
         dimensions: contracts.Dimensions,
     ) !DurableSession {
-        return self.create_with_monitors(session_id, dimensions, &.{});
-    }
-
-    fn create_with_monitors(
-        self: *TestStoreFixture,
-        session_id: []const u8,
-        dimensions: contracts.Dimensions,
-        monitors: []const contracts.MonitorDefinition,
-    ) !DurableSession {
         return self.create_with_persistence(
             session_id,
             dimensions,
-            monitors,
             test_persistence(),
         );
     }
@@ -6923,7 +5942,6 @@ const TestStoreFixture = struct {
         self: *TestStoreFixture,
         session_id: []const u8,
         dimensions: contracts.Dimensions,
-        monitors: []const contracts.MonitorDefinition,
         persistence: contracts.StartPersistence,
     ) !DurableSession {
         return DurableSession.create(&self.profile, .{
@@ -6935,7 +5953,6 @@ const TestStoreFixture = struct {
             .backend = .native,
             .dimensions = dimensions,
             .persistence = persistence,
-            .initial_monitors = monitors,
             .now_ms = 1,
         });
     }
@@ -6952,7 +5969,6 @@ const TestStoreFixture = struct {
             .backend = .tmux,
             .dimensions = .{ .rows = 24, .columns = 80 },
             .persistence = persistence,
-            .initial_monitors = &.{},
             .now_ms = 1,
         });
     }
@@ -7063,8 +6079,6 @@ fn checkStoreAllocationFailures(alloc: Allocator) !void {
     var session = try fixture.create("terminal-store-allocation");
     defer session.deinit();
     _ = try session.append_event(.output, 2);
-    var monitors = try session.load_monitor_definitions(alloc);
-    defer monitors.deinit();
     var replay = try session.replay_events(alloc, 0, 1);
     defer replay.deinit(alloc);
 }
@@ -7097,7 +6111,6 @@ fn checkRecoveryExecutionScopeAllocationFailures(alloc: Allocator) !void {
     var session = try fixture.create_with_persistence(
         "terminal-recovery-scope-allocation",
         .{ .rows = 24, .columns = 80 },
-        &.{},
         persistence,
     );
     defer session.deinit();
@@ -7132,21 +6145,6 @@ fn test_options() Options {
     };
 }
 
-fn expect_monitor_candidate(outcome: MonitorTransitionOutcome) !void {
-    switch (outcome) {
-        .candidate => {},
-        .previous => |err| {
-            _ = @errorName(err);
-            return error.TestExpectedCandidateWinner;
-        },
-        .cancelled => return error.TestExpectedCandidateWinner,
-        .indeterminate => |err| {
-            _ = @errorName(err);
-            return error.TestExpectedCandidateWinner;
-        },
-    }
-}
-
 fn expect_close_candidate(outcome: CloseCommitOutcome) !void {
     switch (outcome) {
         .candidate => {},
@@ -7155,6 +6153,113 @@ fn expect_close_candidate(outcome: CloseCommitOutcome) !void {
             return error.TestExpectedCandidateWinner;
         },
     }
+}
+
+fn test_claim(persistence: contracts.StartPersistence) contracts.AuthorityClaim {
+    return .{
+        .principal = persistence.grant.principal,
+        .actor = persistence.grant.actor,
+        .generation = persistence.grant.generation,
+        .proof = persistence.proof,
+    };
+}
+
+fn test_process_owner(
+    alloc: Allocator,
+    process_provider: process_provider_mod.Provider,
+) !contracts.ProcessOwner {
+    var pid_buffer: [32]u8 = undefined;
+    const pid = std.c.getpid();
+    const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
+    const token = try process_provider.captureToken(
+        alloc,
+        pid_text,
+    );
+    return contracts.ProcessOwner.init(@intCast(pid), token.view());
+}
+
+test "owner catalog enumerates the exact durable owner without a terminal anchor" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+
+    var first = try fixture.create("terminal-catalog-first");
+    defer first.deinit();
+    var second = try fixture.create("terminal-catalog-second");
+    defer second.deinit();
+    var third = try fixture.create("terminal-catalog-third");
+    defer third.deinit();
+    var foreign_persistence = test_persistence();
+    foreign_persistence.grant.principal.workspace_root = "/foreign-workspace";
+    foreign_persistence.grant.principal.cwd = "/foreign-workspace";
+    var foreign = try fixture.create_with_persistence(
+        "terminal-catalog-foreign",
+        .{ .rows = 24, .columns = 80 },
+        foreign_persistence,
+    );
+    defer foreign.deinit();
+    try expect_close_candidate(first.begin_close(
+        test_claim(test_persistence()),
+        3,
+    ));
+    try first.finish_close(3);
+    try second.revoke(4);
+
+    var owner = try fixture.owner_capability(
+        "terminal-store-owner",
+        .writable,
+    );
+    defer owner.deinit();
+    var claim = try loadOrCreateOwnerCatalogClaim(alloc, &owner, .{
+        .profile_user = "profile-user",
+        .durable_session_id = "terminal-store-owner",
+        .workspace_root = "/workspace",
+        .transport_role = .interactive,
+        .actor = .agent,
+    });
+    defer claim.deinit();
+    const catalog_claim = claim.view();
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &catalog_claim.proof.bytes,
+        &test_persistence().proof.bytes,
+    ));
+
+    var catalog = try fixture.profile.ownerCatalog(catalog_claim);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 3), catalog.entries.items.len);
+    var found_closed = false;
+    var found_revoked = false;
+    var found_live = false;
+    for (catalog.entries.items) |entry| {
+        if (std.mem.eql(u8, entry.facts.session_id, "terminal-catalog-first")) {
+            found_closed = entry.facts.lifecycle == .closed and
+                !entry.authorization.controls.read and
+                !entry.authorization.controls.inspect;
+        }
+        if (std.mem.eql(u8, entry.facts.session_id, "terminal-catalog-second")) {
+            found_revoked = !entry.authorization.controls.read and
+                !entry.authorization.controls.inspect;
+        }
+        if (std.mem.eql(u8, entry.facts.session_id, "terminal-catalog-third")) {
+            found_live = true;
+        }
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            entry.facts.session_id,
+            "terminal-catalog-foreign",
+        ));
+    }
+    try std.testing.expect(found_closed);
+    try std.testing.expect(found_revoked);
+    try std.testing.expect(found_live);
+
+    var forged = catalog_claim;
+    forged.proof.bytes[0] ^= 1;
+    try std.testing.expectError(
+        error.InvalidHolderProof,
+        fixture.profile.ownerCatalog(forged),
+    );
 }
 
 fn recovered_session_index(
@@ -7167,87 +6272,2580 @@ fn recovered_session_index(
     return null;
 }
 
-const MonitorCrashCase = enum {
-    every_check,
-    every_n_checks,
-    interval,
-    match,
-    path_baseline,
-};
-
-fn monitor_crash_definition(case: MonitorCrashCase) contracts.MonitorDefinition {
-    return switch (case) {
-        .every_check => .{
-            .condition = .{ .path_exists = "/workspace/ready" },
-            .check_schedule = .{ .interval_ms = 25 },
-            .notify_schedule = .every_check,
-            .lifetime = .until_session_end,
-        },
-        .every_n_checks => .{
-            .condition = .{ .path_exists = "/workspace/ready" },
-            .check_schedule = .{ .interval_ms = 25 },
-            .notify_schedule = .{ .every_n_checks = 2 },
-            .lifetime = .until_session_end,
-        },
-        .interval => .{
-            .condition = .process_exit,
-            .notify_schedule = .{ .interval = .{ .interval_ms = 25 } },
-            .lifetime = .until_session_end,
-        },
-        .match => .{
-            .condition = .{ .output_matches = "re*dy" },
-            .notify_schedule = .on_match,
-            .lifetime = .until_session_end,
-        },
-        .path_baseline => .{
-            .condition = .{ .path_changed = "/workspace/output" },
-            .check_schedule = .{ .interval_ms = 25 },
-            .notify_schedule = .every_check,
-            .lifetime = .until_session_end,
-        },
-    };
+fn replace_test_authority(
+    alloc: Allocator,
+    session: *DurableSession,
+    authority: AuthorityWire,
+) !void {
+    const bytes = try render_json(alloc, authority);
+    defer alloc.free(bytes);
+    const name = try authority_name(alloc, session.record.session_id);
+    defer alloc.free(name);
+    var entry = try (try session.state_capability()).atomicReplace(
+        alloc,
+        .terminal_state,
+        name,
+        bytes,
+    );
+    entry.deinit(alloc);
 }
 
-fn advance_monitor_crash_case(
-    persisted: *monitor_core.PersistedMonitor,
-    case: MonitorCrashCase,
-) !monitor_core.EventReason {
-    const decision = switch (case) {
-        .every_check => try monitor_core.observe(persisted, .check, false, 26),
-        .every_n_checks => blk: {
-            _ = try monitor_core.observe(persisted, .check, false, 26);
-            break :blk try monitor_core.observe(persisted, .check, false, 51);
-        },
-        .interval => try monitor_core.timer_decision(persisted, 26),
-        .match => blk: {
-            const matched = try monitor_core.pattern_feed(
-                "re*dy",
-                true,
-                &persisted.runtime.matcher_states,
-                "ready",
-            );
-            break :blk try monitor_core.observe(persisted, .output, matched, 26);
-        },
-        .path_baseline => blk: {
-            persisted.runtime.path_baseline = .{
-                .exists = true,
-                .size = 73,
-                .modified_ns = 91,
-            };
-            break :blk try monitor_core.observe(persisted, .check, false, 26);
-        },
-    };
-    return decision.notify orelse error.TestExpectedMonitorNotification;
+fn replace_test_close_transaction(
+    alloc: Allocator,
+    session: *DurableSession,
+    bytes: []const u8,
+) !void {
+    const name = try close_transaction_name(alloc, session.record.session_id);
+    defer alloc.free(name);
+    var entry = try (try session.state_capability()).atomicReplace(
+        alloc,
+        .terminal_state,
+        name,
+        bytes,
+    );
+    entry.deinit(alloc);
 }
 
-const ReconciliationCancellation = struct {
-    observed_attempts: *std.atomic.Value(u8),
-    cancelled: *std.atomic.Value(bool),
+fn expect_pending_close_unchanged(
+    alloc: Allocator,
+    profile: *ProfileStore,
+    session_id: []const u8,
+    generation: contracts.AuthorityGeneration,
+    backend_identity: []const u8,
+) !void {
+    var unchanged = try profile.open_existing(
+        "terminal-store-owner",
+        session_id,
+    );
+    defer unchanged.deinit();
+    try std.testing.expectEqual(contracts.Lifecycle.starting, unchanged.record.lifecycle);
+    try std.testing.expect(unchanged.record.authority_revoked);
+    try std.testing.expectEqual(generation, unchanged.record.authority_generation);
+    try std.testing.expectEqualStrings(
+        backend_identity,
+        unchanged.record.backend_identity,
+    );
+    try std.testing.expect(try unchanged.close_cleanup_pending());
+    var authority = try load_authority(
+        alloc,
+        try unchanged.state_capability(),
+        session_id,
+    );
+    defer authority.deinit();
+    try std.testing.expect(authority.value.revoked);
+    try std.testing.expectEqual(generation, authority.value.grant.generation);
+    var replay = try unchanged.replay_events(alloc, 0, 16);
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replay.events.len);
+    try std.testing.expectEqual(
+        contracts.HostEvent.authority_revoked,
+        replay.events[0].kind,
+    );
+}
 
-    fn run(self: *ReconciliationCancellation) void {
-        while (self.observed_attempts.load(.acquire) == 0) {
-            std.Thread.yield() catch std.atomic.spinLoopHint();
-        }
-        self.cancelled.store(true, .release);
+test "durable journal rotates with monotonic cursors and reads exact bytes" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-journal");
+    defer session.deinit();
+
+    try session.append("abc", 2);
+    try session.append("def", 3);
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = 6 },
+        session.record.output_cursor,
+    );
+    var page = try session.read(alloc, .{ .segment = 1, .offset = 0 }, 64);
+    defer page.deinit(alloc);
+    try std.testing.expectEqualStrings("abcdef", page.output);
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = 6 },
+        page.range.?.end,
+    );
+    var next = try session.read(alloc, page.range.?.end, 64);
+    defer next.deinit(alloc);
+    try std.testing.expectEqualStrings("", next.output);
+    try std.testing.expect(try session.contains(
+        "cde",
+        .{ .segment = 1, .offset = 0 },
+    ));
+}
+
+test "durable create load and replay release every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkStoreAllocationFailures,
+        .{},
+    );
+}
+
+test "public raw cursor paginates exactly across private journal rotation" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, .{
+        .per_session_limit = 4 * 1024 * 1024,
+        .profile_limit = 8 * 1024 * 1024,
+        .segment_bytes = 1024 * 1024,
+    });
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-large-continuity");
+    defer session.deinit();
+
+    const payload = try alloc.alloc(u8, 1024 * 1024 + 12_345);
+    defer alloc.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @intCast('a' + index % 26);
+    try session.append(payload, 2);
+    const facts = session.facts();
+    try std.testing.expect(facts.raw_gap == null);
+    try std.testing.expectEqual(
+        contracts.RawRange{
+            .start = .{ .segment = 1, .offset = 0 },
+            .end = .{ .segment = 1, .offset = @intCast(payload.len) },
+        },
+        facts.unread_range.?,
+    );
+
+    var cursor = contracts.RawCursor{ .segment = 1, .offset = 0 };
+    var consumed: usize = 0;
+    while (consumed < payload.len) {
+        var page = try session.read(alloc, cursor, 65_521);
+        defer page.deinit(alloc);
+        try std.testing.expect(page.range != null);
+        try std.testing.expectEqual(cursor, page.range.?.start);
+        try std.testing.expectEqualSlices(
+            u8,
+            payload[consumed .. consumed + page.output.len],
+            page.output,
+        );
+        try std.testing.expect(page.output.len != 0);
+        consumed += page.output.len;
+        cursor = page.range.?.end;
+        try std.testing.expectEqual(@as(u64, 1), cursor.segment);
     }
-};
+    try std.testing.expectEqual(payload.len, consumed);
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = @intCast(payload.len) },
+        cursor,
+    );
+}
+
+test "checkpoint replacement stays opaque and separates raw gaps from screen state" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-checkpoint");
+    defer session.deinit();
+    try session.append("abc", 2);
+    try session.append("def", 3);
+    const payload = "opaque-screen";
+    const envelope = contracts.CheckpointEnvelope{
+        .engine_schema_revision = 1,
+        .applied_cursor = session.record.output_cursor,
+        .payload_len = payload.len,
+        .checksum = contracts.checkpoint_checksum(payload),
+    };
+    try session.store_checkpoint(envelope, payload, 4);
+    var checkpoint = (try session.load_checkpoint(alloc)).?;
+    defer checkpoint.deinit(alloc);
+    try std.testing.expectEqualStrings(payload, checkpoint.payload);
+
+    try session.evict_live_covered_journals();
+    try std.testing.expect(session.record.raw_gap != null);
+    try std.testing.expect(session.record.screen_recovery == .available);
+    var page = try session.read(alloc, .{ .segment = 1, .offset = 0 }, 64);
+    defer page.deinit(alloc);
+    try std.testing.expect(page.gap != null);
+    try std.testing.expectEqualStrings("ef", page.output);
+
+    var encoded = try encode_checkpoint(alloc, envelope, payload);
+    defer alloc.free(encoded);
+    encoded[encoded.len - 1] ^= 1;
+    try std.testing.expectError(
+        error.CheckpointChecksumMismatch,
+        decode_checkpoint(alloc, encoded),
+    );
+    encoded[encoded.len - 1] ^= 1;
+    std.mem.writeInt(u16, encoded[4..6], 2, .little);
+    try std.testing.expectError(
+        error.UnsupportedCheckpointSchema,
+        decode_checkpoint(alloc, encoded),
+    );
+    std.mem.writeInt(u16, encoded[4..6], checkpoint_schema_version, .little);
+    std.mem.writeInt(u32, encoded[24..28], payload.len + 1, .little);
+    try std.testing.expectError(
+        error.InvalidCheckpoint,
+        decode_checkpoint(alloc, encoded),
+    );
+}
+
+test "host absence gap retains both raw segments without matching across them" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-host-gap");
+    try session.append("left", 2);
+    const gap = try session.begin_raw_gap(3);
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = 4 },
+        gap.missing_from,
+    );
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 2, .offset = 0 },
+        gap.available_from,
+    );
+    try session.append("right", 4);
+
+    var before = try session.read(alloc, .{ .segment = 1, .offset = 0 }, 64);
+    defer before.deinit(alloc);
+    try std.testing.expectEqualStrings("left", before.output);
+    try std.testing.expect(before.gap == null);
+    var after = try session.read(alloc, gap.missing_from, 64);
+    defer after.deinit(alloc);
+    try std.testing.expectEqualStrings("right", after.output);
+    try std.testing.expectEqual(gap, after.gap.?);
+    try std.testing.expect(!try session.contains("ftr", .{ .segment = 1, .offset = 0 }));
+    try std.testing.expect(try session.contains("right", .{ .segment = 1, .offset = 0 }));
+
+    session.deinit();
+    var reopened = try fixture.profile.open_existing(
+        "terminal-store-owner",
+        "terminal-host-gap",
+    );
+    defer reopened.deinit();
+    try std.testing.expectEqual(gap, reopened.record.raw_gap.?);
+    var reopened_after = try reopened.read(alloc, gap.missing_from, 64);
+    defer reopened_after.deinit(alloc);
+    try std.testing.expectEqualStrings("right", reopened_after.output);
+
+    const second_gap = try reopened.begin_raw_gap(5);
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = 0 },
+        second_gap.missing_from,
+    );
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 3, .offset = 0 },
+        second_gap.available_from,
+    );
+    try reopened.append("third", 6);
+    var collapsed = try reopened.read(alloc, .{ .segment = 1, .offset = 0 }, 64);
+    defer collapsed.deinit(alloc);
+    try std.testing.expectEqualStrings("third", collapsed.output);
+    try std.testing.expectEqual(second_gap, collapsed.gap.?);
+}
+
+test "reopened gap resumes the existing journal segment" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-reopened-gap");
+    try session.append("left", 2);
+    const gap = try session.begin_raw_gap(3);
+    session.deinit();
+
+    var reopened = try fixture.profile.open_existing(
+        "terminal-store-owner",
+        "terminal-reopened-gap",
+    );
+    defer reopened.deinit();
+    try reopened.append("right", 4);
+
+    try std.testing.expectEqual(gap, reopened.record.raw_gap.?);
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 2, .offset = 5 },
+        reopened.record.output_cursor,
+    );
+    var page = try reopened.read(alloc, gap.available_from, 64);
+    defer page.deinit(alloc);
+    try std.testing.expectEqualStrings("right", page.output);
+}
+
+test "available checkpoint record payload bytes match envelope" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-checkpoint-record-length");
+    defer session.deinit();
+    const payload = "opaque-screen";
+    const envelope = contracts.CheckpointEnvelope{
+        .engine_schema_revision = 1,
+        .applied_cursor = session.record.output_cursor,
+        .payload_len = payload.len,
+        .checksum = contracts.checkpoint_checksum(payload),
+    };
+    try session.store_checkpoint(envelope, payload, 2);
+    try session.record.validate();
+
+    var malformed = session.record;
+    malformed.checkpoint_payload_bytes = @as(u64, envelope.payload_len) - 1;
+    try std.testing.expectError(
+        error.InvalidTerminalRecord,
+        malformed.validate(),
+    );
+    malformed.checkpoint_payload_bytes = @as(u64, envelope.payload_len) + 1;
+    try std.testing.expectError(
+        error.InvalidTerminalRecord,
+        malformed.validate(),
+    );
+}
+
+test "fresh reopen isolates checkpoint payload byte mismatch before accounting" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-checkpoint-record-corrupt");
+    const payload = "opaque-screen";
+    const envelope = contracts.CheckpointEnvelope{
+        .engine_schema_revision = 1,
+        .applied_cursor = session.record.output_cursor,
+        .payload_len = payload.len,
+        .checksum = contracts.checkpoint_checksum(payload),
+    };
+    try session.store_checkpoint(envelope, payload, 2);
+
+    var malformed = session.record;
+    malformed.checkpoint_payload_bytes = @as(u64, envelope.payload_len) + 1;
+    const bytes = try render_json(alloc, record_wire(malformed));
+    defer alloc.free(bytes);
+    const name = try record_name(alloc, malformed.session_id);
+    defer alloc.free(name);
+    var entry = try (try session.state_capability()).atomicReplace(
+        alloc,
+        .terminal_state,
+        name,
+        bytes,
+    );
+    entry.deinit(alloc);
+    session.deinit();
+    try fixture.reopen();
+
+    var candidates = try fixture.profile.scan_payload_candidates();
+    defer candidates.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, payload.len), candidates.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), candidates.items.items.len);
+
+    var recovered = try fixture.profile.recover("host-two", 3);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 0), recovered.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "InvalidTerminalRecord",
+        recovered.diagnostics.items[0].reason,
+    );
+}
+
+test "authority proof is principal bound generation checked and revocable" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-authority");
+    defer session.deinit();
+    const persistence = test_persistence();
+    const claim = test_claim(persistence);
+    try session.verify_claim(claim, .read);
+
+    var foreign = claim;
+    foreign.principal.profile_user = "foreign-profile";
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        session.verify_claim(foreign, .read),
+    );
+    foreign = claim;
+    foreign.principal.durable_session_id = "foreign-session";
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        session.verify_claim(foreign, .read),
+    );
+    foreign = claim;
+    foreign.principal.workspace_root = "/foreign";
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        session.verify_claim(foreign, .read),
+    );
+    foreign = claim;
+    foreign.principal.cwd = "/foreign";
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        session.verify_claim(foreign, .read),
+    );
+    foreign = claim;
+    foreign.principal.transport_role = .headless;
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        session.verify_claim(foreign, .read),
+    );
+    foreign = claim;
+    foreign.principal.transport_role = .acp;
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        session.verify_claim(foreign, .read),
+    );
+    foreign = claim;
+    foreign.principal.backend = .tmux;
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        session.verify_claim(foreign, .read),
+    );
+    foreign = claim;
+    foreign.actor = .human;
+    try std.testing.expectError(
+        error.ActorRoleMismatch,
+        session.verify_claim(foreign, .read),
+    );
+    foreign = claim;
+    foreign.generation = .{ .value = 2 };
+    try std.testing.expectError(
+        error.StaleAuthorityGeneration,
+        session.verify_claim(foreign, .read),
+    );
+    foreign = claim;
+    foreign.proof.bytes[0] ^= 1;
+    try std.testing.expectError(
+        error.InvalidHolderProof,
+        session.verify_claim(foreign, .read),
+    );
+    try session.revoke(5);
+    try std.testing.expectError(
+        error.AuthorityRevoked,
+        session.verify_claim(claim, .read),
+    );
+}
+
+test "holder proof verifier binds the verified observer policy" {
+    var persistence = test_persistence();
+    persistence.grant.actor = .human;
+    const without_observer = proof_verifier(
+        persistence.proof,
+        persistence.grant,
+        false,
+    );
+    const with_observer = proof_verifier(
+        persistence.proof,
+        persistence.grant,
+        true,
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &without_observer,
+        &with_observer,
+    ));
+}
+
+test "holder proof verifier ignores packed control padding" {
+    const canonical = contracts.AllowedControls.full();
+    var padded = canonical;
+    std.mem.asBytes(&padded)[1] |= 0xfc;
+
+    var canonical_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash_allowed_controls(&canonical_hash, canonical);
+    var canonical_digest: contracts.CheckpointChecksum = undefined;
+    canonical_hash.final(&canonical_digest);
+
+    var padded_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash_allowed_controls(&padded_hash, padded);
+    var padded_digest: contracts.CheckpointChecksum = undefined;
+    padded_hash.final(&padded_digest);
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &canonical_digest,
+        &padded_digest,
+    );
+}
+
+test "authority reload covers allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkAuthorityReloadAllocationFailures,
+        .{},
+    );
+}
+
+test "recovery execution scope reloads the exact durable authority" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var persistence = test_persistence();
+    persistence.grant.principal.workspace_root = "/saved-workspace";
+    var session = try fixture.create_with_persistence(
+        "terminal-recovery-scope",
+        .{ .rows = 24, .columns = 80 },
+        persistence,
+    );
+    defer session.deinit();
+
+    var scope = try session.load_recovery_execution_scope(alloc);
+    defer scope.deinit(alloc);
+    try std.testing.expectEqualStrings("/saved-workspace", scope.workspace_root);
+    try std.testing.expect(!std.mem.eql(u8, scope.workspace_root, session.record.cwd));
+    try std.testing.expect(!@hasField(RecoveredExecutionScope, "proof"));
+}
+
+test "recovery execution scope authenticates workspace" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    const cases = [_][]const u8{"terminal-recovery-workspace-tamper"};
+
+    for (cases) |session_id| {
+        var session = try fixture.create(session_id);
+        defer session.deinit();
+        const parsed = try load_authority(
+            alloc,
+            try session.state_capability(),
+            session_id,
+        );
+        defer parsed.deinit();
+        var authority = parsed.value;
+        authority.grant.principal.workspace_root = "/tampered-workspace";
+        try replace_test_authority(alloc, &session, authority);
+        try std.testing.expectError(
+            error.InvalidHolderProof,
+            session.load_recovery_execution_scope(alloc),
+        );
+    }
+}
+
+test "recovery execution scope rejects revocation before reading invalidated proof" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-recovery-scope-revoked");
+    defer session.deinit();
+
+    try session.revoke(2);
+    try std.testing.expectError(
+        error.AuthorityRevoked,
+        session.load_recovery_execution_scope(alloc),
+    );
+}
+
+test "recovery execution scope rejects record authority inconsistency" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-recovery-scope-inconsistent");
+    defer session.deinit();
+
+    const inconsistent_cwd = try alloc.dupe(u8, "/other-cwd");
+    alloc.free(session.record.cwd);
+    session.record.cwd = inconsistent_cwd;
+    try save_record(
+        alloc,
+        try session.state_capability(),
+        session.record,
+    );
+    try std.testing.expectError(
+        error.InvalidAuthorityRecord,
+        session.load_recovery_execution_scope(alloc),
+    );
+}
+
+test "recovery execution scope covers allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkRecoveryExecutionScopeAllocationFailures,
+        .{},
+    );
+}
+
+test "tmux recovery propagates execution scope allocation failure without durable loss" {
+    const alloc = std.testing.allocator;
+    var failing = OneShotFailingAllocator.init(alloc);
+    var fixture = try TestStoreFixture.init(failing.allocator(), test_options());
+    defer fixture.deinit();
+    var session = try fixture.create_tmux("terminal-recovery-scope-oom");
+    const authority_generation = session.record.authority_generation;
+    session.deinit();
+    try fixture.reopen();
+
+    const baseline_start = failing.failing.alloc_index;
+    var baseline = try fixture.profile.recover("host-two", 2);
+    baseline.deinit();
+    const recovery_allocations = failing.failing.alloc_index - baseline_start;
+    try std.testing.expect(recovery_allocations >= 2);
+    // The saved workspace copy is immediately followed by the recovered-list append.
+    failing.failing.fail_index = failing.failing.alloc_index +
+        recovery_allocations - 2;
+
+    if (fixture.profile.recover("host-two", 2)) |unexpected_value| {
+        var unexpected = unexpected_value;
+        defer unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+    }
+    try std.testing.expect(failing.failing.has_induced_failure);
+
+    {
+        var durable = try fixture.profile.open_existing(
+            "terminal-store-owner",
+            "terminal-recovery-scope-oom",
+        );
+        defer durable.deinit();
+        try std.testing.expectEqual(
+            contracts.Lifecycle.starting,
+            durable.record.lifecycle,
+        );
+        try std.testing.expectEqual(
+            authority_generation,
+            durable.record.authority_generation,
+        );
+    }
+
+    var recovered = try fixture.profile.recover("host-two", 2);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 0), recovered.diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.sessions.items.len);
+    try std.testing.expectEqual(
+        contracts.Lifecycle.starting,
+        recovered.sessions.items[0].record.lifecycle,
+    );
+    try std.testing.expectEqual(
+        authority_generation,
+        recovered.sessions.items[0].record.authority_generation,
+    );
+}
+
+test "tmux recovery propagates proof capability failure without durable loss" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create_tmux("terminal-recovery-proof-capability");
+    const authority_generation = session.record.authority_generation;
+    session.deinit();
+    try fixture.reopen();
+
+    const name = try proof_name(alloc, "terminal-recovery-proof-capability");
+    defer alloc.free(name);
+    const path = try std.fs.path.join(alloc, &.{
+        fixture.home,
+        ".fx",
+        "sessions",
+        "terminal-store-owner",
+        "terminal",
+        "proofs",
+        name,
+    });
+    defer alloc.free(path);
+    var proof_file = try std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        path,
+        .{ .mode = .read_write },
+    );
+    try proof_file.setPermissions(
+        std.testing.io,
+        std.Io.File.Permissions.fromMode(0o640),
+    );
+    proof_file.close(std.testing.io);
+
+    if (fixture.profile.recover("host-two", 2)) |unexpected_value| {
+        var unexpected = unexpected_value;
+        defer unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(
+            error.PrivateStatePermissionsUnsupported,
+            err,
+        );
+    }
+
+    proof_file = try std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        path,
+        .{ .mode = .read_write },
+    );
+    defer proof_file.close(std.testing.io);
+    try proof_file.setPermissions(
+        std.testing.io,
+        std.Io.File.Permissions.fromMode(0o600),
+    );
+
+    {
+        var durable = try fixture.profile.open_existing(
+            "terminal-store-owner",
+            "terminal-recovery-proof-capability",
+        );
+        defer durable.deinit();
+        try std.testing.expectEqual(
+            contracts.Lifecycle.starting,
+            durable.record.lifecycle,
+        );
+        try std.testing.expectEqual(
+            authority_generation,
+            durable.record.authority_generation,
+        );
+    }
+
+    var recovered = try fixture.profile.recover("host-two", 2);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 0), recovered.diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 1), recovered.sessions.items.len);
+    try std.testing.expectEqual(
+        contracts.Lifecycle.starting,
+        recovered.sessions.items[0].record.lifecycle,
+    );
+    try std.testing.expectEqual(
+        authority_generation,
+        recovered.sessions.items[0].record.authority_generation,
+    );
+}
+
+test "tmux recovery isolates invalid authority from a valid sibling" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var valid = try fixture.create_tmux("terminal-recovery-valid-sibling");
+    var invalid = try fixture.create_tmux("terminal-recovery-invalid-sibling");
+    const parsed = try load_authority(
+        alloc,
+        try invalid.state_capability(),
+        invalid.record.session_id,
+    );
+    defer parsed.deinit();
+    var authority = parsed.value;
+    authority.grant.principal.workspace_root = "/tampered-workspace";
+    try replace_test_authority(alloc, &invalid, authority);
+    valid.deinit();
+    invalid.deinit();
+    try fixture.reopen();
+
+    var recovered = try fixture.profile.recover("host-two", 2);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), recovered.sessions.items.len);
+    const valid_index = recovered_session_index(
+        recovered.sessions.items,
+        "terminal-recovery-valid-sibling",
+    ).?;
+    const invalid_index = recovered_session_index(
+        recovered.sessions.items,
+        "terminal-recovery-invalid-sibling",
+    ).?;
+    try std.testing.expectEqual(
+        contracts.Lifecycle.starting,
+        recovered.sessions.items[valid_index].record.lifecycle,
+    );
+    try std.testing.expectEqual(
+        contracts.Lifecycle.lost,
+        recovered.sessions.items[invalid_index].record.lifecycle,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recovered.diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "terminal-recovery-invalid-sibling",
+        recovered.diagnostics.items[0].terminal_session_id,
+    );
+    try std.testing.expectEqualStrings(
+        "InvalidHolderProof",
+        recovered.diagnostics.items[0].reason,
+    );
+}
+
+test "close recovery isolates a malformed transaction from a live tmux sibling" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var persistence = test_persistence();
+    persistence.grant.principal.backend = .tmux;
+    var valid = try fixture.create_tmux("terminal-close-valid-tmux-sibling");
+    var invalid = try fixture.create_tmux("terminal-close-invalid-transaction");
+    try expect_close_candidate(invalid.begin_close(test_claim(persistence), 2));
+    try replace_test_close_transaction(alloc, &invalid, "{");
+    valid.deinit();
+    invalid.deinit();
+    try fixture.reopen();
+
+    var recovered = try fixture.profile.recover("host-two", 3);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), recovered.sessions.items.len);
+    const valid_index = recovered_session_index(
+        recovered.sessions.items,
+        "terminal-close-valid-tmux-sibling",
+    ).?;
+    const invalid_index = recovered_session_index(
+        recovered.sessions.items,
+        "terminal-close-invalid-transaction",
+    ).?;
+    const valid_sibling = &recovered.sessions.items[valid_index];
+    const isolated = &recovered.sessions.items[invalid_index];
+    try std.testing.expectEqual(
+        contracts.Lifecycle.starting,
+        valid_sibling.record.lifecycle,
+    );
+    try std.testing.expect(!valid_sibling.record.authority_revoked);
+    try std.testing.expectEqual(contracts.Lifecycle.closed, isolated.record.lifecycle);
+    try std.testing.expect(isolated.record.authority_revoked);
+    try std.testing.expect(try isolated.close_cleanup_pending());
+    try std.testing.expectEqual(@as(usize, 1), recovered.diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "terminal-close-invalid-transaction",
+        recovered.diagnostics.items[0].terminal_session_id,
+    );
+    try std.testing.expectEqualStrings(
+        "InvalidCloseTransaction",
+        recovered.diagnostics.items[0].reason,
+    );
+}
+
+test "close recovery isolates an oversized transaction from a live tmux sibling" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var persistence = test_persistence();
+    persistence.grant.principal.backend = .tmux;
+    var valid = try fixture.create_tmux("terminal-close-valid-oversized-sibling");
+    var invalid = try fixture.create_tmux("terminal-close-oversized-transaction");
+    try expect_close_candidate(invalid.begin_close(test_claim(persistence), 2));
+    const oversized = try alloc.alloc(u8, max_event_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    try replace_test_close_transaction(alloc, &invalid, oversized);
+    valid.deinit();
+    invalid.deinit();
+    try fixture.reopen();
+
+    var recovered = try fixture.profile.recover("host-two", 3);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), recovered.sessions.items.len);
+    const valid_index = recovered_session_index(
+        recovered.sessions.items,
+        "terminal-close-valid-oversized-sibling",
+    ).?;
+    const invalid_index = recovered_session_index(
+        recovered.sessions.items,
+        "terminal-close-oversized-transaction",
+    ).?;
+    const valid_sibling = &recovered.sessions.items[valid_index];
+    const isolated = &recovered.sessions.items[invalid_index];
+    try std.testing.expectEqual(
+        contracts.Lifecycle.starting,
+        valid_sibling.record.lifecycle,
+    );
+    try std.testing.expect(!valid_sibling.record.authority_revoked);
+    try std.testing.expectEqual(contracts.Lifecycle.closed, isolated.record.lifecycle);
+    try std.testing.expect(isolated.record.authority_revoked);
+    try std.testing.expect(try isolated.close_cleanup_pending());
+    try std.testing.expectEqual(@as(usize, 1), recovered.diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "terminal-close-oversized-transaction",
+        recovered.diagnostics.items[0].terminal_session_id,
+    );
+    try std.testing.expectEqualStrings(
+        "InvalidCloseTransaction",
+        recovered.diagnostics.items[0].reason,
+    );
+}
+
+test "close recovery propagates allocation failure without durable mutation" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var persistence = test_persistence();
+    persistence.grant.principal.backend = .tmux;
+    var session = try fixture.create_tmux("terminal-close-recovery-oom");
+    var sibling = try fixture.create_tmux("terminal-close-recovery-oom-sibling");
+    try expect_close_candidate(session.begin_close(test_claim(persistence), 2));
+    try expect_close_candidate(sibling.begin_close(test_claim(persistence), 2));
+    const generation = session.record.authority_generation;
+    const sibling_generation = sibling.record.authority_generation;
+    const backend_identity = try alloc.dupe(u8, session.record.backend_identity);
+    defer alloc.free(backend_identity);
+    const sibling_backend_identity = try alloc.dupe(
+        u8,
+        sibling.record.backend_identity,
+    );
+    defer alloc.free(sibling_backend_identity);
+    session.deinit();
+    sibling.deinit();
+    try fixture.reopen();
+
+    fixture.profile.options.fail_at = .before_close_recovery_oom;
+    if (fixture.profile.recover("host-two", 3)) |unexpected_value| {
+        var unexpected = unexpected_value;
+        defer unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+    }
+    fixture.profile.options.fail_at = null;
+
+    try expect_pending_close_unchanged(
+        alloc,
+        &fixture.profile,
+        "terminal-close-recovery-oom",
+        generation,
+        backend_identity,
+    );
+    try expect_pending_close_unchanged(
+        alloc,
+        &fixture.profile,
+        "terminal-close-recovery-oom-sibling",
+        sibling_generation,
+        sibling_backend_identity,
+    );
+}
+
+test "close recovery propagates capability failure without durable mutation" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var persistence = test_persistence();
+    persistence.grant.principal.backend = .tmux;
+    var session = try fixture.create_tmux("terminal-close-recovery-capability");
+    var sibling = try fixture.create_tmux(
+        "terminal-close-recovery-capability-sibling",
+    );
+    try expect_close_candidate(session.begin_close(test_claim(persistence), 2));
+    try expect_close_candidate(sibling.begin_close(test_claim(persistence), 2));
+    const generation = session.record.authority_generation;
+    const sibling_generation = sibling.record.authority_generation;
+    const backend_identity = try alloc.dupe(u8, session.record.backend_identity);
+    defer alloc.free(backend_identity);
+    const sibling_backend_identity = try alloc.dupe(
+        u8,
+        sibling.record.backend_identity,
+    );
+    defer alloc.free(sibling_backend_identity);
+    session.deinit();
+    sibling.deinit();
+    try fixture.reopen();
+
+    fixture.profile.options.fail_at = .before_close_recovery_capability;
+    if (fixture.profile.recover("host-two", 3)) |unexpected_value| {
+        var unexpected = unexpected_value;
+        defer unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(
+            error.PrivateStatePermissionsUnsupported,
+            err,
+        );
+    }
+    fixture.profile.options.fail_at = null;
+
+    try expect_pending_close_unchanged(
+        alloc,
+        &fixture.profile,
+        "terminal-close-recovery-capability",
+        generation,
+        backend_identity,
+    );
+    try expect_pending_close_unchanged(
+        alloc,
+        &fixture.profile,
+        "terminal-close-recovery-capability-sibling",
+        sibling_generation,
+        sibling_backend_identity,
+    );
+}
+
+test "authority reload requires owner capability and exact durable scope" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-authority-reload");
+    defer session.deinit();
+    const persistence = test_persistence();
+    var owner = try fixture.owner_capability(
+        "terminal-store-owner",
+        .read_only,
+    );
+    defer owner.deinit();
+    const input = AuthorityReload{
+        .terminal_session_id = "terminal-authority-reload",
+        .principal = persistence.grant.principal,
+        .actor = persistence.grant.actor,
+        .generation = persistence.grant.generation,
+    };
+    var loaded = try reloadAuthorityClaim(alloc, &owner, input);
+    defer loaded.deinit();
+    try std.testing.expect(persistence.grant.principal.eql(loaded.view().principal));
+    try std.testing.expectEqual(persistence.grant.controls, loaded.controls);
+    try session.verify_claim(loaded.view(), .write);
+
+    var foreign = input;
+    foreign.principal.profile_user = "foreign-profile";
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        reloadAuthorityClaim(alloc, &owner, foreign),
+    );
+    foreign = input;
+    foreign.principal.durable_session_id = "foreign-session";
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        reloadAuthorityClaim(alloc, &owner, foreign),
+    );
+    foreign = input;
+    foreign.principal.workspace_root = "/foreign";
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        reloadAuthorityClaim(alloc, &owner, foreign),
+    );
+    foreign = input;
+    foreign.principal.cwd = "/foreign";
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        reloadAuthorityClaim(alloc, &owner, foreign),
+    );
+    foreign = input;
+    foreign.principal.transport_role = .acp;
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        reloadAuthorityClaim(alloc, &owner, foreign),
+    );
+    foreign = input;
+    foreign.principal.backend = .tmux;
+    try std.testing.expectError(
+        error.PrincipalMismatch,
+        reloadAuthorityClaim(alloc, &owner, foreign),
+    );
+    foreign = input;
+    foreign.actor = .human;
+    try std.testing.expectError(
+        error.ActorRoleMismatch,
+        reloadAuthorityClaim(alloc, &owner, foreign),
+    );
+    foreign = input;
+    foreign.generation = .{ .value = 2 };
+    try std.testing.expectError(
+        error.StaleAuthorityGeneration,
+        reloadAuthorityClaim(alloc, &owner, foreign),
+    );
+
+    try fixture.create_owner("terminal-foreign-owner");
+    var foreign_owner = try fixture.owner_capability(
+        "terminal-foreign-owner",
+        .read_only,
+    );
+    defer foreign_owner.deinit();
+    try std.testing.expectError(
+        error.TerminalRecordNotFound,
+        reloadAuthorityClaim(alloc, &foreign_owner, input),
+    );
+}
+
+test "authority reload grants direct human model observer controls only" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var persistence = test_persistence();
+    persistence.grant.actor = .human;
+    persistence.direct_human_model_read_only = true;
+    var session = try fixture.create_with_persistence(
+        "terminal-human-reload",
+        .{ .rows = 24, .columns = 80 },
+        persistence,
+    );
+    defer session.deinit();
+    var owner = try fixture.owner_capability(
+        "terminal-store-owner",
+        .read_only,
+    );
+    defer owner.deinit();
+    const base = AuthorityReload{
+        .terminal_session_id = "terminal-human-reload",
+        .principal = persistence.grant.principal,
+        .actor = .human,
+        .generation = persistence.grant.generation,
+    };
+    var human = try reloadAuthorityClaim(alloc, &owner, base);
+    defer human.deinit();
+    try std.testing.expectEqual(contracts.AllowedControls.full(), human.controls);
+
+    var model_input = base;
+    model_input.actor = .agent;
+    var model = try reloadAuthorityClaim(alloc, &owner, model_input);
+    defer model.deinit();
+    try std.testing.expectEqual(contracts.AllowedControls.observer(), model.controls);
+    try session.verify_claim(model.view(), .read);
+    try std.testing.expectError(
+        error.ControlDenied,
+        session.verify_claim(model.view(), .write),
+    );
+}
+
+test "record observer policy tampering rejects reload and live authorization" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    const cases = [_]struct {
+        session_id: []const u8,
+        observer_policy: bool,
+    }{
+        .{
+            .session_id = "terminal-policy-enable-tamper",
+            .observer_policy = false,
+        },
+        .{
+            .session_id = "terminal-policy-disable-tamper",
+            .observer_policy = true,
+        },
+    };
+
+    for (cases) |case| {
+        var persistence = test_persistence();
+        persistence.grant.actor = .human;
+        persistence.direct_human_model_read_only = case.observer_policy;
+        var session = try fixture.create_with_persistence(
+            case.session_id,
+            .{ .rows = 24, .columns = 80 },
+            persistence,
+        );
+        defer session.deinit();
+        var model = test_claim(persistence);
+        model.actor = .agent;
+        if (case.observer_policy) {
+            try session.verify_claim(model, .read);
+        } else {
+            try std.testing.expectError(
+                error.ActorRoleMismatch,
+                session.verify_claim(model, .read),
+            );
+        }
+
+        session.record.direct_human_model_read_only = !case.observer_policy;
+        try std.testing.expectError(
+            error.InvalidAuthorityRecord,
+            session.verify_claim(model, .read),
+        );
+        try save_record(
+            alloc,
+            try session.state_capability(),
+            session.record,
+        );
+        var owner = try fixture.owner_capability(
+            "terminal-store-owner",
+            .read_only,
+        );
+        defer owner.deinit();
+        try std.testing.expectError(
+            error.InvalidAuthorityRecord,
+            reloadAuthorityClaim(alloc, &owner, .{
+                .terminal_session_id = case.session_id,
+                .principal = persistence.grant.principal,
+                .actor = .agent,
+                .generation = persistence.grant.generation,
+            }),
+        );
+    }
+}
+
+test "authority reload rejects malformed state proof lifetime and revocation" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var malformed_session = try fixture.create("terminal-malformed-proof");
+    defer malformed_session.deinit();
+    const persistence = test_persistence();
+    const input = AuthorityReload{
+        .terminal_session_id = "terminal-malformed-proof",
+        .principal = persistence.grant.principal,
+        .actor = persistence.grant.actor,
+        .generation = persistence.grant.generation,
+    };
+    var writable_owner = try fixture.owner_capability(
+        "terminal-store-owner",
+        .writable,
+    );
+    defer writable_owner.deinit();
+    const proof_file = try proof_name(alloc, input.terminal_session_id);
+    defer alloc.free(proof_file);
+    var malformed = try writable_owner.atomicReplace(
+        alloc,
+        .terminal_proofs,
+        proof_file,
+        "bad",
+    );
+    malformed.deinit(alloc);
+    try std.testing.expectError(
+        error.InvalidHolderProof,
+        reloadAuthorityClaim(alloc, &writable_owner, input),
+    );
+
+    var malformed_record = try fixture.create("terminal-malformed-record");
+    defer malformed_record.deinit();
+    const record_file = try record_name(alloc, "terminal-malformed-record");
+    defer alloc.free(record_file);
+    var bad_record = try writable_owner.atomicReplace(
+        alloc,
+        .terminal_state,
+        record_file,
+        "bad",
+    );
+    bad_record.deinit(alloc);
+    var malformed_record_input = input;
+    malformed_record_input.terminal_session_id = "terminal-malformed-record";
+    try std.testing.expectError(
+        error.InvalidTerminalRecord,
+        reloadAuthorityClaim(alloc, &writable_owner, malformed_record_input),
+    );
+
+    var malformed_lifetime = try fixture.create("terminal-malformed-lifetime");
+    defer malformed_lifetime.deinit();
+    const authority_bytes = try render_json(alloc, AuthorityWire{
+        .session_id = "terminal-malformed-lifetime",
+        .grant = persistence.grant,
+        .direct_human_model_read_only = false,
+        .verifier = proof_verifier(
+            persistence.proof,
+            persistence.grant,
+            false,
+        ),
+        .revoked = false,
+    });
+    defer alloc.free(authority_bytes);
+    const invalid_lifetime = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        authority_bytes,
+        "\"lifetime\":\"session\"",
+        "\"lifetime\":\"foreign\"",
+    );
+    defer alloc.free(invalid_lifetime);
+    const authority_file = try authority_name(
+        alloc,
+        "terminal-malformed-lifetime",
+    );
+    defer alloc.free(authority_file);
+    var bad_authority = try writable_owner.atomicReplace(
+        alloc,
+        .terminal_state,
+        authority_file,
+        invalid_lifetime,
+    );
+    bad_authority.deinit(alloc);
+    var malformed_lifetime_input = input;
+    malformed_lifetime_input.terminal_session_id = "terminal-malformed-lifetime";
+    try std.testing.expectError(
+        error.InvalidAuthorityRecord,
+        reloadAuthorityClaim(alloc, &writable_owner, malformed_lifetime_input),
+    );
+
+    var retired = try fixture.create("terminal-retired-authority");
+    defer retired.deinit();
+    const retired_authority = try render_json(alloc, AuthorityWire{
+        .session_id = "terminal-retired-authority",
+        .grant = persistence.grant,
+        .direct_human_model_read_only = false,
+        .verifier = proof_verifier(
+            persistence.proof,
+            persistence.grant,
+            false,
+        ),
+        .revoked = false,
+    });
+    defer alloc.free(retired_authority);
+    const legacy_authority = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        retired_authority,
+        "\"schema_version\":2",
+        "\"schema_version\":1",
+    );
+    defer alloc.free(legacy_authority);
+    const retired_authority_file = try authority_name(
+        alloc,
+        "terminal-retired-authority",
+    );
+    defer alloc.free(retired_authority_file);
+    var retired_authority_write = try writable_owner.atomicReplace(
+        alloc,
+        .terminal_state,
+        retired_authority_file,
+        legacy_authority,
+    );
+    retired_authority_write.deinit(alloc);
+    var retired_input = input;
+    retired_input.terminal_session_id = "terminal-retired-authority";
+    try std.testing.expectError(
+        error.TerminalAuthorityRetired,
+        reloadAuthorityClaim(alloc, &writable_owner, retired_input),
+    );
+
+    var revoked = try fixture.create("terminal-revoked-reload");
+    defer revoked.deinit();
+    try revoked.revoke(5);
+    var revoked_input = input;
+    revoked_input.terminal_session_id = "terminal-revoked-reload";
+    try std.testing.expectError(
+        error.AuthorityRevoked,
+        reloadAuthorityClaim(alloc, &writable_owner, revoked_input),
+    );
+}
+
+test "write leases are exclusive durable and cancellation is actor scoped" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-lease");
+    const agent = test_claim(test_persistence());
+    _ = try session.acquire_write_lease(agent, 2);
+    try std.testing.expectEqual(contracts.WriteLease.agent, session.facts().attention.write_lease);
+    session.deinit();
+    var reopened = try fixture.profile.open_existing(
+        "terminal-store-owner",
+        "terminal-lease",
+    );
+    defer reopened.deinit();
+    try std.testing.expectEqual(
+        contracts.WriteLease.agent,
+        reopened.facts().attention.write_lease,
+    );
+
+    var human = agent;
+    human.actor = .human;
+    try std.testing.expectError(
+        error.ActorRoleMismatch,
+        reopened.acquire_write_lease(human, 3),
+    );
+    try std.testing.expectError(
+        error.ActorRoleMismatch,
+        reopened.cancel_claim(human, 4),
+    );
+    try std.testing.expectEqual(contracts.WriteLease.agent, reopened.facts().attention.write_lease);
+    try reopened.cancel_claim(agent, 5);
+    try std.testing.expectEqual(contracts.WriteLease.none, reopened.facts().attention.write_lease);
+}
+
+test "terminal completion clears attention and retains the termination outcome" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-completed-lease");
+    defer session.deinit();
+    const agent = test_claim(test_persistence());
+
+    _ = try session.acquire_write_lease(agent, 2);
+    try std.testing.expectEqual(
+        contracts.WriteLease.agent,
+        session.facts().attention.write_lease,
+    );
+    try session.persist_termination(.{ .exited = 0 }, 3);
+    try std.testing.expectEqual(contracts.AttentionState{}, session.facts().attention);
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .exited = 0 },
+        session.termination_outcome().?,
+    );
+
+    _ = try session.release_write_lease(agent, 4);
+    _ = try session.release_write_lease(agent, 5);
+    try std.testing.expectEqual(contracts.AttentionState{}, session.facts().attention);
+}
+
+test "cancellation persistence failure preserves the lease for a clean retry" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-cancellation-failure");
+    defer session.deinit();
+    const claim = test_claim(test_persistence());
+    _ = try session.acquire_write_lease(claim, 2);
+
+    fixture.profile.options.fail_at = .cancellation;
+    try std.testing.expectError(
+        error.InjectedCancellationPersistenceFailure,
+        session.cancel_claim(claim, 3),
+    );
+    try std.testing.expectEqual(
+        contracts.WriteLease.agent,
+        session.facts().attention.write_lease,
+    );
+
+    fixture.profile.options.fail_at = null;
+    try session.cancel_claim(claim, 4);
+    try std.testing.expectEqual(
+        contracts.WriteLease.none,
+        session.facts().attention.write_lease,
+    );
+}
+
+test "human owner takeover proof is narrow and excludes agent writes" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-human-takeover");
+    defer session.deinit();
+    var owner = try fixture.owner_capability(
+        "terminal-store-owner",
+        .writable,
+    );
+    defer owner.deinit();
+    var takeover = try reloadHumanTakeoverAuthorityClaim(alloc, &owner, .{
+        .terminal_session_id = "terminal-human-takeover",
+        .profile_user = "profile-user",
+        .durable_session_id = "terminal-store-owner",
+        .workspace_root = "/workspace",
+        .transport_role = .interactive,
+        .actor = .human,
+    });
+    defer takeover.deinit();
+    takeover.value.process_owner = try test_process_owner(
+        alloc,
+        fixture.profile.process_provider,
+    );
+
+    try session.verify_claim(takeover.view(), .screen);
+    try session.verify_claim(takeover.view(), .resize);
+    try std.testing.expectError(
+        error.ControlDenied,
+        session.verify_claim(takeover.view(), .read),
+    );
+    try std.testing.expectError(
+        error.ControlDenied,
+        session.verify_claim(takeover.view(), .close),
+    );
+    try std.testing.expectError(
+        error.ControlDenied,
+        session.verify_claim(takeover.view(), .signal),
+    );
+    _ = try session.acquire_write_lease(takeover.view(), 2);
+    try std.testing.expectEqual(
+        contracts.AttentionState{
+            .attention = .user_takeover,
+            .write_lease = .human,
+        },
+        session.facts().attention,
+    );
+    const agent_claim = test_claim(test_persistence());
+    try session.verify_claim(agent_claim, .read);
+    try session.verify_claim(agent_claim, .screen);
+    try session.verify_claim(agent_claim, .signal);
+    try std.testing.expectError(
+        error.LeaseConflict,
+        session.acquire_write_lease(agent_claim, 3),
+    );
+    _ = try session.release_write_lease(takeover.view(), 4);
+    try std.testing.expectEqual(
+        contracts.WriteLease.none,
+        session.facts().attention.write_lease,
+    );
+
+    var forged = takeover.view();
+    forged.proof.bytes[0] ^= 0xff;
+    try std.testing.expectError(
+        error.InvalidHolderProof,
+        session.acquire_write_lease(forged, 5),
+    );
+}
+
+test "human takeover lease is reclaimable only after its fx process owner is gone" {
+    const Match = struct {
+        var result: process_identity.TokenMatch = .matched;
+
+        fn process(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: process_identity.ProcessInstanceToken,
+        ) process_identity.TokenMatch {
+            return result;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-takeover-reclaim");
+    defer session.deinit();
+    var owner = try fixture.owner_capability(
+        "terminal-store-owner",
+        .writable,
+    );
+    defer owner.deinit();
+    var takeover = try reloadHumanTakeoverAuthorityClaim(alloc, &owner, .{
+        .terminal_session_id = "terminal-takeover-reclaim",
+        .profile_user = "profile-user",
+        .durable_session_id = "terminal-store-owner",
+        .workspace_root = "/workspace",
+        .transport_role = .interactive,
+        .actor = .human,
+    });
+    defer takeover.deinit();
+    takeover.value.process_owner = try test_process_owner(
+        alloc,
+        fixture.profile.process_provider,
+    );
+
+    _ = try session.acquire_write_lease(takeover.view(), 2);
+    try std.testing.expect(session.record.takeover_owner_pid != null);
+    try std.testing.expect(session.record.takeover_owner_process_token != null);
+    try std.testing.expectEqual(
+        contracts.AttentionState{
+            .attention = .user_takeover,
+            .write_lease = .human,
+        },
+        session.facts().attention,
+    );
+
+    try session.persist_attention_state_locked(
+        session.record.attention,
+        "424242",
+        session.record.takeover_owner_process_token,
+        3,
+    );
+    var match_provider = fixture.profile.process_provider;
+    match_provider.match_token_fn = Match.process;
+    fixture.profile.process_provider = match_provider;
+
+    Match.result = .matched;
+    try std.testing.expectEqual(
+        contracts.AttentionState{
+            .attention = .user_takeover,
+            .write_lease = .human,
+        },
+        session.facts().attention,
+    );
+    try std.testing.expectError(
+        error.LeaseConflict,
+        session.acquire_write_lease(takeover.view(), 4),
+    );
+
+    Match.result = .unavailable;
+    _ = try session.authorize(test_claim(test_persistence()), .read);
+    try std.testing.expectEqual(
+        contracts.AttentionState{
+            .attention = .user_takeover,
+            .write_lease = .human,
+        },
+        session.facts().attention,
+    );
+    try std.testing.expectError(
+        error.LeaseConflict,
+        session.acquire_write_lease(test_claim(test_persistence()), 5),
+    );
+
+    Match.result = .mismatched;
+    _ = try session.authorize(test_claim(test_persistence()), .read);
+    try std.testing.expectEqual(
+        contracts.AttentionState{},
+        session.facts().attention,
+    );
+    try std.testing.expect(session.record.takeover_owner_pid == null);
+    try std.testing.expect(session.record.takeover_owner_process_token == null);
+
+    Match.result = .matched;
+    _ = try session.acquire_write_lease(takeover.view(), 6);
+    Match.result = .missing;
+    _ = try session.authorize(test_claim(test_persistence()), .read);
+    try std.testing.expectEqual(contracts.AttentionState{}, session.facts().attention);
+    try std.testing.expect(session.record.takeover_owner_pid == null);
+    try std.testing.expect(session.record.takeover_owner_process_token == null);
+
+    const agent = test_claim(test_persistence());
+    _ = try session.acquire_write_lease(agent, 7);
+    _ = try session.authorize_write(agent);
+    _ = try session.release_write_lease(agent, 8);
+
+    Match.result = .matched;
+    _ = try session.acquire_write_lease(takeover.view(), 9);
+    _ = try session.authorize_write(takeover.view());
+    try std.testing.expectEqual(
+        contracts.AttentionState{
+            .attention = .user_takeover,
+            .write_lease = .human,
+        },
+        session.facts().attention,
+    );
+
+    _ = try session.release_write_lease(takeover.view(), 10);
+    try std.testing.expect(session.record.takeover_owner_pid == null);
+    try std.testing.expect(session.record.takeover_owner_process_token == null);
+}
+
+test "terminal records require takeover attention lease and owner as one state" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-takeover-invariant");
+    defer session.deinit();
+
+    var malformed = session.record;
+    malformed.attention = .{
+        .attention = .user_takeover,
+        .write_lease = .human,
+    };
+    try std.testing.expectError(error.InvalidTerminalRecord, malformed.validate());
+
+    const process_owner = try test_process_owner(
+        alloc,
+        fixture.profile.process_provider,
+    );
+    var pid_buffer: [32]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{process_owner.pid});
+    malformed = session.record;
+    malformed.takeover_owner_pid = @constCast(pid);
+    malformed.takeover_owner_process_token = @constCast(process_owner.token());
+    try std.testing.expectError(error.InvalidTerminalRecord, malformed.validate());
+}
+
+test "direct human authority exposes only the owning model observer controls" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var persistence = test_persistence();
+    persistence.grant.actor = .human;
+    persistence.direct_human_model_read_only = true;
+    var session = try fixture.create_with_persistence(
+        "terminal-direct-human",
+        .{ .rows = 24, .columns = 80 },
+        persistence,
+    );
+    defer session.deinit();
+
+    var model = test_claim(persistence);
+    model.actor = .agent;
+    const observer = try session.authorize(model, .read);
+    try std.testing.expectEqual(contracts.AllowedControls.observer(), observer.controls);
+    try session.verify_claim(model, .screen);
+    try session.verify_claim(model, .inspect);
+    try session.verify_claim(model, .list);
+    var human = test_claim(persistence);
+    human.process_owner = try test_process_owner(
+        alloc,
+        fixture.profile.process_provider,
+    );
+    _ = try session.acquire_write_lease(human, 2);
+    try std.testing.expectError(
+        error.LeaseConflict,
+        session.acquire_write_lease(model, 3),
+    );
+    _ = try session.release_write_lease(human, 4);
+    try std.testing.expectError(
+        error.ControlDenied,
+        session.acquire_write_lease(model, 5),
+    );
+    inline for (.{
+        contracts.Action.write,
+        .wait,
+        .resize,
+        .signal,
+        .close,
+    }) |action| {
+        try std.testing.expectError(
+            error.ControlDenied,
+            session.verify_claim(model, action),
+        );
+    }
+}
+
+test "durable event IDs and acknowledgement cursor are monotonic and idempotent" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-events");
+    defer session.deinit();
+    const first = try session.append_event(.output, 2);
+    const second = try session.append_event(.lifecycle, 3);
+    try std.testing.expectEqual(@as(u64, 1), first);
+    try std.testing.expectEqual(@as(u64, 2), second);
+    try session.acknowledge(second, 4);
+    try session.acknowledge(second, 5);
+    try std.testing.expectEqual(second, session.record.acknowledged_event_id);
+    try std.testing.expectEqual(@as(u64, 0), session.record.event_gap_through);
+    try std.testing.expectEqual(second, session.record.event_cleanup_through);
+    try std.testing.expectError(
+        error.UnknownEventId,
+        session.acknowledge(3, 6),
+    );
+    var reconnected = try fixture.profile.open_existing(
+        "terminal-store-owner",
+        "terminal-events",
+    );
+    defer reconnected.deinit();
+    try reconnected.acknowledge(second, 7);
+    try std.testing.expectEqual(second, reconnected.record.acknowledged_event_id);
+}
+
+test "quota eviction selects oldest completed output before checkpoints and covered live journals" {
+    var candidates = [_]PayloadCandidate{
+        .{
+            .owner_session_id = undefined,
+            .session_id = @constCast("completed-new"),
+            .lifecycle = .exited,
+            .created_at_ms = 20,
+            .journal_bytes = 1,
+            .checkpoint_bytes = 1,
+            .covered_live_bytes = 0,
+        },
+        .{
+            .owner_session_id = undefined,
+            .session_id = @constCast("live-old"),
+            .lifecycle = .running,
+            .created_at_ms = 1,
+            .journal_bytes = 1,
+            .checkpoint_bytes = 1,
+            .covered_live_bytes = 1,
+        },
+        .{
+            .owner_session_id = undefined,
+            .session_id = @constCast("completed-old"),
+            .lifecycle = .closed,
+            .created_at_ms = 10,
+            .journal_bytes = 1,
+            .checkpoint_bytes = 1,
+            .covered_live_bytes = 0,
+        },
+    };
+    var selected = choose_eviction(&candidates, "active").?;
+    try std.testing.expectEqual(EvictionClass.completed_output, selected.class);
+    try std.testing.expectEqual(@as(usize, 2), selected.index);
+    candidates[0].journal_bytes = 0;
+    candidates[2].journal_bytes = 0;
+    selected = choose_eviction(&candidates, "active").?;
+    try std.testing.expectEqual(EvictionClass.completed_checkpoint, selected.class);
+    candidates[0].checkpoint_bytes = 0;
+    candidates[2].checkpoint_bytes = 0;
+    selected = choose_eviction(&candidates, "active").?;
+    try std.testing.expectEqual(EvictionClass.live_covered_journal, selected.class);
+}
+
+test "live quota evicts only journal segments covered by the pinned checkpoint" {
+    const alloc = std.testing.allocator;
+    var options = test_options();
+    options.per_session_limit = 105 * 1024;
+    options.segment_bytes = 1024;
+    var fixture = try TestStoreFixture.init(alloc, options);
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-live-quota");
+    defer session.deinit();
+    const block: [1000]u8 = @splat('x');
+    for (0..10) |index| try session.append(&block, @intCast(index + 2));
+    const payload = "checkpoint";
+    const envelope = contracts.CheckpointEnvelope{
+        .engine_schema_revision = 1,
+        .applied_cursor = session.record.output_cursor,
+        .payload_len = payload.len,
+        .checksum = contracts.checkpoint_checksum(payload),
+    };
+    try session.store_checkpoint(envelope, payload, 20);
+    const additional: [5000]u8 = @splat('y');
+    try session.append(&additional, 21);
+    try std.testing.expect(session.record.raw_gap != null);
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = 9 * 1024 },
+        session.record.available_from,
+    );
+    try std.testing.expect(session.record.screen_recovery == .available);
+    try std.testing.expectError(
+        error.CapacityExceeded,
+        session.check_resize_capacity(.{ .rows = 100, .columns = 100 }),
+    );
+}
+
+test "checkpoint cadence follows the journal byte boundary" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-checkpoint-cadence");
+    defer session.deinit();
+
+    for ("abc") |byte| {
+        try session.append(&.{byte}, 2);
+        try std.testing.expect(session.checkpoint_due_cursor() == null);
+    }
+    try std.testing.expectEqual(@as(u64, 0), session.record.checkpoint_generation);
+
+    try session.append("d", 3);
+    const first_cursor = session.checkpoint_due_cursor().?;
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = 4 },
+        first_cursor,
+    );
+    const payload = "checkpoint";
+    try session.store_checkpoint(.{
+        .engine_schema_revision = 1,
+        .applied_cursor = first_cursor,
+        .payload_len = payload.len,
+        .checksum = contracts.checkpoint_checksum(payload),
+    }, payload, 4);
+    try std.testing.expectEqual(@as(u64, 1), session.record.checkpoint_generation);
+
+    for ("efg") |byte| {
+        try session.append(&.{byte}, 5);
+        try std.testing.expect(session.checkpoint_due_cursor() == null);
+    }
+    try session.append("h", 6);
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = 8 },
+        session.checkpoint_due_cursor().?,
+    );
+    try std.testing.expectEqual(@as(u64, 1), session.record.checkpoint_generation);
+}
+
+test "failed resize checkpoint stays unavailable after fresh reopen" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create_with_dimensions(
+        "terminal-resize-checkpoint-failure",
+        .{ .rows = 2, .columns = 4 },
+    );
+    try session.append("abcdef", 2);
+    const before_payload = "before";
+    try session.store_checkpoint(.{
+        .engine_schema_revision = 1,
+        .applied_cursor = session.record.output_cursor,
+        .payload_len = before_payload.len,
+        .checksum = contracts.checkpoint_checksum(before_payload),
+    }, before_payload, 3);
+
+    const resized = contracts.Dimensions{ .rows = 2, .columns = 6 };
+    try session.resize(resized, 4);
+    try std.testing.expect(!session.record.raw_replay_exact);
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .resize_uncheckpointed },
+        session.record.screen_recovery,
+    );
+
+    fixture.profile.options.fail_at = .checkpoint_replacement;
+    const resized_payload = "resized";
+    try std.testing.expectError(error.InjectedFailure, session.store_checkpoint(.{
+        .engine_schema_revision = 1,
+        .applied_cursor = session.record.output_cursor,
+        .payload_len = resized_payload.len,
+        .checksum = contracts.checkpoint_checksum(resized_payload),
+    }, resized_payload, 5));
+    fixture.profile.options.fail_at = null;
+    session.deinit();
+    try fixture.reopen();
+
+    var reopened = try fixture.profile.open_existing(
+        "terminal-store-owner",
+        "terminal-resize-checkpoint-failure",
+    );
+    defer reopened.deinit();
+    try std.testing.expectEqual(resized, reopened.record.dimensions);
+    try std.testing.expect(!reopened.record.raw_replay_exact);
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .resize_uncheckpointed },
+        reopened.facts().screen_recovery,
+    );
+}
+
+test "profile quota serializes concurrent commitments at fixed limits" {
+    const alloc = std.testing.allocator;
+    const small_reserve = try checkpoint_reserve_bytes(.{ .rows = 1, .columns = 1 });
+    {
+        var fixture = try TestStoreFixture.init(alloc, .{
+            .per_session_limit = small_reserve + 8,
+            .profile_limit = small_reserve * 2 + 8,
+            .segment_bytes = 4,
+        });
+        defer fixture.deinit();
+        var first = try fixture.create_with_dimensions(
+            "terminal-concurrent-append-a",
+            .{ .rows = 1, .columns = 1 },
+        );
+        defer first.deinit();
+        var second = try fixture.create_with_dimensions(
+            "terminal-concurrent-append-b",
+            .{ .rows = 1, .columns = 1 },
+        );
+        defer second.deinit();
+        try std.testing.expectError(
+            error.CapacityExceeded,
+            fixture.create_with_dimensions(
+                "terminal-concurrent-start-c",
+                .{ .rows = 1, .columns = 1 },
+            ),
+        );
+        var first_attempt = ConcurrentAppend{ .session = &first };
+        var second_attempt = ConcurrentAppend{ .session = &second };
+        const first_thread = try std.Thread.spawn(.{}, ConcurrentAppend.run, .{&first_attempt});
+        const second_thread = try std.Thread.spawn(.{}, ConcurrentAppend.run, .{&second_attempt});
+        first_thread.join();
+        second_thread.join();
+        const failures = @as(usize, @intFromBool(first_attempt.result != null)) +
+            @as(usize, @intFromBool(second_attempt.result != null));
+        try std.testing.expectEqual(@as(usize, 1), failures);
+        const failure = first_attempt.result orelse second_attempt.result.?;
+        try std.testing.expectEqual(error.CapacityExceeded, failure);
+    }
+    {
+        const large_reserve = try checkpoint_reserve_bytes(.{
+            .rows = 100,
+            .columns = 100,
+        });
+        var fixture = try TestStoreFixture.init(alloc, .{
+            .per_session_limit = large_reserve,
+            .profile_limit = small_reserve + large_reserve,
+            .segment_bytes = 4,
+        });
+        defer fixture.deinit();
+        var first = try fixture.create_with_dimensions(
+            "terminal-concurrent-resize-a",
+            .{ .rows = 1, .columns = 1 },
+        );
+        defer first.deinit();
+        var second = try fixture.create_with_dimensions(
+            "terminal-concurrent-resize-b",
+            .{ .rows = 1, .columns = 1 },
+        );
+        defer second.deinit();
+        var first_attempt = ConcurrentResize{ .session = &first };
+        var second_attempt = ConcurrentResize{ .session = &second };
+        const first_thread = try std.Thread.spawn(.{}, ConcurrentResize.run, .{&first_attempt});
+        const second_thread = try std.Thread.spawn(.{}, ConcurrentResize.run, .{&second_attempt});
+        first_thread.join();
+        second_thread.join();
+        const failures = @as(usize, @intFromBool(first_attempt.result != null)) +
+            @as(usize, @intFromBool(second_attempt.result != null));
+        try std.testing.expectEqual(@as(usize, 1), failures);
+        const failure = first_attempt.result orelse second_attempt.result.?;
+        try std.testing.expectEqual(error.CapacityExceeded, failure);
+    }
+}
+
+test "resident quota eviction mutates the single durable owner" {
+    const alloc = std.testing.allocator;
+    const reserve = try checkpoint_reserve_bytes(.{ .rows = 1, .columns = 1 });
+    var fixture = try TestStoreFixture.init(alloc, .{
+        .per_session_limit = reserve + 4,
+        .profile_limit = reserve + 4,
+        .segment_bytes = 4,
+    });
+    defer fixture.deinit();
+    var completed = try fixture.create_with_dimensions(
+        "terminal-resident-completed",
+        .{ .rows = 1, .columns = 1 },
+    );
+    defer completed.deinit();
+    try fixture.profile.register_resident(&completed);
+    try completed.append("done", 2);
+    try completed.persist_lost(3);
+
+    var active = try fixture.create_with_dimensions(
+        "terminal-resident-active",
+        .{ .rows = 1, .columns = 1 },
+    );
+    defer active.deinit();
+    try fixture.profile.register_resident(&active);
+    try active.append("live", 4);
+    try std.testing.expectEqual(@as(u64, 0), completed.record.journal_payload_bytes);
+    const resident_facts = completed.facts();
+    try std.testing.expect(resident_facts.raw_gap != null);
+    try std.testing.expect(resident_facts.unread_range == null);
+    try expect_close_candidate(completed.begin_close(
+        test_claim(test_persistence()),
+        5,
+    ));
+    try completed.finish_close(5);
+
+    var reopened = try fixture.profile.open_existing(
+        "terminal-store-owner",
+        "terminal-resident-completed",
+    );
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 0), reopened.record.journal_payload_bytes);
+    try std.testing.expectEqual(contracts.Lifecycle.closed, reopened.record.lifecycle);
+}
+
+test "close intent converges every durable boundary without reviving authority" {
+    const alloc = std.testing.allocator;
+    const points = [_]FailurePoint{
+        .after_close_authority_write,
+        .after_close_record_write,
+        .after_close_authority_event,
+        .after_close_lifecycle_record,
+        .after_close_lifecycle_event,
+        .after_close_cleanup,
+    };
+    for (points, 0..) |point, index| {
+        var fixture = try TestStoreFixture.init(alloc, test_options());
+        defer fixture.deinit();
+        const session_id = try std.fmt.allocPrint(
+            alloc,
+            "terminal-close-boundary-{d}",
+            .{index},
+        );
+        defer alloc.free(session_id);
+        const persistence = test_persistence();
+        const claim = test_claim(persistence);
+        var session = try fixture.create_with_persistence(
+            session_id,
+            .{ .rows = 24, .columns = 80 },
+            persistence,
+        );
+        fixture.profile.options.fail_at = point;
+        const outcome = session.begin_close(claim, 2);
+        switch (outcome) {
+            .candidate => {},
+            .previous, .indeterminate => return error.TestExpectedCandidateWinner,
+        }
+        if (point == .after_close_lifecycle_record or
+            point == .after_close_lifecycle_event or
+            point == .after_close_cleanup)
+        {
+            try std.testing.expectError(error.InjectedCrash, session.finish_close(3));
+        }
+        fixture.profile.options.fail_at = null;
+        session.deinit();
+        try fixture.reopen();
+
+        var recovered = try fixture.profile.recover("host-reopen", 4);
+        defer recovered.deinit();
+        const recovered_index = recovered_session_index(
+            recovered.sessions.items,
+            session_id,
+        ).?;
+        const reopened = &recovered.sessions.items[recovered_index];
+        try reopened.finish_close(5);
+        try std.testing.expectEqual(contracts.Lifecycle.closed, reopened.record.lifecycle);
+        try std.testing.expect(reopened.record.authority_revoked);
+        try std.testing.expectEqual(@as(usize, 0), reopened.record.monitor_count);
+        try std.testing.expectError(
+            error.AuthorityRevoked,
+            reopened.authorize(claim, .read),
+        );
+        var replay = try reopened.replay_events(alloc, 0, 16);
+        defer replay.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), replay.events.len);
+        var authority_events: usize = 0;
+        var closed_events: usize = 0;
+        var previous_id: u64 = 0;
+        for (replay.events) |event| {
+            try std.testing.expect(event.id > previous_id);
+            previous_id = event.id;
+            if (event.kind == .authority_revoked) authority_events += 1;
+            if (event.kind == .lifecycle and event.lifecycle == .closed) {
+                closed_events += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), authority_events);
+        try std.testing.expectEqual(@as(usize, 1), closed_events);
+        const transaction_name = try close_transaction_name(alloc, session_id);
+        defer alloc.free(transaction_name);
+        try std.testing.expectError(
+            error.FileNotFound,
+            (try reopened.state_capability()).stat(
+                .terminal_state,
+                transaction_name,
+            ),
+        );
+    }
+
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    const persistence = test_persistence();
+    const claim = test_claim(persistence);
+    var usable = try fixture.create_with_persistence(
+        "terminal-close-previous",
+        .{ .rows = 24, .columns = 80 },
+        persistence,
+    );
+    defer usable.deinit();
+    fixture.profile.options.fail_at = .close;
+    switch (usable.begin_close(claim, 2)) {
+        .previous => |err| try std.testing.expectEqual(error.InjectedFailure, err),
+        .candidate, .indeterminate => return error.TestExpectedPreviousWinner,
+    }
+    fixture.profile.options.fail_at = null;
+    _ = try usable.authorize(claim, .write);
+    try std.testing.expectEqual(contracts.Lifecycle.starting, usable.record.lifecycle);
+    try std.testing.expect(!usable.record.authority_revoked);
+}
+
+test "close retries authenticate only while the durable winner remains" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    const persistence = test_persistence();
+    const claim = test_claim(persistence);
+    var foreign = claim;
+    foreign.principal.cwd = "/foreign";
+    var malformed = claim;
+    malformed.generation.value = 0;
+
+    var partial = try fixture.create_with_persistence(
+        "terminal-close-authenticated-retry",
+        .{ .rows = 24, .columns = 80 },
+        persistence,
+    );
+    defer partial.deinit();
+    fixture.profile.options.fail_at = .after_close_authority_event;
+    switch (partial.begin_close(claim, 2)) {
+        .candidate => |err| try std.testing.expectEqual(error.InjectedCrash, err.?),
+        .previous, .indeterminate => return error.TestExpectedCandidateWinner,
+    }
+    fixture.profile.options.fail_at = null;
+    switch (partial.begin_close(foreign, 3)) {
+        .previous => |err| try std.testing.expectEqual(error.InvalidHolderProof, err),
+        .candidate, .indeterminate => return error.TestExpectedPreviousWinner,
+    }
+    switch (partial.begin_close(malformed, 3)) {
+        .previous => {},
+        .candidate, .indeterminate => return error.TestExpectedPreviousWinner,
+    }
+    try expect_close_candidate(partial.begin_close(claim, 3));
+    try partial.finish_close(4);
+
+    for ([_]contracts.AuthorityClaim{ claim, foreign, malformed }) |retry| {
+        switch (partial.begin_close(retry, 5)) {
+            .previous => {},
+            .candidate, .indeterminate => return error.TestExpectedPreviousWinner,
+        }
+    }
+    var replay = try partial.replay_events(alloc, 0, 16);
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), replay.events.len);
+    try std.testing.expectEqual(
+        contracts.HostEvent.authority_revoked,
+        replay.events[0].kind,
+    );
+    try std.testing.expectEqual(contracts.HostEvent.lifecycle, replay.events[1].kind);
+}
+
+test "durable failure boundaries do not report success" {
+    const alloc = std.testing.allocator;
+    for ([_]FailurePoint{ .grant, .start }) |point| {
+        var options = test_options();
+        options.fail_at = point;
+        var fixture = try TestStoreFixture.init(alloc, options);
+        defer fixture.deinit();
+        try std.testing.expectError(
+            error.InjectedFailure,
+            fixture.create(if (point == .grant) "terminal-fail-grant" else "terminal-fail-start"),
+        );
+        var state = try fixture.profile.open_capability(
+            "terminal-store-owner",
+            false,
+        );
+        defer state.deinit();
+        const id = if (point == .grant)
+            "terminal-fail-grant"
+        else
+            "terminal-fail-start";
+        const name = try record_name(alloc, id);
+        defer alloc.free(name);
+        try std.testing.expectError(
+            error.FileNotFound,
+            state.stat(.terminal_state, name),
+        );
+    }
+
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-failures");
+    defer session.deinit();
+    const payload = "checkpoint";
+    const envelope = contracts.CheckpointEnvelope{
+        .engine_schema_revision = 1,
+        .applied_cursor = session.record.output_cursor,
+        .payload_len = payload.len,
+        .checksum = contracts.checkpoint_checksum(payload),
+    };
+    fixture.profile.options.fail_at = .append;
+    try std.testing.expectError(error.InjectedFailure, session.append("x", 2));
+    fixture.profile.options.fail_at = .checkpoint_replacement;
+    try std.testing.expectError(
+        error.InjectedFailure,
+        session.store_checkpoint(envelope, payload, 3),
+    );
+    fixture.profile.options.fail_at = null;
+    const event_id = try session.append_event(.output, 4);
+    fixture.profile.options.fail_at = .acknowledgement;
+    try std.testing.expectError(
+        error.InjectedFailure,
+        session.acknowledge(event_id, 5),
+    );
+    fixture.profile.options.fail_at = .revoke;
+    try std.testing.expectError(error.InjectedFailure, session.revoke(6));
+    fixture.profile.options.fail_at = .close;
+    switch (session.begin_close(test_claim(test_persistence()), 7)) {
+        .previous => |err| try std.testing.expectEqual(error.InjectedFailure, err),
+        else => return error.TestExpectedPreviousWinner,
+    }
+    fixture.profile.options.fail_at = .finalization;
+    try std.testing.expectError(error.InjectedFailure, session.persist_lost(8));
+}
+
+test "recovery discovers and removes partial start artifacts after durable effects" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    const points = [_]FailurePoint{
+        .after_journal_create,
+        .after_proof_write,
+        .after_authority_write,
+    };
+    for (points, 0..) |point, index| {
+        const id = try std.fmt.allocPrint(alloc, "terminal-partial-{d}", .{index});
+        defer alloc.free(id);
+        fixture.profile.options.fail_at = point;
+        try std.testing.expectError(error.InjectedCrash, fixture.create(id));
+        fixture.profile.options.fail_at = null;
+        try fixture.reopen();
+        var recovered = try fixture.profile.recover("host-reopen", 10);
+        defer recovered.deinit();
+        try std.testing.expectEqual(@as(usize, 0), recovered.sessions.items.len);
+        try std.testing.expectEqual(@as(usize, 1), recovered.diagnostics.items.len);
+        try std.testing.expectEqualStrings(
+            "PartialStartArtifacts",
+            recovered.diagnostics.items[0].reason,
+        );
+    }
+}
+
+test "fresh reopen reconciles journal checkpoint event authority and cleanup commits" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+
+    var journal = try fixture.create("terminal-crash-journal");
+    try journal.append("base", 2);
+    fixture.profile.options.fail_at = .after_journal_sync;
+    try std.testing.expectError(error.InjectedCrash, journal.append("tail", 3));
+    fixture.profile.options.fail_at = null;
+    journal.deinit();
+    try fixture.reopen();
+    var journal_recovery = try fixture.profile.recover("host-reopen", 4);
+    try std.testing.expectEqual(@as(usize, 1), journal_recovery.sessions.items.len);
+    var page = try journal_recovery.sessions.items[0].read(
+        alloc,
+        .{ .segment = 1, .offset = 0 },
+        64,
+    );
+    try std.testing.expectEqualStrings("base", page.output);
+    page.deinit(alloc);
+    journal_recovery.deinit();
+
+    var checkpoint = try fixture.create("terminal-crash-checkpoint");
+    const first_payload = "first";
+    try checkpoint.store_checkpoint(.{
+        .engine_schema_revision = 1,
+        .applied_cursor = checkpoint.record.output_cursor,
+        .payload_len = first_payload.len,
+        .checksum = contracts.checkpoint_checksum(first_payload),
+    }, first_payload, 2);
+    const second_payload = "second";
+    fixture.profile.options.fail_at = .after_checkpoint_write;
+    try std.testing.expectError(error.InjectedCrash, checkpoint.store_checkpoint(.{
+        .engine_schema_revision = 1,
+        .applied_cursor = checkpoint.record.output_cursor,
+        .payload_len = second_payload.len,
+        .checksum = contracts.checkpoint_checksum(second_payload),
+    }, second_payload, 3));
+    fixture.profile.options.fail_at = null;
+    checkpoint.deinit();
+    try fixture.reopen();
+    var checkpoint_recovery = try fixture.profile.recover("host-reopen", 4);
+    const checkpoint_index = recovered_session_index(
+        checkpoint_recovery.sessions.items,
+        "terminal-crash-checkpoint",
+    ).?;
+    var loaded = (try checkpoint_recovery.sessions.items[checkpoint_index]
+        .load_checkpoint(alloc)).?;
+    try std.testing.expectEqualStrings(first_payload, loaded.payload);
+    loaded.deinit(alloc);
+    checkpoint_recovery.deinit();
+
+    var authority_persistence = test_persistence();
+    authority_persistence.grant.actor = .human;
+    authority_persistence.direct_human_model_read_only = true;
+    var authority = try fixture.create_with_persistence(
+        "terminal-crash-authority",
+        .{ .rows = 24, .columns = 80 },
+        authority_persistence,
+    );
+    fixture.profile.options.fail_at = .after_authority_write;
+    try std.testing.expectError(error.InjectedCrash, authority.revoke(2));
+    fixture.profile.options.fail_at = null;
+    authority.deinit();
+    try fixture.reopen();
+    var authority_recovery = try fixture.profile.recover("host-reopen", 3);
+    const authority_index = recovered_session_index(
+        authority_recovery.sessions.items,
+        "terminal-crash-authority",
+    ).?;
+    try std.testing.expect(
+        authority_recovery.sessions.items[authority_index].record.authority_revoked,
+    );
+    try std.testing.expect(
+        authority_recovery.sessions.items[authority_index]
+            .record.direct_human_model_read_only,
+    );
+    try std.testing.expectError(
+        error.AuthorityRevoked,
+        authority_recovery.sessions.items[authority_index]
+            .load_recovery_execution_scope(alloc),
+    );
+    const recovered_authority = try load_authority(
+        alloc,
+        try authority_recovery.sessions.items[authority_index]
+            .state_capability(),
+        "terminal-crash-authority",
+    );
+    defer recovered_authority.deinit();
+    try std.testing.expect(recovered_authority.value.revoked);
+    try std.testing.expect(
+        recovered_authority.value.direct_human_model_read_only,
+    );
+    authority_recovery.deinit();
+
+    var committed_checkpoint = try fixture.create("terminal-crash-checkpoint-record");
+    try committed_checkpoint.store_checkpoint(.{
+        .engine_schema_revision = 1,
+        .applied_cursor = committed_checkpoint.record.output_cursor,
+        .payload_len = first_payload.len,
+        .checksum = contracts.checkpoint_checksum(first_payload),
+    }, first_payload, 2);
+    fixture.profile.options.fail_at = .after_checkpoint_record;
+    try std.testing.expectError(error.InjectedCrash, committed_checkpoint.store_checkpoint(.{
+        .engine_schema_revision = 1,
+        .applied_cursor = committed_checkpoint.record.output_cursor,
+        .payload_len = second_payload.len,
+        .checksum = contracts.checkpoint_checksum(second_payload),
+    }, second_payload, 3));
+    fixture.profile.options.fail_at = null;
+    committed_checkpoint.deinit();
+    try fixture.reopen();
+    var committed_recovery = try fixture.profile.recover("host-reopen", 4);
+    const committed_index = recovered_session_index(
+        committed_recovery.sessions.items,
+        "terminal-crash-checkpoint-record",
+    ).?;
+    var committed_loaded = (try committed_recovery.sessions.items[committed_index]
+        .load_checkpoint(alloc)).?;
+    try std.testing.expectEqualStrings(second_payload, committed_loaded.payload);
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        committed_recovery.sessions.items[committed_index]
+            .record.checkpoint_cleanup_generation,
+    );
+    committed_loaded.deinit(alloc);
+    committed_recovery.deinit();
+
+    var acknowledged = try fixture.create("terminal-crash-acknowledgement");
+    const acknowledged_id = try acknowledged.append_event(.output, 2);
+    fixture.profile.options.fail_at = .after_acknowledgement_record;
+    try std.testing.expectError(
+        error.InjectedCrash,
+        acknowledged.acknowledge(acknowledged_id, 3),
+    );
+    fixture.profile.options.fail_at = null;
+    acknowledged.deinit();
+    try fixture.reopen();
+    var acknowledged_recovery = try fixture.profile.recover("host-reopen", 4);
+    const acknowledged_index = recovered_session_index(
+        acknowledged_recovery.sessions.items,
+        "terminal-crash-acknowledgement",
+    ).?;
+    try std.testing.expectEqual(
+        acknowledged_id,
+        acknowledged_recovery.sessions.items[acknowledged_index]
+            .record.event_cleanup_through,
+    );
+    acknowledged_recovery.deinit();
+
+    var evicted = try fixture.create("terminal-crash-eviction");
+    try evicted.append("gone", 2);
+    try evicted.persist_lost(3);
+    fixture.profile.options.fail_at = .after_eviction_record;
+    try std.testing.expectError(error.InjectedCrash, evicted.evict_completed_output());
+    fixture.profile.options.fail_at = null;
+    evicted.deinit();
+    try fixture.reopen();
+    var eviction_recovery = try fixture.profile.recover("host-reopen", 4);
+    const eviction_index = recovered_session_index(
+        eviction_recovery.sessions.items,
+        "terminal-crash-eviction",
+    ).?;
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        eviction_recovery.sessions.items[eviction_index].record.journal_payload_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        eviction_recovery.sessions.items[eviction_index]
+            .record.journal_cleanup_through,
+    );
+    eviction_recovery.deinit();
+
+    var events = try fixture.create("terminal-crash-events");
+    fixture.profile.options.fail_at = .after_event_write;
+    try std.testing.expectError(
+        error.InjectedCrash,
+        events.append_event(.output, 2),
+    );
+    fixture.profile.options.fail_at = null;
+    events.deinit();
+    try fixture.reopen();
+    var event_recovery = try fixture.profile.recover("host-reopen", 3);
+    const event_index = recovered_session_index(
+        event_recovery.sessions.items,
+        "terminal-crash-events",
+    ).?;
+    var replay = try event_recovery.sessions.items[event_index]
+        .replay_events(alloc, 0, 10);
+    try std.testing.expectEqual(@as(usize, 1), replay.events.len);
+    try std.testing.expectEqual(contracts.HostEvent.lifecycle, replay.events[0].kind);
+    replay.deinit(alloc);
+    event_recovery.deinit();
+}
+
+test "missing checkpoint is durably reconciled without fabricating a screen" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-missing-checkpoint");
+    defer session.deinit();
+    const payload = "checkpoint";
+    const envelope = contracts.CheckpointEnvelope{
+        .engine_schema_revision = 1,
+        .applied_cursor = session.record.output_cursor,
+        .payload_len = payload.len,
+        .checksum = contracts.checkpoint_checksum(payload),
+    };
+    try session.store_checkpoint(envelope, payload, 2);
+    const name = try checkpoint_name(
+        alloc,
+        session.record.session_id,
+        session.record.checkpoint_generation,
+    );
+    defer alloc.free(name);
+    try (try session.state_capability()).delete(.terminal_state, name);
+    try session.reconcile_checkpoint();
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .missing },
+        session.record.screen_recovery,
+    );
+}
+
+test "journal recovery validates the complete chain and retains only a verified suffix" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-corrupt-journal-chain");
+    try session.append("abcdefghijkl", 2);
+    const name = try journal_name(alloc, session.record.session_id, 2);
+    defer alloc.free(name);
+    var replacement = try (try session.state_capability()).atomicReplace(
+        alloc,
+        .terminal_state,
+        name,
+        "WXYZ",
+    );
+    replacement.deinit(alloc);
+    session.deinit();
+    try fixture.reopen();
+
+    var recovered = try fixture.profile.recover("host-reopen", 3);
+    defer recovered.deinit();
+    const index = recovered_session_index(
+        recovered.sessions.items,
+        "terminal-corrupt-journal-chain",
+    ).?;
+    const durable = &recovered.sessions.items[index];
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = 8 },
+        durable.record.available_from,
+    );
+    var page = try durable.read(alloc, .{ .segment = 1, .offset = 0 }, 64);
+    defer page.deinit(alloc);
+    try std.testing.expect(page.gap != null);
+    try std.testing.expectEqualStrings("ijkl", page.output);
+}
+
+test "completed checkpoint eviction persists an explicit retention marker first" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-completed-checkpoint");
+    defer session.deinit();
+    const payload = "checkpoint";
+    const envelope = contracts.CheckpointEnvelope{
+        .engine_schema_revision = 1,
+        .applied_cursor = session.record.output_cursor,
+        .payload_len = payload.len,
+        .checksum = contracts.checkpoint_checksum(payload),
+    };
+    try session.store_checkpoint(envelope, payload, 2);
+    try session.persist_lost(3);
+    try session.evict_completed_checkpoint();
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .retention_evicted },
+        session.record.screen_recovery,
+    );
+    var reopened = try fixture.profile.open_existing(
+        "terminal-store-owner",
+        "terminal-completed-checkpoint",
+    );
+    defer reopened.deinit();
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .retention_evicted },
+        reopened.record.screen_recovery,
+    );
+}
+
+test "host restart marks native work lost without restart and reconnect is idempotent" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var session = try fixture.create("terminal-restart-loss");
+    try session.append("durable-output", 2);
+    session.deinit();
+
+    var first = try fixture.profile.recover("host-two", 3);
+    try std.testing.expectEqual(@as(usize, 1), first.sessions.items.len);
+    try std.testing.expectEqual(
+        contracts.Lifecycle.lost,
+        first.sessions.items[0].record.lifecycle,
+    );
+    var page = try first.sessions.items[0].read(
+        alloc,
+        .{ .segment = 1, .offset = 0 },
+        64,
+    );
+    defer page.deinit(alloc);
+    try std.testing.expectEqualStrings("durable-output", page.output);
+    try std.testing.expect(try first.sessions.items[0].contains(
+        "durable-output",
+        .{ .segment = 1, .offset = 0 },
+    ));
+    first.deinit();
+
+    var second = try fixture.profile.recover("host-three", 4);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.sessions.items.len);
+    try std.testing.expectEqual(
+        contracts.Lifecycle.lost,
+        second.sessions.items[0].record.lifecycle,
+    );
+}
+
+test "recovery isolates partial corrupt and unsupported records" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    const cases = [_]struct { id: []const u8, bytes: ?[]const u8 }{
+        .{ .id = "terminal-partial-record", .bytes = "{" },
+        .{ .id = "terminal-corrupt-record", .bytes = "{}" },
+        .{ .id = "terminal-unsupported-record", .bytes = null },
+    };
+    for (cases) |case| {
+        var session = try fixture.create(case.id);
+        const name = try record_name(alloc, case.id);
+        defer alloc.free(name);
+        const bytes = if (case.bytes) |value|
+            try alloc.dupe(u8, value)
+        else blk: {
+            const rendered = try render_json(alloc, record_wire(session.record));
+            const marker = std.mem.find(u8, rendered, "\"schema_version\":1") orelse
+                return error.TestExpectedEqual;
+            rendered[marker + "\"schema_version\":".len] = '2';
+            break :blk rendered;
+        };
+        defer alloc.free(bytes);
+        var entry = try (try session.state_capability()).atomicReplace(
+            alloc,
+            .terminal_state,
+            name,
+            bytes,
+        );
+        entry.deinit(alloc);
+        session.deinit();
+    }
+
+    var recovered = try fixture.profile.recover("host-two", 5);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 0), recovered.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 3), recovered.diagnostics.items.len);
+}

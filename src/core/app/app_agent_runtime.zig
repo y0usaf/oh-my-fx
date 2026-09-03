@@ -1,6 +1,8 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
+const runtime_context_compaction = @import("../agent/runtime/context_compaction.zig");
+const runtime_prompt_context = @import("../agent/runtime/prompt_context.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const app_callbacks = @import("app_callbacks.zig");
@@ -12,7 +14,6 @@ const provider_runtime = @import("provider_runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const background_runtime = @import("../background/background_runtime.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
@@ -218,6 +219,15 @@ pub fn Runtime(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
+                .compaction_route = if (comptime @hasDecl(App, "providerSet"))
+                    app.providerSet().compactionRoute(
+                        selected_provider,
+                        app.auth.credentialSource(),
+                    )
+                else if (comptime @hasDecl(App, "compactionRoute"))
+                    app.compactionRoute()
+                else
+                    .{ .unavailable = .missing_policy },
                 .gateway_team = app.auth.gatewayTeam(),
                 .credential_source = app.auth.credentialSource(),
                 .account_id = app.auth.accountId(),
@@ -251,10 +261,17 @@ pub fn Runtime(comptime App: type) type {
                 .worker = &app.worker,
                 .permission_prompter = tool_admission.workerPrompter(&app.worker),
                 .cancel_flag = &app.worker.worker_cancel_requested,
-                .background = &app.background,
                 .session_child_capability = child_capability,
                 .terminal_client = if (comptime @hasField(App, "terminal_client"))
                     &app.terminal_client
+                else
+                    null,
+                .managed_executions = if (comptime @hasField(App, "managed_executions"))
+                    &app.managed_executions
+                else
+                    null,
+                .ephemeral_command_replay = if (comptime @hasField(App, "managed_executions"))
+                    app.managed_executions.replayStore()
                 else
                     null,
                 .session = &app.session,
@@ -265,8 +282,6 @@ pub fn Runtime(comptime App: type) type {
                 .context_registry = app.contextRegistry(),
                 .output_chunk_ctx = @ptrCast(app),
                 .on_output_chunk = app_callbacks.Bindings(App).onCommandOutputChunk,
-                .background_url_ctx = @ptrCast(app),
-                .on_background_url_ready = app_callbacks.Bindings(App).onBackgroundUrlReady,
                 .workspace_executor = if (comptime @hasDecl(App, "workspaceExecutor")) app.workspaceExecutor() else null,
                 .host_sandbox_default = if (host_workspace) |info| switch (info.permission) {
                     .allow_sandboxed => .allow_sandboxed,
@@ -441,10 +456,10 @@ pub fn Runtime(comptime App: type) type {
             return app.callMcpTool(arena, name, arguments_json, max_tool_result_bytes, options);
         }
 
-        fn searchMcpTools(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+        fn searchMcpTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
             if (comptime @hasDecl(App, "searchMcpTools")) {
-                return app.searchMcpTools(arena, query, limit, permission_rules, access);
+                return app.searchMcpTools(arena, request, permission_rules, access);
             }
             return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
         }
@@ -601,6 +616,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !command_admission.PermissionOutcome {
             var ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            applyCredentialLease(app, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return if (revalidation) |request| switch (request) {
@@ -655,6 +671,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 advertised_dynamic_tool_names,
             );
+            applyCredentialLease(app, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return tool_admission.requestPreparedFileMutationPermissionOutcome(
@@ -730,6 +747,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !agent_runtime.ToolExecutionResult {
             var ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            applyCredentialLease(app, &ctx, request.credential, gateway_retry_count, gateway_chat_url);
             ctx.root_user_intent_context = request.root_user_intent_context;
             ctx.root_user_messages = request.root_user_messages;
             ctx.root_user_evidence_complete = request.root_user_evidence_complete;
@@ -737,6 +755,36 @@ pub fn Runtime(comptime App: type) type {
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
             return tool_runtime.executeToolCallAuthorized(ctx, request);
+        }
+
+        fn applyCredentialLease(
+            app: *App,
+            ctx: *tool_runtime.Context,
+            credential: types.CredentialLease,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) void {
+            const credential_secret = credential.secret() orelse return;
+            const credential_source = credential.credentialSource();
+            ctx.api_key = credential_secret;
+            ctx.credential_source = credential_source;
+            ctx.account_id = credential.accountId();
+            ctx.gateway_team = credential.tenant();
+            if (comptime @hasField(App, "web_search_runtime") and @hasField(App, "session")) {
+                if (ctx.provider_capabilities.fx_search) {
+                    app.web_search_runtime.configure(.{
+                        .api_key = credential_secret,
+                        .credential_source = credential_source,
+                        .gateway_team = credential.tenant(),
+                        .worker_model = provider_runtime.model(app),
+                        .gateway_retry_count = gateway_retry_count,
+                        .gateway_chat_url = gateway_chat_url,
+                        .usage = &app.session.usage,
+                        .usage_allocator = app.alloc,
+                    });
+                    ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
+                }
+            }
         }
 
         pub fn appendStaticContextMessage(
@@ -834,8 +882,6 @@ pub fn Runtime(comptime App: type) type {
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
                 .tracker = &app.change_tracker,
-                .background = &app.background,
-                .session = &app.session,
             }, arena, messages);
         }
 
@@ -900,6 +946,12 @@ pub fn Runtime(comptime App: type) type {
             defer app.worker.endActivePromptSnapshots(&snapshot_ownership);
             app.worker.active_context_snapshot = &job.context_snapshot;
             defer app.worker.active_context_snapshot = null;
+            app.worker.active_prompt_is_root_authority = if (app.session_persistence.writable) |writable|
+                writable.external_prompt_origin == .persistent_child and
+                    job.recovery_checkpoint == null
+            else
+                false;
+            defer app.worker.active_prompt_is_root_authority = false;
             app.worker.setActiveAgentTurnSettings(job.agent_settings);
             defer app.worker.clearActiveAgentTurnSettings();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
@@ -910,8 +962,12 @@ pub fn Runtime(comptime App: type) type {
                 try appendClaimedContextNotice(app, &preflight_context_notices.writer, notice);
             }
 
-            var bounded_skills = try app.skills.buildBoundedSystemPromptSection(
+            var skill_catalog = app.skills.acquireCatalog();
+            var skill_catalog_owned = true;
+            defer if (skill_catalog_owned) skill_catalog.deinit();
+            var bounded_skills = try skill_catalog.buildRoutedSystemPromptSection(
                 std.heap.c_allocator,
+                job.prompt,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             );
             defer bounded_skills.deinit(std.heap.c_allocator);
@@ -929,12 +985,14 @@ pub fn Runtime(comptime App: type) type {
             }
             var explicit_skills = try skill_invocation.buildExplicitPromptSection(
                 std.heap.c_allocator,
-                .{ .skills = app.skills.items, .diagnostics = app.skills.diagnostics },
+                .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 job.prompt,
                 explicit_bindings,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             );
             defer explicit_skills.deinit(std.heap.c_allocator);
+            skill_catalog.deinit();
+            skill_catalog_owned = false;
             if (explicit_skills.notice) |notice| {
                 try appendClaimedContextNotice(app, &postflight_context_notices.writer, notice);
             }
@@ -987,7 +1045,7 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
-            const process_result = agent_runtime.processQueuedPrompt(&deps, semantic_presentation, lifecycleContext(app), config, job);
+            const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, job);
             if (postflight_context_notices.written().len > 0) {
                 try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
                     .topic = "context",
@@ -997,6 +1055,110 @@ pub fn Runtime(comptime App: type) type {
                 });
             }
             try process_result;
+        }
+
+        pub fn processContextCompaction(
+            app: *App,
+            job: worker_runtime.ContextCompactionTask,
+            gateway_retry_count: usize,
+        ) !void {
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            const result_storage: runtime_context_compaction.ResultStorage =
+                if (app_session_runtime.Runtime(App).childCapability(app)) |capability|
+                    .{ .managed = capability }
+                else
+                    .unavailable;
+            var messages: std.ArrayList(ChatMessage) = .empty;
+            defer messages.deinit(arena);
+            const uncertain_history_count = @min(
+                @max(
+                    job.unversioned_history_count,
+                    job.context_history_start,
+                ),
+                job.history.len,
+            );
+            try session_runtime.appendCompactionHistoryChatMessages(
+                arena,
+                &messages,
+                job.history[0..uncertain_history_count],
+            );
+            const uncertain_message_count = messages.items.len;
+            try session_runtime.appendCompactionHistoryChatMessages(
+                arena,
+                &messages,
+                job.history[uncertain_history_count..],
+            );
+            const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
+                messages.items,
+            );
+            const retained_tail = try session_runtime.retainedHistoryTailForMessageCount(
+                arena,
+                job.history,
+                2,
+            );
+            const retained_message_count = retained_tail.message_count;
+            const retained_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
+                messages.items[messages.items.len - retained_message_count ..],
+            );
+            const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
+            const raw_turn_count = session_runtime.rawHistoryTurnCount(job.history);
+            const retained_turn_count = retained_tail.turn_count;
+            if (retained_turn_count > raw_turn_count) {
+                return error.InvalidContextHistoryStart;
+            }
+            var compaction_count: usize = 0;
+            for (job.history) |turn| switch (turn) {
+                .compacted_summary => |summary| {
+                    compaction_count = @max(
+                        compaction_count,
+                        summary.compaction_count,
+                    );
+                },
+                else => {},
+            };
+            const transaction = agent_runtime.compactContextTransaction(arena, &deps, .{
+                .trigger = .manual,
+                .provider = job.provider,
+                .working_capabilities = capabilities,
+                .request_tokens = source_tokens,
+                .source_tokens = source_tokens,
+                .protected_tokens = retained_tokens,
+                .source_messages = messages.items[0 .. messages.items.len - retained_message_count],
+                .uncertain_source_message_count = @min(
+                    uncertain_message_count,
+                    messages.items.len - retained_message_count,
+                ),
+                .result_storage = result_storage,
+                .api_key = job.api_key,
+                .credential_source = job.credential_source,
+                .account_id = job.account_id,
+                .gateway_team = job.gateway_team,
+                .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
+                .retry_count = gateway_retry_count,
+                .cancel_flag = &app.worker.worker_cancel_requested,
+                .trace_ctx = .{ .turn_id = job.turn_id },
+                .removed_turn_count = raw_turn_count - retained_turn_count,
+                .compaction_count = compaction_count + 1,
+            }) catch |err| {
+                if (err == error.Cancelled and
+                    app.worker.worker_cancel_requested.load(.seq_cst))
+                {
+                    return;
+                }
+                return err;
+            };
+            _ = transaction orelse {
+                try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
+                    .topic = "context",
+                    .tone = .neutral,
+                    .body = "No context to compact.",
+                });
+                return;
+            };
         }
 
         fn lifecycleContext(app: *App) agent_runtime.LifecycleContext {
@@ -1030,21 +1192,29 @@ pub fn Runtime(comptime App: type) type {
             ) catch
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
-            var bounded_skills = app.skills.buildBoundedSystemPromptSection(
+            var skill_catalog = app.skills.acquireCatalog();
+            var skill_catalog_owned = true;
+            defer if (skill_catalog_owned) skill_catalog.deinit();
+            var bounded_skills = skill_catalog.buildRoutedSystemPromptSection(
                 alloc,
+                message.content,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             ) catch return error.OutOfMemory;
             defer bounded_skills.deinit(alloc);
             var explicit_skills = skill_invocation.buildExplicitPromptSection(
                 alloc,
-                .{ .skills = app.skills.items, .diagnostics = app.skills.diagnostics },
+                .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 message.content,
                 &.{},
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             ) catch return error.OutOfMemory;
             defer explicit_skills.deinit(alloc);
+            skill_catalog.deinit();
+            skill_catalog_owned = false;
             const prompt_policy = app.promptPolicy();
-            const tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
+            var tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
+            tool_context.managed_executions = turn.managedExecutionRuntime();
+            tool_context.ephemeral_command_replay = turn.managedExecutionRuntime().replayStore();
             const providers = if (comptime @hasDecl(App, "providerSet"))
                 app.providerSet()
             else
@@ -1150,10 +1320,7 @@ pub fn Runtime(comptime App: type) type {
                     writable.external_root_user_evidence_complete
                 else
                     false,
-                .current_prompt_is_root_authority = if (app.session_persistence.writable) |writable|
-                    writable.external_prompt_origin == .persistent_child
-                else
-                    false,
+                .current_prompt_is_root_authority = app.worker.active_prompt_is_root_authority,
                 .session_child_capability = session_child_capability,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             };
@@ -1291,8 +1458,7 @@ const test_ignored_list_entries = [_][]const u8{ ".git", "zig-out" };
 const test_gateway_chat_url = "https://gateway.test/chat";
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
-    test_builtin_tools.terminal,
-    test_builtin_tools.memory,
+    test_builtin_tools.shell,
     test_builtin_tools.grep_files,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
@@ -1310,10 +1476,10 @@ const custom_label_tool = tool_dispatch.Tool{
     .completed_action_label = "Custom ran",
     .label_arg_kind = .name,
     .label_arg_default = "custom fallback",
-    .decode = test_builtin_tools.memory.decode,
-    .call = test_builtin_tools.memory.call,
-    .reads_only_fn = test_builtin_tools.memory.reads_only_fn,
-    .irreversible_fn = test_builtin_tools.memory.irreversible_fn,
+    .decode = test_builtin_tools.read_file.decode,
+    .call = test_builtin_tools.read_file.call,
+    .reads_only_fn = test_builtin_tools.read_file.reads_only_fn,
+    .irreversible_fn = test_builtin_tools.read_file.irreversible_fn,
 };
 const custom_registry_tools = [_]tool_dispatch.Tool{custom_label_tool};
 const custom_tool_registry = tool_dispatch.Registry{ .tools = custom_registry_tools[0..] };
@@ -1457,7 +1623,6 @@ const FakeApp = struct {
     fast_mode: bool = true,
     effort: types.ReasoningEffort = types.ReasoningEffort.literal("high"),
     worker: worker_runtime.WorkerRuntime = .{},
-    background: background_runtime.BackgroundRuntime = .{},
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 4 },
     session_persistence: app_session_runtime.Persistence = .{},
     skills_dir: []const u8 = "/tmp/skills",
@@ -1535,6 +1700,10 @@ const FakeApp = struct {
         return self.agent_stream_provider;
     }
 
+    pub fn compactionRoute(_: *const FakeApp) provider_set.CompactionRouteDecision {
+        return .{ .ready = .{ .provider = .gateway, .model = "openai/gpt-5.6-luna" } };
+    }
+
     fn deinit(self: *FakeApp) void {
         self.auth.deinit(self.alloc);
         self.selected_model.deinit(self.alloc);
@@ -1543,7 +1712,6 @@ const FakeApp = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
-        self.background.deinit(self.alloc);
         self.session.deinit(self.alloc);
         self.change_tracker.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
@@ -1709,6 +1877,717 @@ fn testAgentStreamProvider(stream_fn: agent_stream_provider.StreamFn) agent_stre
     return provider;
 }
 
+const TestCatalogProvider = struct {
+    saw_expected_input: bool = false,
+
+    fn appendEntry(
+        alloc: Allocator,
+        catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
+        id_text: []const u8,
+    ) !void {
+        const id = try alloc.dupe(u8, id_text);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try catalog.append(alloc, .{ .id = id, .model_type = model_type });
+    }
+
+    fn fetch(
+        raw_context: ?*anyopaque,
+        alloc: Allocator,
+        input: model_catalog.FetchInput,
+    ) Allocator.Error!model_catalog.ProviderResult {
+        const self: *TestCatalogProvider = @ptrCast(@alignCast(raw_context.?));
+        self.saw_expected_input =
+            std.mem.eql(u8, input.access.authorizationCredential() orelse "", "api-key") and
+            input.access.teamContext() == null and
+            input.access.credentialSource() == .ai_gateway_api_key and
+            std.mem.eql(u8, input.endpoint, "/catalog") and
+            input.cancel_flag == null and
+            input.view == .full;
+
+        var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+        errdefer model_catalog.freeModelCatalog(alloc, &catalog);
+        try appendEntry(alloc, &catalog, "provider/first");
+        try appendEntry(alloc, &catalog, "provider/second");
+        return .{ .catalog = catalog };
+    }
+};
+
+test "app model id loading uses the injected catalog provider" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var test_provider = TestCatalogProvider{};
+
+    var ids = try Runtime(FakeApp).fetchModelIds(
+        &app,
+        .{
+            .context = @ptrCast(&test_provider),
+            .fetch_fn = TestCatalogProvider.fetch,
+        },
+        "/catalog",
+    );
+    defer {
+        for (ids.items) |id| alloc.free(id);
+        ids.deinit(alloc);
+    }
+
+    try std.testing.expect(test_provider.saw_expected_input);
+    try std.testing.expectEqual(@as(usize, 2), ids.items.len);
+    try std.testing.expectEqualStrings("provider/first", ids.items[0]);
+    try std.testing.expectEqualStrings("provider/second", ids.items[1]);
+}
+
+test "app agent runtime builds tool context from app state and MCP callbacks" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    app.permission_engine.mode = .auto;
+    app.worker.agent_turn_settings = .{
+        .max_tool_result_bytes = 4096,
+        .first_call_tool_choice = .none,
+        .fast_mode = true,
+        .effort = types.ReasoningEffort.literal("high"),
+    };
+    try app.permission_engine.allow(alloc, "run_command", "/tmp/workspace::zig build");
+
+    const ctx = testToolContext(&app);
+    try std.testing.expectEqualStrings("/tmp/workspace", ctx.workspace_root);
+    try std.testing.expectEqualStrings("api-key", ctx.api_key);
+    try std.testing.expectEqualStrings("test-model", ctx.model);
+    try std.testing.expect(ctx.tool_registry.lookup("web_search") != null);
+    try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
+    try std.testing.expectEqual(@as(usize, 1), ctx.permission_grants.len);
+    try std.testing.expect(ctx.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), ctx.effort);
+    try std.testing.expect(!ctx.web_search_runtime_ready);
+    try std.testing.expect(ctx.web_search_backend != null);
+    try std.testing.expect(ctx.web_fetch_runtime.? == &app.web_fetch_runtime);
+    try std.testing.expect(ctx.web_fetch_progress_ctx != null);
+    try std.testing.expect(ctx.on_web_fetch_progress != null);
+    try std.testing.expectEqualStrings("test-model", app.web_search_runtime.worker_model);
+    try std.testing.expectEqual(ctx.gateway_retry_count, app.web_search_runtime.gateway_retry_count);
+    try std.testing.expectEqualStrings(ctx.gateway_chat_url, app.web_search_runtime.gateway_chat_url);
+    try std.testing.expectEqualStrings("/models", ctx.gateway_models_path);
+    try std.testing.expectEqual(@as(usize, 4096), ctx.max_tool_result_bytes);
+    try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
+    try std.testing.expect(ctx.cancel_flag.? == &app.worker.worker_cancel_requested);
+    try std.testing.expectEqual(&app.worker, ctx.worker);
+    try std.testing.expect(!@hasField(tool_runtime.Context, "background"));
+    try std.testing.expect(ctx.subagent_host == null);
+    try std.testing.expect(ctx.subagent_caller_id == null);
+    try std.testing.expectEqual(&app.session, ctx.session);
+    try std.testing.expectEqual(&app.change_tracker, ctx.tracker.?);
+    const child_ctx = Runtime(FakeApp).childToolContext(ctx);
+    try std.testing.expect(child_ctx.tracker == null);
+    try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_lookup", .unrestricted));
+
+    const result = try ctx.mcp_call_tool.?(
+        ctx.mcp_ctx.?,
+        alloc,
+        "mcp_lookup",
+        "{}",
+        ctx.max_tool_result_bytes,
+        .{},
+    );
+    defer alloc.free(result.?.model_output);
+    try std.testing.expectEqualStrings("{\"ok\":true}", result.?.model_output);
+}
+
+test "interactive app prepared file mutation callback applies app permission policy" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.workspace_root = workspace;
+    const mutation_tools = [_]tool_dispatch.Tool{test_builtin_tools.write_file};
+    app.tool_registry = .{ .tools = &mutation_tools };
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("blocked.txt"),
+        .action = .deny,
+    }};
+    app.permission_engine.rules = .{ .rules = &rules };
+    defer app.permission_engine.rules = .{};
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "prepared-app-write",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"blocked.txt\",\"content\":\"blocked\"}",
+    };
+    var prepared = switch (try tool_admission.prepareFileMutationCall(arena, call, .{
+        .tool_registry = app.toolRegistry(),
+        .workspace_root = workspace,
+    })) {
+        .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .prepared => |value| value,
+    };
+    defer prepared.deinit(arena);
+
+    const deps = app_callbacks.Bindings(FakeApp).agentRuntimeDeps(&app);
+    const callback = deps.request_prepared_file_mutation_permission orelse
+        return error.TestExpectedPreparedFileMutationCallback;
+    const review_calls = [_]ToolCall{call};
+    const review_root_messages = [_][]const u8{"do not bypass policy"};
+    const review_turn: permission_auto_classifier.ReviewTurnContext = .{
+        .model = "openai/gpt-5",
+        .pending_assistant = .{ .role = .assistant, .tool_calls = &review_calls },
+        .target_call_id = call.id,
+        .origin = .root,
+        .trusted_root_context = review_root_messages[0],
+    };
+    const outcome = try callback(
+        deps.ctx,
+        arena,
+        call,
+        &prepared,
+        review_turn,
+        .ask,
+        &.{},
+        null,
+        &.{},
+    );
+
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+    try std.testing.expect(outcome.execution_authority == null);
+}
+
+test "app prompt projection configures web search then blocks native execution" {
+    const alloc = std.testing.allocator;
+    const web_search_contract = @import("../tooling/web_search_contract.zig");
+    const ProviderState = struct {
+        calls: usize = 0,
+    };
+    const FailingWebSearchProvider = struct {
+        fn execute(
+            raw_ctx: ?*anyopaque,
+            _: Allocator,
+            _: web_search_runtime.Inputs,
+            _: web_search_contract.ProviderRequest,
+            _: ?web_search_contract.ProgressFn,
+            _: ?*anyopaque,
+        ) anyerror!web_search_contract.ProviderResponse {
+            const state: *ProviderState = @ptrCast(@alignCast(raw_ctx orelse return error.TestWebSearchProvider));
+            state.calls += 1;
+            return error.TestWebSearchProvider;
+        }
+    };
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var provider_state = ProviderState{};
+    var provider = app.web_search_runtime.provider orelse return error.TestExpectedEqual;
+    provider.context = @ptrCast(&provider_state);
+    provider.execute_fn = FailingWebSearchProvider.execute;
+    app.web_search_runtime = web_search_runtime.Runtime.init(.{
+        .provider = provider,
+    });
+
+    app.web_search_runtime.configure(.{
+        .api_key = "stale-key",
+        .worker_model = "stale-model",
+        .gateway_retry_count = 99,
+        .gateway_chat_url = "https://stale.invalid/chat",
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(arena);
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try app.appendRuntimeContextMessage(arena, &messages);
+
+    try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.api_key);
+
+    const validation = try app.validateToolCall(arena, .{
+        .id = "search",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"x\"}",
+    });
+    try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
+    try std.testing.expectEqualStrings(app.auth.apiKey().?, app.web_search_runtime.api_key);
+    try std.testing.expectEqualStrings(app.selected_model.items, app.web_search_runtime.worker_model);
+    try std.testing.expectEqual(@as(usize, 2), app.web_search_runtime.gateway_retry_count);
+    try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
+
+    const execution = try app.executeToolCall(.{
+        .call_allocator = arena,
+        .result_allocator = arena,
+        .call = .{
+            .id = "search-execute",
+            .name = "web_search",
+            .arguments_json = "{\"query\":\"current Zig release\"}",
+        },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 2048,
+    });
+    try std.testing.expectEqualStrings(app.auth.apiKey().?, app.web_search_runtime.api_key);
+    try std.testing.expectEqualStrings(app.selected_model.items, app.web_search_runtime.worker_model);
+    try std.testing.expectEqual(@as(usize, 2), app.web_search_runtime.gateway_retry_count);
+    try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
+    try std.testing.expectEqual(.failure, execution.status);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+}
+
+test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var credential = credentials.Credential{
+        .token = try alloc.dupe(u8, "chatgpt-secret"),
+        .source = .chatgpt_subscription,
+    };
+    defer credential.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &credential);
+    app.selected_provider = .codex;
+
+    const ctx = Runtime(FakeApp).toolContext(
+        &app,
+        &test_ignored_list_entries,
+        100,
+        1024,
+        40,
+        120,
+        2048,
+        2,
+        test_gateway_chat_url,
+    );
+    try std.testing.expect(ctx.web_search_backend == null);
+    try std.testing.expect(ctx.permission_reviewer_provider == null);
+}
+
+test "app agent runtime tool context combines active settings with live permission mode" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    app.fast_mode = false;
+    app.effort = types.ReasoningEffort.literal("low");
+    app.worker.agent_turn_settings = .{
+        .max_tool_result_bytes = 1024,
+        .first_call_tool_choice = .auto,
+        .fast_mode = false,
+        .effort = types.ReasoningEffort.literal("low"),
+    };
+    app.worker.setActiveAgentTurnSettings(.{
+        .max_tool_result_bytes = 8192,
+        .first_call_tool_choice = .none,
+        .fast_mode = true,
+        .effort = types.ReasoningEffort.literal("high"),
+    });
+    defer app.worker.clearActiveAgentTurnSettings();
+    app.permission_engine.mode = .auto;
+
+    const ctx = testToolContext(&app);
+
+    try std.testing.expectEqual(@as(usize, 8192), ctx.max_tool_result_bytes);
+    try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
+    try std.testing.expect(ctx.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), ctx.effort);
+    try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
+}
+
+test "app agent runtime formats active completed denied and MCP tool actions" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const run_call: ToolCall = .{
+        .id = "1",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"zig build\"}",
+    };
+
+    const active = try app.describeToolAction(arena, run_call);
+    try std.testing.expect(std.mem.find(u8, active, "● ") != null);
+    try std.testing.expect(std.mem.find(u8, active, "•") == null);
+    try std.testing.expect(std.mem.find(u8, active, "⏺") == null);
+    try std.testing.expect(std.mem.find(u8, active, "▸") == null);
+    try std.testing.expect(std.mem.find(u8, active, "Running") != null);
+    try std.testing.expect(std.mem.find(u8, active, "zig build") != null);
+
+    const completed = try app.describeToolActionCompleted(arena, run_call);
+    try std.testing.expect(std.mem.find(u8, completed, "● ") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "•") == null);
+    try std.testing.expect(std.mem.find(u8, completed, "⏺") == null);
+    try std.testing.expect(std.mem.find(u8, completed, "▸") == null);
+    try std.testing.expect(std.mem.find(u8, completed, "Ran") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "zig build") != null);
+
+    const denied = try app.describeToolActionDenied(arena, run_call, "Denied");
+    try std.testing.expect(std.mem.find(u8, denied, "Denied") != null);
+    try std.testing.expect(std.mem.find(u8, denied, "zig build") != null);
+
+    const malformed_registered: ToolCall = .{
+        .id = "malformed_registered",
+        .name = "grep_files",
+        .arguments_json = "{",
+    };
+    const malformed_completed = try app.describeToolActionCompleted(arena, malformed_registered);
+    try std.testing.expectEqualStrings(
+        "● Completed\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
+        malformed_completed,
+    );
+    const malformed_denied = try app.describeToolActionDenied(arena, malformed_registered, "Denied");
+    try std.testing.expectEqualStrings(
+        "● Denied\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
+        malformed_denied,
+    );
+
+    const malformed_unknown: ToolCall = .{
+        .id = "malformed_unknown",
+        .name = "mcp_unknown",
+        .arguments_json = "{",
+    };
+    const malformed_unknown_completed = try app.describeToolActionCompleted(arena, malformed_unknown);
+    try std.testing.expect(std.mem.find(u8, malformed_unknown_completed, "mcp_unknown") != null);
+
+    const historical_memory: ToolCall = .{
+        .id = "historical_memory",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"list\"}",
+    };
+    const historical_memory_completed = try app.describeToolActionCompleted(arena, historical_memory);
+    try std.testing.expect(std.mem.find(u8, historical_memory_completed, "memory") != null);
+
+    const mcp_call: ToolCall = .{ .id = "mcp", .name = "mcp_lookup", .arguments_json = "{}" };
+    const mcp_action = try app.describeToolActionCompleted(arena, mcp_call);
+    try std.testing.expect(std.mem.find(u8, mcp_action, "Completed") != null);
+    try std.testing.expect(std.mem.find(u8, mcp_action, "MCP") == null);
+    try std.testing.expect(std.mem.find(u8, mcp_action, "mcp_lookup") != null);
+
+    const advertised = [_][]const u8{"mcp_lookup"};
+    const advertised_mcp_active = try Runtime(FakeApp).describeToolAction(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expectEqualStrings(
+        "● Running MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
+        advertised_mcp_active,
+    );
+    const advertised_mcp_action = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expectEqualStrings(
+        "● Ran MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
+        advertised_mcp_action,
+    );
+    app.mcp_has_tool_calls = 0;
+    const advertised_mcp_denied = try Runtime(FakeApp).describeToolActionDenied(&app, arena, mcp_call, null, "Denied", &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expectEqualStrings(
+        "● Denied\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
+        advertised_mcp_denied,
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.mcp_has_tool_calls);
+
+    app.mcp_name = "mcp_other";
+    app.mcp_has_tool_calls = 0;
+    const unavailable_mcp_action = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expect(std.mem.find(u8, unavailable_mcp_action, "MCP") == null);
+    try std.testing.expectEqual(@as(usize, 1), app.mcp_has_tool_calls);
+
+    app.mcp_has_tool_calls = 0;
+    const builtin_advertised = [_][]const u8{"shell"};
+    _ = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, run_call, null, &builtin_advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expectEqual(@as(usize, 0), app.mcp_has_tool_calls);
+}
+
+test "app agent runtime formats registered tool labels from context registry" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.tool_registry = custom_tool_registry;
+
+    const call: ToolCall = .{
+        .id = "custom",
+        .name = "custom_registered_tool",
+        .arguments_json = "{\"name\":\"registry value\"}",
+    };
+    const active = try app.describeToolAction(arena, call);
+    try std.testing.expect(std.mem.find(u8, active, "Custom running") != null);
+    try std.testing.expect(std.mem.find(u8, active, "registry value") != null);
+
+    const completed = try app.describeToolActionCompleted(arena, call);
+    try std.testing.expect(std.mem.find(u8, completed, "Custom ran") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "registry value") != null);
+}
+
+test "app agent runtime bounds a large multiline run command activity" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const arguments_json = "{\"action\":\"run\",\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
+    const label = try app.describeToolAction(arena, .{
+        .id = "large_command",
+        .name = "shell",
+        .arguments_json = arguments_json,
+    });
+
+    try std.testing.expect(label.len <= 180);
+    try std.testing.expect(std.mem.findScalar(u8, label, '\n') == null);
+    try std.testing.expect(std.mem.find(u8, label, "...") != null);
+}
+
+test "native web_search labels preserve bounded query and domain filters" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const call: ToolCall = .{
+        .id = "web_search",
+        .name = "web_search",
+        .arguments_json = "{\"query\":\"current Zig release\",\"allowed_domains\":[\"ziglang.org\",\"github.com\"]}",
+    };
+    const active = try app.describeToolAction(arena, call);
+    try std.testing.expect(std.mem.find(u8, active, "Searching") != null);
+    try std.testing.expect(std.mem.find(u8, active, "current Zig release") != null);
+    try std.testing.expect(std.mem.find(u8, active, "allowed: ziglang.org, github.com") != null);
+
+    const completed = try app.describeToolActionCompleted(arena, call);
+    try std.testing.expect(std.mem.find(u8, completed, "Searched") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "current Zig release") != null);
+}
+
+test "provider search labels use search wording and generic fallback" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const call: ToolCall = .{
+        .id = "provider_search",
+        .name = "parallel_search",
+        .arguments_json = "{}",
+        .provenance = .provider_executed,
+    };
+    const active = try app.describeToolAction(arena, call);
+    try std.testing.expect(std.mem.find(u8, active, "Searching") != null);
+    try std.testing.expect(std.mem.find(u8, active, "web") != null);
+
+    const completed = try app.describeToolActionCompleted(arena, call);
+    try std.testing.expect(std.mem.find(u8, completed, "Searched") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "web") != null);
+}
+
+test "tool labels preserve skill name value" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const skill_call: ToolCall = .{
+        .id = "skill",
+        .name = "skill",
+        .arguments_json = "{\"name\":\"workflow\"}",
+    };
+    const active = try app.describeToolAction(arena, skill_call);
+    try std.testing.expect(std.mem.find(u8, active, "Loading skill") != null);
+    try std.testing.expect(std.mem.find(u8, active, "workflow") != null);
+
+    const completed = try app.describeToolActionCompleted(arena, skill_call);
+    try std.testing.expect(std.mem.find(u8, completed, "Loaded skill") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "workflow") != null);
+
+    const resource_call: ToolCall = .{
+        .id = "skill_resource",
+        .name = "skill",
+        .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}",
+    };
+    const resource_active = try app.describeToolAction(arena, resource_call);
+    try std.testing.expect(std.mem.find(u8, resource_active, "Reading skill resource") != null);
+    try std.testing.expect(std.mem.find(u8, resource_active, "references/contract-design.md") != null);
+    try std.testing.expect(std.mem.find(u8, resource_active, "Loading skill workflow") == null);
+
+    const resource_completed = try app.describeToolActionCompleted(arena, resource_call);
+    try std.testing.expect(std.mem.find(u8, resource_completed, "Read skill resource") != null);
+    try std.testing.expect(std.mem.find(u8, resource_completed, "references/contract-design.md") != null);
+    try std.testing.expect(std.mem.find(u8, resource_completed, "Loaded skill workflow") == null);
+
+    const install_call: ToolCall = .{
+        .id = "install_skill",
+        .name = "install_skill",
+        .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}",
+    };
+    const install_active = try app.describeToolAction(arena, install_call);
+    try std.testing.expect(std.mem.find(u8, install_active, "Installing skill") != null);
+    try std.testing.expect(std.mem.find(u8, install_active, "vercel-labs/agent-skills") != null);
+
+    const install_completed = try app.describeToolActionCompleted(arena, install_call);
+    try std.testing.expect(std.mem.find(u8, install_completed, "Installed skill") != null);
+    try std.testing.expect(std.mem.find(u8, install_completed, "vercel-labs/agent-skills") != null);
+}
+
+test "subagent labels name the action once with the subagent fallback" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const subagent_call: ToolCall = .{
+        .id = "subagent",
+        .name = "subagent",
+        .arguments_json = "{\"command\":{\"inspect\":{\"id\":\"child\",\"sections\":[\"status\"]}}}",
+    };
+
+    const active = try app.describeToolAction(arena, subagent_call);
+    try std.testing.expectEqualStrings("● Managing\x1b[0m \x1b[38;5;245msubagent\x1b[0m", active);
+
+    const completed = try app.describeToolActionCompleted(arena, subagent_call);
+    try std.testing.expectEqualStrings("● Managed\x1b[0m \x1b[38;5;245msubagent\x1b[0m", completed);
+}
+
+test "app agent runtime refreshes enabled project context through registry" {
+    const alloc = std.testing.allocator;
+    refresh_gather_calls = 0;
+    refresh_targets_match = false;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .context_enabled = true,
+        .context_snapshot = try makeTestContextSnapshot(alloc, "test.stale_context", "stale context"),
+        .context_registry = fresh_context_registry,
+    };
+    defer app.deinit();
+
+    const targets = [_]context_contract.ApplicableTarget{.{
+        .path = "/tmp/workspace/images/example.png",
+        .kind = .file,
+    }};
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, &targets);
+
+    try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
+    try std.testing.expect(refresh_targets_match);
+    const contribution = app.context_snapshot.contribution orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("test.fresh_context", contribution.provider_id);
+    try std.testing.expectEqualStrings("fresh:/tmp/workspace", contribution.content);
+    try std.testing.expectEqualStrings("fresh context notice", app.context_notices.items);
+    try std.testing.expectEqual(types.NoticeTone.warning, app.context_notice_tone.?);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, app.context_notice_visibility.?);
+}
+
+test "app agent runtime clears disabled project context without gathering" {
+    const alloc = std.testing.allocator;
+    refresh_gather_calls = 0;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .context_enabled = false,
+        .context_snapshot = try makeTestContextSnapshot(alloc, "test.stale_context", "stale context"),
+        .context_registry = fresh_context_registry,
+    };
+    defer app.deinit();
+
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, &.{});
+
+    try std.testing.expectEqual(@as(usize, 0), refresh_gather_calls);
+    try std.testing.expect(app.context_snapshot.contribution == null);
+}
+
+test "app agent runtime propagates project context gathering failures" {
+    const alloc = std.testing.allocator;
+    const errors = [_]context_contract.ProviderError{
+        error.OutOfMemory,
+        error.NoSpaceLeft,
+        error.WriteFailed,
+    };
+    for (errors) |expected_error| {
+        refresh_gather_calls = 0;
+        refresh_gather_error = expected_error;
+        var app = RefreshContextApp{
+            .alloc = alloc,
+            .context_enabled = true,
+            .context_snapshot = try makeTestContextSnapshot(alloc, "test.stale_context", "stale context"),
+            .context_registry = failing_context_registry,
+        };
+        defer app.deinit();
+
+        try std.testing.expectError(
+            expected_error,
+            Runtime(RefreshContextApp).refreshProjectContext(&app, &.{}),
+        );
+
+        try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
+        try std.testing.expect(app.context_snapshot.contribution == null);
+    }
+}
+
+test "app agent runtime appends static and transient context through configured registry" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(arena);
+    app.permission_engine.mode = .auto;
+
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
+    try std.testing.expectEqualStrings("provider static:project context", messages.items[0].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
+    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto", messages.items[2].content.?);
+}
+
+test "app agent runtime prefers active queued project context snapshot" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var queued_snapshot = try makeTestContextSnapshot(alloc, "test.queued_context", "queued project context");
+    defer queued_snapshot.deinit(alloc);
+    app.worker.active_context_snapshot = &queued_snapshot;
+    defer app.worker.active_context_snapshot = null;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(arena);
+
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
+    const tool_context = testToolContext(&app);
+    try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
+}
+
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
     return .{
         .prompt = try alloc.dupe(u8, "draft an issue"),
@@ -1719,4 +2598,501 @@ fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     };
+}
+
+test "manual compaction worker call commits a checkpoint without a continuation" {
+    const Gateway = struct {
+        request_count: usize = 0,
+        saw_no_tools: bool = false,
+        observed_model: ?[]const u8 = null,
+
+        fn stream(
+            raw: ?*anyopaque,
+            _: Allocator,
+            request: agent_stream_provider.ModelRequest,
+        ) !agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.request_count += 1;
+            self.observed_model = request.model;
+            self.saw_no_tools = request.tools.advertised_names.len == 0 and
+                request.tools.advertised_functions.len == 0 and
+                request.tools.additional_functions.len == 0 and
+                request.tools.selected_dynamic.len == 0 and
+                request.tool_choice == .none;
+            try request.admission.admit();
+            request.delivery.markPossiblySent();
+            const response = "Continue after manual compaction with the user's constraints intact.";
+            request.events.emit(.{ .content_delta = response });
+            return .{ .completed = .{ .completion = .{
+                .content = response,
+                .finish_reason = .stop,
+            } } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var gateway = Gateway{};
+    var provider = testAgentStreamProvider(Gateway.stream);
+    provider.context = &gateway;
+    app.agent_stream_provider = provider;
+
+    var job = worker_runtime.ContextCompactionTask{
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "api-key"),
+        .history = try alloc.alloc(types.HistoryTurn, 2),
+    };
+    defer worker_runtime.freeContextCompactionTask(alloc, job);
+    job.history[0] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("exact user request") },
+        .assistant = @constCast("exact completed response\n" ++ ("evidence " ** 1_000)),
+    } });
+    job.history[1] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("second user request") },
+        .assistant = @constCast("second response"),
+    } });
+
+    try Runtime(FakeApp).processContextCompaction(&app, job, 1);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
+    try std.testing.expect(gateway.saw_no_tools);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", gateway.observed_model.?);
+    var events = app.worker.takeEvents();
+    defer events.deinit(std.heap.c_allocator);
+    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    try std.testing.expectEqual(@as(usize, 3), events.items.len);
+    try std.testing.expect(events.items[0] == .semantic_notice);
+    try std.testing.expectEqualStrings("Compacting context…", events.items[0].semantic_notice.body);
+    try std.testing.expect(events.items[1] == .context_compaction);
+    try std.testing.expect(events.items[1].context_compaction == .compacted_summary);
+    try std.testing.expect(events.items[2] == .semantic_notice);
+    try std.testing.expectEqualStrings("Context compacted.", events.items[2].semantic_notice.body);
+}
+
+test "app agent runtime processes a cancelled queued prompt" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+
+    const job = try makeQueuedPrompt(alloc);
+    defer worker_runtime.freeQueuedPrompt(alloc, job);
+
+    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url);
+
+    try std.testing.expectEqual(@as(usize, 0), app.append_context_count);
+    try std.testing.expectEqual(@as(usize, 1), app.snapshot_tools_count);
+
+    var events = app.worker.takeEvents();
+    defer events.deinit(std.heap.c_allocator);
+    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expect(events.items[0] == .tool_lifecycle);
+    try std.testing.expect(events.items[0].tool_lifecycle.turn_finished.turn_id != 0);
+    try std.testing.expectEqual(
+        types.TurnPresentationOutcome.interrupted,
+        events.items[0].tool_lifecycle.turn_finished.outcome,
+    );
+    try std.testing.expect(events.items[1] == .finish_prompt);
+    try std.testing.expect(events.items[1].finish_prompt.turn == .interrupted);
+}
+
+test "app direct ask delivers semantic presentation through the runtime sink" {
+    const Gateway = struct {
+        fn stream(
+            _: ?*anyopaque,
+            _: Allocator,
+            request: agent_stream_provider.ModelRequest,
+        ) !agent_stream_provider.Result {
+            try request.admission.admit();
+            request.events.emit(.{ .content_delta = "Before table.\n" ++
+                "| Name | Count |\n" ++
+                "|------|------:|\n" ++
+                "| api | 7 |\n" ++
+                "After table.\n\n" ++
+                "```zig\n" ++
+                "const ready = true;\n" ++
+                "```\n\n" ++
+                "---\n" });
+            return .{ .completed = .{ .completion = .{ .content = "", .finish_reason = .stop } } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    const job = try makeQueuedPrompt(alloc);
+    defer worker_runtime.freeQueuedPrompt(alloc, job);
+
+    app.agent_stream_provider = testAgentStreamProvider(Gateway.stream);
+
+    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url);
+
+    var events = app.worker.takeEvents();
+    defer events.deinit(std.heap.c_allocator);
+    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+
+    var table_count: usize = 0;
+    var code_count: usize = 0;
+    var rule_count: usize = 0;
+    const SemanticEvent = enum { table, code_block, thematic_rule };
+    var semantic_events: [3]SemanticEvent = undefined;
+    var semantic_event_count: usize = 0;
+    for (events.items) |event| switch (event) {
+        .assistant_presentation => |presentation| switch (presentation) {
+            .table => |table| {
+                table_count += 1;
+                semantic_events[semantic_event_count] = .table;
+                semantic_event_count += 1;
+                try std.testing.expectEqualStrings("api", table.rows[1].cells[0]);
+            },
+            .code_block => |block| {
+                code_count += 1;
+                semantic_events[semantic_event_count] = .code_block;
+                semantic_event_count += 1;
+                try std.testing.expectEqualStrings("zig", block.language);
+                try std.testing.expectEqualStrings("const ready = true;\n", block.code);
+            },
+            .thematic_rule => {
+                rule_count += 1;
+                semantic_events[semantic_event_count] = .thematic_rule;
+                semantic_event_count += 1;
+            },
+            .text => {},
+        },
+        else => {},
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), table_count);
+    try std.testing.expectEqual(@as(usize, 1), code_count);
+    try std.testing.expectEqual(@as(usize, 1), rule_count);
+    try std.testing.expectEqualSlices(
+        SemanticEvent,
+        &.{ .table, .code_block, .thematic_rule },
+        semantic_events[0..semantic_event_count],
+    );
+}
+
+test "app agent runtime clears active turn settings when queued prompt setup fails" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    app.fast_mode = false;
+    app.effort = types.ReasoningEffort.literal("low");
+    app.worker.agent_turn_settings = .{
+        .fast_mode = false,
+        .effort = types.ReasoningEffort.literal("low"),
+    };
+    app.snapshot_tools_error = error.TestExpectedEqual;
+
+    var job = try makeQueuedPrompt(alloc);
+    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    job.agent_settings = .{
+        .fast_mode = true,
+        .effort = types.ReasoningEffort.literal("high"),
+    };
+    job.permission_mode = .yolo;
+
+    try std.testing.expectError(error.TestExpectedEqual, Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url));
+    try std.testing.expectEqual(
+        @as(?PermissionMode, .yolo),
+        app.snapshot_permission_mode,
+    );
+
+    const effective = app.worker.effectiveAgentTurnSettings();
+    try std.testing.expect(!effective.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("low"), effective.effort);
+}
+
+test "subagent tool projection uses immutable admission permission rules" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    var live_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("live-rule"),
+        .action = .deny,
+    }};
+    app.permission_engine.rules = .{ .rules = &live_rules };
+    defer app.permission_engine.rules = .{};
+
+    var admission_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("admitted-rule"),
+        .action = .allow,
+    }};
+    var admission = try subagent_domain.captureAdmission(alloc, .{
+        .parent_id = "parent",
+        .source_id = "parent",
+        .model = "test-model",
+        .effort = .auto,
+        .permission_mode = .auto,
+        .rules = .{ .rules = &admission_rules },
+    });
+    defer admission.deinit(alloc);
+
+    var replacement_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("replacement-rule"),
+        .action = .ask,
+    }};
+    var barrier = ProjectionBarrier{};
+    app.snapshot_barrier = &barrier;
+    app.snapshot_tools_error = error.TestExpectedEqual;
+    var turn: subagent_execution.TurnContext = undefined;
+    var cancel = std.atomic.Value(bool).init(false);
+    const message = subagent_domain.QueuedMessage{
+        .id = @constCast("message"),
+        .source_id = @constCast("parent"),
+        .content = @constCast("run"),
+        .created_at_ms = 1,
+    };
+
+    const Project = struct {
+        app: *FakeApp,
+        turn: *subagent_execution.TurnContext,
+        message: subagent_domain.QueuedMessage,
+        admission: subagent_domain.AdmissionSnapshot,
+        cancel: *std.atomic.Value(bool),
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            _ = Runtime(FakeApp).runSubagentChild(
+                self.app,
+                self.turn,
+                self.message,
+                self.admission,
+                self.cancel,
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var project = Project{
+        .app = &app,
+        .turn = &turn,
+        .message = message,
+        .admission = admission,
+        .cancel = &cancel,
+    };
+    const projection_thread = try std.Thread.spawn(.{}, Project.run, .{&project});
+    var joined = false;
+    defer if (!joined) {
+        barrier.release.store(true, .release);
+        projection_thread.join();
+    };
+    const observation_deadline = io_mod.milliTimestamp() + 5_000;
+    while (!barrier.entered.load(.acquire) and
+        !project.done.load(.acquire) and
+        io_mod.milliTimestamp() < observation_deadline)
+    {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    if (!barrier.entered.load(.acquire)) {
+        cancel.store(true, .release);
+        barrier.release.store(true, .release);
+        projection_thread.join();
+        joined = true;
+        return error.TestProjectionNotEntered;
+    }
+    app.permission_engine.rules = .{ .rules = &replacement_rules };
+    barrier.release.store(true, .release);
+    projection_thread.join();
+    joined = true;
+
+    try std.testing.expectEqual(error.OutOfMemory, project.err.?);
+    try std.testing.expectEqualStrings(
+        "admitted-rule",
+        app.snapshot_permission_rule_pattern orelse return error.TestExpectedEqual,
+    );
+}
+
+test "subagent tool context uses immutable admission authority" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    var live_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("live-rule"),
+        .action = .deny,
+    }};
+    app.permission_engine.rules = .{ .rules = &live_rules };
+    defer app.permission_engine.rules = .{};
+
+    var admission_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("admitted-rule"),
+        .action = .allow,
+    }};
+    const admission_grants = [_]types.PermissionGrant{.{
+        .tool_name = @constCast("run_command"),
+        .target_path = @constCast("/tmp/workspace::zig build"),
+    }};
+    var admission = try subagent_domain.captureAdmission(alloc, .{
+        .parent_id = "parent",
+        .source_id = "parent",
+        .model = "test-model",
+        .effort = .auto,
+        .permission_mode = .auto,
+        .rules = .{ .rules = &admission_rules },
+        .grants = &admission_grants,
+    });
+    defer admission.deinit(alloc);
+
+    const ctx = app.subagentToolContextForAdmission(admission);
+    try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
+    try std.testing.expectEqual(@as(usize, 1), ctx.permission_rules.rules.len);
+    try std.testing.expectEqualStrings(
+        "admitted-rule",
+        ctx.permission_rules.rules[0].pattern,
+    );
+    try std.testing.expectEqual(@as(usize, 1), ctx.permission_grants.len);
+    try std.testing.expectEqualStrings(
+        "run_command",
+        ctx.permission_grants[0].tool_name,
+    );
+}
+
+test "app agent runtime discards queued snapshots when tool projection preflight fails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "queued-snapshot.bin", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\nqueued");
+    }
+    const snapshot_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "queued-snapshot.bin");
+    defer alloc.free(snapshot_path);
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.snapshot_tools_error = error.TestExpectedEqual;
+
+    var job = try makeQueuedPrompt(alloc);
+    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    job.images = try types.dupeImageAttachmentSlice(alloc, &.{.{
+        .id = 1,
+        .path = @constCast("/tmp/source.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = snapshot_path,
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    }});
+
+    try std.testing.expectError(
+        error.TestExpectedEqual,
+        Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{}),
+    );
+}
+
+test "app agent runtime discards every snapshot in a failed multi-image preflight" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var first = try tmp.dir.createFile(std.testing.io, "first.bin", .{});
+        defer first.close(std.testing.io);
+        try first.writeStreamingAll(std.testing.io, "first");
+    }
+    {
+        var second = try tmp.dir.createFile(std.testing.io, "second.bin", .{});
+        defer second.close(std.testing.io);
+        try second.writeStreamingAll(std.testing.io, "second");
+    }
+    const first_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "first.bin");
+    defer alloc.free(first_path);
+    const second_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "second.bin");
+    defer alloc.free(second_path);
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.snapshot_tools_error = error.TestExpectedEqual;
+    var job = try makeQueuedPrompt(alloc);
+    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    job.images = try types.dupeImageAttachmentSlice(alloc, &.{
+        .{
+            .id = 1,
+            .path = @constCast("/tmp/first.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = first_path,
+            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        },
+        .{
+            .id = 2,
+            .path = @constCast("/tmp/second.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = second_path,
+            .snapshot_sha256 = @constCast("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        },
+    });
+
+    try std.testing.expectError(
+        error.TestExpectedEqual,
+        Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(std.testing.io, first_path, .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(std.testing.io, second_path, .{}),
+    );
+}
+
+test "app agent runtime queued prompt config uses captured job settings over stale live app state" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    app.fast_mode = false;
+    app.effort = types.ReasoningEffort.literal("low");
+    app.worker.agent_turn_settings = .{
+        .max_tool_result_bytes = 1024,
+        .first_call_tool_choice = .auto,
+        .fast_mode = false,
+        .effort = types.ReasoningEffort.literal("low"),
+    };
+
+    var job = try makeQueuedPrompt(alloc);
+    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    job.agent_settings = .{
+        .max_tool_result_bytes = 8192,
+        .first_call_tool_choice = .none,
+        .fast_mode = true,
+        .effort = types.ReasoningEffort.literal("high"),
+    };
+    const custom_guidance = try alloc.dupe(u8, "app custom tool guidance");
+    var tool_projection = tool_projection_mod.EffectiveToolProjection{
+        .advertised_names = try alloc.alloc([]const u8, 0),
+        .advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0),
+        .custom_guidance = custom_guidance,
+    };
+    defer tool_projection.deinit(alloc);
+    const config = Runtime(FakeApp).buildQueuedPromptConfig(&app, job, "", "", 1, test_gateway_chat_url, &tool_projection, null);
+
+    try std.testing.expect(config.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
+    try std.testing.expectEqual(@as(usize, 8192), config.max_tool_result_bytes);
+    try std.testing.expectEqual(types.ToolChoice.none, config.first_call_tool_choice);
+    try std.testing.expectEqualSlices([]const u8, tool_projection.advertised_names, config.advertised_tool_names);
+    try std.testing.expectEqualSlices(model_tool_schema.FunctionSchema, tool_projection.advertised_functions, config.advertised_functions);
+    try std.testing.expectEqualStrings(tool_projection.custom_guidance, config.custom_tool_guidance);
+    try std.testing.expectEqualStrings(test_prompt_policy.system_prompt, config.system_prompt);
+    try std.testing.expectEqualStrings("test model overlay", config.model_prompt_overlay.?);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.effort);
 }

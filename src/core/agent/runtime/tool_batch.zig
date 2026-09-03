@@ -311,23 +311,23 @@ pub fn processCommittedFileResult(
     }
     const committed_contract_degraded =
         execution.status != .success or
-        execution.prepared_result_memory == null or
+        !execution.tool_result_memory_prepared or
+        execution.tool_result_memory == null or
         execution.diff_entry != null or
-        execution.display_output != null or
         execution.finish_turn;
     if (committed_contract_degraded) {
         debug_trace.eventf(
             "tool",
             "committed_result_contract_degraded",
             step_ctx,
-            "call_id={s} name={s} status={s} memory={s} diff={s} display={s} finish_turn={s}",
+            "call_id={s} name={s} status={s} memory={s} diff={s} finish_turn={s}",
             .{
                 tool_call.id,
                 tool_call.name,
                 @tagName(execution.status),
-                if (execution.prepared_result_memory != null) "true" else "false",
+                if (execution.tool_result_memory_prepared and
+                    execution.tool_result_memory != null) "true" else "false",
                 if (execution.diff_entry != null) "true" else "false",
-                if (execution.display_output != null) "true" else "false",
                 if (execution.finish_turn) "true" else "false",
             },
         );
@@ -336,11 +336,14 @@ pub fn processCommittedFileResult(
         }
     }
 
-    var prepared_memory = execution.prepared_result_memory orelse
-        types.ToolResultMemory{
-            .output_bytes = execution.model_output.len,
-            .stored_output_bytes = execution.model_output.len,
-        };
+    const fallback_memory = types.ToolResultMemory{
+        .output_bytes = execution.model_output.len,
+        .stored_output_bytes = execution.model_output.len,
+    };
+    var prepared_memory = if (execution.tool_result_memory_prepared)
+        execution.tool_result_memory orelse fallback_memory
+    else
+        fallback_memory;
     prepared_memory.committed_file_presentation = runtime_execution_memory.captureCommittedFilePresentation(
         history_allocator,
         handoff,
@@ -509,4 +512,86 @@ pub fn appendReviewContinuationSuffix(
         const review_prompt = "Review the changes you just made. Re-read any modified files and briefly note any issues (syntax errors, missing imports, logic bugs). If everything looks correct, say so.";
         try within_turn_suffix.append(arena, .{ .role = .user, .content = review_prompt });
     }
+}
+
+test "appendPermissionFeedback marks typed approval feedback" {
+    const alloc = std.testing.allocator;
+    var batch = StepBatchState{};
+    defer {
+        for (batch.pending_user_suffix.items) |message| {
+            if (message.content) |text| alloc.free(@constCast(text));
+        }
+        batch.pending_user_suffix.deinit(alloc);
+    }
+    try appendPermissionFeedback(
+        alloc,
+        &batch,
+        "call_permission",
+        &.{ "", "read it after writing" },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), batch.pending_user_suffix.items.len);
+    try std.testing.expect(batch.pending_user_suffix.items[0].permission_feedback);
+    try std.testing.expectEqualStrings(
+        "call_permission",
+        batch.pending_user_suffix.items[0].tool_call_id.?,
+    );
+}
+
+test "drained batch feedback follows all tool results and keeps its source call" {
+    const alloc = std.testing.allocator;
+    var batch = StepBatchState{};
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    defer {
+        for (suffix.items) |message| {
+            if (message.role == .user) {
+                if (message.content) |text| alloc.free(@constCast(text));
+            }
+        }
+        suffix.deinit(alloc);
+        batch.pending_user_suffix.deinit(alloc);
+    }
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    defer completed_tool_names.deinit(alloc);
+    const calls = [_]ToolCall{
+        .{ .id = "call_first", .name = "run_command", .arguments_json = "{}" },
+        .{ .id = "call_second", .name = "run_command", .arguments_json = "{}" },
+    };
+
+    try appendAssistantToolCallStep(alloc, &suffix, null, &calls, null);
+    try appendToolResultContent(
+        alloc,
+        &suffix,
+        &completed_tool_names,
+        &batch,
+        calls[0],
+        "first command completed",
+        null,
+        .{},
+    );
+    try appendPermissionFeedback(
+        alloc,
+        &batch,
+        calls[0].id,
+        &.{"first command feedback marker"},
+    );
+    try appendToolResultContent(
+        alloc,
+        &suffix,
+        &completed_tool_names,
+        &batch,
+        calls[1],
+        "second command completed",
+        null,
+        .{},
+    );
+    try drainPendingUserSuffix(alloc, &batch, &suffix);
+
+    try std.testing.expectEqual(@as(usize, 4), suffix.items.len);
+    try std.testing.expectEqual(.assistant, suffix.items[0].role);
+    try std.testing.expectEqual(.tool, suffix.items[1].role);
+    try std.testing.expectEqual(.tool, suffix.items[2].role);
+    try std.testing.expectEqual(.user, suffix.items[3].role);
+    try std.testing.expectEqualStrings("call_first", suffix.items[3].tool_call_id.?);
+    try std.testing.expect(suffix.items[3].permission_feedback);
 }

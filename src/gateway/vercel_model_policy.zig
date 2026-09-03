@@ -2,7 +2,7 @@ const std = @import("std");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 
 pub fn capabilitiesForModel(model: []const u8) model_capabilities.Capabilities {
-    var capabilities: model_capabilities.Capabilities = .{};
+    var capabilities = model_capabilities.capabilitiesForModel(model);
     if (std.mem.startsWith(u8, model, "anthropic/")) {
         capabilities.prompt_caching = true;
     } else if (std.mem.startsWith(u8, model, "xai/")) {
@@ -52,4 +52,14 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
     }
     return false;
+}
+
+test "Vercel fallback policy owns vendor model heuristics" {
+    try std.testing.expect(!capabilitiesForModel("moonshotai/kimi-k3").intrinsic_fast);
+    try std.testing.expect(capabilitiesForModel("moonshotai/kimi-k3-fast").intrinsic_fast);
+    try std.testing.expect(capabilitiesForModel("anthropic/claude-opus-4.8-fast").intrinsic_fast);
+    try std.testing.expect(!capabilitiesForModel("moonshotai/kimi-k3-fast").supports_fast_mode);
+    try std.testing.expectEqual(@as(?u32, 1_000_000), contextWindowSize("anthropic/claude-opus-4.8"));
+    try std.testing.expect(capabilitiesForModel("anthropic/claude-opus-4.8").prompt_caching);
+    try std.testing.expectEqual(@as(?bool, true), capabilitiesForModel("xai/grok-4").parallel_tool_calls);
 }

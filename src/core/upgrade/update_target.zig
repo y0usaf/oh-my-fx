@@ -46,7 +46,7 @@ pub const Target = union(Channel) {
     pub fn initStable(alloc: Allocator, raw_version: []const u8) !Target {
         const trimmed = std.mem.trim(u8, raw_version, " \t\r\n");
         const normalized_version = normalizeVersion(trimmed);
-        if (!validVersion(normalized_version)) return error.InvalidVersion;
+        if (!isValidVersion(normalized_version)) return error.InvalidVersion;
 
         const owned_version = try alloc.dupe(u8, normalized_version);
         errdefer alloc.free(owned_version);
@@ -75,7 +75,7 @@ pub const Target = union(Channel) {
 
         const normalized_version = normalizeVersion(version_value.string);
         const manifest_revision = revision_value.string;
-        if (!validVersion(normalized_version) or !validRevision(manifest_revision)) {
+        if (!isValidVersion(normalized_version) or !isValidRevision(manifest_revision)) {
             return error.InvalidManifest;
         }
 
@@ -161,7 +161,7 @@ pub fn compareVersions(a: []const u8, b: []const u8) std.math.Order {
     return std.math.order(av[2], bv[2]);
 }
 
-fn validVersion(raw: []const u8) bool {
+pub fn isValidVersion(raw: []const u8) bool {
     if (raw.len == 0 or raw.len > max_version_bytes) return false;
     var count: usize = 0;
     var parts = std.mem.splitScalar(u8, raw, '.');
@@ -174,7 +174,7 @@ fn validVersion(raw: []const u8) bool {
     return count == 3;
 }
 
-fn validRevision(raw: []const u8) bool {
+pub fn isValidRevision(raw: []const u8) bool {
     if (raw.len < min_revision_bytes or raw.len > max_revision_bytes) return false;
     for (raw) |byte| if (!std.ascii.isHex(byte)) return false;
     return true;
@@ -190,7 +190,7 @@ fn parseVersionParts(raw: []const u8) [3]u32 {
     return values;
 }
 
-fn revisionsEqual(full: []const u8, current: []const u8) bool {
+pub fn revisionsEqual(full: []const u8, current: []const u8) bool {
     if (std.mem.eql(u8, current, "unknown")) return false;
     const common_len = @min(full.len, current.len);
     if (common_len < min_revision_bytes) return false;
@@ -199,4 +199,91 @@ fn revisionsEqual(full: []const u8, current: []const u8) bool {
 
 fn shortRevision(revision: []const u8) []const u8 {
     return revision[0..@min(revision.len, 12)];
+}
+
+test "channel parsing accepts only stable and dev" {
+    try std.testing.expectEqual(Channel.stable, Channel.parse("stable").?);
+    try std.testing.expectEqual(Channel.dev, Channel.parse("DEV").?);
+    try std.testing.expect(Channel.parse("nightly") == null);
+}
+
+test "dev manifest creates a bounded immutable target" {
+    const alloc = std.testing.allocator;
+    var target = try Target.parseDevManifest(
+        alloc,
+        "{\"version\":\"0.3.62\",\"commit\":\"0123456789abcdef0123456789abcdef01234567\"}",
+    );
+    defer target.deinit(alloc);
+
+    try std.testing.expectEqual(Channel.dev, target.channel());
+    try std.testing.expectEqualStrings("0.3.62", target.version());
+    try std.testing.expectEqualStrings(
+        "dev/0123456789abcdef0123456789abcdef01234567",
+        target.artifactRef(),
+    );
+    var label_buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("dev 0123456789ab", try target.writeDisplayLabel(&label_buf));
+}
+
+test "dev manifest rejects malformed and oversized external data" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidManifest,
+        Target.parseDevManifest(alloc, "{\"version\":\"0.3.62\",\"commit\":\"../escape\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidManifest,
+        Target.parseDevManifest(alloc, "{\"version\":\"0.3\",\"commit\":\"0123456\"}"),
+    );
+    try std.testing.expectError(
+        error.ManifestTooLarge,
+        Target.parseDevManifest(alloc, " " ** (max_manifest_bytes + 1)),
+    );
+}
+
+test "stable release ordering rejects older targets and preserves channel switching" {
+    const alloc = std.testing.allocator;
+    var older = try Target.initStable(alloc, "v0.0.1");
+    defer older.deinit(alloc);
+    const newer_current = CurrentBuild{
+        .channel = .stable,
+        .version = "0.0.2",
+        .revision = "0123456789ab",
+    };
+
+    try std.testing.expect(!older.shouldInstall(newer_current));
+    try std.testing.expect(!older.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.4.5",
+        .revision = "0123456789ab",
+    }));
+    try std.testing.expect(older.shouldInstall(.{
+        .channel = .dev,
+        .version = "0.0.2",
+        .revision = "abcdef012345",
+    }));
+}
+
+test "target freshness uses version for stable and revision for dev" {
+    const alloc = std.testing.allocator;
+    var stable = try Target.initStable(alloc, "v0.3.63");
+    defer stable.deinit(alloc);
+    const stable_current = CurrentBuild{
+        .channel = .stable,
+        .version = "0.3.62",
+        .revision = "0123456789ab",
+    };
+    try std.testing.expect(stable.shouldInstall(stable_current));
+
+    var dev = try Target.parseDevManifest(
+        alloc,
+        "{\"version\":\"0.3.62\",\"commit\":\"abcdef0123456789abcdef0123456789abcdef01\"}",
+    );
+    defer dev.deinit(alloc);
+    try std.testing.expect(dev.shouldInstall(stable_current));
+    try std.testing.expect(!dev.shouldInstall(.{
+        .channel = .dev,
+        .version = "0.3.62",
+        .revision = "abcdef012345",
+    }));
 }

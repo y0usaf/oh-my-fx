@@ -184,6 +184,109 @@ pub const State = struct {
 
     fn reconcilePickerAfterEdit(self: State) void {
         self.picker.reconcileInlinePickerAfterEdit(self.edit);
-        self.picker.resetActiveModelPickerIndex();
+        self.picker.resetActiveCompletionIndex();
     }
 };
+
+test "bounded insertion rejects before applying the successful transition" {
+    const alloc = std.testing.allocator;
+    const placeholder = "[Pasted text #1, 1 line]";
+
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, placeholder);
+
+    var picker: picker_state.State = .{};
+    defer picker.deinit(alloc);
+    try picker.beginModelPickerFlow(alloc, "openai/gpt-5", 2, false, .effort);
+    picker.file_completion_index = 3;
+    picker.file_completion_window_start = 1;
+
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    try entities.pasted_blocks.append(alloc, .{
+        .id = 1,
+        .text = try alloc.dupe(u8, "expanded"),
+        .line_count = 1,
+        .span = .{ .raw_start = 0, .raw_end = placeholder.len },
+    });
+
+    var vertical: vertical_navigation.State = .{ .preferred_column = 7 };
+    var rejection = input_limit_rejection.begin(.{}, text_scalar.Owner.composer).next;
+    var history: edit_history.State = .{};
+    defer history.deinit(alloc);
+    var insertion = State{
+        .edit = &edit,
+        .history = &history,
+        .picker = &picker,
+        .entities = &entities,
+        .vertical_navigation = &vertical,
+        .input_limit_rejection = &rejection,
+    };
+
+    try std.testing.expectEqual(
+        editor_state.InsertResult.limit_exceeded,
+        try insertion.insertSliceBounded(alloc, "!", "expanded".len, .clear),
+    );
+    try std.testing.expectEqualStrings(placeholder, edit.input.items);
+    try std.testing.expectEqual(@as(?usize, 7), vertical.preferredColumn());
+    try std.testing.expectEqual(text_scalar.Owner.composer, rejection.owner.?);
+    try std.testing.expectEqual(picker_state.ModelPickerStage.effort, picker.model_picker_stage);
+    try std.testing.expectEqual(@as(usize, 3), picker.file_completion_index);
+    try std.testing.expectEqual(@as(usize, 1), picker.file_completion_window_start);
+
+    try std.testing.expectEqual(
+        editor_state.InsertResult.inserted,
+        try insertion.insertSliceBounded(alloc, "!", "expanded!".len, .clear),
+    );
+    try std.testing.expectEqualStrings(placeholder ++ "!", edit.input.items);
+    try std.testing.expectEqual(@as(?usize, null), vertical.preferredColumn());
+    try std.testing.expect(rejection.owner == null);
+    try std.testing.expectEqual(picker_state.ModelPickerStage.model, picker.model_picker_stage);
+    try std.testing.expectEqual(@as(usize, 3), picker.file_completion_index);
+    try std.testing.expectEqual(@as(usize, 1), picker.file_completion_window_start);
+    try std.testing.expectEqual(@as(?usize, "expanded!".len), pasted_blocks.expandedLen(
+        edit.input.items,
+        entities.pasted_blocks.items,
+    ));
+}
+
+test "bounded rejection preserves a pending auto separator" {
+    const alloc = std.testing.allocator;
+
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "@AGENTS.md ");
+
+    var picker: picker_state.State = .{};
+    defer picker.deinit(alloc);
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    entities.markFileCompletionSeparator(
+        edit.input.items,
+        edit.cursor,
+        edit.input.items.len - 1,
+    );
+    var vertical: vertical_navigation.State = .{};
+    var rejection: input_limit_rejection.State = .{};
+    var history: edit_history.State = .{};
+    defer history.deinit(alloc);
+    const insertion = State{
+        .edit = &edit,
+        .history = &history,
+        .picker = &picker,
+        .entities = &entities,
+        .vertical_navigation = &vertical,
+        .input_limit_rejection = &rejection,
+    };
+
+    try std.testing.expectEqual(
+        InsertResult.limit_exceeded,
+        try insertion.insertByteBounded(alloc, 'x', edit.input.items.len, .clear),
+    );
+    try std.testing.expectEqual(
+        InsertResult.inserted,
+        try insertion.insertByteBounded(alloc, ' ', edit.input.items.len, .clear),
+    );
+    try std.testing.expectEqualStrings("@AGENTS.md ", edit.input.items);
+}

@@ -533,6 +533,195 @@ fn writeMetadata(writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"io.modelcontextprotocol/related-task\":{\"taskId\":\"fx-test\"}}");
 }
 
+test "prompt pagination owns arguments and sorts stable names" {
+    const alloc = std.testing.allocator;
+    var builder = CatalogBuilder.init(alloc, .modern);
+    defer builder.deinit(alloc);
+    var first = try parseListPage(
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"prompts\":[{\"name\":\"review\",\"description\":\"Review code\",\"arguments\":[{\"name\":\"focus\",\"required\":true}]}],\"nextCursor\":\"next\",\"ttlMs\":100}}",
+        .modern,
+        .{},
+    );
+    defer first.deinit(alloc);
+    try builder.appendPage(alloc, &first, 1000, .{});
+    var second = try parseListPage(
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"prompts\":[{\"name\":\"explain\",\"arguments\":[]}],\"ttlMs\":50}}",
+        .modern,
+        .{},
+    );
+    defer second.deinit(alloc);
+    try builder.appendPage(alloc, &second, 1010, .{});
+    var catalog = try builder.finish(alloc);
+    defer catalog.deinit(alloc);
+    try std.testing.expectEqualStrings("explain", catalog.prompts[0].name);
+    try std.testing.expectEqual(@as(u64, 1060), catalog.expires_at_ms);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateArgumentsJson(alloc, catalog.prompts[1], "{}", .{}),
+    );
+}
+
+test "prompt get preserves every permitted content type" {
+    const alloc = std.testing.allocator;
+    var outcome = try parseGetOutcome(
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"description\":\"fixture\",\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"hello\"}},{\"role\":\"assistant\",\"content\":{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"aGVsbG8=\"}},{\"role\":\"user\",\"content\":{\"type\":\"audio\",\"mimeType\":\"audio/wav\",\"data\":\"aGVsbG8=\"}},{\"role\":\"assistant\",\"content\":{\"type\":\"resource_link\",\"uri\":\"git://repo\",\"name\":\"repo\"}},{\"role\":\"user\",\"content\":{\"type\":\"resource\",\"resource\":{\"uri\":\"memory://one\",\"text\":\"body\"}}}]}}",
+        .modern,
+        .{},
+    );
+    defer outcome.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), outcome.complete.messages.len);
+    try std.testing.expectEqual(ContentKind.resource, outcome.complete.messages[4].content_kind);
+    try std.testing.expectError(
+        error.MessageLimitExceeded,
+        parseGetOutcome(
+            alloc,
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"hello\"}}]}}",
+            .modern,
+            .{ .common = .{ .max_total_content_bytes = 4 } },
+        ),
+    );
+}
+
+test "prompt content preserves schema-valid empty text and zero-byte media" {
+    const alloc = std.testing.allocator;
+    var outcome = try parseGetOutcome(
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"\"}},{\"role\":\"assistant\",\"content\":{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"\"}},{\"role\":\"user\",\"content\":{\"type\":\"audio\",\"mimeType\":\"audio/wav\",\"data\":\"\"}}]}}",
+        .modern,
+        .{},
+    );
+    defer outcome.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), outcome.complete.messages.len);
+    try std.testing.expect(std.mem.find(
+        u8,
+        outcome.complete.messages[0].content_json,
+        "\"text\":\"\"",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        outcome.complete.messages[1].content_json,
+        "\"data\":\"\"",
+    ) != null);
+}
+
+test "prompt catalog metadata enforces the shared JSON depth boundary" {
+    const alloc = std.testing.allocator;
+    const limits = Limits{ .common = .{ .max_json_depth = 6 } };
+
+    var below = try parseListPage(
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"prompts\":[{\"name\":\"below\",\"_meta\":{\"value\":1}}]}}",
+        .modern,
+        limits,
+    );
+    below.deinit(alloc);
+    var at = try parseListPage(
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"prompts\":[{\"name\":\"at\",\"_meta\":{\"nested\":{\"value\":1}}}]}}",
+        .modern,
+        limits,
+    );
+    at.deinit(alloc);
+    try std.testing.expectError(
+        error.JsonDepthLimitExceeded,
+        parseListPage(
+            alloc,
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"prompts\":[{\"name\":\"above\",\"_meta\":{\"nested\":{\"again\":{\"value\":1}}}}]}}",
+            .modern,
+            limits,
+        ),
+    );
+}
+
+test "prompt content enforces the shared JSON depth boundary" {
+    const alloc = std.testing.allocator;
+    const limits = Limits{ .common = .{ .max_json_depth = 7 } };
+
+    var below = try parseGetOutcome(
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"ok\",\"_meta\":{\"value\":1}}}]}}",
+        .modern,
+        limits,
+    );
+    below.deinit(alloc);
+    var at = try parseGetOutcome(
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"ok\",\"_meta\":{\"nested\":{\"value\":1}}}}]}}",
+        .modern,
+        limits,
+    );
+    at.deinit(alloc);
+    try std.testing.expectError(
+        error.JsonDepthLimitExceeded,
+        parseGetOutcome(
+            alloc,
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"no\",\"_meta\":{\"nested\":{\"again\":{\"value\":1}}}}}]}}",
+            .modern,
+            limits,
+        ),
+    );
+}
+
+test "prompt arguments enforce the shared JSON depth boundary" {
+    const alloc = std.testing.allocator;
+    var arguments = [_]Argument{.{ .name = @constCast("focus") }};
+    const prompt = Prompt{
+        .name = @constCast("review"),
+        .arguments = &arguments,
+    };
+    const limits = Limits{ .common = .{ .max_json_depth = 1 } };
+    try validateArgumentsJson(alloc, prompt, "{}", limits);
+    try validateArgumentsJson(alloc, prompt, "{\"focus\":\"security\"}", limits);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateArgumentsJson(alloc, prompt, "{\"focus\":{\"nested\":\"no\"}}", limits),
+    );
+}
+
+test "MRTR request state enforces the shared JSON depth boundary" {
+    const alloc = std.testing.allocator;
+    const limits = Limits{ .common = .{ .max_json_depth = 10 } };
+    const below_response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"input_required","inputRequests":{"confirm":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}}}}}},"requestState":{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}}}
+    ;
+    var below = try parseGetOutcome(alloc, below_response, .modern, limits);
+    below.deinit(alloc);
+
+    const at_response =
+        \\{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"confirm":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}}}}}},"requestState":{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":1}}}}}}}}}}
+    ;
+    var at = try parseGetOutcome(alloc, at_response, .modern, limits);
+    at.deinit(alloc);
+
+    const above_response =
+        \\{"jsonrpc":"2.0","id":3,"result":{"resultType":"input_required","inputRequests":{"confirm":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}}}}}},"requestState":{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":{"i":1}}}}}}}}}}}
+    ;
+    try std.testing.expectError(
+        error.JsonDepthLimitExceeded,
+        parseGetOutcome(alloc, above_response, .modern, limits),
+    );
+}
+
+test "prompt get request preserves exact MRTR continuation" {
+    const alloc = std.testing.allocator;
+    const request = try buildGetRequest(
+        alloc,
+        4,
+        .modern,
+        "review",
+        "{\"focus\":\"security\"}",
+        writeMetadata,
+        "{\"choice\":\"continue\"}",
+        "{\"opaque\":true}",
+    );
+    defer alloc.free(request);
+    try std.testing.expect(std.mem.find(u8, request, "\"name\":\"review\"") != null);
+    try std.testing.expect(std.mem.find(u8, request, "\"requestState\":{\"opaque\":true}") != null);
+}
+
 fn checkPromptCatalogAllocationFailures(alloc: Allocator) !void {
     var page = try parseListPage(
         alloc,
@@ -546,4 +735,12 @@ fn checkPromptCatalogAllocationFailures(alloc: Allocator) !void {
     try builder.appendPage(alloc, &page, 1, .{});
     var catalog = try builder.finish(alloc);
     defer catalog.deinit(alloc);
+}
+
+test "prompt catalog construction is allocation failure safe" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkPromptCatalogAllocationFailures,
+        .{},
+    );
 }

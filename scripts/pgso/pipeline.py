@@ -60,7 +60,7 @@ PROFILE_SECTIONS = (
 )
 
 ARTIFACT_LAYOUTS = {
-    "omfx": (None, "omfx", "omfx.bc"),
+    "fx": (None, "fx", "fx.bc"),
     "file_index": ("bench-file-index", "file-index-bench", "file-index.bc"),
     "ui_activity": (
         "bench-ui-activity",
@@ -81,7 +81,7 @@ class ArtifactSpec:
     target: str = SUPPORTED_TARGET
     optimize: str = "ReleaseSafe"
     update_channel: str = "stable"
-    selector: str = "omfx"
+    selector: str = "fx"
 
     def __post_init__(self) -> None:
         if self.target != SUPPORTED_TARGET:
@@ -132,7 +132,7 @@ class PipelinePaths:
         cls,
         root: pathlib.Path,
         *,
-        selector: str = "omfx",
+        selector: str = "fx",
     ) -> "PipelinePaths":
         return cls._initialize(root, selector=selector, require_empty=True)
 
@@ -141,7 +141,7 @@ class PipelinePaths:
         cls,
         root: pathlib.Path,
         *,
-        selector: str = "omfx",
+        selector: str = "fx",
     ) -> "PipelinePaths":
         root = root.resolve()
         if not root.is_dir():
@@ -316,7 +316,7 @@ def profile_use_argv(
     profile_path: pathlib.Path | None = None,
 ) -> tuple[str, ...]:
     profile = profile_path or paths.merged_profile
-    flags = USE_FLAGS if paths.selector == "omfx" else BENCHMARK_USE_FLAGS
+    flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
     return (
         str(toolchain.opt),
         *flags,
@@ -383,7 +383,7 @@ def candidate_object_argv(
 ) -> tuple[str, ...]:
     # A second AArch64 outliner pass can fold sequences exposed by the first.
     # Keep benchmark artifacts on their established code-generation contract.
-    outliner_flags = FX_MACHINE_OUTLINER_FLAGS if paths.selector == "omfx" else ()
+    outliner_flags = FX_MACHINE_OUTLINER_FLAGS if paths.selector == "fx" else ()
     return (
         str(toolchain.llc),
         "-filetype=obj",

@@ -31,6 +31,7 @@ pub const OAuthError = error{
     AccessDenied,
     ExpiredToken,
     InvalidClient,
+    InvalidGrant,
     OAuthRequestFailed,
 };
 
@@ -331,6 +332,7 @@ fn mapOAuthHttpError(alloc: Allocator, body: []const u8) !void {
     if (std.mem.eql(u8, value.string, "access_denied")) return OAuthError.AccessDenied;
     if (std.mem.eql(u8, value.string, "expired_token")) return OAuthError.ExpiredToken;
     if (std.mem.eql(u8, value.string, "invalid_client")) return OAuthError.InvalidClient;
+    if (std.mem.eql(u8, value.string, "invalid_grant")) return OAuthError.InvalidGrant;
     return OAuthError.OAuthRequestFailed;
 }
 
@@ -441,4 +443,147 @@ const TransportProbe = struct {
 fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
+}
+
+test "oauth discovery maps protocol input through the injected transport" {
+    const issuer = "https://vercel.test";
+    var probe = TransportProbe{
+        .expected_method = .get,
+        .expected_url = issuer ++ "/.well-known/openid-configuration",
+        .response_body = "{\"issuer\":\"https://vercel.test\",\"device_authorization_endpoint\":\"https://vercel.test/device\",\"token_endpoint\":\"https://vercel.test/token\"}",
+    };
+
+    var metadata = try discover(std.testing.allocator, probe.provider(), issuer);
+    defer metadata.deinit(std.testing.allocator);
+
+    try std.testing.expect(probe.matched);
+    try std.testing.expectEqualStrings("https://vercel.test/token", metadata.token_endpoint);
+}
+
+test "oauth device authorization owns form mapping while transport owns execution" {
+    var probe = TransportProbe{
+        .expected_method = .post_form,
+        .expected_url = "https://vercel.test/device",
+        .expected_payload = "client_id=client%20id&scope=openid%20offline_access",
+        .response_body = "{\"device_code\":\"device\",\"user_code\":\"CODE\",\"verification_uri\":\"https://vercel.test/verify\",\"expires_in\":600,\"interval\":5}",
+    };
+    const metadata = Metadata{
+        .issuer = @constCast("https://vercel.test"),
+        .device_authorization_endpoint = @constCast("https://vercel.test/device"),
+        .token_endpoint = @constCast("https://vercel.test/token"),
+    };
+
+    var device = try requestDeviceAuthorization(
+        std.testing.allocator,
+        probe.provider(),
+        metadata,
+        "client id",
+    );
+    defer device.deinit(std.testing.allocator);
+
+    try std.testing.expect(probe.matched);
+    try std.testing.expectEqualStrings("device", device.device_code);
+}
+
+test "oauth polling forwards bounds and preserves pending responses" {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1),
+    });
+    var probe = TransportProbe{
+        .expected_method = .post_form,
+        .expected_url = "https://vercel.test/token",
+        .expected_payload = "client_id=client&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code&device_code=device",
+        .response_disposition = .rejected,
+        .response_body = "{\"error\":\"authorization_pending\"}",
+        .expected_cancel_flag = &cancel_flag,
+        .expect_deadline = true,
+    };
+    const metadata = Metadata{
+        .issuer = @constCast("https://vercel.test"),
+        .device_authorization_endpoint = @constCast("https://vercel.test/device"),
+        .token_endpoint = @constCast("https://vercel.test/token"),
+    };
+
+    const result = try pollDeviceTokenBounded(
+        std.testing.allocator,
+        probe.provider(),
+        metadata,
+        "client",
+        "device",
+        &cancel_flag,
+        deadline,
+    );
+
+    try std.testing.expect(probe.matched);
+    try std.testing.expectEqual(PollResult.pending, result);
+}
+
+test "a reduced grant names the scope the issuer withheld" {
+    try std.testing.expect(missingGrantedScope("openid offline_access", "openid offline_access") == null);
+    try std.testing.expect(missingGrantedScope("openid", "openid email profile") == null);
+    try std.testing.expectEqualStrings(
+        "offline_access",
+        missingGrantedScope("openid offline_access", "openid").?,
+    );
+    // The scope fx used to request was never advertised, so every grant dropped it.
+    try std.testing.expectEqualStrings(
+        "use:ai-gateway",
+        missingGrantedScope("openid offline_access use:ai-gateway", "openid offline_access").?,
+    );
+    try std.testing.expect(missingGrantedScope("", "openid") == null);
+}
+
+test "oauth parses metadata" {
+    var metadata = try parseMetadata(
+        std.testing.allocator,
+        "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/device\",\"token_endpoint\":\"https://vercel.com/token\",\"revocation_endpoint\":\"https://vercel.com/revoke\"}",
+    );
+    defer metadata.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://vercel.com", metadata.issuer);
+    try std.testing.expectEqualStrings("https://vercel.com/device", metadata.device_authorization_endpoint);
+}
+
+test "oauth maps provider errors" {
+    try std.testing.expectError(OAuthError.AuthorizationPending, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"authorization_pending\"}"));
+    try std.testing.expectError(OAuthError.SlowDown, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"slow_down\"}"));
+    try std.testing.expectError(OAuthError.AccessDenied, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"access_denied\"}"));
+    try std.testing.expectError(OAuthError.ExpiredToken, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"expired_token\"}"));
+    try std.testing.expectError(OAuthError.OAuthRequestFailed, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"invalid_request\"}"));
+    try std.testing.expectError(OAuthError.OAuthRequestFailed, mapOAuthHttpError(std.testing.allocator, "{\"error\":42}"));
+    try std.testing.expectError(OAuthError.InvalidClient, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"invalid_client\"}"));
+    try std.testing.expectError(OAuthError.InvalidGrant, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"invalid_grant\"}"));
+}
+
+test "oauth parses token set" {
+    var token = try parseTokenSet(
+        std.testing.allocator,
+        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
+    );
+    defer token.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("access", token.access_token);
+    try std.testing.expectEqualStrings("refresh", token.refresh_token.?);
+    try std.testing.expectEqual(@as(i64, 3600), token.expires_in);
+}
+
+test "oauth parsers clean up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_metadata_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_device_authorization_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_token_set_allocation_failures, .{});
+}
+
+test "oauth expiry timestamps reject invalid durations" {
+    try std.testing.expectEqual(@as(i64, 11_000), try expiry_timestamp_ms(1_000, 10));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(1_000, 0));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(1_000, -1));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(1_000, std.math.maxInt(i64)));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(std.math.maxInt(i64), 1));
+}
+
+test "oauth parsers reject non-object JSON" {
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, parseMetadata(std.testing.allocator, "[]"));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, parseDeviceAuthorization(std.testing.allocator, "null"));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, parseTokenSet(std.testing.allocator, "\"token\""));
+    try std.testing.expectError(OAuthError.OAuthRequestFailed, mapOAuthHttpError(std.testing.allocator, "42"));
 }

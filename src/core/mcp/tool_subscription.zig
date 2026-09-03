@@ -1090,3 +1090,300 @@ fn saturatingIncrement(value: *atomic_value.Value(u64)) void {
         current = result.?;
     }
 }
+
+test "subscription request opens only the Tools filter" {
+    const request = try buildListenRequest(std.testing.allocator, 7, .{
+        .tools_list_changed = true,
+    });
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.find(u8, request, "\"method\":\"subscriptions/listen\"") != null);
+    try std.testing.expect(std.mem.find(u8, request, "\"toolsListChanged\":true") != null);
+    try std.testing.expect(std.mem.find(u8, request, "resources") == null);
+    try std.testing.expect(std.mem.find(u8, request, "prompts") == null);
+}
+
+test "subscription parser retains official acknowledgement and change identities" {
+    const alloc = std.testing.allocator;
+    var acknowledged = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},\"notifications\":{\"toolsListChanged\":true}}}",
+        .{},
+    );
+    defer acknowledged.deinit();
+    const filters = Filters{ .tools_list_changed = true };
+    const ack = parseNotification(acknowledged.value, filters).?;
+    try std.testing.expectEqual(feature_cache.NotificationKind.subscription_acknowledged, ack.kind);
+    try std.testing.expectEqual(@as(?u64, 7), ack.subscription_id);
+
+    var changed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7}}}",
+        .{},
+    );
+    defer changed.deinit();
+    const event = parseNotification(changed.value, filters).?;
+    try std.testing.expectEqual(feature_cache.NotificationKind.tools_list_changed, event.kind);
+    try std.testing.expectEqual(@as(?u64, 7), event.subscription_id);
+}
+
+test "subscription request and parser support the complete modern filter set" {
+    const alloc = std.testing.allocator;
+    const uris = [_][]const u8{ "custom://one", "file:///two" };
+    const filters = Filters{
+        .tools_list_changed = true,
+        .resources_list_changed = true,
+        .prompts_list_changed = true,
+        .resource_subscriptions = &uris,
+    };
+    const request = try buildListenRequest(alloc, 9, filters);
+    defer alloc.free(request);
+    try std.testing.expect(std.mem.find(u8, request, "\"resourcesListChanged\":true") != null);
+    try std.testing.expect(std.mem.find(u8, request, "\"promptsListChanged\":true") != null);
+    try std.testing.expect(std.mem.find(u8, request, "\"resourceSubscriptions\":[\"custom://one\",\"file:///two\"]") != null);
+
+    var acknowledged = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":9},\"notifications\":{\"toolsListChanged\":true,\"resourcesListChanged\":true,\"promptsListChanged\":true,\"resourceSubscriptions\":[\"custom://one\",\"file:///two\"]}}}",
+        .{},
+    );
+    defer acknowledged.deinit();
+    try std.testing.expectEqual(
+        feature_cache.NotificationKind.subscription_acknowledged,
+        parseNotification(acknowledged.value, filters).?.kind,
+    );
+
+    var updated = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":9},\"uri\":\"custom://one\"}}",
+        .{},
+    );
+    defer updated.deinit();
+    const event = parseNotification(updated.value, filters).?;
+    try std.testing.expectEqual(feature_cache.NotificationKind.resource_updated, event.kind);
+    try std.testing.expectEqualStrings("custom://one", event.resource_uri.?);
+}
+
+test "subscription acknowledgement fails closed without an exclusive Tools grant" {
+    const alloc = std.testing.allocator;
+    var unsupported = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7,\"extension\":true},\"notifications\":{}}}",
+        .{},
+    );
+    defer unsupported.deinit();
+    const filters = Filters{ .tools_list_changed = true };
+    const parsed = parseNotification(unsupported.value, filters).?;
+    try std.testing.expectEqual(
+        feature_cache.NotificationKind.subscription_filter_unsupported,
+        parsed.kind,
+    );
+    try std.testing.expectEqual(@as(?u64, 7), parsed.subscription_id);
+
+    var unrequested = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},\"notifications\":{\"resourcesListChanged\":true}}}",
+        .{},
+    );
+    defer unrequested.deinit();
+    const unexpected = parseNotification(unrequested.value, filters).?;
+    try std.testing.expectEqual(
+        feature_cache.NotificationKind.subscription_filter_unsupported,
+        unexpected.kind,
+    );
+    try std.testing.expectEqual(@as(?u64, 7), unexpected.subscription_id);
+
+    var false_tools = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},\"notifications\":{\"toolsListChanged\":false}}}",
+        .{},
+    );
+    defer false_tools.deinit();
+    try std.testing.expectEqual(
+        feature_cache.NotificationKind.subscription_filter_unsupported,
+        parseNotification(false_tools.value, filters).?.kind,
+    );
+}
+
+test "subscription graceful result validates exact request identity" {
+    try validateListenResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7}}}",
+        7,
+    );
+    try std.testing.expectError(
+        error.McpInvalidSubscriptionResponse,
+        validateListenResponse(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":8}}}",
+            7,
+        ),
+    );
+}
+
+test "subscription server identity ownership releases every allocation failure" {
+    const Case = struct {
+        fn listen(
+            _: *anyopaque,
+            alloc: Allocator,
+            _: []const u8,
+            _: u64,
+            _: []const u8,
+            _: mcp_contract.NotificationSink,
+            _: streamable_http.Control,
+        ) anyerror![]u8 {
+            return alloc.dupe(
+                u8,
+                "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7}}}",
+            );
+        }
+
+        fn run(alloc: Allocator) !void {
+            var context: u8 = 0;
+            const state = try State.allocateHttpState(
+                alloc,
+                "server",
+                .{ .context = &context, .callback = listen },
+                1,
+                7,
+                1,
+                .{ .tools_list_changed = true },
+            );
+            state.stopAndDestroy();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+const StdioCreateAttempt = struct {
+    dispatcher: *stdio_dispatcher.StdioDispatcher,
+    cancel: *std.atomic.Value(bool),
+    state: ?*State = null,
+    err: ?anyerror = null,
+
+    fn run(self: *StdioCreateAttempt) void {
+        self.state = State.createStdio(
+            std.testing.allocator,
+            self.dispatcher,
+            .modern,
+            1,
+            0,
+            1,
+            .{ .tools_list_changed = true },
+            std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+                .clock = .awake,
+                .raw = .fromSeconds(1),
+            }),
+            self.cancel,
+        ) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+};
+
+fn createIdleStdioDispatcherForTest() !*stdio_dispatcher.StdioDispatcher {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = &.{ "sh", "-c", "while IFS= read -r request; do :; done" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    return stdio_dispatcher.StdioDispatcher.create(
+        std.testing.allocator,
+        std.heap.c_allocator,
+        child,
+        1,
+        4096,
+    );
+}
+
+fn waitForPendingSubscriptionForTest(
+    dispatcher: *stdio_dispatcher.StdioDispatcher,
+) !void {
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    while (dispatcher.pendingRequestCount() == 0) {
+        if (!std.Io.Clock.Timestamp.compare(
+            std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
+            .lt,
+            deadline,
+        )) return error.McpSubscriptionNotRegistered;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+}
+
+fn expectFailedStdioCreateCleanedUp(
+    dispatcher: *stdio_dispatcher.StdioDispatcher,
+    attempt: StdioCreateAttempt,
+    expected: anyerror,
+) !void {
+    try std.testing.expectEqual(expected, attempt.err.?);
+    try std.testing.expect(attempt.state == null);
+    try std.testing.expectEqual(@as(usize, 0), dispatcher.pendingRequestCount());
+    try std.testing.expect(!dispatcher.hasNotificationSink());
+}
+
+test "modern stdio readiness cancellation joins the listener and clears attachment" {
+    const dispatcher = try createIdleStdioDispatcherForTest();
+    defer dispatcher.deinit();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var attempt = StdioCreateAttempt{ .dispatcher = dispatcher, .cancel = &cancel };
+    defer if (attempt.state) |state| state.stopAndDestroy();
+    dispatcher.write_mutex.lockUncancelable(io_mod.getIo());
+    var write_locked = true;
+    defer if (write_locked) dispatcher.write_mutex.unlock(io_mod.getIo());
+    const thread = try std.Thread.spawn(.{}, StdioCreateAttempt.run, .{&attempt});
+    var joined = false;
+    defer if (!joined) thread.join();
+    try waitForPendingSubscriptionForTest(dispatcher);
+    cancel.store(true, .release);
+    thread.join();
+    joined = true;
+    try expectFailedStdioCreateCleanedUp(dispatcher, attempt, error.Cancelled);
+    dispatcher.write_mutex.unlock(io_mod.getIo());
+    write_locked = false;
+}
+
+test "modern stdio readiness connection failure joins the listener and clears attachment" {
+    const dispatcher = try createIdleStdioDispatcherForTest();
+    defer dispatcher.deinit();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var attempt = StdioCreateAttempt{ .dispatcher = dispatcher, .cancel = &cancel };
+    defer if (attempt.state) |state| state.stopAndDestroy();
+    dispatcher.write_mutex.lockUncancelable(io_mod.getIo());
+    var write_locked = true;
+    defer if (write_locked) dispatcher.write_mutex.unlock(io_mod.getIo());
+    const create_thread = try std.Thread.spawn(.{}, StdioCreateAttempt.run, .{&attempt});
+    var create_joined = false;
+    defer if (!create_joined) create_thread.join();
+    try waitForPendingSubscriptionForTest(dispatcher);
+
+    const Shutdown = struct {
+        fn run(value: *stdio_dispatcher.StdioDispatcher) void {
+            value.shutdown();
+        }
+    };
+    const shutdown_thread = try std.Thread.spawn(.{}, Shutdown.run, .{dispatcher});
+    while (dispatcher.isRunning()) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    dispatcher.write_mutex.unlock(io_mod.getIo());
+    write_locked = false;
+    shutdown_thread.join();
+    create_thread.join();
+    create_joined = true;
+    try expectFailedStdioCreateCleanedUp(dispatcher, attempt, error.McpConnectionClosed);
+}

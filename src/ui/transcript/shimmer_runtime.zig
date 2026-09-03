@@ -291,6 +291,31 @@ fn writeThinkingBlinkText(out: []u8, label: []const u8, marker_visible: bool) []
     return w.buffered();
 }
 
+test "thinking blink keeps the counter bright and dims only the token suffix" {
+    var out: [256]u8 = undefined;
+    const result = writeThinkingBlinkText(&out, "• Thinking (5s) (↑10 ↓20)", true);
+
+    const label_idx = std.mem.find(u8, result, "Thinking (5s)") orelse return error.TestUnexpectedResult;
+    const dim_idx = std.mem.find(u8, result, ui_render.dim_style) orelse return error.TestUnexpectedResult;
+    const tokens_idx = std.mem.find(u8, result, "(↑10 ↓20)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(label_idx < dim_idx);
+    try std.testing.expect(dim_idx < tokens_idx);
+
+    const plain = writeThinkingBlinkText(&out, "• Thinking (5s)", true);
+    try std.testing.expect(std.mem.find(u8, plain, ui_render.dim_style) == null);
+}
+
+test "marker blink is on and off for equal halves of the 40-frame cycle" {
+    var on: usize = 0;
+    var pos: i16 = -8;
+    while (pos <= 31) : (pos += 1) {
+        if (markerBlinkVisible(pos)) on += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 20), on);
+    try std.testing.expect(!markerBlinkVisible(31));
+    try std.testing.expect(markerBlinkVisible(-8));
+}
+
 fn writeStaticStyledText(out: []u8, label: []const u8, style: []const u8) []const u8 {
     const required = style.len + label.len + ui_render.reset_style.len;
     if (required > out.len) return label;
@@ -302,6 +327,18 @@ fn writeStaticStyledText(out: []u8, label: []const u8, style: []const u8) []cons
     @memcpy(out[end .. end + ui_render.reset_style.len], ui_render.reset_style);
     end += ui_render.reset_style.len;
     return out[0..end];
+}
+
+test "activity status styles paint static colored text" {
+    var buf: [128]u8 = undefined;
+    const result = writeStaticStyledText(&buf, "⚠ API error", ui_render.warning_style);
+    var expected_buf: [128]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buf,
+        "{s}⚠ API error{s}",
+        .{ ui_render.warning_style, ui_render.reset_style },
+    ) catch return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected, result);
 }
 
 fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []const u8 {
@@ -346,6 +383,16 @@ fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []co
     @memcpy(out[end .. end + ui_render.reset_style.len], ui_render.reset_style);
     end += ui_render.reset_style.len;
     return out[0..end];
+}
+
+test "tool marker shimmer accepts the minimal final connector" {
+    var out: [256]u8 = undefined;
+    const result = writeToolMarkerBlinkText(&out, "└ Running zig build", 0);
+    try std.testing.expect(std.mem.find(u8, result, "Running zig build") != null);
+    try std.testing.expect(!std.mem.eql(u8, result, "└ Running zig build"));
+
+    const unchanged = writeToolMarkerBlinkText(&out, "├ Read runtime.zig", 0);
+    try std.testing.expectEqualStrings("├ Read runtime.zig", unchanged);
 }
 
 fn traceSurfaceShimmerPaint(surface: *const frame_surface.FrameSurface, row: u16, label: []const u8) void {
@@ -409,4 +456,387 @@ fn testPlan(
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
+}
+
+fn testSurface(plan: paint_plan.PaintPlan) !struct {
+    shadow: vt_emulator.Grid,
+    surface: frame_surface.FrameSurface,
+} {
+    var shadow = try vt_emulator.Grid.init(std.testing.allocator, plan.layout.cols, plan.layout.rows);
+    errdefer shadow.deinit();
+    try shadow.feed("\x1b[1;1Hshell");
+
+    var surface = try frame_surface.FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    errdefer surface.deinit();
+    return .{ .shadow = shadow, .surface = surface };
+}
+
+test "activity surface painter writes transient activity only on planned row" {
+    var fixtures = try testSurface(testPlan(
+        .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+        .{ .top = 4, .bottom = 4, .owner = .activity },
+    ));
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    const result = try paintActivityIntoSurface(&fixtures.surface, .{ .label = "thinking", .shimmer_pos = 0 });
+
+    try std.testing.expect(result.painted);
+    try std.testing.expect(!result.overlay);
+    try std.testing.expectEqual(@as(u16, 4), result.row);
+    try std.testing.expectEqual(@as(u21, 't'), fixtures.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(paint_plan.CellOwner.activity, fixtures.surface.cellAt(4, 1).?.owner);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(3, 1).?.codepoint);
+    try std.testing.expectEqual(paint_plan.CellOwner.transcript, fixtures.surface.cellAt(3, 1).?.owner);
+    try std.testing.expectEqual(paint_plan.CellOwner.footer, fixtures.surface.cellAt(5, 1).?.owner);
+}
+
+test "activity surface painter clamps long transient label to one row" {
+    var plan = testPlan(
+        .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+        .{ .top = 4, .bottom = 4, .owner = .activity },
+    );
+    plan.layout.cols = 8;
+    var fixtures = try testSurface(plan);
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    const result = try paintActivityIntoSurface(&fixtures.surface, .{
+        .label = "abcdefghijklmnopqrstuvwxyz",
+        .shimmer_pos = -8,
+    });
+
+    try std.testing.expect(result.painted);
+    try std.testing.expectEqual(@as(u16, 4), result.row);
+    try std.testing.expectEqual(@as(u21, 'a'), fixtures.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '.'), fixtures.surface.cellAt(4, 6).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '.'), fixtures.surface.cellAt(4, 7).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '.'), fixtures.surface.cellAt(4, 8).?.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(5, 1).?.codepoint);
+    try std.testing.expectEqual(paint_plan.CellOwner.footer, fixtures.surface.cellAt(5, 1).?.owner);
+}
+
+test "activity surface painter wraps static status labels under marker" {
+    var plan = testPlan(
+        .{ .transient_row = .{ .row = 3, .row_count = 3, .gap_above_rows = 0 } },
+        .{ .top = 3, .bottom = 5, .owner = .activity },
+    );
+    plan.layout.rows = 7;
+    plan.layout.cols = 42;
+    plan.footer_band = .{ .top = 6, .bottom = 7, .owner = .footer };
+    plan.footer.top = 6;
+    plan.footer.top_divider = 6;
+    plan.footer.banner = 6;
+    plan.footer.input_base = 6;
+    plan.footer.picker_divider = 6;
+    plan.footer.picker_start = 7;
+    plan.footer.bottom_divider = 6;
+    plan.footer.hint = 7;
+
+    var fixtures = try testSurface(plan);
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    const result = try paintActivityIntoSurface(&fixtures.surface, .{
+        .label = "⚠ API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account.",
+        .shimmer_pos = -8,
+        .style = .danger,
+    });
+
+    try std.testing.expect(result.painted);
+    try std.testing.expectEqual(@as(u16, 3), result.row);
+    try std.testing.expectEqual(@as(u21, '⚠'), fixtures.surface.cellAt(3, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 2).?.codepoint);
+    try std.testing.expect(fixtures.surface.cellAt(4, 3).?.codepoint != ' ');
+    try std.testing.expectEqual(paint_plan.CellOwner.activity, fixtures.surface.cellAt(5, 1).?.owner);
+    try std.testing.expectEqual(paint_plan.CellOwner.footer, fixtures.surface.cellAt(6, 1).?.owner);
+    try fixtures.surface.validate();
+}
+
+test "static status truncation preserves recovery action and attempt suffix" {
+    const preview = try wrappedStaticActivityLabel(
+        std.testing.allocator,
+        "⚠ Provider unavailable · no_available_providers: No providers are currently available · retrying request in 4s · attempt 4/10",
+        32,
+        3,
+        true,
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.startsWith(u8, preview.bytes, "⚠ Provider unavailable ·"));
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "no_available_providers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "...") != null);
+    try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "attempt 4/10"));
+
+    var lines = std.mem.splitScalar(u8, preview.bytes, '\n');
+    var line_count: usize = 0;
+    while (lines.next()) |line| {
+        line_count += 1;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 32);
+    }
+    try std.testing.expectEqual(@as(usize, 3), line_count);
+}
+
+test "static status truncation preserves leading context for non-error statuses" {
+    const preview = try wrappedStaticActivityLabel(
+        std.testing.allocator,
+        "✓ Recovered · resumed after provider retry · later details are omitted",
+        24,
+        2,
+        false,
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.startsWith(u8, preview.bytes, "✓ Recovered · resumed"));
+    try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "..."));
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "later details") == null);
+}
+
+test "activity surface painter breaks static status rows at word boundaries" {
+    var plan = testPlan(
+        .{ .transient_row = .{ .row = 3, .row_count = 2, .gap_above_rows = 0 } },
+        .{ .top = 3, .bottom = 4, .owner = .activity },
+    );
+    plan.layout.cols = 12;
+    var fixtures = try testSurface(plan);
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    const result = try paintActivityIntoSurface(&fixtures.surface, .{
+        .label = "⚠ aaaaaa bbbb",
+        .shimmer_pos = -8,
+        .style = .danger,
+    });
+
+    try std.testing.expect(result.painted);
+    try std.testing.expectEqual(@as(u21, '⚠'), fixtures.surface.cellAt(3, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'a'), fixtures.surface.cellAt(3, 8).?.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(3, 10).?.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 2).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'b'), fixtures.surface.cellAt(4, 3).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'b'), fixtures.surface.cellAt(4, 6).?.codepoint);
+    try fixtures.surface.validate();
+}
+
+test "activity surface painter falls back to the tool label when the stack cannot fit" {
+    var fixtures = try testSurface(testPlan(
+        .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+        .{ .top = 4, .bottom = 4, .owner = .activity },
+    ));
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    _ = try paintActivityIntoSurface(&fixtures.surface, .{
+        .label = "• Thinking",
+        .tool_label = "● Running read_file",
+        .shimmer_pos = 0,
+    });
+
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(std.testing.allocator);
+    var target = try fixtures.surface.copyToTargetGrid(std.testing.allocator);
+    defer target.deinit();
+    try target.rowText(4, &row);
+    try std.testing.expect(std.mem.find(u8, row.items, "Running read_file") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Thinking") == null);
+}
+
+test "activity surface painter uses width-fitting omission markers" {
+    const Case = struct {
+        cols: u16,
+        marker: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .cols = 1, .marker = "." },
+        .{ .cols = 2, .marker = ".." },
+        .{ .cols = 3, .marker = "..." },
+    };
+
+    for (cases) |case| {
+        var plan = testPlan(
+            .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+            .{ .top = 4, .bottom = 4, .owner = .activity },
+        );
+        plan.layout.cols = case.cols;
+        var fixtures = try testSurface(plan);
+        defer fixtures.surface.deinit();
+        defer fixtures.shadow.deinit();
+
+        const result = try paintActivityIntoSurface(&fixtures.surface, .{
+            .label = "\x1b[1mabcdefg\x1b[0m",
+            .shimmer_pos = -8,
+        });
+
+        try std.testing.expect(result.painted);
+        for (case.marker, 0..) |byte, index| {
+            try std.testing.expectEqual(@as(u21, byte), fixtures.surface.cellAt(4, @intCast(index + 1)).?.codepoint);
+        }
+        try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(5, 1).?.codepoint);
+        try std.testing.expectEqual(paint_plan.CellOwner.footer, fixtures.surface.cellAt(5, 1).?.owner);
+        try fixtures.surface.validate();
+    }
+}
+
+test "activity surface painter treats multiline transient label as one row" {
+    var plan = testPlan(
+        .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+        .{ .top = 4, .bottom = 4, .owner = .activity },
+    );
+    plan.layout.cols = 12;
+    var fixtures = try testSurface(plan);
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    const result = try paintActivityIntoSurface(&fixtures.surface, .{
+        .label = "cat > ~/Desktop/hello-world.html <<'EOF'\n<html>\nEOF",
+        .shimmer_pos = -8,
+    });
+
+    try std.testing.expect(result.painted);
+    try std.testing.expectEqual(@as(u16, 4), result.row);
+    try std.testing.expectEqual(@as(u21, 'c'), fixtures.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '.'), fixtures.surface.cellAt(4, 12).?.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(5, 1).?.codepoint);
+    try std.testing.expectEqual(paint_plan.CellOwner.footer, fixtures.surface.cellAt(5, 1).?.owner);
+}
+
+test "activity surface painter overlays planned transcript row" {
+    var fixtures = try testSurface(testPlan(
+        .{ .overlay_entry = 3 },
+        paint_plan.FrameBand.empty(.activity),
+    ));
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    _ = try fixtures.surface.writeAnsiBand(3, 1, "body", .transcript, .same_owner);
+    try std.testing.expectEqual(@as(u21, 'b'), fixtures.surface.cellAt(3, 1).?.codepoint);
+    try std.testing.expectEqual(paint_plan.CellOwner.transcript, fixtures.surface.cellAt(3, 1).?.owner);
+
+    const result = try paintActivityIntoSurface(&fixtures.surface, .{ .label = "go", .shimmer_pos = 0 });
+
+    try std.testing.expect(result.painted);
+    try std.testing.expect(result.overlay);
+    try std.testing.expectEqual(@as(u16, 3), result.row);
+    try std.testing.expectEqual(@as(u21, 'g'), fixtures.surface.cellAt(3, 1).?.codepoint);
+    try std.testing.expectEqual(paint_plan.CellOwner.activity, fixtures.surface.cellAt(3, 1).?.owner);
+    try fixtures.surface.validate();
+}
+
+test "activity surface painter limits tool animation to its marker" {
+    const plan = testPlan(
+        .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+        .{ .top = 4, .bottom = 4, .owner = .activity },
+    );
+    var first = try testSurface(plan);
+    defer first.surface.deinit();
+    defer first.shadow.deinit();
+    var second = try testSurface(plan);
+    defer second.surface.deinit();
+    defer second.shadow.deinit();
+
+    const label = "● Running command\x1b[0m";
+    _ = try paintActivityIntoSurface(&first.surface, .{
+        .label = label,
+        .shimmer_pos = -8,
+        .style = .tool_marker,
+    });
+    _ = try paintActivityIntoSurface(&second.surface, .{
+        .label = label,
+        .shimmer_pos = 4,
+        .style = .tool_marker,
+    });
+
+    const first_marker = first.surface.cellAt(4, 1).?;
+    const second_marker = second.surface.cellAt(4, 1).?;
+    const first_text = first.surface.cellAt(4, 3).?;
+    const second_text = second.surface.cellAt(4, 3).?;
+    try std.testing.expectEqual(@as(u21, '●'), first_marker.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), second_marker.codepoint);
+    try std.testing.expect(first_text.style.eql(second_text.style));
+    try std.testing.expect(!first_text.style.flags.bold);
+
+    _ = try paintActivityIntoSurface(&first.surface, .{
+        .label = "thinking",
+        .shimmer_pos = -8,
+        .style = .thinking,
+    });
+    _ = try paintActivityIntoSurface(&second.surface, .{
+        .label = "thinking",
+        .shimmer_pos = 0,
+        .style = .thinking,
+    });
+    try std.testing.expect(first.surface.cellAt(4, 1).?.style.fg.eql(second.surface.cellAt(4, 1).?.style.fg));
+}
+
+test "activity surface painter honors the thinking blink override" {
+    const plan = testPlan(
+        .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+        .{ .top = 4, .bottom = 4, .owner = .activity },
+    );
+    var hidden = try testSurface(plan);
+    defer hidden.surface.deinit();
+    defer hidden.shadow.deinit();
+    var visible = try testSurface(plan);
+    defer visible.surface.deinit();
+    defer visible.shadow.deinit();
+
+    _ = try paintActivityIntoSurface(&hidden.surface, .{
+        .label = "• Thinking (1s)",
+        .shimmer_pos = -render_request.animation_padding,
+        .thinking_blink = false,
+    });
+    _ = try paintActivityIntoSurface(&visible.surface, .{
+        .label = "• Thinking (1s)",
+        .shimmer_pos = 4,
+        .thinking_blink = true,
+    });
+
+    try std.testing.expectEqual(@as(u21, ' '), hidden.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '•'), visible.surface.cellAt(4, 1).?.codepoint);
+}
+
+test "activity surface painter rejects activity over footer" {
+    var fixtures = try testSurface(testPlan(
+        .{ .overlay_entry = 5 },
+        paint_plan.FrameBand.empty(.activity),
+    ));
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    try std.testing.expectError(
+        error.WriteOutsideBand,
+        paintActivityIntoSurface(&fixtures.surface, .{ .label = "go", .shimmer_pos = 0 }),
+    );
+}
+
+test "activity surface painter skips none placement without writing cells" {
+    var fixtures = try testSurface(testPlan(
+        .none,
+        paint_plan.FrameBand.empty(.activity),
+    ));
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    const result = try paintActivityIntoSurface(&fixtures.surface, .{ .label = "hidden", .shimmer_pos = 0 });
+
+    try std.testing.expect(!result.painted);
+    try std.testing.expect(!result.overlay);
+    try std.testing.expectEqual(@as(u16, 0), result.row);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(2, 1).?.codepoint);
+    try std.testing.expectEqual(paint_plan.CellOwner.transcript, fixtures.surface.cellAt(2, 1).?.owner);
+}
+
+test "activity paint trace formats omit label payload" {
+    const label = "secret prompt text";
+    const label_hash = std.hash.Wyhash.hash(0, label);
+
+    var surface_buf: [256]u8 = undefined;
+    const surface_line = try std.fmt.bufPrint(
+        &surface_buf,
+        surface_shimmer_paint_trace_fmt,
+        .{ @as(u16, 3), "true", "false", label.len, label_hash },
+    );
+    try std.testing.expect(std.mem.find(u8, surface_line, "label=\"") == null);
+    try std.testing.expect(std.mem.find(u8, surface_line, label) == null);
 }

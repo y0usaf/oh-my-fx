@@ -1343,6 +1343,459 @@ fn formatDuration(buf: anytype, duration_ms: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "Unavailable";
 }
 
+test "compact status line menu renders toggled items without choose copy" {
+    const projection: CompactCommandMenuProjection = .{ .statusline = .{
+        .active = true,
+        .selected_index = 0,
+        .snapshot = .{
+            .statusline_context = false,
+            .statusline_session = true,
+            .statusline_workspace = false,
+        },
+    } };
+
+    // Every catalog choice must be reachable as a rendered row.
+    const rows = desiredRowCount(projection, 80);
+    try std.testing.expectEqual(
+        @as(u16, @intCast(settings_row_offset + settings_catalog.statuslineChoiceCount())),
+        rows,
+    );
+
+    var header = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, rows, 80);
+    defer header.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, header.items, "Status line") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Choose") == null);
+
+    var workspace = try composeCompactCommandMenuRow(std.testing.allocator, projection, 4, rows, 80);
+    defer workspace.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, workspace.items, "Workspace") != null);
+    try std.testing.expect(std.mem.find(u8, workspace.items, "off") != null);
+
+    var context = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, rows, 80);
+    defer context.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, context.items, "Context") != null);
+    try std.testing.expect(std.mem.find(u8, context.items, "off") != null);
+
+    var session = try composeCompactCommandMenuRow(std.testing.allocator, projection, 3, rows, 80);
+    defer session.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, session.items, "Session") != null);
+    try std.testing.expect(std.mem.find(u8, session.items, "on") != null);
+}
+
+test "compact status line menu anchors options and prioritizes the selected tiny row" {
+    const projection: CompactCommandMenuProjection = .{ .statusline = .{
+        .active = true,
+        .selected_index = 2,
+        .snapshot = .{
+            .statusline_context = false,
+            .statusline_session = true,
+            .statusline_workspace = false,
+        },
+    } };
+
+    var tiny = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 1, 80);
+    defer tiny.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, tiny.items, "Workspace") != null);
+    try std.testing.expect(std.mem.find(u8, tiny.items, "Status line") == null);
+
+    var medium = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 5, 80);
+    defer medium.deinit(std.testing.allocator);
+    var wide = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 5, 180);
+    defer wide.deinit(std.testing.allocator);
+    const medium_option = std.mem.find(u8, medium.items, "off") orelse return error.TestExpectedOption;
+    const wide_option = std.mem.find(u8, wide.items, "off") orelse return error.TestExpectedOption;
+    const expected_column = 2 + display_width.visibleWidth("Workspace") + 4;
+    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(medium.items[0..medium_option]));
+    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(wide.items[0..wide_option]));
+}
+
+test "usage menu renders token-first totals and selectable model rows" {
+    var models = [_]usage_report.ModelUsage{
+        .{
+            .model = @constCast("z.ai/glm-5.2"),
+            .totals = testUsageTotals(104, 0.0104),
+        },
+        .{
+            .model = @constCast("openai/gpt-5.6"),
+            .totals = testUsageTotals(19, 0.0019),
+        },
+    };
+    const snapshot = usage_report.Snapshot{
+        .scope = .days_30,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = .{
+            .total_tokens = 120,
+            .input_tokens = 100,
+            .output_tokens = 20,
+            .cache_read_tokens = 20,
+            .cache_write_tokens = 10,
+            .reasoning_tokens = 5,
+            .request_count = 2,
+            .total_cost = 0.0123,
+        },
+        .models = &models,
+    };
+    const projection: CompactCommandMenuProjection = .{ .usage = .{
+        .active = true,
+        .snapshot = &snapshot,
+    } };
+
+    var total = try composeCompactCommandMenuRow(std.testing.allocator, projection, 3, 14, 120);
+    defer total.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, total.items, "120 tokens") != null);
+    try std.testing.expect(std.mem.find(u8, total.items, "$0.01 spent") != null);
+    try std.testing.expect(std.mem.find(u8, total.items, "2 requests") != null);
+
+    try std.testing.expectEqual(@as(u16, 11), desiredRowCount(projection, 120));
+    var model = try composeCompactCommandMenuRow(std.testing.allocator, projection, 9, 11, 120);
+    defer model.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, model.items, "z.ai/glm-5.2") != null);
+    try std.testing.expect(std.mem.find(u8, model.items, "104") != null);
+    try std.testing.expect(std.mem.find(u8, model.items, "86.7%") != null);
+
+    var compact_summary = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 8, 40);
+    defer compact_summary.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, compact_summary.items, "120 tokens") != null);
+    try std.testing.expect(std.mem.find(u8, compact_summary.items, "$0.01") != null);
+}
+
+test "usage menu adapts dashboard density without losing model columns" {
+    var models = [_]usage_report.ModelUsage{
+        .{
+            .model = @constCast("openai/gpt-5.6-sol"),
+            .totals = .{
+                .total_tokens = 43_626_823,
+                .input_tokens = 43_000_000,
+                .output_tokens = 626_823,
+                .cache_read_tokens = 30_000_000,
+                .cache_write_tokens = 5_000_000,
+                .reasoning_tokens = 200_000,
+                .request_count = 1_000,
+                .total_cost = 100.7886,
+            },
+        },
+        .{
+            .model = @constCast("provider/a-much-longer-model-name"),
+            .totals = testUsageTotals(17_487_444, 16.4968),
+        },
+    };
+    const snapshot = usage_report.Snapshot{
+        .scope = .days_7,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .partial,
+        .completeness = .incomplete,
+        .totals = .{
+            .total_tokens = 61_114_267,
+            .input_tokens = 60_415_084,
+            .output_tokens = 699_183,
+            .cache_read_tokens = 42_920_431,
+            .cache_write_tokens = 14_728_752,
+            .reasoning_tokens = 253_917,
+            .request_count = 1_464,
+            .total_cost = 117.2854,
+        },
+        .models = &models,
+    };
+    const projection: CompactCommandMenuProjection = .{ .usage = .{
+        .active = true,
+        .scope = .days_7,
+        .snapshot = &snapshot,
+    } };
+
+    var small_header = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 7, 44);
+    defer small_header.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, small_header.items, "Usage") != null);
+    try std.testing.expect(std.mem.find(u8, small_header.items, "[7 days]") != null);
+    try std.testing.expect(std.mem.find(u8, small_header.items, "30 days") == null);
+
+    var small_model = try composeCompactCommandMenuRow(std.testing.allocator, projection, 5, 7, 44);
+    defer small_model.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, small_model.items, "43.6M") != null);
+    try std.testing.expect(std.mem.find(u8, small_model.items, "$100.79") != null);
+    try std.testing.expect(std.mem.find(u8, small_model.items, "%") == null);
+
+    var medium_model = try composeCompactCommandMenuRow(std.testing.allocator, projection, 8, 10, 90);
+    defer medium_model.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, medium_model.items, "43.6M · 71.4% · $100.79") != null);
+
+    var wide_header = try composeCompactCommandMenuRow(std.testing.allocator, projection, 8, 11, 160);
+    defer wide_header.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, wide_header.items, "Model") != null);
+    try std.testing.expect(std.mem.find(u8, wide_header.items, "Tokens") != null);
+    try std.testing.expect(std.mem.find(u8, wide_header.items, "Share") != null);
+    try std.testing.expect(std.mem.find(u8, wide_header.items, "Spend") != null);
+
+    for ([_]u16{ 32, 44, 90, 160 }) |width| {
+        const rows = desiredRowCount(projection, width);
+        for (0..rows) |row_index| {
+            var row = try composeCompactCommandMenuRow(
+                std.testing.allocator,
+                projection,
+                @intCast(row_index),
+                rows,
+                width,
+            );
+            defer row.deinit(std.testing.allocator);
+            try std.testing.expect(std.mem.findScalar(u8, row.items, '\n') == null);
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+        }
+    }
+}
+
+test "usage menu renders scope tabs stable model facts and at most twenty models" {
+    var models: [25]usage_report.ModelUsage = undefined;
+    for (&models, 0..) |*model, index| {
+        model.* = .{
+            .model = @constCast(if (index == models.len - 1)
+                "provider/a-much-longer-selected-model"
+            else
+                "provider/model"),
+            .totals = testUsageTotals(10, 0.001),
+        };
+    }
+    const snapshot = usage_report.Snapshot{
+        .scope = .days_30,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = testUsageTotals(250, 0.025),
+        .models = &models,
+    };
+    const projection: CompactCommandMenuProjection = .{ .usage = .{
+        .active = true,
+        .selected_model = models.len - 1,
+        .model_window_start = models.len - 1,
+        .snapshot = &snapshot,
+    } };
+
+    try std.testing.expectEqual(@as(u16, 28), desiredRowCount(projection, 80));
+    var header = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 28, 80);
+    defer header.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, header.items, "Usage") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "[30 days]") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Session") != null);
+
+    var tiny = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 1, 100);
+    defer tiny.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, tiny.items, "selected-model") != null);
+
+    var pair = [_]usage_report.ModelUsage{
+        .{ .model = @constCast("provider/short"), .totals = testUsageTotals(20, 0.002) },
+        .{ .model = @constCast("provider/a-much-longer-model"), .totals = testUsageTotals(30, 0.003) },
+    };
+    const pair_snapshot = usage_report.Snapshot{
+        .scope = .days_30,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = testUsageTotals(50, 0.005),
+        .models = &pair,
+    };
+    const pair_projection: CompactCommandMenuProjection = .{ .usage = .{
+        .active = true,
+        .snapshot = &pair_snapshot,
+    } };
+    var medium = try composeCompactCommandMenuRow(std.testing.allocator, pair_projection, 8, 10, 80);
+    defer medium.deinit(std.testing.allocator);
+    var wide = try composeCompactCommandMenuRow(std.testing.allocator, pair_projection, 9, 11, 180);
+    defer wide.deinit(std.testing.allocator);
+    const medium_facts = std.mem.find(u8, medium.items, "20") orelse return error.TestExpectedFacts;
+    const wide_facts = std.mem.find(u8, wide.items, "20") orelse return error.TestExpectedFacts;
+    const expected_column = 2 + display_width.visibleWidth("provider/a-much-longer-model") + 4;
+    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(medium.items[0..medium_facts]));
+    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(wide.items[0..wide_facts]));
+}
+
+test "usage menu renders expanded details for the last visible session model" {
+    var models: [13]usage_report.ModelUsage = undefined;
+    for (&models) |*model| {
+        model.* = .{
+            .model = @constCast("provider/model"),
+            .totals = testUsageTotals(10, 0.001),
+        };
+    }
+    const snapshot = usage_report.Snapshot{
+        .scope = .session,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = testUsageTotals(130, 0.013),
+        .models = &models,
+        .session_activity = .{
+            .api_duration_complete = true,
+            .wall_duration_complete = true,
+            .code_complete = true,
+            .api_duration_ms = 1,
+            .wall_duration_ms = 2,
+            .lines_added = 3,
+            .lines_removed = 4,
+        },
+    };
+    const projection: CompactCommandMenuProjection = .{ .usage = .{
+        .active = true,
+        .selected_model = 12,
+        .expanded_model = 12,
+        .model_window_start = 1,
+        .snapshot = &snapshot,
+    } };
+
+    var selected = try composeCompactCommandMenuRow(
+        std.testing.allocator,
+        projection,
+        24,
+        26,
+        100,
+    );
+    defer selected.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, selected.items, "❯ provider/model") != null);
+
+    var details = try composeCompactCommandMenuRow(
+        std.testing.allocator,
+        projection,
+        25,
+        26,
+        100,
+    );
+    defer details.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, details.items, "Input 10 · Output 0") != null);
+}
+
+test "usage menu keeps expanded model details visible at constrained height" {
+    var models: [13]usage_report.ModelUsage = undefined;
+    for (&models) |*model| {
+        model.* = .{
+            .model = @constCast("provider/model"),
+            .totals = testUsageTotals(10, 0.001),
+        };
+    }
+    const snapshot = usage_report.Snapshot{
+        .scope = .days_30,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = testUsageTotals(130, 0.013),
+        .models = &models,
+    };
+    const projection: CompactCommandMenuProjection = .{ .usage = .{
+        .active = true,
+        .selected_model = 12,
+        .expanded_model = 12,
+        .model_window_start = 12,
+        .snapshot = &snapshot,
+    } };
+
+    var details = try composeCompactCommandMenuRow(
+        std.testing.allocator,
+        projection,
+        11,
+        12,
+        72,
+    );
+    defer details.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, details.items, "Input 10 · Output 0") != null);
+}
+
+test "usage menu renders a full pending status once" {
+    var models: [0]usage_report.ModelUsage = .{};
+    const snapshot = usage_report.Snapshot{
+        .scope = .session,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .pending,
+        .totals = null,
+        .models = &models,
+    };
+    const projection: CompactCommandMenuProjection = .{ .usage = .{
+        .active = true,
+        .snapshot = &snapshot,
+    } };
+
+    try std.testing.expectEqual(@as(u16, 2), desiredRowCount(projection, 80));
+    var status = try composeCompactCommandMenuRow(std.testing.allocator, projection, 1, 2, 80);
+    defer status.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, status.items, "Partial data") != null);
+
+    var omitted = try composeCompactCommandMenuRow(std.testing.allocator, projection, 3, 2, 80);
+    defer omitted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), omitted.items.len);
+}
+
+test "usage menu keeps session activity visible while billing is pending" {
+    var models: [0]usage_report.ModelUsage = .{};
+    const snapshot = usage_report.Snapshot{
+        .scope = .session,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .pending,
+        .totals = null,
+        .models = &models,
+        .session_activity = .{
+            .api_duration_complete = true,
+            .wall_duration_complete = false,
+            .code_complete = true,
+            .api_duration_ms = 1200,
+            .wall_duration_ms = 3400,
+            .lines_added = 5,
+            .lines_removed = 2,
+        },
+    };
+    const projection: CompactCommandMenuProjection = .{ .usage = .{
+        .active = true,
+        .scope = .session,
+        .snapshot = &snapshot,
+    } };
+
+    try std.testing.expectEqual(@as(u16, 5), desiredRowCount(projection, 80));
+    var api = try composeCompactCommandMenuRow(
+        std.testing.allocator,
+        projection,
+        3,
+        5,
+        80,
+    );
+    defer api.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, api.items, "API 1s") != null);
+    try std.testing.expect(std.mem.find(u8, api.items, "1s") != null);
+
+    var wall = try composeCompactCommandMenuRow(
+        std.testing.allocator,
+        projection,
+        3,
+        5,
+        80,
+    );
+    defer wall.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, wall.items, "Unavailable") != null);
+
+    var code = try composeCompactCommandMenuRow(
+        std.testing.allocator,
+        projection,
+        4,
+        5,
+        80,
+    );
+    defer code.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, code.items, "+5 · -2") != null);
+}
+
 fn testUsageTotals(tokens: u64, cost: f64) usage_report.Totals {
     return .{
         .total_tokens = tokens,
@@ -1354,4 +1807,124 @@ fn testUsageTotals(tokens: u64, cost: f64) usage_report.Totals {
         .request_count = 1,
         .total_cost = cost,
     };
+}
+
+test "workspace menu keeps paths and status on the same width-safe row" {
+    var entries = [_]workspace_access.Entry{.{
+        .path = @constCast("/Users/example/Developer/Fx/docs"),
+        .saved = true,
+        .command_line = false,
+        .available = true,
+        .active = true,
+    }};
+    const projection: CompactCommandMenuProjection = .{ .workspace = .{
+        .active = true,
+        .selected_row = 1,
+        .primary_directory = "/Users/example/Developer/Fx",
+        .entries = &entries,
+    } };
+
+    try std.testing.expectEqual(@as(u16, 8), desiredRowCount(projection, 80));
+    var primary = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 8, 120);
+    defer primary.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, primary.items, "Primary") != null);
+    try std.testing.expect(std.mem.find(u8, primary.items, "/Users/example/Developer/Fx") != null);
+
+    var entry = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 8, 120);
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.findScalar(u8, entry.items, '\n') == null);
+    try std.testing.expect(std.mem.find(u8, entry.items, "/Users/example/Developer/Fx/docs") != null);
+    try std.testing.expect(std.mem.find(u8, entry.items, "Active · Saved") != null);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(entry.items) <= 120);
+}
+
+test "workspace menu anchors metadata and prioritizes the selected tiny action" {
+    var entries = [_]workspace_access.Entry{
+        .{
+            .path = @constCast("/short"),
+            .saved = true,
+            .command_line = false,
+            .available = true,
+            .active = true,
+        },
+        .{
+            .path = @constCast("/this/is/a/much-longer-path"),
+            .saved = true,
+            .command_line = false,
+            .available = true,
+            .active = true,
+        },
+    };
+    const projection: CompactCommandMenuProjection = .{ .workspace = .{
+        .active = true,
+        .selected_row = 2,
+        .primary_directory = "/workspace",
+        .entries = &entries,
+    } };
+
+    var header = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 9, 80);
+    defer header.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, header.items, "Workspace") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Workspace:") == null);
+
+    var tiny = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 1, 100);
+    defer tiny.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, tiny.items, "much-longer-path") != null);
+
+    var medium = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 9, 80);
+    defer medium.deinit(std.testing.allocator);
+    var wide = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 9, 180);
+    defer wide.deinit(std.testing.allocator);
+    const medium_status = std.mem.find(u8, medium.items, "Active · Saved") orelse return error.TestExpectedStatus;
+    const wide_status = std.mem.find(u8, wide.items, "Active · Saved") orelse return error.TestExpectedStatus;
+    const expected_column = 2 + display_width.visibleWidth("/this/is/a/much-longer-path") + 4;
+    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(medium.items[0..medium_status]));
+    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(wide.items[0..wide_status]));
+}
+
+test "workspace menu keeps launch-only roots visible but not selectable" {
+    var entries = [_]workspace_access.Entry{
+        .{
+            .path = @constCast("/tmp/launch-only"),
+            .saved = false,
+            .command_line = true,
+            .available = true,
+            .active = true,
+        },
+        .{
+            .path = @constCast("/tmp/saved"),
+            .saved = true,
+            .command_line = false,
+            .available = true,
+            .active = true,
+        },
+    };
+    const projection: CompactCommandMenuProjection = .{ .workspace = .{
+        .active = true,
+        .selected_row = 2,
+        .primary_directory = "/tmp/workspace",
+        .entries = &entries,
+    } };
+
+    try std.testing.expectEqual(@as(u16, 9), desiredRowCount(projection, 80));
+    var launch_only = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 9, 80);
+    defer launch_only.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, launch_only.items, "Launch only") != null);
+    try std.testing.expect(std.mem.find(u8, launch_only.items, "❯") == null);
+
+    var saved = try composeCompactCommandMenuRow(std.testing.allocator, projection, 7, 9, 80);
+    defer saved.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, saved.items, "❯ /tmp/saved") != null);
+}
+
+test "compact command menu rows stay single-line and width safe" {
+    const projection: CompactCommandMenuProjection = .{ .statusline = .{
+        .active = true,
+    } };
+    for ([_]u16{ 1, 4, 18 }) |width| {
+        var row = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 4, width);
+        defer row.deinit(std.testing.allocator);
+        try std.testing.expect(std.mem.findScalar(u8, row.items, '\n') == null);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+    }
 }

@@ -67,6 +67,18 @@ pub fn readLineAt(
 }
 
 pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
+    var envelope = try readSessionStarted(alloc, file);
+    defer envelope.deinit(alloc);
+    return envelope.log_generation;
+}
+
+pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File) !bool {
+    var envelope = try readSessionStarted(alloc, file);
+    defer envelope.deinit(alloc);
+    return envelope.event.session_started.subagent_child;
+}
+
+fn readSessionStarted(alloc: Allocator, file: std.Io.File) !session_event.Envelope {
     const length = try file.length(io_mod.getIo());
     const first = try readLineAt(alloc, file, 0, length) orelse
         return error.InvalidSessionFormat;
@@ -76,11 +88,11 @@ pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
     };
-    defer envelope.deinit(alloc);
+    errdefer envelope.deinit(alloc);
     if (envelope.seq != 1 or envelope.kind() != .session_started) {
         return error.InvalidSessionFormat;
     }
-    return envelope.log_generation;
+    return envelope;
 }
 
 pub fn scanCommitPosition(
@@ -161,6 +173,18 @@ inline fn failExactReplay(err: anytype) @TypeOf(err)!ExactReplay {
 
 noinline fn failExactReplayDynamic(err: anyerror) anyerror!ExactReplay {
     return err;
+}
+
+test "exact replay failures preserve exact error types and identities" {
+    const invalid = failExactReplay(error.InvalidSessionFormat);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{InvalidSessionFormat}!ExactReplay,
+    );
+    try std.testing.expectError(error.InvalidSessionFormat, invalid);
+    try std.testing.expectError(
+        error.UnsupportedSessionSchema,
+        failExactReplay(error.UnsupportedSessionSchema),
+    );
 }
 
 pub fn replayExactPosition(
@@ -352,4 +376,294 @@ fn eventBoundary(position: CommitPosition) session_projection.EventBoundary {
         .event_log_bytes = position.through_event_log_bytes,
         .semantic = true,
     };
+}
+
+fn checkRecoveryValidationAllocationFailures(
+    alloc: Allocator,
+    path: []const u8,
+    position: CommitPosition,
+) !void {
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
+    defer file.close(io_mod.getIo());
+    try std.testing.expectEqual(
+        RecoveryValidation.valid,
+        try validateCommitPositionForRecovery(alloc, file, position),
+    );
+}
+
+test "recovery replay preserves reader failure identity" {
+    const FailingReader = struct {
+        buffer: [1]u8 = undefined,
+        interface: std.Io.Reader = undefined,
+
+        fn init(self: *@This()) void {
+            self.* = .{};
+            self.interface = .{
+                .vtable = &.{
+                    .stream = stream,
+                    .readVec = readVec,
+                },
+                .buffer = &self.buffer,
+                .seek = 0,
+                .end = 0,
+            };
+        }
+
+        fn readVec(_: *std.Io.Reader, _: [][]u8) std.Io.Reader.Error!usize {
+            return error.ReadFailed;
+        }
+
+        fn stream(
+            _: *std.Io.Reader,
+            _: *std.Io.Writer,
+            _: std.Io.Limit,
+        ) std.Io.Reader.StreamError!usize {
+            return error.ReadFailed;
+        }
+    };
+
+    var source: FailingReader = undefined;
+    source.init();
+    try std.testing.expectError(
+        error.ReadFailed,
+        reduceBoundaryReader(std.testing.allocator, &source.interface),
+    );
+}
+
+test "session replay parser honors exact copied boundary" {
+    const alloc = std.testing.allocator;
+    const generation: Identifier = .{0x10} ** 16;
+    const first_id: Identifier = .{0x20} ** 16;
+    const second_id: Identifier = .{0x30} ** 16;
+    const first = try session_event.encodeFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = first_id,
+        .timestamp_ms = 10,
+        .event = .{ .session_started = .{
+            .id = @constCast("replay-boundary"),
+            .created_at_ms = 10,
+            .origin_workspace_root = @constCast("/tmp/origin"),
+            .workspace_root = @constCast("/tmp/current"),
+            .conversation_language = .literal("en"),
+            .preferences = .{
+                .model = @constCast("model-a"),
+                .effort = .auto,
+                .fast_mode = false,
+            },
+        } },
+    });
+    defer alloc.free(first);
+    const second = try session_event.encodeFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 2,
+        .event_id = second_id,
+        .timestamp_ms = 20,
+        .event = .{ .preferences_changed = .{ .fast_mode = true } },
+    });
+    defer alloc.free(second);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var output = try tmp.dir.createFile(io_mod.getIo(), "events.jsonl", .{ .truncate = true });
+        defer output.close(io_mod.getIo());
+        try output.writeStreamingAll(io_mod.getIo(), first);
+        try output.writeStreamingAll(io_mod.getIo(), second);
+        try output.sync(io_mod.getIo());
+    }
+    var file = try tmp.dir.openFile(io_mod.getIo(), "events.jsonl", .{});
+    defer file.close(io_mod.getIo());
+    const copied = CommitPosition{
+        .log_generation = generation,
+        .through_seq = 1,
+        .through_event_id = first_id,
+        .through_event_log_bytes = first.len,
+    };
+
+    const boundary = try scanCommitPosition(alloc, file, copied);
+    try std.testing.expectEqual(@as(u64, 1), boundary.seq);
+    var state = try replayBoundary(alloc, file, copied);
+    defer state.deinit(alloc);
+    try std.testing.expectEqualStrings("replay-boundary", state.id);
+    try std.testing.expect(!state.preferences.fast_mode);
+
+    const complete = CommitPosition{
+        .log_generation = generation,
+        .through_seq = 2,
+        .through_event_id = second_id,
+        .through_event_log_bytes = first.len + second.len,
+    };
+    const checkpoint_state = try replayBoundary(alloc, file, copied);
+    var resumed = try replayFromCheckpoint(
+        alloc,
+        file,
+        copied,
+        checkpoint_state,
+        complete,
+    );
+    defer resumed.deinit(alloc);
+    try std.testing.expect(resumed.preferences.fast_mode);
+
+    const exact_state = try replayBoundary(alloc, file, copied);
+    var exact = try replayFromCheckpoint(
+        alloc,
+        file,
+        copied,
+        exact_state,
+        copied,
+    );
+    defer exact.deinit(alloc);
+    try std.testing.expect(!exact.preferences.fast_mode);
+
+    var mismatched = complete;
+    mismatched.through_event_id = .{0xff} ** 16;
+    const rejected_state = try replayBoundary(alloc, file, copied);
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        replayFromCheckpoint(
+            alloc,
+            file,
+            copied,
+            rejected_state,
+            mismatched,
+        ),
+    );
+
+    var unreadable = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "events.jsonl",
+        .{ .mode = .write_only },
+    );
+    defer unreadable.close(io_mod.getIo());
+    try std.testing.expectError(
+        error.ReadFailed,
+        replayBoundary(alloc, unreadable, complete),
+    );
+    const read_failure_state = try replayBoundary(alloc, file, copied);
+    try std.testing.expectError(
+        error.ReadFailed,
+        replayFromCheckpoint(
+            alloc,
+            unreadable,
+            copied,
+            read_failure_state,
+            complete,
+        ),
+    );
+
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "events.jsonl");
+    defer alloc.free(path);
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        checkRecoveryValidationAllocationFailures,
+        .{ path, copied },
+    );
+}
+
+test "session replay parser rejects malformed or truncated bounded input" {
+    const alloc = std.testing.allocator;
+    const generation: Identifier = .{0x40} ** 16;
+    const event_id: Identifier = .{0x50} ** 16;
+    const malformed = "{not-json}\n";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var output = try tmp.dir.createFile(io_mod.getIo(), "events.jsonl", .{ .truncate = true });
+        defer output.close(io_mod.getIo());
+        try output.writeStreamingAll(io_mod.getIo(), malformed);
+        try output.sync(io_mod.getIo());
+    }
+    var file = try tmp.dir.openFile(io_mod.getIo(), "events.jsonl", .{});
+    defer file.close(io_mod.getIo());
+    const copied = CommitPosition{
+        .log_generation = generation,
+        .through_seq = 1,
+        .through_event_id = event_id,
+        .through_event_log_bytes = malformed.len,
+    };
+
+    try std.testing.expectError(error.InvalidSessionFormat, replayBoundary(alloc, file, copied));
+    try std.testing.expectError(error.InvalidSessionFormat, scanCommitPosition(alloc, file, copied));
+    try std.testing.expectError(error.TruncatedEventFrame, readLineAt(alloc, file, 0, malformed.len - 1));
+}
+
+test "session replay parser rejects oversized bounded frame" {
+    const alloc = std.testing.allocator;
+    const generation: Identifier = .{0x60} ** 16;
+    const event_id: Identifier = .{0x70} ** 16;
+    const oversized = try alloc.alloc(u8, session_event.event_frame_max_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    oversized[oversized.len - 1] = '\n';
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var output = try tmp.dir.createFile(io_mod.getIo(), "events.jsonl", .{ .truncate = true });
+        defer output.close(io_mod.getIo());
+        try output.writeStreamingAll(io_mod.getIo(), oversized);
+        try output.sync(io_mod.getIo());
+    }
+    var file = try tmp.dir.openFile(io_mod.getIo(), "events.jsonl", .{});
+    defer file.close(io_mod.getIo());
+    const copied = CommitPosition{
+        .log_generation = generation,
+        .through_seq = 1,
+        .through_event_id = event_id,
+        .through_event_log_bytes = oversized.len,
+    };
+
+    try std.testing.expectError(
+        error.EventFrameTooLarge,
+        readLineAt(alloc, file, 0, copied.through_event_log_bytes),
+    );
+}
+
+test "session replay parser frees line allocation on every caller path" {
+    const alloc = std.testing.allocator;
+    const generation: Identifier = .{0x80} ** 16;
+    const event_id: Identifier = .{0x90} ** 16;
+    const frame = try session_event.encodeFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = event_id,
+        .timestamp_ms = 10,
+        .event = .{ .session_started = .{
+            .id = @constCast("replay-ownership"),
+            .created_at_ms = 10,
+            .origin_workspace_root = @constCast("/tmp/origin"),
+            .workspace_root = @constCast("/tmp/current"),
+            .conversation_language = .literal("en"),
+            .preferences = .{
+                .model = @constCast("model-a"),
+                .effort = .auto,
+                .fast_mode = false,
+            },
+        } },
+    });
+    defer alloc.free(frame);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var output = try tmp.dir.createFile(io_mod.getIo(), "events.jsonl", .{ .truncate = true });
+        defer output.close(io_mod.getIo());
+        try output.writeStreamingAll(io_mod.getIo(), frame);
+        try output.sync(io_mod.getIo());
+    }
+    var file = try tmp.dir.openFile(io_mod.getIo(), "events.jsonl", .{});
+    defer file.close(io_mod.getIo());
+    const copied = CommitPosition{
+        .log_generation = generation,
+        .through_seq = 1,
+        .through_event_id = event_id,
+        .through_event_log_bytes = frame.len,
+    };
+
+    const line = try readLineAt(alloc, file, 0, copied.through_event_log_bytes);
+    defer alloc.free(line.?.bytes);
+    _ = try readFirstGeneration(alloc, file);
+    _ = try scanCommitPosition(alloc, file, copied);
 }

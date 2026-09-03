@@ -70,18 +70,15 @@ try {
       }
       return fetch(input, init);
     },
-    env: {
-      AI_GATEWAY_API_KEY: "native-core-stream-key",
-      FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/chat`,
-      FX_MODEL: "native/test-model",
-    },
+    apiKey: "native-core-stream-key",
+    gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
+    model: "native/test-model",
   });
-  const session = await agent.createSession();
-  const firstTurn = session.prompt("first native prompt");
+  const firstTurn = agent.prompt("first native prompt");
   let firstText = "";
   for await (const update of firstTurn) {
-    if (update.sessionUpdate === "agent_message_chunk" && !update.content.text.startsWith("[context]")) {
-      firstText += update.content.text;
+    if (update.type === "text_delta") {
+      firstText += update.delta;
     }
   }
   assert.equal(firstText.trimEnd(), "native one");
@@ -89,15 +86,15 @@ try {
   events.push("first-turn-complete");
   assert.equal(firstResponse.writableEnded, false, "prompt one must finish before [DONE] or EOF");
 
-  const secondTurn = session.prompt("second native prompt");
+  const secondTurn = agent.prompt("second native prompt");
   await Promise.race([
     Promise.any([firstAbort, firstConnectionClosed]),
     timeout("first response abort or connection close"),
   ]);
   let secondText = "";
   for await (const update of secondTurn) {
-    if (update.sessionUpdate === "agent_message_chunk" && !update.content.text.startsWith("[context]")) {
-      secondText += update.content.text;
+    if (update.type === "text_delta") {
+      secondText += update.delta;
     }
   }
   assert.equal(secondText.trimEnd(), "native two");
@@ -107,12 +104,11 @@ try {
     .filter((index) => index >= 0);
   assert.ok(releaseEvents.length > 0, "the first response must be aborted or closed");
   assert.ok(events.indexOf("second-fetch") > Math.min(...releaseEvents), "request two must start after response one releases the pump slot");
-  await session.close();
-  assert.equal(await agent.close(), 0);
+  assert.equal(await agent.close(), undefined);
   agent = null;
   console.log("native core stream passed: split terminal tail, matching abort, prompt reuse, and graceful close");
 } finally {
-  agent?.abort();
+  await agent?.close().catch(() => {});
   firstResponse?.destroy();
   server.closeAllConnections();
   await new Promise((resolveClose) => server.close(resolveClose));

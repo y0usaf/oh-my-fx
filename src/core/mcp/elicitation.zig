@@ -1700,6 +1700,691 @@ fn stringifyBounded(alloc: Allocator, value: std.json.Value, max_bytes: usize) E
     return out.toOwnedSlice();
 }
 
+test "ACP and modern MCP capability fallbacks stay distinct" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        json: []const u8,
+        acp: Capabilities,
+        mcp: Capabilities,
+    }{
+        .{ .json = "{}", .acp = .{}, .mcp = .{} },
+        .{ .json = "{\"elicitation\":null}", .acp = .{}, .mcp = .{} },
+        .{ .json = "{\"elicitation\":{}}", .acp = .{}, .mcp = .{ .form = true } },
+        .{ .json = "{\"elicitation\":{\"form\":null,\"url\":null}}", .acp = .{}, .mcp = .{} },
+        .{ .json = "{\"elicitation\":{\"form\":{},\"url\":{}}}", .acp = .{ .form = true, .url = true }, .mcp = .{ .form = true, .url = true } },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.acp, parseAcpCapabilities(parsed.value));
+        try std.testing.expectEqual(case.mcp, parseModernMcpCapabilities(parsed.value));
+    }
+}
+
+test "form schemas parse every supported field kind and validate content" {
+    const alloc = std.testing.allocator;
+    const schema =
+        \\{"type":"object","title":"Profile","additionalProperties":false,"properties":{"name":{"type":"string","minLength":2,"maxLength":20,"pattern":"^[A-Za-z]+$"},"age":{"type":"integer","minimum":18,"maximum":120},"ratio":{"type":"number","minimum":0,"maximum":1},"enabled":{"type":"boolean","default":true},"color":{"type":"string","oneOf":[{"const":"red","title":"Red"},{"const":"blue","title":"Blue"}]},"tags":{"type":"array","items":{"anyOf":[{"const":"a","title":"A"},{"const":"b","title":"B"}]},"minItems":1}},"required":["name","age"]}
+    ;
+    var form = try parseFormSchema(alloc, .acp, schema, .{});
+    defer form.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 6), form.fields.len);
+
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"name\":\"Alice\",\"age\":42,\"ratio\":0.5,\"enabled\":false,\"color\":\"red\",\"tags\":[\"a\",\"b\"]}",
+        .{ .parse_numbers = false },
+    );
+    defer valid.deinit();
+    try validateFormContent(alloc, form, valid.value, .{});
+
+    var invalid = try std.json.parseFromSlice(std.json.Value, alloc, "{\"name\":\"A1\",\"age\":17}", .{ .parse_numbers = false });
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidResponse, validateFormContent(alloc, form, invalid.value, .{}));
+}
+
+test "secret fields are rejected before a form is published" {
+    const schemas = [_][]const u8{
+        "{\"type\":\"object\",\"properties\":{\"api_key\":{\"type\":\"string\"}}}",
+        "{\"type\":\"object\",\"properties\":{\"accessToken\":{\"type\":\"string\"}}}",
+        "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\",\"title\":\"PrivateKey\"}}}",
+    };
+    for (schemas) |schema| {
+        try std.testing.expectError(
+            error.SecretField,
+            parseFormSchema(std.testing.allocator, .modern_mcp, schema, .{}),
+        );
+    }
+
+    var guidance = try parseFormSchema(
+        std.testing.allocator,
+        .modern_mcp,
+        "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\",\"description\":\"Do not give us your phone number, pin, or other sensitive info\"}}}",
+        .{},
+    );
+    guidance.deinit(std.testing.allocator);
+}
+
+test "secret classification covers normalized forms without truncation bypasses" {
+    const secret_names = [_][]const u8{
+        "token",
+        "client_secret",
+        "paymentCredential",
+        "PASSWORD",
+        "user-passcode",
+        "otp",
+        "userPin",
+        "api key",
+        "APIKey",
+        "access.token",
+        "privateKey",
+        "credit-card",
+    };
+    for (secret_names) |name| {
+        try std.testing.expect(isSecretField(name, null));
+    }
+    try std.testing.expect(!isSecretField("shipping_address", "Shipping address"));
+
+    var long_name: [1536]u8 = undefined;
+    @memset(&long_name, 'a');
+    @memcpy(long_name[long_name.len - "AccessToken".len ..], "AccessToken");
+    try std.testing.expect(isSecretField(&long_name, null));
+
+    const description = try std.testing.allocator.alloc(u8, 1500);
+    defer std.testing.allocator.free(description);
+    @memset(description, 'a');
+    @memcpy(description[description.len - " private key".len ..], " private key");
+    const schema = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"string\",\"description\":\"{s}\"}}}}}}",
+        .{description},
+    );
+    defer std.testing.allocator.free(schema);
+    var form = try parseFormSchema(
+        std.testing.allocator,
+        .acp,
+        schema,
+        .{ .max_label_bytes = 2048 },
+    );
+    form.deinit(std.testing.allocator);
+}
+
+test "legacy schemas are explicitly scoped to their negotiated revision" {
+    const alloc = std.testing.allocator;
+    const legacy_06 =
+        "{\"message\":\"Choose\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"choice\":{\"type\":\"string\",\"enum\":[\"a\"],\"enumNames\":[\"A\"]}}}}";
+    var request_06 = try parseRequest(alloc, .legacy_mcp_2025_06, legacy_06, .{});
+    defer request_06.deinit(alloc);
+    try std.testing.expectEqual(Mode.form, request_06.mode);
+    try std.testing.expectError(
+        error.UnsupportedMode,
+        parseRequest(
+            alloc,
+            .legacy_mcp_2025_06,
+            "{\"mode\":\"form\",\"message\":\"No explicit mode\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}",
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSchema,
+        parseRequest(
+            alloc,
+            .legacy_mcp_2025_06,
+            "{\"message\":\"No pattern\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\",\"pattern\":\"^[a-z]+$\"}}}}",
+            .{},
+        ),
+    );
+
+    var request_11 = try parseRequest(
+        alloc,
+        .legacy_mcp_2025_11,
+        "{\"mode\":\"form\",\"message\":\"Pattern\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\",\"pattern\":\"^[a-z]+$\"}}}}",
+        .{},
+    );
+    defer request_11.deinit(alloc);
+    try std.testing.expectEqual(Mode.form, request_11.mode);
+    var request_11_enum_names = try parseRequest(
+        alloc,
+        .legacy_mcp_2025_11,
+        legacy_06,
+        .{},
+    );
+    defer request_11_enum_names.deinit(alloc);
+    var parsed_11_form = try parseFormSchema(
+        alloc,
+        .legacy_mcp_2025_11,
+        request_11_enum_names.requested_schema_json.?,
+        .{},
+    );
+    defer parsed_11_form.deinit(alloc);
+    try std.testing.expectEqualStrings("A", parsed_11_form.fields[0].choices[0].title);
+
+    try std.testing.expectError(
+        error.UnsupportedSchema,
+        parseFormSchema(
+            alloc,
+            .acp,
+            "{\"type\":\"object\",\"properties\":{\"choice\":{\"type\":\"string\",\"enum\":[\"a\"],\"enumNames\":[\"A\"]}}}",
+            .{},
+        ),
+    );
+}
+
+test "exact numeric constraints retain large integer and fractional lexemes" {
+    const alloc = std.testing.allocator;
+    var form = try parseFormSchema(
+        alloc,
+        .acp,
+        "{\"type\":\"object\",\"properties\":{\"large\":{\"type\":\"integer\",\"minimum\":9007199254740993,\"maximum\":9007199254740995,\"default\":9007199254740994},\"fraction\":{\"type\":\"number\",\"minimum\":0.1,\"maximum\":0.3,\"multipleOf\":0.1,\"default\":0.3}},\"required\":[\"large\",\"fraction\"]}",
+        .{},
+    );
+    defer form.deinit(alloc);
+
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"large\":9007199254740994,\"fraction\":0.300000000000000000000000000000}",
+        .{ .parse_numbers = false },
+    );
+    defer valid.deinit();
+    try validateFormContent(alloc, form, valid.value, .{});
+
+    var rounded_down = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"large\":9007199254740992,\"fraction\":0.3}",
+        .{ .parse_numbers = false },
+    );
+    defer rounded_down.deinit();
+    try std.testing.expectError(error.InvalidResponse, validateFormContent(alloc, form, rounded_down.value, .{}));
+
+    var not_multiple = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"large\":9007199254740994,\"fraction\":0.300000000000000000000000000001}",
+        .{ .parse_numbers = false },
+    );
+    defer not_multiple.deinit();
+    try std.testing.expectError(error.InvalidResponse, validateFormContent(alloc, form, not_multiple.value, .{}));
+}
+
+test "2025-11 URL-required errors parse only on their negotiated wire" {
+    const alloc = std.testing.allocator;
+    const data =
+        "{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"url-1\"}]}";
+    var required = try parseLegacyUrlRequired(alloc, .legacy_mcp_2025_11, data, .{});
+    defer required.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), required.requests.len);
+    try std.testing.expectEqualStrings("url-1", required.requests[0].elicitation_id.?);
+    const rendered = try renderLegacyUrlRequiredRequests(alloc, required, .{});
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(
+        "{\"url-1\":{\"method\":\"elicitation/create\",\"params\":{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"url-1\"}}}",
+        rendered,
+    );
+    try std.testing.expectError(
+        error.UnsupportedMode,
+        parseLegacyUrlRequired(alloc, .legacy_mcp_2025_06, data, .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidRequest,
+        parseLegacyUrlRequired(
+            alloc,
+            .legacy_mcp_2025_11,
+            "{\"elicitations\":[{\"mode\":\"form\",\"message\":\"No\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}]}",
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRequest,
+        parseLegacyUrlRequired(
+            alloc,
+            .legacy_mcp_2025_11,
+            "{\"elicitations\":[{\"mode\":\"url\",\"message\":\"One\",\"url\":\"https://example.test/one\",\"elicitationId\":\"same\"},{\"mode\":\"url\",\"message\":\"Two\",\"url\":\"https://example.test/two\",\"elicitationId\":\"same\"}]}",
+            .{},
+        ),
+    );
+}
+
+test "ambiguous schemas are rejected before interaction" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidSchema,
+        parseFormSchema(
+            alloc,
+            .acp,
+            "{\"type\":\"object\",\"properties\":{\"color\":{\"type\":\"string\",\"enum\":[\"red\",\"red\"]}}}",
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchema,
+        parseFormSchema(
+            alloc,
+            .acp,
+            "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\",\"name\"]}",
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSchema,
+        parseFormSchema(
+            alloc,
+            .acp,
+            "{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{}}",
+            .{},
+        ),
+    );
+}
+
+test "unknown formats remain ACP annotations but are not widened onto MCP" {
+    const alloc = std.testing.allocator;
+    const schema =
+        "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\",\"format\":\"future-format\"}}}";
+    var acp = try parseFormSchema(alloc, .acp, schema, .{});
+    defer acp.deinit(alloc);
+    try std.testing.expectEqual(Format.unknown, acp.fields[0].format);
+    try std.testing.expectEqualStrings("future-format", acp.fields[0].format_name.?);
+    try std.testing.expectError(
+        error.UnsupportedSchema,
+        parseFormSchema(alloc, .modern_mcp, schema, .{}),
+    );
+}
+
+test "known formats use bounded structural validation" {
+    try std.testing.expect(validFormat(.email, "user@example.test"));
+    try std.testing.expect(!validFormat(.email, "not-an-email"));
+    try std.testing.expect(validFormat(.date, "2024-02-29"));
+    try std.testing.expect(!validFormat(.date, "2023-02-29"));
+    try std.testing.expect(validFormat(.date_time, "2026-08-02T12:34:56.123-04:00"));
+    try std.testing.expect(!validFormat(.date_time, "2026-08-02T99:34:56Z"));
+}
+
+test "elicitation patterns use bounded codepoint semantics" {
+    const alloc = std.testing.allocator;
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"glyph\":\"\\u03c0\",\"space\":\"\\u00a0\"}",
+        .{},
+    );
+    defer valid.deinit();
+
+    var too_many_codepoints = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"glyph\":\"\\u03c0a\",\"space\":\"\\u00a0\"}",
+        .{},
+    );
+    defer too_many_codepoints.deinit();
+
+    for ([_]Wire{ .modern_mcp, .legacy_mcp_2025_11, .acp }) |wire| {
+        var form = try parseFormSchema(
+            alloc,
+            wire,
+            "{\"type\":\"object\",\"properties\":{\"glyph\":{\"type\":\"string\",\"pattern\":\"^.{1}$\"},\"space\":{\"type\":\"string\",\"pattern\":\"^\\\\s$\"}},\"required\":[\"glyph\",\"space\"]}",
+            .{},
+        );
+        defer form.deinit(alloc);
+        try validateFormContent(alloc, form, valid.value, .{});
+        try std.testing.expectError(
+            error.InvalidResponse,
+            validateFormContent(alloc, form, too_many_codepoints.value, .{}),
+        );
+    }
+
+    try std.testing.expectError(
+        error.InvalidSchema,
+        parseFormSchema(
+            alloc,
+            .modern_mcp,
+            "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\",\"pattern\":\"(?=x)\"}}}",
+            .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.LimitExceeded,
+        parseFormSchema(
+            alloc,
+            .modern_mcp,
+            "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\",\"pattern\":\"^a$\"}}}",
+            .{ .max_pattern_states = 1 },
+        ),
+    );
+}
+
+test "duplicate titled alternatives remain valid distinct schema choices" {
+    var schema = try parseFormSchema(
+        std.testing.allocator,
+        .modern_mcp,
+        "{\"type\":\"object\",\"properties\":{\"choice\":{\"type\":\"string\",\"oneOf\":[{\"const\":\"first\",\"title\":\"Duplicate\"},{\"const\":\"second\",\"title\":\"Duplicate\"}]}},\"required\":[\"choice\"]}",
+        .{},
+    );
+    defer schema.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), schema.fields.len);
+    try std.testing.expectEqual(@as(usize, 2), schema.fields[0].choices.len);
+    try std.testing.expectEqualStrings("Duplicate", schema.fields[0].choices[0].title);
+    try std.testing.expectEqualStrings("Duplicate", schema.fields[0].choices[1].title);
+}
+
+test "URL classification permits secure and loopback URLs only" {
+    const alloc = std.testing.allocator;
+    const host = try classifyUrl(alloc, "https://example.test/full/path?state=opaque", .{});
+    defer alloc.free(host);
+    try std.testing.expectEqualStrings("example.test", host);
+    const loopback = try classifyUrl(alloc, "http://localhost:4321/callback", .{});
+    defer alloc.free(loopback);
+    try std.testing.expectEqualStrings("localhost", loopback);
+    try std.testing.expectError(error.InsecureUrl, classifyUrl(alloc, "http://example.test", .{}));
+    try std.testing.expectError(error.InvalidUrl, classifyUrl(alloc, "https://user@example.test", .{}));
+}
+
+test "host classification warns for punycode and non-ASCII without I/O" {
+    try std.testing.expectEqual(HostClassification.ordinary, classifyHost("example.test"));
+    try std.testing.expectEqual(HostClassification.punycode, classifyHost("XN--e1awd7f.test"));
+    try std.testing.expectEqual(HostClassification.punycode, classifyHost("login.xn--pple-43d.test"));
+    try std.testing.expectEqual(HostClassification.non_ascii, classifyHost("ex\xc3\xa4mple.test"));
+}
+
+test "legacy URL completion notification classification validates the full bounded envelope" {
+    const alloc = std.testing.allocator;
+    const malformed = [_][]const u8{
+        "null",
+        "{}",
+        "{\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
+        "{\"jsonrpc\":\"1.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
+        "{\"jsonrpc\":2,\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/completed\",\"params\":{\"elicitationId\":\"id\"}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\"}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":[]}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":7}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"\"}}",
+    };
+    for (malformed) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(classifyLegacyUrlCompletionNotification(parsed.value, .{}) == null);
+    }
+
+    const oversized_id = try alloc.alloc(u8, (Limits{}).max_elicitation_id_bytes + 1);
+    defer alloc.free(oversized_id);
+    @memset(oversized_id, 'x');
+    const oversized_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{{\"elicitationId\":\"{s}\"}}}}",
+        .{oversized_id},
+    );
+    defer alloc.free(oversized_json);
+    var oversized = try std.json.parseFromSlice(std.json.Value, alloc, oversized_json, .{});
+    defer oversized.deinit();
+    try std.testing.expect(classifyLegacyUrlCompletionNotification(oversized.value, .{}) == null);
+
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"matching-id\"}}",
+        .{},
+    );
+    defer valid.deinit();
+    const notification = classifyLegacyUrlCompletionNotification(valid.value, .{}).?;
+    try std.testing.expectEqualStrings("matching-id", notification.elicitation_id);
+}
+
+test "legacy URL completion correlation requires every bound unique ID" {
+    const binding = Binding{
+        .server_name = "server-a",
+        .scope = .{ .operation = .{ .tools_call = "authorize" } },
+        .connection_generation = 4,
+        .client_generation = 5,
+        .catalog_generation = 6,
+        .request_generation = 7,
+        .auth_generation = 8,
+        .deadline_ms = 100,
+    };
+    const ids = [_][]const u8{ "one", "two" };
+    var completed = [_]bool{ false, false };
+    const first = decideLegacyUrlCompletion(
+        binding,
+        &ids,
+        &completed,
+        .{
+            .server_name = "server-a",
+            .elicitation_id = "one",
+            .connection_generation = 4,
+            .client_generation = 5,
+            .catalog_generation = 6,
+            .auth_generation = 8,
+        },
+        99,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 0), first.record.index);
+    try std.testing.expect(!first.record.all_complete);
+    completed[0] = true;
+
+    const duplicate = decideLegacyUrlCompletion(
+        binding,
+        &ids,
+        &completed,
+        .{
+            .server_name = "server-a",
+            .elicitation_id = "one",
+            .connection_generation = 4,
+            .client_generation = 5,
+            .catalog_generation = 6,
+            .auth_generation = 8,
+        },
+        99,
+        true,
+    );
+    try std.testing.expectEqual(LegacyUrlCompletionRejection.duplicate, duplicate.reject);
+
+    const unknown = decideLegacyUrlCompletion(
+        binding,
+        &ids,
+        &completed,
+        .{
+            .server_name = "server-a",
+            .elicitation_id = "wrong",
+            .connection_generation = 4,
+            .client_generation = 5,
+            .catalog_generation = 6,
+            .auth_generation = 8,
+        },
+        99,
+        true,
+    );
+    try std.testing.expectEqual(LegacyUrlCompletionRejection.unknown_id, unknown.reject);
+
+    const wrong_generation = decideLegacyUrlCompletion(
+        binding,
+        &ids,
+        &completed,
+        .{
+            .server_name = "server-a",
+            .elicitation_id = "two",
+            .connection_generation = 9,
+            .client_generation = 5,
+            .catalog_generation = 6,
+            .auth_generation = 8,
+        },
+        99,
+        true,
+    );
+    try std.testing.expectEqual(
+        Rejection.wrong_connection,
+        wrong_generation.reject.binding,
+    );
+
+    const late = decideLegacyUrlCompletion(
+        binding,
+        &ids,
+        &completed,
+        .{
+            .server_name = "server-a",
+            .elicitation_id = "two",
+            .connection_generation = 4,
+            .client_generation = 5,
+            .catalog_generation = 6,
+            .auth_generation = 8,
+        },
+        101,
+        true,
+    );
+    try std.testing.expectEqual(Rejection.late, late.reject.binding);
+
+    const last = decideLegacyUrlCompletion(
+        binding,
+        &ids,
+        &completed,
+        .{
+            .server_name = "server-a",
+            .elicitation_id = "two",
+            .connection_generation = 4,
+            .client_generation = 5,
+            .catalog_generation = 6,
+            .auth_generation = 8,
+        },
+        99,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 1), last.record.index);
+    try std.testing.expect(last.record.all_complete);
+    try std.testing.expectEqual(
+        LegacyUrlRetryDecision.await_completion,
+        decideLegacyUrlRetry(.accepted, .none),
+    );
+    try std.testing.expectEqual(
+        LegacyUrlRetryDecision.retry,
+        decideLegacyUrlRetry(.accepted, .notifications),
+    );
+    try std.testing.expectEqual(
+        LegacyUrlRetryDecision.retry,
+        decideLegacyUrlRetry(.accepted, .manual_retry),
+    );
+    try std.testing.expectEqual(
+        LegacyUrlRetryDecision.declined,
+        decideLegacyUrlRetry(.declined, .notifications),
+    );
+}
+
+test "continuation decisions reject stale cross-owner and duplicate answers" {
+    const expected: Binding = .{
+        .server_name = "alpha",
+        .scope = .{ .operation = .{ .tools_call = "lookup" } },
+        .runtime_generation = 1,
+        .connection_generation = 2,
+        .client_generation = 3,
+        .catalog_generation = 4,
+        .request_generation = 5,
+        .auth_generation = 6,
+        .user_identity = "user-a",
+        .deadline_ms = 100,
+    };
+    const answer: AnswerBinding = .{
+        .server_name = "alpha",
+        .scope = .{ .operation = .{ .tools_call = "lookup" } },
+        .runtime_generation = 1,
+        .connection_generation = 2,
+        .client_generation = 3,
+        .catalog_generation = 4,
+        .request_generation = 5,
+        .auth_generation = 6,
+        .user_identity = "user-a",
+    };
+    try std.testing.expectEqual(Transition.consume, decideTransition(.pending, expected, answer, 99, true));
+    try std.testing.expectEqual(Rejection.duplicate, decideTransition(.consumed, expected, answer, 99, true).reject);
+    var wrong = answer;
+    wrong.server_name = "beta";
+    try std.testing.expectEqual(Rejection.wrong_server, decideTransition(.pending, expected, wrong, 99, true).reject);
+    wrong = answer;
+    wrong.runtime_generation += 1;
+    try std.testing.expectEqual(Rejection.wrong_runtime, decideTransition(.pending, expected, wrong, 99, true).reject);
+    wrong = answer;
+    wrong.auth_generation += 1;
+    try std.testing.expectEqual(Rejection.changed_auth, decideTransition(.pending, expected, wrong, 99, true).reject);
+    wrong = answer;
+    wrong.scope = .{ .operation = .{ .resources_read = "memory://lookup" } };
+    try std.testing.expectEqual(Rejection.wrong_scope, decideTransition(.pending, expected, wrong, 99, true).reject);
+    try std.testing.expectEqual(Rejection.late, decideTransition(.pending, expected, answer, 101, true).reject);
+}
+
+test "request parsing and validation release every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocationFailures, .{});
+}
+
+test "ACP projection keeps the wire distinctions from modern and legacy MCP" {
+    const alloc = std.testing.allocator;
+    var modern = try parseRequest(
+        alloc,
+        .modern_mcp,
+        "{\"message\":\"Profile\",\"requestedSchema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}},\"_meta\":{\"fixture\":true}}",
+        .{},
+    );
+    defer modern.deinit(alloc);
+    const projected = try projectToAcpCreateParams(
+        alloc,
+        modern,
+        .{ .session = .{ .session_id = "session", .tool_call_id = "tool" } },
+        null,
+        null,
+        .{},
+    );
+    defer alloc.free(projected);
+    try std.testing.expect(std.mem.find(u8, projected, "\"mode\":\"form\"") != null);
+    try std.testing.expect(std.mem.find(u8, projected, "\"$schema\"") == null);
+    try std.testing.expect(std.mem.find(u8, projected, "\"_meta\":{\"fixture\":true}") != null);
+
+    var legacy_url = try parseRequest(
+        alloc,
+        .legacy_mcp_2025_11,
+        "{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"legacy-id\"}",
+        .{},
+    );
+    defer legacy_url.deinit(alloc);
+    try std.testing.expectEqualStrings("legacy-id", legacy_url.elicitation_id.?);
+
+    var with_enum_names = try parseRequest(
+        alloc,
+        .legacy_mcp_2025_06,
+        "{\"message\":\"Choose\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"choice\":{\"type\":\"string\",\"enum\":[\"a\"],\"enumNames\":[\"A\"]}}}}",
+        .{},
+    );
+    defer with_enum_names.deinit(alloc);
+    const projected_enum_names = try projectToAcpCreateParams(
+        alloc,
+        with_enum_names,
+        .{ .request = .{ .string = "request" } },
+        null,
+        null,
+        .{},
+    );
+    defer alloc.free(projected_enum_names);
+    try std.testing.expect(std.mem.find(u8, projected_enum_names, "enumNames") == null);
+    try std.testing.expect(std.mem.find(u8, projected_enum_names, "\"enum\":[\"a\"]") != null);
+}
+
+test "canonical responses discard ignored content and unknown fields" {
+    const alloc = std.testing.allocator;
+    var request = try parseRequest(
+        alloc,
+        .acp,
+        "{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"id\"}",
+        .{},
+    );
+    defer request.deinit(alloc);
+    const canonical = try canonicalResponse(
+        alloc,
+        request,
+        "{\"action\":\"decline\",\"content\":{\"ignored\":\"private\"},\"future\":true}",
+        .{},
+    );
+    defer alloc.free(canonical);
+    try std.testing.expectEqualStrings("{\"action\":\"decline\"}", canonical);
+}
+
 fn checkAllocationFailures(alloc: Allocator) !void {
     var request = try parseRequest(
         alloc,
@@ -1736,4 +2421,57 @@ fn checkAllocationFailures(alloc: Allocator) !void {
     defer url_required.deinit(alloc);
     const url_requests = try renderLegacyUrlRequiredRequests(alloc, url_required, .{});
     alloc.free(url_requests);
+}
+
+fn fuzzElicitationJson(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [2048]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buffer, &.{
+        .rangeAtMost(u8, 0x20, 0x7e, 8),
+        .rangeAtMost(u8, 0x00, 0xff, 1),
+        .value(u8, '{', 4),
+        .value(u8, '}', 4),
+        .value(u8, '[', 3),
+        .value(u8, ']', 3),
+        .value(u8, '"', 4),
+        .value(u8, ':', 3),
+        .value(u8, ',', 3),
+    });
+    const bytes = buffer[0..len];
+    var parsed_json = std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        bytes,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
+    if (parsed_json) |*parsed| {
+        defer parsed.deinit();
+        _ = classifyLegacyUrlCompletionNotification(parsed.value, .{});
+    }
+    for ([_]Wire{ .modern_mcp, .legacy_mcp_2025_06, .legacy_mcp_2025_11, .acp }) |wire| {
+        var request = parseRequest(std.testing.allocator, wire, bytes, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        defer request.deinit(std.testing.allocator);
+        const response = canonicalResponse(std.testing.allocator, request, bytes, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        std.testing.allocator.free(response);
+    }
+}
+
+test "elicitation request and response parsers stay bounded under fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzElicitationJson, .{
+        .corpus = &.{
+            "{}",
+            "{\"mode\":\"form\",\"requestedSchema\":{}}",
+            "{\"action\":\"accept\",\"content\":{}}",
+            "{\"mode\":\"url\",\"url\":\"https://example.test\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
+        },
+    });
 }

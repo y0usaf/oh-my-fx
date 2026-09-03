@@ -55,13 +55,3 @@ benchmarks/baseline.json
 .vibe/
 .windsurf/
 .zencoder/
-
-# Nix build output
-/result
-__pycache__/
-
-# Local worktrees
-.worktrees/
-
-# Generated site assets (built by deploy-site.yml or sync-wasm.sh)
-site/omfx-term.wasm

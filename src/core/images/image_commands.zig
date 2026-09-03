@@ -301,6 +301,33 @@ fn realTmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const
     return @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, name);
 }
 
+fn ownedTestAttachment(alloc: std.mem.Allocator, path: []const u8) !types.ImageAttachment {
+    return .{
+        .path = try alloc.dupe(u8, path),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    };
+}
+
+fn testClipboardImage(
+    alloc: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+    source_dir_name: []const u8,
+) !image_attachments.ClipboardImageAttachment {
+    try tmp.dir.createDir(std.testing.io, source_dir_name, .default_dir);
+    const source_sub_path = try std.fs.path.join(alloc, &.{ source_dir_name, "clipboard.png" });
+    defer alloc.free(source_sub_path);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = source_sub_path,
+        .data = "\x89PNG\r\n\x1a\nclipboard",
+    });
+    const source_path = try realTmpPath(alloc, tmp, source_sub_path);
+    defer alloc.free(source_path);
+    return .{
+        .attachment = try image_attachments.loadImageAttachment(alloc, source_path),
+        .source_dir = try realTmpPath(alloc, tmp, source_dir_name),
+    };
+}
+
 fn countSnapshotFiles(snapshot_dir: []const u8) !usize {
     var dir = std.Io.Dir.openDirAbsolute(std.testing.io, snapshot_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return 0,
@@ -313,4 +340,648 @@ fn countSnapshotFiles(snapshot_dir: []const u8) !usize {
         if (entry.kind == .file) count += 1;
     }
     return count;
+}
+
+test "attachPath reports usage for empty path" {
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachPath(&app, " \t ");
+
+    try expectTranscriptContains(&app, "usage: /image <path>");
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+}
+
+test "attachPath inserts placeholder at cursor and tracks the attachment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "shot.png");
+
+    const path = try realTmpPath(alloc, &tmp, "shot.png");
+    defer alloc.free(path);
+
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachPath(&app, path);
+
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expectEqualStrings("image/png", app.pending_images.items[0].media_type);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items[0].id);
+    try std.testing.expectEqualStrings("[Image #1]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, "[Image #1]".len), app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.image_tokens.items.len);
+    try std.testing.expectEqual(
+        entity_spans.Span{ .raw_start = 0, .raw_end = "[Image #1]".len },
+        app.input_runtime.entities.image_tokens.items[0].span,
+    );
+    try expectTranscriptContains(&app, "attached image: shot.png");
+    try tmp.dir.access(std.testing.io, "shot.png", .{});
+}
+
+test "attachPath resolves relative image paths from the workspace" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try writeTestImage(&tmp, "workspace/shot.png");
+
+    const workspace = try realTmpPath(alloc, &tmp, "workspace");
+    defer alloc.free(workspace);
+    const expected = try realTmpPath(alloc, &tmp, "workspace/shot.png");
+    defer alloc.free(expected);
+
+    var app = FakeApp{ .alloc = alloc, .workspace_root = workspace };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachPath(&app, "shot.png");
+
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expectEqualStrings(expected, app.pending_images.items[0].path);
+}
+
+fn expectBadgeProjection(alloc: std.mem.Allocator, app: *const FakeApp, expected: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    _ = try image_attachments.expandPlaceholdersWithBadges(
+        alloc,
+        &out.writer,
+        app.input_runtime.edit_state.input.items,
+        app.pending_images.items,
+        null,
+    );
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
+test "attachPath keeps image ids stable across turns" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "one.png");
+    try writeTestImage(&tmp, "two.png");
+    try writeTestImage(&tmp, "three.png");
+
+    const one = try realTmpPath(alloc, &tmp, "one.png");
+    defer alloc.free(one);
+    const two = try realTmpPath(alloc, &tmp, "two.png");
+    defer alloc.free(two);
+    const three = try realTmpPath(alloc, &tmp, "three.png");
+    defer alloc.free(three);
+
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachPath(&app, one);
+    try Commands(FakeApp).attachPath(&app, two);
+    try std.testing.expectEqualStrings("[Image #1][Image #2]", app.input_runtime.edit_state.input.items);
+    try expectBadgeProjection(alloc, &app, "[Image 1][Image 2]");
+
+    // Submitting the turn releases the draft; the session id counter survives it.
+    app.clearPendingImages();
+    app.input_runtime.edit_state.input.clearRetainingCapacity();
+    app.input_runtime.edit_state.cursor = 0;
+
+    try Commands(FakeApp).attachPath(&app, three);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.pending_images.items[0].id);
+    try std.testing.expectEqualStrings("[Image #3]", app.input_runtime.edit_state.input.items);
+    try expectBadgeProjection(alloc, &app, "[Image 3]");
+}
+
+test "attachPath after a resumed session badges the next collision-free id" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "resumed.png");
+
+    const path = try realTmpPath(alloc, &tmp, "resumed.png");
+    defer alloc.free(path);
+
+    const restored = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("/tmp/one.png"), .media_type = @constCast("image/png") },
+        .{ .id = 2, .path = @constCast("/tmp/two.png"), .media_type = @constCast("image/png") },
+    };
+    const bounds = try image_attachments.calculate_next_image_id(&restored);
+
+    var app = FakeApp{ .alloc = alloc, .next_image_id_counter = bounds.next_id };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachPath(&app, path);
+
+    try std.testing.expectEqual(@as(usize, 3), app.pending_images.items[0].id);
+    try expectBadgeProjection(alloc, &app, "[Image 3]");
+}
+
+test "path and clipboard insertion recover from provider size rejection without mutating the draft" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "provider-too-large.png", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\n");
+        try file.setLength(std.testing.io, image_attachments.max_image_bytes + 1);
+    }
+    try writeTestImage(&tmp, "next.png");
+
+    const rejected_path = try realTmpPath(alloc, &tmp, "provider-too-large.png");
+    defer alloc.free(rejected_path);
+    const next_path = try realTmpPath(alloc, &tmp, "next.png");
+    defer alloc.free(next_path);
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+
+    var app = FakeApp{
+        .alloc = alloc,
+        .next_image_id_counter = 8,
+        .snapshot_dir = snapshot_dir,
+    };
+    defer app.deinit();
+    var existing = try ownedTestAttachment(alloc, "/tmp/existing.png");
+    existing.id = 7;
+    try app.pending_images.append(alloc, existing);
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "draft [Image #7]");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Commands(FakeApp).attachPath(&app, rejected_path);
+
+    try std.testing.expectEqualStrings("draft [Image #7]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 7), app.pending_images.items[0].id);
+    try std.testing.expectEqualStrings("/tmp/existing.png", app.pending_images.items[0].path);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+    try std.testing.expectEqualStrings(
+        "image exceeds the 20 MiB limit\n",
+        app.text(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+
+    app.transcript.clearRetainingCapacity();
+    try Commands(FakeApp).attachPath(&app, next_path);
+
+    try std.testing.expectEqual(@as(usize, 2), app.pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 8), app.pending_images.items[1].id);
+    try std.testing.expect(std.mem.find(u8, app.input_runtime.edit_state.input.items, "[Image #8]") != null);
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "path and clipboard insertion propagate capture out of memory without a notice or mutation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "oom.png");
+
+    const path = try realTmpPath(alloc, &tmp, "oom.png");
+    defer alloc.free(path);
+
+    var app = FakeApp{
+        .alloc = alloc,
+        .capture_error = error.OutOfMemory,
+    };
+    defer app.deinit();
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "draft");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Commands(FakeApp).attachPath(&app, path),
+    );
+
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+}
+
+test "path and clipboard insertion preserve cancellation timeout and fatal capture errors" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "propagated.png");
+
+    const path = try realTmpPath(alloc, &tmp, "propagated.png");
+    defer alloc.free(path);
+
+    for ([_]anyerror{
+        error.Cancelled,
+        error.TimedOut,
+        error.InjectedCaptureFailure,
+    }) |expected_error| {
+        var app = FakeApp{
+            .alloc = alloc,
+            .capture_error = expected_error,
+        };
+        defer app.deinit();
+        try app.input_runtime.edit_state.input.appendSlice(alloc, "draft");
+        app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+        try std.testing.expectError(
+            expected_error,
+            Commands(FakeApp).attachPath(&app, path),
+        );
+
+        try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+        try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+    }
+}
+
+test "attachPath resets vertical intent after successful image append" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "reset.png");
+
+    const path = try realTmpPath(alloc, &tmp, "reset.png");
+    defer alloc.free(path);
+
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachPath(&app, path);
+
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.vertical_navigation.reset_count);
+}
+
+test "attachPath succeeds when placeholder exactly fills the input limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "exact.png");
+
+    const path = try realTmpPath(alloc, &tmp, "exact.png");
+    defer alloc.free(path);
+
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendNTimes(alloc, 'x', FakeApp.input_byte_limit - "[Image #1]".len);
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Commands(FakeApp).attachPath(&app, path);
+
+    try std.testing.expectEqual(FakeApp.input_byte_limit, app.input_runtime.edit_state.input.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expect(image_attachments.imageAttachmentsSortedById(app.pending_images.items));
+}
+
+test "attachPath rejects when placeholder is one byte too long without mutating input or metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "full.png");
+
+    const path = try realTmpPath(alloc, &tmp, "full.png");
+    defer alloc.free(path);
+
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendNTimes(alloc, 'x', FakeApp.input_byte_limit - "[Image #1]".len + 1);
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+    const before = try alloc.dupe(u8, app.input_runtime.edit_state.input.items);
+    defer alloc.free(before);
+
+    try Commands(FakeApp).attachPath(&app, path);
+
+    try std.testing.expectEqualStrings(before, app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.next_image_id_counter);
+    try expectTranscriptContains(&app, "input is full");
+    try tmp.dir.access(std.testing.io, "full.png", .{});
+}
+
+fn checkImageInsertionAllocationFailureIsAtomic(
+    failing: *std.testing.FailingAllocator,
+    fail_offset: ?usize,
+    allocation_count: *usize,
+) !void {
+    const alloc = failing.allocator();
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+    app.next_image_id_counter = 7;
+
+    const image = try ownedTestAttachment(alloc, "/tmp/reserved.png");
+    const start_alloc_index = failing.alloc_index;
+    if (fail_offset) |offset| {
+        failing.fail_index = try std.math.add(
+            usize,
+            start_alloc_index,
+            offset,
+        );
+    }
+
+    _ = Commands(FakeApp).insertImageAtCursor(FakeApp, &app, image, .retained) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.cursor);
+        try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.image_tokens.items.len);
+        try std.testing.expectEqual(@as(usize, 7), app.next_image_id_counter);
+        return err;
+    };
+
+    allocation_count.* = failing.alloc_index - start_alloc_index;
+    try std.testing.expectEqualStrings("[Image #7]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.image_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 8), app.next_image_id_counter);
+}
+
+test "insertImageAtCursor stays atomic across allocation failures" {
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var allocation_count: usize = 0;
+    try checkImageInsertionAllocationFailureIsAtomic(
+        &probe,
+        null,
+        &allocation_count,
+    );
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+
+    for (0..allocation_count) |fail_offset| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{},
+        );
+        var ignored_count: usize = 0;
+        checkImageInsertionAllocationFailureIsAtomic(
+            &failing,
+            fail_offset,
+            &ignored_count,
+        ) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        };
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "insertImageAtCursor rejects image id overflow without mutation" {
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+    app.next_image_id_counter = std.math.maxInt(usize);
+    const image = try ownedTestAttachment(alloc, "/tmp/overflow.png");
+
+    try std.testing.expectError(
+        error.Overflow,
+        Commands(FakeApp).insertImageAtCursor(FakeApp, &app, image, .retained),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    try std.testing.expectEqual(std.math.maxInt(usize), app.next_image_id_counter);
+}
+
+test "temporary image source is removed after insertion and remapped to its snapshot" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+    var loaded = try testClipboardImage(alloc, &tmp, "clipboard-source");
+    const source_dir = try alloc.dupe(u8, loaded.source_dir);
+    defer alloc.free(source_dir);
+
+    var app = FakeApp{
+        .alloc = alloc,
+        .snapshot_dir = snapshot_dir,
+    };
+    defer app.deinit();
+    const result = try Commands(FakeApp).insertImageAtCursor(
+        FakeApp,
+        &app,
+        loaded.takeAttachment(),
+        .temporary,
+    );
+    loaded.deinit(alloc);
+
+    try std.testing.expectEqual(InsertImageResult.inserted, result);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(std.testing.io, source_dir, .{}),
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    const pending = app.pending_images.items[0];
+    try std.testing.expectEqualStrings(pending.snapshot_path.?, pending.path);
+    var verified = try image_attachments.loadVerifiedSnapshot(
+        alloc,
+        pending,
+        .{},
+    );
+    defer verified.deinit(alloc);
+}
+
+test "temporary image source is removed on input full rejection and capture failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+
+    {
+        var loaded = try testClipboardImage(alloc, &tmp, "clipboard-full");
+        const source_dir = try alloc.dupe(u8, loaded.source_dir);
+        defer alloc.free(source_dir);
+        var app = FakeApp{
+            .alloc = alloc,
+            .snapshot_dir = snapshot_dir,
+        };
+        defer app.deinit();
+        try app.input_runtime.edit_state.input.appendNTimes(alloc, 'x', FakeApp.input_byte_limit);
+        app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+        const result = try Commands(FakeApp).insertImageAtCursor(
+            FakeApp,
+            &app,
+            loaded.takeAttachment(),
+            .temporary,
+        );
+        loaded.deinit(alloc);
+
+        try std.testing.expectEqual(InsertImageResult.input_full, result);
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.accessAbsolute(std.testing.io, source_dir, .{}),
+        );
+    }
+
+    for ([_]anyerror{ error.ImageTooLarge, error.OutOfMemory }) |capture_error| {
+        const source_name = if (capture_error == error.ImageTooLarge)
+            "clipboard-rejected"
+        else
+            "clipboard-oom";
+        var loaded = try testClipboardImage(alloc, &tmp, source_name);
+        const source_dir = try alloc.dupe(u8, loaded.source_dir);
+        defer alloc.free(source_dir);
+        var app = FakeApp{
+            .alloc = alloc,
+            .capture_error = capture_error,
+            .snapshot_dir = snapshot_dir,
+        };
+        defer app.deinit();
+
+        if (capture_error == error.ImageTooLarge) {
+            const result = try Commands(FakeApp).insertImageAtCursor(
+                FakeApp,
+                &app,
+                loaded.takeAttachment(),
+                .temporary,
+            );
+            try std.testing.expectEqual(InsertImageResult.rejected, result);
+        } else {
+            try std.testing.expectError(
+                capture_error,
+                Commands(FakeApp).insertImageAtCursor(
+                    FakeApp,
+                    &app,
+                    loaded.takeAttachment(),
+                    .temporary,
+                ),
+            );
+        }
+        loaded.deinit(alloc);
+
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.accessAbsolute(std.testing.io, source_dir, .{}),
+        );
+        try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    }
+}
+
+test "attachPath inserts at the cursor position with surrounding text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "shot.png");
+
+    const path = try realTmpPath(alloc, &tmp, "shot.png");
+    defer alloc.free(path);
+
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "abXY");
+    app.input_runtime.edit_state.cursor = 2;
+
+    try Commands(FakeApp).attachPath(&app, path);
+
+    try std.testing.expectEqualStrings("ab[Image #1]XY", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, "ab[Image #1]".len), app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.history_boundary_count);
+}
+
+test "attachPath at distinct cursor positions assigns ids in order of attachment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "a.png");
+    try writeTestImage(&tmp, "b.png");
+
+    const path_a = try realTmpPath(alloc, &tmp, "a.png");
+    defer alloc.free(path_a);
+    const path_b = try realTmpPath(alloc, &tmp, "b.png");
+    defer alloc.free(path_b);
+
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "hello");
+    app.input_runtime.edit_state.cursor = 5;
+
+    try Commands(FakeApp).attachPath(&app, path_a);
+
+    app.input_runtime.edit_state.cursor = 0;
+    try Commands(FakeApp).attachPath(&app, path_b);
+
+    try std.testing.expectEqualStrings("[Image #2]hello[Image #1]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 2), app.pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items[0].id);
+    try std.testing.expectEqual(@as(usize, 2), app.pending_images.items[1].id);
+    try std.testing.expect(image_attachments.imageAttachmentsSortedById(app.pending_images.items));
+}
+
+test "attachPath reports missing and unsupported image errors" {
+    const alloc = std.testing.allocator;
+    {
+        var app = FakeApp{ .alloc = alloc };
+        defer app.deinit();
+
+        try Commands(FakeApp).attachPath(&app, "/definitely/missing/image.png");
+
+        try expectTranscriptContains(&app, "image file not found");
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+        try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var file = try tmp.dir.createFile(std.testing.io, "note.txt", .{});
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, "plain text");
+        }
+        const path = try realTmpPath(alloc, &tmp, "note.txt");
+        defer alloc.free(path);
+
+        var app = FakeApp{ .alloc = alloc };
+        defer app.deinit();
+
+        try Commands(FakeApp).attachPath(&app, path);
+
+        try expectTranscriptContains(&app, "unsupported image type");
+        try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    }
+}
+
+test "managePending reports empty lists populated lists and clear" {
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).managePending(&app, "");
+    try expectTranscriptContains(&app, "no pending images");
+    app.transcript.clearRetainingCapacity();
+
+    try app.pending_images.append(alloc, .{
+        .path = try alloc.dupe(u8, "/tmp/a.png"),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    });
+    try app.pending_images.append(alloc, .{
+        .path = try alloc.dupe(u8, "/tmp/b.jpeg"),
+        .media_type = try alloc.dupe(u8, "image/jpeg"),
+    });
+
+    try Commands(FakeApp).managePending(&app, "list");
+    try std.testing.expectEqualStrings(
+        "2 pending\n - a.png (image/png)\n - b.jpeg (image/jpeg)\n",
+        app.text(),
+    );
+
+    app.transcript.clearRetainingCapacity();
+    try Commands(FakeApp).managePending(&app, "clear");
+
+    try expectTranscriptContains(&app, "cleared pending images");
+    try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+}
+
+test "attachClipboard is silent on unsupported platforms" {
+    if (@import("builtin").os.tag == .macos) return;
+
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachClipboard(&app);
+
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 }

@@ -1,9 +1,11 @@
 const std = @import("std");
+const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const language_script = @import("../shared/language_script.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -15,6 +17,11 @@ pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const Allocator = std.mem.Allocator;
+
+test {
+    _ = session_usage;
+    _ = profile_usage_runtime;
+}
 
 const compact_continuation_preamble = "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n";
 const compact_recent_messages_note = "Recent conversation turns are preserved verbatim.";
@@ -67,8 +74,6 @@ pub const ToolCall = core_types.ToolCall;
 /// Stored assistant response paired with the user turn that produced it.
 pub const AssistantHistoryTurn = core_types.AssistantHistoryTurn;
 /// Stored background command metadata paired with the user turn that produced it.
-pub const BackgroundCommandHistoryTurn = core_types.BackgroundCommandHistoryTurn;
-pub const StableBackgroundRecordId = core_types.StableBackgroundRecordId;
 pub const CancelledCommandPresentation = core_types.CancelledCommandPresentation;
 /// Stored interrupted turn marker, optionally paired with the active tool call.
 pub const InterruptedHistoryTurn = core_types.InterruptedHistoryTurn;
@@ -134,7 +139,6 @@ pub fn validateWorkId(work_id: []const u8) WorkIdError!void {
 pub fn historyTurnWorkId(turn: HistoryTurn) ?[]const u8 {
     return switch (turn) {
         .assistant => |entry| entry.user.work_id,
-        .background_command => |entry| entry.user.work_id,
         .interrupted => |entry| entry.user.work_id,
         .compacted_summary => null,
     };
@@ -172,7 +176,6 @@ pub fn copyWorkIdToTurn(
     const owned = try alloc.dupe(u8, work_id);
     switch (turn.*) {
         .assistant => |*entry| entry.user.work_id = owned,
-        .background_command => |*entry| entry.user.work_id = owned,
         .interrupted => |*entry| entry.user.work_id = owned,
         .compacted_summary => unreachable,
     }
@@ -395,7 +398,6 @@ fn images_for_history_turn(turn: HistoryTurn) []const ImageAttachment {
     return switch (turn) {
         .compacted_summary => &.{},
         .assistant => |entry| entry.user.images,
-        .background_command => |entry| entry.user.images,
         .interrupted => |entry| entry.user.images,
     };
 }
@@ -404,7 +406,6 @@ fn mutable_images_for_history_turn(turn: *HistoryTurn) []ImageAttachment {
     return switch (turn.*) {
         .compacted_summary => &.{},
         .assistant => |*entry| entry.user.images,
-        .background_command => |*entry| entry.user.images,
         .interrupted => |*entry| entry.user.images,
     };
 }
@@ -413,7 +414,6 @@ fn mutable_images_slice_for_history_turn(turn: *HistoryTurn) ?*[]ImageAttachment
     return switch (turn.*) {
         .compacted_summary => null,
         .assistant => |*entry| &entry.user.images,
-        .background_command => |*entry| &entry.user.images,
         .interrupted => |*entry| &entry.user.images,
     };
 }
@@ -422,7 +422,6 @@ fn user_text_for_history_turn(turn: HistoryTurn) []const u8 {
     return switch (turn) {
         .compacted_summary => "",
         .assistant => |entry| entry.user.text,
-        .background_command => |entry| entry.user.text,
         .interrupted => |entry| entry.user.text,
     };
 }
@@ -560,7 +559,6 @@ fn mutable_user_for_history_turn(turn: *HistoryTurn) ?*UserTurn {
     return switch (turn.*) {
         .compacted_summary => null,
         .assistant => |*entry| &entry.user,
-        .background_command => |*entry| &entry.user,
         .interrupted => |*entry| &entry.user,
     };
 }
@@ -789,6 +787,717 @@ fn make_owned_legacy_image_turn(
     return turn;
 }
 
+fn sessionTestSnapshotDir(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    return std.fs.path.join(alloc, &.{ root, "snapshots" });
+}
+
+fn writeSessionTestImage(
+    alloc: Allocator,
+    tmp: *std.testing.TmpDir,
+    name: []const u8,
+    data: []const u8,
+) ![]u8 {
+    {
+        var file = try tmp.dir.createFile(std.testing.io, name, .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, data);
+    }
+    return io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+}
+
+test "legacy image snapshot repair captures available path once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_a = "\x89PNG\r\n\x1a\nlegacy-a";
+    const image_b = "\x89PNG\r\n\x1a\nlegacy-b";
+    const path = try writeSessionTestImage(alloc, &tmp, "legacy.png", image_a);
+    defer alloc.free(path);
+    const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    var turn = try make_owned_legacy_image_turn(alloc, "legacy [Image #1]", "answer", path);
+    var turn_owned = true;
+    errdefer if (turn_owned) freeHistoryTurn(alloc, turn);
+    turn.assistant.user.images[0].id = 1;
+    var history = [_]HistoryTurn{turn};
+    defer freeHistoryTurn(alloc, history[0]);
+    turn_owned = false;
+
+    try std.testing.expect(try repair_legacy_image_snapshots(alloc, &history, snapshot_dir));
+    try std.testing.expect(history[0].assistant.user.images[0].snapshot_path != null);
+    try std.testing.expect(history[0].assistant.user.images[0].snapshot_sha256 != null);
+    const replaced_path = try writeSessionTestImage(alloc, &tmp, "legacy.png", image_b);
+    defer alloc.free(replaced_path);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try image_attachments.writeImageFilePartJson(alloc, &out.writer, history[0].assistant.user.images[0]);
+    var expected_buf: [128]u8 = undefined;
+    const expected = std.base64.standard.Encoder.encode(&expected_buf, image_a);
+    var unexpected_buf: [128]u8 = undefined;
+    const unexpected = std.base64.standard.Encoder.encode(&unexpected_buf, image_b);
+    try std.testing.expect(std.mem.find(u8, out.written(), expected) != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), unexpected) == null);
+}
+
+test "legacy image snapshot repair drops unavailable path-only images" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const missing_path = try std.fs.path.join(alloc, &.{ root, "missing.png" });
+    defer alloc.free(missing_path);
+    const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    var turn = try make_owned_legacy_image_turn(alloc, "legacy [Image #1]", "answer", missing_path);
+    var turn_owned = true;
+    errdefer if (turn_owned) freeHistoryTurn(alloc, turn);
+    turn.assistant.user.images[0].id = 1;
+    var history = [_]HistoryTurn{turn};
+    defer freeHistoryTurn(alloc, history[0]);
+    turn_owned = false;
+
+    try std.testing.expect(try repair_legacy_image_snapshots(alloc, &history, snapshot_dir));
+    try std.testing.expectEqual(@as(usize, 0), history[0].assistant.user.images.len);
+}
+
+test "legacy image snapshot repair propagates OOM without changing memory or disk" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_bytes = "\x89PNG\r\n\x1a\nlegacy-oom";
+    const path = try writeSessionTestImage(alloc, &tmp, "legacy-oom.png", image_bytes);
+    defer alloc.free(path);
+    var reached_success = false;
+    for (0..256) |fail_index| {
+        var name_buf: [64]u8 = undefined;
+        const snapshot_name = try std.fmt.bufPrint(
+            &name_buf,
+            "snapshots-{d}",
+            .{fail_index},
+        );
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        const snapshot_dir = try std.fs.path.join(alloc, &.{ root, snapshot_name });
+        defer alloc.free(snapshot_dir);
+        const turn = try make_owned_legacy_image_turn(
+            alloc,
+            "legacy [Image #1]",
+            "answer",
+            path,
+        );
+        var history = [_]HistoryTurn{turn};
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+
+        if (repair_legacy_images_transactionally(
+            failing.allocator(),
+            &history,
+            snapshot_dir,
+        )) |changed| {
+            try std.testing.expect(changed);
+            try std.testing.expect(!failing.has_induced_failure);
+            freeHistoryTurn(failing.allocator(), history[0]);
+            reached_success = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqualStrings("legacy [Image #1]", history[0].assistant.user.text);
+            try std.testing.expectEqual(@as(usize, 1), history[0].assistant.user.images.len);
+            const image = history[0].assistant.user.images[0];
+            try std.testing.expectEqual(@as(usize, 0), image.id);
+            try std.testing.expectEqualStrings(path, image.path);
+            try std.testing.expect(image.snapshot_path == null);
+            try std.testing.expect(image.snapshot_sha256 == null);
+            try std.testing.expectError(
+                error.FileNotFound,
+                std.Io.Dir.openDirAbsolute(std.testing.io, snapshot_dir, .{ .iterate = true }),
+            );
+            freeHistoryTurn(alloc, history[0]);
+        }
+    }
+    try std.testing.expect(reached_success);
+}
+
+test "legacy image repair rewrites repeated per-turn ordinals to stable session ids" {
+    const alloc = std.testing.allocator;
+    const first = try make_owned_legacy_image_turn(
+        alloc,
+        "first prose [Image #1] tail",
+        "first answer",
+        "/tmp/legacy-first.png",
+    );
+    var first_owned = true;
+    errdefer if (first_owned) freeHistoryTurn(alloc, first);
+    const second = try make_owned_legacy_image_turn(
+        alloc,
+        "second prose [Image #1] tail",
+        "second answer",
+        "/tmp/legacy-second.png",
+    );
+    var second_owned = true;
+    errdefer if (second_owned) freeHistoryTurn(alloc, second);
+    var history = [_]HistoryTurn{
+        first,
+        second,
+    };
+    defer for (history) |turn| freeHistoryTurn(alloc, turn);
+    first_owned = false;
+    second_owned = false;
+
+    try std.testing.expect(try repair_legacy_zero_image_ids(alloc, &history));
+
+    try std.testing.expectEqual(@as(usize, 1), history[0].assistant.user.images[0].id);
+    try std.testing.expectEqualStrings(
+        "first prose [Image #1] tail",
+        history[0].assistant.user.text,
+    );
+    try std.testing.expectEqual(@as(usize, 2), history[1].assistant.user.images[0].id);
+    try std.testing.expectEqualStrings(
+        "second prose [Image #2] tail",
+        history[1].assistant.user.text,
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/legacy-first.png",
+        history[0].assistant.user.images[0].path,
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/legacy-second.png",
+        history[1].assistant.user.images[0].path,
+    );
+
+    var first_badge: std.Io.Writer.Allocating = .init(alloc);
+    defer first_badge.deinit();
+    _ = try image_attachments.expandPlaceholdersWithBadges(
+        alloc,
+        &first_badge.writer,
+        history[0].assistant.user.text,
+        history[0].assistant.user.images,
+        null,
+    );
+    try std.testing.expect(std.mem.find(u8, first_badge.written(), "[Image 1]") != null);
+    try std.testing.expect(std.mem.find(u8, first_badge.written(), "file://") == null);
+    try std.testing.expect(std.mem.find(u8, first_badge.written(), "/tmp/legacy-first.png") == null);
+    try std.testing.expect(std.mem.find(u8, first_badge.written(), "/tmp/legacy-second.png") == null);
+
+    var second_badge: std.Io.Writer.Allocating = .init(alloc);
+    defer second_badge.deinit();
+    _ = try image_attachments.expandPlaceholdersWithBadges(
+        alloc,
+        &second_badge.writer,
+        history[1].assistant.user.text,
+        history[1].assistant.user.images,
+        null,
+    );
+    try std.testing.expect(std.mem.find(u8, second_badge.written(), "[Image 2]") != null);
+    try std.testing.expect(std.mem.find(u8, second_badge.written(), "file://") == null);
+    try std.testing.expect(std.mem.find(u8, second_badge.written(), "/tmp/legacy-second.png") == null);
+    try std.testing.expect(std.mem.find(u8, second_badge.written(), "/tmp/legacy-first.png") == null);
+
+    const catalog = try collect_image_catalog(alloc, &history, &.{});
+    defer freeImageAttachmentSlice(alloc, catalog);
+    const authorized = try image_attachments.resolve_authorized_images(alloc, catalog, &.{2});
+    defer alloc.free(authorized);
+    try std.testing.expectEqual(@as(usize, 1), authorized.len);
+    try std.testing.expectEqualStrings("/tmp/legacy-second.png", authorized[0].path);
+
+    const bounds = try image_attachments.calculate_next_image_id(catalog);
+    try std.testing.expectEqual(@as(?usize, 2), bounds.maximum_id);
+    try std.testing.expectEqual(@as(usize, 3), bounds.next_id);
+}
+
+test "legacy image repair rewrites three repeated ordinals across persisted turn variants" {
+    const alloc = std.testing.allocator;
+    const assistant_text = try alloc.dupe(u8, "assistant [Image #1]");
+    var assistant_text_owned = true;
+    errdefer if (assistant_text_owned) alloc.free(assistant_text);
+    const background_text = try alloc.dupe(u8, "background [Image #1]");
+    var background_text_owned = true;
+    errdefer if (background_text_owned) alloc.free(background_text);
+    const interrupted_text = try alloc.dupe(u8, "interrupted [Image #1]");
+    var interrupted_text_owned = true;
+    errdefer if (interrupted_text_owned) alloc.free(interrupted_text);
+
+    var assistant_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/assistant-one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var background_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/background-one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var interrupted_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/interrupted-one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = assistant_text, .images = &assistant_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = background_text, .images = &background_images },
+            .assistant = @constCast("historical command"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = interrupted_text, .images = &interrupted_images },
+            .assistant = @constCast("partial"),
+        } },
+    };
+    defer alloc.free(history[0].assistant.user.text);
+    defer alloc.free(history[1].assistant.user.text);
+    defer alloc.free(history[2].interrupted.user.text);
+    assistant_text_owned = false;
+    background_text_owned = false;
+    interrupted_text_owned = false;
+
+    try std.testing.expect(try repair_legacy_zero_image_ids(alloc, &history));
+
+    try std.testing.expectEqual(@as(usize, 1), assistant_images[0].id);
+    try std.testing.expectEqual(@as(usize, 2), background_images[0].id);
+    try std.testing.expectEqual(@as(usize, 3), interrupted_images[0].id);
+    try std.testing.expectEqualStrings("assistant [Image #1]", history[0].assistant.user.text);
+    try std.testing.expectEqualStrings(
+        "background [Image #2]",
+        history[1].assistant.user.text,
+    );
+    try std.testing.expectEqualStrings(
+        "interrupted [Image #3]",
+        history[2].interrupted.user.text,
+    );
+}
+
+test "legacy image repair leaves history unchanged when text reconstruction runs out of memory" {
+    const alloc = std.testing.allocator;
+    var first_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/first.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var second_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/second.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var third_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/third.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    const first_text = try alloc.dupe(u8, "first [Image #1]");
+    var first_text_owned = true;
+    errdefer if (first_text_owned) alloc.free(first_text);
+    const second_text = try alloc.dupe(u8, "second [Image #1]");
+    var second_text_owned = true;
+    errdefer if (second_text_owned) alloc.free(second_text);
+    const third_text = try alloc.dupe(u8, "third [Image #1]");
+    var third_text_owned = true;
+    errdefer if (third_text_owned) alloc.free(third_text);
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = first_text, .images = &first_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = second_text, .images = &second_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = third_text, .images = &third_images },
+            .assistant = @constCast("answer"),
+        } },
+    };
+    defer alloc.free(history[0].assistant.user.text);
+    defer alloc.free(history[1].assistant.user.text);
+    defer alloc.free(history[2].assistant.user.text);
+    first_text_owned = false;
+    second_text_owned = false;
+    third_text_owned = false;
+
+    // Metadata and the first rebuilt turn succeed; the second rebuild fails.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        repair_legacy_zero_image_ids(failing.allocator(), &history),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), first_images[0].id);
+    try std.testing.expectEqual(@as(usize, 0), second_images[0].id);
+    try std.testing.expectEqual(@as(usize, 0), third_images[0].id);
+    try std.testing.expectEqualStrings("first [Image #1]", history[0].assistant.user.text);
+    try std.testing.expectEqualStrings("second [Image #1]", history[1].assistant.user.text);
+    try std.testing.expectEqualStrings("third [Image #1]", history[2].assistant.user.text);
+}
+
+test "legacy image repair preserves canonical placeholder identity by attachment order" {
+    var first_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/five.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var mixed_images = [_]ImageAttachment{
+        .{
+            .id = 0,
+            .path = @constCast("/tmp/nine.png"),
+            .media_type = @constCast("image/png"),
+        },
+        .{
+            .id = 3,
+            .path = @constCast("/tmp/three.png"),
+            .media_type = @constCast("image/png"),
+        },
+    };
+    var skipped_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/twelve.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("first [Image #5]"), .images = &first_images },
+            .assistant = @constCast("first answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("mixed [Image #9] [Image #3]"), .images = &mixed_images },
+            .assistant = @constCast("mixed answer"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("later [Image #12]"), .images = &skipped_images },
+            .assistant = @constCast("partial"),
+        } },
+    };
+
+    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+
+    try std.testing.expectEqual(@as(usize, 5), first_images[0].id);
+    try std.testing.expectEqual(@as(usize, 9), mixed_images[0].id);
+    try std.testing.expectEqual(@as(usize, 3), mixed_images[1].id);
+    try std.testing.expectEqual(@as(usize, 12), skipped_images[0].id);
+    try std.testing.expectEqualStrings("first [Image #5]", history[0].assistant.user.text);
+    try std.testing.expectEqualStrings("/tmp/five.png", first_images[0].path);
+}
+
+test "legacy image repair reserves a later low placeholder before an earlier fallback" {
+    var fallback_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/fallback.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var reserved_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/reserved-one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("missing placeholder"), .images = &fallback_images },
+            .assistant = @constCast("fallback answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("reserved [Image #1]"), .images = &reserved_images },
+            .assistant = @constCast("reserved answer"),
+        } },
+    };
+
+    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+
+    try std.testing.expectEqual(@as(usize, 2), fallback_images[0].id);
+    try std.testing.expectEqual(@as(usize, 1), reserved_images[0].id);
+}
+
+test "legacy image repair preserves a low reservation before a later fallback" {
+    var reserved_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/reserved-one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var fallback_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/fallback.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("reserved [Image #1]"), .images = &reserved_images },
+            .assistant = @constCast("reserved answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("missing placeholder"), .images = &fallback_images },
+            .assistant = @constCast("fallback answer"),
+        } },
+    };
+
+    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+
+    try std.testing.expectEqual(@as(usize, 1), reserved_images[0].id);
+    try std.testing.expectEqual(@as(usize, 2), fallback_images[0].id);
+}
+
+test "legacy image repair reserves low ids before interleaved fallbacks across turns" {
+    var missing_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/missing.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var reserved_one_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/reserved-one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var malformed_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/malformed.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var reserved_two_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/reserved-two.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var later_missing_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/later-missing.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var reserved_four_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/reserved-four.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var positive_images = [_]ImageAttachment{.{
+        .id = 5,
+        .path = @constCast("/tmp/positive-five.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("missing placeholder"), .images = &missing_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("reserved [Image #1]"), .images = &reserved_one_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("malformed [Image #oops]"), .images = &malformed_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("reserved [Image #2]"), .images = &reserved_two_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("later missing placeholder"), .images = &later_missing_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("reserved [Image #4]"), .images = &reserved_four_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("existing positive"), .images = &positive_images },
+            .assistant = @constCast("answer"),
+        } },
+    };
+
+    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+
+    try std.testing.expectEqual(@as(usize, 3), missing_images[0].id);
+    try std.testing.expectEqual(@as(usize, 1), reserved_one_images[0].id);
+    try std.testing.expectEqual(@as(usize, 6), malformed_images[0].id);
+    try std.testing.expectEqual(@as(usize, 2), reserved_two_images[0].id);
+    try std.testing.expectEqual(@as(usize, 7), later_missing_images[0].id);
+    try std.testing.expectEqual(@as(usize, 4), reserved_four_images[0].id);
+    try std.testing.expectEqual(@as(usize, 5), positive_images[0].id);
+}
+
+test "legacy image repair gives existing positive ids priority over placeholder claims" {
+    const alloc = std.testing.allocator;
+    const conflicting_text = try alloc.dupe(u8, "conflicting [Image #1]");
+    var positive_images = [_]ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/positive-one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var conflicting_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/conflicting-one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("existing positive"), .images = &positive_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = conflicting_text, .images = &conflicting_images },
+            .assistant = @constCast("answer"),
+        } },
+    };
+    defer alloc.free(history[1].assistant.user.text);
+
+    _ = try repair_legacy_zero_image_ids(alloc, &history);
+
+    try std.testing.expectEqual(@as(usize, 1), positive_images[0].id);
+    try std.testing.expectEqual(@as(usize, 2), conflicting_images[0].id);
+    try std.testing.expectEqualStrings("conflicting [Image #2]", history[1].assistant.user.text);
+}
+
+test "legacy image repair falls back for missing malformed zero duplicate and conflicting placeholders" {
+    const alloc = std.testing.allocator;
+    const conflicting_text = try alloc.dupe(u8, "conflict [Image #3]");
+    var conflicting_text_owned = true;
+    errdefer if (conflicting_text_owned) alloc.free(conflicting_text);
+    const zero_text = try alloc.dupe(u8, "zero [Image #0]");
+    var zero_text_owned = true;
+    errdefer if (zero_text_owned) alloc.free(zero_text);
+    const duplicate_text = try alloc.dupe(u8, "duplicate [Image #50] [Image #50]");
+    var duplicate_text_owned = true;
+    errdefer if (duplicate_text_owned) alloc.free(duplicate_text);
+    var positive_images = [_]ImageAttachment{.{
+        .id = 3,
+        .path = @constCast("/tmp/positive.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var conflicting_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/conflicting.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var missing_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/missing.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var malformed_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/malformed.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var zero_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/zero.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var duplicate_images = [_]ImageAttachment{
+        .{
+            .id = 0,
+            .path = @constCast("/tmp/duplicate-a.png"),
+            .media_type = @constCast("image/png"),
+        },
+        .{
+            .id = 0,
+            .path = @constCast("/tmp/duplicate-b.png"),
+            .media_type = @constCast("image/png"),
+        },
+    };
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("owned [Image #3]"), .images = &positive_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = conflicting_text, .images = &conflicting_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("missing placeholder"), .images = &missing_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("malformed [Image #oops]"), .images = &malformed_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = zero_text, .images = &zero_images },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = duplicate_text, .images = &duplicate_images },
+            .assistant = @constCast("answer"),
+        } },
+    };
+    defer alloc.free(history[1].assistant.user.text);
+    defer alloc.free(history[4].assistant.user.text);
+    defer alloc.free(history[5].assistant.user.text);
+    conflicting_text_owned = false;
+    zero_text_owned = false;
+    duplicate_text_owned = false;
+
+    _ = try repair_legacy_zero_image_ids(alloc, &history);
+
+    try std.testing.expectEqual(@as(usize, 3), positive_images[0].id);
+    try std.testing.expectEqual(@as(usize, 1), conflicting_images[0].id);
+    try std.testing.expectEqual(@as(usize, 2), missing_images[0].id);
+    try std.testing.expectEqual(@as(usize, 4), malformed_images[0].id);
+    try std.testing.expectEqual(@as(usize, 5), zero_images[0].id);
+    try std.testing.expectEqual(@as(usize, 6), duplicate_images[0].id);
+    try std.testing.expectEqual(@as(usize, 7), duplicate_images[1].id);
+    try std.testing.expectEqualStrings("owned [Image #3]", history[0].assistant.user.text);
+    try std.testing.expectEqualStrings("conflict [Image #1]", history[1].assistant.user.text);
+    try std.testing.expectEqualStrings("missing placeholder", history[2].assistant.user.text);
+    try std.testing.expectEqualStrings("malformed [Image #oops]", history[3].assistant.user.text);
+    try std.testing.expectEqualStrings("zero [Image #5]", history[4].assistant.user.text);
+    try std.testing.expectEqualStrings(
+        "duplicate [Image #6] [Image #7]",
+        history[5].assistant.user.text,
+    );
+}
+
+test "legacy image repair binds transcript and Vision authorization to reserved paths" {
+    const alloc = std.testing.allocator;
+    var fallback_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/fallback.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var reserved_images = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/reserved-one.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("missing placeholder"), .images = &fallback_images },
+            .assistant = @constCast("fallback answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("inspect [Image #1]"), .images = &reserved_images },
+            .assistant = @constCast("reserved answer"),
+        } },
+    };
+
+    _ = try repair_legacy_zero_image_ids(std.testing.allocator, &history);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const expanded = try image_attachments.expandPlaceholdersWithBadges(
+        alloc,
+        &out.writer,
+        history[1].assistant.user.text,
+        history[1].assistant.user.images,
+        null,
+    );
+    const catalog = try collect_image_catalog(alloc, &history, &.{});
+    defer freeImageAttachmentSlice(alloc, catalog);
+    const authorized = try image_attachments.resolve_authorized_images(alloc, catalog, &.{ 1, 2 });
+    defer alloc.free(authorized);
+
+    try std.testing.expect(expanded.expanded_any);
+    try std.testing.expect(std.mem.find(u8, out.written(), "[Image 1]") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "file://") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "/tmp/reserved-one.png") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "/tmp/fallback.png") == null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "[Image #1]") == null);
+    try std.testing.expectEqualStrings("/tmp/reserved-one.png", authorized[0].path);
+    try std.testing.expectEqualStrings("/tmp/fallback.png", authorized[1].path);
+}
+
 fn history_contains_image_id(history: []const HistoryTurn, id: usize) bool {
     for (history) |turn| {
         for (images_for_history_turn(turn)) |attachment| {
@@ -893,7 +1602,7 @@ pub const WebFetchArtifactState = union(enum) {
 };
 
 pub const SessionRuntime = struct {
-    history: std.ArrayList(HistoryTurn) = .empty,
+    agent: kernel_agent.Agent = .{},
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     context_notice_lock: std.Io.Mutex = .init,
     web_fetch_artifacts: WebFetchArtifactState = .none,
@@ -906,6 +1615,10 @@ pub const SessionRuntime = struct {
     /// Count limit for owned model-context snapshots; canonical history is not truncated.
     max_history_turns: usize,
     context_history_start: usize = 0,
+    /// In-memory boundary for handle-free history loaded without writer
+    /// provenance. It is never persisted; accepted checkpoints move the model
+    /// window beyond it.
+    unversioned_history_len: usize = 0,
 
     pub fn init(
         max_history_turns: usize,
@@ -934,8 +1647,7 @@ pub const SessionRuntime = struct {
         self.usage.deinit(alloc);
         self.profile_usage.deinit(alloc);
         self.permission_state.deinit(alloc);
-        self.clearHistory(alloc);
-        self.history.deinit(alloc);
+        self.agent.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
     }
 
@@ -991,6 +1703,7 @@ pub const SessionRuntime = struct {
         for (history) |turn| {
             try self.appendHistoryEntry(alloc, turn);
         }
+        self.unversioned_history_len = self.agent.history.items.len;
     }
 
     pub fn restoreWithContextHistoryStart(
@@ -1003,6 +1716,11 @@ pub const SessionRuntime = struct {
         if (context_history_start > history.len) return error.InvalidContextHistoryStart;
         try self.restore(alloc, language, history);
         self.context_history_start = context_history_start;
+        if (context_history_start < self.agent.history.items.len and
+            isCurrentCompactionCheckpoint(self.agent.history.items[context_history_start]))
+        {
+            self.unversioned_history_len = 0;
+        }
     }
 
     pub fn restoreWithPermissionState(
@@ -1135,47 +1853,49 @@ pub const SessionRuntime = struct {
     }
 
     pub fn clearHistory(self: *SessionRuntime, alloc: Allocator) void {
-        for (self.history.items) |turn| {
-            freeHistoryTurn(alloc, turn);
-        }
-        self.history.clearRetainingCapacity();
+        self.agent.clearHistory(alloc);
         self.context_history_start = 0;
+        self.unversioned_history_len = 0;
     }
 
     pub fn historyLen(self: *const SessionRuntime) usize {
-        return self.history.items.len;
+        return self.agent.history.items.len;
     }
 
     pub fn contextHistoryStart(self: *const SessionRuntime) usize {
         return self.context_history_start;
     }
 
+    pub fn unversionedHistoryEnd(self: *const SessionRuntime) usize {
+        return @min(self.unversioned_history_len, self.agent.history.items.len);
+    }
+
+    pub fn hasContextToCompact(self: *const SessionRuntime) bool {
+        const start = @min(self.context_history_start, self.agent.history.items.len);
+        for (self.agent.history.items[start..]) |turn| {
+            if (turn != .compacted_summary) return true;
+        }
+        return false;
+    }
+
     pub fn compactedTurnCount(self: *const SessionRuntime) usize {
-        if (self.history.items.len == 0) return 0;
-        return switch (self.history.items[0]) {
+        if (self.agent.history.items.len == 0) return 0;
+        return switch (self.agent.history.items[0]) {
             .compacted_summary => |entry| entry.removed_turn_count,
             else => 0,
         };
     }
 
     pub fn compactionCount(self: *const SessionRuntime) usize {
-        if (self.history.items.len == 0) return 0;
-        return switch (self.history.items[0]) {
+        if (self.agent.history.items.len == 0) return 0;
+        return switch (self.agent.history.items[0]) {
             .compacted_summary => |entry| entry.compaction_count,
             else => 0,
         };
     }
 
     pub fn snapshotHistory(self: *const SessionRuntime, alloc: Allocator) ![]HistoryTurn {
-        var copy: std.ArrayList(HistoryTurn) = .empty;
-        errdefer {
-            for (copy.items) |turn| {
-                freeHistoryTurn(alloc, turn);
-            }
-            copy.deinit(alloc);
-        }
-        try appendHistoryCopies(alloc, &copy, self.history.items);
-        return copy.toOwnedSlice(alloc);
+        return self.agent.snapshotHistory(alloc);
     }
 
     pub fn snapshotImageCatalog(
@@ -1183,25 +1903,26 @@ pub const SessionRuntime = struct {
         alloc: Allocator,
         current_images: []const ImageAttachment,
     ) ![]ImageAttachment {
-        return collect_image_catalog(alloc, self.history.items, current_images);
+        return collect_image_catalog(alloc, self.agent.history.items, current_images);
     }
 
     pub fn snapshotContextHistory(self: *const SessionRuntime, alloc: Allocator) ![]HistoryTurn {
         return snapshotOwnedContextHistory(
             alloc,
-            self.history.items,
+            self.agent.history.items,
             self.context_history_start,
             self.max_history_turns,
         );
     }
 
     pub fn appendHistoryEntry(self: *SessionRuntime, alloc: Allocator, turn: HistoryTurn) !void {
-        const copy = try dupeHistoryTurn(alloc, turn);
-        var owns_copy = true;
-        errdefer if (owns_copy) freeHistoryTurn(alloc, copy);
-
-        try self.history.append(alloc, copy);
-        owns_copy = false;
+        try self.agent.appendHistoryEntry(alloc, turn);
+        if (turn == .compacted_summary) {
+            self.context_history_start = self.agent.history.items.len - 1;
+            if (isCurrentCompactionCheckpoint(turn)) {
+                self.unversioned_history_len = 0;
+            }
+        }
     }
 
     pub fn appendAssistantHistoryTurn(self: *SessionRuntime, alloc: Allocator, user: []const u8, assistant: []const u8) !void {
@@ -1209,40 +1930,7 @@ pub const SessionRuntime = struct {
         var owns_turn = true;
         errdefer if (owns_turn) freeHistoryTurn(alloc, turn);
 
-        try self.history.append(alloc, turn);
-        owns_turn = false;
-    }
-
-    pub fn appendBackgroundCommandHistoryTurn(self: *SessionRuntime, alloc: Allocator, user: []const u8, background: command_contract.BackgroundCommand) !void {
-        const user_text = try alloc.dupe(u8, user);
-        var owns_user_text = true;
-        errdefer if (owns_user_text) alloc.free(user_text);
-
-        const log_path = try alloc.dupe(u8, background.log_path);
-        var owns_log_path = true;
-        errdefer if (owns_log_path) alloc.free(log_path);
-
-        const url: ?[]u8 = if (background.url) |url_text| try alloc.dupe(u8, url_text) else null;
-        var owns_url = url != null;
-        errdefer if (owns_url) {
-            if (url) |url_text| alloc.free(url_text);
-        };
-
-        const turn = HistoryTurn{ .background_command = .{
-            .user = .{ .text = user_text, .images = &.{} },
-            .log_path = log_path,
-            .expect_url = background.expect_url,
-            .url = url,
-            .background_record_id = background.background_record_id,
-        } };
-        owns_user_text = false;
-        owns_log_path = false;
-        owns_url = false;
-
-        var owns_turn = true;
-        errdefer if (owns_turn) freeHistoryTurn(alloc, turn);
-
-        try self.history.append(alloc, turn);
+        try self.agent.history.append(alloc, turn);
         owns_turn = false;
     }
 
@@ -1259,7 +1947,7 @@ pub const SessionRuntime = struct {
         messages: *std.ArrayList(core_types.ChatMessage),
         history: []const HistoryTurn,
     ) !void {
-        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true);
+        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
     }
 
     pub fn setConversationLanguageFromUserMessage(self: *SessionRuntime, text: []const u8) void {
@@ -1275,10 +1963,10 @@ pub const SessionRuntime = struct {
     }
 
     pub fn lastAssistantReply(self: *const SessionRuntime) ?[]const u8 {
-        var i = self.history.items.len;
+        var i = self.agent.history.items.len;
         while (i > 0) {
             i -= 1;
-            switch (self.history.items[i]) {
+            switch (self.agent.history.items[i]) {
                 .assistant => |entry| {
                     if (entry.assistant.len > 0) return entry.assistant;
                 },
@@ -1289,20 +1977,15 @@ pub const SessionRuntime = struct {
     }
 
     pub fn lastSummary(self: *const SessionRuntime) ?[]const u8 {
-        for (self.history.items) |turn| {
-            switch (turn) {
-                .compacted_summary => |entry| return entry.summary,
-                else => {},
+        var index = self.agent.history.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (self.agent.history.items[index] == .compacted_summary) {
+                return self.agent.history.items[index].compacted_summary.summary;
             }
         }
         return null;
     }
-
-    pub fn forceCompaction(self: *SessionRuntime) void {
-        if (self.history.items.len <= 1) return;
-        self.context_history_start = self.history.items.len - 1;
-    }
-
     fn setConversationLanguage(self: *SessionRuntime, language: ConversationLanguage) void {
         self.language_lock.lockUncancelable(io_mod.getIo());
         defer self.language_lock.unlock(io_mod.getIo());
@@ -1457,26 +2140,6 @@ pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
                 .execution = execution,
             } };
         },
-        .background_command => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            errdefer core_types.freeExecutionMemory(alloc, execution);
-            const log_path = try alloc.dupe(u8, entry.log_path);
-            errdefer alloc.free(log_path);
-            const url: ?[]u8 = if (entry.url) |url_bytes| try alloc.dupe(u8, url_bytes) else null;
-            return .{ .background_command = .{
-                .user = user,
-                .assistant = assistant,
-                .execution = execution,
-                .log_path = log_path,
-                .expect_url = entry.expect_url,
-                .url = url,
-                .background_record_id = entry.background_record_id,
-            } };
-        },
         .interrupted => |entry| {
             const user = try dupeUserTurn(alloc, entry.user);
             errdefer freeUserTurn(alloc, user);
@@ -1574,6 +2237,190 @@ pub fn makeAssistantTurn(alloc: Allocator, user_text: []const u8, assistant_text
     } };
 }
 
+test "unavailable profile usage keeps reconciled generation pending in host runtime" {
+    const alloc = std.testing.allocator;
+    const Checkpoint = struct {
+        calls: usize = 0,
+
+        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+
+    var checkpoint = Checkpoint{};
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    try std.testing.expectEqual(
+        profile_usage_runtime.InitializeOutcome.unavailable,
+        try runtime.initializeProfileUsage(alloc, null),
+    );
+    runtime.attachProfileUsagePublisher(alloc);
+    runtime.usage.configureCheckpointSink(.{
+        .context = &checkpoint,
+        .allocator = alloc,
+        .persist = Checkpoint.persist,
+    });
+
+    const sequence = try runtime.usage.reserveInvocation();
+    try runtime.usage.finishObservedInvocation(
+        alloc,
+        sequence,
+        1,
+        .observed_generation,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    try runtime.usage.applyGeneration(alloc, .{
+        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .created_at_ms = 1000,
+        .model = "provider/model",
+        .total_cost = 0.25,
+        .input_tokens = 10,
+        .output_tokens = 2,
+        .cache_read_tokens = 1,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = 1,
+        .billable_web_search_calls = 0,
+    });
+
+    var snapshot = try runtime.usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(session_usage.Availability.pending, snapshot.billing);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.input_tokens);
+    try std.testing.expectEqual(@as(usize, 1), checkpoint.calls);
+}
+
+test "readable profile usage does not attach publishers or flush recovery" {
+    const alloc = std.testing.allocator;
+    const Checkpoint = struct {
+        calls: usize = 0,
+
+        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var checkpoint = Checkpoint{};
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    try std.testing.expectEqual(
+        profile_usage_runtime.InitializeOutcome.available,
+        try runtime.initializeProfileUsage(alloc, home),
+    );
+    runtime.usage.configureCheckpointSink(.{
+        .context = &checkpoint,
+        .allocator = alloc,
+        .persist = Checkpoint.persist,
+    });
+
+    const sequence = try runtime.usage.reserveInvocation();
+    try runtime.usage.finishObservedInvocation(
+        alloc,
+        sequence,
+        1,
+        .observed_generation,
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    try runtime.usage.applyGeneration(alloc, .{
+        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .created_at_ms = 1000,
+        .model = "provider/model",
+        .total_cost = 0.25,
+        .input_tokens = 10,
+        .output_tokens = 2,
+        .cache_read_tokens = 1,
+        .cache_write_tokens = 0,
+        .reasoning_tokens = 1,
+        .billable_web_search_calls = 0,
+    });
+
+    const checkpoint_calls = checkpoint.calls;
+    try std.testing.expectEqual(
+        profile_usage_runtime.InitializeOutcome.available,
+        try runtime.ensureProfileUsageReadable(alloc, home),
+    );
+    var saved = try runtime.usage.snapshot(alloc);
+    defer saved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), saved.publication_backlog.len);
+    try std.testing.expectEqual(checkpoint_calls, checkpoint.calls);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io_mod.getIo(), ".fx/usage.jsonl", .{}),
+    );
+}
+
+test "appendAssistantTurnWithExecution transfers memory and clears the source" {
+    const alloc = std.testing.allocator;
+    var execution = core_types.ExecutionMemory{
+        .tool_steps = try alloc.alloc(core_types.ToolExecutionStep, 1),
+    };
+    execution.tool_steps[0] = .{
+        .assistant = try alloc.dupe(u8, "tool step"),
+    };
+
+    const history = try appendAssistantTurnWithExecution(
+        alloc,
+        &.{},
+        "user",
+        "assistant",
+        &execution,
+    );
+    defer freeHistoryTurnSlice(alloc, history);
+
+    try std.testing.expectEqual(@as(usize, 0), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), history[0].assistant.execution.tool_steps.len);
+    try std.testing.expectEqualStrings(
+        "tool step",
+        history[0].assistant.execution.tool_steps[0].assistant.?,
+    );
+}
+
+test "appendAssistantTurnWithExecution keeps source memory on allocation failure" {
+    const alloc = std.testing.allocator;
+
+    for (0..3) |fail_index| {
+        var execution = core_types.ExecutionMemory{
+            .tool_steps = try alloc.alloc(core_types.ToolExecutionStep, 1),
+        };
+        execution.tool_steps[0] = .{
+            .assistant = try alloc.dupe(u8, "tool step"),
+        };
+        defer core_types.freeExecutionMemory(alloc, execution);
+
+        var failing = std.testing.FailingAllocator.init(
+            alloc,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            appendAssistantTurnWithExecution(
+                failing.allocator(),
+                &.{},
+                "user",
+                "assistant",
+                &execution,
+            ),
+        );
+
+        try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+        try std.testing.expectEqualStrings(
+            "tool step",
+            execution.tool_steps[0].assistant.?,
+        );
+    }
+}
+
 /// Projects stored history into request messages while preserving stored turn order.
 pub fn appendHistoryMessages(
     alloc: Allocator,
@@ -1588,12 +2435,405 @@ pub fn appendHistoryChatMessages(
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
 ) !void {
-    _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true);
+    _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
+}
+
+/// Projects complete raw canonical turns for semantic compaction. Prior
+/// checkpoints are derived model context and never become semantic source for
+/// a later checkpoint.
+pub fn appendCompactionHistoryChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+) !void {
+    for (history, 0..) |turn, index| {
+        if (turn == .compacted_summary) continue;
+        _ = try appendHistoryChatMessagesImpl(
+            alloc,
+            messages,
+            history[index .. index + 1],
+            false,
+            .closed,
+        );
+    }
+}
+
+fn isCurrentCompactionCheckpoint(turn: HistoryTurn) bool {
+    return switch (turn) {
+        .compacted_summary => |entry| std.mem.startsWith(
+            u8,
+            entry.summary,
+            core_types.context_handoff_open,
+        ),
+        else => false,
+    };
+}
+
+/// Projects the active model window from one complete canonical snapshot.
+/// New checkpoints may retain raw turns immediately before the appended
+/// checkpoint; those turns are emitted after the checkpoint without
+/// duplicating them in canonical storage.
+pub fn appendActiveContextHistoryChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    context_history_start: usize,
+) !void {
+    return appendActiveContextHistoryChatMessagesWithTrailingProjection(
+        alloc,
+        messages,
+        history,
+        context_history_start,
+        .closed,
+    );
+}
+
+pub fn appendSteeringActiveContextHistoryChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    context_history_start: usize,
+) !void {
+    return appendActiveContextHistoryChatMessagesWithTrailingProjection(
+        alloc,
+        messages,
+        history,
+        context_history_start,
+        .steering_continuation,
+    );
+}
+
+fn appendActiveContextHistoryChatMessagesWithTrailingProjection(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    context_history_start: usize,
+    interrupted_projection: InterruptedChatProjection,
+) !void {
+    if (context_history_start > history.len) {
+        return error.InvalidContextHistoryStart;
+    }
+    if (context_history_start == 0) {
+        return appendHistoryChatMessagesWithTrailingProjection(
+            alloc,
+            messages,
+            history,
+            interrupted_projection,
+        );
+    }
+    if (context_history_start == history.len or
+        history[context_history_start] != .compacted_summary)
+    {
+        return error.InvalidContextHistoryStart;
+    }
+    const checkpoint = history[context_history_start].compacted_summary;
+    var raw_before: usize = 0;
+    for (history[0..context_history_start]) |turn| {
+        if (turn != .compacted_summary) raw_before += 1;
+    }
+    if (checkpoint.removed_turn_count > raw_before) {
+        return error.InvalidContextHistoryStart;
+    }
+    const retained_count = raw_before - checkpoint.removed_turn_count;
+    _ = try appendHistoryChatMessagesImpl(
+        alloc,
+        messages,
+        history[context_history_start .. context_history_start + 1],
+        true,
+        .closed,
+    );
+    if (retained_count > 0) {
+        var retained_start = context_history_start;
+        var remaining = retained_count;
+        while (retained_start > 0 and remaining > 0) {
+            retained_start -= 1;
+            if (history[retained_start] != .compacted_summary) remaining -= 1;
+        }
+        if (remaining != 0) return error.InvalidContextHistoryStart;
+        for (history[retained_start..context_history_start], retained_start..) |turn, index| {
+            if (turn == .compacted_summary) continue;
+            _ = try appendHistoryChatMessagesImpl(
+                alloc,
+                messages,
+                history[index .. index + 1],
+                false,
+                .closed,
+            );
+        }
+    }
+    if (context_history_start + 1 < history.len) {
+        _ = try appendHistoryChatMessagesImpl(
+            alloc,
+            messages,
+            history[context_history_start + 1 ..],
+            false,
+            interrupted_projection,
+        );
+    }
+}
+
+pub fn rawHistoryTurnCount(history: []const HistoryTurn) usize {
+    var count: usize = 0;
+    for (history) |turn| if (turn != .compacted_summary) {
+        count += 1;
+    };
+    return count;
+}
+
+pub fn retainedHistoryTurnCountForMessageTail(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    wanted_messages: usize,
+) !usize {
+    if (wanted_messages == 0) return 0;
+    var remaining = wanted_messages;
+    var retained_turns: usize = 0;
+    var index = history.len;
+    while (index > 0 and remaining > 0) {
+        index -= 1;
+        if (history[index] == .compacted_summary) continue;
+        var projected: std.ArrayList(core_types.ChatMessage) = .empty;
+        defer projected.deinit(alloc);
+        _ = try appendHistoryChatMessagesImpl(
+            alloc,
+            &projected,
+            history[index .. index + 1],
+            false,
+            .closed,
+        );
+        if (projected.items.len == 0) continue;
+        retained_turns += 1;
+        remaining -|= projected.items.len;
+    }
+    return retained_turns;
+}
+
+pub const RetainedHistoryTail = struct {
+    turn_count: usize,
+    message_count: usize,
+};
+
+pub fn retainedHistoryTailForMessageCount(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    wanted_messages: usize,
+) !RetainedHistoryTail {
+    const turn_count = try retainedHistoryTurnCountForMessageTail(
+        alloc,
+        history,
+        wanted_messages,
+    );
+    if (turn_count == 0) return .{ .turn_count = 0, .message_count = 0 };
+    if (turn_count == rawHistoryTurnCount(history)) {
+        return .{ .turn_count = 0, .message_count = 0 };
+    }
+
+    var retained_start = history.len;
+    var remaining = turn_count;
+    while (retained_start > 0 and remaining > 0) {
+        retained_start -= 1;
+        if (history[retained_start] != .compacted_summary) remaining -= 1;
+    }
+    if (remaining != 0) return error.InvalidContextHistoryStart;
+
+    var projected: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer projected.deinit(alloc);
+    try appendCompactionHistoryChatMessages(
+        alloc,
+        &projected,
+        history[retained_start..],
+    );
+    return .{
+        .turn_count = turn_count,
+        .message_count = projected.items.len,
+    };
+}
+
+test "retained compaction tail expands requested messages to complete raw turns" {
+    const alloc = std.testing.allocator;
+    var calls = [_]core_types.ToolCall{.{
+        .id = @constCast("tail-call"),
+        .name = @constCast("terminal"),
+        .arguments_json = @constCast("{\"action\":\"exec\",\"command\":\"printf tail\"}"),
+    }};
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("tail-call"),
+        .tool_name = @constCast("terminal"),
+        .status = .success,
+        .output = @constCast("tail result"),
+        .output_bytes = 11,
+        .stored_output_bytes = 11,
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{
+        .assistant = @constCast("running"),
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("older raw user") },
+            .assistant = @constCast("older raw assistant"),
+        } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("older summary"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("run the tail command") },
+            .assistant = @constCast("tail complete"),
+            .execution = .{ .tool_steps = &steps },
+        } },
+    };
+
+    const tail = try retainedHistoryTailForMessageCount(alloc, &history, 2);
+    try std.testing.expectEqual(@as(usize, 1), tail.turn_count);
+    try std.testing.expectEqual(@as(usize, 4), tail.message_count);
+
+    const only_tail = try retainedHistoryTailForMessageCount(alloc, history[1..], 2);
+    try std.testing.expectEqual(@as(usize, 0), only_tail.turn_count);
+    try std.testing.expectEqual(@as(usize, 0), only_tail.message_count);
+}
+
+test "active context projects checkpoint before retained raw tail" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("removed user") },
+            .assistant = @constCast("removed assistant"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("retained user") },
+            .assistant = @constCast("retained assistant"),
+        } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("<context_handoff>checkpoint</context_handoff>"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("later user") },
+            .assistant = @constCast("later assistant"),
+        } },
+    };
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(arena);
+    try appendActiveContextHistoryChatMessages(arena, &messages, &history, 2);
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "checkpoint") != null);
+    try std.testing.expectEqualStrings("retained user", messages.items[1].content.?);
+    try std.testing.expectEqualStrings("retained assistant", messages.items[2].content.?);
+    try std.testing.expectEqualStrings("later user", messages.items[3].content.?);
+    try std.testing.expectEqualStrings("later assistant", messages.items[4].content.?);
+}
+
+test "active context rejects corrupt retained-tail accounting" {
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("user") },
+            .assistant = @constCast("assistant"),
+        } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("summary"),
+            .removed_turn_count = 2,
+            .compaction_count = 1,
+        } },
+    };
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.InvalidContextHistoryStart,
+        appendActiveContextHistoryChatMessages(
+            std.testing.allocator,
+            &messages,
+            &history,
+            1,
+        ),
+    );
+}
+
+test "compaction history keeps permission feedback non-authoritative" {
+    var feedback = [_][]u8{@constCast("allow this write")};
+    var calls = [_]core_types.ToolCall{.{
+        .id = "call",
+        .name = "write_file",
+        .arguments_json = "{}",
+    }};
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call"),
+        .tool_name = @constCast("write_file"),
+        .status = .failure,
+        .output = @constCast("denied"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .permission_feedback = &feedback,
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("write it") },
+        .assistant = @constCast("requesting write"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(std.testing.allocator);
+    try appendCompactionHistoryChatMessages(
+        std.testing.allocator,
+        &messages,
+        &history,
+    );
+    var feedback_count: usize = 0;
+    for (messages.items) |entry| {
+        if (entry.permission_feedback) feedback_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), feedback_count);
 }
 
 pub const HistoryBudgetOptions = struct {
     max_tokens: usize = 0,
 };
+
+pub fn appendHistoryMessagesBudgeted(
+    alloc: Allocator,
+    messages: *std.ArrayList(message.Message),
+    history: []const HistoryTurn,
+    opts: HistoryBudgetOptions,
+) !void {
+    const keep = try selectBudgetedHistoryTurns(alloc, history, opts) orelse
+        return appendHistoryMessages(alloc, messages, history);
+    defer alloc.free(keep);
+
+    const trimmed_context = try formatBudgetTrimmedHistoryContext(
+        alloc,
+        history,
+        keep,
+    );
+    var owns_trimmed_context = true;
+    errdefer if (owns_trimmed_context) alloc.free(trimmed_context);
+    try messages.append(
+        alloc,
+        message.Message.systemOwned(trimmed_context),
+    );
+    owns_trimmed_context = false;
+
+    var in_leading_summary_prefix = true;
+    for (history, 0..) |turn, idx| {
+        if (!keep[idx]) {
+            in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
+            continue;
+        }
+        in_leading_summary_prefix = try appendHistoryMessagesImpl(
+            alloc,
+            messages,
+            history[idx .. idx + 1],
+            in_leading_summary_prefix,
+        );
+    }
+}
 
 pub fn appendHistoryChatMessagesBudgeted(
     alloc: Allocator,
@@ -1601,8 +2841,52 @@ pub fn appendHistoryChatMessagesBudgeted(
     history: []const HistoryTurn,
     opts: HistoryBudgetOptions,
 ) !void {
+    return appendHistoryChatMessagesBudgetedImpl(
+        alloc,
+        messages,
+        history,
+        opts,
+        .closed,
+    );
+}
+
+/// Projects a handoff turn without telling the model that the user aborted it.
+/// Stored execution evidence remains unchanged; only the trailing interruption
+/// closure is omitted because the current prompt already carries steering intent.
+pub fn appendSteeringContinuationHistoryChatMessagesBudgeted(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    opts: HistoryBudgetOptions,
+) !void {
+    return appendHistoryChatMessagesBudgetedImpl(
+        alloc,
+        messages,
+        history,
+        opts,
+        .steering_continuation,
+    );
+}
+
+const InterruptedChatProjection = enum {
+    closed,
+    steering_continuation,
+};
+
+fn appendHistoryChatMessagesBudgetedImpl(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    opts: HistoryBudgetOptions,
+    trailing_interrupted_projection: InterruptedChatProjection,
+) !void {
     const keep = try selectBudgetedHistoryTurns(alloc, history, opts) orelse
-        return appendHistoryChatMessages(alloc, messages, history);
+        return appendHistoryChatMessagesWithTrailingProjection(
+            alloc,
+            messages,
+            history,
+            trailing_interrupted_projection,
+        );
     defer alloc.free(keep);
 
     const trimmed_context = try formatBudgetTrimmedHistoryContext(alloc, history, keep);
@@ -1620,8 +2904,42 @@ pub fn appendHistoryChatMessagesBudgeted(
             messages,
             history[idx .. idx + 1],
             in_leading_summary_prefix,
+            if (idx + 1 == history.len)
+                trailing_interrupted_projection
+            else
+                .closed,
         );
     }
+}
+
+fn appendHistoryChatMessagesWithTrailingProjection(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    trailing_interrupted_projection: InterruptedChatProjection,
+) !void {
+    if (history.len == 0 or trailing_interrupted_projection == .closed) {
+        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
+        return;
+    }
+
+    var in_leading_summary_prefix = true;
+    if (history.len > 1) {
+        in_leading_summary_prefix = try appendHistoryChatMessagesImpl(
+            alloc,
+            messages,
+            history[0 .. history.len - 1],
+            true,
+            .closed,
+        );
+    }
+    _ = try appendHistoryChatMessagesImpl(
+        alloc,
+        messages,
+        history[history.len - 1 ..],
+        in_leading_summary_prefix,
+        trailing_interrupted_projection,
+    );
 }
 
 fn continuesLeadingSummaryPrefix(in_leading_summary_prefix: bool, turn: HistoryTurn) bool {
@@ -1667,10 +2985,11 @@ fn appendHistoryMessagesImpl(
 ) !bool {
     var in_leading_summary_prefix = starts_in_leading_summary_prefix;
     for (history) |turn| {
-        const summary_is_system = in_leading_summary_prefix;
         in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
         switch (turn) {
             .compacted_summary => |entry| {
+                const summary_is_system = in_leading_summary_prefix and
+                    !isCurrentCompactionCheckpoint(turn);
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
                 errdefer alloc.free(text);
                 try messages.append(
@@ -1691,22 +3010,6 @@ fn appendHistoryMessagesImpl(
                 if (entry.assistant.len > 0) {
                     try messages.append(alloc, message.Message.assistantBorrowed(entry.assistant, &.{}));
                 }
-            },
-            .background_command => |entry| {
-                try messages.append(alloc, .{
-                    .role = .user,
-                    .content = .{ .text = entry.user.text },
-                    .images = entry.user.images,
-                });
-                try appendExecutionMemoryMessages(alloc, messages, entry.execution);
-                if (entry.assistant) |assistant| {
-                    if (assistant.len > 0) {
-                        try messages.append(alloc, message.Message.assistantBorrowed(assistant, &.{}));
-                    }
-                }
-                const text = try formatBackgroundHistoryContext(alloc, entry);
-                errdefer alloc.free(text);
-                try messages.append(alloc, message.Message.userOwned(text));
             },
             .interrupted => |entry| {
                 try messages.append(alloc, .{
@@ -1772,7 +3075,22 @@ fn appendExecutionMemoryMessages(
     messages: *std.ArrayList(message.Message),
     execution: core_types.ExecutionMemory,
 ) !void {
-    for (execution.tool_steps) |step| {
+    var steering_index: usize = 0;
+    for (execution.tool_steps, 0..) |step, step_index| {
+        while (steering_index < execution.steering.len and
+            execution.steering[steering_index].after_tool_step_count == step_index)
+        {
+            const steering = execution.steering[steering_index];
+            if (steering.assistant_prefix) |prefix| {
+                if (prefix.len > 0) {
+                    try messages.append(alloc, message.Message.assistantBorrowed(prefix, &.{}));
+                }
+            }
+            if (steering.text.len > 0) {
+                try messages.append(alloc, message.Message.userText(steering.text));
+            }
+            steering_index += 1;
+        }
         if (step.tool_calls.len == 0) continue;
         try messages.append(alloc, .{
             .role = .assistant,
@@ -1799,6 +3117,16 @@ fn appendExecutionMemoryMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, message.Message.userOwned(text));
     }
+    while (steering_index < execution.steering.len) : (steering_index += 1) {
+        const steering = execution.steering[steering_index];
+        if (steering.assistant_prefix) |prefix| {
+            if (prefix.len > 0) {
+                try messages.append(alloc, message.Message.assistantBorrowed(prefix, &.{}));
+            }
+        }
+        if (steering.text.len == 0) continue;
+        try messages.append(alloc, message.Message.userText(steering.text));
+    }
 }
 
 pub fn appendExecutionMemoryChatMessages(
@@ -1806,7 +3134,22 @@ pub fn appendExecutionMemoryChatMessages(
     messages: *std.ArrayList(core_types.ChatMessage),
     execution: core_types.ExecutionMemory,
 ) !void {
-    for (execution.tool_steps) |step| {
+    var steering_index: usize = 0;
+    for (execution.tool_steps, 0..) |step, step_index| {
+        while (steering_index < execution.steering.len and
+            execution.steering[steering_index].after_tool_step_count == step_index)
+        {
+            const steering = execution.steering[steering_index];
+            if (steering.assistant_prefix) |prefix| {
+                if (prefix.len > 0) {
+                    try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+                }
+            }
+            if (steering.text.len > 0) {
+                try messages.append(alloc, .{ .role = .user, .content = steering.text });
+            }
+            steering_index += 1;
+        }
         if (step.tool_calls.len == 0) continue;
         try messages.append(alloc, .{
             .role = .assistant,
@@ -1820,11 +3163,16 @@ pub fn appendExecutionMemoryChatMessages(
                 .tool_call_id = result.tool_call_id,
                 .tool_name = result.tool_name,
                 .tool_result_status = result.status,
+                .tool_result_memory = toolResultMemory(result),
             });
         }
         for (step.tool_results) |result| {
             for (result.permission_feedback) |feedback| {
-                try messages.append(alloc, .{ .role = .user, .content = feedback });
+                try messages.append(alloc, .{
+                    .role = .user,
+                    .content = feedback,
+                    .permission_feedback = true,
+                });
             }
         }
     }
@@ -1833,6 +3181,30 @@ pub fn appendExecutionMemoryChatMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, .{ .role = .user, .content = text });
     }
+    while (steering_index < execution.steering.len) : (steering_index += 1) {
+        const steering = execution.steering[steering_index];
+        if (steering.assistant_prefix) |prefix| {
+            if (prefix.len > 0) {
+                try messages.append(alloc, .{ .role = .assistant, .content = prefix });
+            }
+        }
+        if (steering.text.len == 0) continue;
+        try messages.append(alloc, .{ .role = .user, .content = steering.text });
+    }
+}
+
+fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {
+    return .{
+        .output_handle = result.output_handle,
+        .preview = result.preview,
+        .output_bytes = result.output_bytes,
+        .stored_output_bytes = result.stored_output_bytes,
+        .truncated = result.truncated,
+        .committed_file_presentation = result.committed_file_presentation,
+        .command_output_replay = result.command_output_replay,
+        .command_process_presentation = result.command_process_presentation,
+        .terminal_action_presentation = result.terminal_action_presentation,
+    };
 }
 
 fn appendHistoryChatMessagesImpl(
@@ -1840,13 +3212,15 @@ fn appendHistoryChatMessagesImpl(
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
     starts_in_leading_summary_prefix: bool,
+    interrupted_projection: InterruptedChatProjection,
 ) !bool {
     var in_leading_summary_prefix = starts_in_leading_summary_prefix;
     for (history) |turn| {
-        const summary_is_system = in_leading_summary_prefix;
         in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
         switch (turn) {
             .compacted_summary => |entry| {
+                const summary_is_system = in_leading_summary_prefix and
+                    !isCurrentCompactionCheckpoint(turn);
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
                 errdefer alloc.free(text);
                 try messages.append(alloc, .{
@@ -1860,18 +3234,6 @@ fn appendHistoryChatMessagesImpl(
                 if (entry.assistant.len > 0) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant });
                 }
-            },
-            .background_command => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
-                try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
-                if (entry.assistant) |assistant| {
-                    if (assistant.len > 0) {
-                        try messages.append(alloc, .{ .role = .assistant, .content = assistant });
-                    }
-                }
-                const text = try formatBackgroundHistoryContext(alloc, entry);
-                errdefer alloc.free(text);
-                try messages.append(alloc, .{ .role = .user, .content = text });
             },
             .interrupted => |entry| {
                 try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
@@ -1889,10 +3251,17 @@ fn appendHistoryChatMessagesImpl(
                         .tool_name = tool_call.name,
                         .tool_result_status = .failure,
                     });
+                } else if (interrupted_projection == .steering_continuation) {
+                    if (entry.assistant) |assistant| {
+                        if (assistant.len > 0) {
+                            try messages.append(alloc, .{ .role = .assistant, .content = assistant });
+                        }
+                    }
                 } else {
                     const assistant_content = try formatInterruptedAssistantClosedContent(alloc, entry);
                     try messages.append(alloc, .{ .role = .assistant, .content = assistant_content });
                 }
+                if (interrupted_projection == .steering_continuation) continue;
                 const text = try formatInterruptedHistoryContext(alloc, entry);
                 errdefer alloc.free(text);
                 try messages.append(alloc, .{ .role = .user, .content = text });
@@ -1903,48 +3272,19 @@ fn appendHistoryChatMessagesImpl(
 }
 /// Infers a conversation language tag from text using core's script-counting heuristic.
 pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguage) ConversationLanguage {
-    var counts: ScriptCounts = .{};
-    var i: usize = 0;
-    while (i < text.len) {
-        const width = std.unicode.utf8ByteSequenceLength(text[i]) catch {
-            i += 1;
-            continue;
-        };
-        if (i + width > text.len) break;
-        const codepoint = std.unicode.utf8Decode(text[i .. i + width]) catch {
-            i += width;
-            continue;
-        };
-        classifyCodepoint(&counts, codepoint);
-        i += width;
-    }
-    if (counts.hiragana + counts.katakana > 0) return ConversationLanguage.literal("ja");
-    if (counts.hangul > 0) return ConversationLanguage.literal("ko");
-    const scores = [_]struct { count: usize, tag: ConversationLanguage }{
-        .{ .count = counts.han, .tag = ConversationLanguage.literal("und-Hani") },
-        .{ .count = counts.arabic, .tag = ConversationLanguage.literal("und-Arab") },
-        .{ .count = counts.hebrew, .tag = ConversationLanguage.literal("und-Hebr") },
-        .{ .count = counts.cyrillic, .tag = ConversationLanguage.literal("und-Cyrl") },
-        .{ .count = counts.greek, .tag = ConversationLanguage.literal("und-Grek") },
-        .{ .count = counts.devanagari, .tag = ConversationLanguage.literal("und-Deva") },
-        .{ .count = counts.thai, .tag = ConversationLanguage.literal("und-Thai") },
-        .{ .count = counts.latin, .tag = ConversationLanguage.literal("und-Latn") },
+    const script = language_script.profile(text).script orelse return fallback;
+    return switch (script) {
+        .japanese => ConversationLanguage.literal("ja"),
+        .hangul => ConversationLanguage.literal("ko"),
+        .han => ConversationLanguage.literal("und-Hani"),
+        .arabic => ConversationLanguage.literal("und-Arab"),
+        .hebrew => ConversationLanguage.literal("und-Hebr"),
+        .cyrillic => ConversationLanguage.literal("und-Cyrl"),
+        .greek => ConversationLanguage.literal("und-Grek"),
+        .devanagari => ConversationLanguage.literal("und-Deva"),
+        .thai => ConversationLanguage.literal("und-Thai"),
+        .latin => ConversationLanguage.literal("und-Latn"),
     };
-    var best_count: usize = 0;
-    var best_tag = fallback;
-    var tied = false;
-    for (scores) |entry| {
-        if (entry.count == 0) continue;
-        if (entry.count > best_count) {
-            best_count = entry.count;
-            best_tag = entry.tag;
-            tied = false;
-            continue;
-        }
-        if (entry.count == best_count) tied = true;
-    }
-    if (best_count == 0 or tied) return fallback;
-    return best_tag;
 }
 
 pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8) ![]u8 {
@@ -1953,16 +3293,6 @@ pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8)
         "{s}{s}\n\n{s}\n{s}",
         .{ compact_continuation_preamble, summary, compact_recent_messages_note, compact_direct_resume_instruction },
     );
-}
-
-pub fn formatBackgroundHistoryContext(alloc: Allocator, entry: BackgroundCommandHistoryTurn) ![]u8 {
-    if (entry.url) |url| {
-        return std.fmt.allocPrint(alloc, "Session event: a previous user request launched a background server. Log: {s}. URL observed at launch: {s}. Re-check runtime context for current liveness before reusing it.", .{ entry.log_path, url });
-    }
-    if (entry.expect_url) {
-        return std.fmt.allocPrint(alloc, "Session event: a previous user request launched a background server. Log: {s}. Re-check runtime context for current liveness and URL state before reusing it.", .{entry.log_path});
-    }
-    return std.fmt.allocPrint(alloc, "Session event: a previous user request launched a background command. Log: {s}. Re-check runtime context for current liveness before treating it as running.", .{entry.log_path});
 }
 
 pub fn formatExecutionFileContext(alloc: Allocator, files: []const core_types.FileEvidence) ![]u8 {
@@ -2023,6 +3353,23 @@ pub fn formatExecutionReplayContext(
     }
 
     return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+test "turn summary alone does not create model execution replay context" {
+    const execution = ExecutionMemory{ .turn_summary = .{
+        .started_at_ms = 100,
+        .completed_at_ms = 250,
+        .thinking_duration_ms = 40,
+        .turn_duration_ms = 150,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    } };
+
+    const context = try formatExecutionReplayContext(
+        std.testing.allocator,
+        execution,
+    );
+    defer if (context) |value| std.testing.allocator.free(value);
+    try std.testing.expect(context == null);
 }
 
 pub fn formatInterruptedHistoryContext(alloc: Allocator, entry: InterruptedHistoryTurn) ![]u8 {
@@ -2140,6 +3487,105 @@ fn buildCompactedSummaryTurn(
     };
 }
 
+test "history compaction discards root-user authority text" {
+    const alloc = std.testing.allocator;
+    const removed = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("first exact request") },
+            .assistant = @constCast("first response"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("second exact request") },
+        } },
+    };
+    const first = try buildCompactedSummaryTurn(alloc, null, &removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
+    try std.testing.expectEqual(@as(usize, 0), first.root_user_messages.len);
+    try std.testing.expect(!first.root_user_messages_complete);
+
+    const later = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("third exact request") },
+        .assistant = @constCast("third response"),
+    } }};
+    const second = try buildCompactedSummaryTurn(alloc, first, &later);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = second });
+    try std.testing.expectEqual(@as(usize, 0), second.root_user_messages.len);
+    try std.testing.expect(!second.root_user_messages_complete);
+}
+
+test "repeated compaction keeps historical authority discarded" {
+    const alloc = std.testing.allocator;
+    const legacy: CompactedSummaryHistoryTurn = .{
+        .summary = @constCast("legacy summary without exact authority"),
+        .removed_turn_count = 4,
+        .compaction_count = 1,
+        .root_user_messages_complete = false,
+        .permission_feedback_complete = false,
+    };
+    const first_removed = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("newer exact request") },
+        .assistant = @constCast("response"),
+    } }};
+    const first = try buildCompactedSummaryTurn(alloc, legacy, &first_removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
+    try std.testing.expect(!first.root_user_messages_complete);
+    try std.testing.expect(!first.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), first.root_user_messages.len);
+
+    const second_removed = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("latest exact request") },
+    } }};
+    const second = try buildCompactedSummaryTurn(alloc, first, &second_removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = second });
+    try std.testing.expect(!second.root_user_messages_complete);
+    try std.testing.expect(!second.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), second.root_user_messages.len);
+}
+
+test "repeated compaction discards historical permission feedback" {
+    const alloc = std.testing.allocator;
+    var first_feedback = [_][]u8{@constCast("Do not write outside the workspace.")};
+    var first_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("first"),
+        .tool_name = @constCast("write_file"),
+        .status = .failure,
+        .output = @constCast("denied"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .permission_feedback = &first_feedback,
+    }};
+    var first_steps = [_]ToolExecutionStep{.{ .tool_results = &first_results }};
+    const first_removed = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Prepare the report.") },
+        .assistant = @constCast("I need to write a file."),
+        .execution = .{ .tool_steps = &first_steps },
+    } }};
+    const first = try buildCompactedSummaryTurn(alloc, null, &first_removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
+    try std.testing.expect(!first.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), first.permission_feedback.len);
+
+    var second_feedback = [_][]u8{@constCast("README changes require approval.")};
+    var second_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("second"),
+        .tool_name = @constCast("edit_file"),
+        .status = .failure,
+        .output = @constCast("denied"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .permission_feedback = &second_feedback,
+    }};
+    var second_steps = [_]ToolExecutionStep{.{ .tool_results = &second_results }};
+    const later = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("Continue with the report.") },
+        .execution = .{ .tool_steps = &second_steps },
+    } }};
+    const repeated = try buildCompactedSummaryTurn(alloc, first, &later);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = repeated });
+    try std.testing.expect(!repeated.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), repeated.permission_feedback.len);
+}
+
 fn buildCompactedSummaryText(
     alloc: Allocator,
     existing: ?CompactedSummaryHistoryTurn,
@@ -2168,7 +3614,6 @@ fn buildCompactedSummaryText(
     try appendUserSummaryLines(arena, &lines, removed);
     try appendAssistantSummaryLines(arena, &lines, removed);
     try appendExecutionSummaryLines(arena, &lines, removed);
-    try appendBackgroundSummaryLines(arena, &lines, removed);
     try appendInterruptedSummaryLines(arena, &lines, removed);
 
     if (lines.items.len <= 2) {
@@ -2184,7 +3629,6 @@ fn appendUserSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), r
     for (removed) |turn| {
         const user_text = switch (turn) {
             .assistant => |entry| entry.user.text,
-            .background_command => |entry| entry.user.text,
             .interrupted => |entry| entry.user.text,
             .compacted_summary => continue,
         };
@@ -2207,7 +3651,6 @@ fn appendAssistantSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u
     for (removed) |turn| {
         const assistant_text = switch (turn) {
             .assistant => |entry| entry.assistant,
-            .background_command => |entry| entry.assistant orelse continue,
             .interrupted => |entry| entry.assistant orelse continue,
             else => continue,
         };
@@ -2230,7 +3673,6 @@ fn appendExecutionSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u
     for (removed) |turn| {
         const execution = switch (turn) {
             .assistant => |entry| entry.execution,
-            .background_command => |entry| entry.execution,
             .interrupted => |entry| entry.execution,
             else => continue,
         };
@@ -2313,7 +3755,6 @@ fn appendBudgetEvidenceForTurn(arena: Allocator, lines: *std.ArrayList([]const u
     if (remaining == 0) return 0;
     const execution = switch (turn) {
         .assistant => |entry| entry.execution,
-        .background_command => |entry| entry.execution,
         .interrupted => |entry| entry.execution,
         else => return 0,
     };
@@ -2349,11 +3790,6 @@ fn estimateHistoryTurnTokens(turn: HistoryTurn) usize {
     return switch (turn) {
         .compacted_summary => |entry| estimateTextTokens(entry.summary),
         .assistant => |entry| estimateTextTokens(entry.user.text) + estimateTextTokens(entry.assistant) + estimateExecutionTokens(entry.execution),
-        .background_command => |entry| estimateTextTokens(entry.user.text) +
-            (if (entry.assistant) |assistant| estimateTextTokens(assistant) else 0) +
-            estimateExecutionTokens(entry.execution) +
-            estimateTextTokens(entry.log_path) +
-            (if (entry.url) |url| estimateTextTokens(url) else 0),
         .interrupted => |entry| estimateTextTokens(entry.user.text) +
             (if (entry.assistant) |assistant| estimateTextTokens(assistant) else 0) +
             estimateExecutionTokens(entry.execution),
@@ -2400,32 +3836,6 @@ fn estimateTextTokens(text: []const u8) usize {
     }
     if (span_len > 0) count += (span_len + 3) / 4;
     return count;
-}
-
-fn appendBackgroundSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), removed: []const HistoryTurn) !void {
-    var added: usize = 0;
-    var saw_header = false;
-    for (removed) |turn| {
-        const entry = switch (turn) {
-            .background_command => |value| value,
-            else => continue,
-        };
-
-        if (!saw_header) {
-            try lines.append(arena, "- Background activity:");
-            saw_header = true;
-        }
-
-        const line = if (entry.url) |url|
-            try std.fmt.allocPrint(arena, "  - log={s}, url={s}", .{ entry.log_path, url })
-        else if (entry.expect_url)
-            try std.fmt.allocPrint(arena, "  - log={s}, local server started (URL pending)", .{entry.log_path})
-        else
-            try std.fmt.allocPrint(arena, "  - log={s}", .{entry.log_path});
-        try lines.append(arena, line);
-        added += 1;
-        if (added >= 3) break;
-    }
 }
 
 fn appendInterruptedSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), removed: []const HistoryTurn) !void {
@@ -2542,111 +3952,1507 @@ fn compactLineText(arena: Allocator, text: []const u8, max_bytes: usize) ![]cons
     return if (written.len == 0) arena.dupe(u8, "") else arena.dupe(u8, written);
 }
 
-const ScriptCounts = struct {
-    latin: usize = 0,
-    cyrillic: usize = 0,
-    arabic: usize = 0,
-    hebrew: usize = 0,
-    devanagari: usize = 0,
-    thai: usize = 0,
-    greek: usize = 0,
-    hangul: usize = 0,
-    hiragana: usize = 0,
-    katakana: usize = 0,
-    han: usize = 0,
-};
-fn classifyCodepoint(counts: *ScriptCounts, codepoint: u21) void {
-    if (isLatinCodepoint(codepoint)) {
-        counts.latin += 1;
-        return;
+test "resume-history-to-request conversion preserves user assistant ordering" {
+    const alloc = std.testing.allocator;
+    var history = try alloc.alloc(HistoryTurn, 2);
+    history[0] = try makeAssistantTurn(alloc, "first", "one");
+    history[1] = try makeAssistantTurn(alloc, "second", "two");
+    defer freeHistoryTurnSlice(alloc, history);
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer {
+        for (messages.items) |*msg| msg.deinit(alloc);
+        messages.deinit(alloc);
     }
-    if (isCyrillicCodepoint(codepoint)) {
-        counts.cyrillic += 1;
-        return;
+    try appendHistoryMessages(alloc, &messages, history);
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("first", messages.items[0].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings("one", messages.items[1].content.?.asText());
+    try std.testing.expectEqual(.user, messages.items[2].role);
+    try std.testing.expectEqualStrings("second", messages.items[2].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[3].role);
+    try std.testing.expectEqualStrings("two", messages.items[3].content.?.asText());
+}
+test "appendHistoryMessages frees owned projection text when append fails" {
+    const compact = [_]HistoryTurn{.{ .compacted_summary = .{ .summary = @constCast("summary"), .removed_turn_count = 1, .compaction_count = 1 } }};
+    var compact_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var compact_messages: std.ArrayList(message.Message) = .empty;
+    try std.testing.expectError(error.OutOfMemory, appendHistoryMessages(compact_failing.allocator(), &compact_messages, &compact));
+}
+test "dupeImageAttachment frees path when media_type allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
+        .path = @constCast("/tmp/a.png"),
+        .media_type = @constCast("image/png"),
+    }));
+}
+test "dupeImageAttachment preserves stable image id" {
+    const alloc = std.testing.allocator;
+    const copy = try dupeImageAttachment(alloc, .{
+        .id = 41,
+        .path = @constCast("/tmp/a.png"),
+        .media_type = @constCast("image/png"),
+    });
+    defer {
+        alloc.free(copy.path);
+        alloc.free(copy.media_type);
     }
-    if (isArabicCodepoint(codepoint)) {
-        counts.arabic += 1;
-        return;
+
+    try std.testing.expectEqual(@as(usize, 41), copy.id);
+}
+test "conversation-language inference matches script signals" {
+    try std.testing.expectEqual(ConversationLanguage.literal("und-Latn"), inferConversationLanguage("puoi aprire la landing page", ConversationLanguage.default()));
+    try std.testing.expectEqual(ConversationLanguage.literal("ja"), inferConversationLanguage("ランディングページを開いて", ConversationLanguage.default()));
+    try std.testing.expectEqual(ConversationLanguage.literal("und-Arab"), inferConversationLanguage("افتح الصفحة الرئيسية", ConversationLanguage.default()));
+    try std.testing.expectEqual(ConversationLanguage.literal("und-Latn"), inferConversationLanguage("12345 !!!", ConversationLanguage.literal("und-Latn")));
+}
+test "history projection keeps system role only for leading summaries" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const history = [_]HistoryTurn{
+        .{ .compacted_summary = .{
+            .summary = @constCast("leading summary"),
+            .removed_turn_count = 2,
+            .compaction_count = 1,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("old request " ++ ("u" ** 800)) },
+            .assistant = @constCast("old answer " ++ ("a" ** 800)),
+        } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("nonleading summary marker"),
+            .removed_turn_count = 1,
+            .compaction_count = 2,
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("interrupt me") },
+            .assistant = @constCast("partial answer"),
+        } },
+    };
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &chat_messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 7), messages.items.len);
+    try std.testing.expectEqual(messages.items.len, chat_messages.items.len);
+    for (messages.items, chat_messages.items) |projected, chat| {
+        try std.testing.expectEqualStrings(@tagName(projected.role), @tagName(chat.role));
+        try std.testing.expectEqualStrings(projected.content.?.asText(), chat.content.?);
     }
-    if (isHebrewCodepoint(codepoint)) {
-        counts.hebrew += 1;
-        return;
+    try std.testing.expectEqual(.system, messages.items[0].role);
+    try std.testing.expectEqual(.user, messages.items[3].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "nonleading summary marker") != null);
+    try std.testing.expectEqual(.user, messages.items[6].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[6].content.?.asText(), "<turn_aborted>") != null);
+
+    var budgeted_messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &budgeted_messages);
+    try appendHistoryMessagesBudgeted(alloc, &budgeted_messages, &history, .{ .max_tokens = 128 });
+
+    var budgeted_chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer budgeted_chat_messages.deinit(arena);
+    try appendHistoryChatMessagesBudgeted(arena, &budgeted_chat_messages, &history, .{ .max_tokens = 128 });
+
+    try std.testing.expectEqual(budgeted_messages.items.len, budgeted_chat_messages.items.len);
+    var saw_nonleading_summary = false;
+    var saw_interruption_marker = false;
+    var saw_non_system = false;
+    for (budgeted_messages.items, budgeted_chat_messages.items) |projected, chat| {
+        try std.testing.expectEqualStrings(@tagName(projected.role), @tagName(chat.role));
+        try std.testing.expectEqualStrings(projected.content.?.asText(), chat.content.?);
+        if (projected.role == .system) {
+            try std.testing.expect(!saw_non_system);
+        } else {
+            saw_non_system = true;
+        }
+        const text = projected.content.?.asText();
+        if (std.mem.find(u8, text, "nonleading summary marker") != null and
+            std.mem.startsWith(u8, text, compact_continuation_preamble))
+        {
+            try std.testing.expectEqual(.user, projected.role);
+            try std.testing.expect(!saw_nonleading_summary);
+            saw_nonleading_summary = true;
+        }
+        if (std.mem.find(u8, text, "<turn_aborted>") != null) {
+            try std.testing.expectEqual(.user, projected.role);
+            try std.testing.expect(!saw_interruption_marker);
+            saw_interruption_marker = true;
+        }
     }
-    if (isDevanagariCodepoint(codepoint)) {
-        counts.devanagari += 1;
-        return;
-    }
-    if (isThaiCodepoint(codepoint)) {
-        counts.thai += 1;
-        return;
-    }
-    if (isGreekCodepoint(codepoint)) {
-        counts.greek += 1;
-        return;
-    }
-    if (isHangulCodepoint(codepoint)) {
-        counts.hangul += 1;
-        return;
-    }
-    if (codepoint >= 0x3040 and codepoint <= 0x309F) {
-        counts.hiragana += 1;
-        return;
-    }
-    if ((codepoint >= 0x30A0 and codepoint <= 0x30FF) or (codepoint >= 0x31F0 and codepoint <= 0x31FF) or (codepoint >= 0xFF66 and codepoint <= 0xFF9F)) {
-        counts.katakana += 1;
-        return;
-    }
-    if (isHanCodepoint(codepoint)) {
-        counts.han += 1;
+    try std.testing.expectEqual(.system, budgeted_messages.items[0].role);
+    try std.testing.expect(saw_nonleading_summary);
+    try std.testing.expect(saw_interruption_marker);
+}
+
+test "resume history projects steering before the final assistant" {
+    const alloc = std.testing.allocator;
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("use file B instead"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("keep the result concise"), .after_tool_step_count = 0 },
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("modify file A") },
+        .assistant = @constCast("updated file B"),
+        .execution = .{ .steering = steering[0..] },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &chat_messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(messages.items.len, chat_messages.items.len);
+    const expected_roles = [_]message.Role{ .user, .user, .user, .assistant };
+    const expected_text = [_][]const u8{
+        "modify file A",
+        "use file B instead",
+        "keep the result concise",
+        "updated file B",
+    };
+    for (messages.items, chat_messages.items, expected_roles, expected_text) |projected, chat, role, text| {
+        try std.testing.expectEqual(role, projected.role);
+        try std.testing.expectEqualStrings(@tagName(role), @tagName(chat.role));
+        try std.testing.expectEqualStrings(text, projected.content.?.asText());
+        try std.testing.expectEqualStrings(text, chat.content.?);
     }
 }
-fn isLatinCodepoint(codepoint: u21) bool {
-    return (codepoint >= 'A' and codepoint <= 'Z') or
-        (codepoint >= 'a' and codepoint <= 'z') or
-        (codepoint >= 0x00C0 and codepoint <= 0x024F) or
-        (codepoint >= 0x1E00 and codepoint <= 0x1EFF);
+
+test "resume history preserves steering between tool episodes" {
+    const alloc = std.testing.allocator;
+    var first_calls = [_]ToolCall{.{
+        .id = "call_first",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"first\"}",
+    }};
+    var first_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_first"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("first result"),
+        .output_bytes = "first result".len,
+        .stored_output_bytes = "first result".len,
+    }};
+    var second_calls = [_]ToolCall{.{
+        .id = "call_second",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"second\"}",
+    }};
+    var second_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_second"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("second result"),
+        .output_bytes = "second result".len,
+        .stored_output_bytes = "second result".len,
+    }};
+    var steps = [_]ToolExecutionStep{
+        .{ .tool_calls = &first_calls, .tool_results = &first_results },
+        .{ .tool_calls = &second_calls, .tool_results = &second_results },
+    };
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("after first"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("after second"), .after_tool_step_count = 2 },
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("run both") },
+        .assistant = @constCast("finished"),
+        .execution = .{
+            .tool_steps = &steps,
+            .steering = &steering,
+        },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 8), messages.items.len);
+    const expected_roles = [_]message.Role{
+        .user,
+        .assistant,
+        .tool,
+        .user,
+        .assistant,
+        .tool,
+        .user,
+        .assistant,
+    };
+    for (messages.items, expected_roles) |projected, role| {
+        try std.testing.expectEqual(role, projected.role);
+    }
+    try std.testing.expectEqualStrings("after first", messages.items[3].content.?.asText());
+    try std.testing.expectEqualStrings("after second", messages.items[6].content.?.asText());
 }
-fn isCyrillicCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x0400 and codepoint <= 0x052F) or
-        (codepoint >= 0x2DE0 and codepoint <= 0x2DFF) or
-        (codepoint >= 0xA640 and codepoint <= 0xA69F);
+
+test "resume projection replays assistant tool execution memory before final answer" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{.{
+        .id = "call_read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"src/main.zig\"}",
+    }};
+    var results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("file contents"),
+        .output_bytes = 13,
+        .stored_output_bytes = 13,
+    }};
+    var steps = [_]ToolExecutionStep{.{
+        .assistant = @constCast("I'll read it."),
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    var files = [_]FileEvidence{.{
+        .path = @constCast("src/main.zig"),
+        .tool_call_id = @constCast("call_read"),
+        .tool_name = @constCast("read_file"),
+        .action = .read,
+        .status = .success,
+        .model_view_covers_full_file = true,
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("inspect main") },
+        .assistant = @constCast("main wires the app"),
+        .execution = .{ .tool_steps = steps[0..], .files = files[0..] },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expectEqual(.user, messages.items[0].role);
+    try std.testing.expectEqual(.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings("call_read", messages.items[1].tool_calls[0].id);
+    try std.testing.expectEqual(.tool, messages.items[2].role);
+    try std.testing.expectEqualStrings("file contents", messages.items[2].content.?.asText());
+    try std.testing.expectEqual(.user, messages.items[3].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "model_view=full") != null);
+    try std.testing.expectEqual(.assistant, messages.items[4].role);
+    try std.testing.expectEqualStrings("main wires the app", messages.items[4].content.?.asText());
 }
-fn isArabicCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x0600 and codepoint <= 0x06FF) or
-        (codepoint >= 0x0750 and codepoint <= 0x077F) or
-        (codepoint >= 0x08A0 and codepoint <= 0x08FF) or
-        (codepoint >= 0xFB50 and codepoint <= 0xFDFF) or
-        (codepoint >= 0xFE70 and codepoint <= 0xFEFF);
+
+test "resume projections omit empty terminal assistant after completed execution" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{.{
+        .id = "call_read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"src/main.zig\"}",
+    }};
+    var results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("file contents"),
+        .output_bytes = 13,
+        .stored_output_bytes = 13,
+    }};
+    var steps = [_]ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("inspect main") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = steps[0..] },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(.user, messages.items[0].role);
+    try std.testing.expectEqual(.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings("call_read", messages.items[1].tool_calls[0].id);
+    try std.testing.expectEqual(.tool, messages.items[2].role);
+    try std.testing.expectEqualStrings("file contents", messages.items[2].content.?.asText());
+
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(alloc);
+    try appendHistoryChatMessages(alloc, &chat_messages, &history);
+    try std.testing.expectEqual(@as(usize, 3), chat_messages.items.len);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[0].role);
+    try std.testing.expectEqual(core_types.ChatRole.assistant, chat_messages.items[1].role);
+    try std.testing.expectEqualStrings("call_read", chat_messages.items[1].tool_calls[0].id);
+    try std.testing.expectEqual(core_types.ChatRole.tool, chat_messages.items[2].role);
+    try std.testing.expectEqualStrings("file contents", chat_messages.items[2].content.?);
 }
-fn isHebrewCodepoint(codepoint: u21) bool {
-    return codepoint >= 0x0590 and codepoint <= 0x05FF;
+
+test "resume projections place permission feedback after its tool result" {
+    const alloc = std.testing.allocator;
+    var feedback = [_][]u8{@constCast("read it after writing")};
+    var calls = [_]ToolCall{.{
+        .id = "call_feedback",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"note.txt\"}",
+    }};
+    var results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_feedback"),
+        .tool_name = @constCast("write_file"),
+        .status = .success,
+        .output = @constCast("wrote note.txt"),
+        .output_bytes = 15,
+        .stored_output_bytes = 15,
+        .permission_feedback = feedback[0..],
+    }};
+    var steps = [_]ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("write a note") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = steps[0..] },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expectEqual(.tool, messages.items[2].role);
+    try std.testing.expectEqual(.user, messages.items[3].role);
+    try std.testing.expectEqualStrings(
+        "read it after writing",
+        messages.items[3].content.?.asText(),
+    );
+    try std.testing.expectEqual(.assistant, messages.items[4].role);
+
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(alloc);
+    try appendHistoryChatMessages(alloc, &chat_messages, &history);
+    try std.testing.expectEqual(@as(usize, 5), chat_messages.items.len);
+    try std.testing.expectEqual(core_types.ChatRole.tool, chat_messages.items[2].role);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[3].role);
+    try std.testing.expectEqualStrings("read it after writing", chat_messages.items[3].content.?);
+    try std.testing.expectEqual(core_types.ChatRole.assistant, chat_messages.items[4].role);
 }
-fn isDevanagariCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x0900 and codepoint <= 0x097F) or
-        (codepoint >= 0xA8E0 and codepoint <= 0xA8FF);
+
+test "resume projections group two tool results before their feedback" {
+    const alloc = std.testing.allocator;
+    var first_feedback = [_][]u8{@constCast("first command feedback marker")};
+    var second_feedback = [_][]u8{@constCast("second command feedback marker")};
+    var calls = [_]ToolCall{
+        .{ .id = "call_first", .name = "run_command", .arguments_json = "{\"command\":\"printf first\"}" },
+        .{ .id = "call_second", .name = "run_command", .arguments_json = "{\"command\":\"printf second\"}" },
+    };
+    var results = [_]PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_first"),
+            .tool_name = @constCast("run_command"),
+            .status = .success,
+            .output = @constCast("first command completed"),
+            .output_bytes = 23,
+            .stored_output_bytes = 23,
+            .permission_feedback = first_feedback[0..],
+        },
+        .{
+            .tool_call_id = @constCast("call_second"),
+            .tool_name = @constCast("run_command"),
+            .status = .success,
+            .output = @constCast("second command completed"),
+            .output_bytes = 24,
+            .stored_output_bytes = 24,
+            .permission_feedback = second_feedback[0..],
+        },
+    };
+    var steps = [_]ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("run both commands") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = steps[0..] },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+    try std.testing.expectEqual(@as(usize, 7), messages.items.len);
+    try std.testing.expectEqual(.tool, messages.items[2].role);
+    try std.testing.expectEqual(.tool, messages.items[3].role);
+    try std.testing.expectEqual(.user, messages.items[4].role);
+    try std.testing.expectEqual(.user, messages.items[5].role);
+
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(alloc);
+    try appendHistoryChatMessages(alloc, &chat_messages, &history);
+    try std.testing.expectEqual(@as(usize, 7), chat_messages.items.len);
+    try std.testing.expectEqual(core_types.ChatRole.tool, chat_messages.items[2].role);
+    try std.testing.expectEqual(core_types.ChatRole.tool, chat_messages.items[3].role);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[4].role);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[5].role);
 }
-fn isThaiCodepoint(codepoint: u21) bool {
-    return codepoint >= 0x0E00 and codepoint <= 0x0E7F;
+
+test "execution replay context and token estimate include permission feedback" {
+    const alloc = std.testing.allocator;
+    var feedback = [_][]u8{@constCast("read it after writing")};
+    var with_feedback_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_feedback"),
+        .tool_name = @constCast("write_file"),
+        .status = .success,
+        .output = @constCast("wrote note.txt"),
+        .output_bytes = 15,
+        .stored_output_bytes = 15,
+        .permission_feedback = feedback[0..],
+    }};
+    var without_feedback_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_feedback"),
+        .tool_name = @constCast("write_file"),
+        .status = .success,
+        .output = @constCast("wrote note.txt"),
+        .output_bytes = 15,
+        .stored_output_bytes = 15,
+    }};
+    var with_feedback_steps = [_]ToolExecutionStep{.{ .tool_results = with_feedback_results[0..] }};
+    var without_feedback_steps = [_]ToolExecutionStep{.{ .tool_results = without_feedback_results[0..] }};
+    const with_feedback = ExecutionMemory{ .tool_steps = with_feedback_steps[0..] };
+    const without_feedback = ExecutionMemory{ .tool_steps = without_feedback_steps[0..] };
+
+    const context = (try formatExecutionReplayContext(alloc, with_feedback)).?;
+    defer alloc.free(context);
+    try std.testing.expect(std.mem.find(u8, context, "wrote note.txt") != null);
+    try std.testing.expect(std.mem.find(u8, context, "read it after writing") != null);
+    try std.testing.expect(estimateExecutionTokens(with_feedback) > estimateExecutionTokens(without_feedback));
 }
-fn isGreekCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x0370 and codepoint <= 0x03FF) or
-        (codepoint >= 0x1F00 and codepoint <= 0x1FFF);
+
+test "budgeted resume projection preserves latest turn and summarizes trimmed handle evidence" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var large_calls = [_]ToolCall{.{
+        .id = "call_large",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"make lots of evidence\"}",
+    }};
+    var large_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_large"),
+        .tool_name = @constCast("run_command"),
+        .status = .success,
+        .output = @constCast("<tool_result_preview handle=\"result-call_large-abc.txt\">preview evidence</tool_result_preview>"),
+        .output_bytes = 80_000,
+        .stored_output_bytes = 80_000,
+        .truncated = true,
+        .provider_native = false,
+        .created_at_ms = 1,
+        .output_handle = @constCast("result-call_large-abc.txt"),
+        .preview = @constCast("preview evidence"),
+    }};
+    var large_steps = [_]ToolExecutionStep{.{
+        .tool_calls = large_calls[0..],
+        .tool_results = large_results[0..],
+    }};
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("old large request") },
+            .assistant = @constCast("old large answer"),
+            .execution = .{ .tool_steps = large_steps[0..] },
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("latest request that must survive") },
+            .assistant = @constCast("latest answer"),
+        } },
+    };
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(arena);
+    try appendHistoryChatMessagesBudgeted(arena, &messages, &history, .{ .max_tokens = 12 });
+
+    try std.testing.expect(messages.items.len >= 3);
+    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "result-call_large-abc.txt") != null);
+    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "preview evidence") != null);
+    try std.testing.expectEqualStrings("latest request that must survive", messages.items[messages.items.len - 2].content.?);
+    try std.testing.expectEqualStrings("latest answer", messages.items[messages.items.len - 1].content.?);
 }
-fn isHangulCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x1100 and codepoint <= 0x11FF) or
-        (codepoint >= 0x3130 and codepoint <= 0x318F) or
-        (codepoint >= 0xA960 and codepoint <= 0xA97F) or
-        (codepoint >= 0xAC00 and codepoint <= 0xD7AF) or
-        (codepoint >= 0xD7B0 and codepoint <= 0xD7FF);
+
+test "budgeted resume projection preserves compacted summary when older handle evidence is trimmed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var large_calls = [_]ToolCall{.{
+        .id = "call_large",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"make lots of evidence\"}",
+    }};
+    var large_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_large"),
+        .tool_name = @constCast("run_command"),
+        .status = .success,
+        .output = @constCast("<tool_result_preview handle=\"result-call_large-summary.txt\">summary preview evidence</tool_result_preview>"),
+        .output_bytes = 80_000,
+        .stored_output_bytes = 80_000,
+        .truncated = true,
+        .provider_native = false,
+        .created_at_ms = 1,
+        .output_handle = @constCast("result-call_large-summary.txt"),
+        .preview = @constCast("summary preview evidence"),
+    }};
+    var large_steps = [_]ToolExecutionStep{.{
+        .tool_calls = large_calls[0..],
+        .tool_results = large_results[0..],
+    }};
+    const history = [_]HistoryTurn{
+        .{ .compacted_summary = .{
+            .summary = @constCast("Conversation summary:\n- Prior compacted decision needle " ++ ("x" ** 240)),
+            .removed_turn_count = 6,
+            .compaction_count = 2,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("old large request") },
+            .assistant = @constCast("old large answer"),
+            .execution = .{ .tool_steps = large_steps[0..] },
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("latest request that must survive") },
+            .assistant = @constCast("latest answer"),
+        } },
+    };
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(arena);
+    try appendHistoryChatMessagesBudgeted(arena, &messages, &history, .{ .max_tokens = 12 });
+
+    try std.testing.expect(messages.items.len >= 3);
+    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "Prior compacted decision needle") != null);
+    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "result-call_large-summary.txt") != null);
+    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "summary preview evidence") != null);
+    try std.testing.expectEqualStrings("latest request that must survive", messages.items[messages.items.len - 2].content.?);
+    try std.testing.expectEqualStrings("latest answer", messages.items[messages.items.len - 1].content.?);
 }
-fn isHanCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x3400 and codepoint <= 0x4DBF) or
-        (codepoint >= 0x4E00 and codepoint <= 0x9FFF) or
-        (codepoint >= 0xF900 and codepoint <= 0xFAFF) or
-        (codepoint >= 0x20000 and codepoint <= 0x2A6DF) or
-        (codepoint >= 0x2A700 and codepoint <= 0x2B73F) or
-        (codepoint >= 0x2B740 and codepoint <= 0x2B81F) or
-        (codepoint >= 0x2B820 and codepoint <= 0x2CEAF);
+
+test "budgeted Message and Chat projections retain latest turn and identical trimmed evidence" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var trimmed_calls = [_]ToolCall{.{
+        .id = "call_trimmed",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"produce extensive evidence\"}",
+    }};
+    var trimmed_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_trimmed"),
+        .tool_name = @constCast("run_command"),
+        .status = .failure,
+        .output = @constCast("trimmed failure output"),
+        .output_bytes = 22,
+        .stored_output_bytes = 22,
+        .output_handle = @constCast("result-call_trimmed.txt"),
+        .preview = @constCast("trimmed failure preview"),
+    }};
+    var trimmed_files = [_]FileEvidence{.{
+        .path = @constCast("src/trimmed.zig"),
+        .tool_call_id = @constCast("call_trimmed"),
+        .tool_name = @constCast("run_command"),
+        .action = .write,
+        .status = .failure,
+        .stale = true,
+    }};
+    var trimmed_steps = [_]ToolExecutionStep{.{
+        .assistant = @constCast("collecting extensive trimmed evidence"),
+        .tool_calls = trimmed_calls[0..],
+        .tool_results = trimmed_results[0..],
+    }};
+    var retained_calls = [_]ToolCall{.{
+        .id = "call_retained",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"src/retained.zig\"}",
+    }};
+    var retained_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_retained"),
+        .tool_name = @constCast("read_file"),
+        .status = .failure,
+        .output = @constCast("retained failure"),
+        .output_bytes = 16,
+        .stored_output_bytes = 16,
+    }};
+    var retained_files = [_]FileEvidence{.{
+        .path = @constCast("src/retained.zig"),
+        .tool_call_id = @constCast("call_retained"),
+        .tool_name = @constCast("read_file"),
+        .action = .read,
+        .status = .failure,
+        .model_view_covers_full_file = true,
+    }};
+    var retained_steps = [_]ToolExecutionStep{.{
+        .assistant = @constCast("reading retained"),
+        .tool_calls = retained_calls[0..],
+        .tool_results = retained_results[0..],
+    }};
+    var background_images = [_]ImageAttachment{.{
+        .id = 7,
+        .path = @constCast("/tmp/background.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var interrupted_images = [_]ImageAttachment{.{
+        .id = 8,
+        .path = @constCast("/tmp/interrupted.jpg"),
+        .media_type = @constCast("image/jpeg"),
+    }};
+    var latest_images = [_]ImageAttachment{.{
+        .id = 9,
+        .path = @constCast("/tmp/latest.webp"),
+        .media_type = @constCast("image/webp"),
+    }};
+    const history = [_]HistoryTurn{
+        .{ .compacted_summary = .{
+            .summary = @constCast("prior compacted decision needle " ++ ("x" ** 320)),
+            .removed_turn_count = 5,
+            .compaction_count = 2,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("old request " ++ ("y" ** 240)) },
+            .assistant = @constCast("old answer " ++ ("z" ** 240)),
+            .execution = .{
+                .tool_steps = trimmed_steps[0..],
+                .files = trimmed_files[0..],
+            },
+        } },
+        .{ .assistant = .{
+            .user = .{
+                .text = @constCast("run retained"),
+                .images = background_images[0..],
+            },
+            .assistant = @constCast("server ready"),
+            .execution = .{
+                .tool_steps = retained_steps[0..],
+                .files = retained_files[0..],
+            },
+        } },
+        .{ .interrupted = .{
+            .user = .{
+                .text = @constCast("stop retained"),
+                .images = interrupted_images[0..],
+            },
+            .assistant = @constCast("partial retained"),
+            .tool_call = .{
+                .id = "call_interrupted",
+                .name = "browser_navigate",
+                .arguments_json = "{\"url\":\"http://localhost:3000\"}",
+            },
+        } },
+        .{ .assistant = .{
+            .user = .{
+                .text = @constCast("latest request"),
+                .images = latest_images[0..],
+            },
+            .assistant = @constCast("latest answer"),
+        } },
+    };
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(arena, &messages);
+    try appendHistoryMessagesBudgeted(
+        arena,
+        &messages,
+        &history,
+        .{ .max_tokens = 64 },
+    );
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessagesBudgeted(
+        arena,
+        &chat_messages,
+        &history,
+        .{ .max_tokens = 64 },
+    );
+
+    try std.testing.expectEqual(messages.items.len, chat_messages.items.len);
+    var saw_interrupted = false;
+    var saw_failure_status = false;
+    var saw_file_evidence = false;
+    var saw_background_image = false;
+    var saw_interrupted_image = false;
+    var saw_latest_image = false;
+    for (messages.items, chat_messages.items) |projected, chat| {
+        try std.testing.expectEqualStrings(
+            @tagName(projected.role),
+            @tagName(chat.role),
+        );
+        try std.testing.expectEqual(projected.content == null, chat.content == null);
+        if (projected.content) |content| {
+            try std.testing.expectEqualStrings(content.asText(), chat.content.?);
+            saw_interrupted = saw_interrupted or
+                std.mem.find(u8, content.asText(), "<turn_aborted>") != null;
+            saw_file_evidence = saw_file_evidence or
+                std.mem.find(u8, content.asText(), "src/retained.zig") != null;
+        }
+        try std.testing.expectEqual(projected.images.len, chat.images.len);
+        for (projected.images, chat.images) |projected_image, chat_image| {
+            try std.testing.expectEqual(projected_image.id, chat_image.id);
+            try std.testing.expectEqualStrings(projected_image.path, chat_image.path);
+            try std.testing.expectEqualStrings(
+                projected_image.media_type,
+                chat_image.media_type,
+            );
+            saw_background_image = saw_background_image or
+                std.mem.eql(u8, projected_image.path, "/tmp/background.png");
+            saw_interrupted_image = saw_interrupted_image or
+                std.mem.eql(u8, projected_image.path, "/tmp/interrupted.jpg");
+            saw_latest_image = saw_latest_image or
+                std.mem.eql(u8, projected_image.path, "/tmp/latest.webp");
+        }
+        try std.testing.expectEqual(projected.tool_calls.len, chat.tool_calls.len);
+        for (projected.tool_calls, chat.tool_calls) |projected_call, chat_call| {
+            try std.testing.expectEqualStrings(projected_call.id, chat_call.id);
+            try std.testing.expectEqualStrings(projected_call.name, chat_call.name);
+            try std.testing.expectEqualStrings(
+                projected_call.arguments_json,
+                chat_call.arguments_json,
+            );
+        }
+        try std.testing.expectEqual(projected.tool_result_status, chat.tool_result_status);
+        saw_failure_status = saw_failure_status or
+            projected.tool_result_status == .failure;
+    }
+
+    const trimmed_context = messages.items[0].content.?.asText();
+    try std.testing.expect(std.mem.find(
+        u8,
+        trimmed_context,
+        "prior compacted decision needle",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trimmed_context,
+        "result-call_trimmed.txt",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trimmed_context,
+        "src/trimmed.zig",
+    ) != null);
+    try std.testing.expect(saw_interrupted);
+    try std.testing.expect(saw_failure_status);
+    try std.testing.expect(saw_file_evidence);
+    try std.testing.expect(saw_background_image);
+    try std.testing.expect(saw_interrupted_image);
+    try std.testing.expect(saw_latest_image);
+    try std.testing.expectEqualStrings(
+        "latest request",
+        messages.items[messages.items.len - 2].content.?.asText(),
+    );
+    try std.testing.expectEqualStrings(
+        "latest answer",
+        messages.items[messages.items.len - 1].content.?.asText(),
+    );
+}
+
+test "context compaction summary preserves large result handle without dropping canonical execution memory" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 2 };
+    defer runtime.deinit(alloc);
+
+    var calls = [_]ToolCall{.{
+        .id = "call_large",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"large\"}",
+    }};
+    var results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_large"),
+        .tool_name = @constCast("run_command"),
+        .status = .success,
+        .output = @constCast("<tool_result_preview handle=\"result-call_large-abc.txt\">important preview</tool_result_preview>"),
+        .output_bytes = 70_000,
+        .stored_output_bytes = 70_000,
+        .truncated = true,
+        .provider_native = false,
+        .created_at_ms = 1,
+        .output_handle = @constCast("result-call_large-abc.txt"),
+        .preview = @constCast("important preview"),
+    }};
+    var steps = [_]ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    const old_turn: HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("old") },
+        .assistant = @constCast("old answer"),
+        .execution = .{ .tool_steps = steps[0..] },
+    } };
+    try runtime.appendHistoryEntry(alloc, old_turn);
+    try runtime.appendAssistantHistoryTurn(alloc, "middle", "middle answer");
+    try runtime.appendAssistantHistoryTurn(alloc, "latest", "latest answer");
+
+    try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
+    try std.testing.expectEqualStrings(
+        "call_large",
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_calls[0].id,
+    );
+    try std.testing.expectEqualStrings(
+        "result-call_large-abc.txt",
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_results[0].output_handle.?,
+    );
+
+    const context = try runtime.snapshotContextHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, context);
+    try std.testing.expectEqual(@as(usize, 2), context.len);
+    try std.testing.expectEqual(HistoryTurn.compacted_summary, std.meta.activeTag(context[0]));
+    try std.testing.expect(std.mem.find(u8, context[0].compacted_summary.summary, "result-call_large-abc.txt") != null);
+    try std.testing.expect(std.mem.find(u8, context[0].compacted_summary.summary, "important preview") != null);
+}
+
+test "interrupted history projects marker and aborted tool result" {
+    const alloc = std.testing.allocator;
+    const replay_sentinel = "PRESENTATION_REPLAY_SENTINEL.bin";
+    const artifact_sentinel = "PRESENTATION_ARTIFACT_SENTINEL.log";
+    const history = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("run a command") },
+        .tool_call = .{
+            .id = "call-command",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"slow\"}",
+        },
+        .cancelled_command = .{
+            .output_replay = .{ .available = .{
+                .handle = replay_sentinel,
+                .framed_bytes = 42,
+            } },
+            .command_artifact_handle = artifact_sentinel,
+        },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("run a command", messages.items[0].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[1].role);
+    try std.testing.expect(messages.items[1].content == null);
+    try std.testing.expectEqual(@as(usize, 1), messages.items[1].tool_calls.len);
+    try std.testing.expectEqualStrings("call-command", messages.items[1].tool_calls[0].id);
+    try std.testing.expectEqualStrings("run_command", messages.items[1].tool_calls[0].name);
+    try std.testing.expectEqual(.tool, messages.items[2].role);
+    try std.testing.expect(
+        std.mem.find(u8, messages.items[2].content.?.asText(), aborted_tool_output) != null,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, messages.items[2].content.?.asText(), replay_sentinel),
+    );
+    try std.testing.expectEqualStrings("call-command", messages.items[2].tool_call_id.?);
+    try std.testing.expectEqual(.user, messages.items[3].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "<turn_aborted>") != null);
+    try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "Do not continue") != null);
+    for (messages.items) |entry| {
+        if (entry.content) |content| {
+            try std.testing.expect(std.mem.find(u8, content.asText(), artifact_sentinel) == null);
+        }
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &chat_messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 4), chat_messages.items.len);
+    try std.testing.expectEqual(core_types.ChatRole.assistant, chat_messages.items[1].role);
+    try std.testing.expect(chat_messages.items[1].content == null);
+    try std.testing.expectEqualStrings("run_command", chat_messages.items[1].tool_calls[0].name);
+    try std.testing.expectEqual(core_types.ChatRole.tool, chat_messages.items[2].role);
+    try std.testing.expect(
+        std.mem.find(u8, chat_messages.items[2].content.?, aborted_tool_output) != null,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, chat_messages.items[2].content.?, replay_sentinel),
+    );
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[3].role);
+    try std.testing.expect(std.mem.find(u8, chat_messages.items[3].content.?, "<turn_aborted>") != null);
+    for (chat_messages.items) |entry| {
+        if (entry.content) |content| {
+            try std.testing.expect(std.mem.find(u8, content, artifact_sentinel) == null);
+        }
+    }
+}
+
+test "no-output interrupted history projects synthetic assistant before marker" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("create test.md with 200 lines") },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("create test.md with 200 lines", messages.items[0].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings(interrupted_before_completion_output, messages.items[1].content.?.asText());
+    try std.testing.expectEqual(.user, messages.items[2].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?.asText(), "<turn_aborted>") != null);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?.asText(), "user interrupted") == null);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?.asText(), "Do not continue this request unless") != null);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &chat_messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 3), chat_messages.items.len);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[0].role);
+    try std.testing.expectEqualStrings("create test.md with 200 lines", chat_messages.items[0].content.?);
+    try std.testing.expectEqual(core_types.ChatRole.assistant, chat_messages.items[1].role);
+    try std.testing.expectEqualStrings(interrupted_before_completion_output, chat_messages.items[1].content.?);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[2].role);
+    try std.testing.expect(std.mem.find(u8, chat_messages.items[2].content.?, "<turn_aborted>") != null);
+    try std.testing.expect(std.mem.find(u8, chat_messages.items[2].content.?, "user interrupted") == null);
+}
+
+test "steering continuation omits only the trailing interrupted closure" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("older interrupted request") },
+            .assistant = @constCast("older partial"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("active request") },
+            .assistant = @constCast("active partial"),
+        } },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(arena);
+
+    try appendSteeringContinuationHistoryChatMessagesBudgeted(
+        arena,
+        &messages,
+        &history,
+        .{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "<turn_aborted>") != null);
+    try std.testing.expectEqual(core_types.ChatRole.user, messages.items[3].role);
+    try std.testing.expectEqualStrings("active request", messages.items[3].content.?);
+    try std.testing.expectEqual(core_types.ChatRole.assistant, messages.items[4].role);
+    try std.testing.expectEqualStrings("active partial", messages.items[4].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[4].content.?, interrupted_before_completion_output) == null);
+}
+
+test "partial-text interrupted history projects partial assistant with closure before marker" {
+    const alloc = std.testing.allocator;
+    const expected_assistant =
+        "Once there was a partial answer.\n\n" ++
+        interrupted_before_completion_output;
+    const history = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("tell me a story") },
+        .assistant = @constCast("Once there was a partial answer."),
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("tell me a story", messages.items[0].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings(expected_assistant, messages.items[1].content.?.asText());
+    try std.testing.expectEqual(.user, messages.items[2].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?.asText(), "<turn_aborted>") != null);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &chat_messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 3), chat_messages.items.len);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[0].role);
+    try std.testing.expectEqualStrings("tell me a story", chat_messages.items[0].content.?);
+    try std.testing.expectEqual(core_types.ChatRole.assistant, chat_messages.items[1].role);
+    try std.testing.expectEqualStrings(expected_assistant, chat_messages.items[1].content.?);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[2].role);
+    try std.testing.expect(std.mem.find(u8, chat_messages.items[2].content.?, "<turn_aborted>") != null);
+}
+
+test "completed-tool interrupted history projects summary before marker" {
+    const alloc = std.testing.allocator;
+    var completed_tool_names = [_][]u8{ @constCast("glob_files"), @constCast("glob_files") };
+    const history = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("use all ur tools 1 by 1 - I need u to test them") },
+        .completed_tool_names = completed_tool_names[0..],
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("use all ur tools 1 by 1 - I need u to test them", messages.items[0].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: glob_files, glob_files.", messages.items[1].content.?.asText());
+    try std.testing.expectEqual(.user, messages.items[2].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?.asText(), "<turn_aborted>") != null);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &chat_messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 3), chat_messages.items.len);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[0].role);
+    try std.testing.expectEqualStrings("use all ur tools 1 by 1 - I need u to test them", chat_messages.items[0].content.?);
+    try std.testing.expectEqual(core_types.ChatRole.assistant, chat_messages.items[1].role);
+    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: glob_files, glob_files.", chat_messages.items[1].content.?);
+    try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[2].role);
+    try std.testing.expect(std.mem.find(u8, chat_messages.items[2].content.?, "<turn_aborted>") != null);
+}
+
+test "two interrupted text turns project in order with partial assistant text" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("tell me a story in 200 words") },
+            .assistant = @constCast("Once there was a quiet signal in the woods."),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("go on") },
+            .assistant = @constCast("The signal crossed the valley and found a door."),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("go on") },
+            .assistant = @constCast("The door opened, and the story ended in daylight."),
+        } },
+    };
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 8), messages.items.len);
+    try std.testing.expectEqual(.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("tell me a story in 200 words", messages.items[0].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings(
+        "Once there was a quiet signal in the woods.\n\n" ++ interrupted_before_completion_output,
+        messages.items[1].content.?.asText(),
+    );
+    try std.testing.expectEqual(.user, messages.items[2].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?.asText(), "<turn_aborted>") != null);
+    try std.testing.expectEqual(.user, messages.items[3].role);
+    try std.testing.expectEqualStrings("go on", messages.items[3].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[4].role);
+    try std.testing.expectEqualStrings(
+        "The signal crossed the valley and found a door.\n\n" ++ interrupted_before_completion_output,
+        messages.items[4].content.?.asText(),
+    );
+    try std.testing.expectEqual(.user, messages.items[5].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[5].content.?.asText(), "<turn_aborted>") != null);
+    try std.testing.expectEqual(.user, messages.items[6].role);
+    try std.testing.expectEqualStrings("go on", messages.items[6].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[7].role);
+    try std.testing.expectEqualStrings("The door opened, and the story ended in daylight.", messages.items[7].content.?.asText());
+
+    var joined = std.ArrayList(u8).empty;
+    defer joined.deinit(alloc);
+    for (messages.items) |msg| {
+        if (msg.content) |content| try joined.appendSlice(alloc, content.asText());
+    }
+    try std.testing.expect(std.mem.find(u8, joined.items, "storygo ongo on") == null);
+    try std.testing.expect(std.mem.find(u8, joined.items, "tell me a story in 200 wordsgo on") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, joined.items, interrupted_before_completion_output));
+}
+
+test "SessionRuntime.restore replaces history, updates language, and preserves exact deep copies" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 2 };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "old", "old reply");
+
+    var restore_history = [_]HistoryTurn{
+        try makeAssistantTurn(alloc, "one", "reply one"),
+        try makeAssistantTurn(alloc, "two", "reply two"),
+        try makeAssistantTurn(alloc, "three", "reply three"),
+    };
+    defer {
+        for (&restore_history) |turn| freeHistoryTurn(alloc, turn);
+    }
+
+    try runtime.restore(alloc, ConversationLanguage.literal("es"), &restore_history);
+
+    try std.testing.expectEqual(ConversationLanguage.literal("es"), runtime.languageSnapshot());
+    try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
+    try std.testing.expectEqualStrings("one", runtime.agent.history.items[0].assistant.user.text);
+    try std.testing.expectEqualStrings("reply one", runtime.agent.history.items[0].assistant.assistant);
+    try std.testing.expectEqualStrings("three", runtime.agent.history.items[2].assistant.user.text);
+    try std.testing.expectEqualStrings("reply three", runtime.agent.history.items[2].assistant.assistant);
+    try std.testing.expect(runtime.agent.history.items[0].assistant.user.text.ptr != restore_history[0].assistant.user.text.ptr);
+    try std.testing.expect(runtime.agent.history.items[2].assistant.assistant.ptr != restore_history[2].assistant.assistant.ptr);
+}
+
+test "SessionRuntime.restore may retain earlier restored turns after later append failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    const alloc = failing.allocator();
+    var runtime: SessionRuntime = .{ .max_history_turns = 0 };
+    defer runtime.deinit(alloc);
+
+    const restore_history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("first") },
+            .assistant = @constCast("one"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("second") },
+            .assistant = @constCast("two"),
+        } },
+    };
+
+    try std.testing.expectError(error.OutOfMemory, runtime.restore(alloc, ConversationLanguage.literal("fr"), &restore_history));
+    try std.testing.expectEqual(ConversationLanguage.literal("fr"), runtime.languageSnapshot());
+    try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
+    try std.testing.expectEqualStrings("first", runtime.agent.history.items[0].assistant.user.text);
+}
+
+test "SessionRuntime.reset clears history and restores default language" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "hola", "que tal");
+    runtime.setConversationLanguageFromUserMessage("ランディングページを開いて");
+    try std.testing.expectEqual(ConversationLanguage.literal("ja"), runtime.languageSnapshot());
+
+    runtime.reset(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.historyLen());
+    try std.testing.expectEqual(ConversationLanguage.default(), runtime.languageSnapshot());
+}
+
+test "SessionRuntime deduplicates context notices until facts change or the session resets" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+
+    try std.testing.expect(try runtime.claimContextNotice(alloc, "observed=20 effective=10"));
+    try std.testing.expect(!try runtime.claimContextNotice(alloc, "observed=20 effective=10"));
+    try std.testing.expect(try runtime.claimContextNotice(alloc, "observed=21 effective=10"));
+    try std.testing.expect(try runtime.claimContextNotice(alloc, "observed=21 effective=11"));
+    runtime.clearContextNotices();
+    try std.testing.expect(try runtime.claimContextNotice(alloc, "observed=20 effective=10"));
+}
+
+test "SessionRuntime.clearHistory empties owned turns and keeps runtime reusable" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "first", "one");
+    try runtime.appendAssistantHistoryTurn(alloc, "second", "two");
+
+    runtime.clearHistory(alloc);
+    try std.testing.expectEqual(@as(usize, 0), runtime.historyLen());
+
+    try runtime.appendAssistantHistoryTurn(alloc, "third", "three");
+    try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
+    try std.testing.expectEqualStrings("three", runtime.lastAssistantReply().?);
+}
+
+test "SessionRuntime appends every canonical history turn without compaction" {
+    const alloc = std.testing.allocator;
+    var runtime = SessionRuntime{ .max_history_turns = 2 };
+    defer runtime.deinit(alloc);
+
+    const first = try makeAssistantTurn(alloc, "one", "first");
+    defer freeHistoryTurn(alloc, first);
+    try runtime.appendHistoryEntry(alloc, first);
+
+    const second = try makeAssistantTurn(alloc, "two", "second");
+    defer freeHistoryTurn(alloc, second);
+    try runtime.appendHistoryEntry(alloc, second);
+
+    const third = try makeAssistantTurn(alloc, "three", "third");
+    defer freeHistoryTurn(alloc, third);
+    try runtime.appendHistoryEntry(alloc, third);
+    try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
+}
+
+test "compactLineText preserves complete UTF-8 codepoints at the byte cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const split = try compactLineText(arena, "ab★z", 3);
+    try std.testing.expectEqualStrings("ab", split);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(split));
+
+    const exact = try compactLineText(arena, "ab★z", 5);
+    try std.testing.expectEqualStrings("ab★", exact);
+
+    const collapsed = try compactLineText(arena, "  alpha\n\tbeta  ", 10);
+    try std.testing.expectEqualStrings("alpha beta", collapsed);
+}
+
+test "compacted Unicode history serializes system content as a string" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 2 };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendAssistantHistoryTurn(alloc, ("a" ** 155) ++ "★", "first reply");
+    try runtime.appendAssistantHistoryTurn(alloc, "second user", "second reply");
+    try runtime.appendAssistantHistoryTurn(alloc, "preserved user", "preserved reply");
+
+    const context = try runtime.snapshotContextHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, context);
+    try std.testing.expectEqual(@as(usize, 2), context.len);
+    try std.testing.expect(context[0] == .compacted_summary);
+    try std.testing.expectEqualStrings("preserved user", context[1].assistant.user.text);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &messages, context);
+    try messages.append(arena, .{ .role = .user, .content = "current user" });
+
+    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
+    try std.testing.expect(messages.items[0].content != null);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(context[0].compacted_summary.summary));
+    try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
+}
+
+test "SessionRuntime preserves canonical turns and derives a bounded request window" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 4 };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "one", "reply one");
+    try runtime.appendAssistantHistoryTurn(alloc, "two", "reply two");
+    try runtime.appendAssistantHistoryTurn(alloc, "three", "reply three");
+    try runtime.appendAssistantHistoryTurn(alloc, "four", "reply four");
+    try runtime.appendAssistantHistoryTurn(alloc, "five", "reply five");
+
+    try std.testing.expectEqual(@as(usize, 5), runtime.historyLen());
+    try std.testing.expectEqualStrings("one", runtime.agent.history.items[0].assistant.user.text);
+    try std.testing.expectEqualStrings("five", runtime.agent.history.items[4].assistant.user.text);
+    try std.testing.expectEqualStrings("reply five", runtime.lastAssistantReply().?);
+
+    const context = try runtime.snapshotContextHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, context);
+    try std.testing.expectEqual(@as(usize, 4), context.len);
+    try std.testing.expect(context[0] == .compacted_summary);
+    try std.testing.expectEqual(@as(usize, 2), context[0].compacted_summary.removed_turn_count);
+    try std.testing.expectEqualStrings("three", context[1].assistant.user.text);
+    try std.testing.expectEqualStrings("five", context[3].assistant.user.text);
+}
+
+test "accepted semantic checkpoint is append-only and becomes the canonical model window" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "first exact prompt", "first exact reply");
+    try runtime.appendAssistantHistoryTurn(alloc, "second exact prompt", "second exact reply");
+    try runtime.appendHistoryEntry(alloc, .{ .compacted_summary = .{
+        .summary = @constCast("<context_handoff>\n# Objective\nContinue exact work.\n</context_handoff>"),
+        .removed_turn_count = 2,
+        .compaction_count = 1,
+    } });
+
+    try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
+    try std.testing.expectEqual(@as(usize, 2), runtime.contextHistoryStart());
+    try std.testing.expectEqualStrings("first exact prompt", runtime.agent.history.items[0].assistant.user.text);
+
+    const compacted = try runtime.snapshotHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, compacted);
+    try std.testing.expectEqual(@as(usize, 3), compacted.len);
+    var projected_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer projected_messages.deinit(alloc);
+    try appendActiveContextHistoryChatMessages(
+        alloc,
+        &projected_messages,
+        compacted,
+        runtime.contextHistoryStart(),
+    );
+    defer alloc.free(@constCast(projected_messages.items[0].content.?));
+    try std.testing.expectEqual(core_types.ChatRole.user, projected_messages.items[0].role);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "post-checkpoint prompt", "post-checkpoint reply");
+    const continued = try runtime.snapshotHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, continued);
+    try std.testing.expectEqual(@as(usize, 4), continued.len);
+    try std.testing.expect(continued[2] == .compacted_summary);
+    try std.testing.expectEqualStrings("post-checkpoint prompt", continued[3].assistant.user.text);
+}
+
+test "restored history keeps an in-memory unversioned prefix boundary" {
+    const alloc = std.testing.allocator;
+    const restored_history = [_]HistoryTurn{
+        try makeAssistantTurn(alloc, "legacy one", "legacy reply one"),
+        try makeAssistantTurn(alloc, "legacy two", "legacy reply two"),
+    };
+    defer for (restored_history) |turn| freeHistoryTurn(alloc, turn);
+
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    try runtime.restoreWithContextHistoryStart(
+        alloc,
+        ConversationLanguage.literal("en"),
+        &restored_history,
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
+    try std.testing.expectEqual(@as(usize, 1), runtime.contextHistoryStart());
+
+    try runtime.appendAssistantHistoryTurn(alloc, "fresh", "fresh reply");
+    try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
+    try std.testing.expectEqual(@as(usize, 1), runtime.contextHistoryStart());
+    runtime.reset(alloc);
+    try std.testing.expectEqual(@as(usize, 0), runtime.unversionedHistoryEnd());
+    try std.testing.expectEqual(@as(usize, 0), runtime.contextHistoryStart());
+}
+
+test "current checkpoint clears restored unversioned history provenance" {
+    const alloc = std.testing.allocator;
+    const restored_history = [_]HistoryTurn{
+        try makeAssistantTurn(alloc, "legacy prompt", "legacy reply"),
+        .{ .compacted_summary = .{
+            .summary = try alloc.dupe(
+                u8,
+                "<context_handoff>\ncurrent checkpoint\n</context_handoff>",
+            ),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+    };
+    defer for (restored_history) |turn| freeHistoryTurn(alloc, turn);
+
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    try runtime.restoreWithContextHistoryStart(
+        alloc,
+        ConversationLanguage.literal("en"),
+        &restored_history,
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 0), runtime.unversionedHistoryEnd());
+
+    try runtime.appendAssistantHistoryTurn(alloc, "fresh", "fresh reply");
+    try std.testing.expectEqual(@as(usize, 0), runtime.unversionedHistoryEnd());
+}
+
+test "legacy checkpoint keeps restored provenance conservative" {
+    const alloc = std.testing.allocator;
+    const restored_history = [_]HistoryTurn{
+        try makeAssistantTurn(alloc, "legacy prompt", "legacy reply"),
+        .{ .compacted_summary = .{
+            .summary = try alloc.dupe(u8, "legacy free-form summary"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+    };
+    defer for (restored_history) |turn| freeHistoryTurn(alloc, turn);
+
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    try runtime.restoreWithContextHistoryStart(
+        alloc,
+        ConversationLanguage.literal("en"),
+        &restored_history,
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
+}
+
+test "compacted failed turn does not claim user interruption" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("stream a response") },
+        .assistant = @constCast("partial response"),
+        .terminal_reason = .failed,
+    } }};
+
+    const summary = try buildCompactedSummaryText(alloc, null, &history);
+    defer alloc.free(summary);
+
+    try std.testing.expect(std.mem.find(u8, summary, "failed") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "user interrupted") == null);
+}
+
+test "compacted cancelled turn omits verbose interruption transcript" {
+    const alloc = std.testing.allocator;
+    var completed_tool_names = [_][]u8{@constCast("read_file")};
+    const history = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("inspect the project") },
+        .completed_tool_names = completed_tool_names[0..],
+    } }};
+
+    const summary = try buildCompactedSummaryText(alloc, null, &history);
+    defer alloc.free(summary);
+
+    try std.testing.expect(std.mem.find(u8, summary, "cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "Interrupted by user after completing") == null);
+    try std.testing.expect(std.mem.find(u8, summary, "<turn_aborted>") == null);
+}
+
+test "SessionRuntime context snapshot allocation failure preserves canonical state" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "first prompt", "first reply");
+    try runtime.appendAssistantHistoryTurn(alloc, "second prompt", "second reply");
+    runtime.context_history_start = 1;
+
+    const context_history_start = runtime.contextHistoryStart();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runtime.snapshotContextHistory(failing.allocator()),
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.historyLen());
+    try std.testing.expectEqual(context_history_start, runtime.contextHistoryStart());
+    try std.testing.expectEqualStrings(
+        "first prompt",
+        runtime.agent.history.items[0].assistant.user.text,
+    );
+    try std.testing.expectEqualStrings(
+        "second prompt",
+        runtime.agent.history.items[1].assistant.user.text,
+    );
 }
 
 fn expectCanonicalHistoryFixtureUnchanged(
@@ -2675,85 +5481,76 @@ fn expectCanonicalHistoryFixtureUnchanged(
     );
     try std.testing.expectEqualStrings(
         "canonical background",
-        canonical[1].background_command.user.text,
+        canonical[1].assistant.user.text,
     );
     try std.testing.expectEqualStrings(
         "background assistant",
-        canonical[1].background_command.assistant.?,
+        canonical[1].assistant.assistant,
     );
-    try std.testing.expectEqual(@as(usize, 1), canonical[1].background_command.execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), canonical[1].assistant.execution.tool_steps.len);
     try std.testing.expectEqualStrings(
         "checking preserved evidence",
-        canonical[1].background_command.execution.tool_steps[0].assistant.?,
+        canonical[1].assistant.execution.tool_steps[0].assistant.?,
     );
-    try std.testing.expectEqual(@as(usize, 1), canonical[1].background_command.execution.tool_steps[0].tool_calls.len);
+    try std.testing.expectEqual(@as(usize, 1), canonical[1].assistant.execution.tool_steps[0].tool_calls.len);
     try std.testing.expectEqualStrings(
         "call_preserved",
-        canonical[1].background_command.execution.tool_steps[0].tool_calls[0].id,
+        canonical[1].assistant.execution.tool_steps[0].tool_calls[0].id,
     );
     try std.testing.expectEqualStrings(
         "read_file",
-        canonical[1].background_command.execution.tool_steps[0].tool_calls[0].name,
+        canonical[1].assistant.execution.tool_steps[0].tool_calls[0].name,
     );
     try std.testing.expectEqualStrings(
         "{\"path\":\"fixture.txt\"}",
-        canonical[1].background_command.execution.tool_steps[0].tool_calls[0].arguments_json,
+        canonical[1].assistant.execution.tool_steps[0].tool_calls[0].arguments_json,
     );
-    try std.testing.expectEqual(@as(usize, 1), canonical[1].background_command.execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqual(@as(usize, 1), canonical[1].assistant.execution.tool_steps[0].tool_results.len);
     try std.testing.expectEqual(
         PersistedToolStatus.failure,
-        canonical[1].background_command.execution.tool_steps[0].tool_results[0].status,
+        canonical[1].assistant.execution.tool_steps[0].tool_results[0].status,
     );
     try std.testing.expectEqualStrings(
         "preserved failure",
-        canonical[1].background_command.execution.tool_steps[0].tool_results[0].output,
+        canonical[1].assistant.execution.tool_steps[0].tool_results[0].output,
     );
     try std.testing.expectEqualStrings(
         "result-call_preserved.txt",
-        canonical[1].background_command.execution.tool_steps[0].tool_results[0].output_handle.?,
+        canonical[1].assistant.execution.tool_steps[0].tool_results[0].output_handle.?,
     );
     try std.testing.expectEqualStrings(
         "preserved preview",
-        canonical[1].background_command.execution.tool_steps[0].tool_results[0].preview.?,
+        canonical[1].assistant.execution.tool_steps[0].tool_results[0].preview.?,
     );
-    try std.testing.expectEqual(@as(usize, 17), canonical[1].background_command.execution.tool_steps[0].tool_results[0].output_bytes);
-    try std.testing.expectEqual(@as(usize, 17), canonical[1].background_command.execution.tool_steps[0].tool_results[0].stored_output_bytes);
-    try std.testing.expectEqual(@as(usize, 1), canonical[1].background_command.execution.files.len);
+    try std.testing.expectEqual(@as(usize, 17), canonical[1].assistant.execution.tool_steps[0].tool_results[0].output_bytes);
+    try std.testing.expectEqual(@as(usize, 17), canonical[1].assistant.execution.tool_steps[0].tool_results[0].stored_output_bytes);
+    try std.testing.expectEqual(@as(usize, 1), canonical[1].assistant.execution.files.len);
     try std.testing.expectEqualStrings(
         "src/preserved.zig",
-        canonical[1].background_command.execution.files[0].path,
+        canonical[1].assistant.execution.files[0].path,
     );
     try std.testing.expectEqualStrings(
         "src/preserved-renamed.zig",
-        canonical[1].background_command.execution.files[0].new_path.?,
+        canonical[1].assistant.execution.files[0].new_path.?,
     );
     try std.testing.expectEqualStrings(
         "call_preserved",
-        canonical[1].background_command.execution.files[0].tool_call_id,
+        canonical[1].assistant.execution.files[0].tool_call_id,
     );
     try std.testing.expectEqualStrings(
         "read_file",
-        canonical[1].background_command.execution.files[0].tool_name,
+        canonical[1].assistant.execution.files[0].tool_name,
     );
     try std.testing.expectEqual(
         FileEvidenceAction.rename,
-        canonical[1].background_command.execution.files[0].action,
+        canonical[1].assistant.execution.files[0].action,
     );
     try std.testing.expectEqual(
         PersistedToolStatus.failure,
-        canonical[1].background_command.execution.files[0].status,
+        canonical[1].assistant.execution.files[0].status,
     );
-    try std.testing.expect(canonical[1].background_command.execution.files[0].model_view_covers_full_file);
-    try std.testing.expect(canonical[1].background_command.execution.files[0].stale);
-    try std.testing.expectEqualStrings(
-        "/tmp/preserved.log",
-        canonical[1].background_command.log_path,
-    );
-    try std.testing.expect(canonical[1].background_command.expect_url);
-    try std.testing.expectEqualStrings(
-        "http://localhost:3000",
-        canonical[1].background_command.url.?,
-    );
+    try std.testing.expect(canonical[1].assistant.execution.files[0].model_view_covers_full_file);
+    try std.testing.expect(canonical[1].assistant.execution.files[0].stale);
     try std.testing.expectEqualStrings(
         "canonical interrupted",
         canonical[2].interrupted.user.text,
@@ -2826,16 +5623,13 @@ fn checkPromptHistorySnapshotAllocationFailures(alloc: Allocator) !void {
             },
             .assistant = @constCast("prefix assistant"),
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("canonical background") },
             .assistant = @constCast("background assistant"),
             .execution = .{
                 .tool_steps = steps[0..],
                 .files = files[0..],
             },
-            .log_path = @constCast("/tmp/preserved.log"),
-            .expect_url = true,
-            .url = @constCast("http://localhost:3000"),
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("canonical interrupted") },
@@ -2872,6 +5666,275 @@ fn checkPromptHistorySnapshotAllocationFailures(alloc: Allocator) !void {
     );
 }
 
+test "prompt history snapshot failure preserves canonical ownership" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkPromptHistorySnapshotAllocationFailures,
+        .{},
+    );
+}
+
+fn checkPromptHistoryMessageProjectionAllocationFailures(
+    alloc: Allocator,
+    prompt_history: []const HistoryTurn,
+) !void {
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+
+    appendHistoryMessagesBudgeted(
+        alloc,
+        &messages,
+        prompt_history,
+        .{ .max_tokens = 1 },
+    ) catch |err| {
+        try std.testing.expectEqualStrings(
+            "old user",
+            prompt_history[0].assistant.user.text,
+        );
+        try std.testing.expectEqualStrings(
+            "latest user",
+            prompt_history[1].assistant.user.text,
+        );
+        try std.testing.expectEqual(
+            PersistedToolStatus.failure,
+            prompt_history[1].assistant.execution.tool_steps[0].tool_results[0].status,
+        );
+        return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            else => err,
+        };
+    };
+
+    try std.testing.expect(messages.items.len >= 6);
+    try std.testing.expectEqualStrings(
+        "latest user",
+        messages.items[messages.items.len - 5].content.?.asText(),
+    );
+    try std.testing.expectEqual(
+        PersistedToolStatus.failure,
+        messages.items[messages.items.len - 3].tool_result_status.?,
+    );
+    try std.testing.expect(std.mem.find(
+        u8,
+        messages.items[messages.items.len - 2].content.?.asText(),
+        "src/latest.zig",
+    ) != null);
+}
+
+test "prompt history cleanup is independent after snapshot creation" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{.{
+        .id = "call_latest",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"src/latest.zig\"}",
+    }};
+    var results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_latest"),
+        .tool_name = @constCast("read_file"),
+        .status = .failure,
+        .output = @constCast("latest failure"),
+        .output_bytes = 14,
+        .stored_output_bytes = 14,
+    }};
+    var files = [_]FileEvidence{.{
+        .path = @constCast("src/latest.zig"),
+        .tool_call_id = @constCast("call_latest"),
+        .tool_name = @constCast("read_file"),
+        .action = .read,
+        .status = .failure,
+    }};
+    var steps = [_]ToolExecutionStep{.{
+        .assistant = @constCast("checking latest"),
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    const canonical = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("old user") },
+            .assistant = @constCast("old assistant"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("latest user") },
+            .assistant = @constCast("latest assistant"),
+            .execution = .{
+                .tool_steps = steps[0..],
+                .files = files[0..],
+            },
+        } },
+    };
+
+    const prompt_history = try snapshotOwnedContextHistory(
+        alloc,
+        &canonical,
+        0,
+        8,
+    );
+    defer freeHistoryTurnSlice(alloc, prompt_history);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        checkPromptHistoryMessageProjectionAllocationFailures,
+        .{prompt_history},
+    );
+
+    try std.testing.expectEqualStrings(
+        "old user",
+        canonical[0].assistant.user.text,
+    );
+    try std.testing.expectEqualStrings(
+        "latest user",
+        canonical[1].assistant.user.text,
+    );
+}
+
+test "owned prompt history selection matches SessionRuntime context snapshot" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 2 };
+    defer runtime.deinit(alloc);
+    try runtime.appendAssistantHistoryTurn(alloc, "one", "reply one");
+    try runtime.appendAssistantHistoryTurn(alloc, "two", "reply two");
+    try runtime.appendAssistantHistoryTurn(alloc, "three", "reply three");
+    runtime.context_history_start = 1;
+
+    const direct = try snapshotOwnedContextHistory(
+        alloc,
+        runtime.agent.history.items,
+        runtime.context_history_start,
+        runtime.max_history_turns,
+    );
+    defer freeHistoryTurnSlice(alloc, direct);
+    const through_runtime = try runtime.snapshotContextHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, through_runtime);
+
+    try std.testing.expectEqual(through_runtime.len, direct.len);
+    for (through_runtime, direct) |runtime_turn, direct_turn| {
+        try std.testing.expectEqual(
+            std.meta.activeTag(runtime_turn),
+            std.meta.activeTag(direct_turn),
+        );
+    }
+    try std.testing.expectEqualStrings(
+        through_runtime[0].compacted_summary.summary,
+        direct[0].compacted_summary.summary,
+    );
+    try std.testing.expectEqualStrings(
+        through_runtime[1].assistant.user.text,
+        direct[1].assistant.user.text,
+    );
+}
+
+test "SessionRuntime context projection preserves nine typed canonical turns" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+
+    var calls = [_]ToolCall{.{
+        .id = "call_first",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"fixture.txt\"}",
+    }};
+    var results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("call_first"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("first result sentinel"),
+        .output_bytes = 21,
+        .stored_output_bytes = 21,
+    }};
+    var steps = [_]ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+    try runtime.appendHistoryEntry(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("first prompt") },
+        .assistant = @constCast("first reply"),
+        .execution = .{ .tool_steps = steps[0..] },
+    } });
+    for (1..9) |index| {
+        const user = try std.fmt.allocPrint(alloc, "prompt {d}", .{index});
+        defer alloc.free(user);
+        const assistant = try std.fmt.allocPrint(alloc, "reply {d}", .{index});
+        defer alloc.free(assistant);
+        try runtime.appendAssistantHistoryTurn(alloc, user, assistant);
+    }
+
+    try std.testing.expectEqual(@as(usize, 9), runtime.historyLen());
+    try std.testing.expectEqualStrings(
+        "call_first",
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_calls[0].id,
+    );
+    try std.testing.expectEqualStrings(
+        "first result sentinel",
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_results[0].output,
+    );
+
+    const context = try runtime.snapshotContextHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, context);
+    try std.testing.expectEqual(@as(usize, 5), context.len);
+    try std.testing.expect(context[0] == .compacted_summary);
+    try std.testing.expectEqual(@as(usize, 5), context[0].compacted_summary.removed_turn_count);
+    try std.testing.expectEqualStrings("prompt 5", context[1].assistant.user.text);
+    try std.testing.expectEqualStrings("prompt 8", context[4].assistant.user.text);
+
+    try std.testing.expectEqual(@as(usize, 9), runtime.historyLen());
+    try std.testing.expectEqualStrings(
+        "call_first",
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_calls[0].id,
+    );
+}
+
+test "SessionRuntime.snapshotHistory returns deep copy that outlives runtime history" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+
+    try runtime.appendAssistantHistoryTurn(alloc, "hello", "world");
+    try runtime.appendAssistantHistoryTurn(alloc, "run", "historical command");
+
+    const snapshot = try runtime.snapshotHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, snapshot);
+
+    try std.testing.expect(snapshot[0].assistant.user.text.ptr != runtime.agent.history.items[0].assistant.user.text.ptr);
+    try std.testing.expect(snapshot[1].assistant.assistant.ptr != runtime.agent.history.items[1].assistant.assistant.ptr);
+
+    runtime.clearHistory(alloc);
+
+    try std.testing.expectEqualStrings("hello", snapshot[0].assistant.user.text);
+    try std.testing.expectEqualStrings("historical command", snapshot[1].assistant.assistant);
+}
+
+test "work provenance survives owned runtime snapshots without entering model context" {
+    const alloc = std.testing.allocator;
+    var source = try makeAssistantTurn(alloc, "delegated prompt", "delegated reply");
+    defer freeHistoryTurn(alloc, source);
+    try copyWorkIdToTurn(alloc, &source, "work-λ");
+
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    try runtime.restore(alloc, ConversationLanguage.literal("en"), &.{source});
+    try runtime.appendAssistantHistoryTurn(alloc, "direct human prompt", "direct reply");
+
+    const snapshot = try runtime.snapshotHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, snapshot);
+    try std.testing.expectEqualStrings("work-λ", snapshot[0].assistant.user.work_id.?);
+    try std.testing.expect(snapshot[0].assistant.user.work_id.?.ptr != source.assistant.user.work_id.?.ptr);
+    try std.testing.expect(snapshot[0].assistant.user.work_id.?.ptr != runtime.agent.history.items[0].assistant.user.work_id.?.ptr);
+    try std.testing.expect(snapshot[1].assistant.user.work_id == null);
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, snapshot);
+    try std.testing.expectEqualStrings(
+        "delegated prompt",
+        messages.items[0].content.?.asText(),
+    );
+    try std.testing.expect(std.mem.find(
+        u8,
+        messages.items[0].content.?.asText(),
+        "work-λ",
+    ) == null);
+}
+
 fn checkWorkProvenanceOwnershipFailures(alloc: Allocator) !void {
     var images = [_]ImageAttachment{.{
         .id = 1,
@@ -2884,4 +5947,493 @@ fn checkWorkProvenanceOwnershipFailures(alloc: Allocator) !void {
         .work_id = @constCast("work-owned"),
     });
     freeUserTurn(alloc, copy);
+}
+
+test "work provenance user ownership frees every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkWorkProvenanceOwnershipFailures,
+        .{},
+    );
+}
+
+test "SessionRuntime.snapshotHistory frees partial copies on allocation failure" {
+    const base = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(base);
+
+    try runtime.appendAssistantHistoryTurn(base, "first", "one");
+    try runtime.appendAssistantHistoryTurn(base, "second", "two");
+
+    var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = 3 });
+    try std.testing.expectError(error.OutOfMemory, runtime.snapshotHistory(failing.allocator()));
+}
+
+test "full image catalog retains history excluded from budgeted context" {
+    const alloc = std.testing.allocator;
+    var historical_images = [_]ImageAttachment{.{
+        .id = 3,
+        .path = @constCast("/tmp/historical.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("old image"), .images = &historical_images },
+            .assistant = @constCast("old answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("recent text") },
+            .assistant = @constCast("recent answer"),
+        } },
+    };
+
+    const budgeted = try snapshotOwnedContextHistory(alloc, &history, 0, 1);
+    defer freeHistoryTurnSlice(alloc, budgeted);
+    try std.testing.expectEqual(@as(usize, 1), budgeted.len);
+    try std.testing.expectEqual(@as(usize, 0), budgeted[0].assistant.user.images.len);
+
+    const catalog = try collect_image_catalog(alloc, &history, &.{});
+    defer core_types.freeImageAttachmentSlice(alloc, catalog);
+    try std.testing.expectEqual(@as(usize, 1), catalog.len);
+    try std.testing.expectEqual(@as(usize, 3), catalog[0].id);
+    try std.testing.expectEqualStrings("/tmp/historical.png", catalog[0].path);
+}
+
+test "full image catalog merges canonical history and current images" {
+    const alloc = std.testing.allocator;
+    var historical_images = [_]ImageAttachment{.{
+        .id = 2,
+        .path = @constCast("/tmp/historical.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    const history = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("old image"), .images = &historical_images },
+    } }};
+    const current = [_]ImageAttachment{.{
+        .id = 8,
+        .path = @constCast("/tmp/current.jpg"),
+        .media_type = @constCast("image/jpeg"),
+    }};
+
+    const catalog = try collect_image_catalog(alloc, &history, &current);
+    defer core_types.freeImageAttachmentSlice(alloc, catalog);
+    try std.testing.expectEqual(@as(usize, 2), catalog.len);
+    try std.testing.expectEqual(@as(usize, 2), catalog[0].id);
+    try std.testing.expectEqual(@as(usize, 8), catalog[1].id);
+}
+
+test "image catalog replacement preserves history and replaces current authority" {
+    const alloc = std.testing.allocator;
+    const catalog = [_]ImageAttachment{
+        .{ .id = 2, .path = @constCast("/tmp/history.png"), .media_type = @constCast("image/png") },
+        .{ .id = 8, .path = @constCast("/tmp/old-current.png"), .media_type = @constCast("image/png") },
+    };
+    const old_current = [_]ImageAttachment{
+        .{ .id = 8, .path = @constCast("/tmp/old-current.png"), .media_type = @constCast("image/png") },
+    };
+    const new_current = [_]ImageAttachment{
+        .{ .id = 9, .path = @constCast("/tmp/new-current.jpg"), .media_type = @constCast("image/jpeg") },
+    };
+
+    const replaced = try replace_image_catalog_current_images(
+        alloc,
+        &catalog,
+        &old_current,
+        &new_current,
+    );
+    defer core_types.freeImageAttachmentSlice(alloc, replaced);
+
+    try std.testing.expectEqual(@as(usize, 2), replaced.len);
+    try std.testing.expectEqual(@as(usize, 2), replaced[0].id);
+    try std.testing.expectEqual(@as(usize, 9), replaced[1].id);
+    try std.testing.expectEqualStrings("/tmp/new-current.jpg", replaced[1].path);
+}
+
+test "image catalog replacement rejects stale current authority" {
+    const catalog = [_]ImageAttachment{
+        .{ .id = 2, .path = @constCast("/tmp/history.png"), .media_type = @constCast("image/png") },
+    };
+    const stale_current = [_]ImageAttachment{
+        .{ .id = 8, .path = @constCast("/tmp/stale.png"), .media_type = @constCast("image/png") },
+    };
+
+    try std.testing.expectError(
+        error.StaleImageCatalog,
+        replace_image_catalog_current_images(
+            std.testing.allocator,
+            &catalog,
+            &stale_current,
+            &.{},
+        ),
+    );
+}
+
+test "image catalog replacement cleans up every allocation failure" {
+    const catalog = [_]ImageAttachment{
+        .{ .id = 2, .path = @constCast("/tmp/history.png"), .media_type = @constCast("image/png") },
+        .{ .id = 8, .path = @constCast("/tmp/old-current.png"), .media_type = @constCast("image/png") },
+    };
+    const old_current = [_]ImageAttachment{
+        .{ .id = 8, .path = @constCast("/tmp/old-current.png"), .media_type = @constCast("image/png") },
+    };
+    const new_current = [_]ImageAttachment{
+        .{ .id = 9, .path = @constCast("/tmp/new-current.jpg"), .media_type = @constCast("image/jpeg") },
+    };
+
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const replaced = try replace_image_catalog_current_images(
+        probe.allocator(),
+        &catalog,
+        &old_current,
+        &new_current,
+    );
+    core_types.freeImageAttachmentSlice(probe.allocator(), replaced);
+
+    for (0..probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            replace_image_catalog_current_images(
+                failing.allocator(),
+                &catalog,
+                &old_current,
+                &new_current,
+            ),
+        );
+    }
+}
+
+fn checkImageCatalogHistoryMergeAllocationFailures(alloc: Allocator) !void {
+    const catalog = [_]ImageAttachment{.{
+        .id = 2,
+        .path = @constCast("/tmp/history.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    var added = [_]ImageAttachment{.{
+        .id = 8,
+        .path = @constCast("/tmp/completed.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    const turn: HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("completed"), .images = &added },
+        .assistant = @constCast("done"),
+    } };
+    const merged = try merge_image_catalog_history_turn(alloc, &catalog, turn);
+    defer core_types.freeImageAttachmentSlice(alloc, merged);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+}
+
+test "image catalog history merge cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkImageCatalogHistoryMergeAllocationFailures,
+        .{},
+    );
+}
+
+test "full image catalog rejects duplicate authority ids" {
+    var historical_images = [_]ImageAttachment{.{
+        .id = 5,
+        .path = @constCast("/tmp/historical.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("old image"), .images = &historical_images },
+        .assistant = @constCast("answer"),
+    } }};
+    const current = [_]ImageAttachment{.{
+        .id = 5,
+        .path = @constCast("/tmp/current.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    try std.testing.expectError(
+        error.DuplicateImageId,
+        collect_image_catalog(std.testing.allocator, &history, &current),
+    );
+}
+
+test "full image catalog rejects zero ids outside durable resume repair" {
+    const current = [_]ImageAttachment{.{
+        .id = 0,
+        .path = @constCast("/tmp/live-zero.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    try std.testing.expectError(
+        error.InvalidImageId,
+        collect_image_catalog(std.testing.allocator, &.{}, &current),
+    );
+}
+
+test "full image catalog cleans up every allocation failure" {
+    var historical_images = [_]ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/historical.png"),
+        .media_type = @constCast("image/png"),
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("old image"), .images = &historical_images },
+        .assistant = @constCast("answer"),
+    } }};
+    const current = [_]ImageAttachment{.{
+        .id = 2,
+        .path = @constCast("/tmp/current.jpg"),
+        .media_type = @constCast("image/jpeg"),
+    }};
+
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const probed = try collect_image_catalog(probe.allocator(), &history, &current);
+    core_types.freeImageAttachmentSlice(probe.allocator(), probed);
+    for (0..probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            collect_image_catalog(failing.allocator(), &history, &current),
+        );
+    }
+}
+
+test "SessionRuntime.setConversationLanguageFromUserMessage preserves fallback without script signal" {
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+
+    runtime.setConversationLanguageFromUserMessage("привет");
+    try std.testing.expectEqual(ConversationLanguage.literal("und-Cyrl"), runtime.languageSnapshot());
+
+    runtime.setConversationLanguageFromUserMessage("12345 !!!");
+    try std.testing.expectEqual(ConversationLanguage.literal("und-Cyrl"), runtime.languageSnapshot());
+}
+
+test "SessionRuntime.languageSnapshot reads restored language through mutex path" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+
+    try runtime.restore(alloc, ConversationLanguage.literal("und-Grek"), &.{});
+    try std.testing.expectEqual(ConversationLanguage.literal("und-Grek"), runtime.languageSnapshot());
+}
+
+test "SessionRuntime.lastAssistantReply and lastSummary return borrowed stored slices" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 0 };
+    defer runtime.deinit(alloc);
+
+    try std.testing.expect(runtime.lastAssistantReply() == null);
+    try std.testing.expect(runtime.lastSummary() == null);
+
+    try runtime.appendHistoryEntry(alloc, .{ .compacted_summary = .{
+        .summary = @constCast("first summary"),
+        .removed_turn_count = 2,
+        .compaction_count = 1,
+    } });
+    try runtime.appendAssistantHistoryTurn(alloc, "first", "one");
+    try runtime.appendHistoryEntry(alloc, .{ .compacted_summary = .{
+        .summary = @constCast("second summary"),
+        .removed_turn_count = 4,
+        .compaction_count = 2,
+    } });
+    try runtime.appendAssistantHistoryTurn(alloc, "second", "two");
+    try runtime.appendAssistantHistoryTurn(alloc, "execution only", "");
+
+    const reply = runtime.lastAssistantReply().?;
+    const summary = runtime.lastSummary().?;
+    try std.testing.expectEqualStrings("two", reply);
+    try std.testing.expectEqualStrings("second summary", summary);
+    try std.testing.expect(reply.ptr == runtime.agent.history.items[3].assistant.assistant.ptr);
+    try std.testing.expect(summary.ptr == runtime.agent.history.items[2].compacted_summary.summary.ptr);
+}
+
+test "SessionRuntime restores a durable context boundary without deleting canonical history" {
+    const alloc = std.testing.allocator;
+    var original: SessionRuntime = .{ .max_history_turns = 8 };
+    defer original.deinit(alloc);
+    try original.appendAssistantHistoryTurn(alloc, "one", "reply one");
+    try original.appendAssistantHistoryTurn(alloc, "two", "reply two");
+    try original.appendAssistantHistoryTurn(alloc, "three", "reply three");
+    original.context_history_start = 2;
+
+    const history = try original.snapshotHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, history);
+
+    var restored: SessionRuntime = .{ .max_history_turns = 8 };
+    defer restored.deinit(alloc);
+    try restored.restoreWithContextHistoryStart(
+        alloc,
+        ConversationLanguage.literal("en"),
+        history,
+        original.contextHistoryStart(),
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), restored.historyLen());
+    try std.testing.expectEqual(@as(usize, 2), restored.contextHistoryStart());
+    const context = try restored.snapshotContextHistory(alloc);
+    defer freeHistoryTurnSlice(alloc, context);
+    try std.testing.expectEqual(@as(usize, 2), context.len);
+    try std.testing.expect(context[0] == .compacted_summary);
+    try std.testing.expect(std.mem.find(
+        u8,
+        context[0].compacted_summary.summary,
+        "one",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        context[0].compacted_summary.summary,
+        "two",
+    ) != null);
+    try std.testing.expectEqualStrings("three", context[1].assistant.user.text);
+    try std.testing.expectError(
+        error.InvalidContextHistoryStart,
+        restored.restoreWithContextHistoryStart(
+            alloc,
+            ConversationLanguage.literal("en"),
+            history,
+            history.len + 1,
+        ),
+    );
+}
+
+test "SessionRuntime owns permission transitions and immutable snapshots" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    const key = try session_permission_state.RuleKey.init(
+        .command,
+        "command\x00/workspace\x00git status",
+    );
+
+    try std.testing.expectEqual(
+        session_permission_state.ApplyStatus.applied,
+        try runtime.applyPermissionEvent(alloc, .{ .set = .{
+            .key = key,
+            .display_identity = "git status in /workspace",
+            .decision = .deny,
+            .expected_generation = null,
+        } }),
+    );
+    var snapshot = try runtime.snapshotPermissionState(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(
+        session_permission_state.StateDecision.deny,
+        session_permission_state.decide(snapshot, key),
+    );
+
+    var restored: SessionRuntime = .{ .max_history_turns = 8 };
+    defer restored.deinit(alloc);
+    try restored.restoreWithPermissionState(
+        alloc,
+        ConversationLanguage.literal("en"),
+        &.{},
+        0,
+        snapshot,
+    );
+    var restored_snapshot = try restored.snapshotPermissionState(alloc);
+    defer restored_snapshot.deinit(alloc);
+    try std.testing.expectEqual(
+        session_permission_state.StateDecision.deny,
+        session_permission_state.decide(restored_snapshot, key),
+    );
+}
+
+test "appendHistoryTurnToOwnedContext moves old ownership, duplicates new turn, and compacts" {
+    const alloc = std.testing.allocator;
+
+    var current = try alloc.alloc(HistoryTurn, 2);
+    current[0] = try makeAssistantTurn(alloc, "one", "reply one");
+    current[1] = try makeAssistantTurn(alloc, "two", "reply two");
+
+    var caller_turn = try makeAssistantTurn(alloc, "three", "reply three");
+    defer freeHistoryTurn(alloc, caller_turn);
+
+    const next = try appendHistoryTurnToOwnedContext(alloc, current, caller_turn, 2);
+    defer freeHistoryTurnSlice(alloc, next);
+
+    caller_turn.assistant.user.text[0] = '!';
+    try std.testing.expectEqual(@as(usize, 2), next.len);
+    try std.testing.expect(next[0] == .compacted_summary);
+    try std.testing.expectEqualStrings("three", next[1].assistant.user.text);
+    try std.testing.expectEqualStrings("reply three", next[1].assistant.assistant);
+}
+
+test "appendHistoryTurnToOwnedContext frees duplicate fields on allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    const turn = HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("prompt") },
+        .assistant = @constCast("reply"),
+    } };
+
+    try std.testing.expectError(error.OutOfMemory, appendHistoryTurnToOwnedContext(failing.allocator(), &.{}, turn, 0));
+}
+
+test "SessionRuntime.appendHistoryMessages matches top-level projection and preserves ownership flags" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{
+        .{ .compacted_summary = .{
+            .summary = @constCast("Conversation summary:\n- Earlier turns compacted: 2"),
+            .removed_turn_count = 2,
+            .compaction_count = 1,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("question") },
+            .assistant = @constCast("answer"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("run dev") },
+            .assistant = @constCast("historical command"),
+        } },
+    };
+
+    var static_messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &static_messages);
+    var top_level_messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &top_level_messages);
+
+    try SessionRuntime.appendHistoryMessages(alloc, &static_messages, &history);
+    try appendHistoryMessages(alloc, &top_level_messages, &history);
+
+    try std.testing.expectEqual(static_messages.items.len, top_level_messages.items.len);
+    for (static_messages.items, top_level_messages.items) |static_msg, top_level_msg| {
+        try std.testing.expectEqual(static_msg.role, top_level_msg.role);
+        try std.testing.expectEqualStrings(static_msg.content.?.asText(), top_level_msg.content.?.asText());
+        try std.testing.expectEqual(static_msg.owns_content, top_level_msg.owns_content);
+    }
+
+    try std.testing.expect(static_messages.items[0].owns_content);
+    try std.testing.expect(!static_messages.items[1].owns_content);
+    try std.testing.expect(!static_messages.items[2].owns_content);
+    try std.testing.expect(!static_messages.items[3].owns_content);
+}
+
+test "SessionRuntime.appendHistoryMessages frees owned system text when append fails" {
+    const compact = [_]HistoryTurn{.{ .compacted_summary = .{
+        .summary = @constCast("summary"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } }};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var messages: std.ArrayList(message.Message) = .empty;
+
+    try std.testing.expectError(error.OutOfMemory, SessionRuntime.appendHistoryMessages(failing.allocator(), &messages, &compact));
+}
+
+test "history context formatters return exact text" {
+    const alloc = std.testing.allocator;
+
+    const compacted = try formatCompactedContinuationMessage(alloc, "summary");
+    defer alloc.free(compacted);
+    try std.testing.expectEqualStrings(
+        "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n" ++
+            "summary\n\n" ++
+            "Recent conversation turns are preserved verbatim.\n" ++
+            "Continue the conversation from where it left off without asking the user to repeat context. Resume directly.",
+        compacted,
+    );
+}
+
+fn deinitMessages(alloc: Allocator, messages: *std.ArrayList(message.Message)) void {
+    for (messages.items) |*msg| msg.deinit(alloc);
+    messages.deinit(alloc);
 }

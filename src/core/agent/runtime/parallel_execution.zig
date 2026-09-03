@@ -36,6 +36,36 @@ pub fn parallelReadOnlyPrefixLen(registry: tool_dispatch.Registry, calls: []cons
     return len;
 }
 
+fn isSubagentCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
+    if (call.provider_result != null) return false;
+    const tool = registry.lookup(call.name) orelse return false;
+    return tool.executor_kind == .subagent and tool.activity_kind == .subagent;
+}
+
+fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
+    var len: usize = 0;
+    while (len < calls.len and isSubagentCall(registry, calls[len])) : (len += 1) {}
+    return len;
+}
+
+pub const GroupKind = enum { none, read_only, subagent };
+
+pub const LeadingGroup = struct {
+    kind: GroupKind = .none,
+    len: usize = 0,
+};
+
+pub fn leadingParallelGroup(
+    registry: tool_dispatch.Registry,
+    calls: []const ToolCall,
+) LeadingGroup {
+    const read_only_len = parallelReadOnlyPrefixLen(registry, calls);
+    if (read_only_len > 0) return .{ .kind = .read_only, .len = read_only_len };
+    const subagent_len = parallelSubagentPrefixLen(registry, calls);
+    if (subagent_len > 0) return .{ .kind = .subagent, .len = subagent_len };
+    return .{};
+}
+
 pub const ParallelToolResult = struct {
     call_id: []const u8,
     tool_name: []const u8,
@@ -94,7 +124,7 @@ const ParallelWorkerSlot = struct {
     owner_cancelled_at_error: bool = false,
 };
 
-pub fn runSequentialReadOnlyCalls(
+pub fn runSequentialCalls(
     alloc: Allocator,
     calls: []const ToolCall,
     options: ParallelRunOptions,
@@ -136,7 +166,7 @@ pub fn runSequentialReadOnlyCalls(
     return .{ .attempts = attempts, .first_cancelled_index = first_cancelled_index };
 }
 
-pub fn runParallelReadOnlyCalls(
+pub fn runParallelCalls(
     alloc: Allocator,
     calls: []const ToolCall,
     options: ParallelRunOptions,
@@ -274,12 +304,11 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
     const tool_name = try alloc.dupe(u8, call.name);
     errdefer alloc.free(tool_name);
 
-    if (execution.background_command != null or
-        execution.diff_entry != null or
+    if (execution.diff_entry != null or
         execution.finish_turn or
         execution.selected_dynamic_tool_name != null or
         execution.selected_dynamic_tool_schema_json != null or
-        execution.prepared_result_memory != null or
+        execution.tool_result_memory_prepared or
         execution.committed_file_handoff != null or
         execution.deferred_tool_completion != null)
     {
@@ -288,7 +317,7 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
             .tool_name = tool_name,
             .execution = .{
                 .status = .failure,
-                .model_output = try alloc.dupe(u8, "Parallel read-only tool returned an unsupported side-effect payload."),
+                .model_output = try alloc.dupe(u8, "Parallel tool returned an unsupported side-effect payload."),
             },
         };
     }
@@ -302,9 +331,6 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
     errdefer freeOwnedToolExecutionResult(alloc, duplicated_execution);
     if (execution.status_detail) |detail| {
         duplicated_execution.status_detail = try alloc.dupe(u8, detail);
-    }
-    if (execution.display_output) |display| {
-        duplicated_execution.display_output = try alloc.dupe(u8, display);
     }
     if (execution.system_notice) |notice| {
         duplicated_execution.system_notice = try alloc.dupe(u8, notice);
@@ -377,7 +403,6 @@ fn freeParallelToolResult(alloc: Allocator, result: ParallelToolResult) void {
 fn freeOwnedToolExecutionResult(alloc: Allocator, result: ToolExecutionResult) void {
     alloc.free(result.model_output);
     if (result.status_detail) |value| alloc.free(value);
-    if (result.display_output) |value| alloc.free(value);
     if (result.system_notice) |value| alloc.free(value);
     if (result.interactive_notice) |notice| types.freeSemanticNotice(alloc, notice);
     freeContextNotices(alloc, result.context_notices);
@@ -412,6 +437,356 @@ fn freeContextNotices(alloc: Allocator, notices: []const []const u8) void {
     if (notices.len > 0) alloc.free(notices);
 }
 
+const ParallelTestPlan = struct {
+    output: []const u8 = "",
+    err: ?anyerror = null,
+    delay_ms: u64 = 0,
+    cancel: bool = false,
+};
+
+const ParallelTestFixture = struct {
+    plans: []const ParallelTestPlan,
+    cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    max_in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
+fn runParallelCallsForTest(
+    alloc: Allocator,
+    calls: []const ToolCall,
+    fixture: *ParallelTestFixture,
+) Allocator.Error!ParallelRunResult {
+    return runParallelCalls(alloc, calls, .{
+        .exec_ctx = fixture,
+        .execute = parallelTestExecute,
+        .format_ctx = fixture,
+        .format_error = parallelTestFormatError,
+        .cancel_flag = &fixture.cancel_flag,
+    });
+}
+
+fn parallelTestExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
+    _ = call;
+    const fixture: *ParallelTestFixture = @ptrCast(@alignCast(ctx));
+    const in_flight = fixture.in_flight.fetchAdd(1, .seq_cst) + 1;
+    updateMaxInFlight(&fixture.max_in_flight, in_flight);
+    defer _ = fixture.in_flight.fetchSub(1, .seq_cst);
+
+    const plan = fixture.plans[index];
+    if (plan.delay_ms > 0) io_mod.sleep(plan.delay_ms * std.time.ns_per_ms);
+    if (plan.cancel) fixture.cancel_flag.store(true, .seq_cst);
+    if (plan.err) |err| return err;
+    return .{ .status = .success, .model_output = try alloc.dupe(u8, plan.output) };
+}
+
+fn updateMaxInFlight(max_in_flight: *std.atomic.Value(usize), candidate: usize) void {
+    var current = max_in_flight.load(.seq_cst);
+    while (candidate > current) {
+        const result = max_in_flight.cmpxchgWeak(current, candidate, .seq_cst, .seq_cst);
+        if (result == null) return;
+        current = result.?;
+    }
+}
+
+fn parallelTestFormatError(_: *anyopaque, alloc: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
+    return std.fmt.allocPrint(alloc, "{s} failed with {s}", .{ tool_name, @errorName(err) });
+}
+
 fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {
     return .{ .id = id, .name = name, .arguments_json = args };
+}
+
+test "parallel classifier uses active registry metadata" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const calls = [_]ToolCall{toolCall("read", "read_file", "{\"path\":\"README.md\"}")};
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+    const active_registry = tool_dispatch.Registry{ .tools = &tools };
+    const empty_registry = tool_dispatch.Registry{};
+    var mislabeled_read = builtin_tools.read_file;
+    mislabeled_read.activity_kind = .write;
+    const mislabeled_tools = [_]tool_dispatch.Tool{mislabeled_read};
+    const mislabeled_registry = tool_dispatch.Registry{ .tools = &mislabeled_tools };
+
+    try std.testing.expectEqual(@as(usize, 1), parallelReadOnlyPrefixLen(active_registry, &calls));
+    try std.testing.expectEqual(@as(usize, 0), parallelReadOnlyPrefixLen(empty_registry, &calls));
+    try std.testing.expectEqual(@as(usize, 0), parallelReadOnlyPrefixLen(mislabeled_registry, &calls));
+}
+
+test "parallel classifier keeps only a leading safe read-only group" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.read_file,
+        builtin_tools.grep_files,
+        builtin_tools.write_file,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const calls = [_]ToolCall{
+        toolCall("read_1", "read_file", "{\"path\":\"src/main.zig\"}"),
+        toolCall("grep_1", "grep_files", "{\"pattern\":\"processQueuedPrompt\"}"),
+        toolCall("write_1", "write_file", "{\"path\":\"tmp.txt\",\"content\":\"x\"}"),
+        toolCall("read_2", "read_file", "{\"path\":\"README.md\"}"),
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
+    try std.testing.expect(isReadOnlyCall(registry, calls[0]));
+    try std.testing.expect(isReadOnlyCall(registry, calls[1]));
+    try std.testing.expect(!isReadOnlyCall(registry, calls[2]));
+}
+
+test "parallel classifier keeps one leading registered subagent group" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.subagent,
+        builtin_tools.read_file,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const calls = [_]ToolCall{
+        toolCall("child_1", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"first\"}}"),
+        toolCall("child_2", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"second\"}}"),
+        toolCall("read_1", "read_file", "{\"path\":\"README.md\"}"),
+    };
+
+    const group = leadingParallelGroup(registry, &calls);
+    try std.testing.expectEqual(GroupKind.subagent, group.kind);
+    try std.testing.expectEqual(@as(usize, 2), group.len);
+}
+
+test "parallel classifier admits approval-bearing web fetch read groups" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.web_fetch,
+        builtin_tools.read_file,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const calls = [_]ToolCall{
+        toolCall("fetch_1", "web_fetch", "{\"url\":\"https://example.com\"}"),
+        toolCall("read_1", "read_file", "{\"path\":\"README.md\"}"),
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
+}
+
+test "parallel classifier admits installed skill reads" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{builtin_tools.skill};
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const calls = [_]ToolCall{toolCall(
+        "skill_1",
+        "skill",
+        "{\"name\":\"demo\",\"location\":\"/tmp/demo\",\"resource\":\"SKILL.md\"}",
+    )};
+
+    try std.testing.expectEqual(@as(usize, 1), parallelReadOnlyPrefixLen(registry, &calls));
+    try std.testing.expect(isReadOnlyCall(registry, calls[0]));
+}
+
+test "parallel classifier rejects prompts approvals dynamic tools and mutations" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.ask_user_question,
+        builtin_tools.mcp_select_tool,
+        builtin_tools.subagent,
+        builtin_tools.install_skill,
+        builtin_tools.shell,
+        builtin_tools.read_file,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const cases = [_]ToolCall{
+        toolCall("ask_1", "ask_user_question", "{\"questions\":[]}"),
+        toolCall("mcp_1", "mcp_select_tool", "{\"name\":\"tool\"}"),
+        toolCall("subagent_1", "subagent", "{\"command\":{\"inspect\":{\"id\":\"01J00000000000000000000000\",\"sections\":[\"status\"]}}}"),
+        toolCall("skill_1", "install_skill", "{\"source\":\"repo\"}"),
+        toolCall("browser_1", "browser_snapshot", "{}"),
+        toolCall("command_1", "run_command", "{\"command\":\"git status --short\"}"),
+        toolCall("unknown_1", "dynamic_mcp_tool", "{}"),
+    };
+
+    for (cases) |call| {
+        try std.testing.expect(!isReadOnlyCall(registry, call));
+    }
+
+    var provider_call = toolCall("provider_1", "read_file", "{\"path\":\"README.md\"}");
+    provider_call.provider_result = "provider result";
+    try std.testing.expect(!isReadOnlyCall(registry, provider_call));
+}
+
+test "parallel read-only execution preserves order and failure fan-in" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
+    };
+    const plans = [_]ParallelTestPlan{
+        .{ .output = "first output", .delay_ms = 20 },
+        .{ .err = error.TestExpectedEqual, .delay_ms = 5 },
+        .{ .output = "third output", .delay_ms = 1 },
+    };
+    var fixture = ParallelTestFixture{ .plans = &plans };
+
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
+    defer run.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), run.attempts.len);
+    try std.testing.expectEqualStrings("first", run.attempts[0].completed.call_id);
+    try std.testing.expectEqualStrings("first output", run.attempts[0].completed.execution.model_output);
+    try std.testing.expectEqualStrings("second", run.attempts[1].completed.call_id);
+    try std.testing.expectEqual(.failure, run.attempts[1].completed.execution.status);
+    try std.testing.expect(std.mem.find(u8, run.attempts[1].completed.execution.model_output, "TestExpectedEqual") != null);
+    try std.testing.expectEqualStrings("third", run.attempts[2].completed.call_id);
+    try std.testing.expectEqualStrings("third output", run.attempts[2].completed.execution.model_output);
+    try std.testing.expect(run.first_cancelled_index == null);
+    try std.testing.expect(fixture.max_in_flight.load(.seq_cst) > 1);
+}
+
+test "parallel read-only execution preserves exact cancelled identity and completed peers" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
+    };
+    const plans = [_]ParallelTestPlan{
+        .{ .output = "first output", .delay_ms = 10 },
+        .{ .err = error.Cancelled, .delay_ms = 5, .cancel = true },
+        .{ .output = "third output", .delay_ms = 20 },
+    };
+    var fixture = ParallelTestFixture{ .plans = &plans };
+
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
+    defer run.deinit(alloc);
+
+    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
+    try std.testing.expectEqual(@as(?usize, 1), run.first_cancelled_index);
+    try std.testing.expectEqualStrings("first", run.attempts[0].completed.call_id);
+    try std.testing.expect(run.attempts[1] == .cancelled);
+    try std.testing.expectEqualStrings("third", run.attempts[2].completed.call_id);
+    try std.testing.expectEqual(@as(usize, 0), fixture.in_flight.load(.seq_cst));
+}
+
+test "parallel workers start no execution when owner cancellation is already set" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+    };
+    const plans = [_]ParallelTestPlan{
+        .{ .output = "must not execute" },
+        .{ .output = "must not execute" },
+    };
+    var fixture = ParallelTestFixture{ .plans = &plans };
+    fixture.cancel_flag.store(true, .seq_cst);
+
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
+    defer run.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?usize, 0), run.first_cancelled_index);
+    try std.testing.expect(run.attempts[0] == .cancelled);
+    try std.testing.expect(run.attempts[1] == .cancelled);
+    try std.testing.expectEqual(@as(usize, 0), fixture.max_in_flight.load(.seq_cst));
+}
+
+test "parallel read-only execution does not relabel earlier ordinary cancellation" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
+    };
+    const plans = [_]ParallelTestPlan{
+        .{ .err = error.Cancelled, .delay_ms = 1 },
+        .{ .output = "second output", .delay_ms = 50, .cancel = true },
+        .{ .output = "third output", .delay_ms = 10 },
+    };
+    var fixture = ParallelTestFixture{ .plans = &plans };
+
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
+    defer run.deinit(alloc);
+
+    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
+    try std.testing.expect(run.first_cancelled_index == null);
+    try std.testing.expectEqual(.failure, run.attempts[0].completed.execution.status);
+    try std.testing.expect(std.mem.find(
+        u8,
+        run.attempts[0].completed.execution.model_output,
+        "Cancelled",
+    ) != null);
+    try std.testing.expectEqualStrings(
+        "second output",
+        run.attempts[1].completed.execution.model_output,
+    );
+    try std.testing.expectEqualStrings(
+        "third output",
+        run.attempts[2].completed.execution.model_output,
+    );
+}
+
+test "parallel read-only execution reports no active call when cancellation follows completed attempts" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+    };
+    const plans = [_]ParallelTestPlan{
+        .{ .output = "first output", .delay_ms = 5, .cancel = true },
+        .{ .output = "second output", .delay_ms = 10 },
+    };
+    var fixture = ParallelTestFixture{ .plans = &plans };
+
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
+    defer run.deinit(alloc);
+
+    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
+    try std.testing.expect(run.first_cancelled_index == null);
+    try std.testing.expect(run.attempts[0] == .completed);
+    try std.testing.expect(run.attempts[1] == .completed);
+}
+
+fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
+    const call = toolCall(
+        "call_read",
+        "read_file",
+        "{\"path\":\"notes.txt\"}",
+    );
+    const execution: ToolExecutionResult = .{
+        .model_output = "contents",
+        .status_detail = "detail",
+        .system_notice = "notice",
+        .interactive_notice = .{
+            .topic = "background",
+            .tone = .information,
+            .body = "Command #7 started. Log: /tmp/run.log",
+        },
+        .context_notices = &.{ "first context notice", "second context notice" },
+        .command_result_json = "{}",
+        .tool_result_memory = .{
+            .output_handle = "result-handle",
+            .preview = "preview",
+            .output_bytes = 8,
+            .stored_output_bytes = 8,
+            .model_view_covers_full_file = true,
+        },
+    };
+    const duplicated = try duplicateParallelToolResult(
+        alloc,
+        call,
+        execution,
+    );
+    defer freeParallelToolResult(alloc, duplicated);
+    try std.testing.expectEqualStrings("notice", duplicated.execution.system_notice.?);
+    const interactive_notice = duplicated.execution.interactive_notice.?;
+    try std.testing.expectEqualStrings("background", interactive_notice.topic);
+    try std.testing.expectEqual(types.NoticeTone.information, interactive_notice.tone);
+    try std.testing.expectEqualStrings("Command #7 started. Log: /tmp/run.log", interactive_notice.body);
+    try std.testing.expectEqual(@as(usize, 2), duplicated.execution.context_notices.len);
+    try std.testing.expectEqualStrings("first context notice", duplicated.execution.context_notices[0]);
+    try std.testing.expectEqualStrings("second context notice", duplicated.execution.context_notices[1]);
+}
+
+test "parallel result duplication cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkParallelResultDuplicationAllocationFailures,
+        .{},
+    );
 }

@@ -86,3 +86,141 @@ fn resourceIdsMatchByBytes(
     const right = right_bytes orelse return false;
     return std.mem.eql(u8, left, right);
 }
+
+test "grid cell comparison resolves hyperlink URI instead of numeric id" {
+    var left = try vt_emulator.Grid.init(std.testing.allocator, 8, 2);
+    defer left.deinit();
+    try left.feed("\x1b]8;;https://unused.example\x1b\\\x1b]8;;\x1b\\");
+    try left.feed("\x1b[1;1H\x1b]8;;https://same.example\x1b\\X\x1b]8;;\x1b\\");
+
+    var right = try vt_emulator.Grid.init(std.testing.allocator, 8, 2);
+    defer right.deinit();
+    try right.feed("\x1b]8;;https://same.example\x1b\\X\x1b]8;;\x1b\\");
+    try right.feed("\x1b]8;;https://unused.example\x1b\\\x1b]8;;\x1b\\");
+
+    const left_cell = left.cellAt(1, 1).?;
+    const right_cell = right.cellAt(1, 1).?;
+    try std.testing.expectEqual(@as(u32, 2), left_cell.style.hyperlink_id);
+    try std.testing.expectEqual(@as(u32, 1), right_cell.style.hyperlink_id);
+    try std.testing.expect(gridCellsEqual(left, left_cell, right, right_cell));
+
+    var different = right_cell;
+    different.style.hyperlink_id = 2;
+    try std.testing.expect(!gridCellsEqual(left, left_cell, right, different));
+
+    var missing = right_cell;
+    missing.style.hyperlink_id = 99;
+    try std.testing.expect(!gridCellsEqual(left, left_cell, right, missing));
+
+    var unlinked = right_cell;
+    unlinked.style.hyperlink_id = 0;
+    try std.testing.expect(!gridCellsEqual(left, left_cell, right, unlinked));
+
+    var different_codepoint = right_cell;
+    different_codepoint.codepoint = 'Y';
+    try std.testing.expect(!gridCellsEqual(left, left_cell, right, different_codepoint));
+
+    var different_color = right_cell;
+    different_color.style.fg = .{ .indexed = 1 };
+    try std.testing.expect(!gridCellsEqual(left, left_cell, right, different_color));
+
+    var different_flags = right_cell;
+    different_flags.style.flags.bold = true;
+    try std.testing.expect(!gridCellsEqual(left, left_cell, right, different_flags));
+}
+
+test "grid cell comparison resolves combining suffix bytes instead of base glyph" {
+    var acute = try vt_emulator.Grid.init(std.testing.allocator, 8, 1);
+    defer acute.deinit();
+    try acute.feed("e\u{0301}");
+
+    var cedilla = try vt_emulator.Grid.init(std.testing.allocator, 8, 1);
+    defer cedilla.deinit();
+    try cedilla.feed("e\u{0327}");
+
+    try std.testing.expect(!gridCellsEqual(
+        acute,
+        acute.cellAt(1, 1).?,
+        cedilla,
+        cedilla.cellAt(1, 1).?,
+    ));
+}
+
+test "grid surface comparison resolves remapped hyperlink and combining resources" {
+    var grid = try vt_emulator.Grid.init(std.testing.allocator, 16, 3);
+    defer grid.deinit();
+    try grid.feed("\x1b]8;;https://unused.example\x1b\\\x1b]8;;\x1b\\");
+    try grid.feed("\x1b[2;1H\x1b]8;;https://same.example\x1b\\e\u{0301}\x1b]8;;\x1b\\");
+
+    const plan = cellMatchTestPlan();
+    var surface = try frame_surface.FrameSurface.initFromShadow(std.testing.allocator, plan, grid);
+    defer surface.deinit();
+    _ = try surface.writeAnsiBand(
+        2,
+        1,
+        "\x1b]8;;https://same.example\x1b\\e\u{0301}\x1b]8;;\x1b\\",
+        .transcript,
+        .same_owner,
+    );
+
+    const grid_cell = grid.cellAt(2, 1).?;
+    const surface_cell = surface.cellAt(2, 1).?;
+    try std.testing.expectEqual(@as(u32, 2), grid_cell.style.hyperlink_id);
+    try std.testing.expectEqual(@as(u32, 2), surface_cell.style.hyperlink_id);
+    try std.testing.expect(gridSurfaceCellsEqual(grid, grid_cell, surface, surface_cell));
+
+    _ = try surface.writeAnsiBand(
+        2,
+        1,
+        "\x1b]8;;https://same.example\x1b\\e\u{0327}\x1b]8;;\x1b\\",
+        .transcript,
+        .same_owner,
+    );
+    try std.testing.expect(!gridSurfaceCellsEqual(grid, grid_cell, surface, surface.cellAt(2, 1).?));
+}
+
+fn cellMatchTestPlan() paint_plan.PaintPlan {
+    return .{
+        .layout = .{
+            .rows = 3,
+            .cols = 16,
+            .content_bottom = 2,
+            .divider_top_row = 3,
+            .input_row = 3,
+            .divider_bottom_row = 3,
+            .hint_row = 3,
+        },
+        .viewport = .{
+            .top_row = 2,
+            .bottom_row = 2,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = 1,
+            .last_visible_row = 2,
+        },
+        .footer = .{
+            .top = 3,
+            .top_divider = 3,
+            .banner = 3,
+            .banner_active = false,
+            .input_base = 3,
+            .picker_divider = 3,
+            .picker_start = 3,
+            .bottom_divider = 3,
+            .hint = 3,
+            .total_rows = 1,
+        },
+        .activity = .none,
+        .preserved_band = .{ .top = 1, .bottom = 1, .owner = .preserved_shell },
+        .transcript_band = .{ .top = 2, .bottom = 2, .owner = .transcript },
+        .activity_band = paint_plan.FrameBand.empty(.activity),
+        .footer_band = .{ .top = 3, .bottom = 3, .owner = .footer },
+        .invalidation = paint_plan.FrameInvalidationSet.empty(),
+        .footer_clean_allowed = true,
+        .synchronized_update = true,
+        .cursor_target = .{ .row = 3, .col = 1, .visible = true },
+        .footer_reservation_source = .footer_layout,
+        .bottom_reserved_rows = 0,
+        .preserve_scrollback = true,
+    };
+}
