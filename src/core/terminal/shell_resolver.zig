@@ -79,7 +79,13 @@ pub fn capturedSelfInvocation(
     clean_start: bool,
     command: []const u8,
 ) (ResolveError || Allocator.Error)!Invocation {
-    const self_path = try self_exe.pathForReexec(alloc);
+    // pathForReexec consults the OS for the on-disk executable; on macOS the
+    // underlying query carries a wide error set, which collapses here so the
+    // public resolver error set stays small.
+    const self_path = self_exe.pathForReexec(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ExecutableNotFound => return error.UnsupportedShell,
+    };
     var invocation = try rushInvocation(self_path, clean_start);
     removeInteractiveFlag(&invocation);
     invocation.setCommand(command);
