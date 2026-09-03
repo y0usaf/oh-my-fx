@@ -6,7 +6,7 @@
     "tui-command-permissions.test.ts": "The file contains a sound scenario and cannot be run safely as a whole."
   },
   "defaults": {
-    "cwd": "tests/e2e",
+    "cwd": ".",
     "env_set": {
       "FX_AUTO_UPGRADE": "0",
       "FX_SOUND": "0",
