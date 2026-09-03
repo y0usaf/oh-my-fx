@@ -495,9 +495,6 @@ fn extract_legacy(alloc: Allocator, response: []const u8) !tool_mcp_runtime.Call
     });
 }
 
-
-
-
 fn check_input_required_allocation_failures(alloc: Allocator) !void {
     var result = try extract(alloc, .{
         .server_name = "server",
@@ -509,7 +506,6 @@ fn check_input_required_allocation_failures(alloc: Allocator) !void {
     defer result.deinit(alloc);
     try std.testing.expectEqual(tool_mcp_runtime.CallStatus.input_required, result.status);
 }
-
 
 fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
     var result = try extract(alloc, .{
@@ -524,6 +520,3 @@ fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
     try std.testing.expectEqual(tool_mcp_runtime.CallStatus.input_required, result.status);
     try std.testing.expect(result.input_required.?.legacy_retry_without_responses);
 }
-
-
-

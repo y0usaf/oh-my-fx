@@ -419,7 +419,6 @@ fn ttlMilliseconds(alloc: Allocator, value: std.json.Value) Error!?u64 {
     return std.math.cast(u64, result);
 }
 
-
 fn checkResourceContentAllocationFailures(alloc: Allocator) !void {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -431,5 +430,3 @@ fn checkResourceContentAllocationFailures(alloc: Allocator) !void {
     var content = try parseResourceContent(alloc, parsed.value, .{});
     defer content.deinit(alloc);
 }
-
-

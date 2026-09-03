@@ -412,6 +412,3 @@ const ApprovalRoutingApp = struct {
         );
     }
 };
-
-
-

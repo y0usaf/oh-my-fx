@@ -1301,14 +1301,6 @@ fn countEntries(dir: std.Io.Dir) !usize {
     return count;
 }
 
-
-
-
-
-
-
-
-
 const FailFirstParentSync = struct {
     calls: usize = 0,
 
@@ -1318,5 +1310,3 @@ const FailFirstParentSync = struct {
         if (self.calls == 1) return error.InjectedParentSyncFailure;
     }
 };
-
-

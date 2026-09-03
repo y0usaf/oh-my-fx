@@ -225,8 +225,6 @@ pub fn authorize(captured: View, live: View, target: Target) Decision {
     return .allow;
 }
 
-
-
 fn checkViewCloneAllocationFailures(alloc: Allocator) !void {
     var source = View{
         .runtime_generation = 7,

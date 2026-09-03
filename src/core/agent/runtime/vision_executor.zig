@@ -506,7 +506,3 @@ fn retryableAttemptForTest(attempt: anyerror!BatchAttempt) !bool {
 fn modeledProviderCallCount(attempt: BatchAttempt) usize {
     return if (attempt.retryable()) 2 else 1;
 }
-
-
-
-

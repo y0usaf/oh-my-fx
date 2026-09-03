@@ -291,8 +291,6 @@ fn writeThinkingBlinkText(out: []u8, label: []const u8, marker_visible: bool) []
     return w.buffered();
 }
 
-
-
 fn writeStaticStyledText(out: []u8, label: []const u8, style: []const u8) []const u8 {
     const required = style.len + label.len + ui_render.reset_style.len;
     if (required > out.len) return label;
@@ -305,7 +303,6 @@ fn writeStaticStyledText(out: []u8, label: []const u8, style: []const u8) []cons
     end += ui_render.reset_style.len;
     return out[0..end];
 }
-
 
 fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []const u8 {
     var marker_start: usize = 0;
@@ -350,7 +347,6 @@ fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []co
     end += ui_render.reset_style.len;
     return out[0..end];
 }
-
 
 fn traceSurfaceShimmerPaint(surface: *const frame_surface.FrameSurface, row: u16, label: []const u8) void {
     debug_trace.logf(
@@ -427,18 +423,3 @@ fn testSurface(plan: paint_plan.PaintPlan) !struct {
     errdefer surface.deinit();
     return .{ .shadow = shadow, .surface = surface };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -552,12 +552,3 @@ fn isPublicIpv6(bytes: [16]u8) bool {
     if (bytes[0] == 0x3f and (bytes[1] & 0xf0) == 0xf0) return false;
     return true;
 }
-
-
-
-
-
-
-
-
-

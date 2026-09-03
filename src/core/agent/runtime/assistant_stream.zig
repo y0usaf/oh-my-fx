@@ -591,7 +591,6 @@ pub fn historyTextForCompletedStream(raw_text: []const u8, normalized_text: []co
     return normalized_text;
 }
 
-
 fn isTrimmedAssistantPrefixByte(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
 }
@@ -870,7 +869,6 @@ const StreamCapture = struct {
     }
 };
 
-
 const PresentationEntry = enum { text, table, code_block, thematic_rule };
 
 const StreamTraceEntry = union(enum) {
@@ -953,40 +951,6 @@ fn assert_frozen_ansi_span_fixture() !void {
     try std.testing.expect(std.mem.find(u8, capture.text_spans.items[3], "\x1b]8;") == null);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkStreamPresentationAllocationFailures(alloc: Allocator) !void {
     var capture = StreamCapture{ .capture_alloc = alloc };
     defer capture.deinit(alloc);
@@ -1048,10 +1012,3 @@ fn checkSemanticCodeBlockCaptureAllocationFailures(alloc: Allocator) !void {
 
     try std.testing.expectEqual(@as(usize, 1), capture.code_blocks.items.len);
 }
-
-
-
-
-
-
-

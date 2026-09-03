@@ -325,11 +325,3 @@ pub fn toolExecutionResultKind(result: ToolExecutionResult) []const u8 {
     if (result.display_output != null) return "display";
     return "model_output";
 }
-
-
-
-
-
-
-
-

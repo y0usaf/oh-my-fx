@@ -206,25 +206,3 @@ pub fn appendTokenProgressSuffix(writer: *std.Io.Writer, progress: types.TurnTok
 pub fn appendTurnTokenSuffix(writer: *std.Io.Writer, stream: StreamState) !void {
     try appendTokenProgressSuffix(writer, stream.token_progress);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

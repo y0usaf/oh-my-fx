@@ -2525,7 +2525,6 @@ noinline fn failReloadedAuthorityClaimDynamic(err: anyerror) anyerror!operation.
     return err;
 }
 
-
 pub const RecoveredExecutionScope = struct {
     workspace_root: []u8,
 
@@ -6030,7 +6029,6 @@ noinline fn failRecordDynamic(err: anyerror) anyerror!Record {
     return err;
 }
 
-
 fn load_record(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
@@ -6761,9 +6759,6 @@ fn checkpoint_envelopes_equal(
         std.mem.eql(u8, &left.checksum, &right.checksum);
 }
 
-
-
-
 const test_process_provider = background_process_provider.Provider{
     .spawn_prepared_fn = testSpawnPrepared,
     .capture_token_fn = testCaptureToken,
@@ -7185,7 +7180,6 @@ fn test_process_owner(
     return contracts.ProcessOwner.init(@intCast(pid), token.view());
 }
 
-
 fn recovered_session_index(
     sessions: []const DurableSession,
     session_id: []const u8,
@@ -7267,44 +7261,6 @@ fn expect_pending_close_unchanged(
     );
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const MonitorCrashCase = enum {
     every_check,
     every_n_checks,
@@ -7378,10 +7334,6 @@ fn advance_monitor_crash_case(
     return decision.notify orelse error.TestExpectedMonitorNotification;
 }
 
-
-
-
-
 const ReconciliationCancellation = struct {
     observed_attempts: *std.atomic.Value(u8),
     cancelled: *std.atomic.Value(bool),
@@ -7393,23 +7345,3 @@ const ReconciliationCancellation = struct {
         self.cancelled.store(true, .release);
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

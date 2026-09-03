@@ -2751,8 +2751,6 @@ pub fn prepareTranscriptDocumentAppendBytes(
     return result;
 }
 
-
-
 pub const PreparedResumeDocumentAppend = struct {
     bytes: []u8 = &.{},
     endpoint_resume_bytes: []u8 = &.{},
@@ -2961,9 +2959,6 @@ fn advanceResetReplayDocumentCursor(
         partial_skip_rows.* = 0;
     }
 }
-
-
-
 
 fn preparedProjectionBoundary(
     prepared: *const PreparedTranscriptSurfacePaint,
@@ -3442,29 +3437,3 @@ fn expectGridContains(grid: *vt_emulator.Grid, alloc: Allocator, needle: []const
     }
     return error.ExpectedTextNotFound;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

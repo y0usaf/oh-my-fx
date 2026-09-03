@@ -49,4 +49,3 @@ pub fn updateEdgeStart(current_start: usize, count: usize, selected: usize, max_
     }
     return start;
 }
-

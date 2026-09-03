@@ -44,4 +44,3 @@ fn sendPrepared(
 ) anyerror!stream_provider.Result {
     return xai_grok.streamPrepared(alloc, request, payload);
 }
-

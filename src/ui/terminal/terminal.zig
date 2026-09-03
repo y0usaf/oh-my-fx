@@ -65,11 +65,3 @@ pub fn isInvalidLayoutError(err: anyerror) bool {
 pub fn moveCursorSequence(buf: []u8, row: u16, col: u16) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x1b[{d};{d}H", .{ row, col });
 }
-
-
-
-
-
-
-
-

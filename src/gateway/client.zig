@@ -66,10 +66,6 @@ fn connectedIoFailureWithWatch(
     return if (watch) |state| state.finish_error(mapped) else mapped;
 }
 
-
-
-
-
 const HttpResult = struct {
     status: std.http.Status,
     body: []u8,
@@ -503,7 +499,6 @@ fn failedGatewayJsonStatus(status: std.http.Status) ?std.http.Status {
     return if (status == .ok) null else status;
 }
 
-
 fn gatewayBaseUrl() []const u8 {
     const override = io_mod.getenv("FX_GATEWAY_BASE_URL") orelse return default_gateway_base_url;
     // The base URL carries the bearer token; only a loopback HTTP override is
@@ -649,8 +644,6 @@ const ConnectionSetupTiming = struct {
 const ResponseHeadTiming = struct {
     timeout_ms: i64 = 30_000,
 };
-
-
 
 const ConnectionSetupEpoch = struct {
     deadline: std.Io.Clock.Timestamp,
@@ -964,8 +957,6 @@ fn expectConnectionSetupActionTag(
     try std.testing.expectEqual(expected, std.meta.activeTag(action));
 }
 
-
-
 pub const StreamRequest = struct {
     api_key: []const u8,
     model: []const u8,
@@ -1034,7 +1025,6 @@ fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]c
     }
     return null;
 }
-
 
 pub fn streamGatewayRequiredToolCompletionBounded(
     alloc: std.mem.Allocator,
@@ -1495,8 +1485,6 @@ fn gatewayModelCatalogExtraHeaders(buf: []std.http.Header, team: ?[]const u8) []
     return buf[0..len];
 }
 
-
-
 fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
     for (headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
@@ -1748,9 +1736,6 @@ fn spawn_gateway_cancel_watcher(
         stream,
     });
 }
-
-
-
 
 fn resolveE2eGatewayUrl(env_name: []const u8, default_url: []const u8) ![]const u8 {
     return selectE2eGatewayUrl(io_mod.getenv(env_name), default_url);
@@ -3261,63 +3246,9 @@ fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     return io_mod.readFileToEnd(alloc, &file, 65536);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // Gateway `tool-call` events may send `input` as parsed JSON instead of a
 // serialized string. Normalize it so downstream tool dispatch always receives
 // a JSON argument buffer.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn consolidatedToolCallSseForTest(
     alloc: std.mem.Allocator,
@@ -3332,9 +3263,6 @@ fn consolidatedToolCallSseForTest(
     try out.writer.writeAll("\"}}\n\ndata: [DONE]\n\n");
     return out.toOwnedSlice();
 }
-
-
-
 
 fn checkConsumeSseAllocationFailures(alloc: std.mem.Allocator) !void {
     const payload =
@@ -3383,13 +3311,6 @@ fn checkConsumeSseAllocationFailures(alloc: std.mem.Allocator) !void {
         types.authoritativeToolAdmission(completion),
     );
 }
-
-
-
-
-
-
-
 
 const BoundedProbeStage = enum {
     request_open,
@@ -3885,21 +3806,6 @@ const ConnectionSetupHarness = struct {
 
 fn discardConnectionSetupTestChunk(_: *anyopaque, _: []const u8) void {}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 var stable_models_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableModelsTestEnviron() !*const std.process.Environ.Map {
@@ -4000,9 +3906,6 @@ fn expectCancellableGatewayJsonCancellation(
     try std.testing.expect(elapsed_ms < max_elapsed_ms);
 }
 
-
-
-
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {
     var socket_buffer: [4096]u8 = undefined;
     var reader = stream.reader(zio, &socket_buffer);
@@ -4059,7 +3962,6 @@ fn writeLoopbackGatewayBytes(zio: std.Io, stream: std.Io.net.Stream, bytes: []co
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();
 }
-
 
 fn expectBoundedLoopbackTimeout(
     mode: LoopbackGatewayMode,
@@ -4163,26 +4065,6 @@ fn expectBoundedLoopbackCancellation(
     try std.testing.expect(fixture.reached_stage.load(.seq_cst));
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectDirectLoopbackCancellation(
     mode: LoopbackGatewayMode,
     payload: []const u8,
@@ -4258,10 +4140,3 @@ fn expectDirectLoopbackCancellation(
     try std.testing.expect(cancel_flag.load(.seq_cst));
     try std.testing.expect(elapsed_ms < max_elapsed_ms);
 }
-
-
-
-
-
-
-

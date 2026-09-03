@@ -293,10 +293,3 @@ fn checkProjection(
     }
     return .valid;
 }
-
-
-
-
-
-
-

@@ -360,7 +360,6 @@ fn agent_terminal_lease_transition(
     };
 }
 
-
 fn normalize_terminal_request_tool_calls(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
@@ -398,9 +397,6 @@ fn normalize_terminal_request_tool_calls(
     return normalized orelse source;
 }
 
-
-
-
 fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void {
     const terminal_tool = tool_dispatch.Tool{
         .name = "terminal",
@@ -437,8 +433,6 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     );
     try std.testing.expectEqualStrings("{\"request\":{\"action\":\"list\"}}", projected[1].tool_calls[0].arguments_json);
 }
-
-
 
 fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !void {
     const native_terminal = tool_dispatch.Tool{
@@ -481,7 +475,6 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
         normalized[2].arguments_json,
     );
 }
-
 
 fn resolveLiveToolAuthority(
     deps: *const AgentRuntimeDeps,
@@ -544,7 +537,6 @@ fn snapshotRootPermissionMode(deps: *const AgentRuntimeDeps) ?types.PermissionMo
     const snapshot = deps.snapshot_root_permission_mode orelse return null;
     return snapshot(deps.ctx);
 }
-
 
 fn rejectPermissionForLiveAuthority(
     outcome: *command_admission.PermissionOutcome,
@@ -1474,7 +1466,6 @@ fn shouldRejectRecoveryAuthority(
     );
 }
 
-
 fn checkpointCause(
     cause: model_response_recovery.FailureCause,
 ) types.ModelRecoveryCause {
@@ -2210,7 +2201,6 @@ fn request_max_output_tokens(capabilities: model_capabilities.Capabilities) ?u32
     return max_output_tokens;
 }
 
-
 fn processQueuedPromptInner(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -2573,7 +2563,6 @@ fn visionFallbackMode(
     }
     return .optional;
 }
-
 
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
@@ -7381,4 +7370,3 @@ pub fn copyLatestStopPartial(
     else
         try alloc.dupe(u8, partial);
 }
-

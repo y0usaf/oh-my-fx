@@ -95,4 +95,3 @@ pub fn traceLogPath(alloc: Allocator, home: []const u8) ![]u8 {
 pub fn recordingsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, recordings_dir_name });
 }
-

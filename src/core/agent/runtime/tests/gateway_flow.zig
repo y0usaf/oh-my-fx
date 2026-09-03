@@ -144,8 +144,6 @@ fn expectRouteStatus(
     try std.testing.expectEqualStrings(expected_label, status.label(&label_buf));
 }
 
-
-
 fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);
@@ -480,33 +478,11 @@ fn expectNoPromptCacheControlAfter(gateway: *const FakeGateway, index: usize, ne
     try std.testing.expect(std.mem.find(u8, body[start..], "cacheControl") == null);
 }
 
-
-
-
-
-
-
 fn deleteLocallyFilteredSnapshots(images: []const types.ImageAttachment) !void {
     for (images) |image| {
         try std.Io.Dir.deleteFileAbsolute(std.testing.io, image.snapshot_path.?);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const scripted_vision_args = "{\"image_ids\":[1],\"focus\":\"inspect\"}";
 const scripted_vision_ok =
@@ -520,127 +496,3 @@ fn scriptedVisionCatalog(
 ) !types.ImageAttachment {
     return testCapturedImage(alloc, tmp, image_path, 1);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

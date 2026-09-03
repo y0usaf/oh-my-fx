@@ -248,8 +248,6 @@ pub fn paintFooterIntoSurface(
     };
 }
 
-
-
 const FrameSink = struct {
     output: std.ArrayList(u8) = .empty,
 
@@ -323,9 +321,3 @@ fn footerSurfaceTestPlan(cols: u16) paint_plan.PaintPlan {
         .preserve_scrollback = true,
     };
 }
-
-
-
-
-
-

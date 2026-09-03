@@ -1956,7 +1956,6 @@ pub fn captureHostAuthorityWithMcpView(
     );
 }
 
-
 fn commandTarget(command: domain.Command) ?[]const u8 {
     return switch (command) {
         .create => null,
@@ -2142,7 +2141,6 @@ fn freshChildState(
         .total_output_tokens = 0,
     };
 }
-
 
 fn reservationWasCommitted(
     alloc: Allocator,
@@ -2496,7 +2494,6 @@ fn forkIdentityIssuer(
     std.c._exit(0);
 }
 
-
 const TestAuthority = struct {
     root_id: []const u8,
     tools: []const []const u8 = &.{"subagent"},
@@ -2608,7 +2605,6 @@ fn forceDurableReplayHorizon(
     }
 }
 
-
 fn testOptions(caller_id: []const u8, invocation_id: []const u8) ExecuteOptions {
     return .{
         .caller_id = caller_id,
@@ -2636,9 +2632,6 @@ fn testHumanOptions(invocation_id: []const u8) HumanCommandOptions {
         .timestamp_ms = 10,
     };
 }
-
-
-
 
 const AuthorizationRaceIds = struct {
     const root = "01J00000000000000000000000";
@@ -2817,9 +2810,6 @@ const PausedPermissionConfigure = struct {
     }
 };
 
-
-
-
 fn resultChildIdAlloc(alloc: Allocator, result_json: []const u8) ![]u8 {
     return resultStringAlloc(alloc, result_json, "child_id");
 }
@@ -2900,16 +2890,6 @@ fn resultStringAlloc(
     return alloc.dupe(u8, raw.string);
 }
 
-
-
-
-
-
-
-
-
-
-
 const BlockingChild = struct {
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -2926,8 +2906,6 @@ const BlockingChild = struct {
         return error.Cancelled;
     }
 };
-
-
 
 const RecoverySyncBarrier = struct {
     entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -2975,14 +2953,6 @@ const ConcurrentRecovery = struct {
     }
 };
 
-
-
-
-
-
-
-
-
 const ConcurrentCreate = struct {
     host: *Runtime,
     root_id: []const u8,
@@ -3028,11 +2998,6 @@ const FailFirstTwoDirSyncs = struct {
         if (self.calls <= 2) return error.InjectedDirSyncFailure;
     }
 };
-
-
-
-
-
 
 const CountingChild = struct {
     completed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -3223,9 +3188,3 @@ fn waitForRegisteredChildWaiter(owner: *execution.Owner) !void {
     }
     return error.TestUnexpectedResult;
 }
-
-
-
-
-
-

@@ -372,8 +372,3 @@ fn containsWordIgnoreCase(source: []const u8, word: []const u8) bool {
 fn isWordByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
-
-
-
-
-

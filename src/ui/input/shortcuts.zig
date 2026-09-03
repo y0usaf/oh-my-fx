@@ -64,7 +64,3 @@ pub fn fromEscapeAction(action: InputEscapeAction) ?ShortcutAction {
         else => null,
     };
 }
-
-
-
-

@@ -23,6 +23,3 @@ pub const registry = mode_registry.Registry{
 pub fn lookup(id: []const u8) ?*const ModeSpec {
     return registry.lookup(id);
 }
-
-
-

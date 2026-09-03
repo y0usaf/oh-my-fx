@@ -1658,7 +1658,3 @@ fn reference_fold(codepoint: u21) u21 {
     }
     return codepoint;
 }
-
-
-
-

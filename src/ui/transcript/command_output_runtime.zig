@@ -138,7 +138,6 @@ pub const CommandOutputRenderPolicy = struct {
     },
 };
 
-
 pub const compact_output_row_limit: usize = 5;
 
 pub const CommandOutputEntryProjection = struct {
@@ -1336,7 +1335,6 @@ fn retainedCommandOutputBytes(shell: anytype, block_index: usize) usize {
         commandOutputBlockRetainedBytes(shell.command_output_blocks.items[block_index]);
 }
 
-
 fn commandStreamIndex(stream: command_output_content.Stream) usize {
     return switch (stream) {
         .stdout => 0,
@@ -1878,7 +1876,6 @@ fn appendDimmedCommandRowsWithGutterStyle(
     }
 }
 
-
 fn foldedHint(alloc: Allocator, hidden_records: usize, cols: u16) ![]u8 {
     const noun = if (hidden_records == 1) "line" else "lines";
     const candidates = [_][]u8{
@@ -1948,14 +1945,6 @@ pub fn renderCommandOutputRecordWithPrimaryGutter(
     try out.append(alloc, '\n');
     return out.toOwnedSlice(alloc);
 }
-
-
-
-
-
-
-
-
 
 pub fn syncCommandOutputBlockEntries(shell: anytype, alloc: Allocator) !bool {
     if (shell.command_output_blocks.items.len == 0) return false;

@@ -268,9 +268,3 @@ fn buildSnapshot(
         incidents[0..incident_count],
     );
 }
-
-
-
-
-
-

@@ -1355,19 +1355,6 @@ fn writeModesArray(w: *std.Io.Writer, registry: mode_registry.Registry) !void {
     try w.writeAll("]");
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 var acp_session_stable_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableAcpSessionTestEnviron() !*const std.process.Environ.Map {
@@ -1487,7 +1474,3 @@ fn initAcpSessionTestState(
         .max_tool_result_bytes = 64 * 1024,
     };
 }
-
-
-
-

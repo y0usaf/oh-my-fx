@@ -364,7 +364,6 @@ fn readOnlyScopeRequiresCanonicalReplay(
     };
 }
 
-
 fn testDeferredCacheToken(session_id: []const u8) summary_codec.DeferredCacheToken {
     return .{
         .session_id = @constCast(session_id),
@@ -377,7 +376,6 @@ fn testDeferredCacheToken(session_id: []const u8) summary_codec.DeferredCacheTok
         },
     };
 }
-
 
 fn retainWorkspaceSummaries(alloc: Allocator, summaries: *std.ArrayList(SessionSummary), workspace_root: []const u8) void {
     var write_index: usize = 0;
@@ -4590,10 +4588,6 @@ fn deleteSnapshotFilesAddedByMigration(
     }
 }
 
-
-
-
-
 pub fn isPristineStartedSession(loaded: *const LoadedWritableSession) bool {
     return loaded.freshly_started and
         std.mem.eql(u8, loaded.active_id, loaded.state.id) and
@@ -4857,7 +4851,6 @@ fn writeSessionFixture(alloc: Allocator, store: Store, id: []const u8, text: []c
     try writeRawFile(path, text);
     return path;
 }
-
 
 fn chmodPath(alloc: Allocator, path: []const u8, mode: std.c.mode_t) !void {
     const path_z = try alloc.dupeZ(u8, path);
@@ -5897,31 +5890,6 @@ const MigrationInterruptedStableCopyCorruption = struct {
     }
 };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectWorkspaceRebindPublicationFailureRepair(
     session_id: []const u8,
     force_compaction: bool,
@@ -5999,134 +5967,3 @@ fn expectWorkspaceRebindPublicationFailureRepair(
     defer pointer.deinit(alloc);
     try std.testing.expectEqualStrings(state.id, pointer.session_id);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

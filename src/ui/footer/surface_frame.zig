@@ -1407,7 +1407,6 @@ fn surfaceTestContext(input: *InputRuntime) RenderContext {
     };
 }
 
-
 fn surfaceTestShell(rows: u16, cols: u16) TranscriptRuntime {
     return .{
         .layout = .{
@@ -1442,25 +1441,6 @@ fn expectMeasuredPickerRows(
     try std.testing.expectEqual(expected_rows, measurement.picker_rows);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn surfaceHasInvalidation(
     set: paint_plan.FrameInvalidationSet,
     reason: paint_plan.FrameInvalidationReason,
@@ -1472,18 +1452,6 @@ fn surfaceHasInvalidation(
     }
     return false;
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn surfaceTestRetargetPaintPlan(top: u16) PaintPlan {
     const rows = footer_layout.FooterRows{
@@ -1558,5 +1526,3 @@ fn surfaceTestApprovalFileRequest(
         .scope = .workspace_files,
     };
 }
-
-

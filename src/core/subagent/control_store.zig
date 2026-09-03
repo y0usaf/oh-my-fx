@@ -130,7 +130,6 @@ noinline fn failOptionalRecordDynamic(err: anyerror) anyerror!?Record {
     return err;
 }
 
-
 pub const Store = struct {
     capability: *session_child_store.SessionChildCapability,
     expected_child_id: []const u8,
@@ -1881,16 +1880,6 @@ fn testRecord(alloc: Allocator) !Record {
     };
 }
 
-
-
-
-
-
-
-
-
-
-
 fn testBorrowedMessage(
     id: []const u8,
     status: domain.QueueStatus,
@@ -1993,8 +1982,6 @@ fn expectInvalidSequence(
     );
 }
 
-
-
 fn checkControlCompactionAllocationFailures(alloc: Allocator) !void {
     var record = try testRecord(alloc);
     defer record.deinit(alloc);
@@ -2083,8 +2070,6 @@ fn checkControlCompactionAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), retained.queue.len);
     try std.testing.expectEqualStrings("work-3", retained.queue[0].id);
 }
-
-
 
 fn fuzzControlRecord(_: void, smith: *std.testing.Smith) !void {
     var buffer: [8192]u8 = undefined;

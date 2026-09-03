@@ -35,5 +35,3 @@ fn isLowerHex(text: []const u8) bool {
     }
     return true;
 }
-
-

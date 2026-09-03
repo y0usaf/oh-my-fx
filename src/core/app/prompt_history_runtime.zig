@@ -222,8 +222,6 @@ pub const PromptHistoryRuntime = struct {
     }
 };
 
-
-
 const BusyLockState = struct {
     now_ms: i64 = 0,
 
@@ -241,5 +239,3 @@ const BusyLockState = struct {
         self.now_ms += @intCast(millis);
     }
 };
-
-

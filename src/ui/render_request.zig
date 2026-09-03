@@ -359,11 +359,6 @@ fn reasonsAffectApproval(reasons: ReasonSet) bool {
     return relevant.count() > 0;
 }
 
-
-
-
-
-
 fn failFramePreparation(
     state: *RenderRequestState,
     alloc: std.mem.Allocator,
@@ -375,12 +370,3 @@ fn failFramePreparation(
     const scratch = try alloc.alloc(u8, 1);
     defer alloc.free(scratch);
 }
-
-
-
-
-
-
-
-
-

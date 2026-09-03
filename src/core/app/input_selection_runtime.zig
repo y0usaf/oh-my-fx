@@ -96,5 +96,3 @@ const TestClipboard = struct {
         return true;
     }
 };
-
-

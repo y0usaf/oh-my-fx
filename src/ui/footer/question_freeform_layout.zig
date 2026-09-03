@@ -214,9 +214,3 @@ fn cursorAtColumn(
     }
     return last_owned;
 }
-
-
-
-
-
-

@@ -471,16 +471,6 @@ fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {
     return .{ .id = id, .name = name, .arguments_json = args };
 }
 
-
-
-
-
-
-
-
-
-
-
 fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
     const call = toolCall(
         "call_read",
@@ -522,4 +512,3 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("first context notice", duplicated.execution.context_notices[0]);
     try std.testing.expectEqualStrings("second context notice", duplicated.execution.context_notices[1]);
 }
-

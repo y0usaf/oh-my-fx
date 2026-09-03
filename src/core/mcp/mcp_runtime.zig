@@ -8979,25 +8979,6 @@ fn loadStoredCredentials(
     );
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const StdioCallOutcome = struct {
     generation: u64,
     protocol: StdioProtocol,
@@ -9196,9 +9177,6 @@ fn connectionAttemptControl(
     attempt.use_startup_timeout = false;
     return attempt;
 }
-
-
-
 
 fn connectServerForDiscovery(
     runtime: *McpRuntime,
@@ -13600,31 +13578,6 @@ fn checkAllocateToolNameCollisionAllocFailures(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("mcp_a_b_c_2", name);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn shellMcpConfigForTest(alloc: Allocator, name: []const u8, script: []const u8) !McpServerConfig {
     const owned_name = try alloc.dupe(u8, name);
     errdefer alloc.free(owned_name);
@@ -13759,14 +13712,6 @@ fn testProcessIsZombie(pid: std.posix.pid_t) bool {
     const read_len = reader.interface.readSliceShort(&status_buf) catch return false;
     return std.mem.find(u8, status_buf[0..read_len], "\nState:\tZ") != null;
 }
-
-
-
-
-
-
-
-
 
 fn resourceTemplateSnapshotServerForTest(
     templates: []resources_feature.Template,
@@ -13942,10 +13887,6 @@ fn checkResourceReadFinishAllocationFailures(
     try expectResourceText(result, "owned contents");
 }
 
-
-
-
-
 fn checkResourceSnapshotWithTemplatesAllocationFailures(alloc: Allocator) !void {
     var templates = [_]resources_feature.Template{.{
         .uri_template = @constCast("memory://{value}"),
@@ -13970,21 +13911,6 @@ fn checkResourceSnapshotWithTemplatesAllocationFailures(alloc: Allocator) !void 
     try std.testing.expectEqualStrings("memory://accepted", snapshot.requested_uri.?);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkModelCatalogSnapshotAllocationFailures(alloc: Allocator) !void {
     var runtime = McpRuntime.init(std.testing.allocator);
     defer runtime.deinit();
@@ -14005,7 +13931,6 @@ fn checkModelCatalogSnapshotAllocationFailures(alloc: Allocator) !void {
     snapshot.deinit(alloc);
 }
 
-
 fn checkHealthSnapshotAllocationFailures(alloc: Allocator) !void {
     var runtime = McpRuntime.init(std.testing.allocator);
     defer runtime.deinit();
@@ -14017,13 +13942,6 @@ fn checkHealthSnapshotAllocationFailures(alloc: Allocator) !void {
     var snapshot = try runtime.snapshotHealth(alloc, 42);
     defer snapshot.deinit(alloc);
 }
-
-
-
-
-
-
-
 
 fn checkToolSnapshotBuildAllocationFailures(alloc: Allocator) !void {
     var used = std.StringHashMap(void).init(alloc);
@@ -14063,7 +13981,6 @@ fn checkCursorReplacementAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("second", cursor.?);
 }
 
-
 fn checkServerDiagnosticSnapshotAllocationFailures(alloc: Allocator) !void {
     var runtime = McpRuntime.init(alloc);
     defer runtime.servers.deinit(alloc);
@@ -14081,23 +13998,6 @@ fn checkServerDiagnosticSnapshotAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqualStrings("fixture", snapshot.items[0].name);
     try std.testing.expectEqualStrings("fixture-error", snapshot.items[0].last_error.?);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkAccessSnapshotAllocationFailures(alloc: Allocator) !void {
     var runtime = McpRuntime.init(std.testing.allocator);
@@ -14122,14 +14022,3 @@ fn checkAccessSnapshotAllocationFailures(alloc: Allocator) !void {
     var view = try runtime.snapshotAccessView(alloc, "child", "parent", .{}, true);
     defer view.deinit(alloc);
 }
-
-
-
-
-
-
-
-
-
-
-

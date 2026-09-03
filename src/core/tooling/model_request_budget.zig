@@ -23,4 +23,3 @@ fn addOptionalStrings(total: *usize, maybe_strings: ?[]const []const u8) !void {
 fn addBytes(total: *usize, count: usize) !void {
     total.* = try std.math.add(usize, total.*, count);
 }
-

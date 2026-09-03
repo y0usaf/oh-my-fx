@@ -900,9 +900,6 @@ fn validAdditionalDirectoryPath(path: []const u8) bool {
         std.mem.findScalar(u8, path, 0) == null;
 }
 
-
-
-
 fn applyMutationToRoot(
     arena: Allocator,
     root: *std.json.Value,
@@ -1984,54 +1981,3 @@ fn writeStoreFixture(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !v
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

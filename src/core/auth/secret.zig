@@ -6,4 +6,3 @@ pub noinline fn zeroAndFree(alloc: std.mem.Allocator, value: []u8) void {
     std.crypto.secureZero(u8, @volatileCast(value));
     alloc.free(value);
 }
-

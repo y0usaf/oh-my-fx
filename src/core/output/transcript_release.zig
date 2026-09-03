@@ -73,6 +73,3 @@ pub const State = struct {
 fn earlier(current: ?usize, candidate: usize) usize {
     return if (current) |value| @min(value, candidate) else candidate;
 }
-
-
-

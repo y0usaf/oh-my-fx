@@ -771,12 +771,6 @@ fn requireBool(object: std.json.ObjectMap, key: []const u8) !bool {
     return value.bool;
 }
 
-
-
-
-
-
-
 fn checkIdentityReservationAllocationFailures(alloc: Allocator) !void {
     var record = try Record.init(alloc, "root-id");
     defer record.deinit(alloc);
@@ -795,9 +789,6 @@ fn checkIdentityReservationAllocationFailures(alloc: Allocator) !void {
     defer alloc.free(operation_id);
     try std.testing.expect(record.hasOutstanding(operation_id));
 }
-
-
-
 
 fn checkCreateCompactionAllocationFailures(alloc: Allocator) !void {
     var record = try Record.init(alloc, "root-id");
@@ -818,8 +809,6 @@ fn checkCreateCompactionAllocationFailures(alloc: Allocator) !void {
     defer alloc.free(bytes);
     try std.testing.expect(retained.entries.len < record.entries.len);
 }
-
-
 
 fn fuzzCreateRecord(_: void, smith: *std.testing.Smith) !void {
     var buffer: [8192]u8 = undefined;

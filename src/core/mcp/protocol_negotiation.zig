@@ -313,11 +313,3 @@ pub fn protocolErrorSupportsVersionForRequest(
     }
     return found;
 }
-
-
-
-
-
-
-
-

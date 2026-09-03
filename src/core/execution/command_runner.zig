@@ -1600,8 +1600,6 @@ fn executeRawInvocation(
     return formatCollectedOutput(alloc, command, cwd, result);
 }
 
-
-
 fn formatExitOutput(alloc: Allocator, command: []const u8, cwd: []const u8, exit_code: i64, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
     return command_contract.formatForegroundCommandResult(alloc, .{
         .command = command,
@@ -2528,9 +2526,6 @@ fn shellQuote(arena: Allocator, input: []const u8) ![]const u8 {
     return try out.toOwnedSlice();
 }
 
-
-
-
 fn spawnForegroundSessionBootstrapForTest(
     workspace: []const u8,
     target_script: []const u8,
@@ -2612,22 +2607,6 @@ fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !vo
     try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const FailFirstCommandArtifactSync = struct {
     calls: usize = 0,
 
@@ -2649,8 +2628,6 @@ const FailCommandArtifactSync = struct {
         return error.InjectedParentSyncFailure;
     }
 };
-
-
 
 fn metadataField(output: []const u8, prefix: []const u8) ?[]const u8 {
     var remaining = output;
@@ -2746,29 +2723,6 @@ const DelayAfterOutput = struct {
     }
 };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectProcessGone(pid: std.posix.pid_t) !void {
     const started_ms = io_mod.milliTimestamp();
     while (true) {
@@ -2783,14 +2737,3 @@ fn expectProcessGone(pid: std.posix.pid_t) !void {
         io_mod.sleep(10 * std.time.ns_per_ms);
     }
 }
-
-
-
-
-
-
-
-
-
-
-

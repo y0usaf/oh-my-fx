@@ -671,7 +671,3 @@ fn testFact(
         .total_cost = total_cost,
     };
 }
-
-
-
-

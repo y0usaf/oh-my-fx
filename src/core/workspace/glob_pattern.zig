@@ -173,8 +173,3 @@ fn expectCompiledMatch(pattern: []const u8, candidate_path: []const u8, expected
     defer compiled.deinit(std.testing.allocator);
     try std.testing.expectEqual(expected, compiled.matchesPath(candidate_path));
 }
-
-
-
-
-

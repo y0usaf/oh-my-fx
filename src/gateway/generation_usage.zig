@@ -232,13 +232,6 @@ fn parseOptionalNonNegativeInteger(value: ?std.json.Value) !?u64 {
     return try parseNonNegativeInteger(actual);
 }
 
-
-
-
-
-
-
-
 fn fuzzGenerationRecord(_: void, smith: *std.testing.Smith) !void {
     var buffer: [4096]u8 = undefined;
     const len: usize = @intCast(smith.slice(&buffer));

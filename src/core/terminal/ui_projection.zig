@@ -187,8 +187,6 @@ fn labelFromRequest(request: contracts.ActionRequest) ?[]const u8 {
     };
 }
 
-
-
 fn checkUpsertAllocationFailures(alloc: Allocator) !void {
     var store: Store = .{};
     defer store.deinit(alloc);
@@ -198,7 +196,6 @@ fn checkUpsertAllocationFailures(alloc: Allocator) !void {
         "display label",
     );
 }
-
 
 fn testFacts(
     session_id: []const u8,

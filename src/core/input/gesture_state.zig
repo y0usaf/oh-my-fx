@@ -116,7 +116,3 @@ pub fn reset(current: State) ResetTransition {
         .cleared_escape_clear = current.escape_clear_armed_ms != null,
     };
 }
-
-
-
-

@@ -625,8 +625,6 @@ const TestHandler = struct {
     fn noteAttentionRequired(_: *anyopaque, _: definitions.AttentionRequiredInput) definitions.HandlerError!void {}
 };
 
-
-
 const RewriteCapture = struct {
     order: [4]u8 = undefined,
     count: usize = 0,
@@ -666,7 +664,6 @@ const RewriteCapture = struct {
     }
 };
 
-
 const OutputHandler = struct {
     output: []const u8,
     action: enum { rewrite, block, stop } = .rewrite,
@@ -686,8 +683,6 @@ const OutputHandler = struct {
     }
 };
 
-
-
 const ErrorHandler = struct {
     cancelled: bool,
 
@@ -703,7 +698,6 @@ const ErrorHandler = struct {
         return error.Failed;
     }
 };
-
 
 const StopCapture = struct {
     calls: usize = 0,
@@ -728,8 +722,6 @@ const StopCapture = struct {
         return .allow;
     }
 };
-
-
 
 const PostTurnEndCapture = struct {
     order: [4]u8 = undefined,
@@ -773,7 +765,6 @@ const PostTurnEndCapture = struct {
     }
 };
 
-
 const AttentionRequiredCapture = struct {
     order: [4]u8 = undefined,
     count: usize = 0,
@@ -810,7 +801,6 @@ const AttentionRequiredCapture = struct {
     }
 };
 
-
 const ConcurrentHandler = struct {
     calls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
@@ -839,4 +829,3 @@ const ConcurrentRun = struct {
         outcome.deinit(std.heap.page_allocator);
     }
 };
-

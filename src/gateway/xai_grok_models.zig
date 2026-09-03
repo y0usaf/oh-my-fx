@@ -379,12 +379,6 @@ fn validateCatalogModelCount(count: usize) !void {
     if (count > max_catalog_models) return error.InvalidGrokModelCatalog;
 }
 
-
-
-
-
-
-
 fn buildCatalogJson(alloc: std.mem.Allocator, model_count: usize, id_bytes: usize, total_bytes: usize) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -514,7 +508,6 @@ const CatalogBodyFixture = struct {
     }
 };
 
-
 var stable_catalog_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableCatalogTestEnviron() !*const std.process.Environ.Map {
@@ -608,5 +601,3 @@ fn expectCatalogFetchError(expected: anyerror, body: []const u8) !void {
     defer response.deinit(std.testing.allocator);
     return error.TestExpectedCatalogFailure;
 }
-
-

@@ -9,7 +9,6 @@ const command_replay_store = @import("../../session/command_replay_store.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
-
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
@@ -100,7 +99,6 @@ pub inline fn failToolExecutionResult(err: anytype) @TypeOf(err)!ToolExecutionRe
 noinline fn failToolExecutionResultDynamic(err: anyerror) anyerror!ToolExecutionResult {
     return err;
 }
-
 
 pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecutionResult {
     return .{

@@ -1714,8 +1714,6 @@ fn monotonicMillis() i64 {
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
-
-
 fn expectResponseError(expected: anyerror, payload: []const u8) !void {
     var reader: std.Io.Reader = .fixed(payload);
     var failure_stage: FailureStage = .response_head;
@@ -1736,14 +1734,6 @@ fn expectResponseBody(payload: []const u8, expected_status: u16, expected_body: 
     try std.testing.expectEqualStrings(expected_body, response.body);
 }
 
-
-
-
-
-
-
-
-
 fn appendRepeatedByte(list: *std.ArrayList(u8), alloc: Allocator, byte: u8, count: usize) !void {
     try list.ensureUnusedCapacity(alloc, count);
     for (0..count) |_| list.appendAssumeCapacity(byte);
@@ -1762,11 +1752,6 @@ fn appendBudgetedInterimResponse(
     try list.appendSlice(alloc, suffix);
 }
 
-
-
-
-
-
 fn appendTrailerLine(
     payload: *std.ArrayList(u8),
     alloc: Allocator,
@@ -1777,10 +1762,6 @@ fn appendTrailerLine(
     try appendRepeatedByte(payload, alloc, 'a', line_len - 2);
     try payload.appendSlice(alloc, "\r\n");
 }
-
-
-
-
 
 const FragmentedResponseReader = struct {
     payload: []const u8 = &.{},
@@ -1835,10 +1816,6 @@ const FragmentedResponseReader = struct {
         return n;
     }
 };
-
-
-
-
 
 const ZeroProgressReader = struct {
     calls: usize = 0,
@@ -2008,14 +1985,6 @@ fn pipeBackedTlsBoundaryReader(
     return fds[0];
 }
 
-
-
-
-
-
-
-
-
 const ResponseSpec = struct {
     status: std.http.Status,
     body: []const u8,
@@ -2140,11 +2109,6 @@ fn compressFlateForTest(alloc: Allocator, plain: []const u8, container: std.comp
     return output.toOwnedSlice();
 }
 
-
-
-
-
-
 fn replaceOwned(alloc: Allocator, slot: *?[]u8, value: []const u8) !void {
     if (slot.*) |old| alloc.free(old);
     slot.* = try alloc.dupe(u8, value);
@@ -2153,19 +2117,6 @@ fn replaceOwned(alloc: Allocator, slot: *?[]u8, value: []const u8) !void {
 fn ip(text: []const u8, port: u16) !IpAddress {
     return std.Io.net.IpAddress.parse(text, port);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn expectAndTraceResponseFailure(
     reader: *std.Io.Reader,
@@ -2208,7 +2159,6 @@ fn expectAndTraceTlsTruncation(
     return error.TestExpectedError;
 }
 
-
 const ScriptedDialer = struct {
     errors: []const ?anyerror,
     returned_fds: []const posix.fd_t,
@@ -2238,9 +2188,6 @@ const ScriptedDialer = struct {
         return error.ConnectionFailed;
     }
 };
-
-
-
 
 const ScriptedPoller = struct {
     result: enum { ready, interrupted_once, system_resources, network_down } = .ready,
@@ -2275,8 +2222,6 @@ const ScriptedPoller = struct {
     }
 };
 
-
-
 fn noOpSignalHandler(_: posix.SIG) callconv(.c) void {}
 
 const PollSignalStorm = struct {
@@ -2292,14 +2237,12 @@ const PollSignalStorm = struct {
     }
 };
 
-
 fn expectSyscallFailure(action: SyscallErrorAction, expected: anyerror) !void {
     switch (action) {
         .retry => return error.TestExpectedEqual,
         .failure => |err| try std.testing.expectEqual(expected, err),
     }
 }
-
 
 const InterruptingRead = struct {
     cancel_flag: *std.atomic.Value(bool),
@@ -2316,7 +2259,3 @@ const InterruptingRead = struct {
         return .{ .failure = .INTR };
     }
 };
-
-
-
-

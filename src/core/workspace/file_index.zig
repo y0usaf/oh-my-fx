@@ -1495,54 +1495,6 @@ fn runGitForFileIndexTest(alloc: Allocator, cwd: []const u8, argv: []const []con
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const TestLoaderGate = struct {
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1648,8 +1600,6 @@ fn installTestLoader(
     return generation;
 }
 
-
-
 fn checkBuildFromRawAllocationFailures(alloc: Allocator) !void {
     var index = FileIndex{};
     defer index.deinit(alloc);
@@ -1666,21 +1616,6 @@ fn checkBuildFromCandidatesAllocationFailures(alloc: Allocator) !void {
     defer index.deinit(alloc);
     try index.buildFromCandidates(alloc, &candidates);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn fuzzRawListAndQuery(_: void, smith: *std.testing.Smith) !void {
     var bytes: [4096]u8 = undefined;

@@ -353,20 +353,6 @@ fn ownerLabel(owner: Owner) []const u8 {
     };
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn readTraceFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());

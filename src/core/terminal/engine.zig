@@ -227,7 +227,6 @@ noinline fn failGridDynamic(err: anyerror) anyerror!Grid {
     return err;
 }
 
-
 pub const Grid = struct {
     alloc: Allocator,
     rows: u16,
@@ -3268,59 +3267,6 @@ fn expectWideCellInvariant(grid: Grid) !void {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn gridsEqual(a: Grid, b: Grid) bool {
     if (a.rows != b.rows or a.cols != b.cols) return false;
     var row: u16 = 1;
@@ -3360,30 +3306,6 @@ fn assertDiffRoundTrip(
     try testing.expect(gridsEqual(prev, next));
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn checkOwnedEngineAllocationFailures(alloc: Allocator) !void {
     var grid = try Grid.init(alloc, 12, 3);
     defer grid.deinit();
@@ -3396,7 +3318,3 @@ fn checkOwnedEngineAllocationFailures(alloc: Allocator) !void {
     var restored = try Grid.restoreCheckpoint(alloc, payload);
     defer restored.deinit();
 }
-
-
-
-

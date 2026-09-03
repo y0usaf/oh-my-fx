@@ -921,16 +921,6 @@ fn freeAnswers(alloc: Allocator, answers: [][]u8) void {
     alloc.free(answers);
 }
 
-
-
-
-
-
-
-
-
-
-
 fn checkAcceptedFormAllocationFailures(alloc: Allocator) !void {
     const required = tool_mcp_runtime.InputRequired{
         .input_requests_json =
@@ -950,7 +940,6 @@ fn checkAcceptedFormAllocationFailures(alloc: Allocator) !void {
     };
     alloc.free(response);
 }
-
 
 const Fixture = struct {
     answers: []const []const u8,

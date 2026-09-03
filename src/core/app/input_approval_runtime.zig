@@ -459,7 +459,6 @@ pub fn ApprovalRuntime(comptime App: type) type {
     };
 }
 
-
 const ApprovalBridgeEnvironment = struct {
     tmp: std.testing.TmpDir,
     home: []u8,
@@ -729,7 +728,6 @@ const ApprovalBridgeApp = struct {
         }
     }
 };
-
 
 fn prepareApprovalBridge(
     alloc: std.mem.Allocator,
@@ -1101,5 +1099,3 @@ fn runTwoApprovalBridgeScenario() !void {
     try std.testing.expectEqual(@as(usize, 0), app.subagents.runtime.snapshot.?.pending_approval_total);
     try std.testing.expect(app.subagents.runtime.mainApprovalRequest() == null);
 }
-
-

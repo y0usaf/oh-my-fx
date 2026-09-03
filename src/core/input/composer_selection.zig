@@ -79,5 +79,3 @@ const Fixture = struct {
         } };
     }
 };
-
-

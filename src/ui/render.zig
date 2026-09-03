@@ -569,16 +569,6 @@ pub fn isPrintableAscii(byte: u8) bool {
     return byte >= 32 and byte <= 126;
 }
 
-
-
-
-
-
-
-
-
-
-
 /// Writes the title to the same file the transcript renders to, so a host
 /// that redirects its output keeps the escape sequence out of the real
 /// stdout. `out` must outlive every call.
@@ -647,9 +637,6 @@ fn clearTerminalTitleProvider(raw: ?*anyopaque) void {
     out.writeStreamingAll(io_mod.getIo(), "\x1b]2;\x07") catch return;
 }
 
-
-
-
 pub fn formatResumeHandoff(
     buffer: []u8,
     session_id: []const u8,
@@ -665,32 +652,3 @@ pub fn formatResumeHandoff(
         .{ dim_style, label, separator, command, session_id, reset_style },
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

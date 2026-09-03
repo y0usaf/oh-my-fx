@@ -146,7 +146,3 @@ fn optionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
         try writer.writeAll("null");
     }
 }
-
-
-
-

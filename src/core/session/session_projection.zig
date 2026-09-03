@@ -83,7 +83,6 @@ noinline fn failCheckpointDynamic(err: anyerror) anyerror!Checkpoint {
     return err;
 }
 
-
 pub const EventBoundary = struct {
     log_generation: session_event.Identifier,
     seq: u64,
@@ -605,12 +604,6 @@ fn writeInt(
     std.mem.writeInt(T, destination[offset.*..][0..width], value, .big);
     offset.* += width;
 }
-
-
-
-
-
-
 
 fn testManifest() Manifest {
     return .{

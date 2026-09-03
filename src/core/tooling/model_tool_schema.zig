@@ -81,7 +81,6 @@ pub fn isSingleRequiredObjectUnionField(
     };
 }
 
-
 fn cappedDescriptionAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     if (text.len <= description_max_bytes) return alloc.dupe(u8, text);
 
@@ -280,11 +279,3 @@ fn writePropertySchema(
     }
     try writer.writeByte('}');
 }
-
-
-
-
-
-
-
-

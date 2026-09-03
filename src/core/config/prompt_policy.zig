@@ -9,4 +9,3 @@ pub const Policy = struct {
         return overlay_fn(model);
     }
 };
-

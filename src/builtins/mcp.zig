@@ -1227,7 +1227,6 @@ fn tmpPath(alloc: Allocator, root: []const u8, name: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ root, name });
 }
 
-
 fn tmpDirPath(alloc: Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
     return io_mod.dirRealpathAlloc(alloc, dir, sub_path);
 }
@@ -1246,52 +1245,3 @@ fn readFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

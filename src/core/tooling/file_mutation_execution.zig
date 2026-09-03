@@ -287,6 +287,3 @@ fn fileMutationRejectionResult(
         .model_output = try out.toOwnedSlice(),
     };
 }
-
-
-

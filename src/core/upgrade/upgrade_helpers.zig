@@ -342,14 +342,3 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8) ![]u8 {
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
 }
-
-
-
-
-
-
-
-
-
-
-

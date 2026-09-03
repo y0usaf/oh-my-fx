@@ -997,7 +997,6 @@ fn expectGridContains(h: *Harness, needle: []const u8) !void {
     return error.TestExpectedGridText;
 }
 
-
 fn expectGridNotContains(h: *Harness, needle: []const u8) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(h.alloc);
@@ -1257,52 +1256,6 @@ fn expectActiveInputSurvivesResize(
     try expectGridContains(&h, "test-mod");
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn appendImageTurn(h: *Harness, id: usize, path: []const u8, label: []const u8) !void {
     const text = try std.fmt.allocPrint(h.alloc, "[Image #{d}] {s}", .{ id, label });
     errdefer h.alloc.free(text);
@@ -1315,18 +1268,6 @@ fn appendImageTurn(h: *Harness, id: usize, path: []const u8, label: []const u8) 
     images[0] = .{ .id = id, .path = image_path, .media_type = media_type };
     _ = try h.shell.appendUserTurnOwned(h.alloc, .{ .text = text, .images = images });
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn applyCompletedReadForGroupFinalityResizeTest(
     h: *Harness,
@@ -1347,21 +1288,6 @@ fn applyCompletedReadForGroupFinalityResizeTest(
         .outcome = .{ .kind = .completed, .summary = "Read fixed-point fixture" },
     } });
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn checkQueuedPromptAdmissionPreservesCommittedHistory(resize_before_cancel: bool) !void {
     const alloc = std.testing.allocator;
@@ -1459,46 +1385,6 @@ fn checkQueuedPromptAdmissionPreservesCommittedHistory(resize_before_cancel: boo
     try expectGridContains(&h, "QUEUE_SCROLL_FIRST");
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 const approval_scrollback_transcript =
     "APPROVAL_SCROLLBACK_01\nAPPROVAL_SCROLLBACK_02\nAPPROVAL_SCROLLBACK_03\n" ++
     "APPROVAL_SCROLLBACK_04\nAPPROVAL_SCROLLBACK_05\nAPPROVAL_SCROLLBACK_06\n" ++
@@ -1514,29 +1400,6 @@ const approval_scrollback_transcript =
     "APPROVAL_SCROLLBACK_34\nAPPROVAL_SCROLLBACK_35\nAPPROVAL_SCROLLBACK_36\n" ++
     "APPROVAL_SCROLLBACK_37\nAPPROVAL_SCROLLBACK_38\nAPPROVAL_SCROLLBACK_39\n" ++
     "APPROVAL_SCROLLBACK_40\n";
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn readEmittedSince(h: *Harness, since_offset: u64) ![]u8 {
     const total = try h.file.length(io_mod.getIo());
@@ -1558,9 +1421,6 @@ fn gridContains(grid: Grid, needle: []const u8) !void {
     }
     return error.TestMissingMarker;
 }
-
-
-
 
 pub fn testReconstructiveFullTranscriptReplay() !void {
     const alloc = std.testing.allocator;
@@ -1637,14 +1497,6 @@ pub fn testReconstructiveFullTranscriptReplay() !void {
     try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
 }
 
-
-
-
-
-
-
-
-
 const CapacityWritePath = enum {
     write_transcript,
     append_replaceable,
@@ -1695,13 +1547,6 @@ fn assertCapacityInvariantUnderWrites(path: CapacityWritePath) !void {
     }
 }
 
-
-
-
-
-
-
-
 fn commandOutputStyles() transcript_runtime.Styles {
     return .{
         .system_notice_label_style = "",
@@ -1745,4 +1590,3 @@ fn expectGridOccurrenceCount(h: *Harness, needle: []const u8, expected: usize) !
         return error.TestUnexpectedGridText;
     }
 }
-

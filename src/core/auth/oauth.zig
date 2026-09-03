@@ -442,13 +442,3 @@ fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
 }
-
-
-
-
-
-
-
-
-
-

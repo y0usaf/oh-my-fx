@@ -582,31 +582,6 @@ fn logIndexContaining(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) ?u
     return null;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn expectRejectedPrompt(completion: FakeCompletion, expected_error: anyerror) !void {
     if (comptime !builtin.is_test) return;
     const alloc = std.testing.allocator;
@@ -669,62 +644,9 @@ fn expectSingleTerminalOutcome(
     try std.testing.expectEqual(@as(usize, 1), matches);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn failContextGateCommit() std.mem.Allocator.Error!void {
     return error.OutOfMemory;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn expectLogOrder(
     hooks: *const FakeAgentRuntimeDeps,
@@ -741,35 +663,3 @@ fn expectLogOrder(
     if (later_index == null) return error.MissingLaterLogEvent;
     if (earlier_index.? >= later_index.?) return error.LogEventOutOfOrder;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
