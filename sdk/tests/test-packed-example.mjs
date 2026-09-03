@@ -34,7 +34,7 @@ await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen
 const agent = await createFxAgent({
   backend,
   nativeAddon: resolve(packageRoot, `libfx.${platform}.node`),
-  wasm: resolve(packageRoot, "fx-core.wasm"),
+  wasm: resolve(packageRoot, "omfx-core.wasm"),
   fetch,
   apiKey: "packed-key",
   gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,

@@ -68,7 +68,7 @@ async function runChild() {
   const agent = await createFxAgent({
     backend,
     nativeAddon: resolve(repoRoot, "zig-out/lib/libfx.node"),
-    wasm: resolve(repoRoot, "zig-out/bin/fx-core.wasm"),
+    wasm: resolve(repoRoot, "zig-out/bin/omfx-core.wasm"),
     fetch: tracedFetch,
     home: repoRoot,
     workspaceRoot: repoRoot,

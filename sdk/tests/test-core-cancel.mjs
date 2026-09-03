@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { createFxAgent, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-core.wasm");
+const defaultWasm = resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm");
 const wasmPath = resolve(process.argv[2] || defaultWasm);
 
 if (!supportsJspi()) {
@@ -39,13 +39,14 @@ const agent = await Promise.race([
   backend: "wasm",
     wasm: await readFile(wasmPath),
     fetch: stalledFetch,
-    apiKey: "sdk-test-key",
+    env: { AI_GATEWAY_API_KEY: "sdk-test-key" },
   }),
   timeout("fx-core initialize"),
 ]);
 
+const session = await agent.createSession();
 const controller = new AbortController();
-const turn = agent.prompt("wait forever", { signal: controller.signal });
+const turn = session.prompt("wait forever", { signal: controller.signal });
 await Promise.race([fetchStarted, timeout("stalled gateway fetch")]);
 controller.abort();
 const result = await Promise.race([turn.result, timeout("cancelled prompt")]);
