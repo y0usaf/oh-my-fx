@@ -4562,19 +4562,6 @@ fn validateOrphanTemp(
     );
 }
 
-const BoundaryFailure = struct {
-    target: Boundary,
-
-    fn hit(raw: ?*anyopaque, point: Boundary) !void {
-        const self: *BoundaryFailure = @ptrCast(@alignCast(raw.?));
-        if (point == self.target) return error.InjectedBoundaryFailure;
-    }
-
-    fn test_controls(self: *BoundaryFailure) TestControls {
-        return .{ .context = self, .boundary_fn = hit };
-    }
-};
-
 const LockTrace = struct {
     items: [16]LockKind = undefined,
     len: usize = 0,
@@ -4587,30 +4574,6 @@ const LockTrace = struct {
 
     fn test_controls(self: *LockTrace) TestControls {
         return .{ .context = self, .lock_fn = record };
-    }
-};
-
-const TempRoot = struct {
-    tmp: std.testing.TmpDir,
-    home: []u8,
-    root: Root,
-
-    fn init(alloc: Allocator) !TempRoot {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
-        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-        errdefer alloc.free(home);
-        var root = try Root.initFromHome(alloc, home, .writable);
-        errdefer root.deinit(alloc);
-        return .{ .tmp = tmp, .home = home, .root = root };
-    }
-
-    fn deinit(self: *TempRoot, alloc: Allocator) void {
-        self.root.deinit(alloc);
-        alloc.free(self.home);
-        self.tmp.cleanup();
-        self.* = undefined;
     }
 };
 
@@ -4633,14 +4596,6 @@ fn testState(alloc: Allocator, id: []const u8, updated_at_ms: i64) !session_code
     };
 }
 
-fn stateWithTurn(
-    alloc: Allocator,
-    prior: session_codec.DurableSessionState,
-    updated_at_ms: i64,
-) !session_codec.DurableSessionState {
-    return stateWithPrompt(alloc, prior, updated_at_ms, "hello", "world");
-}
-
 fn stateWithPrompt(
     alloc: Allocator,
     prior: session_codec.DurableSessionState,
@@ -4659,155 +4614,6 @@ fn stateWithPrompt(
     next.total_input_tokens = 11;
     next.total_output_tokens = 7;
     return next;
-}
-
-const PendingReplacementTestPositions = struct {
-    prior: CommitPosition,
-    proposed: CommitPosition,
-};
-
-fn leavePendingReplacementForTest(
-    alloc: Allocator,
-    loaded: *LoadedWritableSession,
-    updated_at_ms: i64,
-) !PendingReplacementTestPositions {
-    var replacement = try stateWithTurn(alloc, loaded.state, updated_at_ms);
-    defer replacement.deinit(alloc);
-    var failure = BoundaryFailure{ .target = .after_target_namespace_sync };
-    try std.testing.expectError(
-        error.SessionCommitIndeterminate,
-        loaded.commitStateReplacement(
-            alloc,
-            replacement,
-            .recovery,
-            .retry_expected_tail,
-            .{ .test_controls = failure.test_controls() },
-        ),
-    );
-    const failed = loaded.degradedTail() orelse return error.TestUnexpectedResult;
-    return .{ .prior = failed.prior, .proposed = failed.proposed };
-}
-
-fn replaceFrameByteForTest(
-    alloc: Allocator,
-    log: std.Io.File,
-    frame_offset: u64,
-    boundary: u64,
-    needle: []const u8,
-    replacement: u8,
-) !void {
-    const line = try session_replay.readLineAt(
-        alloc,
-        log,
-        frame_offset,
-        boundary,
-    ) orelse return error.TestUnexpectedResult;
-    defer alloc.free(line.bytes);
-    const match = std.mem.find(u8, line.bytes, needle) orelse
-        return error.TestUnexpectedResult;
-    line.bytes[match + needle.len - 1] = replacement;
-    try log.writePositionalAll(io_mod.getIo(), line.bytes, frame_offset);
-    try log.sync(io_mod.getIo());
-}
-
-fn corruptReplacementCommitTimestampForTest(
-    alloc: Allocator,
-    loaded: *LoadedWritableSession,
-    positions: PendingReplacementTestPositions,
-) !void {
-    var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
-    defer log.close(io_mod.getIo());
-    var offset = positions.prior.through_event_log_bytes;
-    while (offset < positions.proposed.through_event_log_bytes) {
-        const line = try session_replay.readLineAt(
-            alloc,
-            log,
-            offset,
-            positions.proposed.through_event_log_bytes,
-        ) orelse return error.TestUnexpectedResult;
-        defer alloc.free(line.bytes);
-        var envelope = try session_event.decodeFrame(alloc, line.bytes);
-        defer envelope.deinit(alloc);
-        if (envelope.kind() == .state_replacement_committed) {
-            const needle = "\"timestamp_ms\":20";
-            const match = std.mem.find(u8, line.bytes, needle) orelse
-                return error.TestUnexpectedResult;
-            line.bytes[match + needle.len - 1] = '1';
-            try log.writePositionalAll(io_mod.getIo(), line.bytes, offset);
-            try log.sync(io_mod.getIo());
-            return;
-        }
-        offset = line.next_offset;
-    }
-    return error.TestUnexpectedResult;
-}
-
-fn corruptReplacementChunkSchemaForTest(
-    alloc: Allocator,
-    loaded: *LoadedWritableSession,
-    positions: PendingReplacementTestPositions,
-) !void {
-    var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
-    defer log.close(io_mod.getIo());
-    const start = try session_replay.readLineAt(
-        alloc,
-        log,
-        positions.prior.through_event_log_bytes,
-        positions.proposed.through_event_log_bytes,
-    ) orelse return error.TestUnexpectedResult;
-    defer alloc.free(start.bytes);
-    try replaceFrameByteForTest(
-        alloc,
-        log,
-        start.next_offset,
-        positions.proposed.through_event_log_bytes,
-        "\"schema_version\":1",
-        '9',
-    );
-}
-
-const PublicationBytesSnapshot = struct {
-    events: []u8,
-    watermark: []u8,
-    intent: []u8,
-
-    fn deinit(self: *PublicationBytesSnapshot, alloc: Allocator) void {
-        alloc.free(self.events);
-        alloc.free(self.watermark);
-        alloc.free(self.intent);
-        self.* = undefined;
-    }
-
-    fn expectEqual(self: PublicationBytesSnapshot, other: PublicationBytesSnapshot) !void {
-        try std.testing.expectEqualSlices(u8, self.events, other.events);
-        try std.testing.expectEqualSlices(u8, self.watermark, other.watermark);
-        try std.testing.expectEqualSlices(u8, self.intent, other.intent);
-    }
-};
-
-fn capturePublicationBytesForTest(
-    alloc: Allocator,
-    root: *Root,
-    session_id: []const u8,
-    generation: Identifier,
-) !PublicationBytesSnapshot {
-    var dir = try openSessionDir(&root.sessions.?, session_id, .read_only);
-    defer dir.close();
-    var log = try openManagedFile(&dir, events_file, .read_only);
-    defer log.close(io_mod.getIo());
-    const events = try io_mod.readFileToEnd(alloc, &log, 16 * 1024 * 1024);
-    errdefer alloc.free(events);
-    const name = try watermarkName(alloc, generation);
-    defer alloc.free(name);
-    const watermark = try readManagedFileAlloc(alloc, &dir, name, watermark_max_bytes);
-    errdefer alloc.free(watermark);
-    const intent = try readManagedFileAlloc(
-        alloc,
-        &dir,
-        publication_intent_file,
-        publication_intent_max_bytes,
-    );
-    return .{ .events = events, .watermark = watermark, .intent = intent };
 }
 
 fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {

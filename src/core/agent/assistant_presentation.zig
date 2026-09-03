@@ -637,54 +637,6 @@ fn registerFootnoteThunk(ctx: *anyopaque, alloc: Allocator, label: []const u8) a
     return self.registerFootnoteReference(alloc, label);
 }
 
-fn checkSetextLookaheadAllocationFailures(alloc: Allocator) !void {
-    const Capture = struct {
-        fn deliver(_: *anyopaque, _: *std.ArrayList(u8)) !void {}
-    };
-
-    var processor = MarkdownProcessor{};
-    defer processor.deinit(alloc);
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-    var capture: u8 = 0;
-    var completion = ThematicRuleCompletion{
-        .ctx = &capture,
-        .deliver = Capture.deliver,
-    };
-
-    try processor.pushWithCompletions(alloc, "allocation title\n---\n", &out, .{ .thematic_rule = &completion });
-    try std.testing.expectEqualStrings("\x1b[1mallocation title\x1b[22m\n", out.items);
-}
-
-fn checkDefinitionListAllocationFailures(alloc: Allocator) !void {
-    const Capture = struct {
-        fn deliver(_: *anyopaque, _: *std.ArrayList(u8)) !void {}
-    };
-    var processor = MarkdownProcessor{};
-    defer processor.deinit(alloc);
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-    var capture: u8 = 0;
-    var completion = ThematicRuleCompletion{
-        .ctx = &capture,
-        .deliver = Capture.deliver,
-    };
-
-    try processor.pushWithCompletions(
-        alloc,
-        "Status\n: **Running**\n: second definition\n",
-        &out,
-        .{ .thematic_rule = &completion },
-    );
-    try processor.flushWithCompletions(alloc, &out, .{ .thematic_rule = &completion });
-    try std.testing.expectEqualStrings(
-        "Status\n" ++
-            "\x1b[2m  \x1b[22m\x1b[1mRunning\x1b[22m\n" ++
-            "\x1b[2m  \x1b[22msecond definition\n",
-        out.items,
-    );
-}
-
 fn checkFootnoteAllocationFailures(alloc: Allocator) !void {
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);

@@ -1858,57 +1858,6 @@ fn expectTranscriptContains(app: *const FakeApp, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, app.text(), needle) != null);
 }
 
-var session_command_stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableSessionCommandTestEnviron() !*const std.process.Environ.Map {
-    if (session_command_stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    session_command_stable_test_environ = map;
-    return map;
-}
-
-const SessionCommandTestHome = struct {
-    alloc: std.mem.Allocator,
-    map: std.process.Environ.Map,
-
-    fn install(alloc: std.mem.Allocator, home: ?[]const u8) !*SessionCommandTestHome {
-        _ = try stableSessionCommandTestEnviron();
-
-        const self = try alloc.create(SessionCommandTestHome);
-        errdefer alloc.destroy(self);
-
-        self.* = .{
-            .alloc = alloc,
-            .map = std.process.Environ.Map.init(alloc),
-        };
-        errdefer self.map.deinit();
-
-        if (home) |value| {
-            try self.map.put("HOME", value);
-        }
-        io_mod.setEnvironMap(&self.map);
-        return self;
-    }
-
-    fn deinit(self: *SessionCommandTestHome) void {
-        if (session_command_stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
-        self.map.deinit();
-        const alloc = self.alloc;
-        alloc.destroy(self);
-    }
-};
-
-fn expectRule(rule: types.PermissionRule, permission: []const u8, pattern: []const u8, action: types.PermissionAction) !void {
-    try std.testing.expectEqualStrings(permission, rule.permission);
-    try std.testing.expectEqualStrings(pattern, rule.pattern);
-    try std.testing.expectEqual(action, rule.action);
-}
-
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());

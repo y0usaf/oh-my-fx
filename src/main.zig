@@ -111,6 +111,8 @@ const app_terminal_takeover_runtime = @import("core/app/app_terminal_takeover_ru
 const terminal_host = @import("core/terminal/host.zig");
 const terminal_native_session = @import("core/terminal/native_session.zig");
 const terminal_tmux_session = @import("core/terminal/tmux_session.zig");
+const shell_resolver = @import("core/terminal/shell_resolver.zig");
+const rush_embed = @import("rush_app"); // trimmed: headless embed root (vendor/rush/src/embed.zig)
 const session_runtime = @import("core/session/session.zig");
 const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
@@ -2973,6 +2975,20 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
 
+    if (isRushInternalModeRaw(raw_args)) {
+        io_mod.setRawEnviron(raw_env);
+        var rush_args: [64][*:0]const u8 = undefined;
+        const rush_arg_slice = rushArgsFromRaw(raw_args, &rush_args);
+        var threaded = std.Io.Threaded.init(processAllocator(), .{
+            .argv0 = .init(argsFromRaw(rush_arg_slice)),
+            .environ = .{ .block = environBlockFromRaw(raw_env) },
+        });
+        defer threaded.deinit();
+        io_mod.setIo(threaded.io());
+        const status = try runRushEmbed(processAllocator(), rush_arg_slice, environBlockFromRaw(raw_env));
+        exitFast(status);
+    }
+
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
@@ -3152,6 +3168,24 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
     return .{ .vector = raw_args };
+}
+
+fn isRushInternalModeRaw(raw_args: []const [*:0]const u8) bool {
+    return raw_args.len >= 2 and
+        std.mem.eql(u8, std.mem.sliceTo(raw_args[1], 0), shell_resolver.rush_internal_mode);
+}
+
+fn rushArgsFromRaw(
+    raw_args: []const [*:0]const u8,
+    out: *[64][*:0]const u8,
+) []const [*:0]const u8 {
+    var count: usize = 0;
+    for (raw_args, 0..) |arg, index| {
+        if (index == 1) continue;
+        out[count] = arg;
+        count += 1;
+    }
+    return out[0..count];
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
@@ -3463,3 +3497,43 @@ const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
     handleSigWinchWeb
 else
     handleSigWinchNative;
+
+/// Runs the embedded rush shell headlessly. `-c SCRIPT` evaluates one command;
+/// otherwise stdin lines are evaluated as a cooked-mode REPL until EOF.
+fn runRushEmbed(
+    allocator: std.mem.Allocator,
+    args: []const [*:0]const u8,
+    env_block: std.process.Environ.Block,
+) !u8 {
+    var env_list: [256][*:0]const u8 = undefined;
+    var env_count: usize = 0;
+    for (env_block.slice) |entry| {
+        if (env_count == env_list.len) break;
+        env_list[env_count] = entry orelse continue;
+        env_count += 1;
+    }
+    var session = try rush_embed.Session.init(allocator, env_list[0..env_count]);
+    defer session.deinit();
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = std.mem.sliceTo(args[index], 0);
+        if (std.mem.eql(u8, arg, "-c")) {
+            if (index + 1 >= args.len) {
+                std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), "omfx: -c requires an argument\n") catch {};
+                return 2;
+            }
+            const script = std.mem.sliceTo(args[index + 1], 0);
+            return session.evalScript(script);
+        }
+    }
+
+    // Cooked-mode REPL: the tty line discipline provides one command per line.
+    var read_buffer: [64 * 1024]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buffer);
+    while (true) {
+        const line_opt = (stdin_reader.interface.takeDelimiter('\n') catch break) orelse break;
+        _ = session.evalScript(line_opt);
+    }
+    return session.finish();
+}

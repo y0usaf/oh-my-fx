@@ -293,10 +293,6 @@ const EntryReplayApp = struct {
     }
 };
 
-fn expectTranscript(app: *const FakeApp, expected: []const u8) !void {
-    try std.testing.expectEqualStrings(expected, app.text());
-}
-
 fn noticeText(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}\n", .{text});
 }

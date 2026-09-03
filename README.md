@@ -13,6 +13,7 @@ oh-my-fx is inspired by:
 - [Pi](https://github.com/earendil-works/pi)
 - [Oh My Pi](https://github.com/can1357/oh-my-pi) — laid the foundation of a "batteries included" layer on top of a minimalist harness
 - [Crush](https://github.com/charmbracelet/crush) — beautiful TUI design
+- [rush](https://github.com/rockorager/rush) — the embedded shell behind the terminal tool
 
 <details>
 <summary>Original vercel-labs/fx README</summary>

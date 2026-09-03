@@ -6,10 +6,6 @@ const skill_runtime = @import("skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("../config/context_limits.zig");
-const test_debug_trace = if (@import("builtin").is_test)
-    @import("../shared/debug_trace.zig")
-else
-    struct {};
 
 const Allocator = std.mem.Allocator;
 const ambiguous_skill_suffix_fmt = "; {d} additional advertised location{s} omitted by the {d}-byte tool-result limit. Refresh available skills and retry with an advertised name and location.";
@@ -895,21 +891,6 @@ fn expectSkillResourceRejected(alloc: Allocator, root: []const u8, resource: []c
     return error.TestUnexpectedResult;
 }
 
-fn createSkillSymlinkOrSkip(
-    dir: std.Io.Dir,
-    target_path: []const u8,
-    link_path: []const u8,
-    is_directory: bool,
-) !void {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
-    dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = is_directory }) catch |err| {
-        if (err == error.AccessDenied or std.mem.eql(u8, @errorName(err), "Permission" ++ "Denied")) {
-            return error.SkipZigTest;
-        }
-        return err;
-    };
-}
-
 fn checkSkillErrorFormattingAllocationFailures(alloc: Allocator) !void {
     const missing = try formatMissingSkill(alloc, "workflow", tool_result_limits.default_max_tool_result_bytes);
     alloc.free(missing);
@@ -944,26 +925,6 @@ fn checkSkillLoadAllocationFailures(
         tool_result_limits.default_max_tool_result_bytes,
     );
     freeExecuteResult(alloc, result);
-}
-
-fn checkExplicitPromptSectionAllocationFailures(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    skills_dir: []const u8,
-    limits: context_limits.Values,
-) !void {
-    var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
-    defer discovery.deinit(alloc);
-    var section = try buildExplicitPromptSection(
-        alloc,
-        .{ .skills = discovery.skills, .diagnostics = discovery.diagnostics },
-        "$workflow",
-        &.{},
-        limits,
-    );
-    defer section.deinit(alloc);
-    try std.testing.expect(section.notice != null);
-    try std.testing.expect(section.diagnostic_notice != null);
 }
 
 fn setTestHome(home: ?[]const u8) !void {

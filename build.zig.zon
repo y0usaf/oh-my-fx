@@ -31,7 +31,12 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
-    .dependencies = .{},
+    .dependencies = .{
+        .rush_uucode = .{
+            .url = "git+https://github.com/jacobsandlund/uucode#2826a37a4562284fdacd8fa029d49509cc9bffcd",
+            .hash = "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA",
+        },
+    },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that
     // is computed for this package. Only files listed here will remain on disk

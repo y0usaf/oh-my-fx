@@ -1,0 +1,35 @@
+.{
+    .name = .rush,
+    .version = "0.1.0",
+    .fingerprint = 0xf533deef8806632f,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#a367b89da09bfe5e1b628501940de5b4f858f5f3",
+            .hash = "vaxis-0.6.0-BWNV_HHwCQB451KS7A8SMykALblPmGwHnzSfiJHjN3_9",
+        },
+        .sqlite = .{
+            .url = "https://www.sqlite.org/2026/sqlite-amalgamation-3530200.zip",
+            .hash = "N-V-__8AALc_rgC04POe18O0LKFRm4ouQpLtL3riscEmWp-Q",
+        },
+        .uucode = .{
+            .url = "git+https://github.com/jacobsandlund/uucode#2826a37a4562284fdacd8fa029d49509cc9bffcd",
+            .hash = "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA",
+        },
+        .zeit = .{
+            .url = "git+https://github.com/rockorager/zeit.git?ref=v0.9.0#b1c1c2fcbc71fd7799a316bbcf0ff88d06d80ccc",
+            .hash = "zeit-0.9.0-5I6bk2m9AgBSMH8-L6rYJkwuQAyhXplnfxnvTSGzVHUR",
+        },
+        .ziglint = .{
+            .url = "git+https://github.com/rockorager/ziglint.git#90dca75f6301706f925c76c71aff58358758d923",
+            .hash = "ziglint-0.5.2-t0bwLwqTBQALZYj3JDnOW03lrsuRqIWHXioRtkN0D7tn",
+        },
+    },
+    .paths = .{
+        "LICENSE",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+    },
+}

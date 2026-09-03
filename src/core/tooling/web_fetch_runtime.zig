@@ -375,22 +375,3 @@ fn freeArtifactRef(alloc: Allocator, ref: CacheSnapshot.OwnedArtifactRef) void {
     alloc.free(ref.handle);
     alloc.free(ref.display_path);
 }
-
-const MutableClock = struct {
-    now_ms: i64,
-
-    fn now(raw: *anyopaque) i64 {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        return self.now_ms;
-    }
-};
-
-fn testRuntime(clock: *MutableClock, max_converted_bytes: usize, max_entries: usize, max_metadata_bytes: usize) Runtime {
-    return Runtime.init(.{
-        .allocator = std.testing.allocator,
-        .clock = .{ .ctx = @ptrCast(clock), .now_fn = MutableClock.now },
-        .max_converted_bytes = max_converted_bytes,
-        .max_entries = max_entries,
-        .max_metadata_bytes = max_metadata_bytes,
-    });
-}

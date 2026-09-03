@@ -412,15 +412,6 @@ fn buildModalitiesJson(alloc: std.mem.Allocator, id_bytes: usize) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn expectCatalogParseError(expected: anyerror, subscription: []const u8, modalities: []const u8) !void {
-    var catalog = parseCatalog(std.testing.allocator, subscription, modalities) catch |err| {
-        try std.testing.expectEqual(expected, err);
-        return;
-    };
-    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
-    return error.TestExpectedCatalogFailure;
-}
-
 const CatalogBodyFixture = struct {
     io_backend: std.Io.Threaded = .init_single_threaded,
     server: std.Io.net.Server,
@@ -552,52 +543,4 @@ const CatalogEndpointEnvironment = struct {
 
 fn catalogFixtureUrl(alloc: std.mem.Allocator, fixture: *CatalogBodyFixture, path: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/{s}", .{ fixture.port(), path });
-}
-
-fn expectCatalogProviderFailure(
-    result: model_catalog.ProviderResult,
-    expected: model_catalog.FailureCategory,
-) !void {
-    switch (result) {
-        .failure => |failure| {
-            try std.testing.expectEqual(expected, failure.category);
-            try std.testing.expect(!failure.retryable);
-        },
-        .catalog => |catalog| {
-            var unexpected = catalog;
-            model_catalog.freeModelCatalog(std.testing.allocator, &unexpected);
-            return error.TestExpectedCatalogFailure;
-        },
-    }
-}
-
-fn fetchCatalogFixture(body: []const u8) !FetchResponse {
-    var fixture = try CatalogBodyFixture.init(body);
-    defer fixture.deinit();
-    try fixture.start();
-    const url = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "http://127.0.0.1:{d}/models",
-        .{fixture.port()},
-    );
-    defer std.testing.allocator.free(url);
-    var operation = FetchOperation{
-        .alloc = std.testing.allocator,
-        .url = url,
-        .credential = "grok-test-token",
-        .account_id = "acct_test",
-    };
-    const result = operation.run();
-    fixture.deinit();
-    if (fixture.failure) |err| return err;
-    return result;
-}
-
-fn expectCatalogFetchError(expected: anyerror, body: []const u8) !void {
-    var response = fetchCatalogFixture(body) catch |err| {
-        try std.testing.expectEqual(expected, err);
-        return;
-    };
-    defer response.deinit(std.testing.allocator);
-    return error.TestExpectedCatalogFailure;
 }

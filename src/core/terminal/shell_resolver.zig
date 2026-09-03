@@ -3,11 +3,11 @@ const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const io_mod = @import("../shared/io.zig");
+const self_exe = @import("../shared/self_exe.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const ResolveError = error{
-    MissingLoginShell,
     RelativeShellPath,
     UnsupportedShell,
 };
@@ -15,38 +15,7 @@ pub const ResolveError = error{
 pub const Profile = command_environment.Profile;
 pub const Environment = command_environment.Environment;
 
-const ShellKind = enum { bash, zsh };
-
-fn shellKind(path: []const u8) ?ShellKind {
-    const basename = std.fs.path.basename(path);
-    if (std.mem.eql(u8, basename, "bash")) return .bash;
-    if (std.mem.eql(u8, basename, "zsh")) return .zsh;
-    return null;
-}
-
-fn existingExecutable(path: []const u8) bool {
-    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
-    return true;
-}
-
-fn fallbackLoginShell() []const u8 {
-    const default_path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash";
-    if (existingExecutable(default_path)) return default_path;
-    for ([_][]const u8{
-        "/usr/bin/bash",
-        "/run/current-system/sw/bin/bash",
-    }) |path| {
-        if (existingExecutable(path)) return path;
-    }
-    return default_path;
-}
-
-fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
-    const path = configured_login_shell orelse return error.MissingLoginShell;
-    if (!std.fs.path.isAbsolute(path)) return error.RelativeShellPath;
-    if (shellKind(path) != null) return path;
-    return fallbackLoginShell();
-}
+const rush_executable_token = "fx";
 
 pub const Invocation = struct {
     path: []const u8,
@@ -68,7 +37,6 @@ pub const Invocation = struct {
     }
 };
 pub const rush_internal_mode = "--fx-internal-rush";
-const rush_executable_token = "fx";
 
 /// Builds the argv used to re-exec the embedded Rush app through fx.
 ///
@@ -77,7 +45,7 @@ const rush_executable_token = "fx";
 /// and development builds may pass null, which deliberately uses the stable
 /// internal executable token.
 pub fn rushInvocation(
-    comptime self_executable: ?[]const u8,
+    self_executable: ?[]const u8,
     clean_start: bool,
 ) ResolveError!Invocation {
     const executable = self_executable orelse rush_executable_token;
@@ -94,7 +62,7 @@ pub fn rushInvocation(
 }
 
 pub fn capturedRushInvocation(
-    comptime self_executable: ?[]const u8,
+    self_executable: ?[]const u8,
     clean_start: bool,
     command: []const u8,
 ) ResolveError!Invocation {
@@ -104,52 +72,36 @@ pub fn capturedRushInvocation(
     return invocation;
 }
 
+/// Builds the argv that re-executes this omfx process as the embedded rush
+/// shell, resolving the on-disk self path so spawns do not depend on PATH.
+pub fn capturedSelfInvocation(
+    alloc: Allocator,
+    clean_start: bool,
+    command: []const u8,
+) (ResolveError || Allocator.Error)!Invocation {
+    // pathForReexec consults the OS for the on-disk executable; on macOS the
+    // underlying query carries a wide error set, which collapses here so the
+    // public resolver error set stays small.
+    const self_path = self_exe.pathForReexec(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ExecutableNotFound => return error.UnsupportedShell,
+    };
+    var invocation = try rushInvocation(self_path, clean_start);
+    removeInteractiveFlag(&invocation);
+    invocation.setCommand(command);
+    return invocation;
+}
+
 pub fn resolve(
     configured_login_shell: ?[]const u8,
     shell: contracts.ShellSpec,
 ) ResolveError!Invocation {
-    const Selection = struct {
-        path: []const u8,
-        clean_start: bool,
+    _ = configured_login_shell;
+    const clean_start = switch (shell) {
+        .user_login => false,
+        .executable => |value| value.clean_start,
     };
-    const selection: Selection = switch (shell) {
-        .user_login => .{
-            .path = try supportedLoginShell(configured_login_shell),
-            .clean_start = false,
-        },
-        .executable => |value| .{
-            .path = value.path,
-            .clean_start = value.clean_start,
-        },
-    };
-    if (!std.fs.path.isAbsolute(selection.path)) {
-        return error.RelativeShellPath;
-    }
-
-    const kind = shellKind(selection.path) orelse return error.UnsupportedShell;
-
-    var result = Invocation{ .path = selection.path };
-    result.append(selection.path);
-    switch (kind) {
-        .bash => {
-            if (selection.clean_start) {
-                result.append("--noprofile");
-                result.append("--norc");
-            } else {
-                result.append("--login");
-            }
-            result.append("-i");
-        },
-        .zsh => {
-            if (selection.clean_start) {
-                result.append("-f");
-            } else {
-                result.append("-l");
-            }
-            result.append("-i");
-        },
-    }
-    return result;
+    return rushInvocation(null, clean_start);
 }
 
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
@@ -179,15 +131,11 @@ pub fn environment(
     configured_login_shell: ?[]const u8,
     profile: ?Profile,
 ) (ResolveError || Allocator.Error)!Environment {
+    _ = configured_login_shell;
     const selected = profile orelse .user;
-    const path = try supportedLoginShell(configured_login_shell);
-    _ = try resolve(null, switch (selected) {
-        .clean => .{ .executable = .{ .path = path, .clean_start = true } },
-        .user => .{ .executable = .{ .path = path } },
-    });
     return switch (selected) {
-        .clean => .{ .clean = try alloc.dupe(u8, path) },
-        .user => .{ .user = try alloc.dupe(u8, path) },
+        .clean => .{ .clean = try alloc.dupe(u8, rush_executable_token) },
+        .user => .{ .user = try alloc.dupe(u8, rush_executable_token) },
     };
 }
 
@@ -196,28 +144,15 @@ pub fn profileShell(
     configured_login_shell: ?[]const u8,
     profile: Profile,
 ) (ResolveError || Allocator.Error)!contracts.ShellSpec {
+    _ = configured_login_shell;
     return switch (profile) {
-        .clean => blk: {
-            const path = try supportedLoginShell(configured_login_shell);
-            _ = try resolve(null, .{ .executable = .{ .path = path, .clean_start = true } });
-            break :blk .{ .executable = .{
-                .path = try alloc.dupe(u8, path),
-                .clean_start = true,
-            } };
-        },
-        .user => blk: {
-            const configured = configured_login_shell orelse
-                break :blk .user_login;
-            const path = try supportedLoginShell(configured);
-            if (std.mem.eql(u8, path, configured)) break :blk .user_login;
-            break :blk .{ .executable = .{
-                .path = try alloc.dupe(u8, path),
-            } };
-        },
+        .clean => .{ .executable = .{
+            .path = try alloc.dupe(u8, rush_executable_token),
+            .clean_start = true,
+        } },
+        .user => .user_login,
     };
 }
-
-const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
 
 pub fn capturedInvocation(
     alloc: Allocator,
@@ -226,30 +161,9 @@ pub fn capturedInvocation(
 ) (ResolveError || Allocator.Error)!Invocation {
     switch (environment_value) {
         .legacy, .workspace_clean => return error.UnsupportedShell,
-        .clean => |path| {
-            var invocation = try resolve(null, .{ .executable = .{
-                .path = path,
-                .clean_start = true,
-            } });
-            removeInteractiveFlag(&invocation);
-            invocation.setCommand(command);
-            return invocation;
-        },
-        .user => |path| {
-            var invocation = try resolve(path, .user_login);
-            if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
-                removeInteractiveFlag(&invocation);
-                invocation.append("-O");
-                invocation.append("expand_aliases");
-            }
-            const effective_command = if (shellKind(path) == .zsh)
-                try std.mem.concat(alloc, u8, &.{ captured_zsh_user_prelude, command })
-            else
-                command;
-            invocation.setCommand(effective_command);
-            return invocation;
-        },
+        .clean, .user => {},
     }
+    return capturedSelfInvocation(alloc, false, command);
 }
 
 pub fn formatInvocationCommand(

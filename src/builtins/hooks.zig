@@ -73,39 +73,6 @@ pub fn Runtime(comptime App: type) type {
     };
 }
 
-const RecordingClient = struct {
-    const Report = struct {
-        state: herdr.State,
-        status: ?[]const u8,
-    };
-
-    reports: [6]Report = undefined,
-    report_count: usize = 0,
-    enabled: bool = false,
-    enable_on_init: bool = true,
-    initialized: bool = false,
-    announced: bool = false,
-    session_id: ?[]const u8 = null,
-
-    fn initFromEnv(self: *RecordingClient, _: std.mem.Allocator) void {
-        self.initialized = true;
-        self.enabled = self.enable_on_init;
-    }
-
-    fn reportSession(self: *RecordingClient, session_id: []const u8) void {
-        self.session_id = session_id;
-    }
-
-    fn announce(self: *RecordingClient) void {
-        self.announced = true;
-    }
-
-    fn reportState(self: *RecordingClient, state: herdr.State, status: ?[]const u8) void {
-        self.reports[self.report_count] = .{ .state = state, .status = status };
-        self.report_count += 1;
-    }
-};
-
 fn testInvocation(kind: hooks.ScopeKind) hooks.Invocation {
     return .{
         .scope = .{
@@ -115,13 +82,4 @@ fn testInvocation(kind: hooks.ScopeKind) hooks.Invocation {
         },
         .turn_id = 42,
     };
-}
-
-fn expectReport(actual: RecordingClient.Report, state: herdr.State, status: ?[]const u8) !void {
-    try std.testing.expectEqual(state, actual.state);
-    if (status) |expected| {
-        try std.testing.expectEqualStrings(expected, actual.status orelse return error.TestExpectedEqual);
-    } else {
-        try std.testing.expect(actual.status == null);
-    }
 }

@@ -870,36 +870,6 @@ fn filterOtherWorkspaceRecords(
     return out.toOwnedSlice(alloc);
 }
 
-fn historyPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return profile_paths.promptHistoryPath(alloc, home);
-}
-
-fn ensureFixtureHome(home: []const u8) !void {
-    const fx_dir = try profile_paths.rootDir(std.testing.allocator, home);
-    defer std.testing.allocator.free(fx_dir);
-    std.Io.Dir.createDirAbsolute(
-        std.testing.io,
-        fx_dir,
-        std.Io.File.Permissions.fromMode(0o700),
-    ) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-}
-
-fn writeFixture(home: []const u8, bytes: []const u8) !void {
-    try ensureFixtureHome(home);
-    const path = try historyPath(std.testing.allocator, home);
-    defer std.testing.allocator.free(path);
-    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{
-        .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
-    });
-    defer file.close(std.testing.io);
-    try file.writeStreamingAll(std.testing.io, bytes);
-    try file.sync(std.testing.io);
-}
-
 fn fixtureLine(
     alloc: Allocator,
     timestamp_ms: i64,
@@ -911,13 +881,6 @@ fn fixtureLine(
         "{{\"schema_version\":1,\"timestamp_ms\":{d},\"workspace_root\":\"{s}\",\"text\":\"{s}\"}}\n",
         .{ timestamp_ms, workspace_root, text },
     );
-}
-
-fn expectTexts(entries: []const LoadedPromptHistoryEntry, expected: []const []const u8) !void {
-    try std.testing.expectEqual(expected.len, entries.len);
-    for (entries, expected) |entry, text| {
-        try std.testing.expectEqualStrings(text, entry.text);
-    }
 }
 
 const LockFailureState = struct {

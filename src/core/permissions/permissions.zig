@@ -1876,11 +1876,6 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) != null);
 }
 
-fn expectGrant(grant: types.PermissionGrant, permission: []const u8, pattern: []const u8) !void {
-    try std.testing.expectEqualStrings(permission, grant.tool_name);
-    try std.testing.expectEqualStrings(pattern, grant.target_path);
-}
-
 fn freeGrants(alloc: std.mem.Allocator, grants: []types.PermissionGrant) void {
     for (grants) |grant| {
         alloc.free(grant.tool_name);
@@ -1905,79 +1900,6 @@ fn checkSuggestedSessionGrantsAllocFailures(alloc: std.mem.Allocator) !void {
 
     const path_grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "write_file", "/tmp/workspace/src/main.zig", .path_create_parent);
     defer freeGrants(alloc, path_grants);
-}
-
-fn testFileTargets(
-    canonical_path: []const u8,
-    external: bool,
-    items: *[1]file_mutation_contract.EvaluatedPermissionTarget,
-) file_mutation_contract.PolicyEvaluatedFileTargets {
-    items.* = .{.{
-        .kind = .target,
-        .disposition = .target_entry,
-        .path_end = canonical_path.len,
-        .expected_identity = null,
-        .rule = .ask,
-        .session_grant_allowed = true,
-    }};
-    return .{
-        .canonical_target_path = canonical_path,
-        .anchor = .{
-            .scope = if (external) .external else .workspace,
-            .path_end = canonical_path.len,
-            .identity = .{
-                .device = 0,
-                .inode = 0,
-                .kind = .directory,
-            },
-            .relative_components = &.{},
-        },
-        .traversal_directories = &.{},
-        .items = items,
-        .prompt_required = true,
-    };
-}
-
-fn deinitTestFileGrantOffer(
-    alloc: std.mem.Allocator,
-    offer: file_mutation_contract.FileGrantOffer,
-) void {
-    types.freePermissionGrantSlice(alloc, @constCast(offer.grants));
-    switch (offer.scope) {
-        .workspace_files => {},
-        .external_tree => |root_tail| alloc.free(@constCast(root_tail)),
-    }
-}
-
-fn checkStructuredFileGrantOfferAllocationFailures(
-    alloc: std.mem.Allocator,
-) !void {
-    var items: [1]file_mutation_contract.EvaluatedPermissionTarget = undefined;
-    const offer = try structuredFileGrantOffer(
-        alloc,
-        "/tmp/workspace",
-        "write_file",
-        testFileTargets("/tmp/workspace/src/main.zig", false, &items),
-    );
-    defer deinitTestFileGrantOffer(alloc, offer);
-    try std.testing.expect(offer.scope == .workspace_files);
-}
-
-fn checkExternalStructuredFileGrantOfferAllocationFailures(
-    alloc: std.mem.Allocator,
-) !void {
-    var items: [1]file_mutation_contract.EvaluatedPermissionTarget = undefined;
-    const offer = try structuredFileGrantOffer(
-        alloc,
-        "/tmp/workspace",
-        "edit_file",
-        testFileTargets("/tmp/external/project/file.txt", true, &items),
-    );
-    defer deinitTestFileGrantOffer(alloc, offer);
-    try std.testing.expectEqualStrings(
-        "/tmp/external/project",
-        offer.scope.external_tree,
-    );
 }
 
 fn testWriteMutationInput(path: []const u8) file_mutation_contract.FileMutationInput {

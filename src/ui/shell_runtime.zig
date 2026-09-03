@@ -19,16 +19,6 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const TmuxHistoryClearRunner = *const fn (Allocator, []const u8) anyerror!void;
 var tmux_history_clear_test_runner: if (builtin.is_test) ?TmuxHistoryClearRunner else void = if (builtin.is_test) null else {};
 
-const supports_test_pty = switch (builtin.os.tag) {
-    .linux,
-    .macos,
-    .freebsd,
-    .netbsd,
-    .openbsd,
-    => true,
-    else => false,
-};
-
 extern "c" fn posix_openpt(flags: c_int) c_int;
 extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
@@ -326,13 +316,6 @@ fn runTmuxHistoryClear(alloc: Allocator, pane: []const u8) !void {
     if (result.term != .exited or result.term.exited != 0) return error.TmuxClearHistoryFailed;
 }
 
-var tmux_history_clear_test_calls: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
-
-fn failTmuxHistoryClearForTest(_: Allocator, _: []const u8) !void {
-    tmux_history_clear_test_calls += 1;
-    return error.TestTmuxHistoryClearFailure;
-}
-
 pub fn detectSyncUpdatesEnabled(_: Allocator) bool {
     const override = io_mod.getenv("FX_SYNC_UPDATES");
 
@@ -533,41 +516,4 @@ fn vtimeIndex() usize {
         .freebsd, .netbsd, .dragonfly, .openbsd => 17,
         else => 17,
     };
-}
-
-const TestPty = struct {
-    master: std.posix.fd_t,
-    slave: std.posix.fd_t,
-
-    fn open() !TestPty {
-        const flags = std.posix.O{
-            .ACCMODE = .RDWR,
-            .NOCTTY = true,
-            .CLOEXEC = true,
-        };
-        const flags_int: c_int = @bitCast(flags);
-        const master_fd = posix_openpt(flags_int);
-        if (master_fd < 0) return error.PtyUnavailable;
-        errdefer closeTestFd(master_fd);
-
-        if (grantpt(master_fd) != 0) return error.PtyUnavailable;
-        if (unlockpt(master_fd) != 0) return error.PtyUnavailable;
-        const slave_name = ptsname(master_fd) orelse return error.PtyUnavailable;
-        const slave_fd = try std.posix.openatZ(std.posix.AT.FDCWD, slave_name, flags, 0);
-        errdefer closeTestFd(slave_fd);
-
-        return .{
-            .master = master_fd,
-            .slave = slave_fd,
-        };
-    }
-
-    fn close(self: TestPty) void {
-        closeTestFd(self.master);
-        closeTestFd(self.slave);
-    }
-};
-
-fn closeTestFd(fd: std.posix.fd_t) void {
-    (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(io_mod.getIo());
 }

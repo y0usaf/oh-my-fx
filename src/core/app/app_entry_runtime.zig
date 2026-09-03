@@ -567,13 +567,6 @@ fn appendInitEvent(launch: *const cli_surface.InteractiveLaunch) void {
     }
 }
 
-fn expectEvents(expected: []const []const u8) !void {
-    try std.testing.expectEqual(expected.len, test_event_count);
-    for (expected, test_events[0..test_event_count]) |want, got| {
-        try std.testing.expectEqualStrings(want, got);
-    }
-}
-
 const TestCapture = struct {
     run_result: cli_surface.RunResult,
     cli_calls: usize = 0,

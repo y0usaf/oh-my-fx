@@ -301,33 +301,6 @@ fn realTmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const
     return @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, name);
 }
 
-fn ownedTestAttachment(alloc: std.mem.Allocator, path: []const u8) !types.ImageAttachment {
-    return .{
-        .path = try alloc.dupe(u8, path),
-        .media_type = try alloc.dupe(u8, "image/png"),
-    };
-}
-
-fn testClipboardImage(
-    alloc: std.mem.Allocator,
-    tmp: *std.testing.TmpDir,
-    source_dir_name: []const u8,
-) !image_attachments.ClipboardImageAttachment {
-    try tmp.dir.createDir(std.testing.io, source_dir_name, .default_dir);
-    const source_sub_path = try std.fs.path.join(alloc, &.{ source_dir_name, "clipboard.png" });
-    defer alloc.free(source_sub_path);
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = source_sub_path,
-        .data = "\x89PNG\r\n\x1a\nclipboard",
-    });
-    const source_path = try realTmpPath(alloc, tmp, source_sub_path);
-    defer alloc.free(source_path);
-    return .{
-        .attachment = try image_attachments.loadImageAttachment(alloc, source_path),
-        .source_dir = try realTmpPath(alloc, tmp, source_dir_name),
-    };
-}
-
 fn countSnapshotFiles(snapshot_dir: []const u8) !usize {
     var dir = std.Io.Dir.openDirAbsolute(std.testing.io, snapshot_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return 0,
@@ -340,53 +313,4 @@ fn countSnapshotFiles(snapshot_dir: []const u8) !usize {
         if (entry.kind == .file) count += 1;
     }
     return count;
-}
-
-fn expectBadgeProjection(alloc: std.mem.Allocator, app: *const FakeApp, expected: []const u8) !void {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    _ = try image_attachments.expandPlaceholdersWithBadges(
-        alloc,
-        &out.writer,
-        app.input_runtime.edit_state.input.items,
-        app.pending_images.items,
-        null,
-    );
-    try std.testing.expectEqualStrings(expected, out.written());
-}
-
-fn checkImageInsertionAllocationFailureIsAtomic(
-    failing: *std.testing.FailingAllocator,
-    fail_offset: ?usize,
-    allocation_count: *usize,
-) !void {
-    const alloc = failing.allocator();
-    var app = FakeApp{ .alloc = alloc };
-    defer app.deinit();
-    app.next_image_id_counter = 7;
-
-    const image = try ownedTestAttachment(alloc, "/tmp/reserved.png");
-    const start_alloc_index = failing.alloc_index;
-    if (fail_offset) |offset| {
-        failing.fail_index = try std.math.add(
-            usize,
-            start_alloc_index,
-            offset,
-        );
-    }
-
-    _ = Commands(FakeApp).insertImageAtCursor(FakeApp, &app, image, .retained) catch |err| {
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.cursor);
-        try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.image_tokens.items.len);
-        try std.testing.expectEqual(@as(usize, 7), app.next_image_id_counter);
-        return err;
-    };
-
-    allocation_count.* = failing.alloc_index - start_alloc_index;
-    try std.testing.expectEqualStrings("[Image #7]", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
-    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.image_tokens.items.len);
-    try std.testing.expectEqual(@as(usize, 8), app.next_image_id_counter);
 }

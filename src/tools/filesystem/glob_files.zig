@@ -554,26 +554,6 @@ fn writeTempFile(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, sub_path);
 }
 
-fn writeTempFileWithMtime(
-    alloc: Allocator,
-    tmp: *std.testing.TmpDir,
-    sub_path: []const u8,
-    content: []const u8,
-    mtime_ns: i96,
-) ![]u8 {
-    if (std.fs.path.dirname(sub_path)) |parent| {
-        try tmp.dir.createDirPath(io_mod.getIo(), parent);
-    }
-    var file = try tmp.dir.createFile(std.testing.io, sub_path, .{});
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), content);
-    try file.setTimestamps(io_mod.getIo(), .{
-        .access_timestamp = .{ .new = .{ .nanoseconds = mtime_ns } },
-        .modify_timestamp = .{ .new = .{ .nanoseconds = mtime_ns } },
-    });
-    return io_mod.dirRealpathAlloc(alloc, tmp.dir, sub_path);
-}
-
 fn countEmittedResultLines(body: []const u8) usize {
     var count: usize = 0;
     var lines = std.mem.splitScalar(u8, body, '\n');
@@ -581,20 +561,4 @@ fn countEmittedResultLines(body: []const u8) usize {
         if (std.mem.startsWith(u8, line, " - ")) count += 1;
     }
     return count;
-}
-
-fn createNumberedFiles(tmp: *std.testing.TmpDir, count: usize) !void {
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "many/file-{d:0>4}.txt", .{i});
-        if (std.fs.path.dirname(name)) |parent| {
-            try tmp.dir.createDirPath(io_mod.getIo(), parent);
-        }
-        {
-            var file = try tmp.dir.createFile(std.testing.io, name, .{});
-            defer file.close(io_mod.getIo());
-            try file.writeStreamingAll(io_mod.getIo(), "x\n");
-        }
-    }
 }

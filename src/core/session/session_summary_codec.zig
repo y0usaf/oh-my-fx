@@ -1863,13 +1863,3 @@ fn writeTestFile(path: []const u8, text: []const u8) !void {
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
 }
-
-fn fuzzDeferredCacheToken(_: void, smith: *std.testing.Smith) !void {
-    var buffer: [max_deferred_cache_token_bytes + 1]u8 = undefined;
-    const len: usize = @intCast(smith.slice(&buffer));
-    var decoded = decodeDeferredCacheToken(
-        std.testing.allocator,
-        buffer[0..len],
-    ) catch return;
-    decoded.deinit(std.testing.allocator);
-}

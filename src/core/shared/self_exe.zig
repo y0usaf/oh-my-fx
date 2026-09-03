@@ -9,14 +9,19 @@ const linux_self_exe = "/proc/self/exe";
 
 /// Returns an owned path that re-execs this process. Linux uses
 /// `/proc/self/exe` so replacing the on-disk binary does not break later spawns.
-pub fn pathForReexec(alloc: Allocator) ![]u8 {
+pub const ReexecError = Allocator.Error || error{ExecutableNotFound};
+
+pub fn pathForReexec(alloc: Allocator) ReexecError![]u8 {
     if (testProductExe()) |path| return alloc.dupe(u8, path);
     return productionPathForReexec(alloc);
 }
 
-fn productionPathForReexec(alloc: Allocator) ![]u8 {
+fn productionPathForReexec(alloc: Allocator) ReexecError![]u8 {
     if (comptime builtin.os.tag == .linux) return alloc.dupe(u8, linux_self_exe);
-    return std.process.executablePathAlloc(io_mod.getIo(), alloc);
+    return std.process.executablePathAlloc(io_mod.getIo(), alloc) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ExecutableNotFound,
+    };
 }
 
 /// Returns an owned path another process can use to launch fx. Linux prefers

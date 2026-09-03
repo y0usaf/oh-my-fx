@@ -1006,49 +1006,6 @@ fn toolsJsonAlloc(alloc: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(alloc, "[{s}]", .{schema_json});
 }
 
-fn buildTestReviewPayload(
-    _: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    tools_json: []const u8,
-    messages: []const types.ChatMessage,
-    target_call_id: []const u8,
-    _: std.Io.Clock.Timestamp,
-    cancel_flag: *std.atomic.Value(bool),
-) ![]u8 {
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try out.writer.writeAll("{\"model\":");
-    try std.json.Stringify.value(model, .{}, &out.writer);
-    try out.writer.writeAll(",\"maxOutputTokens\":2048,\"toolChoice\":{\"type\":\"required\"},\"tools\":");
-    try out.writer.writeAll(tools_json);
-    try out.writer.writeAll(",\"messages\":[");
-    var first = true;
-    for (messages) |message| {
-        if (!first) try out.writer.writeByte(',');
-        first = false;
-        try out.writer.writeAll("{\"role\":");
-        try std.json.Stringify.value(@tagName(message.role), .{}, &out.writer);
-        if (message.content) |content| {
-            try out.writer.writeAll(",\"content\":");
-            try std.json.Stringify.value(content, .{}, &out.writer);
-        }
-        if (message.tool_calls.len > 0) {
-            try out.writer.writeAll(",\"tool_calls\":");
-            try std.json.Stringify.value(message.tool_calls, .{}, &out.writer);
-        }
-        try out.writer.writeByte('}');
-        if (message.role == .assistant) {
-            try out.writer.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
-            try std.json.Stringify.value(target_call_id, .{}, &out.writer);
-            try out.writer.writeAll(",\"content\":\"pending review\"}");
-        }
-    }
-    try out.writer.writeAll("]}");
-    return out.toOwnedSlice();
-}
-
 fn parseCompletion(alloc: std.mem.Allocator, completion: types.ModelCompletion) !ParseOutcome {
     if (completion.content) |content| {
         if (std.mem.trim(u8, content, " \t\r\n").len > 0) return .invalid;

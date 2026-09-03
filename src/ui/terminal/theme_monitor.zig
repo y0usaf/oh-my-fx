@@ -330,12 +330,6 @@ fn forwardByte(byte: u8) FeedResult {
     return .{ .forward = forwarded };
 }
 
-fn beginBackgroundSampleForTest(monitor: *Monitor, now_ms: i64) !void {
-    try std.testing.expectEqual(QueryRequest.response_fence, monitor.takeQueryRequest(now_ms).?);
-    for (response_fence) |byte| _ = monitor.feed(byte, now_ms + 1);
-    try std.testing.expectEqual(QueryRequest.background, monitor.takeQueryRequest(now_ms + 2).?);
-}
-
 fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     const io_mod = @import("../../core/shared/io.zig");
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});

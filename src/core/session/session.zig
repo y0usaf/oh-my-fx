@@ -789,26 +789,6 @@ fn make_owned_legacy_image_turn(
     return turn;
 }
 
-fn sessionTestSnapshotDir(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, "snapshots" });
-}
-
-fn writeSessionTestImage(
-    alloc: Allocator,
-    tmp: *std.testing.TmpDir,
-    name: []const u8,
-    data: []const u8,
-) ![]u8 {
-    {
-        var file = try tmp.dir.createFile(std.testing.io, name, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, data);
-    }
-    return io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
-}
-
 fn history_contains_image_id(history: []const HistoryTurn, id: usize) bool {
     for (history) |turn| {
         for (images_for_history_turn(turn)) |attachment| {
@@ -1614,44 +1594,6 @@ pub fn appendHistoryChatMessages(
 pub const HistoryBudgetOptions = struct {
     max_tokens: usize = 0,
 };
-
-pub fn appendHistoryMessagesBudgeted(
-    alloc: Allocator,
-    messages: *std.ArrayList(message.Message),
-    history: []const HistoryTurn,
-    opts: HistoryBudgetOptions,
-) !void {
-    const keep = try selectBudgetedHistoryTurns(alloc, history, opts) orelse
-        return appendHistoryMessages(alloc, messages, history);
-    defer alloc.free(keep);
-
-    const trimmed_context = try formatBudgetTrimmedHistoryContext(
-        alloc,
-        history,
-        keep,
-    );
-    var owns_trimmed_context = true;
-    errdefer if (owns_trimmed_context) alloc.free(trimmed_context);
-    try messages.append(
-        alloc,
-        message.Message.systemOwned(trimmed_context),
-    );
-    owns_trimmed_context = false;
-
-    var in_leading_summary_prefix = true;
-    for (history, 0..) |turn, idx| {
-        if (!keep[idx]) {
-            in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
-            continue;
-        }
-        in_leading_summary_prefix = try appendHistoryMessagesImpl(
-            alloc,
-            messages,
-            history[idx .. idx + 1],
-            in_leading_summary_prefix,
-        );
-    }
-}
 
 pub fn appendHistoryChatMessagesBudgeted(
     alloc: Allocator,
@@ -2930,53 +2872,6 @@ fn checkPromptHistorySnapshotAllocationFailures(alloc: Allocator) !void {
     );
 }
 
-fn checkPromptHistoryMessageProjectionAllocationFailures(
-    alloc: Allocator,
-    prompt_history: []const HistoryTurn,
-) !void {
-    var messages: std.ArrayList(message.Message) = .empty;
-    defer deinitMessages(alloc, &messages);
-
-    appendHistoryMessagesBudgeted(
-        alloc,
-        &messages,
-        prompt_history,
-        .{ .max_tokens = 1 },
-    ) catch |err| {
-        try std.testing.expectEqualStrings(
-            "old user",
-            prompt_history[0].assistant.user.text,
-        );
-        try std.testing.expectEqualStrings(
-            "latest user",
-            prompt_history[1].assistant.user.text,
-        );
-        try std.testing.expectEqual(
-            PersistedToolStatus.failure,
-            prompt_history[1].assistant.execution.tool_steps[0].tool_results[0].status,
-        );
-        return switch (err) {
-            error.WriteFailed => error.OutOfMemory,
-            else => err,
-        };
-    };
-
-    try std.testing.expect(messages.items.len >= 6);
-    try std.testing.expectEqualStrings(
-        "latest user",
-        messages.items[messages.items.len - 5].content.?.asText(),
-    );
-    try std.testing.expectEqual(
-        PersistedToolStatus.failure,
-        messages.items[messages.items.len - 3].tool_result_status.?,
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        messages.items[messages.items.len - 2].content.?.asText(),
-        "src/latest.zig",
-    ) != null);
-}
-
 fn checkWorkProvenanceOwnershipFailures(alloc: Allocator) !void {
     var images = [_]ImageAttachment{.{
         .id = 1,
@@ -2989,29 +2884,4 @@ fn checkWorkProvenanceOwnershipFailures(alloc: Allocator) !void {
         .work_id = @constCast("work-owned"),
     });
     freeUserTurn(alloc, copy);
-}
-
-fn checkImageCatalogHistoryMergeAllocationFailures(alloc: Allocator) !void {
-    const catalog = [_]ImageAttachment{.{
-        .id = 2,
-        .path = @constCast("/tmp/history.png"),
-        .media_type = @constCast("image/png"),
-    }};
-    var added = [_]ImageAttachment{.{
-        .id = 8,
-        .path = @constCast("/tmp/completed.png"),
-        .media_type = @constCast("image/png"),
-    }};
-    const turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = @constCast("completed"), .images = &added },
-        .assistant = @constCast("done"),
-    } };
-    const merged = try merge_image_catalog_history_turn(alloc, &catalog, turn);
-    defer core_types.freeImageAttachmentSlice(alloc, merged);
-    try std.testing.expectEqual(@as(usize, 2), merged.len);
-}
-
-fn deinitMessages(alloc: Allocator, messages: *std.ArrayList(message.Message)) void {
-    for (messages.items) |*msg| msg.deinit(alloc);
-    messages.deinit(alloc);
 }

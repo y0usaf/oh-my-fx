@@ -1301,42 +1301,10 @@ fn composeSkillCompletionOptionRow(
     return row;
 }
 
-const picker_test_slash_specs = [_]command_specs.SlashSpec{
-    .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general },
-    .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "clear the terminal transcript", .presentation_category = .general },
-    .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
-    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove]", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true },
-    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|yolo|reset]", .completion_description = "choose permission behavior", .presentation_category = .security, .has_args = true },
-    .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account },
-    .{ .kind = .settings, .command = "/settings", .help_entry = "/settings", .completion_description = "configure fx", .presentation_category = .general },
-};
-const picker_test_slash_registry = command_specs.SlashRegistry{ .commands = picker_test_slash_specs[0..] };
-
 fn expectOrderedSubstrings(haystack: []const u8, needles: []const []const u8) !void {
     var offset: usize = 0;
     for (needles) |needle| {
         const relative = std.mem.find(u8, haystack[offset..], needle) orelse return error.TestUnexpectedResult;
         offset += relative + needle.len;
     }
-}
-
-fn composeAuthPickerTestGrid(
-    alloc: Allocator,
-    view: auth_runtime.PickerView,
-    width: u16,
-) !vt_emulator.Grid {
-    const row_count = authPickerRowCount(view);
-    var screen: std.ArrayList(u8) = .empty;
-    defer screen.deinit(alloc);
-    for (0..row_count) |row_index| {
-        if (row_index > 0) try screen.appendSlice(alloc, "\r\n");
-        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), row_count, width);
-        defer row.deinit(alloc);
-        try screen.appendSlice(alloc, row.items);
-    }
-
-    var grid = try vt_emulator.Grid.init(alloc, width, row_count);
-    errdefer grid.deinit();
-    try grid.feed(screen.items);
-    return grid;
 }

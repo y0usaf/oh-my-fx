@@ -796,20 +796,6 @@ fn ensureDir(path: []const u8) !void {
     };
 }
 
-fn resetInstalledSkillFixture(tmp: *std.testing.TmpDir) !void {
-    tmp.dir.deleteTree(io_mod.getIo(), "dest/review") catch {};
-    try writeTempFile(tmp, "dest/review/SKILL.md", "old skill\n");
-}
-
-fn expectNoInstallTransactionEntries(tmp: *std.testing.TmpDir) !void {
-    var dest = try tmp.dir.openDir(io_mod.getIo(), "dest", .{ .iterate = true });
-    defer dest.close(io_mod.getIo());
-    var entries = dest.iterate();
-    while (try entries.next(io_mod.getIo())) |entry| {
-        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".skill-install-"));
-    }
-}
-
 fn countImmediateSkillDirectories(root: []const u8) !usize {
     var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), root, .{ .iterate = true });
     defer dir.close(io_mod.getIo());
@@ -883,32 +869,10 @@ fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []cons
     try file.writeStreamingAll(io_mod.getIo(), content);
 }
 
-fn writeLargeTempSkill(tmp: *std.testing.TmpDir, sub_path: []const u8, name: []const u8) !void {
-    if (std.fs.path.dirname(sub_path)) |parent| {
-        try tmp.dir.createDirPath(io_mod.getIo(), parent);
-    }
-    var file = try tmp.dir.createFile(std.testing.io, sub_path, .{ .truncate = true });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), "---\nname: ");
-    try file.writeStreamingAll(io_mod.getIo(), name);
-    try file.writeStreamingAll(io_mod.getIo(), "\ndescription: valid large skill\n---\n\n");
-    const body_chunk = [_]u8{'x'} ** (16 * 1024);
-    for (0..257) |_| try file.writeStreamingAll(io_mod.getIo(), &body_chunk);
-    try file.writeStreamingAll(io_mod.getIo(), "\nLARGE_SKILL_TAIL\n");
-}
-
 fn readAbsoluteFile(alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, max_bytes);
-}
-
-fn expectNoAbsoluteFile(path: []const u8) !void {
-    if (std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{})) |opened| {
-        var file = opened;
-        defer file.close(io_mod.getIo());
-        try std.testing.expect(false);
-    } else |_| {}
 }
 
 const StaticSkill = struct {

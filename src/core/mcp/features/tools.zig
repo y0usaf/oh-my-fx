@@ -805,17 +805,3 @@ fn checkToolParsingAllocationFailures(alloc: Allocator) !void {
     );
     defer outcome.deinit(alloc);
 }
-
-fn fuzzListPageParser(_: void, smith: *std.testing.Smith) !void {
-    var input_buffer: [4096]u8 = undefined;
-    const input_len = std.math.cast(usize, smith.slice(&input_buffer)) orelse return;
-    if (parseListPage(
-        std.testing.allocator,
-        input_buffer[0..input_len],
-        .modern,
-        .{},
-    )) |page_value| {
-        var page = page_value;
-        page.deinit(std.testing.allocator);
-    } else |_| {}
-}

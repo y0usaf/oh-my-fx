@@ -442,16 +442,3 @@ fn set_bit(states: *[pattern_word_count]u64, index: usize) void {
 fn bit_is_set(states: *const [pattern_word_count]u64, index: usize) bool {
     return states[index / 64] & (@as(u64, 1) << @intCast(index % 64)) != 0;
 }
-
-fn test_definition(
-    condition: contracts.MonitorCondition,
-    notify_schedule: contracts.NotifySchedule,
-    lifetime: contracts.MonitorLifetime,
-) contracts.MonitorDefinition {
-    return .{
-        .condition = condition,
-        .check_schedule = if (condition.requires_polling()) .{ .interval_ms = 25 } else null,
-        .notify_schedule = notify_schedule,
-        .lifetime = lifetime,
-    };
-}

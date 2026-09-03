@@ -675,18 +675,6 @@ pub const QuestionPrompt = struct {
     }
 };
 
-fn syncTestQuestion(prompt: *QuestionPrompt) !void {
-    const opts = [_]types.QuestionOption{
-        .{ .label = "Yes", .description = "go ahead" },
-        .{ .label = "No", .description = null },
-        .{ .label = "Maybe", .description = "decide later" },
-    };
-    const entries = [_]types.QuestionBatchEntry{
-        .{ .question = "Should we proceed?", .options = &opts },
-    };
-    try prompt.syncFrom(std.testing.allocator, &entries);
-}
-
 fn currentChoiceIndex(prompt: *const QuestionPrompt) u8 {
     return prompt.entries.items[prompt.current_index].choice_index;
 }

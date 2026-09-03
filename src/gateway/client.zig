@@ -950,13 +950,6 @@ fn testAwakeTimestamp(milliseconds: i64) std.Io.Clock.Timestamp {
     };
 }
 
-fn expectConnectionSetupActionTag(
-    expected: std.meta.Tag(ConnectionSetupAction),
-    action: ConnectionSetupAction,
-) !void {
-    try std.testing.expectEqual(expected, std.meta.activeTag(action));
-}
-
 pub const StreamRequest = struct {
     api_key: []const u8,
     model: []const u8,
@@ -2678,17 +2671,6 @@ fn captureGenerationMetadata(
     generation_id.* = try alloc.dupe(u8, generation_value.string);
 }
 
-fn consumeSseStream(
-    alloc: std.mem.Allocator,
-    reader: anytype,
-    callback_ctx: *anyopaque,
-    on_content_chunk: StreamCallback,
-    on_tool_start: ?ToolStartCallback,
-    cancel_flag: *std.atomic.Value(bool),
-) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null);
-}
-
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
 ///
 /// The returned completion and every populated child buffer are owned by
@@ -3250,68 +3232,6 @@ fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 // serialized string. Normalize it so downstream tool dispatch always receives
 // a JSON argument buffer.
 
-fn consolidatedToolCallSseForTest(
-    alloc: std.mem.Allocator,
-    content_len: usize,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll(
-        "data: {\"type\":\"tool-call\",\"toolCallId\":\"large\",\"toolName\":\"write_file\",\"input\":{\"path\":\"large.txt\",\"content\":\"",
-    );
-    try out.writer.splatByteAll('x', content_len);
-    try out.writer.writeAll("\"}}\n\ndata: [DONE]\n\n");
-    return out.toOwnedSlice();
-}
-
-fn checkConsumeSseAllocationFailures(alloc: std.mem.Allocator) !void {
-    const payload =
-        "data: {\"type\":\"text-delta\",\"id\":\"text\",\"delta\":\"hello\"}\n\n" ++
-        "data: {\"type\":\"tool-input-start\",\"id\":\"A\",\"toolName\":\"read_file\"}\n\n" ++
-        "data: {\"type\":\"tool-input-delta\",\"id\":\"A\",\"delta\":\"{\\\"path\\\":\\\"alpha.txt\\\",\\\"line_end\\\":2}\"}\n\n" ++
-        "data: {\"type\":\"tool-input-start\",\"id\":\"B\",\"toolName\":\"parallel_search\"}\n\n" ++
-        "data: {\"type\":\"tool-input-delta\",\"id\":\"B\",\"delta\":\"{\\\"query\\\":\\\"zig\\\"}\"}\n\n" ++
-        "data: {\"type\":\"tool-input-end\",\"id\":\"A\"}\n\n" ++
-        "data: {\"type\":\"tool-call\",\"toolCallId\":\"final_A\",\"toolName\":\"read_file\",\"input\":{\"line_end\":2,\"path\":\"alpha.txt\"}}\n\n" ++
-        "data: {\"type\":\"tool-input-end\",\"id\":\"B\"}\n\n" ++
-        "data: {\"type\":\"tool-call\",\"toolCallId\":\"B\",\"input\":{\"query\":\"zig\"},\"providerExecuted\":true}\n\n" ++
-        "data: {\"type\":\"tool-result\",\"toolCallId\":\"B\",\"preliminary\":true,\"result\":{\"phase\":1}}\n\n" ++
-        "data: {\"type\":\"tool-result\",\"toolCallId\":\"B\",\"result\":{\"results\":[{\"title\":\"final\"}]}}\n\n" ++
-        "data: {\"type\":\"tool-call\",\"toolCallId\":\"C\",\"toolName\":\"dynamic_tool\",\"input\":[1,{\"nested\":true}]}\n\n" ++
-        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n";
-
-    const Noop = struct {
-        fn chunk(_: *anyopaque, _: []const u8) void {}
-        fn toolStart(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) void {}
-    };
-
-    var reader = std.Io.Reader.fixed(payload);
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var completion = try consumeSseStream(
-        alloc,
-        &reader,
-        undefined,
-        Noop.chunk,
-        Noop.toolStart,
-        &cancel_flag,
-    );
-    defer deinitGatewayCompletion(alloc, &completion);
-
-    try std.testing.expectEqualStrings("hello", completion.content.?);
-    try std.testing.expectEqual(@as(usize, 3), completion.tool_calls.len);
-    try std.testing.expectEqualStrings(
-        "{\"line_end\":2,\"path\":\"alpha.txt\"}",
-        completion.tool_calls[0].arguments_json,
-    );
-    try std.testing.expectEqualStrings("A", completion.tool_calls[0].provisional_id.?);
-    try std.testing.expectEqualStrings("{\"results\":[{\"title\":\"final\"}]}", completion.tool_calls[1].provider_result.?);
-    try std.testing.expectEqualStrings("[1,{\"nested\":true}]", completion.tool_calls[2].arguments_json);
-    try std.testing.expectEqual(
-        types.AuthoritativeToolAdmission.admitted,
-        types.authoritativeToolAdmission(completion),
-    );
-}
-
 const BoundedProbeStage = enum {
     request_open,
     dns,
@@ -3377,13 +3297,6 @@ const BoundedProbe = struct {
         };
     }
 };
-
-fn testAwakeDeadlineAfter(milliseconds: i64) std.Io.Clock.Timestamp {
-    return std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(milliseconds),
-    });
-}
 
 const LoopbackGatewayMode = enum {
     reset_on_accept,
@@ -3710,42 +3623,6 @@ const loopback_model_catalog_json =
 const loopback_private_model_catalog_json =
     "{\"data\":[{\"id\":\"openai/gpt-5\",\"type\":\"language\",\"tags\":[\"reasoning\",\"tool-use\",\"vision\",\"file-input\",\"web-search\",\"explicit-caching\",\"implicit-caching\"],\"context_window\":256000,\"max_tokens\":32000},{\"id\":\"anthropic/claude-opus-4\",\"type\":\"language\",\"tags\":[\"tool-use\"],\"context_window\":200000},{\"id\":\"anthropic/claude-sonnet-4\",\"type\":\"language\",\"tags\":[\"tool-use\"],\"context_window\":200000},{\"id\":\"private/blue-hornbill\",\"type\":\"language\",\"tags\":[\"tool-use\"],\"context_window\":200000}]}";
 
-pub const TestModelCatalogFixture = struct {
-    fixture: LoopbackGatewayFixture,
-
-    pub fn init() !@This() {
-        return .{ .fixture = try LoopbackGatewayFixture.init(.model_catalog_success, 0) };
-    }
-
-    pub fn initPrivate() !@This() {
-        return .{ .fixture = try LoopbackGatewayFixture.init(.private_model_catalog_success, 0) };
-    }
-
-    pub fn start(self: *@This()) !void {
-        try self.fixture.start();
-    }
-
-    pub fn deinit(self: *@This()) void {
-        self.fixture.deinit();
-    }
-
-    pub fn port(self: *@This()) u16 {
-        return self.fixture.port();
-    }
-
-    pub fn waitForAcceptStart(self: *@This(), timeout_ms: u64) bool {
-        return self.fixture.waitForAcceptStart(timeout_ms);
-    }
-
-    pub fn failure(self: *@This()) ?anyerror {
-        return self.fixture.failure;
-    }
-
-    pub fn capturedHeaderValue(self: *@This(), name: []const u8) ?[]const u8 {
-        return self.fixture.capturedHeaderValue(name);
-    }
-};
-
 const RequestOpenProbe = struct {
     attempts: usize = 0,
     tls_failure_attempt: ?usize = null,
@@ -3777,34 +3654,6 @@ const RequestOpenProbe = struct {
         return client.request(method, uri, options);
     }
 };
-
-const ConnectionSetupHarness = struct {
-    fixture: LoopbackGatewayFixture,
-    url: []u8,
-
-    fn init(mode: LoopbackGatewayMode, use_tls: bool) !ConnectionSetupHarness {
-        var fixture = try LoopbackGatewayFixture.init(mode, 500);
-        errdefer fixture.deinit();
-        const url = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "{s}://127.0.0.1:{d}/chat",
-            .{ if (use_tls) "https" else "http", fixture.port() },
-        );
-        return .{ .fixture = fixture, .url = url };
-    }
-
-    fn start(self: *@This()) !void {
-        try self.fixture.start();
-        if (!self.fixture.waitForAcceptStart(5000)) return error.TestFixtureDidNotStart;
-    }
-
-    fn deinit(self: *@This()) void {
-        self.fixture.deinit();
-        std.testing.allocator.free(self.url);
-    }
-};
-
-fn discardConnectionSetupTestChunk(_: *anyopaque, _: []const u8) void {}
 
 var stable_models_test_environ: ?*std.process.Environ.Map = null;
 
@@ -3844,67 +3693,6 @@ const ModelsUrlTestEnv = struct {
         alloc.destroy(self);
     }
 };
-
-fn expectCancellableGatewayJsonCancellation(
-    mode: LoopbackGatewayMode,
-    api_key: []const u8,
-    use_tls: bool,
-    cancel_after_stage_ms: u64,
-    hold_ms: u64,
-    max_elapsed_ms: i64,
-) !void {
-    const zio = io_mod.getIo();
-    var fixture = try LoopbackGatewayFixture.init(mode, hold_ms);
-    defer fixture.deinit();
-    try fixture.start();
-    try std.testing.expect(fixture.waitForAcceptStart(5000));
-
-    const models_url = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{s}://127.0.0.1:{d}/v1/models",
-        .{ if (use_tls) "https" else "http", fixture.port() },
-    );
-    defer std.testing.allocator.free(models_url);
-    const env = if (use_tls) null else try ModelsUrlTestEnv.install(std.testing.allocator, models_url);
-    defer if (env) |value| value.deinit();
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var request_done = std.atomic.Value(bool).init(false);
-    const Cancel = struct {
-        fn run(
-            server_fixture: *LoopbackGatewayFixture,
-            flag: *std.atomic.Value(bool),
-            done: *std.atomic.Value(bool),
-            delay_ms: u64,
-        ) void {
-            if (!server_fixture.waitForStageOrDone(done)) return;
-            LoopbackGatewayFixture.sleepBlocking(delay_ms);
-            if (!done.load(.seq_cst)) flag.store(true, .seq_cst);
-        }
-    };
-    const cancel_thread = try std.Thread.spawn(.{}, Cancel.run, .{
-        &fixture,
-        &cancel_flag,
-        &request_done,
-        cancel_after_stage_ms,
-    });
-    defer {
-        request_done.store(true, .seq_cst);
-        cancel_thread.join();
-    }
-
-    const started = std.Io.Clock.Timestamp.now(zio, .awake);
-    const result = if (use_tls)
-        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag)
-    else
-        fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag);
-    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
-
-    try std.testing.expectError(error.Cancelled, result);
-    if (fixture.failure) |err| return err;
-    try std.testing.expect(fixture.reached_stage.load(.seq_cst));
-    try std.testing.expect(elapsed_ms < max_elapsed_ms);
-}
 
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {
     var socket_buffer: [4096]u8 = undefined;
@@ -3961,182 +3749,4 @@ fn writeLoopbackGatewayBytes(zio: std.Io, stream: std.Io.net.Stream, bytes: []co
     var writer = stream.writer(zio, &buffer);
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();
-}
-
-fn expectBoundedLoopbackTimeout(
-    mode: LoopbackGatewayMode,
-    payload: []const u8,
-    retry_count: usize,
-    deadline_ms: i64,
-    hold_ms: u64,
-    max_elapsed_ms: i64,
-) !void {
-    const zio = io_mod.getIo();
-    var fixture = try LoopbackGatewayFixture.init(mode, hold_ms);
-    defer fixture.deinit();
-    try fixture.start();
-    try std.testing.expect(fixture.waitForAcceptStart(5000));
-
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
-    defer std.testing.allocator.free(url);
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    const started = std.Io.Clock.Timestamp.now(zio, .awake);
-    const request_result = streamGatewayRequiredToolCompletionBounded(
-        std.testing.allocator,
-        .{
-            .api_key = "test-key",
-            .model = "test/model",
-            .retry_count = retry_count,
-            .chat_url = url,
-            .payload = payload,
-        },
-        testAwakeDeadlineAfter(deadline_ms),
-        &cancel_flag,
-    );
-    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
-
-    fixture.deinit();
-
-    try std.testing.expectError(error.Timeout, request_result);
-    if (fixture.failure) |err| return err;
-    try std.testing.expect(fixture.accepted.load(.seq_cst));
-    try std.testing.expect(fixture.reached_stage.load(.seq_cst));
-    try std.testing.expect(elapsed_ms < max_elapsed_ms);
-}
-
-fn expectBoundedLoopbackCancellation(
-    mode: LoopbackGatewayMode,
-    payload: []const u8,
-    use_tls: bool,
-    cancel_after_stage_ms: u64,
-    hold_ms: u64,
-) !void {
-    var fixture = try LoopbackGatewayFixture.init(mode, hold_ms);
-    defer fixture.deinit();
-    try fixture.start();
-    try std.testing.expect(fixture.waitForAcceptStart(5000));
-
-    const scheme = if (use_tls) "https" else "http";
-    const url = try std.fmt.allocPrint(std.testing.allocator, "{s}://127.0.0.1:{d}/chat", .{ scheme, fixture.port() });
-    defer std.testing.allocator.free(url);
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var request_done = std.atomic.Value(bool).init(false);
-    const Cancel = struct {
-        fn run(
-            server_fixture: *LoopbackGatewayFixture,
-            flag: *std.atomic.Value(bool),
-            done: *std.atomic.Value(bool),
-            delay_ms: u64,
-        ) void {
-            if (!server_fixture.waitForStageOrDone(done)) return;
-            LoopbackGatewayFixture.sleepBlocking(delay_ms);
-            if (done.load(.seq_cst)) return;
-            flag.store(true, .seq_cst);
-        }
-    };
-    const cancel_thread = try std.Thread.spawn(
-        .{},
-        Cancel.run,
-        .{ &fixture, &cancel_flag, &request_done, cancel_after_stage_ms },
-    );
-
-    const request_result = streamGatewayRequiredToolCompletionBounded(
-        std.testing.allocator,
-        .{
-            .api_key = "test-key",
-            .model = "test/model",
-            .retry_count = 1,
-            .chat_url = url,
-            .payload = payload,
-        },
-        testAwakeDeadlineAfter(5000),
-        &cancel_flag,
-    );
-
-    request_done.store(true, .seq_cst);
-    cancel_thread.join();
-    fixture.deinit();
-
-    try std.testing.expectError(error.Cancelled, request_result);
-    if (fixture.failure) |err| return err;
-    try std.testing.expect(fixture.accepted.load(.seq_cst));
-    try std.testing.expect(fixture.reached_stage.load(.seq_cst));
-}
-
-fn expectDirectLoopbackCancellation(
-    mode: LoopbackGatewayMode,
-    payload: []const u8,
-    cancel_after_stage_ms: u64,
-    hold_ms: u64,
-    max_elapsed_ms: i64,
-) !void {
-    const zio = io_mod.getIo();
-    var fixture = try LoopbackGatewayFixture.init(mode, hold_ms);
-    defer fixture.deinit();
-    try fixture.start();
-    try std.testing.expect(fixture.waitForAcceptStart(5000));
-
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
-    defer std.testing.allocator.free(url);
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var request_done = std.atomic.Value(bool).init(false);
-    const Cancel = struct {
-        fn run(
-            server_fixture: *LoopbackGatewayFixture,
-            flag: *std.atomic.Value(bool),
-            done: *std.atomic.Value(bool),
-            delay_ms: u64,
-        ) void {
-            if (!server_fixture.waitForStageOrDone(done)) return;
-            LoopbackGatewayFixture.sleepBlocking(delay_ms);
-            if (!done.load(.seq_cst)) flag.store(true, .seq_cst);
-        }
-    };
-    const cancel_thread = try std.Thread.spawn(.{}, Cancel.run, .{
-        &fixture,
-        &cancel_flag,
-        &request_done,
-        cancel_after_stage_ms,
-    });
-
-    const Noop = struct {
-        fn onChunk(_: *anyopaque, _: []const u8) void {}
-    };
-    var callback_ctx: u8 = 0;
-    const started = std.Io.Clock.Timestamp.now(zio, .awake);
-    const result = streamGatewayCompletionCore(
-        std.testing.allocator,
-        .{
-            .api_key = "test-key",
-            .model = "test/model",
-            .retry_count = 1,
-            .chat_url = url,
-            .payload = payload,
-        },
-        @ptrCast(&callback_ctx),
-        Noop.onChunk,
-        null,
-        &cancel_flag,
-        null,
-        true,
-    );
-    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
-
-    request_done.store(true, .seq_cst);
-    cancel_thread.join();
-    fixture.deinit();
-
-    if (result) |value| {
-        var owned = value;
-        owned.deinit(std.testing.allocator);
-        return error.TestExpectedCancellation;
-    } else |err| {
-        try std.testing.expectEqual(error.Cancelled, err);
-    }
-    if (fixture.failure) |err| return err;
-    try std.testing.expect(cancel_flag.load(.seq_cst));
-    try std.testing.expect(elapsed_ms < max_elapsed_ms);
 }

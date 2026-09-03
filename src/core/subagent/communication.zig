@@ -3769,43 +3769,6 @@ fn checkRetentionGapAllocationFailures(alloc: Allocator) !void {
     );
 }
 
-fn testFileApprovalRequest() permission_request.FileApprovalRequest {
-    return .{
-        .kind = .edit,
-        .intent = .mutation,
-        .preview = .{
-            .path = "src/note.txt",
-            .lines = &.{
-                .{ .op = .deletion, .old_line = 1, .text = "before" },
-                .{ .op = .addition, .new_line = 1, .text = "after" },
-            },
-            .additions = 1,
-            .deletions = 1,
-            .truncated = false,
-        },
-        .scope = .{ .external_tree = "/tmp/project" },
-    };
-}
-
-fn checkFileApprovalRegistrationAllocationFailures(alloc: Allocator) !void {
-    var ledger = try Ledger.init(alloc, "child");
-    defer ledger.deinit(alloc);
-    _ = try registerApproval(alloc, &ledger, .{
-        .id = "file-allocation",
-        .kind = .tool,
-        .child_id = "child",
-        .root_id = "root",
-        .work_id = "work",
-        .prepared_fingerprint = [_]u8{8} ** 32,
-        .label = "file_mutation",
-        .explanation = "allocation sweep",
-        .file = testFileApprovalRequest(),
-        .grants = &.{},
-        .created_at_ms = 1,
-    });
-    try std.testing.expect(ledger.approvals[0].file != null);
-}
-
 fn fillEscapingUnicodeMessage(content: []u8) void {
     const pattern = "\"\\\n🦎";
     var offset: usize = 0;
@@ -3813,54 +3776,4 @@ fn fillEscapingUnicodeMessage(content: []u8) void {
         @memcpy(content[offset..][0..pattern.len], pattern);
     }
     @memset(content[offset..], 'x');
-}
-
-fn checkCommunicationAllocationFailures(alloc: Allocator) !void {
-    var ledger = try Ledger.init(alloc, "child");
-    defer ledger.deinit(alloc);
-    var policy = try domain.validateNotificationPolicy(alloc, .{
-        .milestones = &.{"halfway"},
-        .report_interval_ms = 100,
-    });
-    defer policy.deinit(alloc);
-    try upsertWorkNotification(alloc, &ledger, "work", policy, 1);
-    const grants = [_]types.PermissionGrant{.{
-        .tool_name = @constCast("bash"),
-        .target_path = @constCast("git status"),
-    }};
-    _ = try registerApproval(alloc, &ledger, .{
-        .id = "approval",
-        .kind = .tool,
-        .child_id = "child",
-        .root_id = "root",
-        .work_id = "work",
-        .prepared_fingerprint = [_]u8{1} ** 32,
-        .label = "prepared action",
-        .explanation = "bounded explanation",
-        .grants = &grants,
-        .created_at_ms = 1,
-    });
-    _ = try appendDelivery(alloc, &ledger, .{
-        .id = "delivery",
-        .source_id = "child",
-        .target_id = "root",
-        .work_id = "work",
-        .timestamp_ms = 1,
-        .payload = .{ .message = "bounded update" },
-    });
-    _ = try appendDelivery(alloc, &ledger, .{
-        .id = "delivery-two",
-        .source_id = "child",
-        .target_id = "root",
-        .work_id = "work",
-        .timestamp_ms = 2,
-        .payload = .{ .approval = "prepared action" },
-    });
-    var page = try pageForParentTurn(alloc, ledger, "parent-model", "root", null, 2);
-    defer page.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), page.deliveries.len);
-    const context = try renderTrustedContext(alloc, page.deliveries);
-    defer alloc.free(context);
-    var cloned = try ledger.clone(alloc);
-    defer cloned.deinit(alloc);
 }

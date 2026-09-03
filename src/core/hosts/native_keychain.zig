@@ -673,38 +673,3 @@ fn deleteMcpValueMac(
     if (std.mem.eql(u8, marker, "0")) return false;
     return error.KeychainDeleteFailed;
 }
-
-fn deleteServiceItem(
-    alloc: std.mem.Allocator,
-    service: []const u8,
-) Error!bool {
-    if (!isAvailable()) return error.UnsupportedPlatform;
-
-    var account_buf: AccountBuffer = undefined;
-    const account = try accountName(&account_buf);
-    const result = std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &.{
-            "/usr/bin/security",
-            "delete-generic-password",
-            "-a",
-            account,
-            "-s",
-            service,
-        },
-    }) catch |err| {
-        debug_trace.logf("keychain", "delete failed step=spawn err={s}", .{@errorName(err)});
-        return error.KeychainDeleteFailed;
-    };
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-    if (result.term == .exited and result.term.exited == 0) return true;
-    if (std.mem.find(u8, result.stderr, "could not be found") != null) return false;
-    debug_trace.logf("keychain", "delete failed step=remove term={t}", .{result.term});
-    return error.KeychainDeleteFailed;
-}
-
-const test_service_name = "FX_TEST_AI_GATEWAY_API_KEY";
-
-fn deleteTestServiceItem(alloc: std.mem.Allocator) void {
-    _ = deleteServiceItem(alloc, test_service_name) catch {};
-}

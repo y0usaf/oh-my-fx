@@ -886,68 +886,6 @@ fn requiredInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
 
 const test_session_json = "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\",\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_at_ms\":1,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\",\"team_slug\":\"team-slug\",\"team_id\":\"team-id\"}";
 
-const HostStoreTestState = struct {
-    record: ?[]const u8 = test_session_json,
-    revision: []const u8 = "7",
-    next_revision: []const u8 = "8",
-    force_conflict: bool = false,
-    commit_count: usize = 0,
-    remove_count: usize = 0,
-    expected_revision_matched: bool = false,
-    committed_format_matched: bool = false,
-
-    fn provider(self: *@This()) js_host_auth.SessionStore {
-        return .{
-            .context = self,
-            .load_fn = HostStoreTestState.load,
-            .commit_fn = HostStoreTestState.commit,
-            .remove_fn = HostStoreTestState.remove,
-        };
-    }
-
-    fn load(raw: ?*anyopaque, alloc: Allocator) !?js_host_auth.StoredSession {
-        const self = state(raw);
-        const record = self.record orelse return null;
-        const bytes = try alloc.dupe(u8, record);
-        errdefer secret.zeroAndFree(alloc, bytes);
-        return .{
-            .bytes = bytes,
-            .revision = try alloc.dupe(u8, self.revision),
-        };
-    }
-
-    fn commit(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        bytes: []const u8,
-        expected_revision: ?[]const u8,
-    ) ![]u8 {
-        const self = state(raw);
-        self.commit_count += 1;
-        self.expected_revision_matched = expected_revision != null and
-            std.mem.eql(u8, expected_revision.?, self.revision);
-        self.committed_format_matched = std.mem.eql(u8, bytes, test_session_json ++ "\n");
-        if (self.force_conflict) return error.OAuthSessionRevisionConflict;
-        self.revision = self.next_revision;
-        return alloc.dupe(u8, self.revision);
-    }
-
-    fn remove(raw: ?*anyopaque, expected_revision: ?[]const u8) !js_host_auth.RemoveOutcome {
-        const self = state(raw);
-        self.remove_count += 1;
-        self.expected_revision_matched = expected_revision != null and
-            std.mem.eql(u8, expected_revision.?, self.revision);
-        if (self.force_conflict) return error.OAuthSessionRevisionConflict;
-        if (self.record == null) return .missing;
-        self.record = null;
-        return .deleted;
-    }
-
-    fn state(raw: ?*anyopaque) *@This() {
-        return @ptrCast(@alignCast(raw.?));
-    }
-};
-
 fn check_parse_allocation_failures(alloc: Allocator) !void {
     var session = try parse(alloc, test_session_json);
     defer session.deinit(alloc);
@@ -957,8 +895,6 @@ fn check_load_allocation_failures(alloc: Allocator, dir: *std.Io.Dir) !void {
     var session = (try loadFromDir(alloc, dir, .report_open_failure)) orelse return error.TestUnexpectedMissingSession;
     defer session.deinit(alloc);
 }
-
-const alternate_test_session_json = "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\",\"access_token\":\"keychain-access\",\"refresh_token\":\"keychain-refresh\",\"expires_at_ms\":2,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}";
 
 const FakeOAuthKeychain = struct {
     alloc: Allocator,
@@ -1007,25 +943,6 @@ const FakeOAuthKeychain = struct {
         return true;
     }
 };
-
-fn writeTestAuthFile(dir: std.Io.Dir, contents: []const u8) !void {
-    var file = try dir.createFile(std.testing.io, auth_file_name, .{
-        .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
-    });
-    defer file.close(std.testing.io);
-    try file.writeStreamingAll(std.testing.io, contents);
-}
-
-fn testKeychainMutation(dir: std.Io.Dir, keychain: KeychainBackend) !Mutation {
-    return lockMutationWithBackend(
-        .{ .dir = try dir.openDir(std.testing.io, ".", .{ .iterate = true }) },
-        0,
-        .{},
-        .macos_keychain,
-        keychain,
-    );
-}
 
 const DeleteSyncProbe = struct {
     sync_count: usize = 0,

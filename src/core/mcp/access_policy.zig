@@ -224,29 +224,3 @@ pub fn authorize(captured: View, live: View, target: Target) Decision {
     }
     return .allow;
 }
-
-fn checkViewCloneAllocationFailures(alloc: Allocator) !void {
-    var source = View{
-        .runtime_generation = 7,
-        .owner_id = try std.testing.allocator.dupe(u8, "child"),
-        .parent_id = try std.testing.allocator.dupe(u8, "parent"),
-        .features_visible = true,
-        .servers = try std.testing.allocator.alloc(ServerIdentity, 1),
-        .tools = try std.testing.allocator.alloc(ToolIdentity, 1),
-    };
-    source.servers[0] = .{
-        .name = try std.testing.allocator.dupe(u8, "server"),
-        .source = .profile,
-        .scope = .profile,
-        .connection_generation = 1,
-        .catalog_generation = 2,
-        .auth_generation = 3,
-    };
-    source.tools[0] = .{
-        .name = try std.testing.allocator.dupe(u8, "mcp_server_tool"),
-        .server_name = try std.testing.allocator.dupe(u8, "server"),
-    };
-    defer source.deinit(std.testing.allocator);
-    var cloned = try source.clone(alloc);
-    defer cloned.deinit(alloc);
-}

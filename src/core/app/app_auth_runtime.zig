@@ -1231,60 +1231,6 @@ const TestModelCache = struct {
     }
 };
 
-const BusySignInAuth = struct {
-    start_count: usize = 0,
-
-    fn openChatGptSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
-        self.start_count += 1;
-        return true;
-    }
-
-    fn openGrokSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
-        self.start_count += 1;
-        return true;
-    }
-
-    fn signInBrowserUrlAlloc(_: *BusySignInAuth, _: std.mem.Allocator) !?[]u8 {
-        return null;
-    }
-};
-
-const BusySignInApp = struct {
-    pub const host_profile = runtime_profile.native;
-
-    alloc: std.mem.Allocator = std.testing.allocator,
-    selected_provider: model_provider.ProviderId = .gateway,
-    selected_model: std.ArrayList(u8) = .empty,
-    auth: BusySignInAuth = .{},
-    stream: struct { active: bool = false } = .{},
-    worker: struct {
-        queued_prompts: usize = 0,
-
-        fn queuedPromptCount(self: @This()) usize {
-            return self.queued_prompts;
-        }
-    } = .{},
-    shell: struct { render_requests: TestRenderRequests = .{} } = .{},
-    notice_count: usize = 0,
-    flush_count: usize = 0,
-
-    fn deinit(self: *BusySignInApp) void {
-        self.selected_model.deinit(self.alloc);
-    }
-
-    fn writeDomainNotice(self: *BusySignInApp, _: types.SemanticNotice, _: bool) !void {
-        self.notice_count += 1;
-    }
-
-    fn flushBeforeBlockingExternalWork(self: *BusySignInApp) !void {
-        self.flush_count += 1;
-    }
-
-    fn urlOpener(_: *BusySignInApp) host.UrlOpener {
-        return host.unavailable_url_opener;
-    }
-};
-
 const TestTeam = struct {
     name: []const u8,
     slug: []const u8,

@@ -1085,7 +1085,6 @@ const SupportedRegistry = struct {
                 .start,
                 switch (err) {
                     error.CapacityExceeded => .capacity_exceeded,
-                    error.MissingLoginShell => .shell_unavailable,
                     error.RelativeShellPath,
                     error.UnsupportedShell,
                     => .invalid_request,
@@ -6349,20 +6348,6 @@ fn testPersistence(cwd: []const u8) contracts.StartPersistence {
             .generation = .{ .value = 1 },
         },
         .proof = .{ .bytes = @splat(7) },
-    };
-}
-
-fn outputOwnerTestDefinition(
-    condition: contracts.MonitorCondition,
-) contracts.MonitorDefinition {
-    return .{
-        .condition = condition,
-        .check_schedule = if (condition.requires_polling())
-            .{ .interval_ms = 25 }
-        else
-            null,
-        .notify_schedule = .on_match,
-        .lifetime = .until_session_end,
     };
 }
 

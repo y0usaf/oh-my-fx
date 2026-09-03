@@ -1518,13 +1518,6 @@ fn isTopLevelTokenBoundary(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\n' or byte == ',' or byte == ':' or byte == '<' or byte == '>' or byte == '[' or byte == ']' or byte == '|';
 }
 
-fn expectAllLinesFit(text: []const u8, columns: usize) !void {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        try std.testing.expect(display_width.visibleWidth(line) <= columns);
-    }
-}
-
 fn testSlashRegistry() SlashRegistry {
     const builtin_commands = @import("../../builtins/commands.zig");
     return builtin_commands.slash_registry;
@@ -1538,22 +1531,6 @@ fn testTopLevelRegistry() TopLevelRegistry {
 fn testTopLevelHelpText(alloc: Allocator) ![]u8 {
     const builtin_commands = @import("../../builtins/commands.zig");
     return builtin_commands.renderTopLevelHelp(alloc, top_level_help_default_width, "9.8.7");
-}
-
-fn stripAnsiForTest(alloc: Allocator, text: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    var index: usize = 0;
-    while (index < text.len) {
-        if (text[index] == 0x1b) {
-            index = display_width.ansiSequenceEnd(text, index);
-            continue;
-        }
-        try out.writer.writeByte(text[index]);
-        index += 1;
-    }
-    return out.toOwnedSlice();
 }
 
 fn lineContainsBoth(text: []const u8, first: []const u8, second: []const u8) bool {

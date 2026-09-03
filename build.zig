@@ -20,6 +20,8 @@ const NapiSurface = enum {
     core,
 };
 
+const rush_version = "0.1.0-dev";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -67,6 +69,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("build_options", build_options.createModule());
     const genome_mod = addGenomeModule(b, "native", target, optimize);
     exe.root_module.addImport("genome", genome_mod);
+    const rush_mod = addRushModule(b, target, optimize);
+    exe.root_module.addImport("rush_app", rush_mod);
 
     b.installArtifact(exe);
 
@@ -208,6 +212,36 @@ pub fn build(b: *std.Build) void {
         pgso_ir_step.dependOn(&missing_artifact.step);
     }
 }
+fn addRushModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const rush_build_config = b.addOptions();
+    rush_build_config.addOption([]const u8, "version", rush_version);
+    rush_build_config.addOption([]const u8, "sysconfdir", b.getInstallPath(.prefix, "etc"));
+    rush_build_config.addOption([]const u8, "datadir", b.getInstallPath(.prefix, "share"));
+
+    const uucode = b.dependency("rush_uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = @as([]const []const u8, &.{"general_category"}),
+    }).module("uucode");
+
+    const module = b.createModule(.{
+        .root_source_file = b.path("vendor/rush/src/embed.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .single_threaded = true,
+        .imports = &.{
+            .{ .name = "uucode", .module = uucode },
+        },
+    });
+    module.addOptions("build_config", rush_build_config);
+    return module;
+}
+
 fn addGenomeModule(
     b: *std.Build,
     comptime name_prefix: []const u8,

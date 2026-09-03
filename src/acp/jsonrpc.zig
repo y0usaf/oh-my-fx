@@ -381,19 +381,3 @@ pub const Reader = struct {
         return null;
     }
 };
-
-const ChunkedTestSource = struct {
-    bytes: []const u8,
-    offset: usize = 0,
-    max_chunk: usize,
-
-    fn read(raw: ?*anyopaque, destination: []u8) usize {
-        const self: *ChunkedTestSource = @ptrCast(@alignCast(raw.?));
-        if (self.offset == self.bytes.len) return 0;
-        const remaining = self.bytes.len - self.offset;
-        const count = @min(@min(remaining, destination.len), self.max_chunk);
-        @memcpy(destination[0..count], self.bytes[self.offset .. self.offset + count]);
-        self.offset += count;
-        return count;
-    }
-};

@@ -340,16 +340,3 @@ fn cloneClipped(alloc: Allocator, text: []const u8, width: u16) !std.ArrayList(u
     try row_text.appendClipped(alloc, &row, text, width);
     return row;
 }
-
-const test_snapshot: settings_catalog.Snapshot = .{
-    .model = "zai/glm-5.2",
-    .effort = "default",
-    .fast_mode = true,
-    .permission_mode = "ask",
-    .statusline_context = true,
-    .statusline_session = false,
-    .statusline_workspace = false,
-    .startup_scrollback = true,
-    .prompt_history = true,
-    .sound_level = "on",
-};

@@ -3160,18 +3160,3 @@ fn check_owned_result_allocation_failures(alloc: Allocator) !void {
     defer result.deinit(alloc);
     try result.view().validate();
 }
-
-fn test_principal() Principal {
-    return .{
-        .profile_user = "user-501",
-        .durable_session_id = "session-1",
-        .workspace_root = "/workspace",
-        .cwd = "/workspace/src",
-        .transport_role = .interactive,
-        .backend = .native,
-    };
-}
-
-fn test_proof() HolderProof {
-    return .{ .bytes = [_]u8{1} ** 32 };
-}
