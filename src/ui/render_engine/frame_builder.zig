@@ -102,6 +102,7 @@ pub fn buildAndFlushFrame(
             plan.layout,
         ),
         options.terminal_transition,
+        terminal_diff.FrameReset.fromPlan(plan.reset_terminal, shell.history_reset_uses_ris),
     );
     defer movement.deinit(alloc);
 
@@ -481,7 +482,6 @@ fn testPlan() paint_plan.PaintPlan {
         .footer_clean_allowed = true,
         .synchronized_update = false,
         .cursor_target = .{ .row = 3, .col = 1, .visible = true },
-        .footer_reservation_source = .footer_layout,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };

@@ -7,6 +7,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const terminal_identity = @import("../../core/terminal/identity.zig");
 const terminal_action_executor = @import("../../core/terminal/action_executor.zig");
@@ -101,20 +102,31 @@ pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    if (try decode_input(ctx, args_json)) |input| return .{ .input = input };
+    return .{ .failure = try request_correction(ctx.allocator, args_json, ctx.session_child_capability != null) };
+}
+
+fn decode_input(
+    ctx: tool_dispatch.DispatchContext,
+    args_json: []const u8,
+) tool_dispatch.DispatchError!?tool_dispatch.ToolInput {
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var raw = std.json.parseFromSliceLeaky(
         std.json.Value,
         arena,
         args_json,
         .{ .allocate = .alloc_always },
-    ) catch return decodeFailure(ctx);
-    if (raw != .object) return decodeFailure(ctx);
-    const raw_action = raw.object.get("action") orelse return decodeFailure(ctx);
-    if (raw_action != .string) return decodeFailure(ctx);
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (raw != .object) return null;
+    const raw_action = raw.object.get("action") orelse return null;
+    if (raw_action != .string) return null;
     const action = std.meta.stringToEnum(Action, raw_action.string) orelse
-        return decodeFailure(ctx);
+        return null;
     elideKnownNullFields(&raw.object);
 
     var correction_scratch: ActionFieldCorrectionScratch = .{};
@@ -124,31 +136,29 @@ pub fn decode(
         action,
         raw.object,
         &correction_scratch,
-    )) |correction| {
-        return .{ .failure = try tool_result_errors.terminalActionFieldCorrectionJson(
-            ctx.allocator,
-            correction,
-        ) };
-    }
+    ) != null) return null;
     normalizeCompositeArgument(arena, &raw, "shell") catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return decodeFailure(ctx),
+        else => return null,
     };
-    var input = std.json.parseFromValueLeaky(Input, arena, raw, .{}) catch
-        return decodeFailure(ctx);
+    var input = std.json.parseFromValueLeaky(Input, arena, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (raw.object.get("yield_time_ms") == null) {
         input.yield_time_ms = defaultYieldTime(action);
     }
+    if (argument_problem(input) != null) return null;
     const owned = try ctx.allocator.create(OwnedInput);
     owned.* = .{
         .arena_state = arena_state.state,
         .value = input,
     };
     arena_state.state = .init;
-    return .{ .input = .{
+    return .{
         .ptr = owned,
         .deinit_fn = inputDeinit,
-    } };
+    };
 }
 
 fn defaultYieldTime(action: Action) u32 {
@@ -169,13 +179,192 @@ fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
     return @min(requested_ms, managed_contract.max_yield_time_ms);
 }
 
-fn decodeFailure(
-    ctx: tool_dispatch.DispatchContext,
-) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    return .{ .failure = try ctx.allocator.dupe(
-        u8,
-        "shell arguments must match the advertised action schema",
-    ) };
+// Advisory only: none of these values enters the executable decode path.
+fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: bool) Allocator.Error![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(arena_state);
+    const arena = arena_state.allocator();
+    if (args_json.len > 16 * 1024) {
+        return correction_json(alloc, &.{"Request is too large to suggest a repair; submit the intended action with only its required fields."}, null);
+    }
+    const raw = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return correction_json(alloc, &.{"Shell arguments must be a JSON object."}, null),
+    };
+    if (raw != .object or raw.object.count() > 32) {
+        return correction_json(alloc, &.{"Shell arguments must be one bounded request object."}, null);
+    }
+
+    var problems: std.ArrayList([]const u8) = .empty;
+    var repairable = true;
+    var object = raw.object;
+    if (raw.object.get("request")) |wrapper| {
+        var request = wrapper;
+        if (request == .string) {
+            try problems.append(arena, "request must be an object, not a JSON string.");
+            request = std.json.parseFromSliceLeaky(std.json.Value, arena, request.string, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return correction_json(alloc, problems.items, null),
+            };
+        }
+        if (request != .object or request.object.count() > 32) {
+            return correction_json(alloc, &.{"request must be one object containing the intended action."}, null);
+        }
+        object = request.object;
+        if (raw.object.count() > 1) {
+            try problems.append(arena, "Only request is allowed at the top level; put action fields inside request.");
+            var outer = raw.object.iterator();
+            while (outer.next()) |entry| {
+                const name = entry.key_ptr.*;
+                if (std.mem.eql(u8, name, "request")) continue;
+                if (object.contains(name)) {
+                    repairable = false;
+                } else {
+                    try object.put(arena, name, entry.value_ptr.*);
+                }
+            }
+        }
+    }
+    elideKnownNullFields(&object);
+    const action_value = object.get("action");
+    const action: Action = if (action_value) |value| blk: {
+        if (value == .string) {
+            if (std.meta.stringToEnum(Action, value.string)) |action| break :blk action;
+        }
+        try problems.append(arena, "request.action must be run, interact, or stop.");
+        return correction_json(alloc, problems.items, null);
+    } else blk: {
+        try problems.append(arena, "request.action is required.");
+        const command = object.get("command") orelse return correction_json(alloc, problems.items, null);
+        if (command != .string or object.contains("session_id") or object.contains("chars") or object.contains("force")) {
+            return correction_json(alloc, problems.items, null);
+        }
+        try object.put(arena, "action", .{ .string = "run" });
+        break :blk .run;
+    };
+
+    var scratch: ActionFieldCorrectionScratch = .{};
+    if (try actionFieldCorrection(arena, action, object, &scratch)) |correction| {
+        for (correction.invalid_fields) |name| {
+            try problems.append(arena, try std.fmt.allocPrint(
+                arena,
+                "request.{s} is not accepted for {s}.",
+                .{ text_utils.utf8PrefixByBytes(name, 64), @tagName(action) },
+            ));
+            // A non-null unknown field can express intent that cannot be reconstructed.
+            if (object.get(name).? != .null) repairable = false;
+            _ = object.orderedRemove(name);
+        }
+        for (correction.missing_fields) |name| {
+            try problems.append(arena, try std.fmt.allocPrint(arena, "request.{s} is required.", .{name}));
+            repairable = false;
+        }
+        for (correction.conflicts) |conflict| {
+            try problems.append(arena, try std.fmt.allocPrint(arena, "Choose either request.{s} or request.{s}.", .{ conflict[0], conflict[1] }));
+            repairable = false;
+        }
+    }
+
+    var canonical: std.json.ObjectMap = .empty;
+    inline for (@typeInfo(Input).@"struct".fields) |field| {
+        if (object.get(field.name)) |original| {
+            var value = original;
+            const T = if (@typeInfo(field.type) == .optional) @typeInfo(field.type).optional.child else field.type;
+            const expected = comptime switch (@typeInfo(T)) {
+                .int => "an integer",
+                .bool => "a boolean",
+                .pointer => "a string",
+                .@"enum" => "an advertised value",
+                else => "an object matching its schema",
+            };
+            var type_reported = false;
+            if (comptime @typeInfo(T) == .int) {
+                if (value == .string) {
+                    try problems.append(arena, "request." ++ field.name ++ " must be an integer.");
+                    type_reported = true;
+                    if (std.fmt.parseInt(T, value.string, 10)) |number| {
+                        value = if (std.math.cast(i64, number)) |integer|
+                            .{ .integer = integer }
+                        else
+                            .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{number}) };
+                    } else |_| {
+                        repairable = false;
+                    }
+                }
+            }
+            if (std.json.parseFromValueLeaky(field.type, arena, value, .{})) |_| {
+                if (comptime T == ShellInput) {
+                    var shell: std.json.ObjectMap = .empty;
+                    inline for (@typeInfo(ShellInput).@"struct".fields) |member| {
+                        if (value.object.get(member.name)) |supplied| {
+                            try shell.put(arena, member.name, supplied);
+                        }
+                    }
+                    value = .{ .object = shell };
+                }
+            } else |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                if (!type_reported) try problems.append(arena, "request." ++ field.name ++ " must be " ++ expected ++ ".");
+                repairable = false;
+            }
+            try canonical.put(arena, field.name, value);
+        }
+    }
+    const candidate = std.json.parseFromValueLeaky(Input, arena, .{ .object = canonical }, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return correction_json(alloc, problems.items, null),
+    };
+    if (argument_problem(candidate)) |problem| {
+        try problems.append(arena, problem);
+        repairable = false;
+    }
+    if (!supports_tty and (canonical.contains("tty") or canonical.contains("shell") or canonical.contains("chars"))) {
+        try problems.append(arena, "Interactive Shell fields require a saved session.");
+        repairable = false;
+    }
+    if (problems.items.len == 0) {
+        try problems.append(arena, "Submit one Shell action inside request.");
+    }
+    return correction_json(alloc, problems.items, if (repairable) canonical else null);
+}
+
+fn correction_json(
+    alloc: Allocator,
+    problems: []const []const u8,
+    candidate: ?std.json.ObjectMap,
+) Allocator.Error![]u8 {
+    const Retry = struct { request: std.json.Value };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    std.json.Stringify.value(.{ .@"error" = .{
+        .code = "invalid_shell_request",
+        .executed = false,
+        .problems = problems,
+        .instruction = if (candidate != null) @as(?[]const u8, "Call shell once using retry_with exactly.") else null,
+        .retry_with = if (candidate) |object| @as(?Retry, .{ .request = .{ .object = object } }) else null,
+    } }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn argument_problem(input: Input) ?[]const u8 {
+    switch (input.action) {
+        .run => {
+            const command = input.command orelse return "request.command is required.";
+            if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) return "request.command must contain 1-65536 bytes.";
+            if (input.timeout_ms == 0) return "request.timeout_ms must be at least 1; choose the intended deadline.";
+            if (input.profile != null and input.shell != null) return "Choose either request.profile or request.shell.";
+            if (!input.tty and input.shell != null) return "request.shell requires tty=true; choose the intended execution mode.";
+            if (input.yield_time_ms > managed_contract.max_yield_time_ms) return "request.yield_time_ms must be between 0 and 30000.";
+        },
+        .interact => {
+            if (input.yield_time_ms > managed_contract.max_wait_ceiling_ms) return "request.yield_time_ms must be between 0 and 300000.";
+            if (input.chars) |chars| {
+                if (chars.len > terminal_contracts.max_write_bytes) return "request.chars exceed 65536 bytes.";
+            }
+        },
+        .stop => {},
+    }
+    return null;
 }
 
 fn normalizeCompositeArgument(
@@ -277,7 +466,7 @@ pub fn validate(
 ) tool_dispatch.DispatchError!?[]u8 {
     const input = erased.as(OwnedInput).value;
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     return switch (input.action) {
         .run => validateRun(ctx, arena, input),
@@ -290,17 +479,7 @@ fn validateInteract(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
 ) tool_dispatch.DispatchError!?[]u8 {
-    if (input.yield_time_ms > managed_contract.max_wait_ceiling_ms) {
-        return try ctx.allocator.dupe(
-            u8,
-            "shell interact yield_time_ms must be between 0 and 300000",
-        );
-    }
-    if (input.chars) |chars| {
-        if (chars.len > terminal_contracts.max_write_bytes) {
-            return try ctx.allocator.dupe(u8, "shell interact chars exceed 65536 bytes");
-        }
-    }
+    if (argument_problem(input)) |problem| return try ctx.allocator.dupe(u8, problem);
     return null;
 }
 
@@ -309,20 +488,7 @@ fn validateRun(
     arena: Allocator,
     input: Input,
 ) tool_dispatch.DispatchError!?[]u8 {
-    const command = input.command orelse
-        return try ctx.allocator.dupe(u8, "shell run requires command");
-    if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) {
-        return try ctx.allocator.dupe(u8, "shell run command is invalid");
-    }
-    if (input.profile != null and input.shell != null) {
-        return try ctx.allocator.dupe(u8, "shell run fields profile and shell are mutually exclusive");
-    }
-    if (!input.tty and input.shell != null) {
-        return try ctx.allocator.dupe(u8, "shell run explicit shell requires tty=true");
-    }
-    if (input.yield_time_ms > managed_contract.max_yield_time_ms) {
-        return try ctx.allocator.dupe(u8, "shell yield_time_ms must be between 0 and 30000");
-    }
+    if (argument_problem(input)) |problem| return try ctx.allocator.dupe(u8, problem);
     _ = resolveCwd(arena, ctx, input.cwd) catch |err| {
         return try std.fmt.allocPrint(
             ctx.allocator,
@@ -369,7 +535,7 @@ fn callRun(
     };
     const command = input.command orelse return unavailable(ctx);
     var request_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer request_arena_state.deinit();
+    defer mem_utils.deinit_arena(request_arena_state);
     const request_arena = request_arena_state.allocator();
     const cwd = resolveCwd(request_arena, ctx, input.cwd) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -522,7 +688,7 @@ fn callTtyRun(
     };
     defer ctx.allocator.free(@constCast(cwd));
     var shell_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer shell_arena_state.deinit();
+    defer mem_utils.deinit_arena(shell_arena_state);
     var login_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
     const shell = ttyShell(shell_arena_state.allocator(), input, configured) catch |err|
@@ -1402,6 +1568,58 @@ fn formatModelSafeSnapshotRaw(
     );
 }
 
+const shell_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error), so nothing executed. Rewrite the command with corrected quoting or escaping and submit the full corrected command instead of rerunning the same text.";
+const usage_error_retry_guidance = "The command exited with a usage error (missing or invalid arguments). Rebuild the command with the required arguments explicitly set, then submit the corrected command instead of rerunning it unchanged.";
+
+fn failureRetryGuidance(exit_code: ?i64, output: []const u8) ?[]const u8 {
+    const code = exit_code orelse return null;
+    if (code == 0) return null;
+    if (isShellParseErrorOutput(output)) return shell_parse_retry_guidance;
+    if (hasUsageBannerOutput(output)) return usage_error_retry_guidance;
+    return null;
+}
+
+fn isShellParseErrorOutput(output: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!hasShellErrorPrefix(trimmed)) continue;
+        if (text_utils.containsIgnoreCase(trimmed, "unmatched") or
+            text_utils.containsIgnoreCase(trimmed, "syntax error") or
+            text_utils.containsIgnoreCase(trimmed, "parse error") or
+            text_utils.containsIgnoreCase(trimmed, "unterminated quoted string")) return true;
+    }
+    return false;
+}
+
+// Shell error prefixes may carry an absolute argv[0] path (fx spawns the
+// resolved login shell as /bin/bash, /bin/zsh, ...), so match the basename
+// of the token before the first colon rather than a raw line prefix.
+fn hasShellErrorPrefix(line: []const u8) bool {
+    const colon = std.mem.findScalar(u8, line, ':') orelse return false;
+    const token = line[0..colon];
+    if (token.len == 0 or std.mem.findScalar(u8, token, ' ') != null) return false;
+    const base = if (std.mem.findLast(u8, token, "/")) |slash| token[slash + 1 ..] else token;
+    const names = [_][]const u8{ "zsh", "bash", "sh", "dash" };
+    for (names) |name| {
+        if (std.mem.eql(u8, base, name)) return true;
+    }
+    return false;
+}
+
+fn hasUsageBannerOutput(output: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var scanned: usize = 0;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (scanned >= 4) return false;
+        scanned += 1;
+        if (std.ascii.startsWithIgnoreCase(trimmed, "usage:")) return true;
+    }
+    return false;
+}
+
 fn formatSnapshotRaw(
     alloc: Allocator,
     snapshot: managed_execution.Snapshot,
@@ -1427,7 +1645,8 @@ fn formatSnapshotRaw(
         "Command output is incomplete. Inspect external state and available output before retrying; do not blindly rerun a command that may have changed state."
     else switch (snapshot.state) {
         .lost => "Execution status is indeterminate. Inspect external state before retrying; do not blindly rerun a command that may have changed state.",
-        .running, .completed, .stopped => null,
+        .completed => failureRetryGuidance(projection.exit_code, snapshot.output_delta),
+        .running, .stopped => null,
     };
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -1621,6 +1840,170 @@ test "shell action fields are closed and command authority covers every run" {
     );
 }
 
+test "shell timeout minimum is enforced before correction and execution" {
+    const alloc = std.testing.allocator;
+    const zero = try decode(.{ .allocator = alloc }, "{\"action\":\"run\",\"command\":\"true\",\"timeout_ms\":0}");
+    switch (zero) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, failure, .{});
+            defer parsed.deinit();
+            const detail = parsed.value.object.get("error").?.object;
+            try std.testing.expectEqualStrings("invalid_shell_request", detail.get("code").?.string);
+            try std.testing.expect(!detail.get("executed").?.bool);
+            try std.testing.expect(detail.get("retry_with") == null);
+        },
+    }
+    for ([_][]const u8{
+        "{\"action\":\"run\",\"command\":\"true\"}",
+        "{\"action\":\"run\",\"command\":\"true\",\"timeout_ms\":1}",
+    }) |args| {
+        const decoded = try decode(.{ .allocator = alloc }, args);
+        switch (decoded) {
+            .input => |input| input.deinit(alloc),
+            .failure => |failure| {
+                alloc.free(failure);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+test "shell request correction suggests only unambiguous repairs without executing" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { input: []const u8, retry: ?[]const u8 }{
+        .{ .input = "{\"command\":\"sleep 30\",\"timeout_ms\":\"40000\",\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000,\"timeout_ms\":40000}" },
+        .{ .input = "{\"request\":{\"command\":\"sleep 30\"},\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000}" },
+        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":null}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
+        .{ .input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\"}\"}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
+        .{ .input = "{\"action\":\"interact\",\"session_id\":\"shell-3\",\"yield_time_ms\":\"1000\",\"unused\":null}", .retry = "{\"action\":\"interact\",\"yield_time_ms\":1000,\"session_id\":\"shell-3\"}" },
+        .{ .input = "{\"command\":\"true\",\"tty\":true}", .retry = null },
+        .{ .input = "{}", .retry = null },
+        .{ .input = "{\"action\":null,\"command\":\"true\"}", .retry = null },
+        .{ .input = "{\"session_id\":\"shell-3\"}", .retry = null },
+        .{ .input = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .retry = null },
+        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .retry = null },
+        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .retry = null },
+        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":30001}", .retry = null },
+        .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":\"1000\",\"timeout_ms\":0}}", .retry = null },
+        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
+        .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
+        .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\"},\"command\":\"false\"}", .retry = null },
+        .{ .input = "{", .retry = null },
+        .{ .input = "[]", .retry = null },
+    };
+    for (cases) |case| {
+        const result = try decode(.{ .allocator = alloc }, case.input);
+        const failure = switch (result) {
+            .failure => |failure| failure,
+            .input => |input| {
+                input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+        };
+        defer alloc.free(failure);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, failure, .{});
+        defer parsed.deinit();
+        const detail = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings("invalid_shell_request", detail.get("code").?.string);
+        try std.testing.expect(!detail.get("executed").?.bool);
+        try std.testing.expect(detail.get("problems").?.array.items.len > 0);
+        try std.testing.expect((try tool_result_errors.inspectTerminalActionFieldCorrection(alloc, failure)) != null);
+        if (case.retry) |expected| {
+            const request = detail.get("retry_with").?.object.get("request").?;
+            const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+            defer alloc.free(json);
+            try std.testing.expectEqualStrings(expected, json);
+            const decoded = try decode(.{ .allocator = alloc }, json);
+            switch (decoded) {
+                .input => |input| input.deinit(alloc),
+                .failure => |reason| {
+                    alloc.free(reason);
+                    return error.TestUnexpectedResult;
+                },
+            }
+        } else {
+            try std.testing.expect(detail.get("retry_with") == null);
+        }
+    }
+}
+
+fn check_request_correction_allocations(alloc: Allocator, args_json: []const u8) !void {
+    const result = try decode(.{ .allocator = alloc }, args_json);
+    switch (result) {
+        .failure => |failure| alloc.free(failure),
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+test "shell request correction releases partial allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_request_correction_allocations, .{
+        "{\"request\":{\"command\":\"true\"},\"yield_time_ms\":\"30000\"}",
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_request_correction_allocations, .{
+        "{\"command\":\"true\",\"tty\":true,\"shell\":{\"path\":\"/bin/bash\",\"kind\":\"executable\"}}",
+    });
+}
+
+test "shell request correction canonicalizes nested shell members" {
+    const alloc = std.testing.allocator;
+    const first = try request_correction(alloc,
+        \\{"command":"true","tty":true,"shell":{"kind":"executable","path":"/bin/bash","clean_start":false}}
+    , true);
+    defer alloc.free(first);
+    const reordered = try request_correction(alloc,
+        \\{"shell":{"clean_start":false,"path":"/bin/bash","kind":"executable"},"tty":true,"command":"true"}
+    , true);
+    defer alloc.free(reordered);
+    try std.testing.expectEqualStrings(first, reordered);
+    const omitted = try request_correction(alloc,
+        \\{"command":"true","tty":true,"shell":{"path":"/bin/bash","kind":"executable"}}
+    , true);
+    defer alloc.free(omitted);
+    try std.testing.expect(std.mem.find(u8, omitted, "clean_start") == null);
+}
+
+test "shell request correction bounds feedback and preserves input bytes" {
+    const alloc = std.testing.allocator;
+    const command = "printf '\u{1f308}\\n'; echo \"$VALUE\"";
+    const key = "x" ** 63 ++ "\u{1f308}";
+    const source = try std.json.Stringify.valueAlloc(alloc, .{
+        .command = command,
+        .x = null,
+    }, .{});
+    defer alloc.free(source);
+    const correction = try request_correction(alloc, source, true);
+    defer alloc.free(correction);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, correction, .{});
+    defer parsed.deinit();
+    const request = parsed.value.object.get("error").?.object.get("retry_with").?.object.get("request").?.object;
+    try std.testing.expectEqualStrings(command, request.get("command").?.string);
+
+    const long_key = try std.fmt.allocPrint(alloc, "{{\"command\":\"true\",\"{s}\":null}}", .{key});
+    defer alloc.free(long_key);
+    const bounded = try request_correction(alloc, long_key, true);
+    defer alloc.free(bounded);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(bounded));
+    const too_large = try alloc.alloc(u8, 16 * 1024 + 1);
+    defer alloc.free(too_large);
+    @memset(too_large, ' ');
+    const failure = try request_correction(alloc, too_large, true);
+    defer alloc.free(failure);
+    try std.testing.expect(failure.len < 512);
+    try std.testing.expect(std.mem.find(u8, failure, "retry_with") == null);
+
+    const tty = try request_correction(alloc, "{\"command\":\"true\",\"tty\":true}", true);
+    defer alloc.free(tty);
+    try std.testing.expect(std.mem.find(u8, tty, "retry_with") != null);
+}
+
 test "shell interact classification follows optional input" {
     const alloc = std.testing.allocator;
     const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
@@ -1739,7 +2122,7 @@ test "shell decoder preserves null omission and rejects cross action fields" {
         },
         .failure => |failure| {
             defer alloc.free(failure);
-            try std.testing.expect(std.mem.find(u8, failure, "invalid_action_fields") != null);
+            try std.testing.expect(std.mem.find(u8, failure, "invalid_shell_request") != null);
         },
     }
 }
@@ -1931,6 +2314,167 @@ test "completed shell snapshot reports incomplete output without losing status" 
         object.get("retry_guidance").?.string,
         "do not blindly rerun",
     ) != null);
+}
+
+test "completed shell snapshot with shell parse error carries rewrite guidance" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-parse-error"),
+        .command = @constCast("grep -rn '"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 1 } },
+        .output_delta = @constCast("zsh:1: unmatched '\n"),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("completed", object.get("state").?.string);
+    try std.testing.expectEqual(@as(i64, 1), object.get("exit_code").?.integer);
+    try std.testing.expectEqualStrings(
+        shell_parse_retry_guidance,
+        object.get("retry_guidance").?.string,
+    );
+}
+
+test "completed shell snapshot with usage error carries argument guidance" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-usage-error"),
+        .command = @constCast("grep -n"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 2 } },
+        .output_delta = @constCast("usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz] [-A num] [-B num]\n\t[-e pattern] [-f file] [--binary-files=value]\n"),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 2), object.get("exit_code").?.integer);
+    try std.testing.expectEqualStrings(
+        usage_error_retry_guidance,
+        object.get("retry_guidance").?.string,
+    );
+}
+
+test "completed shell snapshot with ordinary failure has no retry guidance" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-ordinary-failure"),
+        .command = @constCast("grep needle /nonexistent"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 2 } },
+        .output_delta = @constCast("grep: /nonexistent: No such file or directory\n"),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("retry_guidance").? == .null);
+}
+
+test "failure guidance detects signatures in raw output when emitted text is encoded" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-usage-encoded"),
+        .command = @constCast("grep -n"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 2 } },
+        .output_delta = @constCast("usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\npartial \x00 binary\n"),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(
+        usage_error_retry_guidance,
+        object.get("retry_guidance").?.string,
+    );
+}
+
+test "incomplete output guidance takes precedence over failure guidance" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-incomplete-usage"),
+        .command = @constCast("grep -n"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 2 } },
+        .output_delta = @constCast("usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\n"),
+        .output_truncated = false,
+        .output_incomplete = true,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(std.mem.find(
+        u8,
+        parsed.value.object.get("retry_guidance").?.string,
+        "do not blindly rerun",
+    ) != null);
+}
+
+test "failure guidance detectors match only their signatures" {
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(1, "zsh:1: unmatched '\n"),
+    );
+    // fx spawns the resolved login shell with an absolute argv[0], so bash
+    // errors carry a /bin/bash prefix; bare-basename forms also occur when a
+    // command spawns a shell subprocess itself.
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(2, "/bin/bash: -c: line 1: syntax error: unexpected end of file\n"),
+    );
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(2, "bash: -c: line 1: syntax error near unexpected token `)'\n"),
+    );
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(2, "/bin/dash: 1: Syntax error: Unterminated quoted string\n"),
+    );
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(1, "zsh: parse error near '\\n'\n"),
+    );
+    try std.testing.expectEqual(
+        usage_error_retry_guidance,
+        failureRetryGuidance(2, "usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\n"),
+    );
+    try std.testing.expectEqual(
+        usage_error_retry_guidance,
+        failureRetryGuidance(64, "Usage: ls [-ABCFGHabcdfghiklmnopqrstuvwx1] [file ...]\n"),
+    );
+    try std.testing.expectEqual(
+        usage_error_retry_guidance,
+        failureRetryGuidance(2, "grep: unknown option\nusage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\n"),
+    );
+
+    // Exit zero never carries failure guidance.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(0, "usage: grep\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(null, "zsh:1: unmatched '\n"));
+    // A compiler-style syntax error without a shell prefix is not a shell parse error.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "main.c:4:5: error: expected ';' after expression (syntax error)\n"));
+    // A non-shell token before the colon is not a shell prefix even when a shell name appears later.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "error: bash: syntax error\n"));
+    // Ordinary failures keep null guidance.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(2, "grep: /nonexistent: No such file or directory\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, ""));
+    // A usage-looking line deep in output is not an argument rejection banner.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "line one\nline two\nline three\nline four\nusage: not a banner\n"));
 }
 
 test "shell snapshot keeps bounded head tail and control metadata" {

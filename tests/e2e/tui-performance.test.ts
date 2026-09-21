@@ -47,7 +47,7 @@ const LOCAL_MENU_ACTIONS = [
   { name: "mcpOpen", command: "/mcp", marker: "[Servers]" },
   { name: "usageOpen", command: "/usage", marker: "[30 days]" },
   { name: "statuslineOpen", command: "/statusline", marker: "Status line" },
-  { name: "workspaceOpen", command: "/workspace", marker: "Enter Use" },
+  { name: "workspaceOpen", command: "/workspace", marker: "enter use" },
 ] as const;
 
 const MEASURED_ACTION_NAMES = [
@@ -724,7 +724,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
 
       // One correctness cycle also fences the inline prewarm before timing.
       session.sendKeysImmediate(["C-o"]);
-      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
       expect(await session.captureFullScrollback()).toContain("PERF_TRANSCRIPT_HEAD");
       session.sendKeysImmediate(["Escape"]);
       await session.waitForComposer(TIMEOUT);
@@ -742,15 +742,15 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const open = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["C-o"]),
-          () => session!.waitForText("Full detail · ctrl o close", TIMEOUT),
-          "Full detail",
+          () => session!.waitForText("full detail · ctrl+o close", TIMEOUT),
+          "full detail",
         );
         const beforeScroll = await session.capturePane();
         const scroll = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["Up"]),
           () => session!.waitForPane(
-            (pane) => pane !== beforeScroll && pane.includes("Full detail"),
+            (pane) => pane !== beforeScroll && pane.includes("full detail"),
             TIMEOUT,
           ),
         );
@@ -763,14 +763,14 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       }
 
       session.sendKeysImmediate(["C-o"]);
-      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
       let beforePrime = await session.capturePane();
       // The first key moves one viewport into the three-viewport prepared
       // window. Each loop then moves to its edge before the measured key
       // crosses that edge and waits for the replacement window.
       session.sendKeysImmediate(["PageUp"]);
       await session.waitForPane(
-        (pane) => pane !== beforePrime && pane.includes("Full detail"),
+        (pane) => pane !== beforePrime && pane.includes("full detail"),
         TIMEOUT,
       );
       await waitForTapeQuiescence(fixture.tapePath);
@@ -779,7 +779,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         beforePrime = await session.capturePane();
         session.sendKeysImmediate([key]);
         await session.waitForPane(
-          (pane) => pane !== beforePrime && pane.includes("Full detail"),
+          (pane) => pane !== beforePrime && pane.includes("full detail"),
           TIMEOUT,
         );
         await waitForTapeQuiescence(fixture.tapePath);
@@ -788,7 +788,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           fixture.tapePath,
           () => session!.sendKeysImmediate([key]),
           () => session!.waitForPane(
-            (pane) => pane !== beforeMiss && pane.includes("Full detail"),
+            (pane) => pane !== beforeMiss && pane.includes("full detail"),
             TIMEOUT,
           ),
         );
@@ -967,8 +967,8 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
       expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);
-      // Three terminal routes plus the shared command-replay logs and commands routes.
-      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(5);
+      // Three terminal routes plus command-replay logs, commands, and tool-results routes.
+      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(6);
       expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(16 * 1024);
 
       const peakResources = await peakResourcesWhile(pid, async () => {
@@ -1095,7 +1095,7 @@ test.skipIf(!LIVE_ENABLED || !tmuxAvailable())(
       await session.waitForText("LIVE_PERFORMANCE_DONE", TIMEOUT);
 
       session.sendKeysImmediate(["C-o"]);
-      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
       session.sendKeysImmediate(["Up"]);
       await Bun.sleep(25);
       session.sendKeysImmediate(["Escape"]);

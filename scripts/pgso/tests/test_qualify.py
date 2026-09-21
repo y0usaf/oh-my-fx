@@ -552,6 +552,122 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(str(candidate), calls[1][0])
         self.assertTrue(results[0].passed)
 
+    def test_ui_activity_measurement_uses_alternating_hyperfine_rounds(self) -> None:
+        control = self.root / "heavy" / "control"
+        candidate = self.root / "heavy" / "candidate"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        pair = BenchmarkPair(
+            selector="ui_activity",
+            control_binary=control,
+            candidate_binary=candidate,
+            bitcode_sha256="b" * 64,
+            merged_raw_profiles=1,
+        )
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(argv, **kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            if command[0] != str(hyperfine):
+                return CommandResult(command, 0, "measured\n", "", 1.0)
+            export_path = pathlib.Path(
+                command[command.index("--export-json") + 1]
+            )
+            labels = [
+                command[index + 1]
+                for index, value in enumerate(command)
+                if value == "--command-name"
+            ]
+            export_path.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "command": label,
+                                "times": [1.0 if label == "control" else 0.9],
+                            }
+                            for label in labels
+                        ]
+                    }
+                )
+            )
+            return CommandResult(command, 0, "", "", 1.0)
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.build_benchmark_pair",
+                side_effect=AssertionError("must use immutable prebuilt pair"),
+            ),
+            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
+        ):
+            results = measure_heavy_workloads(
+                toolchain=None,
+                repo_root=self.root,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                workload_names=("ui-activity",),
+                prebuilt_pairs={"ui_activity": pair},
+                hyperfine_binary=hyperfine,
+            )
+
+        hyperfine_calls = [
+            command for command in calls if command[0] == str(hyperfine)
+        ]
+        self.assertEqual(50, len(hyperfine_calls))
+        for round_index, command in enumerate(hyperfine_calls):
+            self.assertEqual("1", command[command.index("--runs") + 1])
+            self.assertEqual(
+                "0",
+                command[command.index("--warmup") + 1],
+            )
+            self.assertEqual(
+                (
+                    ("control", "candidate")
+                    if round_index % 2 == 0
+                    else ("candidate", "control")
+                ),
+                tuple(
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--command-name"
+                ),
+            )
+        self.assertEqual(50, len(results[0].control_samples))
+        self.assertEqual(50, len(results[0].candidate_samples))
+        self.assertTrue(results[0].passed)
+
+    def test_ui_activity_measurement_requires_hyperfine(self) -> None:
+        control = self.root / "heavy" / "control"
+        candidate = self.root / "heavy" / "candidate"
+        for path in (control, candidate):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        pair = BenchmarkPair(
+            selector="ui_activity",
+            control_binary=control,
+            candidate_binary=candidate,
+            bitcode_sha256="b" * 64,
+            merged_raw_profiles=1,
+        )
+
+        with self.assertRaisesRegex(
+            PgsoError,
+            "microbenchmark measurement requires Hyperfine: ui_activity",
+        ):
+            measure_heavy_workloads(
+                toolchain=None,
+                repo_root=self.root,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                workload_names=("ui-activity",),
+                prebuilt_pairs={"ui_activity": pair},
+            )
+
     def test_benchmark_pair_uses_the_external_control_for_minimum_macos(self) -> None:
         plan = BENCHMARK_PLANS[0]
         output = self.root / "pair"

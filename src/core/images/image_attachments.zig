@@ -1,4 +1,5 @@
 const std = @import("std");
+const file_picker_path = @import("../input/file_picker_path.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const display_width = @import("../shared/display_width.zig");
@@ -104,23 +105,85 @@ test "image placeholder rewrite projects boundaries and rejects interiors" {
     );
 }
 
+/// The source covers consumed path syntax, not its outside punctuation. Both
+/// ranges are byte offsets; later placeholder-ID changes never mutate this map.
+pub const InlineImageEdit = struct {
+    source: entity_spans.Span,
+    output: entity_spans.Span,
+    id: usize,
+};
+
 pub const ExtractedInlineImages = struct {
     text: []u8,
     images: []types.ImageAttachment,
-    image_spans: []ImagePlaceholderSpan,
+    edits: []InlineImageEdit,
 
     pub fn deinit(self: ExtractedInlineImages, alloc: std.mem.Allocator) void {
         alloc.free(self.text);
         types.freeImageAttachmentSlice(alloc, self.images);
-        alloc.free(self.image_spans);
+        alloc.free(self.edits);
     }
 
     pub fn discard(self: ExtractedInlineImages, alloc: std.mem.Allocator) void {
         alloc.free(self.text);
         discardImageAttachmentSlice(alloc, self.images);
-        alloc.free(self.image_spans);
+        alloc.free(self.edits);
     }
 };
+
+const InlineImageReplacement = struct {
+    source: entity_spans.Span,
+    id: usize,
+};
+
+/// Pure byte transformation. The caller owns both returned allocations.
+fn rewrite_inline_images(alloc: std.mem.Allocator, source: []const u8, replacements: []const InlineImageReplacement) !struct { text: []u8, edits: []InlineImageEdit } {
+    const edits = try alloc.alloc(InlineImageEdit, replacements.len);
+    errdefer alloc.free(edits);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var cursor: usize = 0;
+    for (replacements, edits) |replacement, *edit| {
+        if (!replacement.source.isValid(source.len) or replacement.source.raw_start < cursor or replacement.id == 0) return error.InvalidImageOccurrence;
+        try out.appendSlice(alloc, source[cursor..replacement.source.raw_start]);
+        const start = out.items.len;
+        var buffer: [64]u8 = undefined;
+        try out.appendSlice(alloc, try formatImagePlaceholder(&buffer, replacement.id));
+        edit.* = .{
+            .source = replacement.source,
+            .output = .{ .raw_start = start, .raw_end = out.items.len },
+            .id = replacement.id,
+        };
+        cursor = replacement.source.raw_end;
+    }
+    try out.appendSlice(alloc, source[cursor..]);
+    return .{ .text = try out.toOwnedSlice(alloc), .edits = edits };
+}
+
+/// Projects an existing entity through admitted edits. Consumed entities do not
+/// survive. Edits borrow immutable source/output coordinates from extraction.
+pub fn project_inline_image_span(source_len: usize, span: entity_spans.Span, edits: []const InlineImageEdit) ?entity_spans.Span {
+    if (!span.isValid(source_len)) return null;
+    var source_cursor: usize = 0;
+    var output_cursor: usize = 0;
+    for (edits) |edit| {
+        if (!edit.source.isValid(source_len) or edit.source.raw_start < source_cursor or edit.output.raw_end <= edit.output.raw_start or edit.id == 0) return null;
+        const start = std.math.add(usize, output_cursor, edit.source.raw_start - source_cursor) catch return null;
+        if (edit.output.raw_start != start) return null;
+        source_cursor = edit.source.raw_end;
+        output_cursor = edit.output.raw_end;
+    }
+    _ = std.math.add(usize, output_cursor, source_len - source_cursor) catch return null;
+    var projected = span;
+    var index = edits.len;
+    while (index > 0) {
+        index -= 1;
+        const edit = edits[index];
+        projected = entity_spans.afterDelete(projected, edit.source.raw_start, edit.source.raw_end) orelse return null;
+        projected = entity_spans.afterInsert(projected, edit.source.raw_start, edit.output.raw_end - edit.output.raw_start) orelse return null;
+    }
+    return projected;
+}
 
 pub fn loadImageAttachment(alloc: std.mem.Allocator, path_input: []const u8) !types.ImageAttachment {
     const normalized_path = try normalizePathInput(alloc, path_input);
@@ -137,13 +200,22 @@ pub fn loadUserImageAttachment(
 ) !types.ImageAttachment {
     const normalized_path = try normalizePathInput(alloc, path_input);
     defer alloc.free(normalized_path);
+    // Preserve the raw entry's second trim at the old path-resolution boundary.
+    return load_user_image_literal(alloc, workspace_root, std.mem.trim(u8, normalized_path, " \t\r\n"));
+}
 
+/// Reads a decoded path without changing filename bytes. Caller owns the result.
+fn load_user_image_literal(
+    alloc: std.mem.Allocator,
+    workspace_root: []const u8,
+    path: []const u8,
+) !types.ImageAttachment {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
-    const resolved_path = try pathing.resolveWorkspaceOrExternalPath(
+    const resolved_path = try pathing.resolve_workspace_or_external_literal_path(
         scratch_state.allocator(),
         workspace_root,
-        normalized_path,
+        path,
     );
     const owned_path = try alloc.dupe(u8, resolved_path);
     return loadResolvedImageAttachment(alloc, owned_path);
@@ -533,6 +605,45 @@ pub fn captureInlineImageBytes(
     attachment.path = durable_path;
     return attachment;
 }
+
+/// Captures caller-supplied image bytes for sessions without a filesystem
+/// snapshot backend (libfx kernel sessions on native and wasm). Applies the
+/// same size, media-type, and digest validation as the filesystem capture,
+/// but retains the decoded bytes on the attachment itself so request building
+/// and checkpoint serialization never touch a filesystem.
+/// The caller owns the returned attachment and must release it with
+/// `types.freeImageAttachment` or `discardImageAttachment`.
+pub fn captureInlineImageBytesInMemory(
+    alloc: std.mem.Allocator,
+    image_id: usize,
+    declared_media_type: []const u8,
+    bytes: []const u8,
+) !types.ImageAttachment {
+    if (image_id == 0) return error.InvalidImageId;
+    if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
+    if (bytes.len > max_image_bytes or !fitsEncodedLimit(bytes.len)) return error.ImageTooLarge;
+    const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
+    if (!std.mem.eql(u8, detected, declared_media_type)) return error.ImageSnapshotMediaTypeMismatch;
+
+    const owned_path = try std.fmt.allocPrint(alloc, inline_image_path_prefix ++ "{d}", .{image_id});
+    errdefer alloc.free(owned_path);
+    const owned_media_type = try alloc.dupe(u8, declared_media_type);
+    errdefer alloc.free(owned_media_type);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    const digest_hex = try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+    errdefer alloc.free(digest_hex);
+    const owned_bytes = try alloc.dupe(u8, bytes);
+    return .{
+        .id = image_id,
+        .path = owned_path,
+        .media_type = owned_media_type,
+        .snapshot_sha256 = digest_hex,
+        .inline_data = owned_bytes,
+    };
+}
+
+pub const inline_image_path_prefix = "inline://image-";
 
 fn captureImageSnapshotFromOpenFileWithBudget(
     alloc: std.mem.Allocator,
@@ -1070,6 +1181,23 @@ pub fn loadVerifiedSnapshot(
     attachment: types.ImageAttachment,
     budget: CaptureBudget,
 ) !VerifiedSnapshot {
+    if (attachment.inline_data) |inline_bytes| {
+        const expected_inline = attachment.snapshot_sha256 orelse return error.MissingImageSnapshot;
+        if (expected_inline.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
+        try budget.check();
+        if (inline_bytes.len > max_image_bytes) return error.ImageTooLarge;
+        var actual: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(inline_bytes, &actual, .{});
+        const actual_hex = std.fmt.bytesToHex(actual, .lower);
+        if (!std.mem.eql(u8, actual_hex[0..], expected_inline)) return error.ImageSnapshotCorrupt;
+        const detected = detectMediaTypeFromBytes(inline_bytes) orelse
+            return error.UnsupportedImageType;
+        if (!std.mem.eql(u8, detected, attachment.media_type)) return error.ImageSnapshotMediaTypeMismatch;
+        return .{
+            .bytes = try alloc.dupe(u8, inline_bytes),
+            .media_type = detected,
+        };
+    }
     const path = attachment.snapshot_path orelse return error.MissingImageSnapshot;
     const expected = attachment.snapshot_sha256 orelse return error.MissingImageSnapshot;
     if (expected.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
@@ -1654,7 +1782,7 @@ pub fn writeVerifiedImageFilePartJsonWithBudget(
 
     try writer.writeAll("{\"type\":\"file\",\"mediaType\":\"");
     try writer.writeAll(snapshot.media_type);
-    try writer.writeAll("\",\"data\":\"");
+    try writer.writeAll("\",\"data\":{\"type\":\"data\",\"data\":\"");
 
     var offset: usize = 0;
     while (offset < snapshot.bytes.len) {
@@ -1664,7 +1792,7 @@ pub fn writeVerifiedImageFilePartJsonWithBudget(
         offset = end;
     }
 
-    try writer.writeAll("\"}");
+    try writer.writeAll("\"}}");
     try budget.check();
 }
 
@@ -1674,91 +1802,51 @@ pub fn extractInlineImageAttachments(
     text: []const u8,
     first_image_id: usize,
 ) !ExtractedInlineImages {
-    var output: std.Io.Writer.Allocating = .init(alloc);
-    errdefer output.deinit();
-
     var images: std.ArrayList(types.ImageAttachment) = .empty;
     errdefer {
         for (images.items) |image| types.freeImageAttachment(alloc, image);
         images.deinit(alloc);
     }
-    var image_spans: std.ArrayList(ImagePlaceholderSpan) = .empty;
-    errdefer image_spans.deinit(alloc);
+    var replacements: std.ArrayList(InlineImageReplacement) = .empty;
+    defer replacements.deinit(alloc);
 
-    var i: usize = 0;
+    var index: usize = 0;
     while (true) {
-        while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
-        if (i >= text.len) break;
-
-        const start = i;
-        const end = nextShellTokenEnd(text, start);
-        const raw = text[start..end];
-        i = end;
-
-        if (splitImagePathToken(raw)) |token| {
-            const attachment = loadUserImageAttachment(alloc, workspace_root, token.path) catch |err| switch (err) {
-                error.FileNotFound,
-                error.HomeNotSet,
-                error.InvalidPath,
-                error.NotRegularFile,
-                error.UnsupportedImageType,
-                => blk: {
-                    debug_trace.logf(
-                        "images",
-                        "event=inline_image_promotion_skipped reason={s}",
-                        .{@errorName(err)},
-                    );
-                    try appendToken(&output.writer, raw);
-                    break :blk null;
-                },
-                else => return err,
-            };
-            if (attachment) |loaded_image| {
-                var image = loaded_image;
-                var owns_image = true;
-                errdefer if (owns_image) types.freeImageAttachment(alloc, image);
-                image.id = try std.math.add(usize, first_image_id, images.items.len);
-                try images.append(alloc, image);
-                owns_image = false;
-                var placeholder_buf: [64]u8 = undefined;
-                const placeholder = try formatImagePlaceholder(&placeholder_buf, image.id);
-                const placeholder_start = output.written().len + @intFromBool(output.written().len > 0);
-                try appendToken(&output.writer, placeholder);
-                try image_spans.append(alloc, .{
-                    .start = placeholder_start,
-                    .end = placeholder_start + placeholder.len,
-                    .id = image.id,
-                });
-                try output.writer.writeAll(token.suffix);
+        while (index < text.len and isWhitespace(text[index])) : (index += 1) {}
+        if (index == text.len) break;
+        const start = index;
+        index = nextShellTokenEnd(text, start);
+        const token = splitImagePathToken(text[start..index]) orelse continue;
+        var image = load_inline_image_attachment(alloc, workspace_root, token) catch |err| switch (err) {
+            error.FileNotFound,
+            error.HomeNotSet,
+            error.InvalidPath,
+            error.NotRegularFile,
+            error.UnsupportedImageType,
+            => {
+                debug_trace.logf("images", "event=inline_image_promotion_skipped reason={s}", .{@errorName(err)});
                 continue;
-            }
-        } else {
-            try appendToken(&output.writer, raw);
-        }
+            },
+            else => return err,
+        };
+        var owns_image = true;
+        errdefer if (owns_image) types.freeImageAttachment(alloc, image);
+        image.id = std.math.add(usize, first_image_id, images.items.len) catch return error.ImageIdOverflow;
+        if (image.id == 0) return error.InvalidImageId;
+        _ = std.math.add(usize, image.id, 1) catch return error.ImageIdOverflow;
+        try images.ensureUnusedCapacity(alloc, 1);
+        try replacements.append(alloc, .{
+            .source = .{ .raw_start = start, .raw_end = index - token.suffix.len },
+            .id = image.id,
+        });
+        images.appendAssumeCapacity(image);
+        owns_image = false;
     }
 
     const owned_images = try images.toOwnedSlice(alloc);
     errdefer types.freeImageAttachmentSlice(alloc, owned_images);
-    const owned_spans = try image_spans.toOwnedSlice(alloc);
-    errdefer alloc.free(owned_spans);
-    const compact = std.mem.trim(u8, output.written(), " \t\r\n");
-    const owned = try output.toOwnedSlice();
-    errdefer alloc.free(owned);
-    if (compact.len != owned.len) {
-        const trimmed = try alloc.dupe(u8, compact);
-        alloc.free(owned);
-        return .{
-            .text = trimmed,
-            .images = owned_images,
-            .image_spans = owned_spans,
-        };
-    }
-
-    return .{
-        .text = owned,
-        .images = owned_images,
-        .image_spans = owned_spans,
-    };
+    const rewritten = try rewrite_inline_images(alloc, text, replacements.items);
+    return .{ .text = rewritten.text, .images = owned_images, .edits = rewritten.edits };
 }
 
 pub const ClipboardImageAttachment = struct {
@@ -1870,36 +1958,54 @@ fn normalizePathInput(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn detectMediaTypeFromBytes(bytes: []const u8) ?[]const u8 {
-    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
-    if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
-    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) return "image/gif";
-    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
-    return null;
-}
+const detectMediaTypeFromBytes = @import("image_data.zig").detectMediaTypeFromBytes;
 
 pub const ImagePathToken = struct {
     path: []const u8,
     suffix: []const u8,
+    /// Canonical @ payload without quotes; decode once before literal loading.
+    literal_payload: bool = false,
 };
+
+/// Loads one parsed image token. Caller owns the returned attachment.
+pub fn load_inline_image_attachment(alloc: std.mem.Allocator, workspace_root: []const u8, token: ImagePathToken) !types.ImageAttachment {
+    if (!token.literal_payload) return loadUserImageAttachment(alloc, workspace_root, token.path);
+    const path = try file_picker_path.decode_alloc(alloc, token.path);
+    defer alloc.free(path);
+    return load_user_image_literal(alloc, workspace_root, path);
+}
 
 pub fn splitImagePathToken(raw: []const u8) ?ImagePathToken {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "@\"")) {
+        const token = file_picker_path.parse_at(trimmed, 0) orelse return null;
+        if (token.status != .complete or token.end != trimmed.len) return null;
+        if (token.canonical_escapes) {
+            const payload = trimmed[token.path_start..token.path_end];
+            var storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const decoded = file_picker_path.decode_into(payload, &storage) catch return null;
+            const dot = std.mem.lastIndexOfScalar(u8, decoded, '.') orelse return null;
+            if (!supported_path_extension(decoded[dot..])) return null;
+            return .{ .path = payload, .suffix = trimmed[token.quote_end.?..], .literal_payload = true };
+        }
+        // Noncanonical escapes keep legacy eligibility (notably backslash-dot).
+    }
     const path_start: usize = if (std.mem.startsWith(u8, trimmed, "@")) 1 else 0;
     if (path_start == 1 and std.mem.startsWith(u8, trimmed[path_start..], "@")) return null;
     const suffix_start = trailingSentencePunctuationStart(trimmed);
     if (path_start >= suffix_start) return null;
     const path = trimmed[path_start..suffix_start];
     const ext = extensionIgnoringEscapes(stripBalancedOuterQuotes(path));
-    if (!(std.ascii.eqlIgnoreCase(ext, ".png") or
+    if (!supported_path_extension(ext)) return null;
+    return .{ .path = path, .suffix = trimmed[suffix_start..] };
+}
+
+fn supported_path_extension(ext: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(ext, ".png") or
         std.ascii.eqlIgnoreCase(ext, ".jpg") or
         std.ascii.eqlIgnoreCase(ext, ".jpeg") or
         std.ascii.eqlIgnoreCase(ext, ".gif") or
-        std.ascii.eqlIgnoreCase(ext, ".webp")))
-    {
-        return null;
-    }
-    return .{ .path = path, .suffix = trimmed[suffix_start..] };
+        std.ascii.eqlIgnoreCase(ext, ".webp");
 }
 
 pub fn looksLikeImagePathToken(raw: []const u8) bool {
@@ -1976,41 +2082,10 @@ fn extensionIgnoringEscapes(raw: []const u8) []const u8 {
     return if (dot_index) |idx| raw[idx..] else "";
 }
 
-pub fn nextShellTokenEnd(text: []const u8, start: usize) usize {
-    var i = start;
-    var quote: ?u8 = null;
-    while (i < text.len) : (i += 1) {
-        const ch = text[i];
-        if (quote) |q| {
-            if (ch == '\\' and i + 1 < text.len) {
-                i += 1;
-                continue;
-            }
-            if (ch == q) quote = null;
-            continue;
-        }
-
-        if (ch == '\\' and i + 1 < text.len) {
-            i += 1;
-            continue;
-        }
-        if (ch == '"' or ch == '\'') {
-            quote = ch;
-            continue;
-        }
-        if (isWhitespace(ch)) break;
-    }
-    return i;
-}
+pub const nextShellTokenEnd = file_picker_path.token_end;
 
 pub fn isWhitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
-}
-
-fn appendToken(writer: *std.Io.Writer, raw: []const u8) !void {
-    if (raw.len == 0) return;
-    if (writer.buffered().len > 0) try writer.writeByte(' ');
-    try writer.writeAll(raw);
 }
 
 test "writeImageBadge emits OSC 8 hyperlink wrapping the badge" {
@@ -2563,6 +2638,106 @@ test "hasImagePathToken detects image-looking shell tokens without filesystem ac
     try std.testing.expect(!hasImagePathToken("hello /tmp/not-image.txt"));
 }
 
+test "inline image edits preserve outer multiline whitespace and stable digit boundaries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "first.png", "second.png" }) |path| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "\x89PNG\r\n\x1a\nfixture" });
+    }
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const source = " \tExplain\n  block @./first.png,\n$review @./second.png  \r\n";
+    const result = try extractInlineImageAttachments(alloc, root, source, 9);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings(" \tExplain\n  block [Image #9],\n$review [Image #10]  \r\n", result.text);
+    try std.testing.expectEqual(@as(usize, 2), result.images.len);
+    try std.testing.expectEqual(@as(usize, 9), result.images[0].id);
+    try std.testing.expectEqual(@as(usize, 10), result.images[1].id);
+    try std.testing.expectEqual(@as(usize, 2), result.edits.len);
+    for (result.edits, [_][]const u8{ "@./first.png", "@./second.png" }, [_][]const u8{ "[Image #9]", "[Image #10]" }) |edit, raw, placeholder| {
+        try std.testing.expectEqualStrings(raw, source[edit.source.raw_start..edit.source.raw_end]);
+        try std.testing.expectEqualStrings(placeholder, result.text[edit.output.raw_start..edit.output.raw_end]);
+    }
+    const skill_start = std.mem.find(u8, source, "$review").?;
+    const skill = project_inline_image_span(source.len, .{ .raw_start = skill_start, .raw_end = skill_start + "$review".len }, result.edits).?;
+    try std.testing.expectEqualStrings("$review", result.text[skill.raw_start..skill.raw_end]);
+    try std.testing.expectError(error.ImageIdOverflow, extractInlineImageAttachments(alloc, root, "@./first.png", std.math.maxInt(usize)));
+    try std.testing.expectError(error.InvalidImageId, extractInlineImageAttachments(alloc, root, "@./first.png", 0));
+}
+
+test "inline image edits are pure lossless replacements with half open maps" {
+    const alloc = std.testing.allocator;
+    const source = "aXbYYc";
+    const replacements = [_]InlineImageReplacement{
+        .{ .source = .{ .raw_start = 1, .raw_end = 2 }, .id = 9 },
+        .{ .source = .{ .raw_start = 3, .raw_end = 5 }, .id = 10 },
+    };
+    const result = try rewrite_inline_images(alloc, source, &replacements);
+    defer alloc.free(result.text);
+    defer alloc.free(result.edits);
+    try std.testing.expectEqualStrings("a[Image #9]b[Image #10]c", result.text);
+    for ([_]usize{ 0, 2, 5 }, [_][]const u8{ "a", "b", "c" }) |start, expected| {
+        const projected = project_inline_image_span(source.len, .{ .raw_start = start, .raw_end = start + 1 }, result.edits).?;
+        try std.testing.expectEqualStrings(expected, result.text[projected.raw_start..projected.raw_end]);
+    }
+    try std.testing.expect(project_inline_image_span(source.len, replacements[0].source, result.edits) == null);
+    try std.testing.expect(project_inline_image_span(source.len, .{ .raw_start = 0, .raw_end = 2 }, result.edits) == null);
+    var bad = result.edits[0];
+    bad.output.raw_start += 1;
+    try std.testing.expect(project_inline_image_span(source.len, .{ .raw_start = 0, .raw_end = 1 }, &.{bad}) == null);
+    const unchanged = try rewrite_inline_images(alloc, " \t\r\n[Image #9] \n", &.{});
+    defer alloc.free(unchanged.text);
+    defer alloc.free(unchanged.edits);
+    try std.testing.expectEqualStrings(" \t\r\n[Image #9] \n", unchanged.text);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.edits.len);
+    try std.testing.expectError(error.InvalidImageOccurrence, rewrite_inline_images(alloc, source, &.{ replacements[1], replacements[0] }));
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: std.mem.Allocator, text: []const u8, edits: []const InlineImageReplacement) !void {
+            const rewritten = try rewrite_inline_images(a, text, edits);
+            defer a.free(rewritten.text);
+            defer a.free(rewritten.edits);
+        }
+    }.check, .{ source, @as([]const InlineImageReplacement, &replacements) });
+}
+
+test "canonical at images load exact filenames and preserve legacy eligibility" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const names = [_][]const u8{ "photo.png", ".png", "a\\b.png", "a\"b.png", " leading.png" };
+    for (names) |name| try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = "\x89PNG\r\n\x1a\nfixture" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ab.png", .data = "alternate is not an image" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "photo.png,", .data = "selected is plain text" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    for (names) |name| {
+        const encoded = try file_picker_path.encode(alloc, name, .{ .quoted = true });
+        defer alloc.free(encoded);
+        const token = splitImagePathToken(encoded).?;
+        try std.testing.expect(token.literal_payload);
+        const image = try load_inline_image_attachment(alloc, root, token);
+        defer types.freeImageAttachment(alloc, image);
+        const expected = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, image.path);
+    }
+    const selected = try file_picker_path.encode(alloc, "photo.png,", .{});
+    defer alloc.free(selected);
+    try std.testing.expect(splitImagePathToken(selected) == null);
+    const unchanged = try extractInlineImageAttachments(alloc, root, selected, 1);
+    defer unchanged.deinit(alloc);
+    try std.testing.expectEqualStrings(selected, unchanged.text);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.images.len);
+    for ([_][]const u8{ "@\"photo.png\"other.png", "@\"photo.png", "@\"photo\\.png\"", "(@\"photo.png\")" }) |invalid| {
+        try std.testing.expect(splitImagePathToken(invalid) == null);
+    }
+    const legacy = splitImagePathToken("@photo.png,").?;
+    try std.testing.expect(!legacy.literal_payload);
+    try std.testing.expectEqualStrings("photo.png", legacy.path);
+    try std.testing.expectEqualStrings(",", legacy.suffix);
+}
+
 test "splitImagePathToken preserves only unquoted sentence punctuation" {
     const comma = splitImagePathToken("/tmp/photo.png,").?;
     try std.testing.expectEqualStrings("/tmp/photo.png", comma.path);
@@ -2573,7 +2748,8 @@ test "splitImagePathToken preserves only unquoted sentence punctuation" {
     try std.testing.expectEqualStrings("", mention.suffix);
 
     const quoted_mention = splitImagePathToken("@\"/tmp/quoted image.webp\"?!").?;
-    try std.testing.expectEqualStrings("\"/tmp/quoted image.webp\"", quoted_mention.path);
+    try std.testing.expectEqualStrings("/tmp/quoted image.webp", quoted_mention.path);
+    try std.testing.expect(quoted_mention.literal_payload);
     try std.testing.expectEqualStrings("?!", quoted_mention.suffix);
 
     const quoted = splitImagePathToken("\"/tmp/quoted image.webp\"?!").?;
@@ -3863,4 +4039,63 @@ test "review image replay observes cancellation between base64 chunks" {
     ));
     try std.testing.expect(writer.total_written > 3 * 1024);
     try std.testing.expect(writer.total_written < 16 * 1024);
+}
+
+test "in-memory inline capture validates and retains image bytes without a filesystem" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-payload";
+    const attachment = try captureInlineImageBytesInMemory(alloc, 3, "image/png", png);
+    defer types.freeImageAttachment(alloc, attachment);
+
+    try std.testing.expectEqual(@as(usize, 3), attachment.id);
+    try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expectEqualStrings("inline://image-3", attachment.path);
+    try std.testing.expectEqual(@as(?[]const u8, null), attachment.snapshot_path);
+    try std.testing.expectEqualStrings(png, attachment.inline_data.?);
+    try std.testing.expectEqual(@as(usize, snapshot_digest_hex_len), attachment.snapshot_sha256.?.len);
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualStrings(png, verified.bytes);
+    try std.testing.expectEqualStrings("image/png", verified.media_type);
+}
+
+test "in-memory inline capture rejects invalid input before retaining bytes" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-payload";
+
+    try std.testing.expectError(error.InvalidImageId, captureInlineImageBytesInMemory(alloc, 0, "image/png", png));
+    try std.testing.expectError(error.UnsupportedImageType, captureInlineImageBytesInMemory(alloc, 1, "image/png", ""));
+    try std.testing.expectError(error.UnsupportedImageType, captureInlineImageBytesInMemory(alloc, 1, "", png));
+    try std.testing.expectError(error.UnsupportedImageType, captureInlineImageBytesInMemory(alloc, 1, "image/png", "not an image"));
+    try std.testing.expectError(
+        error.ImageSnapshotMediaTypeMismatch,
+        captureInlineImageBytesInMemory(alloc, 1, "image/jpeg", png),
+    );
+    const oversized = try alloc.alloc(u8, max_image_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    @memcpy(oversized[0..8], "\x89PNG\r\n\x1a\n");
+    try std.testing.expectError(error.ImageTooLarge, captureInlineImageBytesInMemory(alloc, 1, "image/png", oversized));
+}
+
+test "inline snapshot verification rejects corrupted retained bytes" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-payload";
+    const attachment = try captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, attachment);
+
+    var corrupted = attachment;
+    corrupted.inline_data = try alloc.dupe(u8, attachment.inline_data.?);
+    defer alloc.free(corrupted.inline_data.?);
+    corrupted.inline_data.?[9] ^= 1;
+    try std.testing.expectError(error.ImageSnapshotCorrupt, loadVerifiedSnapshot(alloc, corrupted, .{}));
+
+    var wrong_type = attachment;
+    wrong_type.media_type = @constCast("image/jpeg");
+    try std.testing.expectError(error.ImageSnapshotMediaTypeMismatch, loadVerifiedSnapshot(alloc, wrong_type, .{}));
+
+    var missing_digest = attachment;
+    missing_digest.snapshot_sha256 = null;
+    try std.testing.expectError(error.MissingImageSnapshot, loadVerifiedSnapshot(alloc, missing_digest, .{}));
 }

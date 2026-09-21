@@ -13,6 +13,7 @@ const block_render = @import("presentation/block_render.zig");
 var link_id_counter: u32 = 1;
 
 pub const setInlineCodeTheme = ansi.setInlineCodeTheme;
+pub const applyTheme = ansi.applyTheme;
 pub const writeHorizontalRule = ansi.writeHorizontalRule;
 
 pub const TableColumnAlign = payload.TableColumnAlign;
@@ -145,7 +146,8 @@ pub const MarkdownProcessor = struct {
     code_buf: std.ArrayList(u8) = .empty,
     code_language: std.ArrayList(u8) = .empty,
     in_code_block: bool = false,
-    code_fence_marker: ?u8 = null,
+    /// Set for fenced blocks; null while inside an indented code block.
+    code_fence: ?bp.CodeFence = null,
     in_pipe_block: bool = false,
     pipe_last_line_has_lf: bool = false,
     active_blockquote: ?bp.BlockquotePrefix = null,
@@ -172,7 +174,7 @@ pub const MarkdownProcessor = struct {
         self.code_language.clearAndFree(alloc);
         self.deinitFootnotes(alloc);
         self.in_code_block = false;
-        self.code_fence_marker = null;
+        self.code_fence = null;
         self.in_pipe_block = false;
         self.pipe_last_line_has_lf = false;
         self.active_blockquote = null;
@@ -216,35 +218,6 @@ pub const MarkdownProcessor = struct {
         }
     }
 
-    /// Rebuilds structural Markdown state from source that is already visible.
-    /// Buffered bytes are discarded so later chunks emit only new content.
-    pub fn restorePresentedPrefix(
-        self: *MarkdownProcessor,
-        alloc: Allocator,
-        source: []const u8,
-    ) !void {
-        self.reset(alloc);
-        var discarded: std.ArrayList(u8) = .empty;
-        defer discarded.deinit(alloc);
-
-        try self.push(alloc, source, &discarded);
-        if (self.line_buf.items.len > 0) {
-            try self.handleLine(
-                alloc,
-                self.line_buf.items,
-                false,
-                &discarded,
-                .{},
-            );
-            self.line_buf.clearRetainingCapacity();
-        }
-        self.pending_top_level_line.clearRetainingCapacity();
-        self.pipe_buf.clearRetainingCapacity();
-        self.in_pipe_block = false;
-        self.pipe_last_line_has_lf = false;
-        self.code_buf.clearRetainingCapacity();
-    }
-
     pub fn flush(self: *MarkdownProcessor, alloc: Allocator, out: *std.ArrayList(u8)) !void {
         try self.flushWithCompletions(alloc, out, .{});
     }
@@ -281,7 +254,7 @@ pub const MarkdownProcessor = struct {
         if (self.in_code_block) {
             try self.finalizeCodeBlock(alloc, out, completions.code);
             self.in_code_block = false;
-            self.code_fence_marker = null;
+            self.code_fence = null;
         }
         try self.flushFootnotes(alloc, out);
     }
@@ -299,11 +272,11 @@ pub const MarkdownProcessor = struct {
 
         if (self.in_code_block) {
             self.active_definition = false;
-            if (self.code_fence_marker) |marker| {
-                if (bp.codeFenceMarker(tu.leftTrim(line)) == marker) {
+            if (self.code_fence) |fence| {
+                if (bp.closesCodeFence(line, fence)) {
                     try self.finalizeCodeBlock(alloc, out, completions.code);
                     self.in_code_block = false;
-                    self.code_fence_marker = null;
+                    self.code_fence = null;
                     return;
                 }
             } else if (!tu.isBlankMarkdownLine(line) and !bp.hasIndentedCodePrefix(line)) {
@@ -312,7 +285,9 @@ pub const MarkdownProcessor = struct {
                 try self.handleLine(alloc, line, line_has_lf, out, completions);
                 return;
             }
-            const code_line = if (self.code_fence_marker == null and !tu.isBlankMarkdownLine(line))
+            const code_line = if (self.code_fence) |fence|
+                bp.stripFenceIndent(line, fence.indent)
+            else if (!tu.isBlankMarkdownLine(line))
                 bp.deindentCodeLine(line)
             else
                 line;
@@ -378,7 +353,12 @@ pub const MarkdownProcessor = struct {
             self.active_blockquote = null;
         }
 
-        if (bp.hasIndentedCodePrefix(line) and (bp.parseUnorderedList(line) != null or bp.parseOrderedList(line) != null)) {
+        // An indented list marker continues a list, except that a plus sign in
+        // indented-code position stays code so diff-style lines are preserved.
+        const indented_list_item = bp.hasIndentedCodePrefix(line) and
+            (bp.parseUnorderedList(line) != null or bp.parseOrderedList(line) != null);
+        const plus_in_code_position = indented_list_item and self.previous_line_was_blank and tu.leftTrim(line)[0] == '+';
+        if (indented_list_item and !plus_in_code_position) {
             self.active_definition = false;
             try self.processLine(alloc, line, line_has_lf, out);
             try out.append(alloc, '\n');
@@ -388,7 +368,7 @@ pub const MarkdownProcessor = struct {
         if (self.previous_line_was_blank and bp.hasIndentedCodePrefix(line)) {
             self.active_definition = false;
             self.in_code_block = true;
-            self.code_fence_marker = null;
+            self.code_fence = null;
             self.code_language.clearRetainingCapacity();
             try self.appendCodeLine(alloc, bp.deindentCodeLine(line), line_has_lf, out, completions.code);
             return;
@@ -403,12 +383,12 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        if (bp.codeFenceMarker(tu.leftTrim(line))) |marker| {
+        if (bp.parseCodeFence(line)) |fence| {
             self.active_definition = false;
             self.in_code_block = true;
-            self.code_fence_marker = marker;
+            self.code_fence = fence;
             self.code_language.clearRetainingCapacity();
-            try self.code_language.appendSlice(alloc, bp.codeFenceLanguage(tu.leftTrim(line)));
+            try self.code_language.appendSlice(alloc, bp.codeFenceLanguage(line));
             return;
         }
 
@@ -479,8 +459,8 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        if (bp.parseHeader(line)) |header| {
-            try block_render.writeHeading(alloc, header.level, tu.withoutTerminalHardBreakMarker(header.content, line_has_lf), out, &fs, &link_id_counter);
+        if (bp.parseHeader(tu.withoutTerminalHardBreakMarker(line, line_has_lf))) |header| {
+            try block_render.writeHeading(alloc, header.level, header.content, out, &fs, &link_id_counter);
             return;
         }
 
@@ -494,30 +474,7 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        if (bp.parseUnorderedList(line)) |parsed| {
-            try out.appendSlice(alloc, parsed.indent);
-            if (bp.parseTaskListItem(parsed.content)) |task| {
-                try block_render.writeTaskListMarker(alloc, out, task);
-                try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(task.content, line_has_lf), out, false, &fs, &link_id_counter);
-                return;
-            }
-            try ansi.writeDim(alloc, out, ansi.bullet_marker);
-            try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(parsed.content, line_has_lf), out, false, &fs, &link_id_counter);
-            return;
-        }
-
-        if (bp.parseOrderedList(line)) |parsed| {
-            try out.appendSlice(alloc, parsed.indent);
-            try ansi.writeDim(alloc, out, parsed.marker);
-            try out.append(alloc, ' ');
-            if (bp.parseTaskListItem(parsed.content)) |task| {
-                try block_render.writeTaskListMarker(alloc, out, task);
-                try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(task.content, line_has_lf), out, false, &fs, &link_id_counter);
-                return;
-            }
-            try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(parsed.content, line_has_lf), out, false, &fs, &link_id_counter);
-            return;
-        }
+        if (try block_render.writeListLine(alloc, line, line_has_lf, out, &fs, &link_id_counter)) return;
 
         try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(line, line_has_lf), out, false, &fs, &link_id_counter);
     }
@@ -682,10 +639,65 @@ test "markdown link is blue and underlined inside its OSC 8 scope" {
     var expected_buf: [256]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "see \x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[4mdocs\x1b[24m\x1b]8;;\x1b\\ please\n",
+        "see \x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[38;5;75m\x1b[4mdocs\x1b[24m\x1b[39m\x1b]8;;\x1b\\ please\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "markdown link destination keeps balanced parentheses" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const id_before = link_id_counter;
+    try processor.push(alloc, "[w](https://en.wikipedia.org/wiki/Foo_(bar)) tail\n", &out);
+
+    var expected_buf: [256]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "\x1b]8;id=fx-{d};https://en.wikipedia.org/wiki/Foo_(bar)\x1b\\\x1b[38;5;75m\x1b[4mw\x1b[24m\x1b[39m\x1b]8;;\x1b\\ tail\n",
+        .{id_before},
+    );
+    try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "markdown link drops its title and unwraps angle destinations" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const id_before = link_id_counter;
+    try processor.push(
+        alloc,
+        "[t](https://example.com \"Title text\") [s](https://example.com/s 'single') [a](<https://example.com/a b>)\n",
+        &out,
+    );
+
+    var expected_buf: [512]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "\x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[38;5;75m\x1b[4mt\x1b[24m\x1b[39m\x1b]8;;\x1b\\ " ++
+            "\x1b]8;id=fx-{d};https://example.com/s\x1b\\\x1b[38;5;75m\x1b[4ms\x1b[24m\x1b[39m\x1b]8;;\x1b\\ " ++
+            "\x1b]8;id=fx-{d};https://example.com/a b\x1b\\\x1b[38;5;75m\x1b[4ma\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
+        .{ id_before, id_before + 1, id_before + 2 },
+    );
+    try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "markdown link with unbalanced or spaced destination stays literal" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "[u](https://e.com/(x) [v](https://e.com/a b) [w](https://e.com \"open)\n", &out);
+    try std.testing.expectEqualStrings("[u](https://e.com/(x) [v](https://e.com/a b) [w](https://e.com \"open)\n", out.items);
 }
 
 test "markdown image renders its alt text with an image marker inside one OSC 8 scope" {
@@ -701,7 +713,7 @@ test "markdown image renders its alt text with an image marker inside one OSC 8 
     var expected_buf: [512]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "see \x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[4m▧ architecture diagram\x1b[24m\x1b]8;;\x1b\\ please\n",
+        "see \x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[38;5;75m\x1b[4m▧ architecture diagram\x1b[24m\x1b[39m\x1b]8;;\x1b\\ please\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -720,7 +732,7 @@ test "markdown image uses a stable fallback for empty alt text" {
     var expected_buf: [256]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "\x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[4m▧ image\x1b[24m\x1b]8;;\x1b\\\n",
+        "\x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[38;5;75m\x1b[4m▧ image\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -739,7 +751,7 @@ test "markdown image unescapes alt punctuation through the existing link emitter
     var expected_buf: [256]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "\x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[4m▧ architecture *diagram*\x1b[24m\x1b]8;;\x1b\\\n",
+        "\x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[38;5;75m\x1b[4m▧ architecture *diagram*\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -802,7 +814,7 @@ test "markdown images preserve code isolation, chunk buffering, and heading unde
     var expected_buf: [512]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "\x1b[4mbefore \x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[4m▧ diagram\x1b[24m\x1b]8;;\x1b\\\x1b[4m after\x1b[24m\n",
+        "\x1b[4mbefore \x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[38;5;75m\x1b[4m▧ diagram\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[4m after\x1b[24m\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -869,7 +881,7 @@ test "bare URL is underlined and leaves sentence punctuation literal" {
     var expected_buf: [256]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "visit \x1b]8;id=fx-{d};https://example.com/docs\x1b\\\x1b[4mhttps://example.com/docs\x1b[24m\x1b]8;;\x1b\\, now\n",
+        "visit \x1b]8;id=fx-{d};https://example.com/docs\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/docs\x1b[24m\x1b[39m\x1b]8;;\x1b\\, now\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -890,7 +902,7 @@ test "bare URL is recognized after streamed input chunks" {
     var expected_buf: [256]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "visit \x1b]8;id=fx-{d};https://example.com/docs\x1b\\\x1b[4mhttps://example.com/docs\x1b[24m\x1b]8;;\x1b\\\n",
+        "visit \x1b]8;id=fx-{d};https://example.com/docs\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/docs\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -913,9 +925,9 @@ test "angle autolinks use literal URI and email labels" {
     var expected_buf: [1024]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "see \x1b]8;id=fx-{d};https://example.com/docs\\_literal\x1b\\\x1b[4mhttps://example.com/docs\\_literal\x1b[24m\x1b]8;;\x1b\\ and " ++
-            "\x1b]8;id=fx-{d};mailto:dev@example.com\x1b\\\x1b[4mdev@example.com\x1b[24m\x1b]8;;\x1b\\ plus " ++
-            "\x1b]8;id=fx-{d};git+ssh://example.com/repo\x1b\\\x1b[4mgit+ssh://example.com/repo\x1b[24m\x1b]8;;\x1b\\\n",
+        "see \x1b]8;id=fx-{d};https://example.com/docs\\_literal\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/docs\\_literal\x1b[24m\x1b[39m\x1b]8;;\x1b\\ and " ++
+            "\x1b]8;id=fx-{d};mailto:dev@example.com\x1b\\\x1b[38;5;75m\x1b[4mdev@example.com\x1b[24m\x1b[39m\x1b]8;;\x1b\\ plus " ++
+            "\x1b]8;id=fx-{d};git+ssh://example.com/repo\x1b\\\x1b[38;5;75m\x1b[4mgit+ssh://example.com/repo\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{ id_before, id_before +% 1, id_before +% 2 },
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1026,9 +1038,9 @@ test "bare URLs leave closing emphasis delimiters for the inline scanner" {
     var expected_buf: [1024]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "\x1b[1m\x1b]8;id=fx-{d};https://bold.example\x1b\\\x1b[4mhttps://bold.example\x1b[24m\x1b]8;;\x1b\\\x1b[22m " ++
-            "\x1b[3m\x1b]8;id=fx-{d};https://italic.example\x1b\\\x1b[4mhttps://italic.example\x1b[24m\x1b]8;;\x1b\\\x1b[23m " ++
-            "\x1b[9m\x1b]8;id=fx-{d};https://strike.example\x1b\\\x1b[4mhttps://strike.example\x1b[24m\x1b]8;;\x1b\\\x1b[29m tail\n",
+        "\x1b[1m\x1b]8;id=fx-{d};https://bold.example\x1b\\\x1b[38;5;75m\x1b[4mhttps://bold.example\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[22m " ++
+            "\x1b[3m\x1b]8;id=fx-{d};https://italic.example\x1b\\\x1b[38;5;75m\x1b[4mhttps://italic.example\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[23m " ++
+            "\x1b[9m\x1b]8;id=fx-{d};https://strike.example\x1b\\\x1b[38;5;75m\x1b[4mhttps://strike.example\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[29m tail\n",
         .{ id_before, id_before +% 1, id_before +% 2 },
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1059,7 +1071,7 @@ test "heading underline resumes after a link closes its local underline" {
     var expected_buf: [512]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "\x1b[4mbefore \x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[4mlink\x1b[24m\x1b]8;;\x1b\\\x1b[4m after\x1b[24m\nbody\n",
+        "\x1b[4mbefore \x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[38;5;75m\x1b[4mlink\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[4m after\x1b[24m\nbody\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1287,7 +1299,7 @@ test "link labels unescape visible punctuation" {
     var expected_buf: [256]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "\x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[4mdocs *literal*\x1b[24m\x1b]8;;\x1b\\\n",
+        "\x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[38;5;75m\x1b[4mdocs *literal*\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1408,8 +1420,8 @@ test "underscore formatted bare URLs retain path underscores and matching closer
     var expected_buf: [1024]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        "\x1b[3m\x1b]8;id=fx-{d};https://example.com/snake_case\x1b\\\x1b[4mhttps://example.com/snake_case\x1b[24m\x1b]8;;\x1b\\\x1b[23m tail " ++
-            "\x1b[1m\x1b]8;id=fx-{d};https://example.com/snake_case\x1b\\\x1b[4mhttps://example.com/snake_case\x1b[24m\x1b]8;;\x1b\\\x1b[22m tail\n",
+        "\x1b[3m\x1b]8;id=fx-{d};https://example.com/snake_case\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/snake_case\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[23m tail " ++
+            "\x1b[1m\x1b]8;id=fx-{d};https://example.com/snake_case\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/snake_case\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[22m tail\n",
         .{ id_before, id_before +% 1 },
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1434,16 +1446,20 @@ test "underscore formatted URLs require exact active markers" {
         try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
     }
 
-    const wrong_closer_cases = [_]struct {
+    // Trailing underscores are outside the URL, as in GFM autolinks, so the
+    // mismatched runs pair on their shared length and the extra underscore
+    // stays literal next to the styled link.
+    const mismatched_run_cases = [_]struct {
         input: []const u8,
         url: []const u8,
+        prefix: []const u8,
         tail: []const u8,
     }{
-        .{ .input = "_https://example.com/path__ tail\n", .url = "https://example.com/path__", .tail = " tail\x1b[23m\n" },
-        .{ .input = "__https://example.com/path_ tail\n", .url = "https://example.com/path_", .tail = " tail\x1b[22m\n" },
+        .{ .input = "_https://example.com/path__ tail\n", .url = ";https://example.com/path\x1b\\", .prefix = "\x1b[3m\x1b]8;", .tail = "\x1b[23m_ tail\n" },
+        .{ .input = "__https://example.com/path_ tail\n", .url = ";https://example.com/path\x1b\\", .prefix = "_\x1b[3m\x1b]8;", .tail = "\x1b[23m tail\n" },
     };
 
-    for (wrong_closer_cases) |case| {
+    for (mismatched_run_cases) |case| {
         var processor = MarkdownProcessor{};
         defer processor.deinit(alloc);
         var out: std.ArrayList(u8) = .empty;
@@ -1451,11 +1467,12 @@ test "underscore formatted URLs require exact active markers" {
 
         try processor.push(alloc, case.input, &out);
         try std.testing.expect(std.mem.indexOf(u8, out.items, case.url) != null);
+        try std.testing.expect(std.mem.startsWith(u8, out.items, case.prefix));
         try std.testing.expect(std.mem.endsWith(u8, out.items, case.tail));
     }
 }
 
-test "underscore emphasis preserves code literals and closes unpaired spans" {
+test "underscore emphasis preserves code literals and keeps unpaired markers literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -1464,8 +1481,8 @@ test "underscore emphasis preserves code literals and closes unpaired spans" {
 
     try processor.push(alloc, "_unclosed\n__unclosed\n`_literal_ __literal__`\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[3munclosed\x1b[23m\n" ++
-            "\x1b[1munclosed\x1b[22m\n" ++
+        "_unclosed\n" ++
+            "__unclosed\n" ++
             "\x1b[38;5;245m_literal_ __literal__\x1b[39m\n",
         out.items,
     );
@@ -1530,6 +1547,97 @@ test "table payload headers reassert outer bold after inline strong closes" {
         out.items,
         "\x1b[1mprefix \x1b[1mstrong\x1b[22m\x1b[1m suffix\x1b[22m",
     ) != null);
+}
+
+test "double backtick code span keeps inner backticks and trims one padding space" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "use `` a ` b `` and ``x`` here\n", &out);
+    try std.testing.expectEqualStrings(
+        "use \x1b[38;5;245ma ` b\x1b[39m and \x1b[38;5;245mx\x1b[39m here\n",
+        out.items,
+    );
+}
+
+test "code span closes only on a backtick run of the same length" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "`a``b` and ``` lonely **bold**\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;245ma``b\x1b[39m and ``` lonely \x1b[1mbold\x1b[22m\n",
+        out.items,
+    );
+}
+
+test "numeric entities for control characters stay literal" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "x&#27;[2Ky &#x1b;[31m &#7; &#127;&#x9b; &#0; &#x41;\n", &out);
+    try std.testing.expectEqualStrings("x&#27;[2Ky &#x1b;[31m &#7; &#127;&#x9b; \xef\xbf\xbd A\n", out.items);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.items, 0x1b) == null);
+}
+
+test "entity lookup is bounded and a long ampersand line renders in bounded time" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // A semicolon farther than the longest accepted name never forms an entity.
+    try processor.push(alloc, "&ampersand; &amp;\n", &out);
+    try std.testing.expectEqualStrings("&ampersand; &\n", out.items);
+
+    out.clearRetainingCapacity();
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+    try line.appendNTimes(alloc, '&', 64 * 1024);
+    try line.append(alloc, '\n');
+    const io_mod = @import("../shared/io.zig");
+    const started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms) < 500);
+    try std.testing.expectEqualStrings(line.items, out.items);
+}
+
+test "code span content is not entity decoded but prose is" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &#x2192; `&amp;` &unknown; &amp\n", &out);
+    try std.testing.expectEqualStrings(
+        "a & b <c> \"d\" 'e' \xe2\x86\x92 \x1b[38;5;245m&amp;\x1b[39m &unknown; &amp\n",
+        out.items,
+    );
+}
+
+test "heading strips emphasis markers around a multi backtick code span" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "## Run ``**raw**`` now\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[1mRun \x1b[38;5;245m**raw**\x1b[39m now\x1b[22m\n",
+        out.items,
+    );
 }
 
 test "inline code backticks wrap with ANSI" {
@@ -2243,6 +2351,205 @@ test "unordered list asterisk gets bullet" {
     try std.testing.expectEqualStrings("\x1b[2m\xe2\x80\xa2 \x1b[22msecond item\n", out.items);
 }
 
+test "unordered list literal bullet gets dim marker" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "\xe2\x80\xa2 third item\n  \xe2\x80\xa2 nested\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x80\xa2 \x1b[22mthird item\n" ++
+            "  \x1b[2m\xe2\x80\xa2 \x1b[22mnested\n",
+        out.items,
+    );
+}
+
+test "unordered list plus marker and tab separator get bullet" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "+ plus item\n-\ttabbed item\n+not a list\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x80\xa2 \x1b[22mplus item\n" ++
+            "\x1b[2m\xe2\x80\xa2 \x1b[22mtabbed item\n" ++
+            "+not a list\n",
+        out.items,
+    );
+}
+
+test "ordered list accepts paren markers and rejects long numbers" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "1) first\n12) twelfth\n1234567890. too long\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m1)\x1b[22m first\n" ++
+            "\x1b[2m12)\x1b[22m twelfth\n" ++
+            "1234567890. too long\n",
+        out.items,
+    );
+}
+
+test "atx heading strips closing hashes and allows small indent" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "## Title ##\n   ## Indented\n## Keep#\n## Trail ##   \n    ## code\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[1mTitle\x1b[22m\n" ++
+            "\x1b[1mIndented\x1b[22m\n" ++
+            "\x1b[1mKeep#\x1b[22m\n" ++
+            "\x1b[1mTrail\x1b[22m\n" ++
+            "    ## code\n",
+        out.items,
+    );
+}
+
+test "longer code fence contains shorter fences" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "````md\n```zig\ninner\n```\n````\nafter\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m```zig\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22minner\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m```\n" ++
+            "after\n",
+        out.items,
+    );
+    try std.testing.expectEqual(@as(?bp.CodeFence, null), processor.code_fence);
+}
+
+test "code fence language skips the whole marker run" {
+    try std.testing.expectEqualStrings("md", bp.codeFenceLanguage("````md"));
+    try std.testing.expectEqualStrings("zig", bp.codeFenceLanguage("```   zig extra"));
+    try std.testing.expectEqualStrings("", bp.codeFenceLanguage("~~~"));
+}
+
+test "closing fence needs matching marker length and nothing after it" {
+    const open = bp.CodeFence{ .marker = '`', .run = 4, .indent = 0 };
+    try std.testing.expect(bp.closesCodeFence("````", open));
+    try std.testing.expect(bp.closesCodeFence("`````  ", open));
+    try std.testing.expect(!bp.closesCodeFence("```", open));
+    try std.testing.expect(!bp.closesCodeFence("~~~~", open));
+    try std.testing.expect(!bp.closesCodeFence("```` trailing", open));
+}
+
+test "fenced code inside a list item drops the item indentation" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "1. step\n   ```sh\n   ls -la\n     nested\n   ```\n- next\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m1.\x1b[22m step\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22mls -la\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m  nested\n" ++
+            "\x1b[2m\xe2\x80\xa2 \x1b[22mnext\n",
+        out.items,
+    );
+}
+
+test "tab indented fence inside a list item closes on a tab indented fence" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "1. item\n\t```\n\tcode\n\t```\n\tprose after\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m1.\x1b[22m item\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22mcode\n" ++
+            "\tprose after\n",
+        out.items,
+    );
+}
+
+// Known cost of the plus rule: a loose nested list written as "- a", a blank
+// line, then "    + nested" renders the nested line as indented code, while
+// "-" or "*" at the same indent still become list items.
+test "indented plus line after a blank stays indented code" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "    + value\n    second\ntext\n- a\n    + nested\n", &out);
+    try processor.flush(alloc, &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m+ value\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22msecond\n" ++
+            "text\n" ++
+            "\x1b[2m\xe2\x80\xa2 \x1b[22ma\n" ++
+            "    \x1b[2m\xe2\x80\xa2 \x1b[22mnested\n",
+        out.items,
+    );
+}
+
+test "heading keeps a backslash exposed by removing closing hashes" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "## C:\\ ###\n## trailing\\\n> ## C:\\ ###\n> ## quoted\\\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[1mC:\\\x1b[22m\n" ++
+            "\x1b[1mtrailing\x1b[22m\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1mC:\\\x1b[22m\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1mquoted\x1b[22m\n",
+        out.items,
+    );
+}
+
+test "blockquote renders headings and list items inside the quote" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "> ## Note\n> - one\n> 2. two\n> - [x] done\n> plain\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[1mNote\x1b[22m\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m\xe2\x80\xa2 \x1b[22mone\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m2.\x1b[22m two\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[38;5;252m\xe2\x9c\x93\x1b[39m done\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22mplain\n",
+        out.items,
+    );
+}
+
+test "literal bullet without trailing space stays prose" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "\xe2\x80\xa2item\n\xe2\x80\xa2\n", &out);
+    try std.testing.expectEqualStrings("\xe2\x80\xa2item\n\xe2\x80\xa2\n", out.items);
+}
+
 test "ordered list keeps number marker" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
@@ -2549,52 +2856,6 @@ test "code fence toggles block state" {
     const expected = "\x1b[2m\xe2\x94\x82 \x1b[22mconst x = 1;\n";
     try std.testing.expectEqualStrings(expected, out.items);
     try std.testing.expect(!processor.in_code_block);
-}
-
-test "presented prefix restores an unfinished code fence without replaying its bytes" {
-    const alloc = std.testing.allocator;
-    const Capture = struct {
-        block: ?CodeBlockPayload = null,
-
-        fn deinit(self: *@This()) void {
-            if (self.block) |*block| block.deinit(alloc);
-        }
-
-        fn deliver(raw: *anyopaque, block: CodeBlockPayload, _: *std.ArrayList(u8)) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.block = block;
-        }
-    };
-
-    var processor = MarkdownProcessor{};
-    defer processor.deinit(alloc);
-    var capture = Capture{};
-    defer capture.deinit();
-    var completion = CodeBlockCompletion{
-        .ctx = &capture,
-        .deliver = Capture.deliver,
-    };
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-
-    try processor.restorePresentedPrefix(alloc, "```zig\nconst value =");
-    try std.testing.expect(processor.in_code_block);
-    try std.testing.expectEqual(@as(?u8, '`'), processor.code_fence_marker);
-    try std.testing.expectEqualStrings("zig", processor.code_language.items);
-    try std.testing.expectEqual(@as(usize, 0), processor.code_buf.items.len);
-
-    try processor.pushWithCompletions(
-        alloc,
-        " 1;\n```\nafter\n",
-        &out,
-        .{ .code = &completion },
-    );
-    try processor.flushWithCompletions(alloc, &out, .{ .code = &completion });
-
-    const block = capture.block orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("zig", block.language);
-    try std.testing.expectEqualStrings(" 1;\n", block.code);
-    try std.testing.expectEqualStrings("after\n", out.items);
 }
 
 test "code block preserves inline markers literally" {
@@ -2966,7 +3227,7 @@ test "flush emits pending line without newline" {
     try std.testing.expectEqualStrings("partial", out.items);
 }
 
-test "flush closes open styles" {
+test "flush keeps an unmatched emphasis opener literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -2975,10 +3236,10 @@ test "flush closes open styles" {
 
     try processor.push(alloc, "oops **never closed", &out);
     try processor.flush(alloc, &out);
-    try std.testing.expectEqualStrings("oops \x1b[1mnever closed\x1b[22m", out.items);
+    try std.testing.expectEqualStrings("oops **never closed", out.items);
 }
 
-test "flush closes an unpaired inline code span" {
+test "flush keeps an unpaired backtick literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -2987,7 +3248,179 @@ test "flush closes an unpaired inline code span" {
 
     try processor.push(alloc, "run `zig build", &out);
     try processor.flush(alloc, &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;245mzig build\x1b[39m", out.items);
+    try std.testing.expectEqualStrings("run `zig build", out.items);
+}
+
+test "emphasis pairs by the delimiter stack and unmatched runs stay literal" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(
+        alloc,
+        "*not a list item\n" ++
+            "**bold** then **open\n" ++
+            "~~gone~~ and ~~stays\n" ++
+            "a ` b **bold**\n" ++
+            "**bold with `code` inside** *it*\n" ++
+            "***both*** and **`code`**\n" ++
+            "See *italic** plain\n" ++
+            "text **** here **bold** and ~~~~ then ~~gone~~ and *** end\n" ++
+            "**a __b__ c** and *x _y_ z*\n" ++
+            "foo*bar*baz and snake_case_name and 3 * 5 = 15\n",
+        &out,
+    );
+    try std.testing.expectEqualStrings(
+        "*not a list item\n" ++
+            "\x1b[1mbold\x1b[22m then **open\n" ++
+            "\x1b[9mgone\x1b[29m and ~~stays\n" ++
+            "a ` b \x1b[1mbold\x1b[22m\n" ++
+            "\x1b[1mbold with \x1b[38;5;245mcode\x1b[39m inside\x1b[22m \x1b[3mit\x1b[23m\n" ++
+            "\x1b[3m\x1b[1mboth\x1b[22m\x1b[23m and \x1b[1m\x1b[38;5;245mcode\x1b[39m\x1b[22m\n" ++
+            "See \x1b[3mitalic\x1b[23m* plain\n" ++
+            "text **** here \x1b[1mbold\x1b[22m and ~~~~ then \x1b[9mgone\x1b[29m and *** end\n" ++
+            "\x1b[1ma \x1b[1mb\x1b[22m\x1b[1m c\x1b[22m and \x1b[3mx \x1b[3my\x1b[23m\x1b[3m z\x1b[23m\n" ++
+            "foo\x1b[3mbar\x1b[23mbaz and snake_case_name and 3 * 5 = 15\n",
+        out.items,
+    );
+}
+
+test "emphasis lookahead agrees with links, code spans, and bare URLs" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // A backtick inside link text is not a code opener and a star inside a
+    // code span is not a closer.
+    try processor.push(alloc, "[use `](https://example.com) **bold** `code`\n[use `](https://example.com) *open `code*`\n", &out);
+    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 0).?, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m"));
+    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 1).?, " *open \x1b[38;5;245mcode*\x1b[39m"));
+
+    // Emphasis around a multi backtick code span still pairs.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "See _a ``b`c`` d_ end\n", &out);
+    try std.testing.expectEqualStrings("See \x1b[3ma \x1b[38;5;245mb`c\x1b[39m d\x1b[23m end\n", out.items);
+
+    // URL punctuation is never read as markup, and a delimiter that ends a
+    // URL still closes the span around it.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "https://example.com/`x*y` **bold** `code`\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, ";https://example.com/`x*y`\x1b\\") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m\n"));
+    // A trailing delimiter is trimmed from the URL and closes the span.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "*see https://example.com/a* and `code`\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3msee \x1b]8;id=fx-"));
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        out.items,
+        ";https://example.com/a\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/a\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[23m and \x1b[38;5;245mcode\x1b[39m\n",
+    ));
+    // Like a GFM autolink, a URL extends to the next whitespace regardless of
+    // active styles, so interior punctuation belongs to the URL and the rest
+    // of the line is read after it.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "*https://example.com/a*`some code` **bold** `x`\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "*\x1b]8;"));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, ";https://example.com/a*`some\x1b\\") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, " code\x1b[38;5;245m**bold**\x1b[39mx`\n"));
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "text **** https://example.com\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "text **** \x1b]8;"));
+}
+
+test "emphasis flanking reads neighbouring code points not bytes" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // An em dash, curly quotes, and a fullwidth comma are punctuation, so the
+    // marker beside them opens or closes; CJK letters are word characters,
+    // so a star still delimits between them while an underscore does not.
+    // Letters outside ASCII such as the micro sign are still letters, so an
+    // underscore between them stays intraword.
+    try processor.push(alloc, "a\xc2\xb5_b_ and x\xc2\xaa_y_ and \xe3\x80\xb1_z_\n", &out);
+    try std.testing.expectEqualStrings("a\xc2\xb5_b_ and x\xc2\xaa_y_ and \xe3\x80\xb1_z_\n", out.items);
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "a\xe2\x80\x94_b_ \xe2\x80\x9c*q*\xe2\x80\x9d \xe4\xb8\xad*\xe5\xbc\xb7*\xe8\xaa\xbf \xe4\xb8\xad_\xe5\xbc\xb7_\xe8\xaa\xbf **x**\xef\xbc\x8c\n", &out);
+    try std.testing.expectEqualStrings(
+        "a\xe2\x80\x94\x1b[3mb\x1b[23m \xe2\x80\x9c\x1b[3mq\x1b[23m\xe2\x80\x9d \xe4\xb8\xad\x1b[3m\xe5\xbc\xb7\x1b[23m\xe8\xaa\xbf \xe4\xb8\xad_\xe5\xbc\xb7_\xe8\xaa\xbf \x1b[1mx\x1b[22m\xef\xbc\x8c\n",
+        out.items,
+    );
+}
+
+test "heading with unmatched strong marker keeps it literal" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "## 2 ** 8 and **strong** and __also__\n", &out);
+    try std.testing.expectEqualStrings("\x1b[1m2 ** 8 and strong and also\x1b[22m\n", out.items);
+}
+
+test "long lines of unmatched or unbalanced delimiters render in linear time" {
+    const alloc = std.testing.allocator;
+    const io_mod = @import("../shared/io.zig");
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+
+    const shapes = [_]struct { prefix: []const u8, unit: []const u8, repeat: usize, suffix: []const u8 }{
+        .{ .prefix = "", .unit = "*a _b ~~c ", .repeat = 40_000, .suffix = "\n" },
+        .{ .prefix = "", .unit = "a* b_ c~~ ", .repeat = 40_000, .suffix = "\n" },
+        .{ .prefix = "", .unit = "*a https://example.com/b _c ~~d ", .repeat = 20_000, .suffix = "\n" },
+        .{ .prefix = "text ", .unit = "*", .repeat = 64 * 1024, .suffix = "x\n" },
+        .{ .prefix = "https://example.com ", .unit = "*", .repeat = 64 * 1024, .suffix = "\n" },
+        .{ .prefix = "*a", .unit = "*", .repeat = 64 * 1024, .suffix = "x\n" },
+        .{ .prefix = "", .unit = "[", .repeat = 64 * 1024, .suffix = "\n" },
+        .{ .prefix = "", .unit = "![", .repeat = 32 * 1024, .suffix = "\n" },
+        .{ .prefix = "", .unit = "[", .repeat = 64 * 1024, .suffix = "]\n" },
+        .{ .prefix = "", .unit = "![", .repeat = 32 * 1024, .suffix = "]\n" },
+        .{ .prefix = "", .unit = "[^", .repeat = 32 * 1024, .suffix = "]\n" },
+    };
+    // Deeply nested successful pairs must not re-walk consumed ranges.
+    out.clearRetainingCapacity();
+    line.clearRetainingCapacity();
+    for (0..32_000) |_| try line.appendSlice(alloc, "*a ");
+    for (0..32_000) |_| try line.appendSlice(alloc, "b* ");
+    try line.append(alloc, '\n');
+    const nested_started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - nested_started, std.time.ns_per_ms) < 500);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[3ma \x1b[3ma "));
+    // A closer that matches part of its run and then fails to place the rest
+    // must cache that failed remainder instead of rescanning other openers.
+    out.clearRetainingCapacity();
+    line.clearRetainingCapacity();
+    for (0..32_000) |_| try line.appendSlice(alloc, "*a ");
+    for (0..32_000) |_| try line.appendSlice(alloc, "_b c__ ");
+    try line.append(alloc, '\n');
+    const residual_started = io_mod.nanoTimestamp();
+    try processor.push(alloc, line.items, &out);
+    try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - residual_started, std.time.ns_per_ms) < 500);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3mb c\x1b[23m_ ") != null);
+    for (shapes) |shape| {
+        out.clearRetainingCapacity();
+        line.clearRetainingCapacity();
+        try line.appendSlice(alloc, shape.prefix);
+        for (0..shape.repeat) |_| try line.appendSlice(alloc, shape.unit);
+        try line.appendSlice(alloc, shape.suffix);
+        const started = io_mod.nanoTimestamp();
+        try processor.push(alloc, line.items, &out);
+        const elapsed_ms = @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_ms);
+        try std.testing.expect(elapsed_ms < 500);
+    }
 }
 
 test "header with inline markdown" {

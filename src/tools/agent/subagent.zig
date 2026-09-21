@@ -2,6 +2,7 @@ const std = @import("std");
 const model_contract = @import("../../core/subagent/model_contract.zig");
 const tool_provider = @import("../../core/subagent/tool_provider.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const debug_trace = @import("../../core/shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -37,10 +38,12 @@ pub fn decode(
 
     const request_input = parseRoot(parsed.value) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("subagent", "request decode rejected code={s}", .{decodeErrorCode(err)});
         return decodeFailure(ctx, decodeErrorCode(err)) catch return error.OutOfMemory;
     };
     const request = model_contract.validateRequest(ctx.allocator, request_input) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("subagent", "request validation rejected code={s}", .{validationErrorCode(err)});
         return decodeFailure(ctx, validationErrorCode(err)) catch return error.OutOfMemory;
     };
     errdefer {
@@ -86,6 +89,8 @@ fn validationErrorCode(err: model_contract.ValidationError) []const u8 {
         error.InvalidAgent => "invalid_agent",
         error.InvalidInstructions => "invalid_instructions",
         error.InvalidMessage => "invalid_message",
+        error.InvalidModel => "invalid_model",
+        error.InvalidEffort => "invalid_effort",
     };
 }
 
@@ -98,17 +103,21 @@ fn parseRoot(value: std.json.Value) DecodeError!model_contract.RequestInput {
     const action = try requiredString(request, "action");
 
     if (std.mem.eql(u8, action, "run")) {
-        try rejectUnknown(request, &.{ "action", "task" });
+        try rejectUnknown(request, &.{ "action", "task", "model", "effort" });
         return .{ .run = .{
             .task = try requiredString(request, "task"),
+            .model = try optionalString(request, "model"),
+            .effort = try optionalString(request, "effort"),
         } };
     }
     if (std.mem.eql(u8, action, "message")) {
-        try rejectUnknown(request, &.{ "action", "agent", "instructions", "message" });
+        try rejectUnknown(request, &.{ "action", "agent", "instructions", "message", "model", "effort" });
         return .{ .message = .{
             .agent = try requiredString(request, "agent"),
             .instructions = try optionalString(request, "instructions"),
             .message = try requiredString(request, "message"),
+            .model = try optionalString(request, "model"),
+            .effort = try optionalString(request, "effort"),
         } };
     }
     return error.InvalidEnum;
@@ -168,9 +177,20 @@ pub fn call(
         }) catch return error.OutOfMemory;
         return .{ .failure = body };
     };
+    const request = &erased.as(Input).request;
+    debug_trace.logf(
+        "subagent",
+        "request accepted action={s} agent={s} model_override={s} effort_override={s}",
+        .{
+            @tagName(request.action()),
+            request.agentName() orelse "none",
+            request.override().model orelse "none",
+            if (request.override().effort) |effort| effort.label() else "none",
+        },
+    );
     const result = try provider.execute(
         ctx.allocator,
-        &erased.as(Input).request,
+        request,
         ctx.tool_call_id,
     );
     return switch (result.status) {
@@ -268,6 +288,7 @@ test "call executes a validated managed request through the provider" {
             }, input);
             defer result.deinit(alloc);
             switch (result) {
+                .rich => return error.TestUnexpectedRichResult,
                 .success => |body| try std.testing.expectEqualStrings("{\"ok\":true}", body),
                 .failure => return error.TestUnexpectedResult,
             }
@@ -283,9 +304,19 @@ test "decode accepts only delegation intents" {
     try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}", .run);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}}", .message);
+    try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"model\":\"gpt-5.6-sol-fast\",\"effort\":\"medium\"}}", .run);
+    try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":\"gpt-5.6-sol-fast\"}}", .message);
+    try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"effort\":\"high\"}}", .message);
     try expectDecodeFailure("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
+}
+
+test "decode rejects invalid creation overrides" {
+    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"model\":\"\"}}", "invalid_model");
+    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"effort\":\"not an effort!\"}}", "invalid_effort");
+    try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":7}}", "invalid_field_type");
+    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"provider\":\"gateway\"}}", "unknown_field");
 }
 
 test "decode rejects manager input cross-action fields and unknown actions" {
@@ -312,6 +343,7 @@ test "call reports compact host unavailability" {
             const result = try call(.{ .allocator = alloc }, input);
             defer result.deinit(alloc);
             switch (result) {
+                .rich => return error.TestUnexpectedRichResult,
                 .success => return error.TestUnexpectedResult,
                 .failure => |body| try std.testing.expect(std.mem.find(
                     u8,

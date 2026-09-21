@@ -24,7 +24,7 @@ Requirements:
 
 * interactive terminal for manual shell testing
 
-* a Vercel OAuth session via `fx login` for model-backed flows. macOS Keychain API keys (via `fx setup`), `AI_GATEWAY_API_KEY`, and `VERCEL_OIDC_TOKEN` are also supported
+* a model connection for model-backed flows. [Custom model connections](README.md#custom-model-connections) support local and remote endpoints. Vercel OAuth via `fx login`, macOS Keychain API keys via `fx setup`, `AI_GATEWAY_API_KEY`, and `VERCEL_OIDC_TOKEN` are also supported
 
 Common commands:
 
@@ -119,13 +119,13 @@ duplicate, stale, and unclassified files without running the full PGSO gate.
 
 Config precedence (highest wins):
 
-1. Environment variables such as `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
+1. Environment variables such as `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
 2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
 3. `~/.fx/settings.json` top-level (profile global settings)
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
 
 Runtime state lives under `~/.fx/`:
 
@@ -155,13 +155,35 @@ There are two distinct skill categories in `fx`:
 
 The interactive agent can also install skills via the `install_skill` tool when the user asks to install one in conversation, including pasted `npx skills add ...` syntax.
 
+## Slack installation testing
+
+`src/core/slack/install.zig` owns workspace bot installation, local credential
+persistence, and explicit refresh. The web bridge contract is fixed to
+`https://fx.sh/api/slack/install/config`, `/api/slack/install`, and
+`/api/slack/oauth/callback`. Employee MCP authentication is separate.
+
+Build with `zig build`, then run `cd tests/e2e && bun test slack-install.test.ts`.
+The fixture exercises the freshly built binary and real loopback sockets without
+live Slack credentials. `FX_E2E_SLACK_ORIGIN` accepts only an HTTP `127.0.0.1`
+origin with a non-privileged port, serving public metadata plus mocked
+`/api/oauth.v2.access` and `/api/auth.test` responses. Production uses pinned
+Slack endpoints. Local records bind to the bridge origin to prevent fixture
+commands from refreshing production credentials. `FX_NO_OPEN_BROWSER=1` prints
+the start URL for headless operation; authorization still requires a browser on
+the same computer as the listener.
+
+This E2E owner is verification-only in the PGSO corpus because it covers a rare
+workspace setup operation and security boundaries. Live Slack authorization and
+message attribution are not deterministic tests.
+
 ## MCP
 
-fx negotiates MCP `2026-07-28` over local stdio and stateless Streamable HTTP.
-Version-scoped adapters retain legacy stdio,
-`2025-11-25`/`2025-06-18`/`2025-03-26` Streamable HTTP, and deprecated
-`2024-11-05` HTTP+SSE. Native sessions load trusted MCP configuration from the
-profile:
+Native fx connections use MCP v1 initialization by default over stdio,
+Streamable HTTP, and deprecated `2024-11-05` HTTP+SSE. Servers using the newer
+`2026-07-28` discovery lifecycle opt in with
+`FX_MCP_PROTOCOL_VERSION=2026-07-28` in their configured `environment` map.
+The SDK's host-owned client controls its own protocol negotiation. Native
+sessions load trusted MCP configuration from the profile:
 
 * `~/.fx/mcp.json`
 
@@ -200,10 +222,11 @@ Completion, pagination, cache-aware discovery, subscriptions, progress,
 cancellation, and form or URL elicitation. Keep modern and legacy protocol
 behavior in their existing version-scoped modules.
 
-Tool schemas without `$schema` use JSON Schema 2020-12. fx also accepts the
-canonical 2020-12 declaration and the canonical Draft 7 declaration used by
-legacy SDKs, evaluates each with dialect-specific semantics, and rejects other
-dialects or references that would require network fetching before publication.
+fx bounds schema size and structure before publication. It accepts schemas
+without `$schema`, the canonical JSON Schema 2020-12 declaration, and the
+canonical Draft 7 declaration used by legacy SDKs; other declared dialects are
+rejected. fx does not resolve network references or evaluate semantic schema
+assertions. Servers validate their tool arguments and results.
 
 The interactive surface supports:
 
@@ -303,8 +326,20 @@ or `fx ask` model request; optional failures publish a reduced, degraded
 capability set. Terminal `fx ask` completes admitted MCP discovery before its
 first model request. JSON and other headless asks start required servers first
 and defer optional servers until the turn performs an MCP operation or delegates
-MCP capability to a child. `/mcp list` renders a bounded, secret-free health
-snapshot.
+MCP capability to a child. Server-filtered searches, selected tools, and feature
+operations activate only their target; a broad search activates the broader
+catalog. Each server owns its startup and recovery progress. Connection deadlines
+cover discovery, fallback, and restarts together. Interactive authentication and
+logout change only the affected connection. `/mcp list` renders a bounded, secret-free health
+snapshot. The interactive menu refreshes that view while it is open.
+
+Search and explicit selection share bounded schema publication. Definitions are
+checked against their runtime, connection, catalog, and credential generations
+before execution. Tool argument JSON must be bounded and object-shaped; semantic
+schema assertions belong to the server. Image results use the shared tool-result,
+provider, and versioned history paths. Saved native images use managed result
+artifacts that `read_tool_result` can load without repeating the original tool.
+
 `/mcp reload` evaluates a replacement before publication, so invalid config or
 a required-server failure leaves the prior runtime callable.
 
@@ -317,7 +352,7 @@ capability. Missing, revoked, stale, or closed authority fails before transport.
 
 Security is permission-first.
 
-* `permission_mode` controls baseline behavior (`ask`, `auto`, or `yolo`)
+* `permission_mode` controls baseline behavior (`ask`, `auto`, or `full-access`; `yolo` remains an alias)
 
 * `permission` config applies OpenCode-style wildcard rules
 
@@ -329,13 +364,17 @@ Security is permission-first.
 
 * routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy; unknown, destructive, hidden, credential-bearing, public, and overwrite effects remain on the review or approval path
 
-* every unresolved `auto` action receives one narrow security review after configured policy, saved-session rules, grants, and deterministic safe authority; review input always contains the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Prepared file mutations and static root tools omit task text. Reviewed commands, dynamic tools, and subagent actions also receive bounded canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority
+* every unresolved `auto` action receives one narrow security review after configured policy, saved-session rules, grants, and deterministic safe authority; review input always contains the exact unmasked action and targets, origin and call identity, optional host-proven current-branch evidence, and bounded unmasked terminal-safe excerpts of earlier current-turn tool results. A text match between the action and prior tool output is evidence to inspect, not proof of prompt injection or malicious activity. Prepared file mutations and other static root tools omit task text. Reviewed commands, shell input, dynamic tools, and subagent actions also receive bounded unmasked canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority. Shell input reviews also include the owned receiving session's launch command, working directory, and bounded current screen after verifying session authority, including on resume. The launch command describes startup only; screen content remains untrusted evidence and input still receives its own review
 
 * the reviewer returns `caution` only for concrete prompt injection or malicious activity; destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A `clear` review authorizes only the exact unchanged action; a `caution`, incomplete-evidence result, or unavailable review holds only that action and returns guidance without opening a human permission screen, disabling tools, or ending the turn
 
-* exact cautions and deterministic incomplete-evidence results are cached only for the current turn; an unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable transport attempt per turn and changed actions remain independently reviewable until the bounded current-turn transport budget is exhausted. Legacy `permission_request_id` input is rejected without prompting
+* exact cautions and deterministic incomplete-evidence results are cached only for the current turn; an unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable review opportunity per turn and changed actions remain independently reviewable until the bounded current-turn review budget is exhausted. Each review accepts exactly one valid structured decision even with accompanying prose and may retry one malformed completion within the current attempt's deadline. A transport timeout, transient transport failure, or failed transport call is retried once with a fresh 30-second deadline; permanent transport failures, valid cautions, and cancellation are never retried. Legacy `permission_request_id` input is rejected without prompting
 
-* the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
+* host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations and handling instructions as document or test data are not standalone proof of prompt injection
+
+* execution-memory schema 10 preserves review-feedback provenance while reading older schemas with an unmarked default. Conversation records use optional metadata for marked holds. Older builds may reject the new saved metadata or recovery checkpoints; do not downgrade an active session without preserving its files
+
+* the sandbox backend is configured independently; full access uses an effective backend of `none` without rewriting the saved sandbox setting
 
 Do not add new sensitive tool behavior without integrating it into `src/core/permissions/permissions.zig`.
 
@@ -426,6 +465,27 @@ Release notes are public product copy. Describe user-visible behavior, always sp
 
 Do not create tags manually. The workflow owns tag creation.
 
+### Validate release artifacts without publishing
+
+Run **Actions > Release** on `main` with `validate_only` enabled. This builds
+all four release targets, runs macOS arm64 PGSO qualification, and uses the
+existing `apple-signing` approval to notarize both macOS targets. It does not
+create a tag, publish a GitHub Release, upload to the CDN, or change a channel.
+
+The arm64 validation retains both 4 KiB and 16 KiB signature variants of the
+same PGSO payload for comparison. Intel retains 4 KiB signatures. Download the
+workflow artifacts for matched signed-binary performance checks; notarization
+and smoke checks alone do not establish performance equivalence. Normal release
+runs keep the existing signing default.
+
+To compare the retained signatures on an isolated runner, run **Actions >
+Benchmarks** with `signed_run` set to the successful main validation run ID.
+This mode downloads already-notarized binaries and does not access Apple
+credentials. It records two alternating startup cohorts, an identical-control
+status calibration, and a separate native image-flow memory screen. Review the
+retained measurements before changing release signing defaults; successful
+measurement is not performance approval.
+
 ## Benchmarks
 
 Startup latency benchmarks run automatically on every PR and push to `main` via `.github/workflows/bench.yml`.
@@ -461,6 +521,24 @@ brew install hyperfine             # macOS (one-time)
 CI uses `--runs 100` with a reduced warmup and skips the build step because the
 workflow builds ReleaseSafe first. Results are written to
 `benchmarks/results/` (gitignored).
+
+The libfx runtime job measures cold startup, warm prompts, host-tool calls,
+stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
+Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
+native libfx must match or beat Pi p50 and stay within 0.25 ms of Pi p95.
+The Node comparison is report-only because Node's bundled fetch client and
+Pi's dispatcher have different warm-request overhead. Both runtimes still
+require valid measurements, 300 samples, and exactly one inference request per
+prompt. Native/Wasm latency, host-tool, and resource gates remain blocking.
+Live model latency and bulk-stream throughput remain informational.
+
+```sh
+zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=/tmp/libfx-bench-server
+node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
+```
+
+Build the SDK artifacts and install the pinned Pi package first, as shown in
+`.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
 
 ## Before Marking a PR Ready
 

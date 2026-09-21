@@ -271,16 +271,6 @@ pub fn readSidecarOrFallback(
     return decodeSidecarOrFallback(alloc, bytes);
 }
 
-pub fn writeSidecar(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    metadata: DisplayMetadata,
-) !void {
-    const bytes = try encodeSidecar(alloc, metadata);
-    defer alloc.free(bytes);
-    try io_mod.durableReplaceVerified(alloc, session_dir, sidecar_file, bytes);
-}
-
 fn requiredStringDup(alloc: Allocator, maybe_value: ?std.json.Value) ![]u8 {
     const value = maybe_value orelse return error.InvalidDisplayMetadata;
     if (value != .string) return error.InvalidDisplayMetadata;

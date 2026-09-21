@@ -1,12 +1,40 @@
 const std = @import("std");
 const tu = @import("text_util.zig");
 
-pub fn codeFenceMarker(line: []const u8) ?u8 {
-    if (line.len < 3) return null;
-    const marker = line[0];
+pub const CodeFence = struct {
+    marker: u8,
+    /// Number of marker characters in the run; a closing fence needs at least this many.
+    run: usize,
+    /// Leading spaces before the fence, stripped from the block's code lines.
+    indent: usize,
+};
+
+/// Parses an opening or closing fence of three or more backticks or tildes,
+/// allowing any leading spaces so fences inside list items are recognized.
+pub fn parseCodeFence(line: []const u8) ?CodeFence {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    const indent = i;
+    if (i >= line.len) return null;
+    const marker = line[i];
     if (marker != '`' and marker != '~') return null;
-    if (line[1] != marker or line[2] != marker) return null;
-    return marker;
+    var run: usize = 0;
+    while (i < line.len and line[i] == marker) : (i += 1) run += 1;
+    if (run < 3) return null;
+    return .{ .marker = marker, .run = run, .indent = indent };
+}
+
+pub fn codeFenceMarker(line: []const u8) ?u8 {
+    const fence = parseCodeFence(line) orelse return null;
+    return fence.marker;
+}
+
+/// True when `line` closes a block opened by `open`: same marker, a run at
+/// least as long, and nothing but whitespace after it.
+pub fn closesCodeFence(line: []const u8, open: CodeFence) bool {
+    const fence = parseCodeFence(line) orelse return false;
+    if (fence.marker != open.marker or fence.run < open.run) return false;
+    return tu.isBlankMarkdownLine(line[fence.indent + fence.run ..]);
 }
 
 fn isCodeFence(line: []const u8) bool {
@@ -14,9 +42,18 @@ fn isCodeFence(line: []const u8) bool {
 }
 
 pub fn codeFenceLanguage(line: []const u8) []const u8 {
-    const info = std.mem.trim(u8, line[3..], " \t");
+    const fence = parseCodeFence(line) orelse return "";
+    const info = std.mem.trim(u8, line[fence.indent + fence.run ..], " \t");
     const end = std.mem.indexOfAny(u8, info, " \t") orelse info.len;
     return info[0..end];
+}
+
+/// Strips up to `indent` leading spaces or tabs so code inside an indented
+/// list item renders flush with the fence.
+pub fn stripFenceIndent(line: []const u8, indent: usize) []const u8 {
+    var i: usize = 0;
+    while (i < line.len and i < indent and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    return line[i..];
 }
 
 pub fn hasIndentedCodePrefix(line: []const u8) bool {
@@ -33,13 +70,27 @@ const ParsedHeader = struct {
     content: []const u8,
 };
 
+/// ATX heading: up to three leading spaces, one to six `#`, a space, then
+/// content with any closing `#` run removed.
 pub fn parseHeader(line: []const u8) ?ParsedHeader {
-    if (line.len == 0 or line[0] != '#') return null;
+    var start: usize = 0;
+    while (start < 3 and start < line.len and line[start] == ' ') : (start += 1) {}
     var level: usize = 0;
-    while (level < 6 and level < line.len and line[level] == '#') : (level += 1) {}
-    if (level == 0 or level >= line.len) return null;
-    if (line[level] != ' ') return null;
-    return .{ .level = level, .content = line[level + 1 ..] };
+    while (level < 6 and start + level < line.len and line[start + level] == '#') : (level += 1) {}
+    if (level == 0) return null;
+    const marker_end = start + level;
+    if (marker_end >= line.len or line[marker_end] != ' ') return null;
+    return .{ .level = level, .content = withoutClosingHashes(line[marker_end + 1 ..]) };
+}
+
+fn withoutClosingHashes(content: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, content, " \t");
+    var end = trimmed.len;
+    while (end > 0 and trimmed[end - 1] == '#') : (end -= 1) {}
+    if (end == trimmed.len) return content;
+    if (end == 0) return trimmed[0..0];
+    if (trimmed[end - 1] != ' ' and trimmed[end - 1] != '\t') return content;
+    return std.mem.trimEnd(u8, trimmed[0..end], " \t");
 }
 
 pub fn parseSetextUnderline(line: []const u8) ?usize {
@@ -151,13 +202,21 @@ const ParsedUnorderedList = struct {
     content: []const u8,
 };
 
+/// Accepts Markdown `-`, `*`, and `+` markers plus a literal bullet so model
+/// output that already uses `•` gets the same styling and wrap continuation.
 pub fn parseUnorderedList(line: []const u8) ?ParsedUnorderedList {
+    const literal_bullet = "\xe2\x80\xa2";
     var i: usize = 0;
     while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
-    if (i + 1 >= line.len) return null;
-    if (line[i] != '-' and line[i] != '*') return null;
-    if (line[i + 1] != ' ') return null;
-    return .{ .indent = line[0..i], .content = line[i + 2 ..] };
+    const rest = line[i..];
+    const marker_len: usize = if (rest.len > 0 and (rest[0] == '-' or rest[0] == '*' or rest[0] == '+'))
+        1
+    else if (std.mem.startsWith(u8, rest, literal_bullet))
+        literal_bullet.len
+    else
+        return null;
+    if (marker_len >= rest.len or !tu.isSpace(rest[marker_len])) return null;
+    return .{ .indent = line[0..i], .content = rest[marker_len + 1 ..] };
 }
 
 const ParsedOrderedList = struct {
@@ -171,10 +230,10 @@ pub fn parseOrderedList(line: []const u8) ?ParsedOrderedList {
     while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
     const indent_end = i;
     while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {}
-    if (i == indent_end) return null;
+    if (i == indent_end or i - indent_end > 9) return null;
     if (i + 1 >= line.len) return null;
-    if (line[i] != '.') return null;
-    if (line[i + 1] != ' ') return null;
+    if (line[i] != '.' and line[i] != ')') return null;
+    if (!tu.isSpace(line[i + 1])) return null;
     return .{
         .indent = line[0..indent_end],
         .marker = line[indent_end .. i + 1],

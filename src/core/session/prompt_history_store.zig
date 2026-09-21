@@ -20,13 +20,6 @@ pub const LoadedPromptHistoryEntry = struct {
     text: []u8,
 };
 
-pub const PromptHistoryRecord = struct {
-    schema_version: u8 = 1,
-    timestamp_ms: i64,
-    workspace_root: []const u8,
-    text: []const u8,
-};
-
 pub const AppendOutcome = enum {
     appended,
     duplicate,

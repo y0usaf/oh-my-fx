@@ -26,7 +26,6 @@ pub const Geometry = struct {
     bottom_divider: u16,
     hint: u16,
     activity_row: ?u16 = null,
-    activity_reserved_rows: u16 = 0,
 
     pub fn inputPointerPosition(
         self: Geometry,
@@ -333,13 +332,6 @@ const FrameSink = struct {
     }
 };
 
-fn expectGridRow(grid: *vt_emulator.Grid, row: u16, expected: []const u8) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.testing.allocator);
-    try grid.rowTextTrimmed(row, &buf);
-    try std.testing.expectEqualStrings(expected, buf.items);
-}
-
 fn footerSurfaceTestPlan(cols: u16) paint_plan.PaintPlan {
     return .{
         .layout = .{
@@ -380,7 +372,6 @@ fn footerSurfaceTestPlan(cols: u16) paint_plan.PaintPlan {
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = 5, .col = 1, .visible = true },
-        .footer_reservation_source = .footer_layout,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };

@@ -19,14 +19,11 @@ pub const Error = error{
 const ParsedQuery = struct {
     parent: []const u8,
     display_prefix: []const u8,
-    basename_prefix: []const u8,
+    basename_query: []const u8,
 };
 
 pub fn queryMode(query: []const u8) QueryMode {
-    for (query) |byte| {
-        if (std.fs.path.isSep(byte)) return .explicit_path;
-    }
-    return .workspace_index;
+    return if (parseExplicitQuery(query) != null) .explicit_path else .workspace_index;
 }
 
 pub fn complete(
@@ -36,31 +33,59 @@ pub fn complete(
     match_spans: []file_index.MatchSpan,
     path_storage: []u8,
 ) Error!usize {
+    return completeCancellable(workspace_root, io_mod.getenv("HOME"), query, null, out, match_spans, path_storage) catch |err| switch (err) {
+        error.Cancelled => unreachable,
+        else => |failure| return failure,
+    };
+}
+
+/// Blocking directory operation. Inputs and output storage belong to the caller;
+/// cancellation is cooperative and cannot interrupt an in-flight filesystem call.
+pub fn completeCancellable(
+    workspace_root: []const u8,
+    home_dir: ?[]const u8,
+    query: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+    out: []file_index.SearchResult,
+    match_spans: []file_index.MatchSpan,
+    path_storage: []u8,
+) (Error || error{Cancelled})!usize {
+    try checkCancellation(cancel);
     if (out.len == 0) return 0;
     const parsed = parseExplicitQuery(query) orelse return 0;
+    const matcher = file_index.NameQuery.init(parsed.basename_query) orelse return 0;
+    var scores: [file_index.max_search_results]file_index.NameQuery.Score = undefined;
     const slot_len: usize = file_index.max_path_len;
-    if (out.len > path_storage.len / slot_len) return error.NoSpaceLeft;
+    if (out.len > scores.len or out.len > path_storage.len / slot_len) return error.NoSpaceLeft;
 
     var resolve_storage: [file_index.max_path_len * 4]u8 = undefined;
     var resolve_fba = std.heap.FixedBufferAllocator.init(&resolve_storage);
-    const resolved = pathing.resolveWorkspaceOrExternalPath(
+    try checkCancellation(cancel);
+    const resolved = pathing.resolve_workspace_or_external_literal_path_with_home(
         resolve_fba.allocator(),
         workspace_root,
         parsed.parent,
+        home_dir,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.NoSpaceLeft,
         else => return error.PathUnavailable,
     };
 
     const io = io_mod.getIo();
+    try checkCancellation(cancel);
     var dir = std.Io.Dir.openDirAbsolute(io, resolved, .{ .iterate = true }) catch return error.PathUnavailable;
     defer dir.close(io);
 
     var count: usize = 0;
     var iterator = dir.iterate();
-    while (iterator.next(io) catch return error.PathUnavailable) |entry| {
-        if (!std.ascii.startsWithIgnoreCase(entry.name, parsed.basename_prefix)) continue;
+    while (true) {
+        try checkCancellation(cancel);
+        const entry = (iterator.next(io) catch return error.PathUnavailable) orelse break;
+        try checkCancellation(cancel);
         if (!text_utils.isTerminalSafe(entry.name)) continue;
+        const score = matcher.score(entry.name) orelse continue;
+        // candidateKind may stat symlinks or unknown kinds.
+        try checkCancellation(cancel);
         const kind = candidateKind(&dir, entry.name, entry.kind) orelse continue;
 
         var candidate_storage: [file_index.max_path_len]u8 = undefined;
@@ -71,24 +96,30 @@ pub fn complete(
         const candidate = candidate_storage[0..candidate_len];
         if (!text_utils.isTerminalSafe(candidate)) continue;
         if (!file_picker_path.isRepresentable(candidate)) continue;
-        count = insertCandidate(out, path_storage, count, candidate, kind);
+        count = insertCandidate(out, path_storage, &scores, &matcher, count, candidate, kind, score);
     }
 
     var spans_used: usize = 0;
     for (out[0..count]) |*result| {
-        if (parsed.basename_prefix.len == 0) {
-            result.matched_spans = match_spans[0..0];
-            continue;
-        }
-        if (spans_used >= match_spans.len) return error.NoSpaceLeft;
-        match_spans[spans_used] = .{
-            .byte_start = @intCast(parsed.display_prefix.len),
-            .byte_end = @intCast(parsed.display_prefix.len + parsed.basename_prefix.len),
+        try checkCancellation(cancel);
+        const span_count = matcher.match_spans(result.path[parsed.display_prefix.len..], match_spans[spans_used..]) catch |err| switch (err) {
+            error.NoSpaceLeft => return error.NoSpaceLeft,
+            error.InvalidIndexData => return error.PathUnavailable,
         };
-        result.matched_spans = match_spans[spans_used .. spans_used + 1];
-        spans_used += 1;
+        const spans = match_spans[spans_used..][0..span_count];
+        for (spans) |*span| {
+            span.byte_start += @intCast(parsed.display_prefix.len);
+            span.byte_end += @intCast(parsed.display_prefix.len);
+        }
+        result.matched_spans = spans;
+        spans_used += span_count;
     }
+    try checkCancellation(cancel);
     return count;
+}
+
+fn checkCancellation(cancel: ?*const std.atomic.Value(bool)) error{Cancelled}!void {
+    if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
 }
 
 pub fn isCurrentCandidateKind(
@@ -100,7 +131,7 @@ pub fn isCurrentCandidateKind(
 
     var resolve_storage: [file_index.max_path_len * 4]u8 = undefined;
     var resolve_fba = std.heap.FixedBufferAllocator.init(&resolve_storage);
-    const resolved = pathing.resolveWorkspaceOrExternalPath(
+    const resolved = pathing.resolve_workspace_or_external_literal_path(
         resolve_fba.allocator(),
         workspace_root,
         path,
@@ -114,6 +145,13 @@ pub fn isCurrentCandidateKind(
 }
 
 fn parseExplicitQuery(query: []const u8) ?ParsedQuery {
+    inline for (.{ "~", ".", ".." }) |shortcut| {
+        if (std.mem.eql(u8, query, shortcut)) return .{
+            .parent = query,
+            .display_prefix = shortcut ++ "/",
+            .basename_query = "",
+        };
+    }
     var separator_index: ?usize = null;
     for (query, 0..) |byte, index| {
         if (std.fs.path.isSep(byte)) separator_index = index;
@@ -123,7 +161,7 @@ fn parseExplicitQuery(query: []const u8) ?ParsedQuery {
     return .{
         .parent = parent,
         .display_prefix = query[0 .. separator + 1],
-        .basename_prefix = query[separator + 1 ..],
+        .basename_query = query[separator + 1 ..],
     };
 }
 
@@ -161,18 +199,22 @@ fn kindMatchesStat(expected: file_index.CandidateKind, actual: std.Io.File.Kind)
 fn insertCandidate(
     out: []file_index.SearchResult,
     path_storage: []u8,
+    scores: []file_index.NameQuery.Score,
+    matcher: *const file_index.NameQuery,
     count: usize,
     path: []const u8,
     kind: file_index.CandidateKind,
+    score: file_index.NameQuery.Score,
 ) usize {
     var insertion_index: usize = 0;
-    while (insertion_index < count and std.mem.order(u8, path, out[insertion_index].path) != .lt) : (insertion_index += 1) {}
+    while (insertion_index < count and !matcher.better(score, path, scores[insertion_index], out[insertion_index].path)) : (insertion_index += 1) {}
     if (insertion_index >= out.len) return count;
 
     const next_count = @min(count + 1, out.len);
     var index = next_count - 1;
     while (index > insertion_index) : (index -= 1) {
         const previous = out[index - 1];
+        scores[index] = scores[index - 1];
         const slot = pathSlot(path_storage, index);
         @memcpy(slot[0..previous.path.len], previous.path);
         out[index] = .{
@@ -183,6 +225,7 @@ fn insertCandidate(
     }
 
     const slot = pathSlot(path_storage, insertion_index);
+    scores[insertion_index] = score;
     @memcpy(slot[0..path.len], path);
     out[insertion_index] = .{
         .path = slot[0..path.len],
@@ -206,7 +249,7 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8) !void {
 
 test "path completion classifies and splits only path-shaped queries" {
     try std.testing.expectEqual(QueryMode.workspace_index, queryMode("main"));
-    try std.testing.expectEqual(QueryMode.workspace_index, queryMode("~"));
+    try std.testing.expectEqual(QueryMode.explicit_path, queryMode("~"));
     try std.testing.expectEqual(QueryMode.explicit_path, queryMode("~/Dow"));
     try std.testing.expectEqual(QueryMode.explicit_path, queryMode("/tmp/fi"));
     try std.testing.expectEqual(QueryMode.explicit_path, queryMode("./src/"));
@@ -216,7 +259,48 @@ test "path completion classifies and splits only path-shaped queries" {
     const parsed = parseExplicitQuery("../shared/na").?;
     try std.testing.expectEqualStrings("../shared", parsed.parent);
     try std.testing.expectEqualStrings("../shared/", parsed.display_prefix);
-    try std.testing.expectEqualStrings("na", parsed.basename_prefix);
+    try std.testing.expectEqualStrings("na", parsed.basename_query);
+}
+
+test "path completion treats only exact directory shortcuts as roots" {
+    inline for (.{ "~", ".", ".." }) |shortcut| {
+        try std.testing.expectEqual(QueryMode.explicit_path, queryMode(shortcut));
+        const parsed = parseExplicitQuery(shortcut).?;
+        const with_slash = parseExplicitQuery(shortcut ++ "/").?;
+        try std.testing.expectEqualStrings(shortcut, parsed.parent);
+        try std.testing.expectEqualStrings(shortcut ++ "/", parsed.display_prefix);
+        try std.testing.expectEqualStrings("", parsed.basename_query);
+        try std.testing.expectEqualStrings(with_slash.parent, parsed.parent);
+        try std.testing.expectEqualStrings(with_slash.display_prefix, parsed.display_prefix);
+        try std.testing.expectEqualStrings(with_slash.basename_query, parsed.basename_query);
+    }
+    for ([_][]const u8{ "", ".gitignore", "...", "..notes", "~notes", "main", "readme.md" }) |query| {
+        try std.testing.expectEqual(QueryMode.workspace_index, queryMode(query));
+        try std.testing.expect(parseExplicitQuery(query) == null);
+    }
+}
+
+test "path completion browses bare current and parent directories" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "workspace/local.txt");
+    try writeTestFile(tmp.dir, "parent.txt");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+    var results: [4]file_index.SearchResult = undefined;
+    var spans: [4]file_index.MatchSpan = undefined;
+    var paths: [4 * file_index.max_path_len]u8 = undefined;
+
+    try std.testing.expectEqual(@as(usize, 1), try complete(root, ".", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("./local.txt", results[0].path);
+    try std.testing.expectEqual(@as(usize, 0), results[0].matched_spans.len);
+    try std.testing.expect(isCurrentCandidateKind(root, results[0].path, .file));
+
+    try std.testing.expectEqual(@as(usize, 2), try complete(root, "..", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("../parent.txt", results[0].path);
+    try std.testing.expectEqualStrings("../workspace", results[1].path);
+    try std.testing.expect(isCurrentCandidateKind(root, results[1].path, .directory));
 }
 
 test "path completion enumerates immediate entries with deterministic bounded order" {
@@ -244,13 +328,15 @@ test "path completion enumerates immediate entries with deterministic bounded or
     try std.testing.expectEqualStrings("./src/beta.txt", results[2].path);
 
     const filtered_count = try complete(root, "src/al", &results, &spans, &paths);
-    try std.testing.expectEqual(@as(usize, 1), filtered_count);
+    try std.testing.expectEqual(@as(usize, 2), filtered_count);
     try std.testing.expectEqualStrings("src/Alpha.txt", results[0].path);
+    try std.testing.expectEqualStrings("src/space \" file.txt", results[1].path);
     try std.testing.expectEqual(file_index.CandidateKind.file, results[0].kind);
     try std.testing.expectEqual(@as(usize, 1), results[0].matched_spans.len);
     try std.testing.expectEqual(@as(u16, "src/".len), results[0].matched_spans[0].byte_start);
     try std.testing.expectEqual(@as(u16, "src/al".len), results[0].matched_spans[0].byte_end);
-    try std.testing.expectEqual(@as(usize, 0), try complete(root, "src/space", &results, &spans, &paths));
+    try std.testing.expectEqual(@as(usize, 1), try complete(root, "src/space", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("src/space \" file.txt", results[0].path);
 }
 
 test "path completion resolves parent and absolute forms without recursive traversal" {
@@ -317,6 +403,52 @@ test "path completion reports bounded storage and unavailable parents" {
     try std.testing.expectError(error.PathUnavailable, complete("/", "/definitely/missing/fx-path/", &results, &spans, &paths));
 }
 
+test "path completion fuzzy names stay within the exact parent and highlight suffixes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "Desktop");
+    try writeTestFile(tmp.dir, "unrelated/Desktop.txt");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var results: [4]file_index.SearchResult = undefined;
+    var spans: [16]file_index.MatchSpan = undefined;
+    var paths: [4 * file_index.max_path_len]u8 = undefined;
+    for ([_][]const u8{ "~/ktop", "~/dsktp" }) |query| {
+        const count = try completeCancellable(home, home, query, null, &results, &spans, &paths);
+        try std.testing.expectEqual(@as(usize, 1), count);
+        try std.testing.expectEqualStrings("~/Desktop", results[0].path);
+        try std.testing.expectEqual(file_index.CandidateKind.directory, results[0].kind);
+    }
+    _ = try completeCancellable(home, home, "~/ktop", null, &results, &spans, &paths);
+    try std.testing.expectEqualSlices(file_index.MatchSpan, &.{.{ .byte_start = 5, .byte_end = 9 }}, results[0].matched_spans);
+    _ = try completeCancellable(home, home, "~/dsktp", null, &results, &spans, &paths);
+    try std.testing.expectEqualSlices(file_index.MatchSpan, &.{
+        .{ .byte_start = 2, .byte_end = 3 },
+        .{ .byte_start = 4, .byte_end = 7 },
+        .{ .byte_start = 8, .byte_end = 9 },
+    }, results[0].matched_spans);
+}
+
+test "path completion fuzzy ranking retains the best bounded result and checks span capacity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "Desktop");
+    try tmp.dir.createDirPath(std.testing.io, "ktop");
+    try tmp.dir.createDirPath(std.testing.io, "OtherDesktop");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var results: [1]file_index.SearchResult = undefined;
+    var spans: [4]file_index.MatchSpan = undefined;
+    var paths: [file_index.max_path_len]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try complete(root, "./ktop", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("./ktop", results[0].path);
+    try std.testing.expectError(error.NoSpaceLeft, complete(root, "./dsktp", &results, spans[0..1], &paths));
+    try std.testing.expectEqual(@as(usize, 1), try complete(root, "./dsktp", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("./Desktop", results[0].path);
+}
+
 test "path completion validates the current explicit candidate kind" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -330,4 +462,21 @@ test "path completion validates the current explicit candidate kind" {
     try std.testing.expect(!isCurrentCandidateKind(root, "./folder", .file));
     try std.testing.expect(isCurrentCandidateKind(root, "./file.txt", .file));
     try std.testing.expect(!isCurrentCandidateKind(root, "./missing", .file));
+}
+
+test "path completion cancellable operation uses captured HOME and literal parent bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "dir /chosen.txt");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var results: [2]file_index.SearchResult = undefined;
+    var spans: [2]file_index.MatchSpan = undefined;
+    var paths: [2 * file_index.max_path_len]u8 = undefined;
+    var cancel: std.atomic.Value(bool) = .init(false);
+    try std.testing.expectEqual(@as(usize, 1), try completeCancellable("/unused-workspace", root, "~/dir /ch", &cancel, &results, &spans, &paths));
+    try std.testing.expectEqualStrings("~/dir /chosen.txt", results[0].path);
+    cancel.store(true, .release);
+    try std.testing.expectError(error.Cancelled, completeCancellable(root, null, "./missing/", &cancel, &results, &spans, &paths));
 }

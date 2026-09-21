@@ -26,6 +26,7 @@ import {
   contentText,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
+import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const SOURCE_URL = "https://ziglang.org/download/";
@@ -251,6 +252,7 @@ function startFakeGateway(
   model: string | ModelCatalogFixture = OUTER_MODEL,
 ) {
   const requests: GatewayRequest[] = [];
+  const titleRequests: GatewayRequest[] = [];
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -263,15 +265,22 @@ function startFakeGateway(
         });
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
-      requests.push({ body: await req.text(), headers: req.headers });
+      const body = await req.text();
+      // Title generation side calls bypass the queued responses entirely.
+      if (body.includes(TITLE_GENERATION_MARKER)) {
+        titleRequests.push({ body, headers: req.headers });
+        return fakeGatewayTitleDefault();
+      }
+      requests.push({ body, headers: req.headers });
       return await (responses.shift() ?? new Response("unexpected request", { status: 500 }));
     },
   });
 
   return {
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     baseUrl: `http://127.0.0.1:${server.port}`,
     requests,
+    titleRequests,
     stop() {
       server.stop(true);
     },
@@ -619,6 +628,88 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
+    "saved search replays restarted segments with their own metadata",
+    async () => {
+      const model = "anthropic/claude-opus-4.6";
+      const root = createIsolatedRoot(null);
+      const gateway = startFakeGateway([
+        sse([
+          { type: "reasoning-start", id: "0" },
+          { type: "reasoning-delta", id: "0", delta: "" },
+          { type: "reasoning-end", id: "0", providerMetadata: { anthropic: { signature: "before-search" } } },
+          { type: "text-start", id: "1" },
+          { type: "text-delta", id: "1", delta: "Checking sources. " },
+          { type: "text-end", id: "1" },
+          { type: "tool-input-start", id: "search-1", toolName: "exa_search" },
+          { type: "tool-call", toolCallId: "search-1", toolName: "exa_search", input: { query: "Zig release" }, providerExecuted: true },
+          { type: "tool-result", toolCallId: "search-1", result: { results: [{ title: "Zig downloads", url: SOURCE_URL }] } },
+          { type: "reasoning-start", id: "0" },
+          { type: "reasoning-delta", id: "0", delta: "" },
+          { type: "reasoning-end", id: "0", providerMetadata: { anthropic: { signature: "after-search" } } },
+          { type: "text-start", id: "1" },
+          { type: "text-delta", id: "1", delta: "Found the release information." },
+          { type: "text-end", id: "1" },
+          { type: "finish", finishReason: { unified: "stop", raw: "end_turn" } },
+        ]),
+        outerText("The saved search context is available."),
+      ], model);
+      const env = fakeGatewayEnv(root, gateway, { FX_MODEL: model });
+      try {
+        const first = await runFx(
+          ["ask", "--auto", "--json", "Search the web for the latest Zig release."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(first.code).toBe(0);
+        const saved = JSON.parse(first.stdout.trim());
+        expect(saved.final_output).toBe("Checking sources. Found the release information.");
+        expect(saved.session_id).toMatch(/^[A-Za-z0-9_-]{12}$/);
+        expect(gateway.requests).toHaveLength(1);
+
+        const resumed = await runFx(
+          ["ask", "--auto", "--json", "--resume-id", saved.session_id, "Summarize the saved search."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(resumed.code).toBe(0);
+        expect(JSON.parse(resumed.stdout.trim()).final_output).toBe("The saved search context is available.");
+        expect(resumed.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(2);
+        const prompt = JSON.parse(gateway.requests[1]!.body).prompt as Array<{
+          role: string;
+          content: string | Array<Record<string, any>>;
+        }>;
+        const parts = prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : []
+        );
+        const reasoning = parts.filter((part) => part.type === "reasoning");
+        expect(reasoning.map((part) => part.providerOptions?.anthropic?.signature)).toEqual([
+          "before-search",
+          "after-search",
+        ]);
+        const calls = parts.filter((part) => part.type === "tool-call");
+        expect(calls.map((part) => [part.toolCallId, part.toolName])).toEqual([
+          ["search-1", "exa_search"],
+        ]);
+        const results = parts.filter((part) => part.type === "tool-result");
+        expect(results.map((part) => part.toolCallId)).toEqual(["search-1"]);
+        expect(contentText(results[0]!.output)).toContain(SOURCE_URL);
+        const text = prompt
+          .filter((message) => message.role === "assistant")
+          .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+          .filter((part) => part.type === "text");
+        expect(text.map((part) => part.text).join("")).toBe(
+          "Checking sources. Found the release information.",
+        );
+        expect(first.stdout + resumed.stdout).not.toContain("before-search");
+        expect(first.stdout + resumed.stdout).not.toContain("after-search");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "malformed direct provider result identity fails before synthesis",
     async () => {
       const root = createIsolatedRoot();
@@ -880,7 +971,7 @@ describe("web_search Gateway fixture", () => {
           const request = JSON.parse(gateway.requests[0].body);
           expect(request).not.toHaveProperty("reasoning");
           expect(request).not.toHaveProperty("fast");
-          expect(request.providerOptions?.gateway).toBeUndefined();
+          expect(request.providerOptions?.gateway).toEqual({ caching: "auto" });
           expect(gateway.requests[0].body).not.toContain('"thinking"');
 
           const stored = JSON.parse(

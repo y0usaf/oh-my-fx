@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
-import { composerContains, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { composerContains, FAKE_GATEWAY_MODEL, fakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const tmuxTest = test.skipIf(!tmuxAvailable());
 const PASTE_START = ["1b", "5b", "32", "30", "30", "7e"] as const;
@@ -170,4 +170,69 @@ tmuxTest("tmux leaves native-clear probing disabled and preserves ordinary input
   const trace = existsSync(trace_path) ? readFileSync(trace_path, "utf8") : "";
   expect(trace).not.toContain("native_clear_probe requested");
   expect(readFileSync(stderr_path, "utf8")).toBe("");
+}, 30_000);
+
+tmuxTest("typing inside the ctrl+o full transcript never starts the native-clear probe", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fx-native-clear-ctrl-o-"));
+  temp_dirs.push(dir);
+  const trace_path = join(dir, "trace.log");
+  const stderr_path = join(dir, "stderr.log");
+  mkdirSync(join(dir, ".fx"), { recursive: true });
+  writeFileSync(join(dir, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
+  const gateway = startFakeGateway([fakeGatewayFinalText("ctrl-o probe target")]);
+
+  session = await TmuxSession.create({
+    width: 100,
+    height: 30,
+    stderrPath: stderr_path,
+    env: {
+      HOME: dir,
+      AI_GATEWAY_API_KEY: "fake-native-clear-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_THEME: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+      FX_AUTO_UPGRADE: "0",
+      TMUX: undefined,
+      FX_TRACE_LOG: trace_path,
+      FX_TRACE_SCOPES: "native_clear",
+    },
+  });
+  try {
+    await session.waitForComposer(10_000);
+
+    // One completed turn so the full transcript has content to open.
+    await session.sendLiteral("hello");
+    await session.sendKeys("Enter");
+    await session.waitForText("ctrl-o probe target", 10_000);
+
+    // Control: a printable byte in the main view starts and settles the probe.
+    await session.sendLiteral("a");
+    await waitForTrace(trace_path, "native_clear_probe requested");
+    await session.waitForPane((pane) => composerContains(pane, "a"), 10_000);
+    const baseline_requests = readFileSync(trace_path, "utf8")
+      .split("native_clear_probe requested").length - 1;
+
+    // While the full transcript owns the alternate screen, the terminal cursor
+    // no longer reflects the main-grid footer row, so the probe must not begin.
+    await session.sendKeys("C-o");
+    await session.waitForText("ctrl+o close", 10_000);
+    await session.sendLiteral("j");
+
+    // The typed byte still reaches the composer through the modal fallthrough.
+    // Waiting for it first proves the byte traversed the input path while the
+    // transcript owned the screen, so the no-probe assertion needs no sleep.
+    await session.sendKeys("C-o");
+    await session.waitForPane((pane) => composerContains(pane, "aj"), 10_000);
+
+    const trace = readFileSync(trace_path, "utf8");
+    const requests = trace.split("native_clear_probe requested").length - 1;
+    expect(requests).toBe(baseline_requests);
+    expect(trace).not.toContain("native_clear_probe mismatch");
+    expect(trace).not.toContain("native_clear_recovery_requested");
+    expect(readFileSync(stderr_path, "utf8")).toBe("");
+  } finally {
+    gateway.stop();
+  }
 }, 30_000);

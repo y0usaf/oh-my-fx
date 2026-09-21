@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const helpers = @import("upgrade_helpers.zig");
 const update_target = @import("update_target.zig");
 
@@ -8,6 +9,9 @@ const Allocator = std.mem.Allocator;
 const check_interval_ms: u64 = 30 * 60 * 1000;
 const initial_delay_ms: u64 = 10_000;
 const sleep_increment_ms: u64 = 50;
+/// Upper bound stop() waits for the upgrade thread once cancellation has
+/// been requested; a stuck network read must not delay process exit.
+const stop_join_budget_ms: i64 = 250;
 
 pub const State = enum(u8) {
     idle = 0,
@@ -48,6 +52,7 @@ pub fn isDevelopmentBuildPath(path: []const u8) bool {
 pub const AutoUpgrade = struct {
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(State.idle)),
     should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     render_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
@@ -58,6 +63,8 @@ pub const AutoUpgrade = struct {
     previous_revision_len: u8 = 0,
 
     selected_channel: update_target.Channel = .stable,
+
+    transfer_interrupt: helpers.TransferInterrupt = .{},
 
     relaunch_request: ?RelaunchRequest = null,
 
@@ -80,14 +87,34 @@ pub const AutoUpgrade = struct {
 
     pub fn stop(self: *AutoUpgrade) void {
         self.should_stop.store(true, .release);
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
+        // Wake a thread blocked in a transfer read so it can observe the
+        // cancel flag instead of stalling on the socket.
+        self.transfer_interrupt.interrupt();
+        const t = self.thread orelse return;
+        const deadline_ms = io_mod.milliTimestamp() + stop_join_budget_ms;
+        while (!self.stopped.load(.acquire) and io_mod.milliTimestamp() < deadline_ms) {
+            io_mod.sleep(std.time.ns_per_ms);
         }
+        if (self.stopped.load(.acquire)) {
+            t.join();
+        } else {
+            // The thread is stuck in a network read; process exit reaps it.
+            // downloadAndInstall rechecks should_stop before touching the
+            // executable, so a late wake-up cannot install.
+            debug_trace.logf("upgrade", "stop detaching upgrade thread mid-transfer", .{});
+        }
+        self.thread = null;
     }
 
     pub fn getState(self: *const AutoUpgrade) State {
         return @enumFromInt(self.state.load(.acquire));
+    }
+
+    fn transferControl(self: *AutoUpgrade) helpers.TransferControl {
+        return .{
+            .cancel = &self.should_stop,
+            .interrupt = &self.transfer_interrupt,
+        };
     }
 
     pub fn requestRelaunch(self: *AutoUpgrade, executable_path: []const u8) !void {
@@ -179,6 +206,7 @@ pub const AutoUpgrade = struct {
         alloc: Allocator,
         current: update_target.CurrentBuild,
     ) void {
+        defer self.stopped.store(true, .release);
         self.sleepInterruptible(initial_delay_ms);
 
         while (!self.should_stop.load(.acquire)) {
@@ -200,7 +228,8 @@ pub const AutoUpgrade = struct {
         current: update_target.CurrentBuild,
     ) void {
         const cdn_base = helpers.resolveCdnBase();
-        var target = helpers.fetchTarget(alloc, self.selected_channel, cdn_base) catch return;
+        if (helpers.cancelRequested(&self.should_stop)) return;
+        var target = helpers.fetchTarget(alloc, self.selected_channel, cdn_base, self.transferControl()) catch return;
         defer target.deinit(alloc);
 
         if (!target.shouldInstall(current)) return;
@@ -252,14 +281,20 @@ pub const AutoUpgrade = struct {
         const archive_url = helpers.artifactUrl(alloc, cdn_base, target, "") catch return error.AllocFailed;
         defer alloc.free(archive_url);
 
-        helpers.downloadFileStreaming(&client, archive_url, archive_path) catch return error.DownloadFailed;
+        helpers.downloadFileStreaming(&client, archive_url, archive_path, self.transferControl()) catch |err| return switch (err) {
+            error.Cancelled => error.Cancelled,
+            else => error.DownloadFailed,
+        };
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
         const checksum_url = helpers.artifactUrl(alloc, cdn_base, target, ".sha256") catch return error.AllocFailed;
         defer alloc.free(checksum_url);
 
-        helpers.verifyChecksum(&client, archive_path, checksum_url) catch return error.ChecksumFailed;
+        helpers.verifyChecksum(&client, archive_path, checksum_url, self.transferControl()) catch |err| return switch (err) {
+            error.Cancelled => error.Cancelled,
+            else => error.ChecksumFailed,
+        };
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
@@ -290,6 +325,44 @@ test "statusLabel idle returns empty" {
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
     try std.testing.expectEqual(@as(usize, 0), label.len);
+}
+
+test "stop joins a finished upgrade thread" {
+    var au = AutoUpgrade{};
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(self: *AutoUpgrade) void {
+            io_mod.sleep(10 * std.time.ns_per_ms);
+            self.stopped.store(true, .release);
+        }
+    }.run, .{&au});
+    au.thread = t;
+    const started_ms = io_mod.milliTimestamp();
+    au.stop();
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < stop_join_budget_ms);
+    try std.testing.expect(au.thread == null);
+    try std.testing.expect(au.stopped.load(.acquire));
+}
+
+test "stop detaches instead of blocking on a stuck upgrade thread" {
+    var au = AutoUpgrade{};
+    var blocker = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(block: *std.atomic.Value(bool)) void {
+            // Never reports stopped; simulates a thread wedged in a network
+            // read. The blocker keeps it alive until the test process moves on.
+            while (!block.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+        }
+    }.run, .{&blocker});
+    au.thread = t;
+    const started_ms = io_mod.milliTimestamp();
+    au.stop();
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    blocker.store(true, .release);
+    t.join();
+    try std.testing.expect(elapsed_ms >= stop_join_budget_ms);
+    try std.testing.expect(elapsed_ms < stop_join_budget_ms * 4);
+    try std.testing.expect(au.thread == null);
+    try std.testing.expect(!au.stopped.load(.acquire));
 }
 
 test "selected release channel is owned by the upgrade runtime" {

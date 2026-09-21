@@ -7,7 +7,6 @@ const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
-const session_test_controls = @import("session_test_controls.zig");
 const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
@@ -21,6 +20,7 @@ const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
@@ -29,6 +29,7 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
+const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
@@ -42,12 +43,18 @@ const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
+const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const libfx_steering = @import("libfx_steering.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 const legacy_url_completion_timeout_ms: i64 = 10 * 60 * 1000;
+const libfx_provider_tools = [_]tool_dispatch.Tool{
+    host_tool_runtime.providerProjection(builtin_tools.web_search),
+};
+const libfx_provider_tool_registry = tool_dispatch.Registry{ .tools = &libfx_provider_tools };
 
 const AcpMethod = enum {
     request_cancel,
@@ -65,6 +72,7 @@ const AcpMethod = enum {
     libfx_checkpoint,
     libfx_restore,
     libfx_new,
+    libfx_steer,
     unknown,
 
     fn parse(method: []const u8) AcpMethod {
@@ -83,6 +91,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/checkpoint")) return .libfx_checkpoint;
         if (std.mem.eql(u8, method, "libfx/restore")) return .libfx_restore;
         if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
+        if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
         return .unknown;
     }
 
@@ -97,6 +106,7 @@ const AcpMethod = enum {
             .session_resume,
             .session_close,
             .libfx_new,
+            .libfx_steer,
             => false,
             .session_list,
             .session_remove,
@@ -111,7 +121,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer => true,
             else => false,
         };
     }
@@ -204,9 +214,11 @@ pub const ActiveSessionState = struct {
     /// profile or project configuration.
     session_grants: []types.PermissionGrant = &.{},
     session_rt: session_runtime.SessionRuntime,
+    title_task: ?*session_title_generation.Task = null,
     mcp: ?*mcp_runtime.McpRuntime = null,
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
+    steering: libfx_steering.Runtime = .{},
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
         for (self.session_grants) |grant| {
@@ -242,6 +254,7 @@ const ActivePrompt = struct {
 };
 
 pub const ServerState = struct {
+    configured_providers: @import("../core/config/configured_provider.zig").Registry = .{},
     alloc: Allocator,
     cfg: Config,
     writer: jsonrpc.Writer,
@@ -262,6 +275,7 @@ pub const ServerState = struct {
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
+    process_provider_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
@@ -271,6 +285,7 @@ pub const ServerState = struct {
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
+    session_titles: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -331,6 +346,7 @@ pub const ServerState = struct {
         self.pending_outbound.deinit(self.alloc);
         clearPendingLegacyUrls(self);
         self.pending_legacy_urls.deinit(self.alloc);
+        self.configured_providers.deinit(self.alloc);
     }
 };
 
@@ -347,7 +363,7 @@ fn credentialReadyAt(
     refresh_after_ms: ?i64,
     now_ms: i64,
 ) bool {
-    if (source == null or token.len == 0) return false;
+    if (source == null or (token.len == 0 and source != .configured)) return false;
     if (credentials.sourceRefreshable(source.?) and
         refresh_after_ms != null and refresh_after_ms.? <= now_ms)
     {
@@ -356,7 +372,8 @@ fn credentialReadyAt(
     return true;
 }
 
-fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
+/// Transfers credential storage after the caller has stopped its prior borrowers.
+pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
     if (state.active_session) |*active| active.api_key = &.{};
     if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
     if (state.gateway_team) |team| state.alloc.free(team);
@@ -408,25 +425,38 @@ pub fn selectCredentialForProvider(
         }
         return true;
     }
+    var prepared = prepareCredentialForProvider(state, provider) catch |err| {
+        if (err == error.ProviderCredentialUnavailable) return false;
+        return err;
+    };
+    defer if (prepared) |*credential| credential.deinit(state.alloc);
+    if (prepared) |*credential| adoptServerCredential(state, credential);
+    return true;
+}
+
+/// Stages authorization without changing any in-flight credential storage.
+/// The caller owns a non-null credential; null retains the current authorization.
+pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
+    if (state.cfg.auth_mode == .host_managed) return null;
     const now_ms = io_mod.milliTimestamp();
     if (state.active_session) |active| {
-        if (credentialMatchesProvider(active.credential_source, provider) and
+        if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
             credentialReadyAt(
                 active.credential_source,
                 active.api_key,
                 active.credential_refresh_after_ms,
                 now_ms,
-            )) return true;
+            )) return null;
     }
-    if (credentialMatchesProvider(state.credential_source, provider) and
+    if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
         credentialReadyAt(
             state.credential_source,
             state.api_key,
             state.credential_refresh_after_ms,
             now_ms,
-        )) return true;
+        )) return null;
 
-    var credential = if (provider == .gateway and state.cfg.credential_override != null)
+    return if (provider == .gateway and state.cfg.credential_override != null)
         credentials.Credential{
             .token = try state.alloc.dupe(u8, state.cfg.credential_override.?),
             .source = .ai_gateway_api_key,
@@ -438,11 +468,27 @@ pub fn selectCredentialForProvider(
             state.cfg.secret_store,
             provider,
             if (provider == .gateway) state.gateway_source_preference else state.credential_source,
-        )) orelse return false;
+        )) orelse return error.ProviderCredentialUnavailable;
     };
-    defer credential.deinit(state.alloc);
-    adoptServerCredential(state, &credential);
-    return true;
+}
+
+test "ACP credential preparation preserves the existing borrowed credential" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.cfg.auth_mode = .local;
+    state.cfg.credential_override = "next-token";
+    state.active_session = null;
+    state.credential_source = .configured;
+    state.api_key = try alloc.dupe(u8, "active-token");
+    defer secret.zeroAndFree(alloc, state.api_key);
+    const borrowed = state.api_key;
+    var prepared = (try prepareCredentialForProvider(&state, .gateway)).?;
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqualStrings("next-token", prepared.token);
+    try std.testing.expectEqualStrings("active-token", borrowed);
+    try std.testing.expect(state.api_key.ptr == borrowed.ptr);
+    try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
 }
 
 pub fn streamProviderFor(
@@ -467,6 +513,10 @@ pub fn refreshModelCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
+    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+        return null;
+    }
     var refreshed = (try auth_runtime.refreshCredentialForAccount(
         state.cfg.gateway_provider.oauth_transport,
         state.alloc,
@@ -587,8 +637,13 @@ fn closeActiveSession(state: *ServerState) !void {
 
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
+    if (active.title_task) |task| {
+        debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});
+        task.destroy();
+    }
     state.alloc.free(active.session_id);
     state.alloc.free(active.model);
+    active.steering.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp) |runtime| {
@@ -624,15 +679,6 @@ pub fn enableSubagentHost(state: *ServerState) void {
         state.subagent_store.?.deinit(state.alloc);
         state.subagent_store = null;
         return;
-    };
-    state.subagent_host.?.requestBackgroundRecovery(
-        io_mod.milliTimestamp(),
-    ) catch |err| {
-        debug_trace.logf(
-            "subagent",
-            "acp background recovery unavailable root_id={s} outcome={s}",
-            .{ state.subagent_host.?.root_id, @errorName(err) },
-        );
     };
 }
 
@@ -707,22 +753,13 @@ pub fn disableSubagentHost(state: *ServerState) void {
 fn flushActiveSessionUsage(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     const writable = if (active.writable) |*value| value else return;
-    if (!writable.needsFinalStateReplacement(
-        active.session_rt.usage.isDirty(),
-    )) return;
+    if (!active.session_rt.usage.isDirty()) return;
 
-    var current = try writable.state.dupe(state.alloc);
-    defer current.deinit(state.alloc);
-    const history = try active.session_rt.snapshotHistory(state.alloc);
-    types.freeHistoryTurnSlice(state.alloc, current.history);
-    current.history = history;
-    const permission_state = try active.session_rt.snapshotPermissionState(state.alloc);
-    current.permission_state.deinit(state.alloc);
-    current.permission_state = permission_state;
-    current.conversation_language = active.session_rt.languageSnapshot();
     const usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
-    if (current.usage) |*old| old.deinit(state.alloc);
-    current.usage = usage_snapshot;
+    defer {
+        var owned = usage_snapshot;
+        owned.deinit(state.alloc);
+    }
     const store = if (active.store) |*value|
         value
     else
@@ -732,21 +769,16 @@ fn flushActiveSessionUsage(state: *ServerState) !void {
         writable,
         usage_snapshot,
     );
-    current.updated_at_ms = recovery_checkpoint.timestamp_ms;
-    _ = try writable.commitStateReplacement(
+    _ = try writable.appendEvent(
         state.alloc,
-        current,
-        .compaction,
-        .retry_expected_tail,
-        .{},
+        .{ .usage_checkpointed = .{ .usage = usage_snapshot } },
+        recovery_checkpoint.timestamp_ms,
     );
     try store.finishUsageRecoveryCheckpoint(
         writable.active_id,
         recovery_checkpoint,
     );
-    if (current.usage) |usage| {
-        active.session_rt.usage.markClean(usage);
-    }
+    active.session_rt.usage.markClean(usage_snapshot);
 }
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
@@ -770,7 +802,7 @@ pub fn runWithTransport(
         .cfg = cfg,
         .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
-            .provider = cfg.provider_set.gateway.fx_search.?,
+            .provider = cfg.provider_set.gateway.fx_search,
         }),
         .terminal_client = terminal_client_runtime.Runtime.init(
             cfg.process_provider,
@@ -820,9 +852,10 @@ pub fn runWithTransport(
         }
 
         dispatch(&state, alloc, &msg) catch |err| {
+            const auth_notice = auth_runtime.preparationFailureNotice(err);
             state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.internal_error,
-                .message = @errorName(err),
+                .code = if (auth_notice != null) ErrorCode.invalid_request else ErrorCode.internal_error,
+                .message = auth_notice orelse @errorName(err),
             }) catch break;
         };
         if (state.terminate_connection) break;
@@ -1266,6 +1299,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
             .libfx_restore => handleKernelRestore(state, alloc, msg),
             .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
+            .libfx_steer => handleKernelSteer(state, alloc, msg),
             else => state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.method_not_found,
                 .message = "Method not available in the web core yet",
@@ -1285,6 +1319,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
         .libfx_restore => handleKernelRestore(state, alloc, msg),
         .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
+        .libfx_steer => handleKernelSteer(state, alloc, msg),
         .initialize,
         .request_cancel,
         .session_cancel,
@@ -1357,6 +1392,15 @@ fn activeLibfxSession(
     const active = if (state.active_session) |*session| session else return null;
     if (!std.mem.eql(u8, active.session_id, session_id.string)) return null;
     return active;
+}
+
+pub fn takeLibfxSteering(
+    state: *ServerState,
+    result_alloc: Allocator,
+    close_if_empty: bool,
+) Allocator.Error![][]u8 {
+    const active = if (state.active_session) |*session| session else return &.{};
+    return active.steering.takeAll(state.alloc, result_alloc, close_if_empty);
 }
 
 fn handleKernelCheckpoint(
@@ -1441,6 +1485,56 @@ fn handleKernelRestore(
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
+fn handleKernelSteer(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx steer params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const text = parsed.value.object.get("text") orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Missing steering text",
+        });
+    if (text != .string) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid steering text",
+    });
+    active.steering.enqueue(state.alloc, text.string) catch |err| {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = switch (err) {
+                error.SteeringQueueFull, error.SteeringNotActive => ErrorCode.invalid_request,
+                else => ErrorCode.invalid_params,
+            },
+            .message = switch (err) {
+                error.EmptySteeringMessage => "Steering text cannot be empty",
+                error.SteeringMessageTooLarge => "Steering text exceeds the 64 KiB libfx limit",
+                error.SteeringQueueFull => "Steering queue is full",
+                error.SteeringNotActive => "No prompt is running",
+                error.OutOfMemory => "Failed to queue steering text",
+            },
+        });
+    };
+    var update: std.Io.Writer.Allocating = .init(alloc);
+    defer update.deinit();
+    try update.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(active.session_id, &update.writer);
+    try update.writer.writeAll(",\"update\":");
+    try acp_types.writeUserMessageChunk(&update.writer, "libfx-steering", text.string);
+    try update.writer.writeByte('}');
+    try state.writer.writeNotification(alloc, "session/update", update.written());
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
 fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
     if (!try requireActiveSessionTarget(state, alloc, msg)) return;
     const session = if (state.active_session) |*active| active else unreachable;
@@ -1456,6 +1550,7 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
     session.cancel_flag.store(false, .seq_cst);
+    if (state.cfg.minimal_kernel) session.steering.open(state.alloc);
     if (comptime host_target.is_wasm) {
         promptWorkerMain(active);
         jsonrpc.freeMessage(active.alloc, &active.msg);
@@ -1554,6 +1649,9 @@ fn promptWorkerMain(active: *ActivePrompt) void {
             .message = @errorName(err),
         },
     };
+    if (active.state.active_session) |*session| {
+        if (active.state.cfg.minimal_kernel) session.steering.close(active.state.alloc, "turn_finished");
+    }
     active.reapable.store(true, .seq_cst);
     publishPromptOutcome(active, outcome) catch {};
     prompt_test_controls.pauseAfterTerminalWrite();
@@ -1662,9 +1760,10 @@ fn parseInitializeRequest(
     if (allow_libfx) {
         if (capabilities.object.get("libfx")) |libfx| {
             if (libfx != .object) return error.InvalidInitializeParams;
-            request.host_tools = try host_tool_runtime.Runtime.init(
+            request.host_tools = try host_tool_runtime.Runtime.initWithProviderRegistry(
                 alloc,
                 libfx.object.get("tools"),
+                libfx_provider_tool_registry,
             );
             errdefer request.host_tools.deinit();
             if (libfx.object.get("instructions")) |instructions| {
@@ -1690,6 +1789,21 @@ test "ACP initialize owns libfx tools and instructions" {
     try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
     try std.testing.expectEqualStrings("lookup", request.host_tools.tools[0].name);
     try std.testing.expectEqualStrings("Be concise.", request.host_instructions);
+}
+
+test "ACP initialize accepts registered provider-executed libfx tools" {
+    const alloc = std.testing.allocator;
+    var request = try parseInitializeRequest(
+        alloc,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"tools":[{"name":"web_search","providerExecuted":true}]}}}
+    ,
+        true,
+    );
+    defer request.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
+    try std.testing.expectEqual(@as(usize, 0), request.host_tools.dynamic_tools.len);
+    try std.testing.expect(request.host_tools.tools[0].provider_executed);
+    try std.testing.expect(request.host_tools.tools[0].write_provider_advertisement_fn != null);
 }
 
 test "ordinary ACP ignores private libfx capabilities" {
@@ -1764,6 +1878,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
     defer startup.deinit(alloc);
+    if (state.cfg.auth_mode == .local and startup.credential == null and
+        !(startup.provider == .gateway and state.cfg.credential_override != null))
+    {
+        if (startup.credential_load_failure) |failure| {
+            if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
+        }
+    }
     if (!state.cfg.minimal_kernel) {
         try app_lifecycle.applyWorkspaceLaunch(
             &startup,
@@ -1798,6 +1919,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.process_model_override = startup.model_source == .process_override;
     }
     state.provider = startup.provider;
+    state.process_provider_override = config_runtime.providerEnvOverride() != null;
+    state.configured_providers.deinit(alloc);
+    state.configured_providers = startup.configured_providers;
+    startup.configured_providers = .{};
+    state.cfg.provider_set.definitions = state.configured_providers.definitions;
     state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
@@ -1847,7 +1973,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             }
             break :routed &routed_credential.?;
         };
-        if (credential.token.len == 0) {
+        if (credential.token.len == 0 and credential.source != .configured) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = if (state.provider == .codex)
@@ -1872,6 +1998,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
+    state.session_titles = startup.session_title_generation;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
@@ -1911,6 +2038,19 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         );
     }
 
+    if (state.cfg.effort_override) |raw| {
+        const effort = types.ReasoningEffort.parse(raw) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Invalid reasoning effort",
+            });
+        if (!try applyEffortOverride(state, alloc, msg, effort)) return;
+    }
+
+    if (state.cfg.fast_override) |fast| {
+        if (!try applyFastOverride(state, alloc, msg, fast)) return;
+    }
+
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
@@ -1933,10 +2073,207 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+/// Applies a host-supplied reasoning effort override to sessions created after
+/// initialize. A non-default effort must be one of the selected model's
+/// advertised efforts whenever the catalog resolves; a catalog outage leaves
+/// the override in place, matching turn-time capability fallback. Returns
+/// false after writing the rejection response.
+fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message, effort: types.ReasoningEffort) !bool {
+    state.effort = effort;
+    if (effort.isDefault()) return true;
+
+    const bundle = state.cfg.provider_set.select(state.provider);
+    const fallback = bundle.fallbackModelCapabilities(state.selected_model);
+    var capabilities: model_capabilities.Capabilities = undefined;
+    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+        // libfx cores skip the startup catalog resolve; explicit effort and
+        // fast overrides are the creation-time consumers that need it.
+        const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
+        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
+            .access = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    state.gateway_team,
+                    state.account_id,
+                ),
+            .endpoint = state.cfg.gateway_models_path,
+            .cancel_flag = &catalog_cancel_flag,
+        }, state.selected_model, fallback);
+    } else {
+        capabilities = state.capability_resolver.available(state.selected_model, fallback);
+    }
+    // A failed catalog lookup cannot name the supported set; the turn-time
+    // capability check remains the backstop.
+    if (state.capability_resolver.state == .failed) return true;
+
+    const rejection = effortOverrideRejection(alloc, capabilities, effort, state.selected_model) catch {
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Failed to validate reasoning effort",
+        });
+        return false;
+    };
+    if (rejection) |message| {
+        defer alloc.free(message);
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = message,
+        });
+        return false;
+    }
+    return true;
+}
+
+/// Pure decision for a host-supplied effort override: returns an owned
+/// rejection message naming the model's advertised efforts, or null when the
+/// effort is usable. Caller frees the returned slice.
+fn effortOverrideRejection(
+    alloc: Allocator,
+    capabilities: model_capabilities.Capabilities,
+    effort: types.ReasoningEffort,
+    model: []const u8,
+) Allocator.Error!?[]u8 {
+    if (model_capabilities.reasoningEffortSupported(capabilities, effort)) return null;
+    if (capabilities.reasoning_efforts.len == 0) {
+        return try alloc.dupe(u8, "Reasoning effort is unavailable for the active model");
+    }
+    var set: std.ArrayList(u8) = .empty;
+    defer set.deinit(alloc);
+    for (capabilities.reasoning_efforts.slice(), 0..) |option, index| {
+        if (index > 0) try set.appendSlice(alloc, ", ");
+        try set.appendSlice(alloc, option.label());
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "Reasoning effort \"{s}\" is not available for model \"{s}\" (available: {s})",
+        .{ effort.label(), model, set.items },
+    );
+}
+
+test "effortOverrideRejection accepts default and advertised efforts" {
+    const alloc = std.testing.allocator;
+    const capabilities = model_capabilities.Capabilities{
+        .reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("high"),
+        }),
+    };
+    try std.testing.expectEqual(@as(?[]u8, null), try effortOverrideRejection(alloc, capabilities, .auto, "provider/model"));
+    try std.testing.expectEqual(@as(?[]u8, null), try effortOverrideRejection(alloc, capabilities, .literal("high"), "provider/model"));
+}
+
+test "effortOverrideRejection names the advertised set" {
+    const alloc = std.testing.allocator;
+    const capabilities = model_capabilities.Capabilities{
+        .reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("high"),
+        }),
+    };
+    const rejection = (try effortOverrideRejection(alloc, capabilities, .literal("max"), "provider/model")).?;
+    defer alloc.free(rejection);
+    try std.testing.expect(std.mem.find(u8, rejection, "\"max\"") != null);
+    try std.testing.expect(std.mem.find(u8, rejection, "provider/model") != null);
+    try std.testing.expect(std.mem.find(u8, rejection, "low, high") != null);
+}
+
+test "effortOverrideRejection reports models without advertised efforts" {
+    const alloc = std.testing.allocator;
+    const rejection = (try effortOverrideRejection(alloc, .{}, .literal("high"), "provider/plain")).?;
+    defer alloc.free(rejection);
+    try std.testing.expectEqualStrings("Reasoning effort is unavailable for the active model", rejection);
+}
+
+/// Applies a host-supplied fast-lane override to sessions created after
+/// initialize. Enabling fast mode requires the selected model to offer a fast
+/// path whenever the catalog resolves; a catalog outage leaves the override in
+/// place, matching turn-time capability fallback. Disabling is always
+/// accepted. Returns false after writing the rejection response.
+fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message, fast: bool) !bool {
+    state.fast_mode = fast;
+    if (!fast) return true;
+
+    const bundle = state.cfg.provider_set.select(state.provider);
+    const fallback = bundle.fallbackModelCapabilities(state.selected_model);
+    var capabilities: model_capabilities.Capabilities = undefined;
+    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+        // Shares the effort override's one-shot catalog resolve: creation is
+        // the only point that can reject before any turn runs.
+        const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
+        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
+            .access = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    state.gateway_team,
+                    state.account_id,
+                ),
+            .endpoint = state.cfg.gateway_models_path,
+            .cancel_flag = &catalog_cancel_flag,
+        }, state.selected_model, fallback);
+    } else {
+        capabilities = state.capability_resolver.available(state.selected_model, fallback);
+    }
+    // A failed catalog lookup cannot confirm a fast path; the turn-time
+    // capability gate remains the backstop.
+    if (state.capability_resolver.state == .failed) return true;
+
+    const rejection = fastOverrideRejection(alloc, capabilities, state.selected_model) catch {
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Failed to validate fast mode",
+        });
+        return false;
+    };
+    if (rejection) |message| {
+        defer alloc.free(message);
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = message,
+        });
+        return false;
+    }
+    return true;
+}
+
+/// Pure decision for a host-supplied fast override: returns an owned rejection
+/// message naming the model, or null when the model offers a fast path. An
+/// intrinsically fast model already satisfies the request. Caller frees the
+/// returned slice.
+fn fastOverrideRejection(
+    alloc: Allocator,
+    capabilities: model_capabilities.Capabilities,
+    model: []const u8,
+) Allocator.Error!?[]u8 {
+    if (capabilities.supports_fast_mode or capabilities.intrinsic_fast) return null;
+    return try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{model});
+}
+
+test "fastOverrideRejection accepts models with a fast path" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try fastOverrideRejection(alloc, .{ .supports_fast_mode = true }, "provider/model"));
+    try std.testing.expectEqual(@as(?[]u8, null), try fastOverrideRejection(alloc, .{ .intrinsic_fast = true }, "provider/model-fast"));
+}
+
+test "fastOverrideRejection names models without a fast path" {
+    const alloc = std.testing.allocator;
+    const rejection = (try fastOverrideRejection(alloc, .{}, "provider/plain")).?;
+    defer alloc.free(rejection);
+    try std.testing.expectEqualStrings("Fast mode is not available for model \"provider/plain\"", rejection);
+}
+
 fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
+        if (state.cfg.minimal_kernel) session.steering.close(state.alloc, "cancelled");
     }
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
@@ -2036,28 +2373,33 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         if (comptime !host_target.is_wasm) {
             if (session.provider != .gateway) {
-                var model_available = false;
-                if (state.capability_resolver.catalogEntries()) |entries| {
-                    for (entries) |entry| {
-                        if (std.mem.eql(u8, entry.id, value)) {
-                            model_available = true;
-                            break;
+                if (session.provider != .configured) {
+                    try refreshModelCatalogForOptions(state);
+                    var model_available = false;
+                    if (state.capability_resolver.catalogEntries()) |entries| {
+                        for (entries) |entry| {
+                            if (std.mem.eql(u8, entry.id, value)) {
+                                model_available = true;
+                                break;
+                            }
                         }
                     }
-                }
-                if (!model_available) {
-                    return state.writer.writeError(alloc, msg.id, .{
-                        .code = ErrorCode.invalid_params,
-                        .message = "Model is not available for the active provider",
-                    });
+                    if (!model_available) {
+                        return state.writer.writeError(alloc, msg.id, .{
+                            .code = ErrorCode.invalid_params,
+                            .message = "Model is not available for the active provider",
+                        });
+                    }
                 }
                 if (!try selectCredentialForProvider(state, session.provider)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (session.provider == .codex)
                             credentials.missing_chatgpt_credential_message
+                        else if (session.provider == .grok)
+                            credentials.missing_grok_credential_message
                         else
-                            credentials.missing_grok_credential_message,
+                            "Configured provider authentication is unavailable",
                     });
                 }
             }
@@ -2083,16 +2425,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             alloc,
             session,
             value,
-            session_test_controls.logOptions(),
         ) catch |err| {
-            if (modelCommitFailureTerminatesConnection(err)) {
-                try state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.internal_error,
-                    .message = "Failed to persist session model",
-                });
-                state.terminate_connection = true;
-                return;
-            }
             return state.writer.writeError(alloc, msg.id, .{
                 .code = if (err == error.InvalidDurableField)
                     ErrorCode.invalid_params
@@ -2105,16 +2438,18 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         };
     } else if (std.mem.eql(u8, config_id, "provider")) {
-        const target = model_provider.parse(value) orelse
+        const parsed_provider = model_provider.parse(value) orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid provider",
             });
+        const target = parsed_provider.bind(state.configured_providers) catch
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Unknown or changed configured provider" });
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "No active session",
         });
-        if (target != session.provider) {
+        if (!target.eql(session.provider)) {
             if (host_target.is_wasm) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
@@ -2167,10 +2502,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     staged_credential.?.gatewayTeam(),
                     staged_credential.?.accountId(),
                 );
+            // Provider selection is independent of earlier prompt cancellation.
+            var catalog_cancel_flag = std.atomic.Value(bool).init(false);
             const fetched = try catalog_provider.fetch(alloc, .{
                 .access = access,
                 .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &session.cancel_flag,
+                .cancel_flag = &catalog_cancel_flag,
                 .view = .picker,
             });
             var catalog = switch (fetched) {
@@ -2181,7 +2518,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 }),
             };
             defer model_catalog.freeModelCatalog(alloc, &catalog);
-            if (catalog.items.len == 0) {
+            if (target != .configured and catalog.items.len == 0) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
                     .message = "Provider returned no supported models",
@@ -2193,31 +2530,30 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 try config_runtime.loadMergedSettings(alloc, state.workspace_root);
             defer settings.deinit(alloc);
             const saved_model = settings.models.get(target);
-            var selected_model = catalog.items[0].id;
-            if (saved_model) |saved| {
+            var selected_model = if (target == .configured)
+                saved_model orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = "Configure a model for the selected provider" })
+            else
+                catalog.items[0].id;
+            if (target != .configured) if (saved_model) |saved| {
                 for (catalog.items) |entry| {
                     if (std.mem.eql(u8, entry.id, saved)) {
                         selected_model = entry.id;
                         break;
                     }
                 }
-            }
+            };
             commitActiveSessionProvider(
                 alloc,
                 session,
                 target,
                 selected_model,
-                session_test_controls.logOptions(),
-            ) catch |err| {
-                if (modelCommitFailureTerminatesConnection(err)) {
-                    state.terminate_connection = true;
-                }
+            ) catch {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.internal_error,
                     .message = "Failed to persist session provider",
                 });
             };
-            state.capability_resolver.adoptOwnedCatalog(alloc, &catalog);
+            state.capability_resolver.adoptOwnedCatalog(alloc, catalog_provider, access, &catalog);
             if (staged_credential) |*credential| {
                 adoptServerCredential(state, credential);
             } else {
@@ -2233,8 +2569,36 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             defer state.subagent_authority_mutex.unlock(io_mod.getIo());
             applySessionMode(state.cfg.mode_registry, session, value);
         }
+    } else if (std.mem.eql(u8, config_id, "effort")) {
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        const effort = types.ReasoningEffort.parse(value) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Invalid reasoning effort",
+            });
+        const config = sessions.effortConfigState(state) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Reasoning effort is unavailable for the active model",
+            });
+        if (!sessions.effortSupportedBy(config.efforts, effort)) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Reasoning effort is not available for the active model",
+            });
+        }
+        commitActiveSessionEffort(alloc, session, effort) catch {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to persist session effort",
+            });
+        };
     }
 
+    try refreshModelCatalogForOptions(state);
     const current_model = if (state.active_session) |s| s.model else state.selected_model;
     const current_mode: []const u8 = if (state.active_session) |s| s.mode else state.cfg.mode_registry.default_mode_id;
 
@@ -2245,6 +2609,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         try sessions.writeProviderConfigOption(
             &out.writer,
             if (state.active_session) |session| session.provider else state.provider,
+            state.configured_providers.definitions,
         );
         try out.writer.writeAll(",");
     }
@@ -2255,8 +2620,35 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     );
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
+    if (sessions.effortConfigState(state)) |config| {
+        try out.writer.writeAll(",");
+        try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
+    if (comptime host_target.is_wasm) return;
+    if (state.cfg.minimal_kernel) return;
+    const active = if (state.active_session) |*session| session else return;
+    const provider = catalogProviderFor(state, active.provider) orelse return;
+    std.debug.assert(state.active_prompt == null);
+    // Restoring the same session can leave its previous cancellation flag set.
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    try state.capability_resolver.refreshIfDue(state.alloc, provider, .{
+        .access = if (state.cfg.auth_mode == .host_managed)
+            .host_managed
+        else
+            credentials.catalogAccessForCredentialAndAccount(
+                active.credential_source,
+                active.api_key,
+                state.gateway_team,
+                active.account_id,
+            ),
+        .endpoint = state.cfg.gateway_models_path,
+        .cancel_flag = &cancel_flag,
+    });
 }
 
 fn commitActiveSessionProvider(
@@ -2264,7 +2656,6 @@ fn commitActiveSessionProvider(
     session: *ActiveSessionState,
     provider: model_provider.ProviderId,
     model: []const u8,
-    options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2281,8 +2672,6 @@ fn commitActiveSessionProvider(
             .model = @constCast(model),
         } },
         io_mod.milliTimestamp(),
-        .rollback_before_adapter_continue,
-        options,
     );
     alloc.free(session.model);
     session.model = staged_model;
@@ -2293,7 +2682,6 @@ fn commitActiveSessionModel(
     alloc: Allocator,
     session: *ActiveSessionState,
     value: []const u8,
-    options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2306,7 +2694,6 @@ fn commitActiveSessionModel(
         writable,
         &session.model,
         value,
-        options,
     );
 }
 
@@ -2315,7 +2702,6 @@ fn commitSessionModel(
     writable: *session_store.LoadedWritableSession,
     active_model: *[]u8,
     value: []const u8,
-    options: session_log.Options,
 ) !void {
     const staged_model = try alloc.dupe(u8, value);
     errdefer alloc.free(staged_model);
@@ -2323,16 +2709,37 @@ fn commitSessionModel(
         alloc,
         .{ .preferences_changed = .{ .model = @constCast(value) } },
         io_mod.milliTimestamp(),
-        .rollback_before_adapter_continue,
-        options,
     );
     alloc.free(active_model.*);
     active_model.* = staged_model;
 }
 
-fn modelCommitFailureTerminatesConnection(err: anyerror) bool {
-    return err == error.SessionCommitIndeterminate or
-        err == error.SessionLogCompactionIndeterminate;
+fn commitActiveSessionEffort(
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    effort: types.ReasoningEffort,
+) !void {
+    if (host_target.is_wasm and session.writable == null) {
+        const previous = session.effort;
+        session.effort = effort;
+        sessions.commitWasmSession(alloc, session) catch |err| {
+            session.effort = previous;
+            return err;
+        };
+        return;
+    }
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*active|
+        active
+    else
+        return error.SessionPersistenceUnavailable;
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .effort = effort } },
+        io_mod.milliTimestamp(),
+    );
+    session.effort = effort;
 }
 
 fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -2444,10 +2851,12 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.libfx_checkpoint, AcpMethod.parse("libfx/checkpoint"));
     try std.testing.expectEqual(AcpMethod.libfx_restore, AcpMethod.parse("libfx/restore"));
     try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
+    try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
     try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
     try std.testing.expect(AcpMethod.libfx_new.isLibfx());
+    try std.testing.expect(AcpMethod.libfx_steer.isLibfx());
     try std.testing.expect(!AcpMethod.session_new.isLibfx());
 }
 
@@ -2462,6 +2871,7 @@ test "ACP prompt gate policy keeps lifecycle interruption responsive" {
     try std.testing.expect(AcpMethod.session_prompt.waitsForActivePrompt());
     try std.testing.expect(AcpMethod.session_set_config_option.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_set_mode.waitsForActivePrompt());
+    try std.testing.expect(!AcpMethod.libfx_steer.waitsForActivePrompt());
     try std.testing.expect(AcpMethod.unknown.waitsForActivePrompt());
 }
 
@@ -2785,22 +3195,6 @@ test "ACP legacy URL state requires consent and completion" {
     removeLegacyUrl(&state, "acp-new");
 }
 
-const AcpModelBoundaryFailure = struct {
-    target: session_log.Boundary,
-
-    fn hit(raw: ?*anyopaque, point: session_log.Boundary) !void {
-        const self: *AcpModelBoundaryFailure = @ptrCast(@alignCast(raw.?));
-        if (point == self.target) return error.InjectedBoundaryFailure;
-    }
-
-    fn options(self: *AcpModelBoundaryFailure) session_log.Options {
-        return .{ .test_controls = .{
-            .context = self,
-            .boundary_fn = hit,
-        } };
-    }
-};
-
 fn acpModelTestState(
     alloc: Allocator,
     id: []const u8,
@@ -2833,114 +3227,6 @@ fn acpModelTestState(
     };
 }
 
-test "ACP model commit rolls back before later request can succeed" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace);
-
-    var store = try session_store.Store.initFromHome(alloc, home, workspace);
-    defer store.deinit(alloc);
-    var state = try acpModelTestState(alloc, "acp-model-rollback", workspace);
-    defer state.deinit(alloc);
-    var writable = try store.startWritableSession(alloc, state);
-    defer writable.deinit(alloc);
-    var active_model = try alloc.dupe(u8, "old-model");
-    defer alloc.free(active_model);
-    var failure = AcpModelBoundaryFailure{ .target = .after_event_sync };
-
-    try std.testing.expectError(
-        error.SessionPersistenceDegraded,
-        commitSessionModel(
-            alloc,
-            &writable,
-            &active_model,
-            "rejected-model",
-            failure.options(),
-        ),
-    );
-    try std.testing.expectEqualStrings("old-model", active_model);
-    try std.testing.expectEqualStrings(
-        "old-model",
-        writable.state.preferences.model,
-    );
-    try std.testing.expect(writable.degradedTail() == null);
-
-    try commitSessionModel(
-        alloc,
-        &writable,
-        &active_model,
-        "accepted-model",
-        .{},
-    );
-    try std.testing.expectEqualStrings("accepted-model", active_model);
-    try std.testing.expectEqualStrings(
-        "accepted-model",
-        writable.state.preferences.model,
-    );
-}
-
-test "ACP indeterminate model commit leaves staged runtime value unapplied" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace);
-
-    var store = try session_store.Store.initFromHome(alloc, home, workspace);
-    defer store.deinit(alloc);
-    var state = try acpModelTestState(
-        alloc,
-        "acp-model-indeterminate",
-        workspace,
-    );
-    defer state.deinit(alloc);
-    var writable = try store.startWritableSession(alloc, state);
-    defer writable.deinit(alloc);
-    var active_model = try alloc.dupe(u8, "old-model");
-    defer alloc.free(active_model);
-    var failure = AcpModelBoundaryFailure{
-        .target = .after_target_namespace_sync,
-    };
-
-    const result = commitSessionModel(
-        alloc,
-        &writable,
-        &active_model,
-        "uncertain-model",
-        failure.options(),
-    );
-    try std.testing.expectError(error.SessionCommitIndeterminate, result);
-    try std.testing.expectEqualStrings("old-model", active_model);
-    try std.testing.expect(
-        modelCommitFailureTerminatesConnection(
-            error.SessionCommitIndeterminate,
-        ),
-    );
-    try std.testing.expect(
-        modelCommitFailureTerminatesConnection(
-            error.SessionLogCompactionIndeterminate,
-        ),
-    );
-}
-
 test "ACP model commits honor the active session write boundary" {
     const alloc = std.testing.allocator;
     var active: ActiveSessionState = undefined;
@@ -2962,7 +3248,6 @@ test "ACP model commits honor the active session write boundary" {
                 self.alloc,
                 self.active,
                 "new-model",
-                .{},
             ) catch |err| {
                 self.failure = err;
             };
@@ -3109,19 +3394,16 @@ test "ACP usage flush preserves snapshot ownership on allocation failure" {
 
     var counting = std.testing.FailingAllocator.init(alloc, .{});
     {
-        var current = try state.active_session.?.writable.?.state.dupe(
+        var usage = try state.active_session.?.session_rt.usage.snapshot(
             counting.allocator(),
         );
-        defer current.deinit(counting.allocator());
-        const history = try state.active_session.?.session_rt.snapshotHistory(
-            counting.allocator(),
-        );
-        defer types.freeHistoryTurnSlice(counting.allocator(), history);
+        defer usage.deinit(counting.allocator());
     }
+    try std.testing.expect(counting.alloc_index > 0);
 
     var failing = std.testing.FailingAllocator.init(
         alloc,
-        .{ .fail_index = counting.alloc_index },
+        .{ .fail_index = counting.alloc_index - 1 },
     );
     state.alloc = failing.allocator();
     try std.testing.expectError(

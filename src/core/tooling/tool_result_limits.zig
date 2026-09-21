@@ -16,15 +16,15 @@ pub const PreparedModelOutput = struct {
     truncated: bool,
 };
 
-/// Returns an owned sanitized and secret-masked copy before any model cap.
-pub fn prepareRedactedOutput(
+/// Returns an owned sanitized copy before any model cap.
+pub fn prepareSanitizedOutput(
     alloc: Allocator,
     raw: []const u8,
 ) error{OutOfMemory}![]u8 {
     var scratch_impl = std.heap.ArenaAllocator.init(alloc);
     defer scratch_impl.deinit();
-    const redacted = try redactModelText(scratch_impl.allocator(), raw);
-    return alloc.dupe(u8, redacted);
+    const sanitized = try text_utils.sanitizeModelText(scratch_impl.allocator(), raw);
+    return alloc.dupe(u8, sanitized);
 }
 
 pub fn prepareModelOutput(
@@ -51,31 +51,21 @@ pub fn prepareModelOutputWithTruncation(
     defer scratch_impl.deinit();
     const scratch = scratch_impl.allocator();
 
-    const redacted = try redactModelText(scratch, raw);
+    const sanitized = try text_utils.sanitizeModelText(scratch, raw);
     const capped = try truncateText(scratch, .{
-        .text = redacted,
+        .text = sanitized,
         .max_bytes = max_bytes,
         .marker = try std.fmt.allocPrint(
             scratch,
             "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
-            .{ tool_name, redacted.len, max_bytes },
+            .{ tool_name, sanitized.len, max_bytes },
         ),
         .trace_scope = "tool",
         .trace_label = tool_name,
     });
     return .{
         .model_output = try alloc.dupe(u8, capped),
-        .truncated = redacted.len > max_bytes,
-    };
-}
-
-fn redactModelText(
-    alloc: Allocator,
-    raw: []const u8,
-) error{OutOfMemory}![]const u8 {
-    const sanitized = try text_utils.sanitizeModelText(alloc, raw);
-    return text_utils.maskSecrets(alloc, sanitized) catch |err| switch (err) {
-        error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
+        .truncated = sanitized.len > max_bytes,
     };
 }
 
@@ -84,13 +74,10 @@ pub fn modelProjectionPreservesText(
     raw: []const u8,
 ) error{OutOfMemory}!bool {
     const sanitized = try text_utils.sanitizeModelText(request_scratch, raw);
-    const masked = text_utils.maskSecrets(request_scratch, sanitized) catch |err| switch (err) {
-        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
-    };
-    return std.mem.eql(u8, raw, masked);
+    return std.mem.eql(u8, raw, sanitized);
 }
 
-test "model projection stability rejects sanitized and secret-bearing identities" {
+test "model projection stability rejects non-utf8 identities" {
     var scratch_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
@@ -98,7 +85,6 @@ test "model projection stability rejects sanitized and secret-bearing identities
 
     try std.testing.expect(try modelProjectionPreservesText(scratch, "mcp_datadog_list_incidents"));
     try std.testing.expect(!try modelProjectionPreservesText(scratch, &invalid_utf8));
-    try std.testing.expect(!try modelProjectionPreservesText(scratch, "token=secret-value"));
 }
 
 pub const PreparedInlineResult = struct {
@@ -157,25 +143,27 @@ pub fn truncateText(arena: std.mem.Allocator, opts: TruncateOptions) ![]const u8
     return try std.mem.concat(arena, u8, &.{ opts.text[0..prefix_len], opts.marker });
 }
 
-test "prepareModelOutput masks secrets before applying cap" {
+test "prepareModelOutput preserves secret-shaped assignments verbatim" {
     const alloc = std.testing.allocator;
-    const output = try prepareModelOutput(alloc, "mcp__server__tool", "token=secret-value", default_max_tool_result_bytes);
+    const raw = "token=abcdefghijklmnopqrstuvwxyz";
+    const output = try prepareModelOutput(alloc, "mcp__server__tool", raw, default_max_tool_result_bytes);
     defer alloc.free(@constCast(output));
 
-    try std.testing.expectEqualStrings("token=[redacted]", output);
+    try std.testing.expectEqualStrings(raw, output);
 }
 
-test "prepareModelOutput masks quoted sensitive assignments" {
+test "prepareModelOutput preserves quoted sensitive assignments verbatim" {
     const alloc = std.testing.allocator;
-    const output = try prepareModelOutput(alloc, "run_command", "API_KEY=\"secret-value\"", default_max_tool_result_bytes);
+    const raw = "API_KEY=\"secret-value-123456\"";
+    const output = try prepareModelOutput(alloc, "run_command", raw, default_max_tool_result_bytes);
     defer alloc.free(@constCast(output));
 
-    try std.testing.expectEqualStrings("API_KEY=\"[redacted]\"", output);
+    try std.testing.expectEqualStrings(raw, output);
 }
 
-test "prepareInlineResult does not classify redaction shrink as cap loss" {
+test "prepareInlineResult preserves assignments without reclassifying lengths" {
     const alloc = std.testing.allocator;
-    const raw = "AI_GATEWAY_API_KEY=abcdefghijklmnop end";
+    const raw = "AI_GATEWAY_KEY=abcdefghijklmnop";
     const prepared = try prepareInlineResult(
         alloc,
         "mcp__server__tool",
@@ -184,32 +172,10 @@ test "prepareInlineResult does not classify redaction shrink as cap loss" {
     );
     defer alloc.free(prepared.model_output);
 
-    try std.testing.expectEqualStrings(
-        "AI_GATEWAY_API_KEY=[redacted] end",
-        prepared.model_output,
-    );
-    try std.testing.expect(prepared.model_output.len < raw.len);
+    try std.testing.expectEqualStrings(raw, prepared.model_output);
     try std.testing.expect(!prepared.memory.truncated);
     try std.testing.expectEqual(raw.len, prepared.memory.output_bytes);
-}
-
-test "prepareInlineResult classifies cap loss after redaction expansion" {
-    const alloc = std.testing.allocator;
-    const raw = "CUSTOM_API_KEY=abc123\n" ** 46;
-    try std.testing.expectEqual(@as(usize, 1012), raw.len);
-
-    const prepared = try prepareInlineResult(
-        alloc,
-        "mcp__server__tool",
-        raw,
-        min_configured_tool_result_bytes,
-    );
-    defer alloc.free(prepared.model_output);
-
-    try std.testing.expectEqual(min_configured_tool_result_bytes, prepared.model_output.len);
-    try std.testing.expect(prepared.memory.truncated);
-    try std.testing.expect(std.mem.find(u8, prepared.model_output, "abc123") == null);
-    try std.testing.expect(std.mem.find(u8, prepared.model_output, "[redacted]") != null);
+    try std.testing.expectEqual(raw.len, prepared.memory.stored_output_bytes);
 }
 
 test "prepareModelOutput caps chatty output with explicit marker" {

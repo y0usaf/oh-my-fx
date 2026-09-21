@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const diagnostics = @import("../core/workspace/diagnostics.zig");
 const io_mod = @import("../core/shared/io.zig");
 const record_tape = @import("../core/workspace/record_tape.zig");
 const types = @import("../core/shared/types.zig");
@@ -144,6 +145,11 @@ pub fn requestRedraw(
     metrics: *Metrics,
     mode: RedrawMode,
 ) !void {
+    diagnostics.recordRenderEvent(
+        .redraw,
+        "mode={s} terminal={d}x{d} owned_top={d} viewport_top={d} content_bottom={d} cursor={d},{d}",
+        .{ @tagName(mode), shell.layout.cols, shell.layout.rows, shell.owned_top_row, shell.viewport_top_row, shell.layout.content_bottom, shell.cursor_row, shell.cursor_col },
+    );
     debug_trace.logf("resize", "request_redraw mode={s} layout={d}x{d} viewport_top={d} content_bottom={d} cursor={d},{d}", .{ @tagName(mode), shell.layout.cols, shell.layout.rows, shell.viewport_top_row, shell.layout.content_bottom, shell.cursor_row, shell.cursor_col });
     switch (mode) {
         .resize_light, .replay_viewport => {
@@ -712,6 +718,11 @@ fn applyResizeWithLayoutResolved(
     });
 
     const mode = picked_mode orelse return;
+    diagnostics.recordRenderEvent(
+        .resize,
+        "old={d}x{d} new={d}x{d} settled={} mode={s} history_delta={any} pending_reflow={} invalid_dimensions={}",
+        .{ shell.layout.cols, shell.layout.rows, new_layout.cols, new_layout.rows, settled, @tagName(mode), history_row_delta, shell.render_requests.pending_settled_width_reflow, recovering_invalid_dimensions },
+    );
     const needs_owned_band_invalidation = size_changed or recovering_invalid_dimensions;
 
     if (!settled) {

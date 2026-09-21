@@ -19,6 +19,15 @@ pub fn explicitThemeOverride() ?bool {
     return null;
 }
 
+/// FX_THEME values other than light/dark name a user theme under
+/// `~/.fx/themes/<name>.json`.
+pub fn explicitThemeName() ?[]const u8 {
+    const override = io_mod.getenv("FX_THEME") orelse return null;
+    if (override.len == 0) return null;
+    if (explicitThemeOverride() != null) return null;
+    return override;
+}
+
 pub fn detectTheme(_: std.mem.Allocator, terminal_state: *const shell_runtime.TerminalState) Detection {
     if (explicitThemeOverride()) |light| return .{ .light = light, .rgb = null };
     if (comptime builtin.os.tag == .wasi) return .{ .light = false, .rgb = null };

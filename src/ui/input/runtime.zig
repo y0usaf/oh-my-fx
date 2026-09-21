@@ -55,8 +55,6 @@ const InputEscapeAction = input_action.Action;
 const MouseInput = escape_parser.MouseInput;
 
 pub const shortcutFromControlByte = shortcuts.fromControlByte;
-pub const shortcutFromFocusedEditorControlByte = shortcuts.fromFocusedEditorControlByte;
-pub const shortcutFromEscapeAction = shortcuts.fromEscapeAction;
 
 pub fn approvalActionFromByte(byte: u8) ?approval_decision.Action {
     return switch (byte) {
@@ -2954,6 +2952,14 @@ test "input escape parser admits raw ctrl+o control byte" {
         controlByteFeatureAction(15),
     );
     try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(3));
+}
+
+test "input escape parser admits raw ctrl+p control byte" {
+    try std.testing.expectEqual(
+        @as(?InputEscapeAction, .open_model_catalog),
+        controlByteFeatureAction(16),
+    );
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(14));
 }
 
 test "input escape parser handles ctrl+o csi u sequence" {

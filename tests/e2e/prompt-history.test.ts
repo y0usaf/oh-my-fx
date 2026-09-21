@@ -57,7 +57,7 @@ async function disablePromptHistory(
   settingsPath: string,
 ): Promise<void> {
   await session.sendText("/settings");
-  await session.waitForText("←→ Change", TIMEOUT);
+  await session.waitForText("←→ change", TIMEOUT);
   await session.sendLiteral("prompt history");
   await session.waitForPane(
     (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
@@ -76,7 +76,7 @@ async function disablePromptHistory(
   if (enabled !== false) throw new Error("Timed out disabling prompt history");
   await session.sendKeys("Escape");
   await session.waitForPane(
-    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ Change"),
+    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
     TIMEOUT,
   );
 }
@@ -117,9 +117,9 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         await session.sendText("PLAN10_PROMPT_HISTORY_SENTINEL");
         await session.waitForText("HTTP 401", TIMEOUT);
         await session.sendText("/help");
-        await session.waitForText("Commands 35", TIMEOUT);
+        await session.waitForText("Commands 34", TIMEOUT);
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("Enter Open"), TIMEOUT);
+        await session.waitForPane((pane) => !pane.includes("enter open"), TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
@@ -288,7 +288,8 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         expect(composer).not.toContain("PLAN10_HISTORY_DISABLED");
         expect(composer).toContain("/settings");
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         recalled = await session.waitForPane(
           (pane) => {
             const current = currentComposerLine(pane);
@@ -303,7 +304,8 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         expect(composer).not.toContain("PLAN10_HISTORY_DISABLED");
         expect(composer).toContain("/quit");
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         recalled = await session.waitForPane(
           (pane) => {
             const current = currentComposerLine(pane);

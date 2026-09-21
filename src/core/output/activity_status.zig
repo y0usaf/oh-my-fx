@@ -2,6 +2,85 @@ const std = @import("std");
 const types = @import("../shared/types.zig");
 
 pub const StreamState = types.StreamState;
+const compaction_activity = @import("compaction_activity.zig");
+const ActivityProjection = @import("activity_runtime.zig").ActivityProjection;
+
+/// Selects the display clock without changing the underlying turn or its accounting.
+pub fn compactionClock(stream: StreamState, operation: compaction_activity.Operation) StreamState {
+    return if (operation.origin == .manual)
+        .{ .turn_started_ms = operation.started_at_ms }
+    else
+        stream;
+}
+
+/// Borrows either static feedback or the caller's label buffer.
+pub fn compactionProjection(
+    buf: []u8,
+    snapshot: compaction_activity.Snapshot,
+    stream: StreamState,
+    now_ms: i64,
+) ActivityProjection {
+    const op = snapshot.operation orelse return .none;
+    if (!op.visible(now_ms)) return .none;
+    const label: []const u8 = switch (op.phase) {
+        .preparing => "• Preparing compaction",
+        .running => |stage| if (stage == .preparation) "• Preparing compaction" else "• Compacting",
+        .stopping => "• Stopping compaction",
+        .terminal => |feedback| return .{ .turn_thinking = .{
+            .label = compactionFeedbackLabel(feedback),
+            .tone = switch (feedback.outcome) {
+                .failed => .danger,
+                .busy => .warning,
+                .succeeded, .no_op, .cancelled => .neutral,
+            },
+        } },
+    };
+    var out: std.Io.Writer = .fixed(buf);
+    out.writeAll(label) catch return .{ .turn_thinking = .{ .label = label } };
+    appendTurnElapsedSuffix(&out, compactionClock(stream, op), now_ms) catch {};
+    return .{ .turn_thinking = .{ .label = out.buffered() } };
+}
+
+fn compactionFeedbackLabel(feedback: compaction_activity.Feedback) []const u8 {
+    if (feedback.publication == .uncertain)
+        return "Compaction could not confirm saved context. Reopen the session before retrying.";
+    if (feedback.publication == .committed)
+        return "Compaction saved context, but could not finish. Reopen the session before retrying.";
+    if (feedback.outcome == .failed) {
+        if (feedback.err) |err| {
+            switch (err) {
+                error.CompactionAuthenticationRejected => return "Compaction was not started. Check authentication and try /compact again.",
+                error.ContextCapacityExceeded => return "Context is too large to compact. Choose a model with a larger context window.",
+                else => {},
+            }
+        }
+    }
+    return switch (feedback.outcome) {
+        .succeeded => "",
+        .no_op => "No context to compact.",
+        .busy => "Wait for the active work to finish before compacting context.",
+        .cancelled => "Compaction cancelled. Try /compact again when ready.",
+        .failed => if (feedback.stage == .preparation)
+            "Compaction was not started. Try /compact again."
+        else
+            "Compaction failed. Try /compact again.",
+    };
+}
+
+test "compaction feedback distinguishes authentication and capacity from other setup failures" {
+    try std.testing.expectEqualStrings(
+        "Compaction was not started. Check authentication and try /compact again.",
+        compactionFeedbackLabel(compaction_activity.failure(error.CompactionAuthenticationRejected, .preparation, false)),
+    );
+    try std.testing.expectEqualStrings(
+        "Context is too large to compact. Choose a model with a larger context window.",
+        compactionFeedbackLabel(compaction_activity.failure(error.ContextCapacityExceeded, .preparation, false)),
+    );
+    try std.testing.expectEqualStrings(
+        "Compaction was not started. Try /compact again.",
+        compactionFeedbackLabel(compaction_activity.failure(error.OutOfMemory, .preparation, false)),
+    );
+}
 
 const ActivityPart = struct {
     count: usize,
@@ -27,7 +106,7 @@ fn markedTurnPhaseLabel(phase: types.TurnPhase) []const u8 {
     return switch (phase) {
         .thinking => "• Thinking",
         .generating => "• Generating",
-        .running => "• Running",
+        .running, .waiting_for_subagent => "• Running",
     };
 }
 
@@ -205,6 +284,66 @@ pub fn appendTokenProgressSuffix(writer: *std.Io.Writer, progress: types.TurnTok
 
 pub fn appendTurnTokenSuffix(writer: *std.Io.Writer, stream: StreamState) !void {
     try appendTokenProgressSuffix(writer, stream.token_progress);
+}
+
+test "compaction projection preserves turn accounting and selects the origin clock" {
+    var state: compaction_activity.State = .{};
+    const stream: StreamState = .{
+        .active = true,
+        .phase = .running,
+        .last_activity_kind = .read,
+        .turn_started_ms = 1_000,
+        .token_progress = .{ .input_tokens = 100, .output_tokens = 20 },
+    };
+    var buf: [256]u8 = undefined;
+    for ([_]compaction_activity.Origin{ .manual, .automatic, .provider_overflow }) |origin| {
+        const id = state.begin(origin, 1, 3_500);
+        state.running(id, .summary);
+        const projection = compactionProjection(&buf, state.snapshot, stream, 4_000);
+        try std.testing.expectEqualStrings(if (origin == .manual) "• Compacting (0s)" else "• Compacting (3s)", projection.turn_thinking.label);
+        try std.testing.expectEqual(@as(?bool, origin != .manual), activityBlinkVisible(compactionClock(stream, state.snapshot.operation.?), 4_000));
+        state.stopping(id);
+        try std.testing.expect(std.mem.startsWith(u8, compactionProjection(&buf, state.snapshot, stream, 4_000).turn_thinking.label, "• Stopping compaction"));
+        state.settle(id, .{ .outcome = .succeeded }, 4_000);
+        try std.testing.expect(compactionProjection(&buf, state.snapshot, stream, 4_000) == .none);
+    }
+    try std.testing.expectEqual(@as(u64, 100), stream.token_progress.input_tokens);
+    try std.testing.expectEqualStrings("• Running (3s) (↑100 ↓20)", buildTurnLabel(&buf, .{
+        .phase = stream.phase,
+        .turn_started_ms = stream.turn_started_ms,
+        .token_progress = stream.token_progress,
+    }, 4_000).?);
+}
+
+test "compaction terminal feedback is static scoped and publication honest" {
+    var state: compaction_activity.State = .{};
+    var buf: [256]u8 = undefined;
+    const id = state.begin(.manual, null, 1_000);
+    try std.testing.expectEqualStrings("• Preparing compaction (0s)", compactionProjection(&buf, state.snapshot, .{}, 1_000).turn_thinking.label);
+    state.settle(id, .{ .outcome = .failed, .stage = .publication, .publication = .uncertain }, 1_500);
+    const failed = compactionProjection(&buf, state.snapshot, .{}, 9_000).turn_thinking;
+    try std.testing.expectEqual(ActivityProjection.Tone.danger, failed.tone);
+    try std.testing.expectEqualStrings("Compaction could not confirm saved context. Reopen the session before retrying.", failed.label);
+    try std.testing.expect(state.dismiss(id, state.snapshot.revision));
+    try std.testing.expect(compactionProjection(&buf, state.snapshot, .{}, 9_000) == .none);
+    const next = state.begin(.manual, null, 10_000);
+    state.settle(next, .{ .outcome = .no_op }, 10_000);
+    try std.testing.expectEqual(ActivityProjection.Tone.neutral, compactionProjection(&buf, state.snapshot, .{}, 11_499).turn_thinking.tone);
+    try std.testing.expect(compactionProjection(&buf, state.snapshot, .{}, 11_500) == .none);
+}
+
+test "subagent wait label preserves turn time and token accounting" {
+    var buf: [128]u8 = undefined;
+    const stream: StreamState = .{
+        .active = true,
+        .phase = .waiting_for_subagent,
+        .turn_started_ms = 1_000,
+        .token_progress = .{ .input_tokens = 32, .output_tokens = 253 },
+    };
+    try std.testing.expectEqualStrings("• Running (30s) (↑32 ↓253)", buildTurnLabel(&buf, stream, 31_000).?);
+    var resumed = stream;
+    resumed.phase = .generating;
+    try std.testing.expectEqualStrings("• Generating (31s) (↑32 ↓253)", buildTurnLabel(&buf, resumed, 32_000).?);
 }
 
 test "buildTurnLabel returns thinking when no tool activity" {

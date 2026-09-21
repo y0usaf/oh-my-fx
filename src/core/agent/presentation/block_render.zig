@@ -67,7 +67,61 @@ pub fn writeBlockquoteLine(
 ) !void {
     try out.appendNTimes(alloc, ' ', blockquote.indent);
     for (0..blockquote.depth) |_| try ansi.writeDim(alloc, out, ansi.vertical_rule_prefix);
+    try writeQuotedBlockContent(alloc, content, line_has_lf, out, footnotes, link_id);
+}
+
+/// Renders headings and list items inside a blockquote with their usual
+/// styling; everything else is inline prose.
+fn writeQuotedBlockContent(
+    alloc: Allocator,
+    content: []const u8,
+    line_has_lf: bool,
+    out: *std.ArrayList(u8),
+    footnotes: ?*const payload.FootnoteSink,
+    link_id: *u32,
+) !void {
+    if (bp.parseHeader(tu.withoutTerminalHardBreakMarker(content, line_has_lf))) |header| {
+        try writeHeading(alloc, header.level, header.content, out, footnotes, link_id);
+        return;
+    }
+    if (try writeListLine(alloc, content, line_has_lf, out, footnotes, link_id)) return;
     try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(content, line_has_lf), out, false, footnotes, link_id);
+}
+
+/// Renders an unordered, ordered, or task list line without a trailing
+/// newline. Returns false when `line` is not a list item.
+pub fn writeListLine(
+    alloc: Allocator,
+    line: []const u8,
+    line_has_lf: bool,
+    out: *std.ArrayList(u8),
+    footnotes: ?*const payload.FootnoteSink,
+    link_id: *u32,
+) !bool {
+    if (bp.parseUnorderedList(line)) |parsed| {
+        try out.appendSlice(alloc, parsed.indent);
+        if (bp.parseTaskListItem(parsed.content)) |task| {
+            try writeTaskListMarker(alloc, out, task);
+            try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(task.content, line_has_lf), out, false, footnotes, link_id);
+            return true;
+        }
+        try ansi.writeDim(alloc, out, ansi.bullet_marker);
+        try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(parsed.content, line_has_lf), out, false, footnotes, link_id);
+        return true;
+    }
+    if (bp.parseOrderedList(line)) |parsed| {
+        try out.appendSlice(alloc, parsed.indent);
+        try ansi.writeDim(alloc, out, parsed.marker);
+        try out.append(alloc, ' ');
+        if (bp.parseTaskListItem(parsed.content)) |task| {
+            try writeTaskListMarker(alloc, out, task);
+            try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(task.content, line_has_lf), out, false, footnotes, link_id);
+            return true;
+        }
+        try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(parsed.content, line_has_lf), out, false, footnotes, link_id);
+        return true;
+    }
+    return false;
 }
 
 pub fn writeDefinitionLine(

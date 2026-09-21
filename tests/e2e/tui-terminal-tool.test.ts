@@ -242,7 +242,8 @@ test.skipIf(!tmuxAvailable())(
     expect(interactResult).toContain("CAPTURED_DONE");
     const scrollback = await active.captureFullScrollback();
     expect(scrollback).toContain("Ran sleep 2; printf CAPTURED_DONE");
-    expect(scrollback).toContain(`Observed session ${sessionId}`);
+    expect(scrollback).toContain("Observed sleep 2; printf CAPTURED_DONE");
+    expect(scrollback).not.toContain(`Observed session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -295,6 +296,9 @@ test.skipIf(!tmuxAvailable())(
     await active.sendText("Stop the exact retained command now.");
     await active.sendKeys("Enter");
     await active.waitForText("PHASE_TWO_READY", TIMEOUT);
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("Stopped printf HANDOFF_READY; sleep 30");
+    expect(scrollback).not.toContain(`Stopped session ${sessionId}`);
     expect(toolResultEnvelope(
       gateway.requests[3]!.body,
       "shell_cross_turn_stop",
@@ -547,6 +551,166 @@ test.skipIf(!tmuxAvailable())(
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "session command statuses reclip to the live width instead of the activity cap",
+  async () => {
+    const fixture = createFixture("fx-shell-session-width-");
+    const launchCommand = `echo ${"f".repeat(100)} >/dev/null; sleep 60`;
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_width_run", "shell", {
+        request: {
+          action: "run",
+          command: launchCommand,
+          profile: "clean",
+          tty: true,
+          yield_time_ms: 0,
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (!sessionId) return new Response("missing session id", { status: 500 });
+        return fakeGatewayToolCall("shell_width_observe", "shell", {
+          request: { action: "interact", session_id: sessionId, chars: "" },
+        });
+      },
+      (body) => {
+        const id = sessionId || findSessionId(JSON.parse(body)) || "";
+        return fakeGatewayToolCall("shell_width_stop", "shell", {
+          request: { action: "stop", session_id: id },
+        });
+      },
+      fakeGatewayFinalText("WIDTH_FLOW_DONE"),
+    ]);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({
+      isolated: true,
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home,
+        SHELL: terminalFixtureShell(),
+        AI_GATEWAY_API_KEY: "fake-shell-tool-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "yolo",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TRACE_LOG: fixture.tracePath,
+        FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent",
+        FX_TERMINAL_HOST_IDLE_MS: "500",
+      },
+      width: 160,
+      height: 32,
+      stderrPath: fixture.stderrPath,
+    });
+    sessions.push(session);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Run and observe the session.");
+    await session.waitForText("WIDTH_FLOW_DONE", TIMEOUT);
+    await Bun.sleep(300);
+
+    // The 126-column activity cap used to freeze these phrases with trailing
+    // marks; at 160 columns the full launch command fits and must render
+    // without an ellipsis for captured runs, tty runs, and session actions.
+    const grid = await session.capturePaneGrid();
+    const row = (prefix: string) =>
+      grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
+    expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
+    expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
+    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "resumed session rows reclip to the live width from recorded launch commands",
+  async () => {
+    const fixture = createFixture("fx-shell-resume-width-");
+    const launchCommand = `echo ${"r".repeat(100)} >/dev/null; sleep 60`;
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_resume_run", "shell", {
+        request: {
+          action: "run",
+          command: launchCommand,
+          profile: "clean",
+          tty: true,
+          yield_time_ms: 0,
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (!sessionId) return new Response("missing session id", { status: 500 });
+        return fakeGatewayToolCall("shell_resume_observe", "shell", {
+          request: { action: "interact", session_id: sessionId, chars: "" },
+        });
+      },
+      (body) => {
+        const id = sessionId || findSessionId(JSON.parse(body)) || "";
+        return fakeGatewayToolCall("shell_resume_stop", "shell", {
+          request: { action: "stop", session_id: id },
+        });
+      },
+      fakeGatewayFinalText("RESUME_WIDTH_DONE"),
+    ]);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({
+      isolated: true,
+      cmd: "/bin/sh -i",
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home,
+        SHELL: terminalFixtureShell(),
+        AI_GATEWAY_API_KEY: "fake-shell-tool-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "yolo",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TRACE_LOG: fixture.tracePath,
+        FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent",
+        FX_TERMINAL_HOST_IDLE_MS: "500",
+        PS1: "RESUME_SHELL> ",
+      },
+      width: 160,
+      height: 36,
+    });
+    sessions.push(session);
+    await session.waitForText("RESUME_SHELL>", TIMEOUT);
+    await session.sendText(`${FX_BIN} 2>${fixture.stderrPath}`);
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("Run and observe the session.");
+    await session.waitForText("RESUME_WIDTH_DONE", TIMEOUT);
+    await session.sendText("/quit");
+    await session.waitForText("RESUME_SHELL>", TIMEOUT);
+
+    const sessionsRoot = join(fixture.home, ".fx", "sessions");
+    const fxSessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name !== "latest")
+      .map((entry) => entry.name);
+    expect(fxSessionIds).toHaveLength(1);
+
+    await session.sendText(`${FX_BIN} --resume ${fxSessionIds[0]} 2>>${fixture.stderrPath}`);
+    await session.waitForText("session resumed", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+
+    // The resumed transcript must rebuild full-width rows: the 120-column
+    // activity cap would leave trailing marks, and an unrecorded tty session
+    // would fall back to the raw session id.
+    const grid = await session.capturePaneGrid();
+    const row = (prefix: string) =>
+      grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
+    expect(row("├ Observed ")).toBe(`├ Observed ${launchCommand}`);
+    expect(row("├ Ran ")).toBe(`├ Ran ${launchCommand}`);
+    expect(row("└ Stopped ")).toBe(`└ Stopped ${launchCommand}`);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT * 2,
 );
 
 test.skipIf(!tmuxAvailable())(

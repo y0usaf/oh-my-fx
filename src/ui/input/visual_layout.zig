@@ -70,9 +70,7 @@ pub const Row = struct {
     raw_start: usize,
     raw_end: usize,
     break_kind: BreakKind,
-    prefix_cell_width: usize,
     content_width: usize,
-    first_cursor_offset: usize,
     last_cursor_offset: usize,
 };
 
@@ -140,7 +138,6 @@ pub const Iterator = struct {
     }
 
     fn finishRow(self: *Iterator, break_kind: BreakKind, raw_end: usize) Event {
-        const prefix = inputPrefix(self.row_index);
         const last_cursor_offset = switch (break_kind) {
             .soft_wrap => if (self.last_cursor_offset == raw_end) self.previous_cursor_offset else self.last_cursor_offset,
             .hard_newline, .input_end => raw_end,
@@ -150,9 +147,7 @@ pub const Iterator = struct {
             .raw_start = self.row_start,
             .raw_end = raw_end,
             .break_kind = break_kind,
-            .prefix_cell_width = prefix.cell_width,
             .content_width = self.content_column,
-            .first_cursor_offset = self.row_start,
             .last_cursor_offset = last_cursor_offset,
         };
 

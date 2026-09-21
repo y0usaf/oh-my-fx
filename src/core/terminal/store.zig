@@ -21,8 +21,8 @@ const default_segment_bytes: u64 = 1024 * 1024;
 const max_record_bytes: usize = 1024 * 1024;
 const max_event_bytes: usize = 64 * 1024;
 const event_retention_limit: u64 = 256;
-const record_schema_version: u16 = 1;
-const authority_schema_version: u16 = 2;
+const record_schema_version: u16 = 2;
+const authority_schema_version: u16 = 3;
 const owner_catalog_authority_schema_version: u16 = 2;
 const event_schema_version: u16 = 1;
 const close_transaction_schema_version: u16 = 2;
@@ -203,7 +203,6 @@ pub const Record = struct {
     monitor_count: u16,
     authority_generation: contracts.AuthorityGeneration,
     authority_revoked: bool,
-    direct_human_model_read_only: bool,
     termination: ?PersistedTermination,
     created_at_ms: i64,
     updated_at_ms: i64,
@@ -450,7 +449,6 @@ const RecordWire = struct {
     monitor_count: u16,
     authority_generation: contracts.AuthorityGeneration,
     authority_revoked: bool,
-    direct_human_model_read_only: bool,
     termination: ?PersistedTermination,
     created_at_ms: i64,
     updated_at_ms: i64,
@@ -460,7 +458,6 @@ const AuthorityWire = struct {
     schema_version: u16 = authority_schema_version,
     session_id: []const u8,
     grant: contracts.AuthorityGrant,
-    direct_human_model_read_only: bool,
     verifier: contracts.CheckpointChecksum,
     revoked: bool,
 };
@@ -1599,7 +1596,6 @@ fn record_wire(record: Record) RecordWire {
         .monitor_count = record.monitor_count,
         .authority_generation = record.authority_generation,
         .authority_revoked = record.authority_revoked,
-        .direct_human_model_read_only = record.direct_human_model_read_only,
         .termination = record.termination,
         .created_at_ms = record.created_at_ms,
         .updated_at_ms = record.updated_at_ms,
@@ -1684,7 +1680,6 @@ fn clone_record(alloc: Allocator, wire: RecordWire) Allocator.Error!Record {
         .monitor_count = wire.monitor_count,
         .authority_generation = wire.authority_generation,
         .authority_revoked = wire.authority_revoked,
-        .direct_human_model_read_only = wire.direct_human_model_read_only,
         .termination = wire.termination,
         .created_at_ms = wire.created_at_ms,
         .updated_at_ms = wire.updated_at_ms,
@@ -1844,7 +1839,6 @@ fn load_event(
 fn proof_verifier(
     proof: contracts.HolderProof,
     grant: contracts.AuthorityGrant,
-    direct_human_model_read_only: bool,
 ) contracts.CheckpointChecksum {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("fx.terminal.holder-proof.v2\x00");
@@ -1854,7 +1848,6 @@ fn proof_verifier(
     hash.update(@tagName(grant.principal.transport_role));
     hash.update(@tagName(grant.principal.backend));
     hash.update(@tagName(grant.principal.lifetime));
-    hash.update(if (direct_human_model_read_only) "\x01" else "\x00");
     hash_text(&hash, grant.principal.profile_user);
     hash_text(&hash, grant.principal.durable_session_id);
     hash_text(&hash, grant.principal.workspace_root);
@@ -1989,19 +1982,12 @@ fn catalog_authorization(
     if (record.authority_revoked or authority.revoked) {
         return .{ .actor = actor, .controls = .{} };
     }
-    const observer_policy = verified_observer_policy(record, authority) catch
-        return .{ .actor = actor, .controls = .{} };
-    const direct_model_observer = observer_policy and
-        authority.grant.actor == .human and actor == .agent;
-    if (!direct_model_observer and authority.grant.actor != actor) {
+    if (authority.grant.actor != actor) {
         return .{ .actor = actor, .controls = .{} };
     }
     return .{
         .actor = actor,
-        .controls = if (direct_model_observer)
-            contracts.AllowedControls.observer()
-        else
-            authority.grant.controls,
+        .controls = authority.grant.controls,
     };
 }
 
@@ -2081,7 +2067,6 @@ pub const CloseCommitOutcome = union(enum) {
 
 pub const EventReplay = struct {
     events: []DurableEvent,
-    gap_through: u64,
     next_event_id: u64,
 
     pub fn deinit(self: *EventReplay, alloc: Allocator) void {
@@ -2316,10 +2301,6 @@ pub fn reloadAuthorityClaim(
         input.terminal_session_id,
     );
     defer authority.deinit();
-    const observer_policy = try verified_observer_policy(
-        &record,
-        &authority.value,
-    );
     if (record.authority_revoked or authority.value.revoked) {
         return failReloadedAuthorityClaim(error.AuthorityRevoked);
     }
@@ -2332,19 +2313,14 @@ pub fn reloadAuthorityClaim(
     {
         return failReloadedAuthorityClaim(error.StaleAuthorityGeneration);
     }
-    const direct_model_observer = observer_policy and
-        grant.actor == .human and input.actor == .agent;
-    if (!direct_model_observer and grant.actor != input.actor) {
+    if (grant.actor != input.actor) {
         return failReloadedAuthorityClaim(error.ActorRoleMismatch);
     }
-    const controls = if (direct_model_observer)
-        contracts.AllowedControls.observer()
-    else
-        grant.controls;
+    const controls = grant.controls;
 
     var proof = try read_proof(alloc, owner, input.terminal_session_id);
     defer std.crypto.secureZero(u8, @volatileCast(proof.bytes[0..]));
-    const actual = proof_verifier(proof, grant, observer_policy);
+    const actual = proof_verifier(proof, grant);
     if (!std.mem.eql(u8, &actual, &authority.value.verifier)) {
         return failReloadedAuthorityClaim(error.InvalidHolderProof);
     }
@@ -2493,7 +2469,6 @@ pub const DurableSession = struct {
             .monitor_count = 0,
             .authority_generation = input.persistence.grant.generation,
             .authority_revoked = false,
-            .direct_human_model_read_only = input.persistence.direct_human_model_read_only,
             .termination = null,
             .created_at_ms = input.now_ms,
             .updated_at_ms = input.now_ms,
@@ -2524,7 +2499,6 @@ pub const DurableSession = struct {
             &state,
             input.session_id,
             input.persistence.grant,
-            input.persistence.direct_human_model_read_only,
             input.persistence.proof,
             false,
         );
@@ -2580,7 +2554,6 @@ pub const DurableSession = struct {
         const verifier = proof_verifier(
             proof,
             authority.value.grant,
-            authority.value.direct_human_model_read_only,
         );
         if (!std.mem.eql(u8, &verifier, &authority.value.verifier)) {
             return error.InvalidHolderProof;
@@ -3606,7 +3579,6 @@ pub const DurableSession = struct {
         }
         return .{
             .events = try events.toOwnedSlice(alloc),
-            .gap_through = self.record.event_gap_through,
             .next_event_id = @min(id, self.record.next_event_id),
         };
     }
@@ -3820,7 +3792,6 @@ pub const DurableSession = struct {
             try self.state_capability(),
             self.record.session_id,
             grant,
-            authority.value.direct_human_model_read_only,
             .{ .bytes = @splat(1) },
             true,
         );
@@ -4102,7 +4073,6 @@ pub const DurableSession = struct {
                 capability,
                 self.record.session_id,
                 grant,
-                authority.value.direct_human_model_read_only,
                 .{ .bytes = @splat(1) },
                 true,
             );
@@ -4257,20 +4227,12 @@ pub const DurableSession = struct {
             self.record.session_id,
         );
         defer authority.deinit();
-        const observer_policy = try verified_observer_policy(
-            &self.record,
-            &authority.value,
-        );
         if (authority.value.revoked or self.record.authority_revoked) {
             return error.AuthorityRevoked;
         }
         const grant = authority.value.grant;
-        const direct_model_observer = observer_policy and
-            grant.actor == .human and claim.actor == .agent;
         const human_takeover = grant.actor == .agent and claim.actor == .human;
-        const controls = if (direct_model_observer)
-            contracts.AllowedControls.observer()
-        else if (human_takeover)
+        const controls = if (human_takeover)
             contracts.AllowedControls.humanTakeover()
         else
             grant.controls;
@@ -4278,7 +4240,7 @@ pub const DurableSession = struct {
         if (!grant.principal.eql(claim.principal)) {
             return error.PrincipalMismatch;
         }
-        if (!direct_model_observer and !human_takeover and grant.actor != claim.actor) {
+        if (!human_takeover and grant.actor != claim.actor) {
             return error.ActorRoleMismatch;
         }
         if (grant.generation.value != claim.generation.value) {
@@ -4302,7 +4264,6 @@ pub const DurableSession = struct {
             const actual = proof_verifier(
                 claim.proof,
                 authority.value.grant,
-                observer_policy,
             );
             if (!std.mem.eql(u8, &actual, &authority.value.verifier)) {
                 return error.InvalidHolderProof;
@@ -5191,7 +5152,7 @@ fn facts_from_record(record: Record, session_id: []const u8) contracts.SessionFa
         .lifecycle = record.lifecycle,
         .attention = record.attention,
         .backend = record.backend,
-        .model_managed = !record.direct_human_model_read_only,
+        .model_managed = true,
         .timed_out = record.timed_out,
         .output_cursor = record.output_cursor,
         .unread_range = unread_range,
@@ -5462,22 +5423,16 @@ fn write_authority(
     capability: *session_child_store.SessionChildCapability,
     session_id: []const u8,
     grant: contracts.AuthorityGrant,
-    direct_human_model_read_only: bool,
     proof: contracts.HolderProof,
     revoked: bool,
 ) !void {
     try grant.validate();
-    if (direct_human_model_read_only and grant.actor != .human) {
-        return error.InvalidAuthorityRecord;
-    }
     const bytes = try render_json(alloc, AuthorityWire{
         .session_id = session_id,
         .grant = grant,
-        .direct_human_model_read_only = direct_human_model_read_only,
         .verifier = proof_verifier(
             proof,
             grant,
-            direct_human_model_read_only,
         ),
         .revoked = revoked,
     });
@@ -5528,31 +5483,13 @@ fn load_authority(
         return error.InvalidAuthorityRecord;
     }
     parsed.value.grant.validate() catch return error.InvalidAuthorityRecord;
-    if (parsed.value.direct_human_model_read_only and
-        parsed.value.grant.actor != .human)
-    {
-        return error.InvalidAuthorityRecord;
-    }
     return parsed;
-}
-
-fn verified_observer_policy(
-    record: *const Record,
-    authority: *const AuthorityWire,
-) error{InvalidAuthorityRecord}!bool {
-    if (record.direct_human_model_read_only !=
-        authority.direct_human_model_read_only)
-    {
-        return error.InvalidAuthorityRecord;
-    }
-    return authority.direct_human_model_read_only;
 }
 
 fn validate_recovery_principal(
     record: *const Record,
     authority: *const AuthorityWire,
 ) error{InvalidAuthorityRecord}!void {
-    _ = try verified_observer_policy(record, authority);
     const principal = authority.grant.principal;
     if (!std.mem.eql(u8, record.session_id, authority.session_id) or
         !std.mem.eql(u8, record.owner_session_id, principal.durable_session_id) or
@@ -6710,26 +6647,6 @@ test "authority proof is principal bound generation checked and revocable" {
     );
 }
 
-test "holder proof verifier binds the verified observer policy" {
-    var persistence = test_persistence();
-    persistence.grant.actor = .human;
-    const without_observer = proof_verifier(
-        persistence.proof,
-        persistence.grant,
-        false,
-    );
-    const with_observer = proof_verifier(
-        persistence.proof,
-        persistence.grant,
-        true,
-    );
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        &without_observer,
-        &with_observer,
-    ));
-}
-
 test "holder proof verifier ignores packed control padding" {
     const canonical = contracts.AllowedControls.full();
     var padded = canonical;
@@ -7322,112 +7239,6 @@ test "authority reload requires owner capability and exact durable scope" {
     );
 }
 
-test "authority reload grants direct human model observer controls only" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    var persistence = test_persistence();
-    persistence.grant.actor = .human;
-    persistence.direct_human_model_read_only = true;
-    var session = try fixture.create_with_persistence(
-        "terminal-human-reload",
-        .{ .rows = 24, .columns = 80 },
-        persistence,
-    );
-    defer session.deinit();
-    var owner = try fixture.owner_capability(
-        "terminal-store-owner",
-        .read_only,
-    );
-    defer owner.deinit();
-    const base = AuthorityReload{
-        .terminal_session_id = "terminal-human-reload",
-        .principal = persistence.grant.principal,
-        .actor = .human,
-        .generation = persistence.grant.generation,
-    };
-    var human = try reloadAuthorityClaim(alloc, &owner, base);
-    defer human.deinit();
-    try std.testing.expectEqual(contracts.AllowedControls.full(), human.controls);
-
-    var model_input = base;
-    model_input.actor = .agent;
-    var model = try reloadAuthorityClaim(alloc, &owner, model_input);
-    defer model.deinit();
-    try std.testing.expectEqual(contracts.AllowedControls.observer(), model.controls);
-    try session.verify_claim(model.view(), .read);
-    try std.testing.expectError(
-        error.ControlDenied,
-        session.verify_claim(model.view(), .write),
-    );
-}
-
-test "record observer policy tampering rejects reload and live authorization" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    const cases = [_]struct {
-        session_id: []const u8,
-        observer_policy: bool,
-    }{
-        .{
-            .session_id = "terminal-policy-enable-tamper",
-            .observer_policy = false,
-        },
-        .{
-            .session_id = "terminal-policy-disable-tamper",
-            .observer_policy = true,
-        },
-    };
-
-    for (cases) |case| {
-        var persistence = test_persistence();
-        persistence.grant.actor = .human;
-        persistence.direct_human_model_read_only = case.observer_policy;
-        var session = try fixture.create_with_persistence(
-            case.session_id,
-            .{ .rows = 24, .columns = 80 },
-            persistence,
-        );
-        defer session.deinit();
-        var model = test_claim(persistence);
-        model.actor = .agent;
-        if (case.observer_policy) {
-            try session.verify_claim(model, .read);
-        } else {
-            try std.testing.expectError(
-                error.ActorRoleMismatch,
-                session.verify_claim(model, .read),
-            );
-        }
-
-        session.record.direct_human_model_read_only = !case.observer_policy;
-        try std.testing.expectError(
-            error.InvalidAuthorityRecord,
-            session.verify_claim(model, .read),
-        );
-        try save_record(
-            alloc,
-            try session.state_capability(),
-            session.record,
-        );
-        var owner = try fixture.owner_capability(
-            "terminal-store-owner",
-            .read_only,
-        );
-        defer owner.deinit();
-        try std.testing.expectError(
-            error.InvalidAuthorityRecord,
-            reloadAuthorityClaim(alloc, &owner, .{
-                .terminal_session_id = case.session_id,
-                .principal = persistence.grant.principal,
-                .actor = .agent,
-                .generation = persistence.grant.generation,
-            }),
-        );
-    }
-}
-
 test "authority reload rejects malformed state proof lifetime and revocation" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
@@ -7483,11 +7294,9 @@ test "authority reload rejects malformed state proof lifetime and revocation" {
     const authority_bytes = try render_json(alloc, AuthorityWire{
         .session_id = "terminal-malformed-lifetime",
         .grant = persistence.grant,
-        .direct_human_model_read_only = false,
         .verifier = proof_verifier(
             persistence.proof,
             persistence.grant,
-            false,
         ),
         .revoked = false,
     });
@@ -7524,11 +7333,9 @@ test "authority reload rejects malformed state proof lifetime and revocation" {
     const retired_authority = try render_json(alloc, AuthorityWire{
         .session_id = "terminal-retired-authority",
         .grant = persistence.grant,
-        .direct_human_model_read_only = false,
         .verifier = proof_verifier(
             persistence.proof,
             persistence.grant,
-            false,
         ),
         .revoked = false,
     });
@@ -7537,8 +7344,8 @@ test "authority reload rejects malformed state proof lifetime and revocation" {
         u8,
         alloc,
         retired_authority,
+        "\"schema_version\":3",
         "\"schema_version\":2",
-        "\"schema_version\":1",
     );
     defer alloc.free(legacy_authority);
     const retired_authority_file = try authority_name(
@@ -7874,56 +7681,6 @@ test "terminal records require takeover attention lease and owner as one state" 
     malformed.takeover_owner_pid = @constCast(pid);
     malformed.takeover_owner_process_token = @constCast(process_owner.token());
     try std.testing.expectError(error.InvalidTerminalRecord, malformed.validate());
-}
-
-test "direct human authority exposes only the owning model observer controls" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    var persistence = test_persistence();
-    persistence.grant.actor = .human;
-    persistence.direct_human_model_read_only = true;
-    var session = try fixture.create_with_persistence(
-        "terminal-direct-human",
-        .{ .rows = 24, .columns = 80 },
-        persistence,
-    );
-    defer session.deinit();
-
-    var model = test_claim(persistence);
-    model.actor = .agent;
-    const observer = try session.authorize(model, .read);
-    try std.testing.expectEqual(contracts.AllowedControls.observer(), observer.controls);
-    try session.verify_claim(model, .screen);
-    try session.verify_claim(model, .inspect);
-    try session.verify_claim(model, .list);
-    var human = test_claim(persistence);
-    human.process_owner = try test_process_owner(
-        alloc,
-        fixture.profile.process_provider,
-    );
-    _ = try session.acquire_write_lease(human, 2);
-    try std.testing.expectError(
-        error.LeaseConflict,
-        session.acquire_write_lease(model, 3),
-    );
-    _ = try session.release_write_lease(human, 4);
-    try std.testing.expectError(
-        error.ControlDenied,
-        session.acquire_write_lease(model, 5),
-    );
-    inline for (.{
-        contracts.Action.write,
-        .wait,
-        .resize,
-        .signal,
-        .close,
-    }) |action| {
-        try std.testing.expectError(
-            error.ControlDenied,
-            session.verify_claim(model, action),
-        );
-    }
 }
 
 test "durable event IDs and acknowledgement cursor are monotonic and idempotent" {
@@ -8539,7 +8296,6 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
 
     var authority_persistence = test_persistence();
     authority_persistence.grant.actor = .human;
-    authority_persistence.direct_human_model_read_only = true;
     var authority = try fixture.create_with_persistence(
         "terminal-crash-authority",
         .{ .rows = 24, .columns = 80 },
@@ -8558,10 +8314,6 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     try std.testing.expect(
         authority_recovery.sessions.items[authority_index].record.authority_revoked,
     );
-    try std.testing.expect(
-        authority_recovery.sessions.items[authority_index]
-            .record.direct_human_model_read_only,
-    );
     try std.testing.expectError(
         error.AuthorityRevoked,
         authority_recovery.sessions.items[authority_index]
@@ -8575,9 +8327,6 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     );
     defer recovered_authority.deinit();
     try std.testing.expect(recovered_authority.value.revoked);
-    try std.testing.expect(
-        recovered_authority.value.direct_human_model_read_only,
-    );
     authority_recovery.deinit();
 
     var committed_checkpoint = try fixture.create("terminal-crash-checkpoint-record");
@@ -8828,9 +8577,9 @@ test "recovery isolates partial corrupt and unsupported records" {
             try alloc.dupe(u8, value)
         else blk: {
             const rendered = try render_json(alloc, record_wire(session.record));
-            const marker = std.mem.find(u8, rendered, "\"schema_version\":1") orelse
+            const marker = std.mem.find(u8, rendered, "\"schema_version\":2") orelse
                 return error.TestExpectedEqual;
-            rendered[marker + "\"schema_version\":".len] = '2';
+            rendered[marker + "\"schema_version\":".len] = '1';
             break :blk rendered;
         };
         defer alloc.free(bytes);

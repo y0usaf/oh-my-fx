@@ -316,14 +316,6 @@ pub const ActivityPaintResult = struct {
     overlay: bool,
 };
 
-pub const FooterReservationSource = enum {
-    none,
-    footer_layout,
-    transient_activity,
-    idle_footer_gap,
-    resize_reflow,
-};
-
 pub const FooterPaintResult = struct {
     painted_rows: u16,
     top_row: u16,
@@ -357,7 +349,6 @@ pub const PaintPlan = struct {
     footer_clean_allowed: bool,
     synchronized_update: bool,
     cursor_target: ?FrameCursorTarget,
-    footer_reservation_source: FooterReservationSource,
     bottom_reserved_rows: u16,
     preserve_scrollback: bool,
     reset_terminal: bool = false,
@@ -759,7 +750,6 @@ fn validPlan() PaintPlan {
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = 22, .col = 1, .visible = true },
-        .footer_reservation_source = .footer_layout,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -784,7 +774,6 @@ test "paint plan permits an explicit zero-row footer" {
         .total_rows = 0,
     };
     plan.footer_band = FrameBand.empty(.footer);
-    plan.footer_reservation_source = .none;
     plan.cursor_target = .{ .row = 4, .col = 1, .visible = true };
 
     try plan.validate();

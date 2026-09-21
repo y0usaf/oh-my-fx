@@ -138,7 +138,7 @@ fn executeCommand(alloc: Allocator, command: Command, request: CommandRequest) !
             .{request.skills_dir},
             false,
         ),
-        .usage => noticeLiteral(alloc, "Usage: /skills [list|add|install|show|create|remove|path] [name|url|path]", false),
+        .usage => noticeLiteral(alloc, "usage: /skills [list|add|install|show|create|remove|path] [name|url|path]", false),
     };
 }
 

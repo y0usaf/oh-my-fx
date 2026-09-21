@@ -561,17 +561,17 @@ fn commandMaxScrollRows(command: []const u8, content_width: usize, row_count: u1
 // only cue that the review scrolls); the tail tiers reuse the shared approval
 // ladder so reworded copy cannot drift.
 const command_review_amendment_hints = [_][]const u8{
-    "1–3 Choose now    ↑↓ Options    Tab Amend    Wheel Scroll    Enter Confirm    Esc Cancel",
-    "1–3 Choose now    ↑↓ Options    Wheel Scroll    Enter Confirm    Esc Cancel",
-    "1–3 Choose    Wheel Scroll    Enter Confirm    Esc Cancel",
+    "1–3 choose now    ↑↓ options    tab amend    wheel scroll    enter confirm    esc cancel",
+    "1–3 choose now    ↑↓ options    wheel scroll    enter confirm    esc cancel",
+    "1–3 choose    wheel scroll    enter confirm    esc cancel",
     interaction_state.approval_hint_compact,
     interaction_state.approval_hint_minimal,
 };
 
 const command_review_navigation_hints = [_][]const u8{
-    "1–3 Choose now    ↑↓ or Tab Options    Wheel Scroll    Enter Confirm    Esc Cancel",
-    "1–3 Choose now    ↑↓ Options    Wheel Scroll    Enter Confirm    Esc Cancel",
-    "1–3 Choose    Wheel Scroll    Enter Confirm    Esc Cancel",
+    "1–3 choose now    ↑↓ or tab options    wheel scroll    enter confirm    esc cancel",
+    "1–3 choose now    ↑↓ options    wheel scroll    enter confirm    esc cancel",
+    "1–3 choose    wheel scroll    enter confirm    esc cancel",
     interaction_state.approval_hint_compact,
     interaction_state.approval_hint_minimal,
 };
@@ -1677,7 +1677,7 @@ test "command approval screen includes compact permission header" {
         row_text.clearRetainingCapacity();
         try grid.rowTextTrimmed(row, &row_text);
         if (std.mem.find(u8, row_text.items, "3. No") != null) choice_three_row = row;
-        if (std.mem.find(u8, row_text.items, "1–3 Choose") != null) hint_row = row;
+        if (std.mem.find(u8, row_text.items, "1–3 choose") != null) hint_row = row;
     }
 
     const choice_row = choice_three_row orelse return error.TestMissingChoice;
@@ -2191,7 +2191,7 @@ test "file approval top-aligns a fitting welcome document and clears below" {
 
     row.clearRetainingCapacity();
     try grid.rowTextTrimmed(16, &row);
-    try std.testing.expect(std.mem.indexOf(u8, row.items, "1–3 Choose") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row.items, "1–3 choose") != null);
     row.clearRetainingCapacity();
     try grid.rowTextTrimmed(17, &row);
     try std.testing.expectEqualStrings("", row.items);
@@ -2453,30 +2453,30 @@ test "command review hint keeps enter and esc guidance at narrow widths" {
     var wide: std.Io.Writer.Allocating = .init(alloc);
     defer wide.deinit();
     try writeCommandReviewHint(&wide.writer, 5, 100, true);
-    try std.testing.expect(std.mem.find(u8, wide.written(), "Wheel Scroll") != null);
-    try std.testing.expect(std.mem.find(u8, wide.written(), "Tab Amend") != null);
-    try std.testing.expect(std.mem.find(u8, wide.written(), "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, wide.written(), "wheel scroll") != null);
+    try std.testing.expect(std.mem.find(u8, wide.written(), "tab amend") != null);
+    try std.testing.expect(std.mem.find(u8, wide.written(), "esc cancel") != null);
 
     var navigation: std.Io.Writer.Allocating = .init(alloc);
     defer navigation.deinit();
     try writeCommandReviewHint(&navigation.writer, 5, 100, false);
-    try std.testing.expect(std.mem.find(u8, navigation.written(), "Tab Options") != null);
-    try std.testing.expect(std.mem.find(u8, navigation.written(), "Tab Amend") == null);
+    try std.testing.expect(std.mem.find(u8, navigation.written(), "tab options") != null);
+    try std.testing.expect(std.mem.find(u8, navigation.written(), "tab amend") == null);
 
     var narrow: std.Io.Writer.Allocating = .init(alloc);
     defer narrow.deinit();
     try writeCommandReviewHint(&narrow.writer, 5, 60, true);
-    try std.testing.expect(std.mem.find(u8, narrow.written(), "Wheel Scroll") != null);
-    try std.testing.expect(std.mem.find(u8, narrow.written(), "Enter Confirm") != null);
-    try std.testing.expect(std.mem.find(u8, narrow.written(), "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.written(), "wheel scroll") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.written(), "enter confirm") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.written(), "esc cancel") != null);
     try std.testing.expect(std.mem.find(u8, narrow.written(), "Options") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.written()) <= 60);
 
     var minimal: std.Io.Writer.Allocating = .init(alloc);
     defer minimal.deinit();
     try writeCommandReviewHint(&minimal.writer, 5, 40, true);
-    try std.testing.expect(std.mem.find(u8, minimal.written(), "Enter Confirm") != null);
-    try std.testing.expect(std.mem.find(u8, minimal.written(), "Esc Cancel") != null);
-    try std.testing.expect(std.mem.find(u8, minimal.written(), "Wheel Scroll") == null);
+    try std.testing.expect(std.mem.find(u8, minimal.written(), "enter confirm") != null);
+    try std.testing.expect(std.mem.find(u8, minimal.written(), "esc cancel") != null);
+    try std.testing.expect(std.mem.find(u8, minimal.written(), "wheel scroll") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(minimal.written()) <= 40);
 }

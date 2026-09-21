@@ -1931,8 +1931,8 @@ test "dimmed command rows frame physical lines independently" {
 fn foldedHint(alloc: Allocator, hidden_records: usize, cols: u16) ![]u8 {
     const noun = if (hidden_records == 1) "line" else "lines";
     const candidates = [_][]u8{
-        try std.fmt.allocPrint(alloc, "│ … {d} {s} more (ctrl o to view)", .{ hidden_records, noun }),
-        try std.fmt.allocPrint(alloc, "│ … {d} more (ctrl o)", .{hidden_records}),
+        try std.fmt.allocPrint(alloc, "│ … {d} {s} more (ctrl+o to view)", .{ hidden_records, noun }),
+        try std.fmt.allocPrint(alloc, "│ … {d} more (ctrl+o)", .{hidden_records}),
         try std.fmt.allocPrint(alloc, "│ … {d} more", .{hidden_records}),
     };
     defer for (candidates) |candidate| alloc.free(candidate);
@@ -2081,7 +2081,7 @@ test "compact command output caps physical rows" {
     try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, compact.bytes.items, "\n") + 1);
     try std.testing.expect(std.mem.find(u8, compact.bytes.items, "│ line-5") != null);
     try std.testing.expect(std.mem.find(u8, compact.bytes.items, "│ line-6") == null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes.items, "│ … 2 lines more (ctrl o to view)") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes.items, "│ … 2 lines more (ctrl+o to view)") != null);
 }
 
 test "compact command output stays bounded at one and two columns" {
@@ -2199,7 +2199,7 @@ test "compact incomplete retained record shows one hidden line" {
     defer compact.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "│ retained prefix\n│ … 1 line more (ctrl o to view)",
+        "│ retained prefix\n│ … 1 line more (ctrl+o to view)",
         compact.bytes.items,
     );
 }
@@ -2233,7 +2233,7 @@ test "compact hint stays at the final owned source entry" {
 
     const first = projection.bytesForEntry(10).?;
     const final = projection.bytesForEntry(30).?;
-    try std.testing.expect(std.mem.find(u8, first, "ctrl o") == null);
+    try std.testing.expect(std.mem.find(u8, first, "ctrl+o") == null);
     try std.testing.expect(std.mem.find(u8, final, "│ … 2 more") != null);
 }
 

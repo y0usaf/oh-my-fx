@@ -6,23 +6,39 @@ The candidate is accepted only when it is no larger than **7.800 MiB**, has the 
 
 ## Toolchain and target
 
-The driver fails unless all of these match exactly:
+The driver requires:
 
 - macOS on an arm64 host
 - generic `aarch64-macos` output
 - Zig `0.16.0`
 - LLVM `21.1.8` tools and profile runtime from one configured LLVM root
+- the selected Xcode macOS SDK and native Apple linker with arm64 support
 - Bun `1.3.14`
 - Hyperfine `1.20.0`
 - the selected source commit, update channel, bitcode hash, corpus hash, and profile-generation flags
 
-The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture and minimum macOS version, contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
+The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture, minimum macOS version, SDK compatibility stamp, main-stack request, and dynamic-library dependency versions. It must contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
+
+Training records execution counts and first-use function timestamps in the same
+continuous profiles. Counter supplements preserve the temporal traces. The
+main PGSO executable uses LLVM's temporal function order through the native
+Apple linker; benchmark and other native release links keep their existing
+paths. Identical-code folding stays disabled. The function-starts table is
+omitted, matching the existing stripped Zig link. The exact optimized Zig
+runtime object and bundled system-library stub remain the link inputs; the
+selected Xcode SDK supplies re-export stubs. Compatibility and sysroot SDK
+versions are recorded separately. Build evidence retains input digests, every
+mapped or unmapped profile name, the full linker map, and verified ordered code
+counts. Empty or ambiguous mappings, an unapplied order, and truncated symbol
+output fail closed.
 
 ## Commands
 
 Every mutating command requires a fresh or empty output directory. State from separate runs is never merged implicitly.
 
 ```bash
+brew install llvm@21
+
 python3 -m scripts.pgso build \
   --llvm-bin "$(brew --prefix llvm@21)/bin" \
   --output-dir /tmp/fx-pgso-build
@@ -53,6 +69,16 @@ non-overlapping candidate assignments. The six startup and six heavy-workload
 comparisons run on twelve fresh machines. Every performance job measures its
 immutable control and candidate on the same machine.
 
+The fx candidate applies the accepted whole-program profile-use pipeline, then
+uses LLVM's deterministic name-hash split to divide the optimized IR into two
+balanced modules. Each module is outlined sequentially before the modules are
+relinked and their original private linkage is restored. This keeps the IR
+outliner's suffix-tree memory below the standard runner limit without changing
+the training corpus, benchmark candidates, or performance measurement hardware.
+Generated IR helpers are kept in one dense linker cluster ordered by their
+hottest profiled caller so outlining does not scatter startup code across cold
+pages.
+
 `python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
 GitHub Actions matrices. The remaining distributed subcommands are workflow
 phase interfaces: `train-shard`, `candidate`, `behavior-shard`, `measure`, and
@@ -60,6 +86,13 @@ phase interfaces: `train-shard`, `candidate`, `behavior-shard`, `measure`, and
 binary, candidate, assignment, or shard identity mismatch. The aggregate
 command requires all 36 training scenarios, all 53 behavior scenarios, and all
 12 performance gates exactly once before it emits `eligible: true`.
+
+Workflow artifact names include the producing run attempt, so earlier attempts
+remain available. Seed and candidate consumers use the artifact IDs returned
+by their producer jobs. Shard collection selects the newest attempt for each
+shard; a failed or invalid newest result cannot fall back to an earlier pass.
+Source and artifact hashes must still match before aggregation can qualify a
+release. Overwrite applies only to an identical attempt-qualified name.
 
 ## Corpus
 
@@ -121,7 +154,28 @@ manifest.json
 
 Generated binaries, bitcode, objects, profiles, caches, measurements, and logs are evidence artifacts and must not be committed. `manifest.json` is rewritten atomically after every stage. A failed manifest retains completed evidence, names the failing stage, records `eligible: false`, and never falls back to an unprofiled candidate.
 
-The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. JSON evidence retains at most the last 1,048,576 characters from each output stream per command and records the total character counts and truncation status; no environment variables are printed.
+The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. JSON evidence normally retains at most the last 1,048,576 characters from each output stream per command. The candidate symbol census permits 8,388,608 characters and rejects truncated output. Records include total character counts and truncation status; no environment variables are printed.
+
+To compare a qualified PR merge with its exact main parent, or a qualified
+manual branch head with its exact main ancestor, dispatch the
+**Benchmarks** workflow on the comparison branch with `pgso_control_artifact`
+and `pgso_candidate_artifact` set to the two qualified aggregate artifact IDs.
+The main control may come from the dedicated PGSO workflow or the Release
+workflow that invokes it. Both artifacts must have completed qualification.
+The candidate must come from the dedicated PGSO workflow. For source-only PRs,
+run that workflow manually on the PR branch. Its manifest source must match the
+run head, and GitHub's immutable SHA comparison must prove that exact control
+is both the base and merge base, with no behind commits and a complete nonempty
+ahead commit list ending at the candidate. Missing or truncated ancestry is
+rejected. The manual candidate branch cannot be `main`.
+Leave `signed_run` empty. The native macOS arm64 job downloads those immutable
+artifacts without rebuilding them, checks their run/source relationships and
+binary hashes, then measures normal and recovered no-history requests. It runs
+identical-control calibration before paired memory and latency comparisons,
+rejects uncalibrated or resolved-regression results, and retains raw evidence.
+These checks supplement the production PGSO gate; they do not replace it or
+prove performance for every workload. Legacy aggregate names are accepted only
+from a first-attempt run; attempt-qualified names must match the run attempt.
 
 Corpus scenarios inherit only a small operating-system environment allowlist. Credentials, live-test flags, tracing settings, and repository dotenv files are excluded unless a value is explicitly declared in the versioned corpus. The runner temporarily installs the assigned artifact at `zig-out/bin/fx` for E2E compatibility, then restores the prior file (or prior absence) after success, failure, timeout, or cancellation.
 

@@ -10,6 +10,8 @@ pub const FrameDocumentAppend = struct {
     bytes: []const u8 = &.{},
     start_row: u16 = 1,
     start_col: u16 = 1,
+    /// Source continuation after an occupied right margin, not a row replay.
+    start_pending_wrap: bool = false,
     clear: FrameDocumentAppendClear = .remainder,
     reset_replay: bool = false,
 

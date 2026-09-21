@@ -89,7 +89,6 @@ pub const Document = struct {
 
 pub const Match = struct {
     document_index: usize,
-    clear_match: bool,
 };
 
 pub const Page = struct {
@@ -136,7 +135,6 @@ const Ranked = struct {
     exact_identity: bool,
     score: f64,
     primary_hits: u8,
-    secondary_hits: u8,
 };
 
 const CorpusStats = struct {
@@ -235,7 +233,6 @@ pub fn retrieve(
             .exact_identity = exact_identity,
             .score = score,
             .primary_hits = primary_hits,
-            .secondary_hits = secondary_hits,
         };
         ranked_count += 1;
     }
@@ -255,12 +252,6 @@ pub fn retrieve(
     for (ranked[start_offset..end], 0..) |match, index| {
         page_matches[index] = .{
             .document_index = match.document_index,
-            .clear_match = clearMatch(
-                query_tokens.len,
-                match.exact_identity,
-                match.primary_hits,
-                match.secondary_hits,
-            ),
         };
     }
     return .{

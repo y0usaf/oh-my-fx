@@ -1,0 +1,38 @@
+[
+  {
+    "id": "node-chat",
+    "title": "Node.js readline chat",
+    "prompt": "Build a Node.js readline chat with libfx. Keep one agent for the conversation, stream text to stdout, and close it on exit. Use the files below as a starting point.",
+    "entry": "chat.mjs",
+    "command": "npm run chat",
+    "files": ["package.json", "chat.mjs", "handler.mjs", "server.mjs", "index.html"],
+    "demo": "https://fx-demo-node-chat.vercel.app"
+  },
+  {
+    "id": "browser-agent",
+    "title": "Browser agent",
+    "prompt": "Build a browser agent with libfx and WebAssembly using plain HTML without CSS. Use the free-token proxy by default. Let visitors enter an AI Gateway API key to connect directly, without sending their key to the proxy or saving it. Start a new conversation when the key changes. Use the files below as a starting point.",
+    "entry": "main.js",
+    "command": "npm run dev",
+    "files": ["package.json", "index.html", "main.js", "api/gateway.js"],
+    "demo": "https://fx-demo-browser-agent.vercel.app"
+  },
+  {
+    "id": "nextjs-agent",
+    "title": "Next.js App Router",
+    "prompt": "Build a Next.js App Router app with a plain prompt form and a libfx agent in a server route. Stream the reply to the form and close the agent after each request. Use the files below as a starting point.",
+    "entry": "app/api/chat/route.js",
+    "command": "npm run dev",
+    "files": ["package.json", "next.config.mjs", "app/layout.js", "app/page.js", "app/api/chat/route.js"],
+    "demo": "https://fx-demo-nextjs-agent.vercel.app"
+  },
+  {
+    "id": "nuxt-agent",
+    "title": "Nuxt",
+    "prompt": "Build a Nuxt app with a plain prompt form and a libfx agent in a Nitro server route. Stream the reply to the form and close the agent after each request. Use the files below as a starting point.",
+    "entry": "server/api/chat.post.js",
+    "command": "npm run dev",
+    "files": ["package.json", "nuxt.config.ts", "app/app.vue", "server/api/chat.post.js"],
+    "demo": "https://fx-demo-nuxt-agent.vercel.app"
+  }
+]

@@ -316,7 +316,6 @@ pub const StartRequest = struct {
 pub const StartPersistence = struct {
     grant: AuthorityGrant,
     proof: HolderProof,
-    direct_human_model_read_only: bool = false,
 
     pub fn validate(self: StartPersistence, request: StartRequest) error{
         InvalidPrincipal,
@@ -331,9 +330,6 @@ pub const StartPersistence = struct {
         if (!std.mem.eql(u8, self.grant.principal.cwd, request.cwd) or
             self.grant.principal.backend != request.backend)
         {
-            return error.InvalidStartPersistence;
-        }
-        if (self.direct_human_model_read_only and self.grant.actor != .human) {
             return error.InvalidStartPersistence;
         }
     }
@@ -736,7 +732,6 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
         StartPersistence{
             .grant = try clone_authority_grant(alloc, value.grant),
             .proof = value.proof,
-            .direct_human_model_read_only = value.direct_human_model_read_only,
         }
     else
         null;
@@ -1499,15 +1494,6 @@ pub const AllowedControls = packed struct {
     resize: bool = false,
     signal: bool = false,
     close: bool = false,
-
-    pub fn observer() AllowedControls {
-        return .{
-            .read = true,
-            .screen = true,
-            .inspect = true,
-            .list = true,
-        };
-    }
 
     pub fn full() AllowedControls {
         return .{
@@ -3118,25 +3104,20 @@ test "authority generations increase monotonically and reject exhaustion" {
     );
 }
 
-test "direct human observation does not grant model control" {
-    const observer = AllowedControls.observer();
-    try std.testing.expect(observer.allows(.read));
-    try std.testing.expect(observer.allows(.screen));
-    try std.testing.expect(!observer.allows(.write));
-    try std.testing.expect(!observer.allows(.wait));
-    try std.testing.expect(!observer.allows(.resize));
-    try std.testing.expect(!observer.allows(.signal));
-    try std.testing.expect(!observer.allows(.close));
-}
-
 test "next actions are the pure lifecycle authority and lease intersection" {
+    const read_only: AllowedControls = .{
+        .read = true,
+        .screen = true,
+        .inspect = true,
+        .list = true,
+    };
     const observer = project_next_actions(
         .running,
-        .observer(),
+        read_only,
         .agent,
         .{},
     );
-    try std.testing.expectEqual(AllowedControls.observer(), observer);
+    try std.testing.expectEqual(read_only, observer);
 
     const lifecycle_cases = [_]struct {
         lifecycle: Lifecycle,

@@ -1,12 +1,12 @@
 const std = @import("std");
 const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
-const permission_gate = @import("../../core/permissions/permission_gate.zig");
 const read_tracker = @import("../../core/workspace/read_tracker.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const image_data = @import("../../core/images/image_data.zig");
+const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
-const write_file_impl = @import("write_file.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -153,6 +153,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const rel = pathing.workspaceRelativePath(arena, ctx.workspace_root, target) catch target;
 
     if (!text_utils.isModelSafeText(text)) {
+        if (try imageToolResult(ctx, rel, text, stat.size, truncated_by_size or actual_len != stat.size)) |result| return result;
         tool_dispatch.reportToolResultMemory(ctx, .{
             .model_view_covers_full_file = false,
         });
@@ -183,6 +184,7 @@ fn readFileFailure(alloc: Allocator, err: anyerror, path: []const u8) tool_dispa
     if (tool_result_errors.isFilesystemAccessDenied(err)) {
         return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(alloc, "read_file", path, err) };
     }
+
     if (err == error.NotRegularFile) {
         const details = [_]tool_result_errors.Detail{
             .{ .name = "field", .value = .{ .string = "path" } },
@@ -217,6 +219,55 @@ fn readIntoBuffer(reader: *std.Io.Reader, buffer: []u8) !usize {
         total += n;
     }
     return total;
+}
+
+/// Raw image bytes that fit the encoded tool-image attach limit.
+const max_attach_image_bytes: usize = image_data.max_encoded_image_bytes / 4 * 3;
+
+/// Attaches supported image files to the tool result so models with image
+/// input receive the pixels inline through the normal tool-image pipeline.
+/// Returns null for non-image or incompletely read content, which falls back
+/// to the binary-omitted summary.
+fn imageToolResult(
+    ctx: tool_dispatch.DispatchContext,
+    rel: []const u8,
+    bytes: []const u8,
+    file_size: u64,
+    incomplete_read: bool,
+) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
+    if (incomplete_read) return null;
+    const mime_type = image_data.detectMediaTypeFromBytes(bytes) orelse return null;
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    if (encoded_len > image_data.max_encoded_image_bytes) {
+        tool_dispatch.reportToolResultMemory(ctx, .{
+            .model_view_covers_full_file = false,
+        });
+        return .{ .success = try std.fmt.allocPrint(
+            ctx.allocator,
+            "<path>{s}</path>\n<content>image not attached: {s} is {d} bytes, over the {d}-byte attach limit</content>",
+            .{ rel, mime_type, file_size, max_attach_image_bytes },
+        ) };
+    }
+    const encoded = try ctx.allocator.alloc(u8, encoded_len);
+    errdefer ctx.allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    const owned_mime = try ctx.allocator.dupe(u8, mime_type);
+    errdefer ctx.allocator.free(owned_mime);
+    const images = try ctx.allocator.alloc(core_types.ToolImage, 1);
+    errdefer ctx.allocator.free(images);
+    images[0] = .{ .data = encoded, .mime_type = owned_mime };
+    tool_dispatch.reportToolResultMemory(ctx, .{
+        .model_view_covers_full_file = true,
+    });
+    return .{ .rich = .{
+        .text = try std.fmt.allocPrint(
+            ctx.allocator,
+            "<path>{s}</path>\n<content>image attached ({s}, {d} bytes)</content>",
+            .{ rel, mime_type, file_size },
+        ),
+        .images = images,
+        .is_error = false,
+    } };
 }
 
 const LineRecord = struct {
@@ -431,25 +482,6 @@ const read_file_dispatch_tool = tool_dispatch.Tool{
     .irreversible_fn = isIrreversible,
 };
 
-const write_file_dispatch_tool = tool_dispatch.Tool{
-    .name = "write_file",
-    .description = "Write file dispatch test fixture.",
-    .model_schema = .{
-        .name = "write_file",
-        .description = "Write file dispatch test fixture.",
-    },
-    .executor_kind = .write_file,
-    .activity_kind = .write,
-    .requires_approval = true,
-    .permission_target_kind = .path_create_parent,
-    .decode = write_file_impl.decode,
-    .validate = write_file_impl.validate,
-    .call = write_file_impl.call,
-    .take_file_mutation_input_fn = write_file_impl.takeFileMutationInput,
-    .reads_only_fn = write_file_impl.readsOnly,
-    .irreversible_fn = write_file_impl.isIrreversible,
-};
-
 fn dispatchReadFileInWorkspace(alloc: Allocator, workspace_root: []const u8, args_json: []const u8) !tool_dispatch.DispatchResult {
     const registry = tool_dispatch.Registry{ .tools = &.{read_file_dispatch_tool} };
     return tool_dispatch.dispatchToolCall(.{ .allocator = alloc, .permission_mode = .auto, .workspace_root = workspace_root }, registry, .{
@@ -479,46 +511,6 @@ fn dispatchReadFileWithTrackerInWorkspace(alloc: Allocator, workspace_root: []co
 
 fn dispatchReadFileWithTracker(alloc: Allocator, args_json: []const u8, tracker: *read_tracker.ReadTracker) !tool_dispatch.DispatchResult {
     return dispatchReadFileWithTrackerInWorkspace(alloc, "", args_json, tracker);
-}
-
-fn allowDecision(_: *const tool_dispatch.Tool, _: tool_dispatch.ToolInput, _: tool_dispatch.DispatchContext) permission_gate.Decision {
-    return .{ .action = .allow, .reason = "allowed by test" };
-}
-
-fn writeFileArgsJson(alloc: Allocator, path: []const u8, content: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll("{\"path\":");
-    try std.json.Stringify.value(path, .{}, &out.writer);
-    try out.writer.writeAll(",\"content\":");
-    try std.json.Stringify.value(content, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    return try out.toOwnedSlice();
-}
-
-fn dispatchWriteFileWithTracker(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    path: []const u8,
-    content: []const u8,
-    tracker: *read_tracker.ReadTracker,
-) !tool_dispatch.DispatchResult {
-    const args_json = try writeFileArgsJson(alloc, path, content);
-    defer alloc.free(args_json);
-
-    const registry = tool_dispatch.Registry{ .tools = &.{write_file_dispatch_tool} };
-    return tool_dispatch.dispatchToolCall(.{
-        .allocator = alloc,
-        .permission_mode = .auto,
-        .permission_decider = allowDecision,
-        .workspace_root = workspace_root,
-        .read_tracker = tracker,
-    }, registry, .{
-        .id = "call_2",
-        .name = "write_file",
-        .arguments_json = args_json,
-    });
 }
 
 fn tmpPath(alloc: Allocator, tmp: std.testing.TmpDir, sub_path: []const u8) ![]u8 {
@@ -604,6 +596,7 @@ test "read_file access denial returns structured recovery" {
     const alloc = std.testing.allocator;
     const result = try readFileFailure(alloc, error.AccessDenied, "/tmp/blocked/read.txt");
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| {
             defer alloc.free(body);
             try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body));
@@ -623,6 +616,7 @@ test "read_file non-regular paths return structured recovery" {
     const alloc = std.testing.allocator;
     const result = try readFileFailure(alloc, error.NotRegularFile, "/tmp/search-pipe");
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| {
             defer alloc.free(body);
             try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body));
@@ -708,6 +702,86 @@ test "read_file omits binary content using active success output" {
 
     try std.testing.expectEqual(.success, result.status);
     try std.testing.expect(std.mem.find(u8, result.body, "binary or non-utf8 file omitted") != null);
+    try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+const test_png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+fn writeTestImage(dir: std.Io.Dir, name: []const u8, base64: []const u8) !void {
+    const decoder = std.base64.standard.Decoder;
+    const size = try decoder.calcSizeForSlice(base64);
+    const bytes = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(bytes);
+    try decoder.decode(bytes, base64);
+    var file = try dir.createFile(std.testing.io, name, .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), bytes);
+}
+
+test "read_file attaches a png image to the tool result" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(tmp.dir, "pixel.png", test_png_base64);
+    const path = try tmpPath(std.testing.allocator, tmp, "pixel.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image attached (image/png") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
+    try std.testing.expectEqualStrings(test_png_base64, result.images[0].data);
+    try std.testing.expect(result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+test "read_file detects images by magic bytes regardless of extension" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(tmp.dir, "pixel.bin", test_png_base64);
+    const path = try tmpPath(std.testing.allocator, tmp, "pixel.bin");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
+}
+
+test "read_file reports images over the attach limit without pixels" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "big.png", .{});
+        defer file.close(io_mod.getIo());
+        const header = "\x89PNG\r\n\x1a\n".*;
+        try file.writeStreamingAll(io_mod.getIo(), &header);
+        var remaining: usize = max_attach_image_bytes + 1 - header.len;
+        var filler: [8192]u8 = @splat(0xAB);
+        while (remaining > 0) {
+            const chunk = @min(remaining, filler.len);
+            try file.writeStreamingAll(io_mod.getIo(), filler[0..chunk]);
+            remaining -= chunk;
+        }
+    }
+    const path = try tmpPath(std.testing.allocator, tmp, "big.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image not attached") != null);
+    try std.testing.expectEqual(@as(usize, 0), result.images.len);
     try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
 }
 

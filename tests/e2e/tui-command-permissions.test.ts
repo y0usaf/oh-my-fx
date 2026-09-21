@@ -21,11 +21,13 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   canonicalSubagentIdForStore,
-  classifierEvidenceFromRequest,
   fakeGatewayPermissionDecision,
+  fakeGatewaySerializedToolCall,
+  fakeGatewayTitleDefault,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
   startDynamicFakeGateway,
+  TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -138,16 +140,6 @@ function permissionDecision(
   toolCallId = "permission_decision_1",
 ) {
   return fakeGatewayPermissionDecision(decision, toolCallId, "deterministic test decision");
-}
-
-function classifierTrustContext(body: string): string {
-  const evidence = classifierEvidenceFromRequest(body);
-  const startMarker = "review_origin: ";
-  const endMarker = "Normalized action evidence";
-  const start = evidence.indexOf(startMarker);
-  const end = evidence.indexOf(endMarker, start);
-  if (start < 0 || end < 0) throw new Error("classifier trust context missing");
-  return evidence.slice(start, end);
 }
 
 function subagentCreateCall(
@@ -406,6 +398,7 @@ function startFakeGateway(
         }
         return permissionDecision(options.classifierDecision ?? "clear");
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body, headers: req.headers });
       const response = responses.shift();
       if (!response) return new Response("unexpected request", { status: 500 });
@@ -414,7 +407,7 @@ function startFakeGateway(
   });
   const gateway = {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
     stop() {
@@ -816,7 +809,7 @@ function normalizeVolatileStatusRows(grid: string[]): string[] {
     /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
-      : line.replace(/\s+YOLO enabled: fx permission checks disabled$/, "")
+      : line.replace(/\s+Full access enabled: fx permission checks disabled$/, "")
   );
 }
 
@@ -824,8 +817,8 @@ test("volatile token status rows normalize before transcript grid comparison", (
   expect(normalizeVolatileStatusRows(["  (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows(["  0s (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows([
-    "YOLO · gpt-5                 YOLO enabled: fx permission checks disabled",
-  ])).toEqual(["YOLO · gpt-5"]);
+    "full access · gpt-5                 Full access enabled: fx permission checks disabled",
+  ])).toEqual(["full access · gpt-5"]);
 });
 
 describe("effect-aware command permissions", () => {
@@ -918,7 +911,7 @@ describe("effect-aware command permissions", () => {
         ],
         { cwd: root.workspace, env: gatewayEnv(root, cliResumeGateway) },
       );
-      expect(cliResume.code).toBe(0);
+      expect(cliResume.code, cliResume.stdout + cliResume.stderr).toBe(0);
       expect(cliResume.stderr).toBe("");
       expect(cliResumeGateway.requests).toHaveLength(1);
       expectGroupedContinuationRequest(cliResumeGateway.requests[0]!.body, feedback);
@@ -1233,7 +1226,7 @@ describe("effect-aware command permissions", () => {
       expectNoOutputRows(completed);
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.waitForText("FXC110_FAILED_STDERR", TIMEOUT);
       const full = await activeSession.capturePane();
       expect(full).toContain("FXC110_FAST_STDOUT");
@@ -1242,7 +1235,10 @@ describe("effect-aware command permissions", () => {
       expect(full).toContain("FXC110_FAILED_STDERR");
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("3 tool calls", TIMEOUT);
+      await activeSession.waitForPane(
+        pane => pane.includes("3 tool calls") && !pane.includes("full detail · ctrl+o close"),
+        TIMEOUT,
+      );
       expectNoOutputRows(await activeSession.captureFullScrollback());
       await activeSession.resizeWindow(64, 28);
       expectNoOutputRows(await activeSession.captureFullScrollback());
@@ -1264,7 +1260,7 @@ describe("effect-aware command permissions", () => {
       expectNoOutputRows(await activeSession.captureFullScrollback());
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.waitForText("FXC110_FAILED_STDERR", TIMEOUT);
       let resumedFull = await activeSession.capturePane();
       await activeSession.sendHexBytes(["1b", "5b", "35", "7e"]);
@@ -1418,14 +1414,14 @@ describe("effect-aware command permissions", () => {
       const losslessGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.waitForText(losslessRows[6]!, TIMEOUT);
       const losslessFull = await activeSession.capturePane();
       const losslessFullOutput = commandOutputText(losslessFull);
       for (const row of losslessRows) expect(losslessFullOutput).toContain(`│ ${row}`);
       expect(losslessFullOutput).not.toContain("<stdout>");
       expect(losslessFullOutput).not.toContain("</stdout>");
-      expect(losslessFullOutput).not.toContain("lines more (ctrl o");
+      expect(losslessFullOutput).not.toContain("lines more (ctrl+o");
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("DIRECT_LOSSLESS_DONE", TIMEOUT);
       expect(normalizeVolatileStatusRows(await activeSession.capturePaneGrid())).toEqual(
@@ -1447,7 +1443,7 @@ describe("effect-aware command permissions", () => {
       const lossyGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.sendHexBytes(["1b", "5b", "36", "7e"]);
       await activeSession.waitForText(lossyRows[7]!, TIMEOUT);
       const lossyFull = await activeSession.capturePane();
@@ -1517,7 +1513,7 @@ describe("effect-aware command permissions", () => {
       expect(resumedCompactOutput).toBe("");
       for (const row of lossyRows) expect(resumedCompact).not.toContain(`│ ${row}`);
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.sendHexBytes(["1b", "5b", "36", "7e"]);
       await activeSession.waitForText(lossyRows[7]!, TIMEOUT);
       const resumedFull = await activeSession.capturePane();
@@ -1584,7 +1580,7 @@ describe("effect-aware command permissions", () => {
       for (const row of commandRows) expect(compact).not.toContain(`│ ${row}`);
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       await activeSession.waitForText(commandRows.at(-1)!, TIMEOUT);
       const full = await activeSession.capturePane();
       for (const row of commandRows) expect(full).toContain(`│ ${row}`);
@@ -1597,19 +1593,19 @@ describe("effect-aware command permissions", () => {
       expect(extractResponses(beforeSlashCommands)).toEqual(responseRows);
 
       await activeSession.sendText("/sound on");
-      await activeSession.waitForText("● Sound: on", TIMEOUT);
+      await activeSession.waitForText("* sound: on", TIMEOUT);
       await activeSession.sendText("/settings");
-      await activeSession.waitForText("←→ Change", TIMEOUT);
+      await activeSession.waitForText("←→ change", TIMEOUT);
       await activeSession.sendKeys("Escape");
       await activeSession.waitForPane(
-        (pane) => !pane.includes("←→ Change"),
+        (pane) => !pane.includes("←→ change"),
         TIMEOUT,
       );
       await activeSession.waitForText(responseRows.at(-1)!, TIMEOUT);
 
       const afterSlashCommands = await activeSession.captureFullScrollback();
       expect(extractResponses(afterSlashCommands)).toEqual(responseRows);
-      expect(afterSlashCommands.indexOf("● Sound: on")).toBeGreaterThan(
+      expect(afterSlashCommands.indexOf("* sound: on")).toBeGreaterThan(
         afterSlashCommands.indexOf(responseRows.at(-1)!),
       );
       expect(afterSlashCommands).toContain("Ran printf");
@@ -1677,7 +1673,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI trace distinguishes rejected edits from failed commands",
+    "TUI trace distinguishes failed edits from failed commands",
     async () => {
       const root = createIsolatedRoot();
       const fixturePath = join(root.workspace, "duplicate.txt");
@@ -1686,11 +1682,16 @@ describe("effect-aware command permissions", () => {
       writeFileSync(stderrPath, "");
       installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
       const gateway = startFakeGateway([
+        gatewayToolCall("subagent", {
+          request: { action: "run", task: "Run the prepared child diagnostic command." },
+        }, "trace_child"),
+        toolCall("printf child-trace-output", {}, "trace_child_command"),
+        finalText("child diagnostic complete"),
         gatewayToolCall("edit_file", {
           path: "duplicate.txt",
           old_string: "same",
           new_string: "new",
-        }, "trace_edit_rejected"),
+        }, "trace_edit_failed"),
         toolCall("exit 7", {}, "trace_command_failed"),
         finalText("diagnostic fixture complete"),
       ]);
@@ -1702,6 +1703,9 @@ describe("effect-aware command permissions", () => {
           PATH: hostilePath(root),
           TMPDIR: root.root,
           FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
         }),
         stderrPath,
         width: 120,
@@ -1721,11 +1725,17 @@ describe("effect-aware command permissions", () => {
       );
       const report = readFileSync(latestTraceReportPath(root), "utf8");
 
-      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests).toHaveLength(6);
       expect(report).toContain(
-        "last=2 succeeded=0 rejected=1 command_failed=1 tool_failed=0 runtime_failed=0",
+        "last=4 succeeded=2 rejected=0 command_failed=1 tool_failed=1 runtime_failed=0",
       );
-      expect(report).toContain("name=edit_file outcome=rejected");
+      const localCalls = report.split("## Tool Calls\n### Local\n")[1]?.split("### Web Search")[0];
+      expect(localCalls).toBeDefined();
+      expect(localCalls).toMatch(/name=shell outcome=succeeded duration=\d+ms source=subagent#1\n/);
+      expect(localCalls).toMatch(/name=subagent outcome=succeeded duration=\d+ms source=parent\n/);
+      expect(localCalls).toMatch(/name=shell outcome=command_failed duration=\d+ms source=parent\n/);
+      expect(localCalls).toMatch(/name=edit_file outcome=tool_failed duration=\d+ms source=parent\n/);
+      expect(report).toContain("name=edit_file outcome=tool_failed");
       expect(report).toContain("name=shell outcome=command_failed");
       expect(report).not.toContain("name=edit_file outcome=runtime_failed");
       expect(report).not.toContain("name=shell outcome=runtime_failed");
@@ -1807,7 +1817,10 @@ describe("effect-aware command permissions", () => {
     "TUI creates a private Markdown trace without a feedback CTA",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startFakeGateway([]);
+      const gateway = startFakeGateway([finalText(
+        Array.from({ length: 80 }, (_, index) => `TRACE_RENDER_ROW_${index}\n`).join("") +
+          "TRACE_RENDER_DONE",
+      )]);
       const stderrPath = join(root.root, "trace-report-stderr.log");
       const clipboardPath = join(root.root, "trace-clipboard-path.txt");
       installClipboardFixture(
@@ -1823,12 +1836,20 @@ describe("effect-aware command permissions", () => {
           PATH: hostilePath(root),
           TMPDIR: root.root,
           FX_TRACE_CLIPBOARD_OUTPUT: clipboardPath,
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
         }),
         stderrPath,
         width: 120,
         height: 40,
       });
       await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Render the trace fixture.");
+      await activeSession.waitForText("TRACE_RENDER_DONE", TIMEOUT);
+      await activeSession.waitForStableComposer(TIMEOUT);
+      await activeSession.resizeWindow(100, 32);
+      await activeSession.waitForStableComposer(TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin"
@@ -1847,6 +1868,16 @@ describe("effect-aware command permissions", () => {
       expect(report).toContain("# fx trace");
       expect(report).toContain("## Summary");
       expect(report).toContain(root.workspace);
+      expect(report).toContain("terminal_hosts: tmux=true");
+      expect(report).toContain("projection: view=");
+      const rendererEvents = report.split("## Recent Renderer Events\n")[1]?.split("## Transcript Timeline")[0];
+      expect(rendererEvents).toBeDefined();
+      expect(rendererEvents).toContain("kind=transition");
+      expect(rendererEvents).toContain("kind=commit");
+      expect(rendererEvents).toContain("kind=resize");
+      expect(rendererEvents).not.toContain("TRACE_RENDER_ROW_");
+      expect(rendererEvents).not.toContain("[truncated]");
+      expect(existsSync(join(root.home, ".fx", "logs", "trace.log"))).toBe(false);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
       if (process.platform === "darwin") {
         expect(readFileSync(clipboardPath, "utf8")).toBe(reportPath);
@@ -1959,7 +1990,7 @@ describe("effect-aware command permissions", () => {
       const compactGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
       const fullTranscript = await activeSession.capturePane();
       expect(fullTranscript).not.toContain("Auto agent approved this request");
       expect(fullTranscript.indexOf("└ Ran")).toBeGreaterThanOrEqual(0);
@@ -2263,7 +2294,7 @@ describe("effect-aware command permissions", () => {
         expect(scrollback).not.toContain("FX_FOREGROUND_EXEC_FAILED");
 
         await activeSession.sendKeys("C-o");
-        await activeSession.waitForText("Full detail · ctrl o close", TIMEOUT);
+        await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
         await activeSession.waitForText("TTY_SESSION_STDERR", TIMEOUT);
         const full = await activeSession.capturePane();
         expect(full).toContain("TTY_SESSION_STDOUT_BEGIN");
@@ -2427,7 +2458,7 @@ describe("effect-aware command permissions", () => {
           finalText("Reviewer unavailable handled normally."),
         ],
         {
-          classifierResponses: [finalText("invalid")],
+          classifierResponses: [finalText("invalid"), finalText("invalid")],
         },
       );
       const tracePath = join(root.root, "trace.log");
@@ -2457,7 +2488,7 @@ describe("effect-aware command permissions", () => {
       expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(5);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(2);
       const trace = readFileSync(tracePath, "utf8");
       expect(
         trace.match(/decision=unavailable fallback_reason=completion_text/g),
@@ -2559,7 +2590,7 @@ describe("effect-aware command permissions", () => {
       }
       expect(gateway.classifierRequests).toHaveLength(1);
 
-      await activeSession.sendKeys("Escape");
+      await activeSession.sendInterruptEscapePair(TIMEOUT);
       const cancelDeadline = Date.now() + TIMEOUT;
       while (
         (!existsSync(tracePath) || !readFileSync(tracePath, "utf8").includes("fallback_reason=Cancelled")) &&
@@ -2887,7 +2918,7 @@ describe("effect-aware command permissions", () => {
         toolCall("touch must-not-exist"),
         finalText("permission resume denial complete"),
       ]);
-      await resumed.session.waitForText("● Session resumed", TIMEOUT);
+      await resumed.session.waitForText("* session resumed", TIMEOUT);
       await resumed.session.waitForText("ask · gpt-5", TIMEOUT);
       await resumed.session.sendText("Create the marker after resuming.");
 
@@ -2907,7 +2938,7 @@ describe("effect-aware command permissions", () => {
 
       const resumedScrollback = await resumed.session.captureFullScrollback();
       expect(resumedScrollback).toContain("permission resume seed complete");
-      expect(resumedScrollback).toContain("● Session resumed");
+      expect(resumedScrollback).toContain("* session resumed");
     },
     90_000,
   );
@@ -3188,6 +3219,17 @@ describe("effect-aware command permissions", () => {
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
+      const classifierPrompt = JSON.parse(
+        gateway.classifierRequests[0]!.body,
+      ).prompt as Array<{ role: string }>;
+      const firstConversationIndex = classifierPrompt.findIndex(
+        (message) => message.role !== "system",
+      );
+      expect(classifierPrompt[0]?.role).toBe("system");
+      expect(firstConversationIndex).toBeGreaterThan(0);
+      expect(
+        classifierPrompt.slice(firstConversationIndex).map((message) => message.role),
+      ).not.toContain("system");
       expect(gateway.classifierRequests[0]!.headers.get("ai-language-model-id")).toBe(
         "openai/gpt-5.6-luna",
       );
@@ -3221,8 +3263,77 @@ describe("effect-aware command permissions", () => {
     TIMEOUT,
   );
 
+  test.skipIf(!tmuxAvailable())(
+    "TUI review response commentary permits the exact config edit and later turns",
+    async () => {
+      const root = createIsolatedRoot();
+      const target = join(root.root, "ghostty-config");
+      const before = "macos-titlebar-style = tabs\n";
+      const after = "macos-titlebar-style = native\n";
+      writeFileSync(target, before);
+      const gateway = startFakeGateway([
+        gatewayToolCall("edit_file", { path: target, old_string: before, new_string: after }, "titlebar_edit"),
+        finalText("Native titlebar set."),
+        finalText("The next turn works."),
+      ], {
+        classifierResponses: [fakeGatewaySerializedToolCall(
+          "review", "permission_decision", '{"decision":"clear"}',
+          "This is a benign local config edit.",
+        )],
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN, cwd: root.workspace,
+        env: gatewayEnv(root, gateway, { FX_PERMISSION_MODE: "auto" }),
+        stderrPath, width: 120, height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Change the titlebar to native.");
+      await activeSession.waitForText("Native titlebar set.", TIMEOUT);
+      expect(readFileSync(target, "utf8")).toBe(after);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1].body).not.toContain("tool_review_held");
+      const scrollback = await activeSession.captureFullScrollback();
+      expect(scrollback).toContain("Edited");
+      expect(scrollback).not.toContain("Review unavailable");
+      expect(scrollback).not.toContain(COMMAND_APPROVAL_PROMPT);
+      await activeSession.sendText("Confirm the next turn.");
+      await activeSession.waitForText("The next turn works.", TIMEOUT);
+      expect(gateway.requests).toHaveLength(3);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+    }, TIMEOUT,
+  );
+
   test(
-    "fx ask does not retry a malformed classifier completion and safely replans",
+    "fx ask review response recovery executes only once after malformed text",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "recovered-action.txt");
+      const gateway = startFakeGateway([
+        toolCall(`printf 'one\\n' >> ${JSON.stringify(marker)}`),
+        (body) => {
+          expect(body).not.toContain("tool_review_held");
+          return finalText("Recovered action completed.");
+        },
+      ], { classifierResponses: [finalText("This looks safe."), permissionDecision("clear")] });
+      const result = await runFx(["ask", "--json", "--quiet", "--no-save", "--auto", "Run the requested action once."], {
+        cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("Recovered action completed.");
+      expect(readFileSync(marker, "utf8")).toBe("one\n");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(gateway.classifierRequests[0].body).toBe(gateway.classifierRequests[1].body);
+    }, TIMEOUT,
+  );
+
+  test(
+    "fx ask safely replans after bounded malformed classifier recovery",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-malformed-must-not-run.txt");
@@ -3238,7 +3349,7 @@ describe("effect-aware command permissions", () => {
           finalText("classifier recovery complete"),
         ],
         {
-          classifierResponses: [finalText("accept")],
+          classifierResponses: [finalText("accept"), finalText("accept")],
         },
       );
       const tracePath = join(root.root, "trace.log");
@@ -3258,9 +3369,9 @@ describe("effect-aware command permissions", () => {
       expect(result.code).toBe(0);
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(3);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(2);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
       expect(trace).toContain("fallback_reason=completion_text");
@@ -3270,7 +3381,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask returns one malformed classifier completion to the agent without execution",
+    "fx ask returns persistent malformed classifier output without execution",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-fallback-must-not-exist.txt");
@@ -3281,10 +3392,11 @@ describe("effect-aware command permissions", () => {
           (body) => {
             expect(body).toContain("review_unavailable");
             expect(body).toContain('\\"review_cause\\":\\"completion_text\\"');
+            expect(body).toContain("Safety reviewer returned an invalid response; action held");
             return finalText("classifier fallback handled");
           },
         ],
-        { classifierResponses: [finalText("accept")] },
+        { classifierResponses: [finalText("accept"), finalText("accept")] },
       );
       const tracePath = join(root.root, "trace.log");
 
@@ -3304,9 +3416,9 @@ describe("effect-aware command permissions", () => {
       expect(result.stdout).toContain("classifier fallback handled");
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(2);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
       expect(trace).toContain("fallback_reason=completion_text");
@@ -3332,7 +3444,7 @@ describe("effect-aware command permissions", () => {
         ],
         {
           classifierResponses: Array.from(
-            { length: 1 },
+            { length: 2 },
             () => new Response("provider unavailable", { status: 502 }),
           ),
         },
@@ -3355,9 +3467,10 @@ describe("effect-aware command permissions", () => {
       expect(result.stdout).toContain("provider failure handled");
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(2);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
+      expect(trace.match(/event=auto_review_transport_retry/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
       expect(trace).toContain(

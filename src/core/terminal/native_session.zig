@@ -20,7 +20,6 @@ const io_mod = @import("../shared/io.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
-const workspace_pathing = @import("../workspace/pathing.zig");
 
 const Allocator = std.mem.Allocator;
 

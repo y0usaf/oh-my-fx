@@ -5173,23 +5173,6 @@ fn appendStoredResultFallback(
     return true;
 }
 
-fn appendSavedResultUnavailable(
-    alloc: Allocator,
-    walker: *ProjectionRowWalker,
-    styles: transcript_blocks.Styles,
-    line_prefix: []const u8,
-) !bool {
-    var line: std.Io.Writer.Allocating = .init(alloc);
-    defer line.deinit();
-    try writeSecondaryPrefixedLine(
-        &line.writer,
-        styles,
-        line_prefix,
-        "Full saved result unavailable.",
-    );
-    return walker.append(line.written());
-}
-
 fn appendPermanentCommandUnavailable(
     walker: *ProjectionRowWalker,
     styles: transcript_blocks.Styles,
@@ -6427,6 +6410,26 @@ fn appendTerminalSafeToolOutputInterruptible(
     if (wrapped.len > 0 or ends_with_newline) try writer.writeByte('\n');
 }
 
+/// Heading rows carry SGR styling; compare the argument against their plain
+/// text. Truncation past the buffer reports not-visible, which keeps the
+/// argument row (the safe direction).
+fn containsIgnoringSgr(haystack: []const u8, needle: []const u8) bool {
+    var plain_buf: [4096]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < haystack.len and n < plain_buf.len) {
+        const next = display_width.ansiSequenceEnd(haystack, i);
+        if (next != i) {
+            i = next;
+            continue;
+        }
+        plain_buf[n] = haystack[i];
+        n += 1;
+        i += 1;
+    }
+    return std.mem.find(u8, plain_buf[0..n], needle) != null;
+}
+
 fn argumentVisibleInToolHeading(
     entries: []const transcript_blocks.TranscriptEntry,
     entry_id: u32,
@@ -6440,7 +6443,7 @@ fn argumentVisibleInToolHeading(
             .raw_bytes => |candidate| candidate,
             else => return false,
         };
-        if (raw.class != .tool_status or std.mem.find(u8, raw.bytes, value) == null) return false;
+        if (raw.class != .tool_status or !containsIgnoringSgr(raw.bytes, value)) return false;
         return display_width.visibleWidthIgnoringAnsi(raw.bytes) <= cols;
     }
     return false;
@@ -6848,4 +6851,13 @@ fn appendTerminalSafeIndented(writer: *std.Io.Writer, alloc: Allocator, raw: []c
     try stream.append(writer, raw);
     try stream.finish(writer);
     if (!stream.line_start) try writer.writeByte('\n');
+}
+
+test "containsIgnoringSgr matches arguments inside styled tool headings" {
+    const styled = "● Ran\x1b[0m \x1b[38;5;245mprintf \x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m\x1b[0m";
+    try std.testing.expect(containsIgnoringSgr(styled, "printf 'hello world'"));
+    try std.testing.expect(containsIgnoringSgr(styled, "Ran"));
+    try std.testing.expect(!containsIgnoringSgr(styled, "missing"));
+    try std.testing.expect(containsIgnoringSgr("plain row", "plain"));
+    try std.testing.expect(containsIgnoringSgr("\x1b[38;5;245m", "x") == false);
 }

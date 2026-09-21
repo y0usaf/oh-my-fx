@@ -63,14 +63,19 @@ pub fn streamModelCompletion(
     };
     var request = request_value;
     request.admission = .{ .context = &admission, .admit_fn = InvocationAdmission.admit };
-    var result = provider.stream(alloc, request) catch |err| {
+    // Only the owned result escapes. HTTP and parser scratch is released after
+    // every attempt, including transport failure and cancellation.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer scratch.deinit();
+    const request_alloc = scratch.allocator();
+    var result = provider.stream(request_alloc, request) catch |err| {
         runtime_telemetry.recordGatewayCallMetric(request.model, started_at_ms, 0, 0, 0, 0, request.trace_ctx.turn_id, request.trace_ctx.step_id, request.trace_ctx.subagent_id, @errorName(err), "");
         if (admission.observation) |observation| try observation.fail(
             if (request.delivery.load() == .possibly_sent) .ambiguous_delivery else .unbilled,
         );
         return err;
     };
-    errdefer result.deinit(alloc);
+    defer result.deinit(request_alloc);
     const observation = admission.observation orelse
         return agent_stream_provider.failResult(error.ProviderAdmissionMissing);
 
@@ -101,7 +106,10 @@ pub fn streamModelCompletion(
             }
         },
     }
-    return result;
+    return switch (result) {
+        .completed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
+        .failed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
+    };
 }
 
 fn recordProviderResultMetric(
@@ -152,6 +160,67 @@ fn recordProviderResultMetric(
     );
 }
 
+test "gateway request scratch is released across success failure cancellation and retries" {
+    const Fake = struct {
+        mode: usize = 0,
+
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !StreamResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            const payload = try alloc.alloc(u8, 64 * 1024);
+            defer alloc.free(payload);
+            @memset(payload, 'x');
+            const content = try alloc.dupe(u8, "owned response");
+            if (self.mode == 1 or self.mode == 2) {
+                defer alloc.free(content);
+                return if (self.mode == 1) error.ConnectionResetByPeer else error.Cancelled;
+            }
+            if (self.mode == 3) return .{ .failed = .{ .kind = .server_error, .detail = content, .ownership = .owned } };
+            return .{ .completed = .{ .completion = .{ .content = content }, .ownership = .owned } };
+        }
+
+        fn emit(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+    var turn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer turn.deinit();
+    var fake: Fake = .{};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    for (0..1000) |attempt| {
+        fake.mode = attempt % 4;
+        var delivery = DeliveryCertainty.init();
+        var evidence: AttemptEvidence = .{};
+        const result = streamModelCompletion(.{ .context = &fake, .stream_fn = Fake.stream }, turn.allocator(), .{
+            .credential = .{ .direct = .{ .secret_bytes = "fixture-key", .source = .ai_gateway_api_key } },
+            .model = "fixture-model",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .events = .{ .context = &fake, .emit_fn = Fake.emit },
+            .cancel_flag = &cancel,
+            .provider_attempt_owner = .agent,
+        }, null, std.testing.allocator);
+        if (fake.mode == 1) {
+            try std.testing.expectError(error.ConnectionResetByPeer, result);
+        } else if (fake.mode == 2) {
+            try std.testing.expectError(error.Cancelled, result);
+        } else {
+            var owned = try result;
+            defer owned.deinit(turn.allocator());
+            const content = switch (owned) {
+                .completed => |completed| completed.completion.content.?,
+                .failed => |failure| failure.detail.?,
+            };
+            try std.testing.expectEqualStrings("owned response", content);
+        }
+        try std.testing.expect(turn.queryCapacity() < 128 * 1024);
+    }
+}
+
 fn failureMetricCode(kind: agent_stream_provider.FailureKind) u16 {
     return switch (kind) {
         .invalid_request => 400,
@@ -174,17 +243,166 @@ fn clampTokenCount(value: ?u64) u32 {
 
 pub const VisionToolMode = agent_stream_provider.VisionMode;
 
-pub fn recordSelectedDynamicTool(
+pub const ToolImageProjection = struct {
+    messages: []const types.ChatMessage,
+    /// True when at least one stored tool image was withheld from the request.
+    stripped: bool,
+};
+
+/// Projects stored tool images into the request only when the model accepts
+/// inline image input. Otherwise the images stay in the session image store
+/// and the tool message explains exactly why they were withheld and what the
+/// model can do instead, so the next step is never a dead end.
+pub fn projectToolImageMessages(
     alloc: Allocator,
-    names: *std.ArrayList([]const u8),
-    tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
-    execution: ToolExecutionResult,
-) !void {
-    const name = execution.selected_dynamic_tool_name orelse return;
-    const schema_json = execution.selected_dynamic_tool_schema_json orelse return;
-    for (names.items) |existing| {
-        if (std.mem.eql(u8, existing, name)) return;
+    messages: []const types.ChatMessage,
+    image_input_support: model_capabilities.ImageInputSupport,
+    vision_fallback_available: bool,
+    text_limit: usize,
+) !ToolImageProjection {
+    if (image_input_support == .native) return .{ .messages = messages, .stripped = false };
+    const has_images = for (messages) |message| {
+        if (message.tool_result_memory) |memory| if (memory.tool_images.len > 0 or memory.tool_image_handle != null) break true;
+    } else false;
+    if (!has_images) return .{ .messages = messages, .stripped = false };
+    const notice: []const u8 = switch (image_input_support) {
+        .native => unreachable,
+        .non_native => if (vision_fallback_available)
+            "[Tool images were retained but not sent: this model receives image input through the vision tool, not inline. Call vision with the image file's local path to inspect it.]\n"
+        else
+            "[Tool images were retained but not sent: this model does not accept inline images and no vision fallback is available. Ask the user to attach the image directly or switch to a vision-capable model.]\n",
+        .unknown => "[Tool images were retained but not sent: fx could not confirm image input support for this model (the model is not listed in the model catalog, or the catalog is unavailable). This can recover later in the session, so a retry may succeed; otherwise ask the user to attach the image directly.]\n",
+    };
+    const projected = try alloc.dupe(types.ChatMessage, messages);
+    for (projected) |*message| {
+        if (message.tool_result_memory) |*memory| {
+            if (memory.tool_images.len == 0 and memory.tool_image_handle == null) continue;
+            memory.tool_images = &.{};
+            const content = message.content orelse "";
+            const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, text_limit -| notice.len);
+            memory.truncated = memory.truncated or keep < content.len;
+            message.content = try std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, text_limit)], content[0..keep] });
+        }
     }
+    return .{ .messages = projected, .stripped = true };
+}
+
+test "projectToolImageMessages passes images through for native models" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "shot",
+        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .native, false, 1024);
+    try std.testing.expect(!projected.stripped);
+    try std.testing.expect(projected.messages.ptr == (&messages).ptr);
+}
+
+test "projectToolImageMessages explains the vision fallback for non native models" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "shot",
+        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .non_native, true, 1024);
+    defer {
+        for (projected.messages) |message| alloc.free(message.content.?);
+        alloc.free(projected.messages);
+    }
+    try std.testing.expect(projected.stripped);
+    const memory = projected.messages[0].tool_result_memory.?;
+    try std.testing.expectEqual(@as(usize, 0), memory.tool_images.len);
+    try std.testing.expect(std.mem.startsWith(u8, projected.messages[0].content.?, "[Tool images were retained but not sent: this model receives image input through the vision tool"));
+    try std.testing.expect(std.mem.find(u8, projected.messages[0].content.?, "shot") != null);
+}
+
+test "projectToolImageMessages tells the truth when the catalog is unavailable" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "shot",
+        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .unknown, true, 1024);
+    defer {
+        for (projected.messages) |message| alloc.free(message.content.?);
+        alloc.free(projected.messages);
+    }
+    try std.testing.expect(projected.stripped);
+    const content = projected.messages[0].content.?;
+    try std.testing.expect(std.mem.find(u8, content, "could not confirm image input support") != null);
+    try std.testing.expect(std.mem.find(u8, content, "does not support image input") == null);
+}
+
+test "projectToolImageMessages names the dead end when no fallback exists" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "shot",
+        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .non_native, false, 1024);
+    defer {
+        for (projected.messages) |message| alloc.free(message.content.?);
+        alloc.free(projected.messages);
+    }
+    try std.testing.expect(projected.stripped);
+    const content = projected.messages[0].content.?;
+    try std.testing.expect(std.mem.find(u8, content, "no vision fallback is available") != null);
+}
+
+test "projectToolImageMessages leaves image free history untouched" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "plain",
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .unknown, false, 1024);
+    try std.testing.expect(!projected.stripped);
+    try std.testing.expect(projected.messages.ptr == (&messages).ptr);
+}
+
+pub fn snapshotDynamicTools(alloc: Allocator, deps: *const @import("deps.zig").AgentRuntimeDeps, selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool)) ![]const agent_stream_provider.DynamicFunctionTool {
+    var offered: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    errdefer offered.deinit(alloc);
+    const count = selected.items.len;
+    for (0..count) |index| {
+        const tool = selected.items[index];
+        if (tool.mcp_binding) |binding| {
+            const snapshot = deps.snapshot_mcp_definition orelse continue;
+            switch (try snapshot(deps.ctx, alloc, tool.name, binding)) {
+                .current => {},
+                .unavailable => continue,
+                .updated => |definition| {
+                    if (!std.mem.eql(u8, definition.name, tool.name) or definition.mcp_binding == null) return error.InvalidToolSchema;
+                    try recordSelectedDynamicTool(alloc, selected, definition);
+                    try offered.append(alloc, selected.items[index]);
+                    continue;
+                },
+            }
+        }
+        try offered.append(alloc, tool);
+    }
+    return offered.toOwnedSlice(alloc);
+}
+
+pub fn recordSelectedDynamicTools(alloc: Allocator, tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool), execution: ToolExecutionResult) !void {
+    for (execution.retired_dynamic_tool_names) |name| {
+        for (tools.items, 0..) |tool, index| {
+            if (std.mem.eql(u8, name, tool.name)) {
+                _ = tools.orderedRemove(index);
+                break;
+            }
+        }
+    }
+    for (execution.selected_dynamic_tools) |selected| try recordSelectedDynamicTool(alloc, tools, selected);
+}
+
+fn recordSelectedDynamicTool(alloc: Allocator, tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool), selected: @import("../../tooling/tool_mcp_runtime.zig").SelectedTool) !void {
+    const name = selected.name;
+    const schema_json = selected.schema_json;
     const schema = try std.json.parseFromSliceLeaky(
         std.json.Value,
         alloc,
@@ -200,12 +418,15 @@ pub fn recordSelectedDynamicTool(
     {
         return error.InvalidToolSchema;
     }
-    try names.append(alloc, name);
-    try tools.append(alloc, .{
-        .name = name,
-        .description = description.string,
-        .input_schema = input_schema,
-    });
+    for (tools.items) |*existing| {
+        if (std.mem.eql(u8, existing.name, name)) {
+            existing.description = description.string;
+            existing.input_schema = input_schema;
+            existing.mcp_binding = selected.mcp_binding;
+            return;
+        }
+    }
+    try tools.append(alloc, .{ .name = name, .description = description.string, .input_schema = input_schema, .mcp_binding = selected.mcp_binding });
 }
 
 pub fn gatewayHttpErrorDetail(
@@ -588,4 +809,91 @@ test "provider-local exact usage reaches session accounting" {
     try std.testing.expectEqualStrings("codex/gpt-test", snapshot.models[0].model);
     try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.publication_backlog.len);
+}
+
+test "selected MCP schemas replace old definitions without duplicate names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try recordSelectedDynamicTools(alloc, &tools, .{
+        .model_output = "selected",
+        .selected_dynamic_tools = &.{
+            .{ .name = "mcp_fixture_lookup", .schema_json =
+            \\{"name":"mcp_fixture_lookup","description":"Lookup","inputSchema":{"type":"object","properties":{"old_value":{"type":"string"}}}}
+            },
+            .{ .name = "mcp_fixture_other", .schema_json =
+            \\{"name":"mcp_fixture_other","description":"Other","inputSchema":{"type":"object"}}
+            },
+        },
+    });
+    try recordSelectedDynamicTools(alloc, &tools, .{
+        .model_output = "selected",
+        .selected_dynamic_tools = &.{.{ .name = "mcp_fixture_lookup", .schema_json =
+        \\{"name":"mcp_fixture_lookup","description":"Updated lookup","inputSchema":{"type":"object","properties":{"new_value":{"type":"string"}}}}
+        }},
+    });
+    try std.testing.expectEqual(@as(usize, 2), tools.items.len);
+    try std.testing.expectEqualStrings("Updated lookup", tools.items[0].description);
+    const properties = tools.items[0].input_schema.object.get("properties").?.object;
+    try std.testing.expect(properties.contains("new_value"));
+    try std.testing.expect(!properties.contains("old_value"));
+}
+
+test "invalid writer at provider completion prevents delivery of executable tool calls" {
+    const Sink = struct {
+        calls: usize = 0,
+        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 2) return error.SessionPersistenceUncertain;
+        }
+    };
+    const Provider = struct {
+        fn stream(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
+            try request.admission.admit();
+            return .{ .completed = .{
+                .completion = .{ .tool_calls = try types.dupeToolCallSlice(alloc, &.{.{
+                    .id = "unsaved-tool",
+                    .name = "read_file",
+                    .arguments_json = "{}",
+                }}), .finish_reason = .tool_calls },
+                .ownership = .owned,
+            } };
+        }
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+    const alloc = std.testing.allocator;
+    var sink = Sink{};
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    usage.configureCheckpointSink(.{ .context = &sink, .allocator = alloc, .persist = Sink.persist });
+    var cancel = std.atomic.Value(bool).init(false);
+    var delivery = DeliveryCertainty.init();
+    var evidence: AttemptEvidence = .{};
+    var callback_ctx: u8 = 0;
+    try std.testing.expectError(error.SessionPersistenceUncertain, streamModelCompletion(
+        .{ .stream_fn = Provider.stream },
+        alloc,
+        .{
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
+            .model = "test/model",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .events = .{ .context = &callback_ctx, .emit_fn = Provider.event },
+            .cancel_flag = &cancel,
+        },
+        &usage,
+        alloc,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    try std.testing.expect(evidence.provider_admitted);
+    try std.testing.expect(usage.checkpoint_mutex.tryLock());
+    usage.checkpoint_mutex.unlock(io_mod.getIo());
 }

@@ -1,7 +1,8 @@
 const std = @import("std");
 const common = @import("common.zig");
-const feature_cache = @import("../feature_cache.zig");
+const catalog_freshness = @import("../catalog_freshness.zig");
 const mrtr = @import("../mrtr.zig");
+const mem_utils = @import("../../shared/mem_utils.zig");
 const sort_utils = @import("../../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -154,13 +155,13 @@ pub const CatalogBuilder = struct {
         }
         if (page.next_cursor) |cursor| {
             const owned = try alloc.dupe(u8, cursor);
-            errdefer alloc.free(owned);
+            errdefer mem_utils.free(alloc, owned);
             try self.cursors.put(owned, {});
         }
         self.pages = next_pages;
         if (self.first_received_at_ms == null) self.first_received_at_ms = received_at_ms;
         self.cache_scope = self.cache_scope orelse page.cache.scope;
-        const page_expiry = feature_cache.pageExpiry(
+        const page_expiry = catalog_freshness.pageExpiry(
             switch (self.protocol) {
                 .legacy => .legacy,
                 .modern => .modern,
@@ -169,7 +170,7 @@ pub const CatalogBuilder = struct {
             page.cache.ttl_present,
             page.cache.ttl_ms,
         );
-        self.expires_at_ms = feature_cache.earliestExpiry(self.expires_at_ms, page_expiry);
+        self.expires_at_ms = catalog_freshness.earliestExpiry(self.expires_at_ms, page_expiry);
         try self.prompts.ensureUnusedCapacity(alloc, page.prompts.len);
         for (page.prompts) |*prompt| {
             self.prompts.appendAssumeCapacity(prompt.*);
@@ -257,7 +258,7 @@ pub fn parseListPage(alloc: Allocator, response: []const u8, protocol: Protocol,
         }
         break :blk try alloc.dupe(u8, cursor.string);
     } else null;
-    errdefer if (next_cursor) |cursor| alloc.free(cursor);
+    errdefer if (next_cursor) |cursor| mem_utils.free(alloc, cursor);
     return .{ .prompts = prompts, .next_cursor = next_cursor, .cache = try common.parseCacheHints(alloc, result) };
 }
 
@@ -427,11 +428,11 @@ fn parsePrompt(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Pr
         count += 1;
     }
     const owned_name = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned_name);
+    errdefer mem_utils.free(alloc, owned_name);
     const owned_title = if (title) |item| try alloc.dupe(u8, item) else null;
-    errdefer if (owned_title) |item| alloc.free(item);
+    errdefer if (owned_title) |item| mem_utils.free(alloc, item);
     const owned_description = if (description) |item| try alloc.dupe(u8, item) else null;
-    errdefer if (owned_description) |item| alloc.free(item);
+    errdefer if (owned_description) |item| mem_utils.free(alloc, item);
     const icons_json = if (value.object.get("icons")) |icons|
         try common.stringifyValueAlloc(
             alloc,
@@ -441,7 +442,7 @@ fn parsePrompt(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Pr
         )
     else
         null;
-    errdefer if (icons_json) |item| alloc.free(item);
+    errdefer if (icons_json) |item| mem_utils.free(alloc, item);
     const metadata_json = if (value.object.get("_meta")) |metadata|
         try common.stringifyValueAlloc(
             alloc,
@@ -470,7 +471,7 @@ fn parseArgument(alloc: Allocator, value: std.json.Value, limits: common.Limits)
         break :blk required_value.bool;
     } else false;
     const owned_name = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned_name);
+    errdefer mem_utils.free(alloc, owned_name);
     const owned_description = if (description) |item| try alloc.dupe(u8, item) else null;
     return .{ .name = owned_name, .description = owned_description, .required = required };
 }

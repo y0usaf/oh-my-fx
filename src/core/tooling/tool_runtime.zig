@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../skills/skill_contract.zig");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -32,7 +33,6 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const session_runtime = @import("../session/session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
-const session_codec_mod = @import("../session/session_codec.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_store = @import("../session/session_store.zig");
@@ -77,11 +77,6 @@ else
     struct {};
 const js_host_workspace = @import("../hosts/js_host_workspace.zig");
 
-const agent_test_support = if (builtin.is_test)
-    @import("../agent/runtime/tests/support.zig")
-else
-    struct {};
-
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
 const ChatMessage = types.ChatMessage;
@@ -89,28 +84,27 @@ const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolPermissionDecision = types.ToolPermissionDecision;
-const subagent_tool_name = "subagent";
 const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 const SessionRuntime = session_runtime.SessionRuntime;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
-const max_file_mutation_success_bytes: usize = 8 * 1024;
 
 const helpers = struct {
     const requiredStringArg = tool_args.requiredStringArg;
     const parseToolArgsObject = tool_args.parseToolArgsObject;
 };
 
-const optionalIntArg = tool_args.optionalIntArg;
 const parseToolArgsObject = helpers.parseToolArgsObject;
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
+const terminal_managed_observer = @import("../terminal/managed_observer.zig");
 
 test {
     _ = tool_admission;
     _ = command_result_mapping;
     _ = @import("../session/command_replay_store.zig");
+    _ = @import("../session/result_store.zig");
     _ = file_mutation_execution;
     _ = tool_presentation;
 }
@@ -127,7 +121,6 @@ pub const Context = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     api_key: []const u8,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
-    compaction_route: provider_set.CompactionRouteDecision = .{ .unavailable = .missing_policy },
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
@@ -139,6 +132,9 @@ pub const Context = struct {
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host_mod.SecretStore = host_mod.unavailable_secret_store,
     model: []const u8,
+    /// Resolved review-model override for automatic permission review. Empty
+    /// keeps the reviewer provider's compiled default.
+    reviewer_model: []const u8 = "",
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
     root_user_messages: []const []const u8 = &.{},
@@ -150,6 +146,11 @@ pub const Context = struct {
     agent_step_limit: usize,
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    /// Borrowed gateway provider routing inherited by subagent turns. Never
+    /// applied to tool-internal provider requests (vision, web search), which
+    /// keep gateway-default routing.
+    provider_order: []const []const u8 = &.{},
+    provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
     tool_registry: tool_dispatch.Registry = .{},
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
@@ -169,6 +170,7 @@ pub const Context = struct {
     session: *SessionRuntime,
     session_allocator: Allocator = std.heap.c_allocator,
     skills_dir: []const u8 = "",
+    skill_locations: ?*const skill_contract.Locations = null,
     context_limits: context_limits.Values = .{},
     context_registry: context_contract.Registry,
     context_enabled: bool = true,
@@ -192,12 +194,18 @@ pub const Context = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    mcp_snapshot_tool: ?tool_mcp_runtime.SnapshotToolFn = null,
     expected_mcp_runtime_generation: ?u64 = null,
+    expected_mcp_binding: ?types.McpToolBinding = null,
+    mcp_review_schema_json: ?[]const u8 = null,
     mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_progress_ctx: ?*anyopaque = null,
     on_mcp_progress: ?*const fn (*anyopaque, types.ToolLifecycleId, []const u8) void = null,
+    tool_progress_ctx: ?*anyopaque = null,
+    on_tool_progress: ?*const fn (*anyopaque, types.ToolLifecycleId, []const u8) void = null,
+    subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
@@ -214,6 +222,7 @@ pub const Context = struct {
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
     model_capability_resolver: ?model_capabilities.Resolver = null,
+    model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
@@ -239,17 +248,38 @@ pub const Context = struct {
             },
             .tool_registry = self.tool_registry,
             .worker = self.worker,
+            .mcp_review_schema_json = self.mcp_review_schema_json,
             .permission_prompter = self.permission_prompter,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
             .mcp_runtime = mcpRuntimeCapabilities(self),
             .context_limits = self.context_limits,
             .auto_classifier = self.admissionAutoClassifier(),
+            .terminal_review_context = self.terminalReviewContext(),
             .host_sandbox_default = self.host_sandbox_default,
         };
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
         }
         return input;
+    }
+
+    fn terminalReviewContext(self: Context) ?terminal_managed_observer.Context {
+        return .{
+            .alloc = self.session_allocator,
+            .lifecycle_allocator = self.session_allocator,
+            .terminal_client = self.terminal_client orelse return null,
+            .managed_runtime = self.managed_executions orelse return null,
+            .owner = self.session_child_capability orelse return null,
+            .durable_session_id = self.lifecycle_scope.session_id orelse return null,
+            .workspace_root = self.workspace_root,
+            .transport_role = switch (self.lifecycle_scope.kind) {
+                .interactive, .subagent => .interactive,
+                .ask => .headless,
+                .acp => .acp,
+            },
+            .max_output_bytes = self.max_command_output_bytes,
+            .cancel_flag = runtimeCancelFlag(self),
+        };
     }
 
     pub fn admissionInputWithLiveAuthority(
@@ -279,6 +309,7 @@ pub const Context = struct {
             .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
+            .reviewer_model = self.reviewer_model,
             .cancel_flag = self.cancel_flag,
             .usage = &self.session.usage,
             .usage_allocator = self.session_allocator,
@@ -355,6 +386,7 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
+    execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
     }
@@ -382,6 +414,7 @@ pub fn executeToolCallAuthorized(
     }
     execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
     execution_ctx.expected_mcp_runtime_generation = request.expected_mcp_runtime_generation;
+    execution_ctx.expected_mcp_binding = request.expected_mcp_binding;
     execution_ctx.current_turn_messages = request.current_turn_messages;
     execution_ctx.output_chunk_lifecycle_id = request.lifecycle_id;
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
@@ -431,6 +464,7 @@ pub fn executeToolCallAuthorized(
             .model_output = "",
             .outcome = classifyToolExecutionError(err),
             .started_at_ms = started_at_ms,
+            .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
@@ -438,11 +472,9 @@ pub fn executeToolCallAuthorized(
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .outcome = classifyReturnedToolCallOutcome(
-            uses_file_mutation_contract,
-            result,
-        ),
+        .outcome = classifyReturnedToolCallOutcome(result),
         .started_at_ms = started_at_ms,
+        .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
@@ -459,18 +491,27 @@ fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
 }
 
 fn classifyReturnedToolCallOutcome(
-    uses_file_mutation_contract: bool,
     result: ToolExecutionResult,
 ) diagnostics.ToolCallOutcome {
     if (result.status == .success) return .succeeded;
     if (result.command_result_json != null) return .command_failed;
-    if (uses_file_mutation_contract) return .rejected;
-    return .tool_failed;
+    // Only an explicit denial records a rejection. An authorized execution
+    // that failed — with or without a declared kind — is a tool failure, so
+    // a producer that forgets to declare a kind cannot silently masquerade
+    // as a rejection in diagnostics.
+    return switch (result.failure_kind) {
+        .denied => .rejected,
+        .none, .preflight, .apply => .tool_failed,
+    };
 }
 
 test "returned tool results retain diagnostic outcome identity" {
     const success = ToolExecutionResult{ .model_output = "ok" };
-    const rejection = ToolExecutionResult{ .model_output = "rejected", .status = .failure };
+    const rejection = ToolExecutionResult{
+        .model_output = "rejected",
+        .status = .failure,
+        .failure_kind = .denied,
+    };
     const command_failure = ToolExecutionResult{
         .model_output = "exit 7",
         .status = .failure,
@@ -480,19 +521,19 @@ test "returned tool results retain diagnostic outcome identity" {
 
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.succeeded,
-        classifyReturnedToolCallOutcome(false, success),
+        classifyReturnedToolCallOutcome(success),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.rejected,
-        classifyReturnedToolCallOutcome(true, rejection),
+        classifyReturnedToolCallOutcome(rejection),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.command_failed,
-        classifyReturnedToolCallOutcome(false, command_failure),
+        classifyReturnedToolCallOutcome(command_failure),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.tool_failed,
-        classifyReturnedToolCallOutcome(false, tool_failure),
+        classifyReturnedToolCallOutcome(tool_failure),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.rejected,
@@ -505,6 +546,47 @@ test "returned tool results retain diagnostic outcome identity" {
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.runtime_failed,
         classifyToolExecutionError(error.Unexpected),
+    );
+}
+
+test "executed file mutation failures classify as tool failures, not rejections" {
+    const preflight_failure = ToolExecutionResult{
+        .model_output = "edit_file failed: old_string not found in file",
+        .status = .failure,
+        .failure_kind = .preflight,
+    };
+    const apply_failure = ToolExecutionResult{
+        .model_output = "file mutation rejected because the file changed after preview; make a new tool call for a fresh preview",
+        .status = .failure,
+        .failure_kind = .apply,
+    };
+    const denied_failure = ToolExecutionResult{
+        .model_output = "file mutation execution requires prepared approval",
+        .status = .failure,
+        .failure_kind = .denied,
+    };
+    const undeclared_failure = ToolExecutionResult{
+        .model_output = "some producer forgot its kind",
+        .status = .failure,
+    };
+
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(preflight_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(apply_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.rejected,
+        classifyReturnedToolCallOutcome(denied_failure),
+    );
+    // A producer that does not declare a kind is still a tool failure; only
+    // explicit denials record rejections.
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(undeclared_failure),
     );
 }
 
@@ -755,11 +837,15 @@ fn executeRegisteredTool(
         .runtime = ctx,
         .authorized_image_catalog = authorized_image_catalog,
     };
-    var subagent_provider = SubagentProviderState{ .runtime = ctx };
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
     var dispatch_metadata: DispatchMetadata = .{};
+    var subagent_provider = SubagentProviderState{
+        .runtime = ctx,
+        .call = call,
+        .completion_sink = &dispatch_metadata.subagent_completion,
+    };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     dispatch_metadata.attach(&dispatch_ctx);
     var result_commit_token: ?result_commit.Token = null;
@@ -767,6 +853,7 @@ fn executeRegisteredTool(
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
         .expected_runtime_generation = ctx.expected_mcp_runtime_generation,
+        .expected_binding = ctx.expected_mcp_binding,
         .cancel_flag = dispatch_ctx.cancel_flag,
         .progress = .{
             .context = @ptrCast(&mcp_progress_bridge),
@@ -817,6 +904,7 @@ fn executeRegisteredTool(
     }
     if (mcp_execution_error) |err| {
         dispatched.deinit(arena);
+        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, arena, call.name);
         return err;
     }
 
@@ -835,8 +923,7 @@ fn executeRegisteredTool(
         execution.finish_turn = true;
         execution.status_detail = "McpInputRequired";
     }
-    execution.selected_dynamic_tool_name = selected_dynamic_tool_sink.name;
-    execution.selected_dynamic_tool_schema_json = selected_dynamic_tool_sink.schema_json;
+    execution.selected_dynamic_tools = selected_dynamic_tool_sink.tools.items;
     execution.context_notices = context_notice_sink.notices.items;
     execution.result_commit = result_commit_token;
     if (dispatch_ctx.cancel_flag) |cancel_flag| {
@@ -889,21 +976,22 @@ fn executeRunCommandBackend(
 }
 
 const DispatchMetadata = struct {
+    model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     status_detail: ?[]u8 = null,
     inner_usage: ?types.ToolUsage = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
+    subagent_completion: ?types.SubagentStatus = null,
     tool_result_memory: ?types.ToolResultMemory = null,
     command_result_json: ?[]const u8 = null,
-    turn_control: ?tool_dispatch.TurnControl = null,
 
     fn attach(self: *DispatchMetadata, ctx: *tool_dispatch.DispatchContext) void {
+        ctx.model_content_kind_sink = &self.model_content_kind;
         ctx.inner_usage_sink = &self.inner_usage;
         ctx.web_search_completion_sink = &self.web_search_completion;
         ctx.web_fetch_completion_sink = &self.web_fetch_completion;
         ctx.tool_result_memory_sink = &self.tool_result_memory;
         ctx.command_result_json_sink = &self.command_result_json;
-        ctx.turn_control_sink = &self.turn_control;
     }
 };
 
@@ -911,16 +999,23 @@ fn toolExecutionResultFromDispatch(
     result: tool_dispatch.AuthorizedDispatchResult,
     metadata: DispatchMetadata,
 ) ToolExecutionResult {
+    var memory = metadata.tool_result_memory;
+    if (result.images.len > 0) {
+        var rich_memory = memory orelse types.ToolResultMemory{};
+        rich_memory.tool_images = result.images;
+        memory = rich_memory;
+    }
     return switch (result.status) {
         .success => .{
+            .model_content_kind = metadata.model_content_kind,
             .model_output = result.body,
             .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
-            .tool_result_memory = metadata.tool_result_memory,
+            .subagent_completion = metadata.subagent_completion,
+            .tool_result_memory = memory,
             .command_result_json = metadata.command_result_json,
-            .turn_control = metadata.turn_control,
         },
         .failure => .{
             .status = .failure,
@@ -929,17 +1024,65 @@ fn toolExecutionResultFromDispatch(
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
-            .tool_result_memory = metadata.tool_result_memory,
+            .subagent_completion = metadata.subagent_completion,
+            .tool_result_memory = memory,
             .command_result_json = metadata.command_result_json,
-            .turn_control = metadata.turn_control,
         },
+    };
+}
+
+pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+    const runtime = ctx.mcp_ctx orelse return .unavailable;
+    const snapshot = ctx.mcp_snapshot_tool orelse return .unavailable;
+    return snapshot(runtime, arena, name, known, ctx.permission_rules, ctx.context_limits, ctx.mcp_access);
+}
+
+fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolExecutionResult {
+    var unavailable_output: []const u8 = "MCP tool definition changed before execution and is no longer available. Search for current tools.";
+    var notice: ?[]const u8 = null;
+    if (ctx.mcp_ctx) |runtime_context| if (ctx.mcp_tool_schema) |schema_fn| {
+        const current = schema_fn(runtime_context, arena, name, ctx.permission_rules, ctx.context_limits, ctx.mcp_access, runtimeCancelFlag(ctx)) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+        if (current) |projection| switch (projection) {
+            .selected => |payload| {
+                const selected = try arena.alloc(tool_mcp_runtime.SelectedTool, 1);
+                selected[0] = .{ .name = name, .schema_json = payload.model_output, .mcp_binding = payload.mcp_binding };
+                return .{
+                    .status = .failure,
+                    .model_output = "MCP tool definition changed before execution. Its current schema is loaded; review it before issuing a new call.",
+                    .selected_dynamic_tools = selected,
+                    .context_notices = if (payload.notice) |value| notices: {
+                        const values = try arena.alloc([]const u8, 1);
+                        values[0] = value;
+                        break :notices values;
+                    } else &.{},
+                };
+            },
+            .rejected => |payload| {
+                unavailable_output = payload.model_output;
+                notice = payload.notice;
+            },
+        };
+    };
+    const retired = try arena.alloc([]const u8, 1);
+    retired[0] = name;
+    return .{
+        .status = .failure,
+        .model_output = unavailable_output,
+        .retired_dynamic_tool_names = retired,
+        .context_notices = if (notice) |value| notices: {
+            const values = try arena.alloc([]const u8, 1);
+            values[0] = value;
+            break :notices values;
+        } else &.{},
     };
 }
 
 const SelectedDynamicToolSinkState = struct {
     allocator: Allocator,
-    name: ?[]const u8 = null,
-    schema_json: ?[]const u8 = null,
+    tools: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty,
 };
 
 const ContextNoticeSinkState = struct {
@@ -972,14 +1115,15 @@ fn recordSelectedDynamicToolForDispatch(
     raw_ctx: ?*anyopaque,
     name: []const u8,
     schema_json: []const u8,
+    binding: ?tool_mcp_runtime.Binding,
 ) error{OutOfMemory}!void {
     const state_ptr = raw_ctx orelse return;
     const state: *SelectedDynamicToolSinkState = @ptrCast(@alignCast(state_ptr));
     const owned_name = try state.allocator.dupe(u8, name);
     errdefer state.allocator.free(owned_name);
     const owned_schema_json = try state.allocator.dupe(u8, schema_json);
-    state.name = owned_name;
-    state.schema_json = owned_schema_json;
+    errdefer state.allocator.free(owned_schema_json);
+    try state.tools.append(state.allocator, .{ .name = owned_name, .schema_json = owned_schema_json, .mcp_binding = binding });
 }
 
 fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchContext {
@@ -995,6 +1139,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .access_scope = ctx.access_scope,
         .change_tracker = ctx.tracker,
         .skills_dir = ctx.skills_dir,
+        .skill_locations = ctx.skill_locations,
         .context_limits = ctx.context_limits,
         .ignored_list_entries = ctx.ignored_list_entries,
         .max_list_entries = ctx.max_list_entries,
@@ -1111,7 +1256,16 @@ fn typedDispatchContextForCall(
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.tool_call_id = call.id;
     dispatch.tool_call_name = call.name;
+    dispatch.resolved_skill = call.resolved_skill;
     return dispatch;
+}
+
+pub fn prepareSkillCall(ctx: Context, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const tool = ctx.tool_registry.lookup(call.name) orelse return error.UnsupportedTool;
+    const prepare = tool.prepare_skill_call_fn orelse return error.UnsupportedTool;
+    var dispatch = typedDispatchContextForCall(ctx, arena, call);
+    dispatch.skill_locations = locations;
+    return prepare(dispatch, call.arguments_json);
 }
 
 const VisionProviderState = struct {
@@ -1309,7 +1463,6 @@ fn mcpRuntimeCapabilities(ctx: Context) tool_mcp_runtime.RuntimeCapabilities {
         .has_tool = ctx.mcp_has_tool,
         .validate_tool = ctx.mcp_validate_tool,
         .call_tool = ctx.mcp_call_tool,
-        .tool_schema = ctx.mcp_tool_schema,
         .access = ctx.mcp_access,
     };
 }
@@ -1447,6 +1600,10 @@ fn toolRunCommand(
         const output = switch (compatibility) {
             .success => |body| body,
             .failure => |body| body,
+            .rich => {
+                compatibility.deinit(arena);
+                return error.RichCommandOutputUnsupported;
+            },
         };
         if (compatibility == .success and capture != null and output.len > 0) {
             callback.accept(
@@ -1484,6 +1641,7 @@ fn toolRunCommand(
                 .status = switch (compatibility) {
                     .success => .success,
                     .failure => .failure,
+                    .rich => unreachable,
                 },
                 .model_output = output,
             },
@@ -1866,7 +2024,110 @@ test "file mutations reject ordinary execution authority without mutating" {
 
 const SubagentProviderState = struct {
     runtime: Context,
+    call: ToolCall,
+    completion_sink: *?types.SubagentStatus,
 };
+
+fn requestDerivedSubagentSessionTitle(alloc: Allocator, call: ToolCall) Allocator.Error!?[]u8 {
+    const action = try tool_presentation.subagentAction(alloc, call, .identity) orelse return null;
+    alloc.free(action.detail);
+    return action.label;
+}
+
+const SubagentProgressBridge = struct {
+    alloc: Allocator,
+    call: ToolCall,
+    renderer: types.SubagentStatusRenderer,
+    progress_ctx: *anyopaque,
+    progress_fn: *const fn (*anyopaque, types.ToolLifecycleId, []const u8) void,
+    lifecycle_id: types.ToolLifecycleId,
+
+    fn init(alloc: Allocator, ctx: Context, call: ToolCall) ?SubagentProgressBridge {
+        return .{
+            .alloc = alloc,
+            .call = call,
+            .renderer = ctx.subagent_status_renderer orelse return null,
+            .progress_ctx = ctx.tool_progress_ctx orelse return null,
+            .progress_fn = ctx.on_tool_progress orelse return null,
+            .lifecycle_id = ctx.output_chunk_lifecycle_id orelse return null,
+        };
+    }
+
+    fn sink(self: *SubagentProgressBridge) subagent_tool_host.ProgressSink {
+        return .{ .context = self, .publish_fn = publish };
+    }
+
+    fn publish(raw: *anyopaque, status: types.SubagentStatus) void {
+        const self: *SubagentProgressBridge = @ptrCast(@alignCast(raw));
+        var rendered_status = status;
+        const session_title = requestDerivedSubagentSessionTitle(self.alloc, self.call) catch null;
+        defer if (session_title) |title| self.alloc.free(title);
+        rendered_status.session_title = session_title;
+        var status_buf: [256]u8 = undefined;
+        const status_line = self.renderer.render(&status_buf, rendered_status);
+        if (status_line.len == 0) return;
+        const first_line = (tool_presentation.formatSubagentPlainAction(self.alloc, self.call, .active) catch return) orelse return;
+        defer self.alloc.free(first_line);
+        const row = std.fmt.allocPrint(self.alloc, "● {s}\n  {s}", .{ first_line, status_line }) catch return;
+        defer self.alloc.free(row);
+        self.progress_fn(self.progress_ctx, self.lifecycle_id, row);
+    }
+};
+
+test "subagent progress publishes a complete two-line lifecycle row" {
+    const Capture = struct {
+        text: ?[]u8 = null,
+
+        fn render(_: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
+            return std.fmt.bufPrint(buf, "{s} · {s} · {s} · {d}k", .{ status.model, status.effort.displayLabel(), status.session_title orelse "missing", status.input_tokens / 1000 }) catch "";
+        }
+
+        fn publish(raw: *anyopaque, _: types.ToolLifecycleId, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.text = std.testing.allocator.dupe(u8, text) catch null;
+        }
+    };
+    var capture = Capture{};
+    defer if (capture.text) |text| std.testing.allocator.free(text);
+    var bridge = SubagentProgressBridge{
+        .alloc = std.testing.allocator,
+        .call = .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        .renderer = .{ .ctx = &capture, .render_fn = Capture.render },
+        .progress_ctx = &capture,
+        .progress_fn = Capture.publish,
+        .lifecycle_id = .{ .turn_id = 4, .call_id = "child" },
+    };
+    bridge.sink().publish(.{
+        .model = "openai/gpt-5.5",
+        .effort = types.ReasoningEffort.literal("high"),
+        .input_tokens = 12_000,
+        .context_window = 100_000,
+    });
+
+    try std.testing.expectEqualStrings("● Subagent working · inspect auth\n  openai/gpt-5.5 · high · Subagent · 12k", capture.text.?);
+}
+
+test "subagent session title is derived only from the current request identity" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { arguments_json: []const u8, expected: []const u8 }{
+        .{ .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}", .expected = "Subagent" },
+        .{ .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}", .expected = "reviewer" },
+    };
+    for (cases) |case| {
+        const title = (try requestDerivedSubagentSessionTitle(alloc, .{
+            .id = "child",
+            .name = "subagent",
+            .arguments_json = case.arguments_json,
+        })).?;
+        defer alloc.free(title);
+        try std.testing.expectEqualStrings(case.expected, title);
+    }
+    try std.testing.expect((try requestDerivedSubagentSessionTitle(alloc, .{
+        .id = "child",
+        .name = "subagent",
+        .arguments_json = "{}",
+    })) == null);
+}
 
 fn subagentProviderFailure(
     alloc: Allocator,
@@ -1892,6 +2153,7 @@ fn executeSubagentProvider(
     const caller_id = ctx.subagent_caller_id orelse
         return subagentProviderFailure(arena, "caller_unavailable");
     const identity_epoch = host.issueOperationIdentity(invocation_id);
+    var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
     const output = host.executeManaged(arena, request, .{
         .caller_id = caller_id,
         .invocation_id = invocation_id,
@@ -1910,11 +2172,20 @@ fn executeSubagentProvider(
         .timestamp_ms = io_mod.milliTimestamp(),
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
+        .steering_worker = if (ctx.interactive) ctx.worker else null,
+        .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
+        .model_capability_resolver = ctx.model_capability_resolver,
+        .model_override_resolver = ctx.model_override_resolver,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;
         return subagentProviderFailure(arena, "host_failure");
     };
+    if (output.final_status) |status_value| {
+        var status = status_value;
+        status.session_title = requestDerivedSubagentSessionTitle(arena, state.call) catch null;
+        state.completion_sink.* = status;
+    }
     return .{
         .status = if (output.success) .success else .failure,
         .body = output.body,
@@ -1922,7 +2193,6 @@ fn executeSubagentProvider(
 }
 
 fn noopOutput(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) !void {}
-fn noopBackgroundReady(_: *anyopaque, _: u64, _: []const u8) void {}
 
 const TestCapturedShellInput = struct {
     command: []u8,
@@ -2155,15 +2425,13 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
 
 const TestRuntime = struct {
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
-    compaction_route: provider_set.CompactionRouteDecision = .{
-        .ready = .{ .provider = .gateway, .model = "openai/gpt-5.6-luna" },
-    },
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     worker: WorkerRuntime = .{},
     session: SessionRuntime = .{ .max_history_turns = 8 },
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
     model: []const u8 = "",
+    reviewer_model: []const u8 = "",
     session_allocator: Allocator = std.testing.allocator,
     workspace_root: []const u8 = "/tmp",
     ignored_list_entries: []const []const u8 = &.{},
@@ -2197,6 +2465,7 @@ const TestRuntime = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    mcp_snapshot_tool: ?tool_mcp_runtime.SnapshotToolFn = null,
     mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
@@ -2230,11 +2499,11 @@ const TestRuntime = struct {
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
             .agent_stream_provider = self.agent_stream_provider,
-            .compaction_route = self.compaction_route,
             .gateway_team = self.gateway_team,
             .provider = self.provider,
             .provider_capabilities = self.provider_capabilities,
             .model = self.model,
+            .reviewer_model = self.reviewer_model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
             .agent_step_limit = 0,
@@ -2269,6 +2538,7 @@ const TestRuntime = struct {
             .mcp_call_tool = self.mcp_call_tool,
             .mcp_search_tools = self.mcp_search_tools,
             .mcp_tool_schema = self.mcp_tool_schema,
+            .mcp_snapshot_tool = self.mcp_snapshot_tool,
             .mcp_call_feature = self.mcp_call_feature,
             .mcp_input_responder = self.mcp_input_responder,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
@@ -2303,46 +2573,12 @@ const CancelTestCommandOnOutput = struct {
     }
 };
 
-const TestCommandOutputCapture = struct {
-    alloc: Allocator,
-    bytes: std.ArrayList(u8) = .empty,
-    stdout_chunks: usize = 0,
-    stderr_chunks: usize = 0,
-
-    fn deinit(self: *@This()) void {
-        self.bytes.deinit(self.alloc);
-    }
-
-    fn onChunk(
-        raw_ctx: *anyopaque,
-        _: ?types.ToolLifecycleId,
-        stream: command_contract.CommandOutputStream,
-        chunk: []const u8,
-    ) !void {
-        const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-        try self.bytes.appendSlice(self.alloc, chunk);
-        switch (stream) {
-            .stdout => self.stdout_chunks += 1,
-            .stderr => self.stderr_chunks += 1,
-        }
-    }
-};
-
 fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"action\":\"run\",\"command\":");
     try std.json.Stringify.value(command, .{}, &out.writer);
     try out.writer.writeAll(",\"timeout_ms\":600000}");
-    return out.toOwnedSlice();
-}
-
-fn runCommandArgsWithCleanProfileForTest(alloc: Allocator, command: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"action\":\"run\",\"command\":");
-    try std.json.Stringify.value(command, .{}, &out.writer);
-    try out.writer.writeAll(",\"profile\":\"clean\",\"timeout_ms\":600000}");
     return out.toOwnedSlice();
 }
 
@@ -2389,8 +2625,12 @@ fn terminalExecCallForTest(arena: Allocator, call: ToolCall) !ToolCall {
 }
 
 test "registered terminal exec preserves invalid execution authority error" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
     var rt = TestRuntime{};
     defer rt.deinit(std.testing.allocator);
+    var ctx = rt.context();
+    ctx.lifecycle_scope = .{ .kind = .subagent, .workspace_root = rt.workspace_root, .subagent_id = 8 };
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2403,7 +2643,7 @@ test "registered terminal exec preserves invalid execution authority error" {
 
     try std.testing.expectError(
         error.InvalidRunCommandExecutionAuthority,
-        executeToolCallAuthorized(rt.context(), .{
+        executeToolCallAuthorized(ctx, .{
             .call_allocator = arena,
             .result_allocator = arena,
             .call = call,
@@ -2413,6 +2653,10 @@ test "registered terminal exec preserves invalid execution authority error" {
             .max_tool_result_bytes = rt.max_tool_result_bytes,
         }),
     );
+    var metrics: [1]diagnostics.ToolCallMetric = undefined;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotToolCalls(&metrics));
+    try std.testing.expectEqual(@as(u64, 8), metrics[0].subagent_id);
+    try std.testing.expectEqual(diagnostics.ToolCallOutcome.runtime_failed, metrics[0].outcome);
 }
 
 test "captured command compatibility bypasses compound commands" {
@@ -2511,6 +2755,7 @@ const TestAutoReview = struct {
             null;
         self.action_tag = std.meta.activeTag(request.action);
         switch (request.action) {
+            .shell_input => |shell_input| self.exact_arguments_json = shell_input.arguments_json,
             .command => |command| self.exact_command = command.command,
             .file_mutation => |file| {
                 self.file_display_path = file.display_path;
@@ -3500,6 +3745,38 @@ test "parent web_fetch tool-call metric omits URL and fetched result content" {
     try std.testing.expectEqual(@as(u32, 0), buf[0].args_total_bytes);
     try std.testing.expectEqual(@as(u32, 0), buf[0].result_total_bytes);
     try expectNotContains(buf[0].result(), "FETCHED_PAGE_SECRET_RAW");
+}
+
+test "tool-call metrics retain caller identity across returned results" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "note.txt", "caller attribution");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var rt = TestRuntime{ .workspace_root = root };
+    defer rt.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const callers = [_]?u64{ null, 3, 7, null };
+    for (callers, 0..) |caller, index| {
+        var ctx = rt.context();
+        ctx.lifecycle_scope = .{ .kind = if (caller == null) .interactive else .subagent, .workspace_root = root, .subagent_id = caller };
+        const result = try executeToolCall(ctx, arena.allocator(), .{
+            .id = "attribution",
+            .name = if (index == 2) "unknown_tool" else "read_file",
+            .arguments_json = "{\"path\":\"note.txt\"}",
+        });
+        try std.testing.expectEqual(if (index == 2) tool_contracts.ToolExecutionStatus.failure else .success, result.status);
+    }
+    var metrics: [4]diagnostics.ToolCallMetric = undefined;
+    try std.testing.expectEqual(@as(usize, 4), diagnostics.snapshotToolCalls(&metrics));
+    for (metrics, callers, 0..) |metric, caller, index| {
+        try std.testing.expectEqual(caller orelse 0, metric.subagent_id);
+        try std.testing.expectEqual(if (index == 2) diagnostics.ToolCallOutcome.tool_failed else .succeeded, metric.outcome);
+    }
 }
 
 test "non-web_fetch tool-call metrics retain bounded args and result" {
@@ -5025,6 +5302,7 @@ test "no-save terminal exec publishes one readable ephemeral replay" {
     const read_result = try read_tool_result.call(read_ctx, read_input);
     defer read_result.deinit(arena);
     switch (read_result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |page| try expectContains(page, "ephemeral-needle"),
         .failure => return error.TestExpectedReplay,
     }
@@ -5818,8 +6096,9 @@ test "shell run rejects legacy background input without creating state" {
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "\"code\":\"invalid_action_fields\"");
-    try expectContains(result.model_output, "\"invalid_fields\":[\"background\"]");
+    try expectContains(result.model_output, "\"code\":\"invalid_shell_request\"");
+    try expectContains(result.model_output, "request.background is not accepted for run.");
+    try std.testing.expect(std.mem.find(u8, result.model_output, "retry_with") == null);
 }
 
 const PermissionThreadState = struct {
@@ -6091,21 +6370,21 @@ const McpFixture = struct {
         return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{request.query.raw}) };
     }
 
-    fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
         if (!std.mem.eql(u8, name, "mcp_fs_read")) return null;
         return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
     }
 
-    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, request: capability_retrieval.Request, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, request: capability_retrieval.Request, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
         return search(raw_ctx, arena, request, permission_rules, limits);
     }
 
-    fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.schema_rule_count = permission_rules.rules.len;
-        return schema(raw_ctx, arena, name, permission_rules, limits, access);
+        return schema(raw_ctx, arena, name, permission_rules, limits, access, cancel_flag);
     }
 };
 
@@ -6200,9 +6479,9 @@ test "MCP select does not authorize same-response dynamic execution" {
         .arguments_json = "{\"name\":\"mcp_fs_read\"}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, selected.status);
-    try std.testing.expectEqualStrings("mcp_fs_read", selected.selected_dynamic_tool_name.?);
-    try expectContains(selected.selected_dynamic_tool_schema_json.?, "context_limit_rejection");
-    try expectContains(selected.selected_dynamic_tool_schema_json.?, "<context_limit action='literal' />");
+    try std.testing.expectEqualStrings("mcp_fs_read", selected.selected_dynamic_tools[0].name);
+    try expectContains(selected.selected_dynamic_tools[0].schema_json, "context_limit_rejection");
+    try expectContains(selected.selected_dynamic_tools[0].schema_json, "<context_limit action='literal' />");
 
     const result = try executeToolCall(rt.context(), arena, .{
         .id = "dynamic",
@@ -6479,14 +6758,22 @@ test "skill tool preserves resource and discovery notices separately" {
     defer arena_state.deinit();
     var ctx = rt.context();
     ctx.context_limits.skill_chunk_bytes = .{ .value = .{ .bytes = 96 }, .source = .command_line };
-    const result = try executeToolCall(ctx, arena_state.allocator(), .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
-    try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
-    try expectContains(result.model_output, "use the workflow skill");
-    try expectNotContains(result.model_output, "assets/data.txt");
-    try std.testing.expect(result.system_notice == null);
-    try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
-    try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
-    try expectContains(result.context_notices[1], "skill discovery warning:");
+    const call: ToolCall = .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" };
+    const preparation = try prepareSkillCall(ctx, arena_state.allocator(), call, null);
+    defer @import("../skills/skill_invocation.zig").freeCallPreparation(arena_state.allocator(), preparation);
+    const selected = preparation.selected;
+    for ([_]bool{ false, true }) |bound| {
+        var effective_call = call;
+        if (bound) effective_call.resolved_skill = &selected;
+        const result = try executeToolCall(ctx, arena_state.allocator(), effective_call);
+        try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
+        try expectContains(result.model_output, "use the workflow skill");
+        try expectNotContains(result.model_output, "assets/data.txt");
+        try std.testing.expect(result.system_notice == null);
+        try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
+        try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
+        try expectContains(result.context_notices[1], "skill discovery warning:");
+    }
 }
 
 test "skill tool loads the exact advertised duplicate and rejects ambiguous or untrusted locations" {

@@ -52,6 +52,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const usage_cli_runtime = @import("usage_cli_runtime.zig");
 
+const slack_install = @import("../slack/install.zig");
 const Allocator = std.mem.Allocator;
 const CommandCatalog = command_specs.TopLevelRegistry;
 const TopLevelKind = command_specs.TopLevelKind;
@@ -69,6 +70,7 @@ pub const Command = union(enum) {
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
+    slack: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
@@ -106,13 +108,14 @@ pub const UpgradeRelaunch = struct {
 const resume_picker_alias = "-r";
 
 pub const ResumeTarget = union(enum) {
+    remembered,
     pick,
     last,
     id: []u8,
 
     pub fn deinit(self: *ResumeTarget, alloc: Allocator) void {
         switch (self.*) {
-            .pick, .last => {},
+            .remembered, .pick, .last => {},
             .id => |value| alloc.free(value),
         }
         self.* = undefined;
@@ -123,18 +126,48 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    provider_override: ?model_provider.ProviderId = null,
+    model_override: ?[]u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
+    fast_override: ?bool = null,
+    provider_order_override: ?[][]const u8 = null,
+    provider_strict_override: ?bool = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
+        if (self.model_override) |model| alloc.free(model);
+        if (self.provider_order_override) |order| freeProviderOrderOverride(alloc, order);
         self.* = .{};
     }
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
     }
+
+    pub fn hasModelOverrides(self: LaunchModifiers) bool {
+        return self.provider_override != null or self.model_override != null or
+            self.effort_override != null or self.fast_override != null or
+            self.provider_order_override != null or self.provider_strict_override != null;
+    }
 };
+
+fn freeProviderOrderOverride(alloc: Allocator, order: []const []const u8) void {
+    for (order) |slug| alloc.free(@constCast(slug));
+    if (order.len > 0) alloc.free(order);
+}
+
+/// Parses one `--provider-order` value, replacing any earlier occurrence.
+/// The returned slice is owned by `alloc`.
+fn parseProviderOrderFlag(alloc: Allocator, raw: []const u8, previous: ?[][]const u8) ![][]const u8 {
+    const parsed: [][]const u8 = switch (config_runtime.parseProviderOrderList(alloc, raw)) {
+        .ok => |maybe| maybe orelse return error.InvalidProviderOrderValue,
+        .invalid => return error.InvalidProviderOrderValue,
+    };
+    if (previous) |old| freeProviderOrderOverride(alloc, old);
+    return parsed;
+}
 
 pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
@@ -306,18 +339,16 @@ const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
 const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
-const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
+const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode, ?model_provider.ProviderId) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
-const SelfExePathFn = *const fn (?*anyopaque, Allocator) anyerror![]u8;
 const ReadMaskedKeyFn = *const fn (?*anyopaque, Allocator, WriteFn, ?*anyopaque) anyerror![]u8;
 const SetupTerminalAvailableFn = *const fn (?*anyopaque) bool;
 const RunDeps = struct {
     stdout_ctx: ?*anyopaque = null,
     stderr_ctx: ?*anyopaque = null,
     env_ctx: ?*anyopaque = null,
-    self_exe_ctx: ?*anyopaque = null,
     setup_ctx: ?*anyopaque = null,
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
@@ -329,7 +360,6 @@ const RunDeps = struct {
     load_startup_status_with_auth_mode: LoadStartupStatusWithAuthModeFn = app_lifecycle.loadStartupStatusWithAuthMode,
     getenv: GetenvFn = getenvDefault,
     environ_map: EnvironMapFn = environMapDefault,
-    self_exe_path: SelfExePathFn = selfExePathDefault,
     read_masked_key: ReadMaskedKeyFn = readMaskedKeyDefault,
     setup_terminal_available: SetupTerminalAvailableFn = setupTerminalAvailableDefault,
 };
@@ -362,6 +392,14 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var provider_override: ?model_provider.ProviderId = null;
+    var model_override: ?[]u8 = null;
+    errdefer if (model_override) |model| alloc.free(model);
+    var effort_override: ?types.ReasoningEffort = null;
+    var fast_override: ?bool = null;
+    var provider_order_override: ?[][]const u8 = null;
+    errdefer if (provider_order_override) |order| freeProviderOrderOverride(alloc, order);
+    var provider_strict_override: ?bool = null;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -383,6 +421,52 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--provider")) {
+            index += 1;
+            if (index >= args.len) return error.MissingProviderValue;
+            provider_override = model_provider.parse(args[index]) orelse
+                return error.InvalidProviderValue;
+        } else if (std.mem.startsWith(u8, arg, "--provider=")) {
+            provider_override = model_provider.parse(arg["--provider=".len..]) orelse
+                return error.InvalidProviderValue;
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            index += 1;
+            if (index >= args.len) return error.MissingModelValue;
+            const model = std.mem.trim(u8, args[index], " \t\r\n");
+            if (model.len == 0) return error.MissingModelValue;
+            const owned_model = try alloc.dupe(u8, model);
+            if (model_override) |old| alloc.free(old);
+            model_override = owned_model;
+        } else if (std.mem.startsWith(u8, arg, "--model=")) {
+            const model = std.mem.trim(u8, arg["--model=".len..], " \t\r\n");
+            if (model.len == 0) return error.MissingModelValue;
+            const owned_model = try alloc.dupe(u8, model);
+            if (model_override) |old| alloc.free(old);
+            model_override = owned_model;
+        } else if (std.mem.eql(u8, arg, "--effort")) {
+            index += 1;
+            if (index >= args.len) return error.MissingEffortValue;
+            effort_override = types.ReasoningEffort.parse(args[index]) orelse
+                return error.InvalidEffortValue;
+        } else if (std.mem.startsWith(u8, arg, "--effort=")) {
+            effort_override = types.ReasoningEffort.parse(arg["--effort=".len..]) orelse
+                return error.InvalidEffortValue;
+        } else if (std.mem.eql(u8, arg, "--fast") or std.mem.eql(u8, arg, "--no-fast")) {
+            const enabled = std.mem.eql(u8, arg, "--fast");
+            if (fast_override != null and fast_override.? != enabled)
+                return error.ConflictingFastFlags;
+            fast_override = enabled;
+        } else if (std.mem.eql(u8, arg, "--provider-order")) {
+            index += 1;
+            if (index >= args.len) return error.MissingProviderOrderValue;
+            provider_order_override = try parseProviderOrderFlag(alloc, args[index], provider_order_override);
+        } else if (std.mem.startsWith(u8, arg, "--provider-order=")) {
+            provider_order_override = try parseProviderOrderFlag(alloc, arg["--provider-order=".len..], provider_order_override);
+        } else if (std.mem.eql(u8, arg, "--provider-strict") or std.mem.eql(u8, arg, "--no-provider-strict")) {
+            const strict = std.mem.eql(u8, arg, "--provider-strict");
+            if (provider_strict_override != null and provider_strict_override.? != strict)
+                return error.ConflictingProviderStrictFlags;
+            provider_strict_override = strict;
         } else {
             break;
         }
@@ -398,6 +482,12 @@ fn parseGlobalLaunchArgs(
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .provider_override = provider_override,
+            .model_override = model_override,
+            .effort_override = effort_override,
+            .fast_override = fast_override,
+            .provider_order_override = provider_order_override,
+            .provider_strict_override = provider_strict_override,
         },
     };
 }
@@ -414,12 +504,26 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--provider") or
+            std.mem.eql(u8, arg, "--provider-order") or
+            std.mem.eql(u8, arg, "--model") or
+            std.mem.eql(u8, arg, "--effort"))
+        {
             index += 1;
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.startsWith(u8, arg, "--provider=") and
+            !std.mem.startsWith(u8, arg, "--provider-order=") and
+            !std.mem.startsWith(u8, arg, "--model=") and
+            !std.mem.startsWith(u8, arg, "--effort=") and
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--fast") and
+            !std.mem.eql(u8, arg, "--no-fast") and
+            !std.mem.eql(u8, arg, "--provider-strict") and
+            !std.mem.eql(u8, arg, "--no-provider-strict"))
         {
             return args[index..];
         }
@@ -487,6 +591,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
                 }
                 return .{ .session = args[1..] };
             }
+            if (command_specs.matchesTopLevel(command_catalog, command, .slack)) return .{ .slack = args[1..] };
         },
         't' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
@@ -601,10 +706,6 @@ pub fn runIfRequested(alloc: Allocator, args: []const [:0]const u8, cfg: Config)
     return runIfRequestedWithDeps(alloc, args, cfg, .{});
 }
 
-pub fn runNoConfigIfRequested(alloc: Allocator, args: []const [:0]const u8, version: []const u8, command_catalog: CommandCatalog) !bool {
-    return runNoConfigIfRequestedWithDeps(alloc, args, version, command_catalog, .{});
-}
-
 fn runNoConfigIfRequestedWithDeps(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -680,6 +781,56 @@ fn activateProviderSelection(
     caller: ProviderActivationCaller,
     exact_source: ?credentials.Source,
 ) !bool {
+    return activateProviderSelectionFallible(alloc, cfg, deps, target, caller, exact_source) catch |err| {
+        switch (err) {
+            error.CredentialStorageUnavailable,
+            error.CredentialTemporarilyUnavailable,
+            error.CredentialRefreshPersistenceUncertain,
+            error.CredentialAuthorityChanged,
+            => {},
+            else => return err,
+        }
+        const detail = try auth_runtime.preparationFailureText(alloc, target, err);
+        defer alloc.free(detail);
+        try writeProviderActivationError(alloc, deps, caller, detail);
+        return false;
+    };
+}
+
+fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
+    switch (provider) {
+        .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
+    }
+}
+
+fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, caller: ProviderActivationCaller, err: anyerror) !void {
+    debug_trace.logf("auth", "provider sign-in failed provider={t} err={s}", .{ provider, @errorName(err) });
+    const failure = auth_runtime.classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
+    if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
+        const detail = try auth_runtime.preparationFailureText(alloc, provider, err);
+        defer alloc.free(detail);
+        try writeProviderActivationError(alloc, deps, caller, detail);
+        return;
+    }
+    try writeProviderActivationError(alloc, deps, caller, switch (err) {
+        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
+        error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
+        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
+        else => "failed to sign in",
+    });
+}
+
+fn activateProviderSelectionFallible(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    target: model_provider.ProviderId,
+    caller: ProviderActivationCaller,
+    exact_source: ?credentials.Source,
+) !bool {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
     var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
@@ -689,6 +840,26 @@ fn activateProviderSelection(
     };
     defer settings.deinit(alloc);
 
+    if (target == .configured) {
+        const bound = try target.bind(settings.providers orelse .{});
+        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
+        var attempt = config_runtime.attemptUserPreferences(alloc, .{
+            .provider = bound,
+            .model_preference = .{ .provider = bound, .model = selected_model },
+        });
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => {
+                try writeProviderActivationError(alloc, deps, caller, "failed to save provider selection");
+                return false;
+            },
+            .outcome => {},
+        }
+        const message = try std.fmt.allocPrint(alloc, "Provider set to {s}.\n", .{bound.label()});
+        defer alloc.free(message);
+        if (caller == .provider_command) try writeStdout(deps, message);
+        return true;
+    }
     const preferred_source = exact_source orelse settings.credential_source;
     var prepared_credential = if (cfg.auth_mode == .host_managed)
         null
@@ -702,7 +873,7 @@ fn activateProviderSelection(
         );
     defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
-    const already_selected = (settings.provider orelse .gateway) == target;
+    const already_selected = (settings.provider orelse @as(model_provider.ProviderId, .gateway)).eql(target);
     if (caller == .provider_command and already_selected and
         (cfg.auth_mode == .host_managed or prepared_credential != null))
     {
@@ -710,33 +881,18 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .configured => "Configured provider is already selected.\n",
         });
         return true;
     }
 
     var performed_login: ?model_provider.ProviderId = null;
-    if (cfg.auth_mode == .local and prepared_credential == null and target == .codex and caller == .provider_command) {
-        chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
-            debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
-            try writeProviderActivationError(alloc, deps, caller, "Codex login failed");
+    if (cfg.auth_mode == .local and prepared_credential == null and provider_catalog.find(target).subscription and caller == .provider_command) {
+        runProviderLogin(alloc, cfg, target) catch |err| {
+            try writeProviderLoginFailure(alloc, deps, target, caller, err);
             return false;
         };
-        performed_login = .codex;
-        prepared_credential = try auth_runtime.prepareCredential(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            target,
-            preferred_source,
-        );
-    }
-    if (cfg.auth_mode == .local and prepared_credential == null and target == .grok and caller == .provider_command) {
-        grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
-            debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
-            try writeProviderActivationError(alloc, deps, caller, "Grok login failed");
-            return false;
-        };
-        performed_login = .grok;
+        performed_login = target;
         prepared_credential = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
@@ -759,6 +915,7 @@ fn activateProviderSelection(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                .configured => "configure the provider auth environment variable first",
             },
         );
         return false;
@@ -768,6 +925,7 @@ fn activateProviderSelection(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
+            .configured => "Configured model catalog is unavailable",
         });
         return false;
     };
@@ -834,13 +992,14 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .gateway, .configured => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .configured => "Provider set to configured connection.\n",
         });
     }
     return true;
@@ -859,7 +1018,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -890,6 +1049,11 @@ fn runNonInteractiveWithDeps(
         !commandSupportsWorkspaceModifiers(parsed_command))
     {
         try writeWorkspaceModifierUsage(deps);
+        return .handled_failure;
+    }
+
+    if (global_args.modifiers.hasModelOverrides()) {
+        try writeModelModifierUsage(deps);
         return .handled_failure;
     }
 
@@ -969,68 +1133,24 @@ fn runNonInteractiveWithDeps(
             }
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
-            switch (login_provider) {
-                .gateway => {
-                    login_flow.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        const message = switch (err) {
-                            error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                            error.AccessDenied => "fx login: authorization denied\n",
-                            error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                            else => "fx login: failed to sign in\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    if (!try activateProviderSelection(
-                        alloc,
-                        cfg,
-                        deps,
-                        .gateway,
-                        .provider_login,
-                        .fx_login,
-                    )) return .handled_failure;
-                    try writeStdout(deps, "Signed in to Vercel.\n");
-                    try writeStdout(deps, "AI Gateway access may still require billing or API setup for the selected account.\n");
-                },
-                .codex => {
-                    chatgpt_oauth.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        const message = switch (err) {
-                            error.ChatGptLoginTimedOut => "fx login: Codex authorization expired; run fx login codex again\n",
-                            error.ChatGptAuthorizationFailed => "fx login: Codex authorization denied\n",
-                            else => "fx login: failed to sign in with Codex\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login, null)) {
-                        return .handled_failure;
-                    }
-                    try writeStdout(deps, "Signed in with Codex.\n");
-                },
-                .grok => {
-                    grok_oauth.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
-                        try writeStderr(deps, "fx login: failed to sign in with Grok\n");
-                        return .handled_failure;
-                    };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login, null)) {
-                        return .handled_failure;
-                    }
-                    try writeStdout(deps, "Signed in with Grok.\n");
-                },
-            }
+            runProviderLogin(alloc, cfg, login_provider) catch |err| {
+                try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
+                return .handled_failure;
+            };
+            if (!try activateProviderSelection(
+                alloc,
+                cfg,
+                deps,
+                login_provider,
+                .provider_login,
+                if (login_provider == .gateway) .fx_login else null,
+            )) return .handled_failure;
+            try writeStdout(deps, switch (login_provider) {
+                .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
+                .codex => "Signed in with Codex.\n",
+                .grok => "Signed in with Grok.\n",
+                .configured => "Configured providers use settings.json authentication.\n",
+            });
             return .handled_success;
         },
         .logout => |rest| {
@@ -1168,11 +1288,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <name>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
@@ -1225,6 +1345,7 @@ fn runNonInteractiveWithDeps(
                 .revision = cfg.revision,
             }, mcp_inspection.profile_diagnostic);
             snapshot.mcp = localMcpView(&mcp_inspection);
+            snapshot.provider_endpoint = startup.provider_endpoint;
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1257,6 +1378,28 @@ fn runNonInteractiveWithDeps(
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
         },
+        .slack => |rest| {
+            if (rest.len == 0) {
+                const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .slack);
+                defer alloc.free(help);
+                try writeStdout(deps, help);
+                return .handled_success;
+            }
+            const opts = slack_install.parse(rest) catch |err| {
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .slack, "slack", err, rest);
+                return .handled_failure;
+            };
+            var arena: std.heap.ArenaAllocator = .init(alloc);
+            defer arena.deinit();
+            const snapshot = slack_install.run(arena.allocator(), opts.action, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+                try writeCommandFailure(alloc, deps, "slack", err, opts.format);
+                return .handled_failure;
+            };
+            const text = try snapshot.render(alloc, opts.format);
+            defer alloc.free(text);
+            try writeFormattedOutput(deps, text, opts.format);
+            return .handled_success;
+        },
         .mcp => |rest| {
             return runTopLevelMcp(alloc, rest, cfg, deps);
         },
@@ -1273,6 +1416,7 @@ fn runNonInteractiveWithDeps(
                     cfg.default_model,
                     cfg.default_agent_step_limit,
                     cfg.auth_mode,
+                    null,
                 )
             else
                 try deps.load_startup_state(
@@ -1286,11 +1430,14 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const catalog_access = startup.modelCatalogAccess();
-            const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
+            var available_providers = cfg.provider_set;
+            available_providers.definitions = startup.configured_providers.definitions;
+            const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .configured => "fx models: Configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
@@ -2172,12 +2319,6 @@ fn environMapDefault(_: ?*anyopaque) ?*const std.process.Environ.Map {
     return io_mod.environMap();
 }
 
-fn selfExePathDefault(_: ?*anyopaque, alloc: Allocator) ![]u8 {
-    const path_z = try std.process.executablePathAlloc(io_mod.getIo(), alloc);
-    defer alloc.free(path_z);
-    return alloc.dupe(u8, path_z);
-}
-
 fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopLevelKind) !void {
     try writeStderr(deps, "usage: fx ");
     try writeStderr(deps, command_specs.topLevelUsage(command_catalog, kind));
@@ -2234,8 +2375,10 @@ fn runTopLevelMcp(
     deps: RunDeps,
 ) !RunResult {
     if (rest.len == 0) {
-        try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-        return .handled_failure;
+        const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .mcp);
+        defer alloc.free(help);
+        try writeStdout(deps, help);
+        return .handled_success;
     }
     const operation = rest[0];
     if (std.mem.eql(u8, operation, "add")) {
@@ -2373,7 +2516,7 @@ fn runTopLevelMcp(
     }
     if (std.mem.eql(u8, operation, "auth")) {
         if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            try writeStderr(deps, "usage: fx " ++ command_specs.mcp_auth_usage ++ "\n");
             return .handled_failure;
         }
         var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
@@ -2386,7 +2529,7 @@ fn runTopLevelMcp(
             try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
             return .handled_failure;
         };
-        var opener = cfg.url_opener;
+        var opener = McpCliAuthorization{ .opener = cfg.url_opener, .deps = deps };
         var result = runtime.authenticateServer(
             rest[1],
             &opener,
@@ -2529,13 +2672,26 @@ fn writeMcpTrustSuccess(
     try writeStdout(deps, out.written());
 }
 
+const McpCliAuthorization = struct {
+    opener: host.UrlOpener,
+    deps: RunDeps,
+};
+
 fn openTopLevelMcpUrl(
     raw: ?*anyopaque,
     alloc: Allocator,
     url: []const u8,
 ) anyerror!bool {
-    const opener: *const host.UrlOpener = @ptrCast(@alignCast(raw.?));
-    return opener.open(alloc, url);
+    const presentation: *const McpCliAuthorization = @ptrCast(@alignCast(raw.?));
+    var encoded_url = try text_utils.encodeTerminalSafe(alloc, url, std.math.maxInt(usize));
+    defer encoded_url.deinit(alloc);
+    try writeStdout(presentation.deps, "Open this URL to authenticate the MCP server:\n");
+    try writeStdout(presentation.deps, encoded_url.bytes);
+    try writeStdout(presentation.deps, "\n\nWaiting for browser authorization...\n");
+    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
+        _ = try presentation.opener.open(alloc, url);
+    }
+    return true;
 }
 
 fn writeMcpProfileMutationSuccess(
@@ -2763,22 +2919,6 @@ fn permissionRulesForSnapshot(alloc: Allocator, active_rules: anytype) !types.Pe
     return .{ .rules = rules };
 }
 
-fn loadLatestWorkspaceSessionDetail(
-    alloc: Allocator,
-    store: session_store.Store,
-) !session_store.ReadOnlyDetail {
-    var summary = try store.latestReadOnlyWorkspaceSummary(alloc);
-    defer summary.deinit(alloc);
-    return store.loadReadOnlyDetail(alloc, summary.id, .{});
-}
-
-fn loadLatestWorkspaceSessionSummary(
-    alloc: Allocator,
-    store: session_store.Store,
-) !session_store.SessionSummary {
-    return store.latestReadOnlyWorkspaceSummary(alloc);
-}
-
 fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
     return switch (failure.category) {
         .authentication => "AuthenticationRejected",
@@ -2854,7 +2994,12 @@ fn writeLookupFailure(
         error.SessionNotFound => {
             try writeStderr(deps, "fx session: record not found\n");
         },
-        error.InvalidSessionFormat => {
+        error.InvalidSessionFormat,
+        error.InvalidPermissionState,
+        error.PermissionStateTooLarge,
+        error.InvalidRecoveryCheckpoint,
+        error.InvalidUsageSidecar,
+        => {
             try writeStderr(
                 deps,
                 "fx session: record is corrupt; run `fx doctor` for recovery guidance\n",
@@ -2908,7 +3053,7 @@ fn writeLookupFailure(
         error.SessionRecoveryRequiresCurrentSchema => {
             try writeStderr(
                 deps,
-                "fx session: recovery only applies to current schema-v3 sessions; migrate legacy sessions first\n",
+                "fx session: recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first\n",
             );
         },
         error.SessionRecoveryUnsupportedSchema => {
@@ -3030,7 +3175,12 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.NoSavedSessions => "no saved sessions for this workspace",
         error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
-        error.InvalidSessionFormat => "record is corrupt; run `fx doctor` for recovery guidance",
+        error.InvalidSessionFormat,
+        error.InvalidPermissionState,
+        error.PermissionStateTooLarge,
+        error.InvalidRecoveryCheckpoint,
+        error.InvalidUsageSidecar,
+        => "record is corrupt; run `fx doctor` for recovery guidance",
         error.UnsupportedSessionSchema => "record uses an unsupported session version",
         error.InvalidSessionId => "invalid session id",
         error.LegacySessionTooLarge => "legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`",
@@ -3039,7 +3189,7 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.LegacySessionMigrationFailed, error.LegacySessionChanged => "migration did not complete; the original session remains authoritative",
         error.LegacySessionMigrationIndeterminate => "migration outcome is indeterminate and will be resolved by the next exact writable load",
         error.SessionRecoveryNotNeeded => "recovery was refused because the session has a valid commit boundary; resume it normally",
-        error.SessionRecoveryRequiresCurrentSchema => "recovery only applies to current schema-v3 sessions; migrate legacy sessions first",
+        error.SessionRecoveryRequiresCurrentSchema => "recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first",
         error.SessionRecoveryUnsupportedSchema => "recovery is unavailable for this unsupported session version",
         error.SessionRecoveryBoundaryInvalid => "no exact trustworthy recovery boundary was found; the source was left unchanged",
         error.SessionRecoveryIndeterminate => "the recovery copy could not be confirmed; the source was left unchanged",
@@ -3113,6 +3263,32 @@ test "session detail failures separate corruption from unsupported schema" {
         "fx session: session future-session uses an unsupported session version\n",
         unsupported_text.stderr.written(),
     );
+}
+
+test "session lookup failures preserve supporting-state errors in the requested format" {
+    const cases = [_]struct { err: anyerror, code: []const u8 }{
+        .{ .err = error.InvalidPermissionState, .code = "InvalidPermissionState" },
+        .{ .err = error.PermissionStateTooLarge, .code = "PermissionStateTooLarge" },
+        .{ .err = error.InvalidRecoveryCheckpoint, .code = "InvalidRecoveryCheckpoint" },
+        .{ .err = error.InvalidUsageSidecar, .code = "InvalidUsageSidecar" },
+    };
+    for (cases) |case| {
+        for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
+            var output = CaptureOutput.init(std.testing.allocator);
+            defer output.deinit();
+            try writeLookupFailure(std.testing.allocator, output.deps(), "session", case.err, format);
+            const body = if (format == .json) output.stdout.written() else output.stderr.written();
+            const unused = if (format == .json) output.stderr.written() else output.stdout.written();
+            try std.testing.expectEqual(@as(usize, 0), unused.len);
+            try std.testing.expect(std.mem.find(u8, body, "fx doctor") != null);
+            try std.testing.expect(std.mem.find(u8, body, "resume it normally") == null);
+            if (format == .json) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings(case.code, parsed.value.object.get("code").?.string);
+            }
+        }
+    }
 }
 
 test "session recovery boundary failures keep stable text and json guidance" {
@@ -3210,10 +3386,26 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeModelModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --provider, --model, --effort, --fast, --provider-order, and --provider-strict apply to interactive sessions; for one-shot runs pass model flags after `fx ask`\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.MissingModelValue => "--model requires a model id",
+        error.MissingEffortValue => "--effort requires a value",
+        error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
+        error.ConflictingFastFlags => "--fast and --no-fast cannot be used together",
+        error.MissingProviderValue => "--provider requires a provider name",
+        error.InvalidProviderValue => "--provider accepts gateway, codex, grok, or a configured provider name",
+        error.MissingProviderOrderValue => "--provider-order requires a comma-separated provider list",
+        error.InvalidProviderOrderValue => "--provider-order accepts comma-separated provider slugs (letters, digits, '-')",
+        error.ConflictingProviderStrictFlags => "--provider-strict and --no-provider-strict cannot be used together",
         else => null,
     };
 }
@@ -3547,6 +3739,7 @@ fn parseResumeArgs(
         }
         if (args.len != 1) return error.InvalidResumeArgs;
         if (std.mem.eql(u8, args[0], resume_picker_alias)) return .pick;
+        if (std.mem.eql(u8, args[0], "-c") or std.mem.eql(u8, args[0], "--continue")) return .remembered;
         if (command_specs.matchesTopLevel(command_catalog, args[0], .@"resume")) return .last;
         if (!std.mem.startsWith(u8, args[0], resume_id_alias_prefix)) return error.InvalidResumeArgs;
         const id = args[0][resume_id_alias_prefix.len..];
@@ -3789,6 +3982,138 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("/tmp/shared-two", parsed.modifiers.additional_directories[1]);
     try std.testing.expect(parsed.modifiers.saved_directories_suppressed);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+}
+
+test "global launch modifiers own provider model effort and fast overrides before the command" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--provider"),
+        @constCast("grok"),
+        @constCast("--model"),
+        @constCast("provider/launch-model"),
+        @constCast("--effort=high"),
+        @constCast("--fast"),
+        @constCast("--add-dir"),
+        @constCast("/tmp/shared"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?model_provider.ProviderId, .grok), parsed.modifiers.provider_override);
+    try std.testing.expectEqualStrings("provider/launch-model", parsed.modifiers.model_override.?);
+    try std.testing.expect(parsed.modifiers.effort_override.?.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expectEqual(@as(?bool, true), parsed.modifiers.fast_override);
+    try std.testing.expect(parsed.modifiers.hasModelOverrides());
+    try std.testing.expectEqual(@as(usize, 1), parsed.modifiers.additional_directories.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.remaining.len);
+
+    var routed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--provider-order"),
+        @constCast("azure, anthropic"),
+        @constCast("--provider-strict"),
+    });
+    defer routed.deinit(std.testing.allocator);
+    const order = routed.modifiers.provider_order_override.?;
+    try std.testing.expectEqual(@as(usize, 2), order.len);
+    try std.testing.expectEqualStrings("azure", order[0]);
+    try std.testing.expectEqualStrings("anthropic", order[1]);
+    try std.testing.expectEqual(@as(?bool, true), routed.modifiers.provider_strict_override);
+
+    var spaced = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--model= provider/spaced "),
+        @constCast("--effort"),
+        @constCast("low"),
+        @constCast("--no-fast"),
+    });
+    defer spaced.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("provider/spaced", spaced.modifiers.model_override.?);
+    try std.testing.expect(spaced.modifiers.effort_override.?.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expectEqual(@as(?bool, false), spaced.modifiers.fast_override);
+
+    var untouched = try parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("ask"), @constCast("--fast") });
+    defer untouched.deinit(std.testing.allocator);
+    try std.testing.expect(!untouched.modifiers.hasModelOverrides());
+    try std.testing.expectEqual(@as(usize, 2), untouched.remaining.len);
+}
+
+test "global launch modifiers accept configured provider names" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--provider"),
+        @constCast("my-llm"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    const provider = parsed.modifiers.provider_override.?;
+    try std.testing.expect(provider == .configured);
+    try std.testing.expectEqualStrings("my-llm", provider.label());
+}
+
+test "global model overrides fail closed when malformed" {
+    try std.testing.expectError(
+        error.MissingProviderValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider")}),
+    );
+    try std.testing.expectError(
+        error.InvalidProviderValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--provider"), @constCast("bogus name") }),
+    );
+    try std.testing.expectError(
+        error.MissingModelValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--model")}),
+    );
+    try std.testing.expectError(
+        error.MissingModelValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--model=")}),
+    );
+    try std.testing.expectError(
+        error.MissingEffortValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--effort")}),
+    );
+    try std.testing.expectError(
+        error.InvalidEffortValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--effort=not an effort")}),
+    );
+    try std.testing.expectError(
+        error.ConflictingFastFlags,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--fast"), @constCast("--no-fast") }),
+    );
+    try std.testing.expectError(
+        error.ConflictingFastFlags,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-fast"), @constCast("--fast") }),
+    );
+    try std.testing.expectError(
+        error.MissingProviderOrderValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider-order")}),
+    );
+    try std.testing.expectError(
+        error.InvalidProviderOrderValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider-order=Bad Slug")}),
+    );
+    try std.testing.expectError(
+        error.InvalidProviderOrderValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider-order=azure,azure")}),
+    );
+    try std.testing.expectError(
+        error.ConflictingProviderStrictFlags,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--provider-strict"), @constCast("--no-provider-strict") }),
+    );
+}
+
+test "argsAfterGlobalLaunchArgs skips provider routing flags" {
+    const remaining = argsAfterGlobalLaunchArgs(&.{
+        @constCast("--provider-order"),
+        @constCast("azure,anthropic"),
+        @constCast("--provider-strict"),
+        @constCast("ask"),
+    });
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings("ask", remaining[0]);
+
+    const equals_form = argsAfterGlobalLaunchArgs(&.{
+        @constCast("--provider-order=azure"),
+        @constCast("--no-provider-strict"),
+        @constCast("ask"),
+    });
+    try std.testing.expectEqual(@as(usize, 1), equals_form.len);
+    try std.testing.expectEqualStrings("ask", equals_form[0]);
 }
 
 test "additional directory flags fail closed when malformed" {
@@ -4174,7 +4499,7 @@ test "parse resume args accepts explicit id flag" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("release.2026.06", id),
     }
 }
@@ -4188,7 +4513,7 @@ test "parse resume args accepts an operand on the top-level resume flag" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("session-123", id),
     }
 
@@ -4208,7 +4533,7 @@ test "parse resume args treats last after id flag as exact id" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("last", id),
     }
 }
@@ -4284,7 +4609,7 @@ test "parseInteractiveLaunch shares native resume grammar" {
                 const target = launch.requested_resume orelse return error.TestExpectedResumeTarget;
                 if (case.expected_id) |expected_id| switch (target) {
                     .id => |id| try std.testing.expectEqualStrings(expected_id, id),
-                    .pick, .last => return error.TestExpectedExactResumeId,
+                    .remembered, .pick, .last => return error.TestExpectedExactResumeId,
                 } else try std.testing.expectEqual(ResumeTarget.last, target);
             },
             .noninteractive => |value| {
@@ -4896,7 +5221,10 @@ test "runIfRequested top-level resume aliases return the existing target" {
             capture.deps(),
         );
         switch (result) {
-            .interactive => |launch| try std.testing.expectEqual(ResumeTarget.last, launch.requested_resume.?),
+            .interactive => |launch| {
+                const expected: ResumeTarget = if (std.mem.eql(u8, args[0], "-c") or std.mem.eql(u8, args[0], "--continue")) .remembered else .last;
+                try std.testing.expectEqual(expected, launch.requested_resume.?);
+            },
             else => return error.TestExpectedEqual,
         }
         try std.testing.expectEqualStrings("", capture.stdout.written());
@@ -4918,7 +5246,7 @@ test "runIfRequested top-level resume aliases return the existing target" {
             defer launch.deinit(std.testing.allocator);
             switch (launch.requested_resume.?) {
                 .id => |id| try std.testing.expectEqualStrings("session.123", id),
-                .pick, .last => return error.TestExpectedExactResumeId,
+                .remembered, .pick, .last => return error.TestExpectedExactResumeId,
             }
         },
         else => return error.TestExpectedEqual,
@@ -4939,7 +5267,7 @@ test "runIfRequested top-level resume aliases return the existing target" {
             defer launch.deinit(std.testing.allocator);
             switch (launch.requested_resume.?) {
                 .id => |id| try std.testing.expectEqualStrings("session.123", id),
-                .pick, .last => return error.TestExpectedExactResumeId,
+                .remembered, .pick, .last => return error.TestExpectedExactResumeId,
             }
         },
         else => return error.TestExpectedEqual,

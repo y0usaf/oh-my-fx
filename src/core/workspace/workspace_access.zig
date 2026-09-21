@@ -582,7 +582,14 @@ fn canonicalExistingDirectory(
 
     const canonical = io_mod.realpathAlloc(alloc, absolute) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.FileNotFound => return error.PathNotFound,
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.SymLinkLoop,
+        error.NameTooLong,
+        error.InputOutput,
+        => return error.PathNotFound,
+        error.NotDir => return error.NotDirectory,
         else => return error.InvalidPath,
     };
     errdefer alloc.free(canonical);
@@ -856,6 +863,40 @@ test "workspace access refreshes availability after a saved directory disappears
     try std.testing.expect(access.entries[0].available);
     try std.testing.expect(access.entries[0].active);
     try std.testing.expect((try access.stageAvailabilityRefresh(alloc, primary)) == null);
+}
+
+test "workspace access deactivates an observed root when its ancestor becomes unusable" {
+    for ([_]bool{ false, true }) |loop| {
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(std.testing.io, "primary");
+        try tmp.dir.createDirPath(std.testing.io, "parent/shared");
+        const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
+        defer alloc.free(primary);
+        const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "parent/shared");
+        defer alloc.free(shared);
+        var access = try WorkspaceAccess.init(alloc, primary, &.{shared}, &.{}, false);
+        defer access.deinit(alloc);
+        try tmp.dir.rename("parent", tmp.dir, "held", std.testing.io);
+        if (loop) {
+            try tmp.dir.symLink(std.testing.io, "parent", "parent", .{ .is_directory = true });
+        } else {
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent", .data = "not a directory" });
+        }
+        var unavailable = (try access.stageAvailabilityRefresh(alloc, primary)) orelse return error.TestExpectedRefresh;
+        access.deinit(alloc);
+        access = unavailable;
+        unavailable = .{};
+        try std.testing.expect(!access.entries[0].available);
+        try std.testing.expect(!access.scope(primary).contains(shared));
+        try tmp.dir.deleteFile(std.testing.io, "parent");
+        try tmp.dir.rename("held", tmp.dir, "parent", std.testing.io);
+        var restored = (try access.stageAvailabilityRefresh(alloc, primary)) orelse return error.TestExpectedRefresh;
+        defer restored.deinit(alloc);
+        try std.testing.expect(restored.entries[0].available);
+        try std.testing.expect(restored.scope(primary).contains(shared));
+    }
 }
 
 test "workspace access canonicalizes a saved directory restored through a symlinked ancestor" {

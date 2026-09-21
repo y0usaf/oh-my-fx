@@ -27,7 +27,6 @@ const State = struct {
     file: ?std.Io.File = null,
     path: ?[]u8 = null,
     path_alloc: ?Allocator = null,
-    start_ms: i64 = 0,
     last_ms: i64 = 0,
 };
 
@@ -242,7 +241,6 @@ fn configureWithOptions(
         .file = file,
         .path = owned_path,
         .path_alloc = alloc,
-        .start_ms = now,
         .last_ms = now,
     };
 }

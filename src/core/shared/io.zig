@@ -903,9 +903,22 @@ pub fn makeDirRecursive(path: []const u8) !void {
 
 pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+    const path_z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return error.NameTooLong;
     var result_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const ptr = std.c.realpath(path_z, &result_buf) orelse return error.FileNotFound;
+    const ptr = std.c.realpath(path_z, &result_buf) orelse {
+        return switch (std.posix.errno(-1)) {
+            .NOENT => error.FileNotFound,
+            .NOTDIR => error.NotDir,
+            .LOOP => error.SymLinkLoop,
+            .ACCES => error.AccessDenied,
+            .PERM => error.PermissionDenied,
+            .NAMETOOLONG => error.NameTooLong,
+            .INVAL => error.BadPathName,
+            .IO => error.InputOutput,
+            .NOMEM => error.OutOfMemory,
+            else => |err| std.posix.unexpectedErrno(err),
+        };
+    };
     const resolved = std.mem.sliceTo(ptr, 0);
     return alloc.dupe(u8, resolved);
 }
@@ -1272,6 +1285,23 @@ test "realpathAlloc on nonexistent path returns FileNotFound" {
     defer alloc.free(missing);
 
     try std.testing.expectError(error.FileNotFound, realpathAlloc(alloc, missing));
+}
+
+test "realpathAlloc distinguishes non-directory and symlink-loop paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "file", "content");
+    try tmp.dir.symLink(getIo(), "loop", "loop", .{});
+    const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const not_dir = try std.fs.path.join(alloc, &.{ root, "file/child" });
+    defer alloc.free(not_dir);
+    const loop = try std.fs.path.join(alloc, &.{ root, "loop/child" });
+    defer alloc.free(loop);
+
+    try std.testing.expectError(error.NotDir, realpathAlloc(alloc, not_dir));
+    try std.testing.expectError(error.SymLinkLoop, realpathAlloc(alloc, loop));
 }
 
 const DurableFailureState = struct {

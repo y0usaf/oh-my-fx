@@ -24,7 +24,6 @@ const SkillsMenuLayout = struct {
     visible_items: u16 = 0,
     show_header: bool = true,
     first_item_row: u16 = header_rows,
-    description_row_count: u16 = 0,
     item_stride: u16 = title_rows,
     row_count: u16 = 0,
 
@@ -61,7 +60,6 @@ const SkillsMenuLayout = struct {
                 .selected = selected,
                 .visible_items = 1,
                 .first_item_row = 1,
-                .description_row_count = 1,
                 .item_stride = title_rows + description_rows,
                 .row_count = 3,
             };
@@ -76,7 +74,6 @@ const SkillsMenuLayout = struct {
             .selected = selected,
             .visible_items = visible_items,
             .first_item_row = first_item_row,
-            .description_row_count = description_rows,
             .item_stride = item_stride,
             .row_count = first_item_row + visible_items * item_stride - item_gap_rows,
         };

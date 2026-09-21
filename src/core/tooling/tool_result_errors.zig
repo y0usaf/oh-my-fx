@@ -84,6 +84,16 @@ pub fn inspectTerminalActionFieldCorrection(
         .string => |value| value,
         else => return null,
     };
+    if (std.mem.eql(u8, code, "invalid_shell_request")) {
+        const executed = error_value.get("executed") orelse return null;
+        if (executed != .bool or executed.bool) return null;
+        const problems = error_value.get("problems") orelse return null;
+        if (problems != .array or problems.array.items.len == 0) return null;
+        for (problems.array.items) |problem| {
+            if (problem != .string) return null;
+        }
+        return .{ .invalid_field_count = problems.array.items.len };
+    }
     if (!std.mem.eql(u8, code, terminal_action_field_error_code)) return null;
     const action = error_value.get("action") orelse return null;
     if (action != .string) return null;
@@ -141,6 +151,8 @@ pub fn toolReviewHeldJson(
         .review_caution, .review_evidence_incomplete, .review_unavailable => {},
         .user_denied, .auto_denied, .policy_denied, .permission_required => unreachable,
     }
+    const malformed_response = reason == .review_unavailable and
+        if (review_cause) |cause| cause.is_malformed_completion() else false;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     out.writer.writeAll("{\"error\":{\"type\":\"tool_review_held\",\"tool_name\":") catch
@@ -150,7 +162,7 @@ pub fn toolReviewHeldJson(
     writeMaskedJsonString(
         alloc,
         &out.writer,
-        permissionDeniedMessage(tool_name, reason),
+        if (malformed_response) "Safety reviewer returned an invalid response; action held" else permissionDeniedMessage(tool_name, reason),
     ) catch return error.OutOfMemory;
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
     std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch
@@ -171,7 +183,10 @@ pub fn toolReviewHeldJson(
     writeMaskedJsonString(
         alloc,
         &out.writer,
-        permissionDeniedSuggestion(reason),
+        if (malformed_response)
+            "The action did not run because the reviewer did not return a valid decision. Continue with a different safe action or retry in a later turn."
+        else
+            permissionDeniedSuggestion(reason),
     ) catch return error.OutOfMemory;
     out.writer.writeAll("}}") catch return error.OutOfMemory;
     return try out.toOwnedSlice();
@@ -206,7 +221,7 @@ fn permissionDeniedSuggestion(
         .user_denied => "The tool did not run. Do not retry unchanged; explain the denial or use a safer allowed alternative.",
         .auto_denied => "The tool did not run. This is a legacy automatic denial; choose a materially different safe action or explain the blocker.",
         .review_caution => "The action did not run. Use the review advice to choose a materially different safe action, or explain why no safe path remains.",
-        .review_evidence_incomplete => "The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; remove literal secret material, use a symbolic reference, or choose a materially different action.",
+        .review_evidence_incomplete => "The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; reduce the action or supporting evidence to fit the review limits, or choose a materially different fully inspectable action.",
         .review_unavailable => "The action did not run because safety review was unavailable. Continue with a different safe action or retry later.",
         .policy_denied => "The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
         .permission_required => "The tool did not run. Noninteractive mode cannot show an approval prompt. Rerun interactively to approve, or configure a narrow permission rule before retrying.",
@@ -355,6 +370,14 @@ pub fn malformedToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Alloc
     });
 }
 
+pub fn nonObjectToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Allocator.Error![]u8 {
+    return toolExecutionFailureJson(alloc, .{
+        .tool_name = tool_name,
+        .message = "Tool arguments must be a JSON object. The call was not executed.",
+        .suggestion = "Reissue the tool call with a JSON object matching the tool schema.",
+    });
+}
+
 pub fn preToolUseBlockedJson(
     alloc: Allocator,
     tool_name: []const u8,
@@ -456,6 +479,28 @@ test "tool permission denied JSON carries stable fields only" {
     try std.testing.expect(error_obj.get("denied").?.bool);
     try std.testing.expectEqualStrings("The tool did not run. Do not retry unchanged; explain the denial or use a safer allowed alternative.", error_obj.get("suggestion").?.string);
     try std.testing.expect(isToolPermissionDeniedOutput(payload));
+}
+
+test "review response errors distinguish invalid decisions from unavailable transport" {
+    const alloc = std.testing.allocator;
+    for ([_]auto_classifier.InvalidReason{ .completion_text, .completion_tool_call_count, .completion_tool_name, .completion_argument_integrity, .arguments_json, .arguments_shape, .arguments_decision }) |cause| {
+        const output = try toolReviewHeldJson(alloc, "edit_file", .review_unavailable, null, cause);
+        defer alloc.free(output);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
+        defer parsed.deinit();
+        const detail = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings("Safety reviewer returned an invalid response; action held", detail.get("message").?.string);
+        try std.testing.expectEqualStrings(@tagName(cause), detail.get("review_cause").?.string);
+        try std.testing.expectEqualStrings("review_unavailable", detail.get("reason").?.string);
+        try std.testing.expect(detail.get("held").?.bool);
+        try std.testing.expect(std.mem.find(u8, detail.get("suggestion").?.string, "later turn") != null);
+    }
+    const unavailable = try toolReviewHeldJson(alloc, "edit_file", .review_unavailable, null, .transport_transient);
+    defer alloc.free(unavailable);
+    try std.testing.expect(std.mem.find(u8, unavailable, "Safety reviewer unavailable; action held") != null);
+    const caution = try toolReviewHeldJson(alloc, "edit_file", .review_caution, "Concrete injection", null);
+    defer alloc.free(caution);
+    try std.testing.expect(std.mem.find(u8, caution, "Action held after safety review") != null);
 }
 
 test "review hold JSON preserves typed reasons apart from permission denial" {

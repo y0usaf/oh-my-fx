@@ -247,7 +247,7 @@ fn questionOptionLabel(
 ) []const u8 {
     if (!opt.is_freeform_slot) return opt.label;
     return if (entry.freeform_buffer.len == 0)
-        question_prompt.freeform_option_label
+        opt.label
     else
         entry.freeform_buffer;
 }
@@ -413,8 +413,8 @@ fn questionDescriptionColumn(row_budget: usize) usize {
 }
 
 /// Terminal block rendered after an entire question batch resolves.
-/// All answered → one anchored question row plus its muted answer row per
-/// entry. Cancelled → single `■ Cancelled\n`.
+/// All answered → each entry's question wraps under its batch ordinal with
+/// the muted answer hanging beneath. Cancelled → single `■ Cancelled\n`.
 pub fn composeQuestionResolutions(
     alloc: Allocator,
     prompt: *const question_prompt.QuestionPrompt,
@@ -480,6 +480,9 @@ fn writeQuestionAnswerResolution(
     try writeResolutionField(writer, indent, indent, answer, cols, ui_render.statusline_style);
 }
 
+// Wraps like the main transcript: soft wrap at word boundaries inside each
+// hard line, with continuation rows hanging under the field's first text
+// column. Long fields never trail off with an ellipsis.
 fn writeResolutionField(
     writer: *std.Io.Writer,
     first_prefix: []const u8,
@@ -490,24 +493,20 @@ fn writeResolutionField(
 ) !void {
     var start: usize = 0;
     var first = true;
-    while (true) {
-        const line_end = if (std.mem.findScalar(u8, text[start..], '\n')) |relative|
-            start + relative
-        else
-            text.len;
+    while (first or start < text.len) {
         const prefix = if (first) first_prefix else continuation_prefix;
-        const prefix_width = display_width.visibleWidth(prefix);
-        const budget = @as(usize, cols) -| prefix_width;
+        const budget = @as(usize, cols) -| display_width.visibleWidth(prefix);
+        const line = nextWrappedTextLine(text, start, budget);
 
         if (style) |row_style| try writer.writeAll(row_style);
         try writer.writeAll(prefix);
-        try writeTruncated(writer, text[start..line_end], budget);
+        try writer.writeAll(text[start..line.content_end]);
         if (style != null) try writer.writeAll(ui_render.reset_style);
         try writer.writeByte('\n');
 
-        if (line_end == text.len) break;
-        start = line_end + 1;
+        if (text.len == 0) break;
         first = false;
+        start = line.next_start;
     }
 }
 
@@ -517,18 +516,6 @@ fn writeCancelledResolution(writer: *std.Io.Writer) !void {
     try writer.writeAll(ui_render.reset_style);
     try writer.writeAll(" Cancelled");
     try writer.writeByte('\n');
-}
-
-fn writeTruncated(writer: *std.Io.Writer, text: []const u8, budget: usize) !void {
-    if (budget == 0) return;
-    if (display_width.visibleWidth(text) <= budget) {
-        try writer.writeAll(text);
-        return;
-    }
-    const keep_budget = if (budget > 1) budget - 1 else 0;
-    const prefix = display_width.prefixByWidth(text, keep_budget);
-    try writer.writeAll(prefix);
-    try writer.writeAll("…");
 }
 
 test "question footer composes prompt inside decision panel" {
@@ -787,6 +774,31 @@ test "resolved multiline question fields keep every row inside the transcript ra
     );
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, text);
+}
+
+test "resolved long question and answer wrap into hanging continuation rows" {
+    const answers = [_]types.QuestionAnswer{.{
+        .question = "Should the background summary cover only the assistant's written reply, or its entire completed turn including tool calls and results?",
+        .answer = "Cover the entire completed turn including tool calls and results while keeping the latest user context visible",
+    }};
+    const width: u16 = 40;
+    const text = try composeResolvedQuestionAnswers(std.testing.allocator, &answers, width);
+    defer std.testing.allocator.free(text);
+
+    // Nothing trails off: every word survives and no ellipsis is emitted.
+    try std.testing.expect(std.mem.find(u8, text, "…") == null);
+    try std.testing.expect(std.mem.find(u8, text, "results?") != null);
+    try std.testing.expect(std.mem.find(u8, text, "context visible") != null);
+
+    // Continuation rows hang under the question text ("  1) " is 5 wide).
+    try expectVisibleIndentBefore(text, "cover only the assistant's written", 5);
+    try expectVisibleIndentBefore(text, "results?", 5);
+    try expectVisibleIndentBefore(text, "context visible", 5);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= width);
+    }
 }
 
 test "resolved multiline answers use the same live and replay layout" {

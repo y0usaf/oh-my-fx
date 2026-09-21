@@ -414,7 +414,7 @@ fn composeOnboardingPickerRow(
         7 => "   Get started",
         12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
         13, 14 => "",
-        15 => "   Esc to set up later · Explore all commands with /help",
+        15 => "   esc to set up later · explore all commands with /help",
         16, 17 => "",
         else => "",
     };
@@ -505,7 +505,7 @@ fn composeSignInPickerRow(
             try row_text.appendClipped(
                 alloc,
                 &row,
-                "  Browser didn't return? Press Tab to enter a code",
+                "  Browser didn't return? press tab to enter a code",
                 width,
             );
         }
@@ -580,9 +580,9 @@ fn composeSignInPickerRow(
             .cancelled => "   Sign-in cancelled",
         },
         6 => if (accepts_manual_code)
-            "   Enter submits or reopens browser · Esc cancels"
+            "   enter submits or reopens browser · esc cancels"
         else
-            "   Enter reopens browser · Esc cancels",
+            "   enter reopens browser · esc cancels",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
@@ -615,7 +615,7 @@ fn composeApiKeyPickerRow(
                 for (0..@min(mask_count, width -| 5)) |_| try row.appendSlice(alloc, "•");
             }
         },
-        2 => try row_text.appendClipped(alloc, &row, "   Enter saves · Esc cancels", width),
+        2 => try row_text.appendClipped(alloc, &row, "   enter saves · esc cancels", width),
         3 => {
             var label_buf: [128]u8 = undefined;
             const label = std.fmt.bufPrint(
@@ -629,11 +629,6 @@ fn composeApiKeyPickerRow(
     }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
-}
-
-pub fn pickerRowCount(completion_count: usize) u16 {
-    if (completion_count == 0) return 1;
-    return @intCast(@min(completion_count, input_presentation.max_model_picker_rows));
 }
 
 pub fn activeListPickerReservedRows(terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
@@ -1209,7 +1204,7 @@ pub fn composeSlashMenuHeaderRow(
     const noun = if (layout.command_count == layout.result_count) "Commands" else "Results";
     var left_buf: [96]u8 = undefined;
     const left = if (std.mem.eql(u8, prefix, "/"))
-        std.fmt.bufPrint(&left_buf, "{s} {d} · Type to filter", .{ noun, layout.result_count }) catch noun
+        std.fmt.bufPrint(&left_buf, "{s} {d} · type to filter", .{ noun, layout.result_count }) catch noun
     else
         std.fmt.bufPrint(&left_buf, "{s} {d}", .{ noun, layout.result_count }) catch noun;
 
@@ -1516,7 +1511,7 @@ const picker_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "clear the terminal transcript", .presentation_category = .general },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove]", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true },
-    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|yolo|reset]", .completion_description = "choose permission behavior", .presentation_category = .security, .has_args = true },
+    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|full-access|reset]", .completion_description = "choose permission behavior", .presentation_category = .security, .has_args = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account },
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings", .completion_description = "configure fx", .presentation_category = .general },
 };
@@ -1584,7 +1579,7 @@ test "slash menu header reports command totals and visible range" {
     var row = try composeSlashMenuHeaderRow(std.testing.allocator, "/", layout, 80);
     defer row.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.find(u8, row.items, "Commands 7 · Type to filter") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Commands 7 · type to filter") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "1–6") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 80);
 }
@@ -2157,7 +2152,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "Esc to set up later · Explore all commands with /help") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "esc to set up later · explore all commands with /help") != null);
 
     var body_row = try composeAuthPickerRow(alloc, view, 2, authPickerRowCount(view), 100);
     defer body_row.deinit(alloc);
@@ -2259,8 +2254,8 @@ test "setup root fits the inline picker with status and controls" {
     try std.testing.expect(std.mem.find(u8, screen.items, "Model provider") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Vercel team") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Credential source") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "Enter Open") == null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "Esc Close") == null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "enter open") == null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "esc close") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Routing") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Vercel account") == null);
 
@@ -2481,7 +2476,7 @@ test "sign-in stage renders the complete device authorization screen" {
         "Open   https://vercel.test/verify",
         "Code   TEST-CODE",
         "Waiting for authorization",
-        "Enter reopens browser · Esc cancels",
+        "enter reopens browser · esc cancels",
     }) |expected| {
         try std.testing.expect(std.mem.find(u8, screen.items, expected) != null);
     }
@@ -2606,7 +2601,7 @@ test "Grok sign-in starts with the collapsed browser flow in the VT emulator" {
         "Sign in with Grok                                     Waiting for authorization…",
         "",
         "  Open   Authorize with Grok",
-        "  Browser didn't return? Press Tab to enter a code",
+        "  Browser didn't return? press tab to enter a code",
         "",
     };
     for (expected_rows, 1..) |expected, row_index| {
@@ -2719,8 +2714,8 @@ test "compact Grok sign-in keeps masked code entry without duplicate controls" {
     var row = try composeAuthPickerRow(alloc, view, 0, 1, 80);
     defer row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, row.items, "•••") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Enter submits") == null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Esc cancels") == null);
+    try std.testing.expect(std.mem.find(u8, row.items, "enter submits") == null);
+    try std.testing.expect(std.mem.find(u8, row.items, "esc cancels") == null);
     try std.testing.expect(std.mem.find(u8, row.items, ui_render.selected_completion_style) != null);
 }
 

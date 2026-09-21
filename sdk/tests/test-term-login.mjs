@@ -97,7 +97,7 @@ const stubFetch = async (input, init = {}) => {
       data: [{ id: "stub/login-model", type: "language", released: 1, tags: ["tool-use"] }],
     });
   }
-  if (url.href === "https://ai-gateway.vercel.sh/v3/ai/language-model") {
+  if (url.href === "https://ai-gateway.vercel.sh/v4/ai/language-model") {
     gatewayRequests.push({ authorization: headers.get("authorization") });
     return sseResponse(`LOGIN_GATEWAY_OK_${gatewayRequests.length}`);
   }

@@ -72,6 +72,7 @@ class BenchmarkPlan:
     function_prefixes: tuple[str, ...]
     training_argvs: tuple[tuple[str, ...], ...]
     workloads: tuple[Workload, ...]
+    microbenchmark: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,6 +115,7 @@ BENCHMARK_PLANS = (
         ),
         training_argvs=((),),
         workloads=(Workload("ui-activity", ()),),
+        microbenchmark=True,
     ),
     BenchmarkPlan(
         selector="approval_review",
@@ -977,6 +979,87 @@ def measure_startup(
     return tuple(results)
 
 
+def _measure_microbenchmark(
+    name: str,
+    control_binary: pathlib.Path,
+    candidate_binary: pathlib.Path,
+    hyperfine_binary: pathlib.Path,
+    repo_root: pathlib.Path,
+    output_dir: pathlib.Path,
+    samples: int,
+    timeout_s: float,
+) -> MeasurementResult:
+    home = output_dir / "home"
+    logs = output_dir / "logs"
+    home.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    for label, binary in (("control", control_binary), ("candidate", candidate_binary)):
+        result = run_checked(
+            (str(binary),),
+            cwd=repo_root,
+            env=_measurement_environment(home),
+            timeout_s=timeout_s,
+            log_path=logs / f"preflight-{label}.json",
+        )
+        if not result.stdout.strip():
+            raise PgsoError(f"microbenchmark produced empty stdout: {name}")
+
+    control_samples: list[float] = []
+    candidate_samples: list[float] = []
+    for round_index in range(samples):
+        export_path = logs / f"round-{round_index}-samples.json"
+        benchmark_argv: list[str] = [
+            str(hyperfine_binary),
+            "--shell=none",
+            "--style",
+            "none",
+            "--warmup",
+            "0",
+            "--runs",
+            "1",
+            "--export-json",
+            str(export_path),
+        ]
+        order = (
+            (("control", control_binary), ("candidate", candidate_binary))
+            if round_index % 2 == 0
+            else (("candidate", candidate_binary), ("control", control_binary))
+        )
+        for label, binary in order:
+            benchmark_argv.extend(
+                (
+                    "--command-name",
+                    label,
+                    shlex.join((str(binary),)),
+                )
+            )
+        run_checked(
+            benchmark_argv,
+            cwd=repo_root,
+            env=_measurement_environment(home),
+            timeout_s=timeout_s,
+            log_path=logs / f"round-{round_index}.json",
+            require_empty_stderr=False,
+        )
+        round_results = _read_hyperfine_samples(export_path, expected_samples=1)
+        control_samples.append(round_results["control"][0])
+        candidate_samples.append(round_results["candidate"][0])
+
+    comparison = compare_samples(tuple(control_samples), tuple(candidate_samples))
+    return MeasurementResult(
+        name=name,
+        argv=(),
+        requested_samples=samples,
+        control_samples=tuple(control_samples),
+        candidate_samples=tuple(candidate_samples),
+        control_failures=0,
+        candidate_failures=0,
+        errors=(),
+        comparison=comparison,
+        passed=comparison.passed,
+    )
+
+
 def measure_heavy_workloads(
     *,
     toolchain: Toolchain | None,
@@ -986,6 +1069,7 @@ def measure_heavy_workloads(
     timeout_s: float,
     workload_names: Sequence[str] | None = None,
     prebuilt_pairs: Mapping[str, BenchmarkPair] | None = None,
+    hyperfine_binary: pathlib.Path | None = None,
 ) -> tuple[MeasurementResult, ...]:
     output_dir.mkdir(parents=True, exist_ok=False)
     home = output_dir / "home"
@@ -1048,6 +1132,24 @@ def measure_heavy_workloads(
                     )
                 return result.elapsed_seconds
 
+            if plan.microbenchmark:
+                if hyperfine_binary is None:
+                    raise PgsoError(
+                        f"microbenchmark measurement requires Hyperfine: {plan.selector}"
+                    )
+                results.append(
+                    _measure_microbenchmark(
+                        workload.name,
+                        pair.control_binary,
+                        pair.candidate_binary,
+                        hyperfine_binary,
+                        repo_root,
+                        workload_logs,
+                        samples,
+                        timeout_s,
+                    )
+                )
+                continue
             results.append(
                 measure_alternating(
                     name=workload.name,

@@ -22,7 +22,7 @@ pub fn Commands(comptime App: type) type {
         pub fn attachPath(app: *App, path: []const u8) !void {
             const trimmed = std.mem.trim(u8, path, " \t");
             if (trimmed.len == 0) {
-                try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = "usage: /image <path>" }, true);
+                try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /image <path>" }, true);
                 return;
             }
 

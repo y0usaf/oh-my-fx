@@ -138,6 +138,7 @@ pub const Runtime = struct {
         event: usage_report.ProfileEvent,
     ) anyerror!void {
         const self: *Runtime = @ptrCast(@alignCast(context));
+        const started_ms = io_mod.milliTimestamp();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         const store = if (self.store) |*value| value else return error.ProfileUsageUnavailable;
@@ -145,6 +146,11 @@ pub const Runtime = struct {
             self.last_error = err;
             return err;
         };
+        debug_trace.logf(
+            "session",
+            "usage profile append ms={d} outcome={s}",
+            .{ io_mod.milliTimestamp() - started_ms, @tagName(outcome) },
+        );
         if (outcome == .conflict) {
             self.last_error = error.ConflictingUsagePublication;
             return error.ConflictingUsagePublication;

@@ -1,9 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const session_runtime = @import("../session/session.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 
 const CancellationTarget = enum {
     none,
@@ -47,13 +45,35 @@ test "cancellation target distinguishes agent turns and manual compaction" {
 
 pub fn InterruptRuntime(comptime App: type) type {
     return struct {
-        const queue_rt = input_queue_runtime.Runtime(App);
-
         pub fn hasActiveOperation(app: *App) bool {
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
+                    if (app.auth.providerPreparationPending()) return true;
+                }
+            }
             return activeCancellationTarget(app) != .none;
         }
 
+        pub fn dismissCompactionFeedback(app: *App) bool {
+            if (comptime !@hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) return false;
+            const observed = app.worker.compactionActivitySnapshot();
+            const op = observed.operation orelse return false;
+            if (!op.visible(@import("../shared/io.zig").milliTimestamp())) return false;
+            if (!app.worker.dismissCompactionActivity(op.id, observed.revision)) return false;
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         pub fn cancelActiveOperation(app: *App) !void {
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "cancelProviderPreparation")) {
+                    if (app.auth.cancelProviderPreparation()) {
+                        if (comptime @hasDecl(App, "cancelPendingSubmission")) _ = App.cancelPendingSubmission(app);
+                        app.shell.render_requests.request(.footer);
+                        return;
+                    }
+                }
+            }
             if (activeCancellationTarget(app) == .context_compaction) {
                 if (comptime !@hasDecl(
                     @TypeOf(app.worker),
@@ -65,11 +85,6 @@ pub fn InterruptRuntime(comptime App: type) type {
                 if (!cancelled) return;
                 app.pacer.clear(app.alloc);
                 if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
-                try app.writeDomainNotice(.{
-                    .topic = "context",
-                    .tone = .neutral,
-                    .body = "Context compaction cancelled.",
-                }, true);
                 app.shell.render_requests.request(.footer);
                 return;
             }
@@ -77,21 +92,43 @@ pub fn InterruptRuntime(comptime App: type) type {
             // Pending approval keeps the stream active until resolution.
             // Avoid duplicate cancellation notices once the worker is cancelled.
             if (app.worker.isCancelRequested()) return;
+            const compacting = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) blk: {
+                const observed = app.worker.compactionActivitySnapshot();
+                break :blk if (observed.operation) |op| op.active() else false;
+            } else false;
             const tool_active = activeToolStatusCount(app) > 0;
             debug_trace.logf("input", "cancel active operation queued={d}", .{app.worker.queuedPromptCount()});
             traceInterruptRequested(app, "input_active_stream");
-            const queue_review_opened = if (comptime @hasField(App, "queued_prompt_review"))
-                queue_rt.requestCancelAndOpen(app)
-            else blk: {
+            if (comptime @hasDecl(@TypeOf(app.worker), "requestInteractiveCancel")) {
+                app.worker.requestInteractiveCancel();
+            } else {
                 app.worker.requestCancel();
-                break :blk false;
-            };
+            }
             app.pacer.clear(app.alloc);
             if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
-            if (!tool_active) {
-                try app.writeDomainNotice(session_runtime.interrupted_turn_notice, true);
+            if (compacting) {
+                app.shell.render_requests.request(.footer);
+                return;
             }
-            if (tool_active and !queue_review_opened) return;
+            if (tool_active) {
+                _ = try shell_runtime.presentActiveToolCancellation(
+                    app.alloc,
+                    &app.shell,
+                );
+            } else {
+                if (comptime @hasField(App, "metrics")) {
+                    try shell_runtime.writeTurnCancellation(
+                        app.alloc,
+                        &app.shell,
+                        &app.metrics,
+                        true,
+                    );
+                }
+            }
+            if (tool_active) {
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             app.stream = .{};
             app.shell.render_requests.request(.footer);
         }
@@ -149,6 +186,22 @@ pub fn InterruptRuntime(comptime App: type) type {
             return cancellationTarget(app.stream.active, status);
         }
     };
+}
+
+test "idle compaction feedback dismissal is scoped and never cancels active work" {
+    const FakeApp = struct {
+        worker: worker_runtime.WorkerRuntime = .{},
+        shell: struct { render_requests: @import("../../ui/render_request.zig").RenderRequestState = .{} } = .{},
+    };
+    var app: FakeApp = .{};
+    defer app.worker.deinit(std.testing.allocator);
+    const id = app.worker.beginCompactionActivity(.manual, null);
+    try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app));
+    app.worker.settleCompactionActivity(id, .{ .outcome = .cancelled });
+    try std.testing.expect(InterruptRuntime(FakeApp).dismissCompactionFeedback(&app));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expect(!app.worker.isCancelRequested());
+    try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app));
 }
 
 test "interactive connectivity wait maps try later to recovery pause" {

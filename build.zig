@@ -103,6 +103,35 @@ pub fn build(b: *std.Build) void {
         addNapiArtifact(b, napi_surface, target, git_commit, app_version, update_channel);
     }
 
+    const mcp_test_exports = b.createModule(.{
+        .root_source_file = b.path("src/mcp_test_exports.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mcp_test_exports.addImport("build_options", build_options.createModule());
+    const mcp_dispatcher_e2e = b.addExecutable(.{
+        .name = "mcp-stdio-dispatcher-driver",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "tests/e2e/fixtures/mcp-stdio-dispatcher-driver.zig",
+            ),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mcp_dispatcher_e2e.root_module.addImport(
+        "mcp_test_exports",
+        mcp_test_exports,
+    );
+    const run_mcp_dispatcher_e2e = b.addRunArtifact(mcp_dispatcher_e2e);
+    if (b.args) |args| run_mcp_dispatcher_e2e.addArgs(args);
+    const mcp_dispatcher_e2e_step = b.step(
+        "run-mcp-stdio-dispatcher-e2e",
+        "Run the MCP stdio dispatcher E2E driver",
+    );
+    mcp_dispatcher_e2e_step.dependOn(&run_mcp_dispatcher_e2e.step);
 
     // --- file_index search benchmark ---
     const benchmark_exports_mod = b.createModule(.{
@@ -361,6 +390,7 @@ fn addWasmArtifact(
             .strip = true,
         }),
     });
+    if (surface == .core) wasm_exe.stack_size = 1024 * 1024;
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});

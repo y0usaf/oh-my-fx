@@ -1,4 +1,6 @@
 const std = @import("std");
+
+pub const mcp_auth_usage = "mcp auth NAME";
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
@@ -17,6 +19,7 @@ pub const TopLevelKind = enum {
     status,
     permissions,
     mcp,
+    slack,
     models,
     provider,
     doctor,
@@ -37,7 +40,6 @@ pub const SlashKind = enum {
     new_session,
     reset_session,
     resume_session,
-    continue_recovery,
     rename_session,
     help,
     login,
@@ -741,7 +743,7 @@ const permissions_arg_completions = [_][]const u8{
     "/permissions auto",
     "/permissions remember",
     "/permissions revoke",
-    "/permissions yolo",
+    "/permissions full-access",
     "/permissions reset",
 };
 
@@ -965,39 +967,6 @@ fn nthAllowlistArgLabel(query: []const u8, n: usize) ?[]const u8 {
     const state = allowlistArgCompletionState(query);
     const full = nthArgCompletion(state.completions, state.label_offset, state.query, n) orelse return null;
     return full[state.label_offset..];
-}
-
-/// Returns the index of `label` among the matching arg completions for
-/// the given prefix, or null if the label is not in the filtered set.
-pub fn argCompletionIndexForLabel(prefix: []const u8, label: []const u8) ?usize {
-    if (allowlistArgCompletionPrefix(prefix)) |query| {
-        const state = allowlistArgCompletionState(query);
-        return indexOfArgLabel(state.completions, state.label_offset, state.query, label);
-    }
-    if (statuslineArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&statusline_arg_completions, "/statusline ".len, query, label);
-    }
-    if (notificationsArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&notifications_arg_completions, "/sound ".len, query, label);
-    }
-    if (permissionsArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&permissions_arg_completions, "/permissions ".len, query, label);
-    }
-    if (workspaceArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&workspace_arg_completions, "/workspace ".len, query, label);
-    }
-    return null;
-}
-
-fn indexOfArgLabel(completions: []const []const u8, command_with_space_len: usize, query: []const u8, label: []const u8) ?usize {
-    var idx: usize = 0;
-    for (completions) |completion| {
-        if (!argCompletionMatches(completion, command_with_space_len, query)) continue;
-        const arg = completion[command_with_space_len..];
-        if (std.mem.eql(u8, arg, label)) return idx;
-        idx += 1;
-    }
-    return null;
 }
 
 fn argCompletionMatches(completion: []const u8, command_with_space_len: usize, query: []const u8) bool {
@@ -1661,7 +1630,7 @@ test "top-level help renders flags as compact aligned rows" {
 
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
-    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
+    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the remembered workspace session"));
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
     try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));
@@ -1796,7 +1765,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 35), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 34), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -2072,15 +2041,15 @@ test "slash completions list permission modes and rule management" {
     try std.testing.expectEqualStrings("/permissions auto", nthSlashCompletion(testSlashRegistry(), "/permissions ", 1).?);
     try std.testing.expectEqualStrings("/permissions remember", nthSlashCompletion(testSlashRegistry(), "/permissions ", 2).?);
     try std.testing.expectEqualStrings("/permissions revoke", nthSlashCompletion(testSlashRegistry(), "/permissions ", 3).?);
-    try std.testing.expectEqualStrings("/permissions yolo", nthSlashCompletion(testSlashRegistry(), "/permissions ", 4).?);
+    try std.testing.expectEqualStrings("/permissions full-access", nthSlashCompletion(testSlashRegistry(), "/permissions ", 4).?);
     try std.testing.expectEqualStrings("/permissions reset", nthSlashCompletion(testSlashRegistry(), "/permissions ", 5).?);
     try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/permissions a"));
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions as"));
     try std.testing.expectEqualStrings("/permissions ask", nthSlashCompletion(testSlashRegistry(), "/permissions as", 0).?);
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions au"));
     try std.testing.expectEqualStrings("/permissions auto", nthSlashCompletion(testSlashRegistry(), "/permissions au", 0).?);
-    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions y"));
-    try std.testing.expectEqualStrings("/permissions yolo", nthSlashCompletion(testSlashRegistry(), "/permissions y", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions f"));
+    try std.testing.expectEqualStrings("/permissions full-access", nthSlashCompletion(testSlashRegistry(), "/permissions f", 0).?);
     try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/permissions r"));
     try std.testing.expectEqualStrings("/permissions remember", nthSlashCompletion(testSlashRegistry(), "/permissions r", 0).?);
     try std.testing.expectEqualStrings("/permissions revoke", nthSlashCompletion(testSlashRegistry(), "/permissions r", 1).?);
@@ -2093,7 +2062,7 @@ test "slash completion labels strip argument prefixes" {
     try std.testing.expectEqualStrings("auto", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 1).?);
     try std.testing.expectEqualStrings("remember", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 2).?);
     try std.testing.expectEqualStrings("revoke", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 3).?);
-    try std.testing.expectEqualStrings("yolo", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 4).?);
+    try std.testing.expectEqualStrings("full-access", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 4).?);
     try std.testing.expectEqualStrings("reset", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 5).?);
     try std.testing.expectEqualStrings("view", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 0).?);
     try std.testing.expectEqualStrings("add", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 1).?);
@@ -2166,3 +2135,18 @@ test "top-level help lines fit representative terminal widths" {
         try expectAllLinesFit(text, width);
     }
 }
+
+pub const slack_install_spec: TopLevelSpec = .{
+    .kind = .slack,
+    .token = "slack",
+    .usage = "slack <install|status|refresh> [--json]",
+    .summary = "Install and manage the workspace Slack bot locally",
+    .options = &.{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }},
+    .details = &.{
+        "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
+        "status shows local installation metadata; refresh renews tokens without browser authorization.",
+        "This is a workspace bot installer. Employee MCP login remains fx mcp auth NAME.",
+        "Credentials are saved in ~/.fx/slack/installation.json with owner-only permissions.",
+        "Refresh runs only when requested; no background service is installed.",
+    },
+};

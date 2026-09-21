@@ -25,7 +25,10 @@ pub fn menuRowCount(projection: McpMenuProjection, width: u16, max_rows: u16) u1
             @max(projection.itemCount(), @as(usize, 1)),
             body_budget,
         )),
-        .details => @min(@as(u16, 7), body_budget),
+        .details => @min(if (projection.selectedServer()) |server|
+            if (server.failure != null) @as(u16, 8) else 7
+        else
+            @as(u16, 1), body_budget),
         .preview => @min(previewVisualRowCount(projection.preview, width), body_budget),
         .add => @min(
             if (projection.state.add_transport == .local) @as(u16, 5) else @as(u16, 4),
@@ -35,7 +38,7 @@ pub fn menuRowCount(projection: McpMenuProjection, width: u16, max_rows: u16) u1
             @max(projection.arguments.len, @as(usize, 1)),
             body_budget,
         )),
-        .info => @min(@as(u16, 2), body_budget),
+        .info => @min(@as(u16, 7), body_budget),
         .confirm => 1,
     };
     return header_rows + body_rows;
@@ -87,10 +90,17 @@ pub noinline fn composeMcpMenuRow(
         ) catch "Filter";
         return composeTextRow(alloc, filter, width, ui_render.dim_style, 2);
     }
+    if (show_header and row_index == 1) {
+        if (projection.state.section == .resources or projection.state.section == .prompts) {
+            if (projection.selectedServer()) |server| return composeFactRow(alloc, "Server", server.configured_name, width);
+        } else if (projection.state.section == .tools) {
+            return composeTextRow(alloc, "All available servers", width, ui_render.dim_style, 2);
+        }
+    }
     if (row_index < body_start) return empty;
     const body_index = row_index - body_start;
     return switch (projection.state.screen) {
-        .browse => composeBrowseRow(alloc, projection, body_index, width, row_count - body_start),
+        .browse => composeBrowseRow(alloc, projection, body_index, width, row_count - body_start, show_header),
         .details => composeDetailsRow(alloc, projection, body_index, width),
         .preview => composePreviewRow(
             alloc,
@@ -136,11 +146,11 @@ fn composeArgumentRow(
 
 fn confirmationText(action: ?mcp_menu_state.Action) []const u8 {
     return switch (action orelse return "Confirm this MCP action before continuing.") {
-        .remove => "Remove this profile MCP server? Press Enter to confirm.",
-        .logout => "Log out of this MCP server? Press Enter to confirm.",
-        .trust_reject => "Reject this project MCP server? Press Enter to confirm.",
-        .trust_approve_all => "Approve all pending project MCP servers? Press Enter to confirm.",
-        .trust_reset => "Reset all project MCP choices? Press Enter to confirm.",
+        .remove => "Remove this profile MCP server? press enter to confirm.",
+        .logout => "Log out of this MCP server? press enter to confirm.",
+        .trust_reject => "Reject this project MCP server? press enter to confirm.",
+        .trust_approve_all => "Approve all pending project MCP servers? press enter to confirm.",
+        .trust_reset => "Reset all project MCP choices? press enter to confirm.",
         else => "Confirm this MCP action before continuing.",
     };
 }
@@ -194,12 +204,14 @@ fn composeBrowseRow(
     body_index: u16,
     width: u16,
     visible_rows: u16,
+    feedback_in_header: bool,
 ) !std.ArrayList(u8) {
-    if (projection.state.load_state == .loading) {
+    if (projection.state.load_state == .loading and projection.state.section != .servers) {
         if (body_index > 0) return .empty;
         return composeTextRow(alloc, "Loading MCP catalog…", width, ui_render.dim_style, 2);
     }
-    if (projection.state.load_state == .failed and projection.feedback != null) {
+    if (projection.state.load_state == .failed and projection.feedback != null and projection.state.section != .servers) {
+        if (feedback_in_header) return .empty;
         if (body_index > 0) return .empty;
         return composeTextRow(alloc, projection.feedback.?, width, ui_render.warning_style, 2);
     }
@@ -273,6 +285,11 @@ fn composeInfoRow(alloc: Allocator, row_index: u16, width: u16) !std.ArrayList(u
     return switch (row_index) {
         0 => composeFactRow(alloc, "Profile config", "~/.fx/mcp.json", width),
         1 => composeFactRow(alloc, "Project config", "<workspace>/.mcp.json", width),
+        2 => composeTextRow(alloc, "servers: a add · r reload · enter inspect", width, ui_render.dim_style, 2),
+        3 => composeTextRow(alloc, "project trust: p approve all · z reset", width, ui_render.dim_style, 2),
+        4 => composeTextRow(alloc, "details: enter sign in · l logout · d remove", width, ui_render.dim_style, 2),
+        5 => composeTextRow(alloc, "project details: a approve · x reject", width, ui_render.dim_style, 2),
+        6 => composeTextRow(alloc, "catalogs: / filter · enter open · i insert preview", width, ui_render.dim_style, 2),
         else => .empty,
     };
 }
@@ -344,20 +361,21 @@ fn composeServerRow(
         try appendTerminalSafeSingleLine(alloc, &row, state, state_width);
     }
     if (width >= 80) {
-        try row_text.appendSpacesToColumn(alloc, &row, 44);
+        try row_text.appendSpacesToColumn(alloc, &row, 46);
         var meta_buf: [160]u8 = undefined;
         const meta = serverMetadata(&meta_buf, server);
-        try appendTerminalSafeSingleLine(alloc, &row, meta, @as(usize, width) -| 44);
+        try appendTerminalSafeSingleLine(alloc, &row, meta, @as(usize, width) -| 46);
     }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
 
 fn serverStateLabel(server: mcp_health.ServerSnapshot) []const u8 {
+    if (server.reloading) return "Reloading";
     if (server.workspace_admission == .pending) return "Pending trust";
-    if (server.authentication == .required) return "Needs authentication";
-    return switch (server.connection) {
-        .disconnected => "Disconnected",
+    return switch (mcp_health.classify(server.connection, server.authentication, false)) {
+        .needs_auth => "Needs authentication",
+        .unavailable, .on_demand => "Disconnected",
         .disabled => "Disabled",
         .connecting => "Connecting",
         .ready => "Ready",
@@ -405,6 +423,7 @@ fn composeDetailsRow(
         4 => .{ .label = "Policy", .value = if (server.required) "required" else "optional" },
         5 => .{ .label = "Protocol", .value = server.protocol_version orelse "unavailable" },
         6 => .{ .label = "Capabilities", .value = capabilitySummary(&value_buf, server.counts) },
+        7 => .{ .label = "Error", .value = server.failure orelse return .empty },
         else => return .empty,
     };
     return composeFactRow(alloc, pair.label, pair.value, width);
@@ -838,6 +857,23 @@ test "MCP menu every screen and section renders through the VT" {
         &.{ "MCP 1", "[Servers]", "fixture", "Ready", "stdio · Profile" },
     );
 
+    var unauthenticated = server;
+    unauthenticated.transport = .http;
+    unauthenticated.authentication = .required;
+    const auth_servers = [_]mcp_health.ServerSnapshot{unauthenticated};
+    projection.servers = &auth_servers;
+    try expectMcpMenuVtContains(alloc, projection, width, max_inline_rows, &.{"Needs authentication  HTTP"});
+    projection.servers = &servers;
+
+    var independently_reloading = [_]mcp_health.ServerSnapshot{ server, server };
+    independently_reloading[0].reloading = true;
+    independently_reloading[1].configured_name = @constCast("other");
+    projection.servers = &independently_reloading;
+    projection.state.load_state = .loading;
+    try expectMcpMenuVtContains(alloc, projection, width, max_inline_rows, &.{ "Reloading", "Ready", "other" });
+    projection.servers = &servers;
+    projection.state.load_state = .ready;
+
     projection.state.screen = .details;
     try expectMcpMenuVtContains(
         alloc,
@@ -951,6 +987,6 @@ test "MCP menu every screen and section renders through the VT" {
         projection,
         width,
         max_inline_rows,
-        &.{"Remove this profile MCP server? Press Enter to confirm."},
+        &.{"Remove this profile MCP server? press enter to confirm."},
     );
 }

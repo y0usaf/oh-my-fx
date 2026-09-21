@@ -190,22 +190,6 @@ pub fn decodeHeader(bytes: []const u8) Error!Header {
     return header;
 }
 
-pub fn encodePage(alloc: Allocator, page_data: PageData) Allocator.Error![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    out.writer.writeAll(page_magic) catch return error.OutOfMemory;
-    writeInt(&out.writer, u32, epoch_schema_version) catch return error.OutOfMemory;
-    writeInt(&out.writer, u64, page_data.number) catch return error.OutOfMemory;
-    writeInt(&out.writer, u64, page_data.storage_epoch) catch return error.OutOfMemory;
-    for (page_data.slots) |slot| {
-        out.writer.writeByte(if (slot.occupied) 1 else 0) catch return error.OutOfMemory;
-        writeInt(&out.writer, u64, slot.next_free) catch return error.OutOfMemory;
-        writeInt(&out.writer, u16, slot.child_len) catch return error.OutOfMemory;
-        out.writer.writeAll(slot.childId()) catch return error.OutOfMemory;
-    }
-    return out.toOwnedSlice();
-}
-
 pub fn decodePage(
     bytes: []const u8,
     expected_number: u64,

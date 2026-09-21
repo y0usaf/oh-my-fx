@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
 const FETCH_URL = "https://example.com/docs";
@@ -89,13 +90,15 @@ function startFakeGateway(
         });
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
-      requests.push({ body: await req.text(), headers: req.headers });
+      const body = await req.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+      requests.push({ body, headers: req.headers });
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
     },
   });
 
   return {
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     baseUrl: `http://127.0.0.1:${server.port}`,
     model,
     requests,
@@ -348,7 +351,7 @@ describe("web_fetch Gateway fixture", () => {
   );
 
   test(
-    "invalid credentialed web_fetch persists no URL credentials",
+    "invalid credentialed web_fetch persists the URL verbatim",
     async () => {
       const root = createIsolatedRoot({ webFetchPermission: "allow" });
       const gateway = startFakeGateway([
@@ -381,8 +384,8 @@ describe("web_fetch Gateway fixture", () => {
           "utf8",
         );
         expect(sessionEvents).toContain("web_fetch");
-        expect(sessionEvents).not.toContain("user:pass");
-        expect(sessionEvents).toContain("https://[redacted]@example.com/docs");
+        expect(sessionEvents).toContain("https://user:pass@example.com/docs");
+        expect(sessionEvents).not.toContain("[redacted]");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

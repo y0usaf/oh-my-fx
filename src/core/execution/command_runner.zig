@@ -5,6 +5,7 @@ const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -606,7 +607,7 @@ pub fn executeCommand(
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
     var scratch_state = std.heap.ArenaAllocator.init(arena);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var effective_cfg = cfg;
@@ -629,7 +630,7 @@ pub fn executeCommandInEnvironment(
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(arena);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var effective_cfg = cfg;
@@ -1049,24 +1050,6 @@ fn finishCollectedProcess(
 
 fn executeProcess(scratch: Allocator, cfg: Config, argv: []const []const u8, cwd: []const u8) !CollectedProcess {
     return executeProcessWithInput(scratch, cfg, argv, cwd, false, true);
-}
-
-fn executeProcessWithClosedInput(
-    scratch: Allocator,
-    cfg: Config,
-    argv: []const []const u8,
-    cwd: []const u8,
-) !CollectedProcess {
-    if (comptime supports_foreground_session) {
-        return executeProcessWithDetachedSession(
-            scratch,
-            cfg,
-            argv,
-            cwd,
-            "",
-        );
-    }
-    return executeProcessWithInput(scratch, cfg, argv, cwd, true, true);
 }
 
 fn executeProcessWithInput(
@@ -1774,19 +1757,6 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     try std.testing.expectEqual(@as(?u32, null), trapped.command_result.?.signal);
 }
 
-fn formatExitOutput(alloc: Allocator, command: []const u8, cwd: []const u8, exit_code: i64, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
-    return command_contract.formatCommandResult(alloc, .{
-        .command = command,
-        .cwd = cwd,
-        .status = .{ .exit_code = exit_code },
-        .stdout_display = stdout_raw,
-        .stderr_display = stderr_raw,
-        .stdout_bytes = stdout_raw.len,
-        .stderr_bytes = stderr_raw.len,
-        .duration_ms = duration_ms,
-    });
-}
-
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
     return formatOutputWithStatus(
         alloc,
@@ -1892,7 +1862,7 @@ fn writePreviewEnvelope(alloc: Allocator, writer: *std.Io.Writer, label: []const
 
     try writer.print("<{s}>\n", .{label});
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     if (preview.total_bytes <= preview.max_bytes) {
@@ -3098,10 +3068,11 @@ test "foreground session owner loss kills the target and descendant before delay
     defer alloc.free(quoted_pids);
     const quoted_effect = try shellQuote(alloc, effect_path);
     defer alloc.free(quoted_effect);
+    // Keep a write window open, but publish readiness only after the PID record is complete.
     const target_script = try std.fmt.allocPrint(
         alloc,
-        "sleep 30 & child=$!; printf '%s %s' \"$$\" \"$child\" > {s}; sleep 3; printf FINISHED > {s}",
-        .{ quoted_pids, quoted_effect },
+        "sleep 30 & child=$!; (sleep 0.05; printf '%s %s' \"$$\" \"$child\") > {s}.pending && mv {s}.pending {s}; sleep 3; printf FINISHED > {s}",
+        .{ quoted_pids, quoted_pids, quoted_pids, quoted_effect },
     );
     defer alloc.free(target_script);
 
@@ -3111,6 +3082,11 @@ test "foreground session owner loss kills the target and descendant before delay
 
     const owner_write = child.stdin orelse return error.TestUnexpectedResult;
     child.stdin = null;
+    var owner_open = true;
+    errdefer if (owner_open) {
+        owner_write.close(io_mod.getIo());
+        _ = child.wait(io_mod.getIo()) catch {};
+    };
     try writeForegroundSessionFrameForTest(
         owner_write,
         foreground_session_release_byte,
@@ -3125,6 +3101,7 @@ test "foreground session owner loss kills the target and descendant before delay
     }
     const pids_text = try readAbsoluteFile(alloc, pids_path, 128);
     defer alloc.free(pids_text);
+    try std.testing.expectEqual(true, pids_text.len > 0);
     var pids = std.mem.tokenizeAny(u8, pids_text, " \r\n\t");
     const target_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
     const descendant_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
@@ -3133,6 +3110,7 @@ test "foreground session owner loss kills the target and descendant before delay
     defer signalProcess(descendant_pid, std.posix.SIG.KILL) catch {};
 
     owner_write.close(io_mod.getIo());
+    owner_open = false;
     _ = try child.wait(io_mod.getIo());
     try expectProcessGoneWithinForTest(target_pid, 2_000);
     try expectProcessGoneWithinForTest(descendant_pid, 2_000);
@@ -4721,18 +4699,25 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(workspace);
     const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
     defer alloc.free(pid_path);
+    // Natural cleanup may kill the child before it publishes its PID unless
+    // the parent waits for readiness after setsid and stream redirection.
     const command = try std.fmt.allocPrint(
         alloc,
         "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
+            " os.close(ready_r)\n" ++
             " os.setsid()\n" ++
             " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
             " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
-            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
             " time.sleep(30)\n" ++
             "else:\n" ++
-            " pass'",
+            " os.close(ready_w)\n" ++
+            " if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            " os.close(ready_r)'",
         .{pid_path},
     );
     defer alloc.free(command);

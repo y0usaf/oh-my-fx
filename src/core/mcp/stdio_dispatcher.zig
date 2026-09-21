@@ -11,6 +11,10 @@ const Allocator = std.mem.Allocator;
 const request_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const shutdown_grace_ms: i64 = 1_000;
 const termination_grace_ms: i64 = 1_000;
+/// Process-exit drain window: after stdin closes, give the child a short
+/// beat to read already-written frames (for example a cancellation
+/// notification) and exit before the kill lands.
+const immediate_drain_ms: i64 = 50;
 const cancellation_write_timeout_ms: u32 = 100;
 const server_request_write_timeout_ms: u32 = 1_000;
 
@@ -788,14 +792,28 @@ pub const StdioDispatcher = struct {
     }
 
     pub fn shutdown(self: *StdioDispatcher) void {
-        self.shutdownWithGrace(true);
+        self.shutdownWithMode(.graceful);
     }
 
     fn shutdownForced(self: *StdioDispatcher) void {
-        self.shutdownWithGrace(false);
+        self.shutdownWithMode(.forced);
     }
 
-    fn shutdownWithGrace(self: *StdioDispatcher, allow_grace: bool) void {
+    pub fn deinitImmediate(self: *StdioDispatcher) void {
+        self.shutdownImmediate();
+        self.destroy();
+    }
+
+    /// Process-exit path: kill the child immediately instead of waiting out
+    /// the grace windows; the reader thread unblocks as soon as the child
+    /// dies, so the join below stays bounded.
+    fn shutdownImmediate(self: *StdioDispatcher) void {
+        self.shutdownWithMode(.immediate);
+    }
+
+    const ShutdownMode = enum { graceful, forced, immediate };
+
+    fn shutdownWithMode(self: *StdioDispatcher, mode: ShutdownMode) void {
         var should_join = false;
         self.state_mutex.lockUncancelable(io_mod.getIo());
         switch (self.state) {
@@ -816,7 +834,7 @@ pub const StdioDispatcher = struct {
             return;
         }
 
-        if (allow_grace) {
+        if (mode == .graceful) {
             const deadline_ms = std.math.add(
                 i64,
                 io_mod.milliTimestamp(),
@@ -826,7 +844,17 @@ pub const StdioDispatcher = struct {
                 io_mod.sleep(request_poll_ns);
             }
         }
-        if (!self.readerIsDone()) {
+        if (mode == .immediate and !self.readerIsDone()) {
+            const deadline_ms = std.math.add(
+                i64,
+                io_mod.milliTimestamp(),
+                immediate_drain_ms,
+            ) catch std.math.maxInt(i64);
+            while (!self.readerIsDone() and io_mod.milliTimestamp() < deadline_ms) {
+                io_mod.sleep(request_poll_ns);
+            }
+        }
+        if (mode != .immediate and !self.readerIsDone()) {
             debug_trace.logf(
                 "mcp",
                 "stdio dispatcher requesting child termination generation={d}",
@@ -2365,6 +2393,22 @@ test "operation timeout returns and shutdown joins an uncooperative child" {
 
     dispatcher.shutdown();
     try expectProcessReaped(fixture.pid);
+}
+
+test "MCP immediate shutdown kills an uncooperative child without grace waits" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\trap '' TERM
+        \\while :; do sleep 1; done
+    );
+    const dispatcher = fixture.dispatcher;
+    const started_ms = io_mod.milliTimestamp();
+    dispatcher.deinitImmediate();
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try expectProcessReaped(fixture.pid);
+    try std.testing.expect(elapsed_ms < shutdown_grace_ms);
 }
 
 test "MCP normal shutdown gives a cooperative child TERM before forced cleanup" {

@@ -200,7 +200,7 @@ export async function runNativeRenderLab(
     markers: {
       shell: shellMarkers,
       clearedShell: scenario.commandK ? [shellMarkers[0]!] : [],
-      submitted: scenario.commandK ? ["permission_mode", "● Version:"] : ["permission_mode", "● Version:", "/help"],
+      submitted: scenario.commandK ? ["permission_mode", "* version:"] : ["permission_mode", "* version:", "/help"],
     },
     native: {
       adapter: scenario.adapter,
@@ -300,7 +300,7 @@ async function runNativeRelaunchScenario(
   );
 
   await launchFx(context, controller, "native-second");
-  await submitSlashCommand(context, controller, "/version", "● Version:", "native-second-version-visible");
+  await submitSlashCommand(context, controller, "/version", "* version:", "native-second-version-visible");
   await resize(context, controller, 96, 32, "native-second-resize-medium");
   await resize(context, controller, 132, 42, "native-second-resize-wide");
   await resize(context, controller, 120, 40, "native-second-resize-restored");
@@ -351,7 +351,7 @@ async function runCommandKScenario(context: NativeContext, controller: NativeCon
     "native-command-k-after-clear-marker",
   );
   await launchFx(context, controller, "native-command-k-after-clear");
-  await submitSlashCommand(context, controller, "/version", "● Version:", "native-command-k-version-visible");
+  await submitSlashCommand(context, controller, "/version", "* version:", "native-command-k-version-visible");
   const finalFrame = await capture(context, controller, "native-command-k-final-state");
   context.manifest.finalFrameIndex = finalFrame.index;
   await quitFx(context, controller, "native-command-k-cleanup");

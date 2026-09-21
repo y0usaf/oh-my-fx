@@ -17,12 +17,12 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const ApprovalPrompt = approval_prompt.ApprovalPrompt;
 const ApprovalProjection = approval_prompt.Projection;
 
-const file_approval_hint = "1–3 Choose now    ↑↓ Options    Tab Amend    Enter Confirm    Esc Cancel";
-const file_approval_navigation_hint = "1–3 Choose now    ↑↓ or Tab Options    Enter Confirm    Esc Cancel";
-const file_approval_screen_hint = "1–3 Choose now    ↑↓ Options    Tab Amend    Wheel Scroll    Enter Confirm    Esc Cancel";
-const file_approval_navigation_screen_hint = "1–3 Choose now    ↑↓ or Tab Options    Wheel Scroll    Enter Confirm    Esc Cancel";
-const file_approval_hint_compact = "1–3 Choose now    Enter Confirm    Esc Cancel";
-const file_approval_hint_minimal = "Enter Confirm    Esc Cancel";
+const file_approval_hint = "1–3 choose now    ↑↓ options    tab amend    enter confirm    esc cancel";
+const file_approval_navigation_hint = "1–3 choose now    ↑↓ or tab options    enter confirm    esc cancel";
+const file_approval_screen_hint = "1–3 choose now    ↑↓ options    tab amend    wheel scroll    enter confirm    esc cancel";
+const file_approval_navigation_screen_hint = "1–3 choose now    ↑↓ or tab options    wheel scroll    enter confirm    esc cancel";
+const file_approval_hint_compact = "1–3 choose now    enter confirm    esc cancel";
+const file_approval_hint_minimal = "enter confirm    esc cancel";
 // Ordered widest-first; every variant keeps the Enter/Esc controls so narrow
 // terminals never lose the submit and cancel instructions.
 const file_approval_hint_variants = [_][]const u8{ file_approval_hint, file_approval_hint_compact, file_approval_hint_minimal };
@@ -31,15 +31,15 @@ const file_approval_navigation_hint_variants = [_][]const u8{ file_approval_navi
 // is the only cue that the review document scrolls.
 const file_approval_screen_hint_variants = [_][]const u8{
     file_approval_screen_hint,
-    "1–3 Choose now    ↑↓ Options    Wheel Scroll    Enter Confirm    Esc Cancel",
-    "1–3 Choose    Wheel Scroll    Enter Confirm    Esc Cancel",
+    "1–3 choose now    ↑↓ options    wheel scroll    enter confirm    esc cancel",
+    "1–3 choose    wheel scroll    enter confirm    esc cancel",
     file_approval_hint_compact,
     file_approval_hint_minimal,
 };
 const file_approval_navigation_screen_hint_variants = [_][]const u8{
     file_approval_navigation_screen_hint,
-    "1–3 Choose now    ↑↓ Options    Wheel Scroll    Enter Confirm    Esc Cancel",
-    "1–3 Choose    Wheel Scroll    Enter Confirm    Esc Cancel",
+    "1–3 choose now    ↑↓ options    wheel scroll    enter confirm    esc cancel",
+    "1–3 choose    wheel scroll    enter confirm    esc cancel",
     file_approval_hint_compact,
     file_approval_hint_minimal,
 };
@@ -125,10 +125,6 @@ pub fn composeFileApprovalScreenRow(
             .complete = true,
         },
     };
-}
-
-pub fn approvalPanelRowsForLayout(shell: *const TranscriptRuntime) u16 {
-    return approvalPanelRowsForTerminalRows(shell.layout.rows);
 }
 
 pub fn inlineApprovalPanelRows(
@@ -1739,8 +1735,8 @@ fn approvalChoicePrefix(choice: u8) []const u8 {
 fn approvalHint(approval: ApprovalProjection, width: u16) []const u8 {
     if (approval.request.confirmation_only) {
         const confirmation_variants = [_][]const u8{
-            "1–2 Choose    Enter Confirm    Esc Cancel",
-            "Enter Confirm    Esc Cancel",
+            "1–2 choose    enter confirm    esc cancel",
+            "enter confirm    esc cancel",
         };
         return display_width.widestFitting(&confirmation_variants, width);
     }
@@ -2273,15 +2269,15 @@ test "approval panel hint keeps enter and esc guidance at narrow widths" {
 
     var wide = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 120, 10, interaction_state.approval_panel_rows_spacious);
     defer wide.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, wide.items, "1–3 Choose now") != null);
-    try std.testing.expect(std.mem.find(u8, wide.items, "Tab Amend") != null);
-    try std.testing.expect(std.mem.find(u8, wide.items, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "1–3 choose now") != null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "tab amend") != null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "esc cancel") != null);
 
     prompt.decision.choice_index = 1;
     var navigation = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 120, 10, interaction_state.approval_panel_rows_spacious);
     defer navigation.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, navigation.items, "Tab Options") != null);
-    try std.testing.expect(std.mem.find(u8, navigation.items, "Tab Amend") == null);
+    try std.testing.expect(std.mem.find(u8, navigation.items, "tab options") != null);
+    try std.testing.expect(std.mem.find(u8, navigation.items, "tab amend") == null);
 
     _ = try prompt.decision.apply(
         std.testing.allocator,
@@ -2291,12 +2287,12 @@ test "approval panel hint keeps enter and esc guidance at narrow widths" {
     );
     var denial = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 120, 10, interaction_state.approval_panel_rows_spacious);
     defer denial.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, denial.items, "Tab Amend") != null);
+    try std.testing.expect(std.mem.find(u8, denial.items, "tab amend") != null);
 
     var narrow = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 60, 10, interaction_state.approval_panel_rows_spacious);
     defer narrow.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "Enter Confirm") != null);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "enter confirm") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "esc cancel") != null);
     try std.testing.expect(std.mem.find(u8, narrow.items, "Options") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.items) <= 60);
 }
@@ -2305,9 +2301,9 @@ test "file approval hint keeps Enter and Esc guidance at narrow widths" {
     const alloc = std.testing.allocator;
     var row = try composeFileApprovalHintRow(alloc, null, 40);
     defer row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, row.items, "Enter Confirm") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Esc Cancel") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Tab Amend") == null);
+    try std.testing.expect(std.mem.find(u8, row.items, "enter confirm") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "esc cancel") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "tab amend") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 40);
 }
 
@@ -2323,18 +2319,18 @@ test "file approval hints follow the selected amendment capability" {
     const projection = projectFileApproval(request, prompt.decision.choice_index, 120, fileApprovalDesiredRows(preview));
     var inline_hint = try composeFileApprovalRow(alloc, request, &projection, prompt.decision.choice_index, prompt.projection().?, 120, .hint);
     defer inline_hint.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, inline_hint.items, "Tab Options") != null);
-    try std.testing.expect(std.mem.find(u8, inline_hint.items, "Tab Amend") == null);
+    try std.testing.expect(std.mem.find(u8, inline_hint.items, "tab options") != null);
+    try std.testing.expect(std.mem.find(u8, inline_hint.items, "tab amend") == null);
 
     var screen = try composeFileApprovalScreenRow(alloc, request, .active_session, prompt.decision.choice_index, 120, .hint, true, true, prompt.projection().?);
     defer screen.text.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, screen.text.items, "Tab Options") != null);
-    try std.testing.expect(std.mem.find(u8, screen.text.items, "Wheel Scroll") != null);
+    try std.testing.expect(std.mem.find(u8, screen.text.items, "tab options") != null);
+    try std.testing.expect(std.mem.find(u8, screen.text.items, "wheel scroll") != null);
 
     prompt.decision.choice_index = 2;
     var denial = try composeFileApprovalScreenRow(alloc, request, .active_session, prompt.decision.choice_index, 120, .hint, true, true, prompt.projection().?);
     defer denial.text.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, denial.text.items, "Tab Amend") != null);
+    try std.testing.expect(std.mem.find(u8, denial.text.items, "tab amend") != null);
 }
 
 test "scrollable file approval hint keeps the wheel notice and Esc at 80 columns" {
@@ -2343,8 +2339,8 @@ test "scrollable file approval hint keeps the wheel notice and Esc at 80 columns
     const request: permission_request.FileApprovalRequest = .{ .kind = .edit, .intent = .mutation, .preview = preview, .scope = .workspace_files };
     var row = try composeFileApprovalScreenRow(alloc, request, .active_session, 0, 80, .hint, true, true, null);
     defer row.text.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, row.text.items, "Wheel Scroll") != null);
-    try std.testing.expect(std.mem.find(u8, row.text.items, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, row.text.items, "wheel scroll") != null);
+    try std.testing.expect(std.mem.find(u8, row.text.items, "esc cancel") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.text.items) <= 80);
 }
 
@@ -2429,8 +2425,8 @@ test "inline command panel wraps the complete target before its controls" {
     try std.testing.expect(std.mem.find(u8, panel.items, "INLINE_COMMAND_START") != null);
     try std.testing.expect(std.mem.find(u8, panel.items, "INLINE_COMMAND_END") != null);
     try std.testing.expect(std.mem.find(u8, panel.items, interaction_state.approval_once_label) != null);
-    try std.testing.expect(std.mem.find(u8, panel.items, "Enter Confirm") == null);
-    try std.testing.expect(std.mem.find(u8, panel.items, "Esc Cancel") == null);
+    try std.testing.expect(std.mem.find(u8, panel.items, "enter confirm") == null);
+    try std.testing.expect(std.mem.find(u8, panel.items, "esc cancel") == null);
 }
 
 test "inline command panel uses full command when label is bounded" {
@@ -2967,15 +2963,15 @@ test "permission hints use compact ask modal language" {
     try std.testing.expect(std.mem.find(
         u8,
         generic.items,
-        "1–3 Choose now",
+        "1–3 choose now",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, generic.items, "Tab Amend") != null);
+    try std.testing.expect(std.mem.find(u8, generic.items, "tab amend") != null);
     try std.testing.expect(std.mem.find(
         u8,
         generic.items,
-        "Enter Confirm",
+        "enter confirm",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, generic.items, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, generic.items, "esc cancel") != null);
 
     const preview = diff_mod.FileChangePreview{
         .path = "note.txt",
@@ -3005,8 +3001,8 @@ test "permission hints use compact ask modal language" {
     try std.testing.expect(std.mem.find(
         u8,
         file.text.items,
-        "1–3 Choose now",
+        "1–3 choose now",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, file.text.items, "Wheel Scroll") != null);
-    try std.testing.expect(std.mem.find(u8, file.text.items, "Tab Amend") != null);
+    try std.testing.expect(std.mem.find(u8, file.text.items, "wheel scroll") != null);
+    try std.testing.expect(std.mem.find(u8, file.text.items, "tab amend") != null);
 }

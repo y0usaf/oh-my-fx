@@ -334,12 +334,12 @@ test("render-lab analyzer enforces active-tool placement and uniqueness", () => 
     },
     {
       event: "active-tool-clipped",
-      grid: ["│ ACTIVE_TOOL_LINE_05", "│ … 27 lines more (ctrl o to view)", "", "● Running sleep 1; i=1", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
+      grid: ["│ ACTIVE_TOOL_LINE_05", "│ … 27 lines more (ctrl+o to view)", "", "● Running sleep 1; i=1", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
       rejected: false,
     },
     {
       event: "active-tool-clipped",
-      grid: ["│ ACTIVE_TOOL_LINE_05", "│ … 27 lines more (ctrl o to view)", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
+      grid: ["│ ACTIVE_TOOL_LINE_05", "│ … 27 lines more (ctrl+o to view)", "", "▲ Thinking", "", "────────────────", "❯", "────────────────", "test"],
       rejected: true,
     },
     {
@@ -714,7 +714,7 @@ describe.skipIf(SKIP)("tui: render lab", () => {
       expect(readQuiescence(artifacts.manifest)).toHaveLength(1);
       expect(artifacts.gatewayRequests).toEqual([
         "GET /coding-agent/v1/models",
-        "POST /v3/ai/language-model",
+        "POST /v4/ai/language-model",
       ]);
       expect(artifacts.stderr).toBe("");
     },
@@ -734,7 +734,7 @@ describe.skipIf(SKIP)("tui: render lab", () => {
       expect(artifacts.finalFrame.grid.some((row) => /^┃\s*$/.test(row))).toBe(true);
       expect(artifacts.finalFrame.grid.some((row) => row.includes("HTTP 401"))).toBe(false);
       expect(artifacts.finalFrame.grid.some((row) => row.includes("RENDER_LAB_LOCAL_GATEWAY_OK"))).toBe(false);
-      expect(artifacts.gatewayRequests).toEqual(["GET /coding-agent/v1/models", "POST /v3/ai/language-model"]);
+      expect(artifacts.gatewayRequests).toEqual(["GET /coding-agent/v1/models", "POST /v4/ai/language-model"]);
       expect(artifacts.stderr).toBe("");
     },
     TIMEOUT,
@@ -754,7 +754,7 @@ describe.skipIf(SKIP)("tui: render lab", () => {
       expect(artifacts.finalFrame.grid.some((row) => /^┃\s*$/.test(row))).toBe(true);
       expect(artifacts.finalFrame.grid.some((row) => row.includes("HTTP 401"))).toBe(false);
       expect(artifacts.finalFrame.grid.some((row) => row.includes("RENDER_LAB_LOCAL_GATEWAY_OK"))).toBe(false);
-      expect(artifacts.gatewayRequests).toEqual(["GET /coding-agent/v1/models", "POST /v3/ai/language-model"]);
+      expect(artifacts.gatewayRequests).toEqual(["GET /coding-agent/v1/models", "POST /v4/ai/language-model"]);
       expect(artifacts.stderr).toBe("");
     },
     TIMEOUT,

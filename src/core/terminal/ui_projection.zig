@@ -9,7 +9,6 @@ pub const Row = struct {
     lifecycle: contracts.Lifecycle,
     attention: contracts.AttentionState,
     backend: contracts.Backend,
-    attachable: bool = true,
 
     fn deinit(self: *Row, alloc: Allocator) void {
         alloc.free(self.label);

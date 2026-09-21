@@ -2,6 +2,7 @@ const std = @import("std");
 const glob_pattern = @import("../../core/workspace/glob_pattern.zig");
 const grep_search = @import("../../core/workspace/grep_search.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
@@ -220,7 +221,7 @@ fn callWithOps(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInp
     const input = erased.as(Input);
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
 
     const absolute_root = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, input.path) catch |err| {
@@ -740,6 +741,7 @@ fn grepFilesFailureWithOps(
 
     const result = try callWithOps(.{ .allocator = alloc, .workspace_root = workspace_root }, .{ .ptr = &input, .deinit_fn = noopInputDeinit }, ops);
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| return body,
         .success => |body| {
             defer alloc.free(body);

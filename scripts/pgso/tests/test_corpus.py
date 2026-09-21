@@ -29,6 +29,7 @@ TRAINING_E2E_TESTS = (
     "file-tool-paths.test.ts",
     "file-tool-permissions.test.ts",
     "gateway-stream-lifecycle.test.ts",
+    "session-title.test.ts",
     "web-fetch-fake-network.test.ts",
     "web-search-fake-gateway.test.ts",
     "vision-route-fake-gateway.test.ts",
@@ -53,9 +54,14 @@ TRAINING_E2E_TESTS = (
 )
 
 VERIFICATION_E2E_TESTS = (
+    "slack-install.test.ts",
     "auto-mode-reliability.test.ts",
+    "review-model-override.test.ts",
+    "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
     "tui-auth-source-selection.test.ts",
+    "tui-compaction-activity.test.ts",
+    "compaction-policy.test.ts",
     "tui-composer-edit-contracts.test.ts",
     "tui-cost.test.ts",
     "tui-decision-prompts.test.ts",
@@ -364,8 +370,8 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(35, len(corpus.scenarios))
-        self.assertEqual(52, len(corpus.candidate_scenarios))
+        self.assertEqual(36, len(corpus.scenarios))
+        self.assertEqual(57, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

@@ -51,6 +51,17 @@ pub const FrameTerminalTransition = union(enum) {
     }
 };
 
+pub const FrameReset = enum {
+    none,
+    clear,
+    ris,
+
+    pub fn fromPlan(reset_terminal: bool, history_reset_uses_ris: bool) FrameReset {
+        if (!reset_terminal) return .none;
+        return if (history_reset_uses_ris) .ris else .clear;
+    }
+};
+
 pub const FrameCommitInput = struct {
     previous: *vt_emulator.Grid,
     surface: *const frame_surface.FrameSurface,
@@ -124,6 +135,8 @@ pub const PreparedTerminalMovement = struct {
         .expected_scroll_rows = 0,
     },
     terminal_transition: FrameTerminalTransition = .none,
+    reset: FrameReset = .none,
+    sync_prefix_offset: usize = 0,
     reset_replay: bool = false,
     source_rows: u16,
     source_cols: u16,
@@ -148,6 +161,7 @@ pub const PreparedTerminalMovement = struct {
         planned_scroll_rows: u16,
         non_deferable_scroll_rows: u16,
         terminal_transition: FrameTerminalTransition,
+        reset: FrameReset,
         reset_replay: bool,
     ) !void {
         const expected_rows = try resolveTerminalMovementRows(
@@ -166,6 +180,10 @@ pub const PreparedTerminalMovement = struct {
             self.target_cols != target_cols or
             !std.meta.eql(self.scroll_rows, expected_rows) or
             !std.meta.eql(self.terminal_transition, terminal_transition) or
+            self.reset != reset or
+            (self.reset == .ris) != (self.sync_prefix_offset > 0) or
+            self.sync_prefix_offset > self.bytes.len or
+            (self.hasDocumentAppend() and self.sync_prefix_offset > self.document_append_start) or
             self.reset_replay != reset_replay or
             self.segments.terminal_transition.scroll_rows != 0 or
             self.segments.document_append.scroll_rows != self.scroll_rows.materialized_scroll_rows or
@@ -306,7 +324,7 @@ const FrameMovementSegments = struct {
 
     fn fromPreparedMovement(prefix_len: usize, movement: PreparedTerminalMovement) FrameMovementSegments {
         return .{
-            .movement_start = prefix_len,
+            .movement_start = if (movement.sync_prefix_offset == 0) prefix_len else 0,
             .movement_end = prefix_len + movement.bytes.len,
             .document_append = movement.segments.document_append.absolute(prefix_len),
             .alignment_scroll = movement.segments.alignment_scroll.absolute(prefix_len),
@@ -347,6 +365,7 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     if (input.document_append.reset_replay and !input.surface.plan.reset_terminal) {
         return error.InvalidFrameScrollPlan;
     }
+    const reset = FrameReset.fromPlan(input.surface.plan.reset_terminal, input.history_reset_uses_ris);
     var local_movement: ?PreparedTerminalMovement = null;
     defer if (local_movement) |*movement| movement.deinit(alloc);
     const movement = if (input.prepared_movement) |prepared|
@@ -362,6 +381,7 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
             target.rows,
             0,
             input.terminal_transition,
+            reset,
         );
         break :blk &local_movement.?;
     };
@@ -372,6 +392,7 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         terminal_scroll_rows,
         input.scroll_plan.preserved_release_rows,
         input.terminal_transition,
+        reset,
         input.document_append.reset_replay,
     );
     const terminal_scroll_bytes = movement.bytes;
@@ -424,7 +445,7 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         &target,
         repaint_window,
         full_repaint,
-        terminal_scroll_bytes,
+        movement,
     );
     const wire_frame_bytes = wire_frame.written();
     const document_append_range = movement.documentAppendWireRange(prefix_len);
@@ -584,20 +605,15 @@ fn composeWireFrame(
     target: *const vt_emulator.Grid,
     repaint_window: paint_plan.FrameRepaintWindow,
     full_repaint: bool,
-    terminal_scroll_bytes: []const u8,
+    movement: *const PreparedTerminalMovement,
 ) !usize {
-    if (input.surface.plan.reset_terminal and input.history_reset_uses_ris) {
-        // RIS clears modes that fx enables at startup, so restore them before repainting.
-        try wire_frame.writer.writeAll("\x1bc");
-        try wire_frame.writer.writeAll(ui_terminal.interactive_mode_enable_sequence);
-    }
+    // RIS and startup modes precede synchronization; document bytes follow it.
+    try wire_frame.writer.writeAll(movement.bytes[0..movement.sync_prefix_offset]);
+    const prefix_start = wire_frame.written().len;
     if (input.synchronized_update) try wire_frame.writer.writeAll("\x1b[?2026h");
     try wire_frame.writer.writeAll("\x1b[?25l");
-    if (input.surface.plan.reset_terminal) {
-        try wire_frame.writer.writeAll("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
-    }
-    const prefix_len = wire_frame.written().len;
-    try wire_frame.writer.writeAll(terminal_scroll_bytes);
+    const prefix_len = wire_frame.written().len - prefix_start;
+    try wire_frame.writer.writeAll(movement.bytes[movement.sync_prefix_offset..]);
 
     if (!repaint_window.isEmpty()) {
         if (full_repaint) {
@@ -981,19 +997,6 @@ fn cloneAuthoritativeShadow(
     return next;
 }
 
-fn blankResetReplayShadow(
-    alloc: Allocator,
-    authoritative: *const vt_emulator.Grid,
-    target_cols: u16,
-    target_rows: u16,
-) !vt_emulator.Grid {
-    var next = try vt_emulator.Grid.init(alloc, target_cols, target_rows);
-    errdefer next.deinit();
-    next.autowrap = authoritative.autowrap;
-    next.cursor_visible = authoritative.cursor_visible;
-    return next;
-}
-
 test "authoritative shadow clone retains the normal buffer during an alternate screen" {
     var previous = try vt_emulator.Grid.init(std.testing.allocator, 12, 3);
     defer previous.deinit();
@@ -1037,6 +1040,7 @@ test "normal-screen transition precedes document movement in the prepared shadow
         4,
         0,
         transition,
+        .none,
     );
     defer movement.deinit(std.testing.allocator);
 
@@ -1207,6 +1211,7 @@ pub fn prepareTerminalMovement(
         target_rows,
         0,
         .none,
+        if (document_append.reset_replay) .clear else .none,
     );
 }
 
@@ -1220,18 +1225,12 @@ pub fn prepareTerminalMovementForFrame(
     target_rows: u16,
     alignment_clear_start_row: u16,
     terminal_transition: FrameTerminalTransition,
+    reset: FrameReset,
 ) !PreparedTerminalMovement {
-    if (document_append.reset_replay and planned_scroll_rows != 0) {
+    if (document_append.reset_replay and (planned_scroll_rows != 0 or reset == .none)) {
         return error.InvalidFrameScrollPlan;
     }
-    const reset_replay_starts_blank = document_append.reset_replay and switch (terminal_transition) {
-        .none => true,
-        .restore_normal_screen => false,
-    };
-    var post_movement = if (reset_replay_starts_blank)
-        try blankResetReplayShadow(alloc, authoritative, target_cols, target_rows)
-    else
-        try cloneAuthoritativeShadow(alloc, authoritative, target_cols, target_rows);
+    var post_movement = try cloneAuthoritativeShadow(alloc, authoritative, target_cols, target_rows);
     errdefer post_movement.deinit();
 
     var bytes: std.Io.Writer.Allocating = .init(alloc);
@@ -1242,6 +1241,7 @@ pub fn prepareTerminalMovementForFrame(
         &post_movement,
         terminal_transition,
     );
+    const sync_prefix_offset = try appendFrameReset(&bytes, &post_movement, reset);
 
     const document_movement = try appendDocumentMovement(
         &bytes,
@@ -1298,12 +1298,33 @@ pub fn prepareTerminalMovementForFrame(
         },
         .scroll_rows = movement_rows,
         .terminal_transition = terminal_transition,
+        .reset = reset,
+        .sync_prefix_offset = sync_prefix_offset,
         .reset_replay = document_append.reset_replay,
         .source_rows = authoritative.rows,
         .source_cols = authoritative.cols,
         .target_rows = target_rows,
         .target_cols = target_cols,
     };
+}
+
+fn appendFrameReset(
+    bytes: *std.Io.Writer.Allocating,
+    post_movement: *vt_emulator.Grid,
+    reset: FrameReset,
+) !usize {
+    if (reset == .none) return 0;
+    const start = bytes.written().len;
+    var sync_prefix_offset: usize = 0;
+    if (reset == .ris) {
+        try bytes.writer.writeAll("\x1bc");
+        try bytes.writer.writeAll(ui_terminal.interactive_mode_enable_sequence);
+        sync_prefix_offset = bytes.written().len;
+    }
+    try bytes.writer.writeAll("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+    const segment = try feedMovementSegment(bytes, post_movement, start);
+    if (segment.scroll_rows != 0) return error.InvalidFrameScrollPlan;
+    return sync_prefix_offset;
 }
 
 fn appendTerminalTransition(
@@ -1360,6 +1381,11 @@ fn appendDocumentMovement(
 
     const append_start = bytes.written().len;
     const start_col = try document_append.validatedStartCol(target_cols, target_rows);
+    if (document_append.start_pending_wrap and
+        (start_col != target_cols or document_append.clear != .remainder or document_append.reset_replay))
+    {
+        return error.InvalidFrameScrollPlan;
+    }
     try bytes.writer.print(
         "\x1b[{d};{d}H",
         .{ document_append.start_row, start_col },
@@ -1387,6 +1413,9 @@ fn appendDocumentMovement(
     }
     const autowrap_was_enabled = post_movement.autowrap;
     if (!autowrap_was_enabled) try bytes.writer.writeAll("\x1b[?7h");
+    if (document_append.start_pending_wrap) {
+        try post_movement.writePendingWrapRestore(document_append.start_row, &bytes.writer);
+    }
     try bytes.writer.writeAll(document_append.bytes);
     if (!autowrap_was_enabled) try bytes.writer.writeAll("\x1b[?7l");
 
@@ -1542,7 +1571,6 @@ fn testPlan() paint_plan.PaintPlan {
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = 3, .col = 1, .visible = true },
-        .footer_reservation_source = .footer_layout,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -1620,6 +1648,7 @@ const TestFrameCommitOptions = struct {
     terminal_transition: FrameTerminalTransition = .none,
     prepared_movement: ?*const PreparedTerminalMovement = null,
     synchronized_update: ?bool = null,
+    history_reset_uses_ris: bool = false,
 };
 
 fn flush_test_frame(
@@ -1641,6 +1670,7 @@ fn flush_test_frame(
             .{ .include_transcript = true },
         ),
         .synchronized_update = options.synchronized_update orelse true,
+        .history_reset_uses_ris = options.history_reset_uses_ris,
         .scroll_plan = frame_scroll_plan.merge(
             plan.layout.rows,
             1,
@@ -1653,6 +1683,150 @@ fn flush_test_frame(
         .sink = sink.frameSink(),
         .metrics = &metrics,
     });
+}
+
+test "append pending wrap real sink preserves occupied last cell in history" {
+    const alloc = std.testing.allocator;
+    const painter = @import("../transcript/painter.zig");
+    const raw = "A\nB\nC\n12345678X\nY\nZ\nW\n";
+    const seed = "A\r\nB\r\nC\r\n12345678";
+    var previous = try vt_emulator.Grid.init(alloc, 8, 4);
+    defer previous.deinit();
+    try previous.feed(seed);
+    var prepared = try painter.prepareTranscriptDocumentAppend(alloc, raw, 8, 14, raw.len, true);
+    defer prepared.deinit(alloc);
+    const append: frame_scroll_plan.FrameDocumentAppend = .{ .bytes = prepared.bytes, .start_row = 4, .start_col = 8, .start_pending_wrap = prepared.start_pending_wrap };
+    var movement = try prepareTerminalMovement(alloc, &previous, append, 5, 8, 4);
+    defer movement.deinit(alloc);
+    var sink = TestSink{};
+    defer sink.deinit(alloc);
+    const result = try flush_test_frame(&previous, &sink, .{ .surface_shadow = movement.post_movement, .document_append = append, .scroll_rows = 5, .prepared_movement = &movement });
+    try std.testing.expect(result.is_committed());
+    var physical = try @import("../resize_tests.zig").PhysicalHistoryProbe.init(8, 4);
+    defer physical.deinit();
+    try physical.feed(seed);
+    try physical.feed(sink.bytes.items);
+    try std.testing.expectEqualStrings("A\nB\nC\n12345678\nX\n", physical.history.items);
+}
+
+test "append pending wrap sink boundary controls and accepted prefixes" {
+    const alloc = std.testing.allocator;
+    const painter = @import("../transcript/painter.zig");
+    const open = "\x1b]8;id=margin;https://example.com\x1b\\";
+    const cases = [_]struct { cols: u16 = 8, old: []const u8, suffix: []const u8, history: []const u8, scroll: u16 = 5 }{
+        .{ .old = "123456", .suffix = "X", .history = "123456X", .scroll = 4 },
+        .{ .old = "1234567", .suffix = "X", .history = "1234567X", .scroll = 4 },
+        .{ .old = "12345678", .suffix = "X", .history = "12345678\nX" },
+        .{ .old = "12345678", .suffix = "\nX", .history = "12345678\nX" },
+        .{ .old = "12345678", .suffix = "\r\nX", .history = "12345678\nX" },
+        .{ .old = "12345678", .suffix = "\rX", .history = "X2345678", .scroll = 4 },
+        .{ .old = "12345678", .suffix = "\n\nX", .history = "12345678\n\nX", .scroll = 6 },
+        .{ .old = "12345678", .suffix = "\x1b[32mX", .history = "12345678\nX" },
+        .{ .old = "12345678", .suffix = open ++ "X", .history = "12345678\nX" },
+        .{ .old = "\x1b[31m" ++ open ++ "12345678", .suffix = "X", .history = "12345678\nX" },
+        .{ .old = "1234567e\u{301}", .suffix = "X", .history = "1234567e\u{301}\nX" },
+        .{ .old = "12345678", .suffix = "\u{301}X", .history = "12345678\u{301}\nX" },
+        .{ .old = "123456界", .suffix = "X", .history = "123456界\nX" },
+        .{ .old = "12345678", .suffix = "界", .history = "12345678\n界" },
+        .{ .old = "", .suffix = "X", .history = "X", .scroll = 4 },
+        .{ .cols = 1, .old = "8", .suffix = "X", .history = "8\nX" },
+    };
+    for (cases) |case| {
+        const seed = try std.mem.concat(alloc, u8, &.{ "A\r\nB\r\nC\r\n", case.old, "\x1b]8;;\x1b\\\x1b[0m" });
+        defer alloc.free(seed);
+        const prefix = try std.mem.concat(alloc, u8, &.{ "A\nB\nC\n", case.old });
+        defer alloc.free(prefix);
+        const raw = try std.mem.concat(alloc, u8, &.{ prefix, case.suffix, "\nY\nZ\nW\n" });
+        defer alloc.free(raw);
+        const expected = try std.mem.concat(alloc, u8, &.{ "A\nB\nC\n", case.history, "\n" });
+        defer alloc.free(expected);
+        var original = try vt_emulator.Grid.init(alloc, case.cols, 4);
+        defer original.deinit();
+        try original.feed(seed);
+        var prepared = try painter.prepareTranscriptDocumentAppend(alloc, raw, case.cols, prefix.len, raw.len, true);
+        defer prepared.deinit(alloc);
+        const append: frame_scroll_plan.FrameDocumentAppend = .{
+            .bytes = prepared.bytes,
+            .start_row = 4,
+            .start_col = original.cursor_col,
+            .start_pending_wrap = prepared.start_pending_wrap,
+        };
+        var movement = try prepareTerminalMovement(alloc, &original, append, case.scroll, case.cols, 4);
+        defer movement.deinit(alloc);
+        if (case.cols == 1) {
+            var narrow = try @import("../resize_tests.zig").PhysicalHistoryProbe.init(1, 4);
+            defer narrow.deinit();
+            try narrow.feed(seed);
+            try narrow.feed(movement.bytes);
+            try std.testing.expectEqualStrings(expected, narrow.history.items);
+            continue;
+        }
+        var previous = try cloneAuthoritativeShadow(alloc, &original, case.cols, 4);
+        defer previous.deinit();
+        var sink = TestSink{};
+        defer sink.deinit(alloc);
+        var plan = testPlan();
+        plan.layout.cols = case.cols;
+        const result = try flush_test_frame(&previous, &sink, .{ .plan = plan, .surface_shadow = movement.post_movement, .document_append = append, .scroll_rows = case.scroll, .prepared_movement = &movement });
+        try std.testing.expect(result.is_committed());
+        var physical = try @import("../resize_tests.zig").PhysicalHistoryProbe.init(case.cols, 4);
+        defer physical.deinit();
+        try physical.feed(seed);
+        try physical.feed(sink.bytes.items);
+        try std.testing.expectEqualStrings(expected, physical.history.items);
+
+        // Every cut in the append segment is terminal, not a retryable suffix.
+        // After the segment, the receipt must prevent a second publication.
+        const prefix_len = "\x1b[?2026h\x1b[?25l".len;
+        const range = movement.documentAppendWireRange(prefix_len);
+        for (range.start + 1..range.end + 1) |cut| {
+            var partial_previous = try cloneAuthoritativeShadow(alloc, &original, case.cols, 4);
+            defer partial_previous.deinit();
+            var partial_sink = TestSink{ .fail_after_prefix = cut };
+            defer partial_sink.deinit(alloc);
+            const partial = flush_test_frame(&partial_previous, &partial_sink, .{ .plan = plan, .surface_shadow = movement.post_movement, .document_append = append, .scroll_rows = case.scroll, .prepared_movement = &movement });
+            if (cut < range.end) {
+                try std.testing.expectError(error.DocumentAppendInterrupted, partial);
+            } else {
+                const receipt = try partial;
+                try std.testing.expect(receipt.document_append_committed);
+                try std.testing.expectEqual(case.scroll, receipt.terminal_scroll_rows_applied());
+            }
+            var accepted = try @import("../resize_tests.zig").PhysicalHistoryProbe.init(case.cols, 4);
+            defer accepted.deinit();
+            try accepted.feed(seed);
+            try accepted.feed(partial_sink.bytes.items);
+            try std.testing.expect(std.mem.startsWith(u8, expected, accepted.history.items));
+            try std.testing.expect(!accepted.grid.sync_active);
+        }
+    }
+}
+
+test "append pending wrap committed receipt prevents duplicate publication on retry" {
+    const alloc = std.testing.allocator;
+    const painter = @import("../transcript/painter.zig");
+    const seed = "A\r\nB\r\nC\r\n12345678";
+    const raw = "A\nB\nC\n12345678X\nY\nZ\nW\n";
+    var previous = try vt_emulator.Grid.init(alloc, 8, 4);
+    defer previous.deinit();
+    try previous.feed(seed);
+    var prepared = try painter.prepareTranscriptDocumentAppend(alloc, raw, 8, 14, raw.len, true);
+    defer prepared.deinit(alloc);
+    const append: frame_scroll_plan.FrameDocumentAppend = .{ .bytes = prepared.bytes, .start_row = 4, .start_col = 8, .start_pending_wrap = prepared.start_pending_wrap };
+    var movement = try prepareTerminalMovement(alloc, &previous, append, 5, 8, 4);
+    defer movement.deinit(alloc);
+    var sink = TestSink{ .fail_after_prefix = "\x1b[?2026h\x1b[?25l".len + movement.document_append_end };
+    defer sink.deinit(alloc);
+    const receipt = try flush_test_frame(&previous, &sink, .{ .surface_shadow = movement.post_movement, .document_append = append, .scroll_rows = 5, .prepared_movement = &movement });
+    try std.testing.expect(receipt.document_append_committed);
+    try std.testing.expect(!receipt.is_committed());
+    const retry = try flush_test_frame(&previous, &sink, .{ .surface_shadow = movement.post_movement });
+    try std.testing.expect(retry.is_committed());
+    var physical = try @import("../resize_tests.zig").PhysicalHistoryProbe.init(8, 4);
+    defer physical.deinit();
+    try physical.feed(seed);
+    try physical.feed(sink.bytes.items);
+    try std.testing.expectEqualStrings("A\nB\nC\n12345678\nX\n", physical.history.items);
 }
 
 test "normal-screen restore and inline repaint commit in one sink write" {
@@ -1676,6 +1850,7 @@ test "normal-screen restore and inline repaint commit in one sink write" {
             4,
             0,
             transition,
+            .none,
         );
         defer movement.deinit(std.testing.allocator);
 
@@ -1748,6 +1923,7 @@ test "normal-screen restore preserves saved modes through reset replay" {
         4,
         0,
         transition,
+        .clear,
     );
     defer movement.deinit(std.testing.allocator);
 
@@ -1789,7 +1965,7 @@ test "normal-screen restore preserves saved modes through reset replay" {
     ) orelse return error.TestExpectedNormalScreenRestore;
     try std.testing.expect(sync_start < cursor_hide);
     try std.testing.expect(cursor_hide < reset_clear);
-    try std.testing.expect(reset_clear < restore);
+    try std.testing.expect(restore < reset_clear);
 }
 
 test "normal-screen restore partial write retries to the committed frame" {
@@ -1812,6 +1988,7 @@ test "normal-screen restore partial write retries to the committed frame" {
         4,
         0,
         transition,
+        .none,
     );
     defer uninterrupted_movement.deinit(std.testing.allocator);
     var uninterrupted_sink = TestSink{};
@@ -1846,6 +2023,7 @@ test "normal-screen restore partial write retries to the committed frame" {
         4,
         0,
         transition,
+        .none,
     );
     defer movement.deinit(std.testing.allocator);
     const cut = "\x1b[?2026h".len + "\x1b[?25l".len +
@@ -1877,6 +2055,7 @@ test "normal-screen restore partial write retries to the committed frame" {
         4,
         0,
         transition,
+        .none,
     );
     defer retry_movement.deinit(std.testing.allocator);
     var retry_sink = TestSink{};
@@ -1895,6 +2074,142 @@ test "normal-screen restore partial write retries to the committed frame" {
     try physical.feed(retry_sink.bytes.items);
     try expect_grid_and_cursor_equal(uninterrupted, authoritative);
     try expect_grid_and_cursor_equal(uninterrupted, physical);
+}
+
+test "normal-screen reset replay recovers interrupted controls and accepted document bytes" {
+    const alloc = std.testing.allocator;
+    const transition: FrameTerminalTransition = .{
+        .restore_normal_screen = .{ .mouse_tracking_active = true },
+    };
+    const document_append: frame_scroll_plan.FrameDocumentAppend = .{
+        .bytes = "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n",
+        .start_row = 1,
+        .start_col = 1,
+        .reset_replay = true,
+    };
+    const reset_sequence = "\x1b[0m\x1b[2J\x1b[3J\x1b[H";
+    var seed = try vt_emulator.Grid.init(alloc, 8, 4);
+    defer seed.deinit();
+    seed.autowrap = false;
+    try seed.feed("normal\x1b[?1049happroval");
+
+    for ([_]FrameReset{ .clear, .ris }) |reset| {
+        var plan = testPlan();
+        plan.reset_terminal = true;
+        var uninterrupted = try cloneAuthoritativeShadow(alloc, &seed, 8, 4);
+        defer uninterrupted.deinit();
+        var movement = try prepareTerminalMovementForFrame(
+            alloc,
+            &uninterrupted,
+            document_append,
+            0,
+            0,
+            8,
+            4,
+            0,
+            transition,
+            reset,
+        );
+        defer movement.deinit(alloc);
+        var sink = TestSink{};
+        defer sink.deinit(alloc);
+        const complete = try flush_test_frame(&uninterrupted, &sink, .{
+            .plan = plan,
+            .surface_shadow = movement.post_movement,
+            .document_append = document_append,
+            .terminal_transition = transition,
+            .prepared_movement = &movement,
+            .history_reset_uses_ris = reset == .ris,
+        });
+        try std.testing.expect(complete.is_committed());
+        const restore = std.mem.find(u8, sink.bytes.items, ui_terminal.alternate_screen_leave_sequence).?;
+        const clear = std.mem.find(u8, sink.bytes.items, reset_sequence).?;
+        const document = std.mem.find(u8, sink.bytes.items, document_append.bytes).?;
+        const content_end = document + document_append.bytes.len;
+        try std.testing.expect(std.mem.startsWith(u8, sink.bytes.items[content_end..], "\x1b[?7l"));
+        const append_end = content_end + "\x1b[?7l".len;
+        try std.testing.expect(restore < clear and clear < document);
+        if (reset == .ris) {
+            const ris = std.mem.find(u8, sink.bytes.items, "\x1bc").?;
+            const sync = std.mem.find(u8, sink.bytes.items, "\x1b[?2026h").?;
+            try std.testing.expect(restore < ris and ris < sync and sync < clear);
+        }
+        try std.testing.expect(!uninterrupted.autowrap);
+
+        const ris = std.mem.find(u8, sink.bytes.items, "\x1bc");
+        const cuts = [_]?usize{
+            restore,
+            restore + ui_terminal.alternate_screen_leave_sequence.len - 1,
+            clear + reset_sequence.len - 1,
+            document + 3,
+            append_end,
+            if (ris) |offset| offset + 1 else null,
+            if (ris) |offset| offset + 2 else null,
+        };
+        for (cuts) |maybe_cut| {
+            const cut = maybe_cut orelse continue;
+            var authoritative = try cloneAuthoritativeShadow(alloc, &seed, 8, 4);
+            defer authoritative.deinit();
+            var physical = try cloneAuthoritativeShadow(alloc, &seed, 8, 4);
+            defer physical.deinit();
+            var failing_sink = TestSink{ .fail_after_prefix = cut };
+            defer failing_sink.deinit(alloc);
+            const failure = flush_test_frame(&authoritative, &failing_sink, .{
+                .plan = plan,
+                .surface_shadow = movement.post_movement,
+                .document_append = document_append,
+                .terminal_transition = transition,
+                .prepared_movement = &movement,
+                .history_reset_uses_ris = reset == .ris,
+            });
+            if (cut == document + 3) {
+                try std.testing.expectError(error.DocumentAppendInterrupted, failure);
+                try physical.feed(failing_sink.bytes.items);
+                try std.testing.expect(!physical.sync_active and physical.cursor_visible);
+                try std.testing.expectEqual(seed.autowrap, physical.autowrap);
+                continue;
+            }
+            const failed = try failure;
+            try std.testing.expectEqual(ShadowCommitState.terminal_partial_write, failed.state());
+            try std.testing.expectEqual(failing_sink.bytes.items.len, failed.bytes_written);
+            try std.testing.expectEqual(cut >= append_end, failed.document_append_applied());
+            try std.testing.expect(failed.terminal_scroll_rows_applied() <= complete.terminal_scroll_rows_applied());
+            try physical.feed(failing_sink.bytes.items);
+
+            var retry_plan = plan;
+            try retry_plan.invalidation.append(failed.retry_invalidation().?);
+            retry_plan.footer_clean_allowed = false;
+            var retry_movement = try prepareTerminalMovementForFrame(
+                alloc,
+                &authoritative,
+                document_append,
+                0,
+                0,
+                8,
+                4,
+                0,
+                transition,
+                reset,
+            );
+            defer retry_movement.deinit(alloc);
+            var retry_sink = TestSink{};
+            defer retry_sink.deinit(alloc);
+            const retried = try flush_test_frame(&authoritative, &retry_sink, .{
+                .plan = retry_plan,
+                .surface_shadow = retry_movement.post_movement,
+                .document_append = document_append,
+                .terminal_transition = transition,
+                .prepared_movement = &retry_movement,
+                .history_reset_uses_ris = reset == .ris,
+            });
+            try std.testing.expect(retried.is_committed());
+            try physical.feed(retry_sink.bytes.items);
+            try expect_grid_and_cursor_equal(uninterrupted, authoritative);
+            try expect_grid_and_cursor_equal(uninterrupted, physical);
+            try std.testing.expectEqual(uninterrupted.autowrap, physical.autowrap);
+            try std.testing.expectEqual(uninterrupted.autowrap, authoritative.autowrap);
+        }
+    }
 }
 
 fn expect_grid_and_cursor_equal(expected: vt_emulator.Grid, actual: vt_emulator.Grid) !void {
@@ -2753,13 +3068,17 @@ test "flushFrame retries resize external clear and reset to uninterrupted state"
         var uninterrupted_physical = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
         defer uninterrupted_physical.deinit();
         try prepare_physical_grid_for_scenario(&uninterrupted_physical, scenario);
-        var uninterrupted_movement = try prepareTerminalMovement(
+        var uninterrupted_movement = try prepareTerminalMovementForFrame(
             std.testing.allocator,
             &uninterrupted,
             .{},
             0,
+            0,
             plan.layout.cols,
             plan.layout.rows,
+            0,
+            .none,
+            FrameReset.fromPlan(plan.reset_terminal, false),
         );
         defer uninterrupted_movement.deinit(std.testing.allocator);
         var uninterrupted_sink = TestSink{};
@@ -2783,13 +3102,17 @@ test "flushFrame retries resize external clear and reset to uninterrupted state"
         var physical = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
         defer physical.deinit();
         try prepare_physical_grid_for_scenario(&physical, scenario);
-        var movement = try prepareTerminalMovement(
+        var movement = try prepareTerminalMovementForFrame(
             std.testing.allocator,
             &authoritative,
             .{},
             0,
+            0,
             plan.layout.cols,
             plan.layout.rows,
+            0,
+            .none,
+            FrameReset.fromPlan(plan.reset_terminal, false),
         );
         defer movement.deinit(std.testing.allocator);
         var failing_sink = TestSink{ .fail_after_prefix = 3 };
@@ -2809,13 +3132,17 @@ test "flushFrame retries resize external clear and reset to uninterrupted state"
         var retry_plan = plan;
         try retry_plan.invalidation.append(failed.retry_invalidation().?);
         retry_plan.footer_clean_allowed = false;
-        var retry_movement = try prepareTerminalMovement(
+        var retry_movement = try prepareTerminalMovementForFrame(
             std.testing.allocator,
             &authoritative,
             .{},
             0,
+            0,
             retry_plan.layout.cols,
             retry_plan.layout.rows,
+            0,
+            .none,
+            FrameReset.fromPlan(retry_plan.reset_terminal, false),
         );
         defer retry_movement.deinit(std.testing.allocator);
         var retry_sink = TestSink{};
@@ -3227,7 +3554,11 @@ test "flushFrame rejects stale prepared movement metadata" {
 
     try std.testing.expectError(
         error.InvalidFrameScrollPlan,
-        movement.validateForCommit(&previous, 7, 4, 0, 0, .none, false),
+        movement.validateForCommit(&previous, 7, 4, 0, 0, .none, .none, false),
+    );
+    try std.testing.expectError(
+        error.InvalidFrameScrollPlan,
+        movement.validateForCommit(&previous, 8, 4, 0, 0, .none, .clear, false),
     );
 }
 

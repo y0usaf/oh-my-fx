@@ -237,6 +237,9 @@ pub const State = struct {
         var selected: ?ItemRow = null;
         for (item_rows) |item| {
             if (item.row > offset) break;
+            // Synthetic full-detail records share the never-issued id 0 and
+            // are not addressable restore anchors.
+            if (item.entry_id == 0) continue;
             selected = item;
         }
         const item = selected orelse if (item_rows.len > 0)
@@ -382,4 +385,18 @@ test "transcript presentation snapshot round trips all state" {
         .projection_cols = 40,
     };
     try std.testing.expectEqualDeep(state, State.from_snapshot(state.snapshot()));
+}
+
+test "transcript presentation bookmark skips synthetic id-0 full-detail records" {
+    const item_rows = [_]ItemRow{
+        .{ .entry_id = 0, .row = 1 },
+        .{ .entry_id = 0, .row = 4 },
+        .{ .entry_id = 10, .row = 8 },
+    };
+    const selected = (State{}).select_visual_offset(14, 4, &item_rows);
+    try std.testing.expectEqual(@as(?u32, 10), selected.state.bookmark_entry_id);
+
+    const records_only = [_]ItemRow{.{ .entry_id = 0, .row = 1 }};
+    const degenerate = (State{}).select_visual_offset(8, 4, &records_only);
+    try std.testing.expectEqual(@as(?u32, 0), degenerate.state.bookmark_entry_id);
 }

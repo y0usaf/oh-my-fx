@@ -44,12 +44,14 @@ pub fn execute(input: Input) Error!ToolExecutionResult {
         input.result_allocator,
         "file mutation execution authority is invalid",
         "preflight failed",
+        .denied,
     );
     if (allocatorsEqual(input.call_allocator, input.result_allocator)) {
         return fileMutationFailure(
             input.result_allocator,
             "file mutation execution requires distinct call and result owners",
             "preflight failed",
+            .preflight,
         );
     }
     if (authorization.prepared == null) {
@@ -58,6 +60,7 @@ pub fn execute(input: Input) Error!ToolExecutionResult {
                 input.result_allocator,
                 "file mutation execution requires prepared approval",
                 "preflight failed",
+                .denied,
             );
         }
         authorization.prepared = switch (file_mutation.prepare(
@@ -71,6 +74,7 @@ pub fn execute(input: Input) Error!ToolExecutionResult {
                 input.result_allocator,
                 reason,
                 "preflight failed",
+                .preflight,
             ),
         };
     }
@@ -199,10 +203,12 @@ fn fileMutationFailure(
     alloc: Allocator,
     message: []const u8,
     detail: []const u8,
+    kind: tool_contracts.ToolFailureKind,
 ) Allocator.Error!ToolExecutionResult {
     return .{
         .status = .failure,
         .status_detail = detail,
+        .failure_kind = kind,
         .model_output = try alloc.dupe(u8, message),
     };
 }
@@ -234,6 +240,7 @@ fn mapFileMutationApplyError(
             alloc,
             "file mutation result contract is invalid",
             "preflight failed",
+            .preflight,
         ),
     };
 }
@@ -284,6 +291,14 @@ fn fileMutationRejectionResult(
             .stale_preimage => "stale preview",
             .cancelled => "cancelled",
             else => "rejected",
+        },
+        .failure_kind = switch (rejection.reason) {
+            // The approved binding was invalidated or the commit was
+            // cancelled before its effect landed.
+            .binding_mismatch, .traversal_changed, .staged_source_changed, .cancelled => .denied,
+            // Authorized work failed at the effect boundary; retry with a
+            // fresh preview.
+            .stale_preimage, .io_failure => .apply,
         },
         .model_output = try out.toOwnedSlice(),
     };
@@ -502,4 +517,87 @@ test "post-commit full view capture failure preserves the committed file" {
     const installed = try io_mod.readFileToEnd(alloc, &installed_file, 1024);
     defer alloc.free(installed);
     try std.testing.expectEqualStrings("committed\n", installed);
+}
+
+test "file executor kinds semantic failures preflight and missing authority denied" {
+    const io_mod = @import("../shared/io.zig");
+    const permissions = @import("../permissions/permissions.zig");
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "workspace/strategy.ts",
+        .data = "export interface RacePlan {\n  laps: number;\n}\n",
+    });
+
+    var call_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer call_arena_state.deinit();
+    var result_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer result_arena_state.deinit();
+    const call_alloc = call_arena_state.allocator();
+    const result_alloc = result_arena_state.allocator();
+
+    // The requested edit was already applied, so the content match fails.
+    const call: ToolCall = .{
+        .id = "kinds",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"strategy.ts\",\"old_string\":\"  trajectory?: Trajectory;\\n}\",\"new_string\":\"}\"}",
+    };
+    const mutation_input: file_mutation_contract.FileMutationInput = .{ .edit = .{
+        .path = try call_alloc.dupe(u8, "strategy.ts"),
+        .old_string = try call_alloc.dupe(u8, "  trajectory?: Trajectory;\n}"),
+        .new_string = try call_alloc.dupe(u8, "}"),
+    } };
+    var allow_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("**"),
+        .action = .allow,
+    }};
+    const policy_targets = switch (try permissions.evaluateFileMutationTargets(
+        call_alloc,
+        workspace,
+        mutation_input,
+        .auto,
+        .{ .rules = &allow_rules },
+        &.{},
+        &.{},
+    )) {
+        .evaluated => |value| value,
+        .target_resolution_failure, .policy_denied => return error.TestExpectedAllowed,
+    };
+    try std.testing.expect(!policy_targets.prompt_required);
+
+    const result = try execute(.{
+        .call_allocator = call_alloc,
+        .result_allocator = result_alloc,
+        .call = call,
+        .authorization = .{
+            .input = mutation_input,
+            .policy_targets = policy_targets,
+        },
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try std.testing.expectEqual(tool_contracts.ToolFailureKind.preflight, result.failure_kind);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "old_string not found in file") != null);
+
+    // The executed failure must not modify the file.
+    var file = try tmp.dir.openFile(io_mod.getIo(), "workspace/strategy.ts", .{});
+    defer file.close(io_mod.getIo());
+    const unchanged = try io_mod.readFileToEnd(alloc, &file, 4096);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings("export interface RacePlan {\n  laps: number;\n}\n", unchanged);
+
+    // A call without execution authority is denial-class.
+    const no_authority = try execute(.{
+        .call_allocator = call_alloc,
+        .result_allocator = result_alloc,
+        .call = call,
+        .authorization = null,
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, no_authority.status);
+    try std.testing.expectEqual(tool_contracts.ToolFailureKind.denied, no_authority.failure_kind);
 }

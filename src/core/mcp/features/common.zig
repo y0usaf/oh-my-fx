@@ -2,6 +2,7 @@ const std = @import("std");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
+const mem_utils = @import("../../shared/mem_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -142,7 +143,7 @@ pub fn parseProtocolError(alloc: Allocator, value: std.json.Value, limits: Limit
         return error.InvalidEnvelope;
     }
     const owned_message = try alloc.dupe(u8, message.string);
-    errdefer alloc.free(owned_message);
+    errdefer mem_utils.free(alloc, owned_message);
     const data_json = if (value.object.get("data")) |data|
         try stringifyValueAlloc(alloc, data, limits.max_metadata_bytes, limits.max_json_depth)
     else
@@ -164,19 +165,19 @@ pub fn parseResourceContent(alloc: Allocator, value: std.json.Value, limits: Lim
     }
 
     const owned_uri = try alloc.dupe(u8, uri);
-    errdefer alloc.free(owned_uri);
+    errdefer mem_utils.free(alloc, owned_uri);
     const owned_mime_type = if (mime_type) |item| try alloc.dupe(u8, item) else null;
-    errdefer if (owned_mime_type) |item| alloc.free(item);
+    errdefer if (owned_mime_type) |item| mem_utils.free(alloc, item);
     const annotations_json = if (value.object.get("annotations")) |annotations|
         try stringifyValueAlloc(alloc, annotations, limits.max_metadata_bytes, limits.max_json_depth)
     else
         null;
-    errdefer if (annotations_json) |item| alloc.free(item);
+    errdefer if (annotations_json) |item| mem_utils.free(alloc, item);
     const metadata_json = if (value.object.get("_meta")) |metadata|
         try stringifyValueAlloc(alloc, metadata, limits.max_metadata_bytes, limits.max_json_depth)
     else
         null;
-    errdefer if (metadata_json) |item| alloc.free(item);
+    errdefer if (metadata_json) |item| mem_utils.free(alloc, item);
 
     const data: ResourceData = if (text) |content| text_data: {
         if (content != .string or content.string.len > limits.max_content_field_bytes) {

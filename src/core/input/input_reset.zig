@@ -68,6 +68,13 @@ pub const State = struct {
                 .{},
             );
         }
+        if (gesture_reset.cleared_escape_interrupt) {
+            debug_trace.logf(
+                "input",
+                "event=esc_interrupt_disarmed reason=pending_gesture_reset",
+                .{},
+            );
+        }
     }
 };
 

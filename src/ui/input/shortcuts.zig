@@ -14,7 +14,6 @@ pub fn fromControlByte(byte: u8) ?ShortcutAction {
         5 => move(.line_end),
         2 => move(.character_left),
         6 => move(.character_right),
-        16 => .history_previous,
         14 => .history_next,
         4 => .delete_forward,
         11 => .delete_to_line_end,
@@ -75,7 +74,6 @@ test "composer shortcut raw control bytes map only typing-edit actions" {
         .{ .byte = 5, .action = move(.line_end) },
         .{ .byte = 2, .action = move(.character_left) },
         .{ .byte = 6, .action = move(.character_right) },
-        .{ .byte = 16, .action = .history_previous },
         .{ .byte = 14, .action = .history_next },
         .{ .byte = 4, .action = .delete_forward },
         .{ .byte = 11, .action = .delete_to_line_end },
@@ -110,6 +108,7 @@ test "composer shortcut table excludes app and terminal controls" {
     const excluded_bytes = [_]u8{
         3,
         15,
+        16,
         18,
         22,
         24,

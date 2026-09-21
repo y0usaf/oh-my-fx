@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const secret = @import("../auth/secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const generation_fact_codec = @import("generation_fact_codec.zig");
 const generation_usage = @import("generation_usage_provider.zig");
 const io_mod = @import("../shared/io.zig");
@@ -214,7 +215,7 @@ pub const InvocationObservation = struct {
                     "usage generation queued sequence={d} id={s}",
                     .{ self.sequence, reference.generation_id },
                 );
-                ledger.flushProfilePublications();
+                ledger.scheduleProfilePublicationDrain();
             },
             .unavailable => unreachable,
         }
@@ -284,11 +285,11 @@ pub const PendingGeneration = struct {
 
     fn dupe(self: PendingGeneration, alloc: Allocator) Allocator.Error!PendingGeneration {
         const id = try alloc.dupe(u8, self.id);
-        errdefer alloc.free(id);
+        errdefer mem_utils.free(alloc, id);
         const origin = try alloc.dupe(u8, self.origin);
-        errdefer alloc.free(origin);
+        errdefer mem_utils.free(alloc, origin);
         const team = if (self.team) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (team) |value| alloc.free(value);
+        errdefer if (team) |value| mem_utils.free(alloc, value);
         const account_id = if (self.account_id) |value| try alloc.dupe(u8, value) else null;
         return .{
             .id = id,
@@ -393,6 +394,11 @@ pub const Usage = struct {
     reconciliation_authority: ?ReconciliationAuthority = null,
     reconciliation_credential_blocked: bool = false,
     generation_usage_providers: generation_usage.Set = .{},
+    publication_drain_mutex: std.Io.Mutex = .init,
+    publication_drain_thread: ?std.Thread = null,
+    publication_drain_done: std.atomic.Value(bool) = .init(true),
+    publication_drain_cancel: std.atomic.Value(bool) = .init(false),
+    publication_drain_epoch: std.atomic.Value(u64) = .init(0),
 
     pub fn initFresh() Usage {
         return .{
@@ -430,17 +436,20 @@ pub const Usage = struct {
 
     pub fn deinit(self: *Usage, alloc: Allocator) void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         self.clearOwned(alloc);
         self.* = undefined;
     }
 
     pub fn resetFresh(self: *Usage, alloc: Allocator) void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         self.reset(alloc, true);
     }
 
     pub fn resetLegacy(self: *Usage, alloc: Allocator) void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         self.reset(alloc, false);
     }
 
@@ -526,10 +535,11 @@ pub const Usage = struct {
         outcome: DeliveryOutcome,
     ) !void {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         self.finishInvocation(sequence, duration_ms, outcome);
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        self.flushProfilePublications();
+        self.scheduleProfilePublicationDrain();
     }
 
     fn finishObservedInvocationDurably(
@@ -543,6 +553,7 @@ pub const Usage = struct {
         team: ?[]const u8,
     ) !bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         const accepted = self.finishObservedInvocationAccepted(
             alloc,
             sequence,
@@ -553,17 +564,17 @@ pub const Usage = struct {
             team,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             debug_trace.logf(
                 "session",
                 "usage generation checkpointed incomplete reason={s}",
                 .{@errorName(err)},
             );
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.scheduleProfilePublicationDrain();
             return false;
         };
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
         return accepted;
     }
@@ -577,6 +588,7 @@ pub const Usage = struct {
         reference: stream_provider.DeferredUsageReference,
     ) !bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         const accepted = self.finishDeferredInvocationAccepted(
             alloc,
             sequence,
@@ -585,17 +597,17 @@ pub const Usage = struct {
             reference,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             debug_trace.logf(
                 "session",
                 "usage generation checkpointed incomplete reason={s}",
                 .{@errorName(err)},
             );
             self.checkpoint_mutex.unlock(io_mod.getIo());
-            self.flushProfilePublications();
+            self.scheduleProfilePublicationDrain();
             return false;
         };
-        _ = self.persistCheckpointBestEffortLocked();
+        _ = try self.persistCheckpointForContinuationLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
         return accepted;
     }
@@ -661,6 +673,7 @@ pub const Usage = struct {
         };
 
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
+        errdefer self.checkpoint_mutex.unlock(io_mod.getIo());
         const durable_bridge = self.checkpoint_sink != null;
         const accepted = self.finishExactInvocationAccepted(
             alloc,
@@ -673,7 +686,7 @@ pub const Usage = struct {
             durable_bridge,
         ) catch |err| {
             self.markBillingIncomplete();
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             self.checkpoint_mutex.unlock(io_mod.getIo());
             debug_trace.logf(
                 "session",
@@ -683,16 +696,16 @@ pub const Usage = struct {
             return false;
         };
         if (!accepted) {
-            _ = self.persistCheckpointBestEffortLocked();
+            _ = try self.persistCheckpointForContinuationLocked();
             self.checkpoint_mutex.unlock(io_mod.getIo());
             return false;
         }
-        if (durable_bridge and !self.persistCheckpointBestEffortLocked()) {
+        if (durable_bridge and !(try self.persistCheckpointForContinuationLocked())) {
             self.checkpoint_mutex.unlock(io_mod.getIo());
             return false;
         }
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        if (durable_bridge) self.flushProfilePublications();
+        if (durable_bridge) self.scheduleProfilePublicationDrain();
         return true;
     }
 
@@ -741,6 +754,10 @@ pub const Usage = struct {
     }
 
     fn persistCheckpointBestEffortLocked(self: *Usage) bool {
+        return self.persistCheckpointForContinuationLocked() catch false;
+    }
+
+    fn persistCheckpointForContinuationLocked(self: *Usage) error{ SessionPersistenceUncertain, SessionWriterChanged, SessionWriterParked, SessionCommitFailed }!bool {
         const sink = self.checkpoint_sink orelse return true;
         var persisted = self.snapshotCurrent(sink.allocator) catch |err| {
             self.markBillingIncomplete();
@@ -759,6 +776,14 @@ pub const Usage = struct {
                 "usage checkpoint unavailable; billing marked incomplete reason={s}",
                 .{@errorName(err)},
             );
+            switch (err) {
+                error.SessionPersistenceUncertain,
+                error.SessionWriterChanged,
+                error.SessionWriterParked,
+                error.SessionCommitFailed,
+                => return @errorCast(err),
+                else => {},
+            }
             return false;
         };
         self.markClean(persisted);
@@ -958,7 +983,7 @@ pub const Usage = struct {
             }
             if (std.mem.eql(u8, pending.id, id)) {
                 if (pending.sequence != sequence or
-                    pending.provider != provider or
+                    !pending.provider.same_authority(provider) or
                     !std.mem.eql(u8, pending.origin, origin) or
                     !optionalStringsEqual(pending.team, team) or
                     pending.credential_source != credential_source or
@@ -1004,13 +1029,13 @@ pub const Usage = struct {
             return error.UsageCapacityExceeded;
         }
         const owned_id = try alloc.dupe(u8, id);
-        errdefer alloc.free(owned_id);
+        errdefer mem_utils.free(alloc, owned_id);
         const owned_origin = try alloc.dupe(u8, origin);
-        errdefer alloc.free(owned_origin);
+        errdefer mem_utils.free(alloc, owned_origin);
         const owned_team = if (team) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_team) |value| alloc.free(value);
+        errdefer if (owned_team) |value| mem_utils.free(alloc, value);
         const owned_account_id = if (account_id) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_account_id) |value| alloc.free(value);
+        errdefer if (owned_account_id) |value| mem_utils.free(alloc, value);
         try self.pending.append(alloc, .{
             .id = owned_id,
             .sequence = sequence,
@@ -1140,7 +1165,7 @@ pub const Usage = struct {
         ) catch return self.failOverflow();
 
         var owned_model: ?[]u8 = null;
-        errdefer if (owned_model) |model| alloc.free(model);
+        errdefer if (owned_model) |model| mem_utils.free(alloc, model);
         if (model_index == null) {
             owned_model = try alloc.dupe(u8, record.model);
             try self.models.ensureUnusedCapacity(alloc, 1);
@@ -1264,7 +1289,7 @@ pub const Usage = struct {
             usage_report.PendingMarker,
             self.pending.items.len,
         );
-        errdefer alloc.free(pending);
+        errdefer mem_utils.free(alloc, pending);
         var copied_pending: usize = 0;
         errdefer for (pending[0..copied_pending]) |*marker| marker.deinit(alloc);
         for (self.pending.items, 0..) |generation, index| {
@@ -1279,13 +1304,13 @@ pub const Usage = struct {
             usage_report.Incident,
             self.incidents[0..self.incident_count],
         );
-        errdefer alloc.free(incidents);
+        errdefer mem_utils.free(alloc, incidents);
 
         const facts = try alloc.alloc(
             usage_report.GenerationFact,
             self.publication_backlog.items.len,
         );
-        errdefer alloc.free(facts);
+        errdefer mem_utils.free(alloc, facts);
         var copied_facts: usize = 0;
         errdefer for (facts[0..copied_facts]) |*fact| fact.deinit(alloc);
         for (self.publication_backlog.items, 0..) |fact, index| {
@@ -1299,6 +1324,57 @@ pub const Usage = struct {
             .facts = facts,
             .checkpoint_changed = checkpoint_changed,
         };
+    }
+
+    /// Queues a profile-publication drain so invocation finish paths never run
+    /// the append-only store's full-file parse on the agent worker thread. The
+    /// session checkpoint is already durable before this is called; the drain
+    /// only updates the profile-level usage ledger. Tests keep the legacy
+    /// synchronous flush so assertions stay deterministic.
+    fn scheduleProfilePublicationDrain(self: *Usage) void {
+        if (builtin.is_test or comptime builtin.os.tag == .wasi) {
+            self.flushProfilePublications();
+            return;
+        }
+        _ = self.publication_drain_epoch.fetchAdd(1, .seq_cst);
+        self.publication_drain_mutex.lockUncancelable(io_mod.getIo());
+        defer self.publication_drain_mutex.unlock(io_mod.getIo());
+        if (self.publication_drain_thread) |thread| {
+            if (!self.publication_drain_done.load(.seq_cst)) return;
+            thread.join();
+            self.publication_drain_thread = null;
+            self.publication_drain_done.store(true, .seq_cst);
+        }
+        self.publication_mutex.lockUncancelable(io_mod.getIo());
+        const has_sink = self.publication_sink != null;
+        self.publication_mutex.unlock(io_mod.getIo());
+        if (!has_sink) return;
+        self.publication_drain_cancel.store(false, .seq_cst);
+        self.publication_drain_done.store(false, .seq_cst);
+        self.publication_drain_thread = std.Thread.spawn(.{}, publicationDrainThreadMain, .{self}) catch |err| {
+            self.publication_drain_done.store(true, .seq_cst);
+            debug_trace.logf(
+                "session",
+                "usage profile publication drain start failed reason={s}",
+                .{@errorName(err)},
+            );
+            self.flushProfilePublications();
+            return;
+        };
+    }
+
+    /// Stops the background profile-publication drain, joining any live worker.
+    /// A later schedule starts a fresh worker.
+    fn stopPublicationDrain(self: *Usage) void {
+        if (builtin.is_test or comptime builtin.os.tag == .wasi) return;
+        self.publication_drain_cancel.store(true, .seq_cst);
+        self.publication_drain_mutex.lockUncancelable(io_mod.getIo());
+        defer self.publication_drain_mutex.unlock(io_mod.getIo());
+        const thread = self.publication_drain_thread;
+        self.publication_drain_thread = null;
+        if (thread) |handle| handle.join();
+        self.publication_drain_done.store(true, .seq_cst);
+        self.publication_drain_cancel.store(false, .seq_cst);
     }
 
     fn flushProfilePublications(self: *Usage) void {
@@ -1529,7 +1605,7 @@ pub const Usage = struct {
         defer self.mutex.unlock(io_mod.getIo());
 
         const models = try alloc.alloc(ModelAggregate, self.models.items.len);
-        errdefer alloc.free(models);
+        errdefer mem_utils.free(alloc, models);
         var copied_models: usize = 0;
         errdefer for (models[0..copied_models]) |*model| model.deinit(alloc);
         for (self.models.items, 0..) |model, index| {
@@ -1538,7 +1614,7 @@ pub const Usage = struct {
         }
 
         const pending = try alloc.alloc(PendingGeneration, self.pending.items.len);
-        errdefer alloc.free(pending);
+        errdefer mem_utils.free(alloc, pending);
         var copied_pending: usize = 0;
         errdefer for (pending[0..copied_pending]) |*generation| generation.deinit(alloc);
         for (self.pending.items, 0..) |generation, index| {
@@ -1550,7 +1626,7 @@ pub const Usage = struct {
             usage_report.GenerationFact,
             self.publication_backlog.items.len,
         );
-        errdefer alloc.free(publication_backlog);
+        errdefer mem_utils.free(alloc, publication_backlog);
         var copied_publications: usize = 0;
         errdefer for (publication_backlog[0..copied_publications]) |*fact| {
             fact.deinit(alloc);
@@ -1564,7 +1640,7 @@ pub const Usage = struct {
             usage_report.Incident,
             self.incidents[0..self.incident_count],
         );
-        errdefer alloc.free(incidents);
+        errdefer mem_utils.free(alloc, incidents);
 
         const now_ms = io_mod.milliTimestamp();
         if (self.active_started_at_ms == 0) self.active_started_at_ms = now_ms;
@@ -1674,6 +1750,7 @@ pub const Usage = struct {
         session_started_at_ms: i64,
     ) !void {
         self.stopReconciliation();
+        self.stopPublicationDrain();
         try validateSnapshot(source);
 
         var copied = try dupeSnapshotOwned(alloc, source);
@@ -2001,6 +2078,7 @@ pub const Usage = struct {
     }
 
     pub fn finishProfilePublicationsBeforeShutdown(self: *Usage) void {
+        self.stopPublicationDrain();
         self.flushProfilePublications();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -2152,7 +2230,7 @@ pub const Usage = struct {
                 generation.sequence != saved.sequence or
                 !std.mem.eql(u8, generation.origin, saved.origin) or
                 !optionalStringsEqual(generation.team, saved.team) or
-                generation.provider != saved.provider or
+                !generation.provider.same_authority(saved.provider) or
                 generation.credential_source != saved.credential_source or
                 !optionalCredentialIdentitiesEqual(generation.credential_identity, saved.credential_identity) or
                 !optionalStringsEqual(generation.account_id, saved.account_id) or
@@ -2235,12 +2313,17 @@ const ReconciliationAuthority = struct {
     credential_identity: ?credential_authority.Identity,
 
     fn eql(self: ReconciliationAuthority, other: ReconciliationAuthority) bool {
-        return self.provider == other.provider and
+        return self.provider.same_authority(other.provider) and
             optionalCredentialIdentitiesEqual(self.credential_identity, other.credential_identity);
     }
 };
 
 pub fn validateSnapshot(snapshot: Snapshot) !void {
+    _ = try validateSnapshotContract(snapshot, false);
+}
+
+fn validateSnapshotContract(snapshot: Snapshot, allow_legacy_cache: bool) !bool {
+    var cache_totals_valid = true;
     if (snapshot.next_sequence == 0) return error.InvalidUsageSnapshot;
     if (snapshot.settled_through_sequence >= snapshot.next_sequence) {
         return error.InvalidUsageSnapshot;
@@ -2307,7 +2390,8 @@ pub fn validateSnapshot(snapshot: Snapshot) !void {
         if (model.cache_read_tokens > model.input_tokens or
             model.cache_write_tokens > model.input_tokens)
         {
-            return error.InvalidUsageSnapshot;
+            if (!allow_legacy_cache) return error.InvalidUsageSnapshot;
+            cache_totals_valid = false;
         }
         if (model.reasoning_tokens) |reasoning| {
             if (reasoning > model.output_tokens) return error.InvalidUsageSnapshot;
@@ -2402,6 +2486,7 @@ pub fn validateSnapshot(snapshot: Snapshot) !void {
         }
     }
     if (identifier_bytes > max_identifier_bytes) return error.UsageCapacityExceeded;
+    return cache_totals_valid;
 }
 
 pub fn appendIncidentOwned(
@@ -2535,7 +2620,7 @@ pub fn billingProjectionEql(first: Snapshot, second: Snapshot) bool {
             left.sequence != right.sequence or
             !std.mem.eql(u8, left.origin, right.origin) or
             !optionalStringsEqual(left.team, right.team) or
-            left.provider != right.provider or
+            !left.provider.same_authority(right.provider) or
             left.credential_source != right.credential_source or
             !optionalCredentialIdentitiesEqual(left.credential_identity, right.credential_identity) or
             !optionalStringsEqual(left.account_id, right.account_id))
@@ -2735,16 +2820,61 @@ fn writePendingAuthority(writer: *std.Io.Writer, pending: PendingGeneration) !vo
 
 /// Parses either the rollback-readable or current usage snapshot schema.
 pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
+    var snapshot = try parseSnapshotFields(alloc, value);
+    errdefer snapshot.deinit(alloc);
+    try validateSnapshot(snapshot);
+    return snapshot;
+}
+
+/// Caller owns the result. Only historical separate-cache accounting may
+/// become unavailable; malformed or versioned snapshots remain errors.
+pub fn parseLegacySnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
+    var snapshot = try parseSnapshotFields(alloc, value);
+    errdefer snapshot.deinit(alloc);
+    if (try validateSnapshotContract(snapshot, isUnversionedSnapshot(value))) return snapshot;
+
+    snapshot.deinit(alloc);
+    return .{
+        .billing = .legacy,
+        .api_duration_complete = false,
+        .wall_duration_complete = false,
+        .code_complete = false,
+        .next_sequence = 1,
+        .settled_through_sequence = 0,
+        .api_duration_ms = 0,
+        .wall_duration_ms = 0,
+        .total_cost = 0,
+        .input_tokens = 0,
+        .output_tokens = 0,
+        .cache_read_tokens = 0,
+        .cache_write_tokens = 0,
+        .billable_web_search_calls = 0,
+        .lines_added = 0,
+        .lines_removed = 0,
+        .models = &.{},
+        .pending = &.{},
+    };
+}
+
+fn isUnversionedSnapshot(value: std.json.Value) bool {
+    return value == .object and value.object.count() == 18;
+}
+
+pub fn supports_snapshot_schema(schema_version: u64) bool {
+    return schema_version == 2 or schema_version == 3;
+}
+
+fn parseSnapshotFields(alloc: Allocator, value: std.json.Value) !Snapshot {
     if (value != .object) {
         return error.InvalidUsageSnapshot;
     }
-    const legacy = value.object.count() == 18;
+    const legacy = isUnversionedSnapshot(value);
     const schema_version = if (legacy)
         @as(u64, 1)
     else
         try parseNonNegativeInteger(value.object.get("schema_version"));
     if (!legacy) {
-        if (value.object.count() != 23 or (schema_version != 2 and schema_version != 3)) {
+        if (value.object.count() != 23 or !supports_snapshot_schema(schema_version)) {
             return error.InvalidUsageSnapshot;
         }
     }
@@ -2792,11 +2922,65 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
         return error.UsageCapacityExceeded;
     }
 
-    const models = try alloc.alloc(ModelAggregate, models_value.array.items.len);
-    errdefer alloc.free(models);
-    var model_count: usize = 0;
-    errdefer for (models[0..model_count]) |*model| model.deinit(alloc);
-    for (models_value.array.items, 0..) |model_value, index| {
+    const models = try parseModelAggregates(
+        alloc,
+        models_value.array.items,
+        legacy,
+    );
+    errdefer deinitModelAggregates(alloc, models);
+    const pending = try parsePendingGenerations(
+        alloc,
+        pending_value.array.items,
+    );
+    errdefer deinitPendingGenerations(alloc, pending);
+    const publication_backlog = try parsePublicationBacklog(
+        alloc,
+        value.object,
+        legacy,
+    );
+    errdefer deinitPublicationBacklog(alloc, publication_backlog);
+    const incidents = try parseUsageIncidents(alloc, value.object, legacy);
+    errdefer if (incidents.len > 0) mem_utils.free(alloc, incidents);
+
+    const snapshot = Snapshot{
+        .billing = billing,
+        .api_duration_complete = api_complete,
+        .wall_duration_complete = wall_complete,
+        .code_complete = code_complete,
+        .next_sequence = next_sequence,
+        .settled_through_sequence = settled_through_sequence,
+        .api_duration_ms = api_duration_ms,
+        .wall_duration_ms = wall_duration_ms,
+        .total_cost = total_cost,
+        .input_tokens = input_tokens,
+        .output_tokens = output_tokens,
+        .cache_read_tokens = cache_read_tokens,
+        .cache_write_tokens = cache_write_tokens,
+        .reasoning_tokens = reasoning_tokens,
+        .request_count = request_count,
+        .billable_web_search_calls = billable_web_search_calls,
+        .lines_added = lines_added,
+        .lines_removed = lines_removed,
+        .models = models,
+        .pending = pending,
+        .publication_backlog = publication_backlog,
+        .incidents = incidents,
+    };
+    return snapshot;
+}
+
+fn parseModelAggregates(
+    alloc: Allocator,
+    values: []const std.json.Value,
+    legacy: bool,
+) ![]ModelAggregate {
+    const models = try alloc.alloc(ModelAggregate, values.len);
+    var count: usize = 0;
+    errdefer {
+        for (models[0..count]) |*model| model.deinit(alloc);
+        mem_utils.free(alloc, models);
+    }
+    for (values, 0..) |model_value, index| {
         const expected_model_fields: usize = if (legacy) 8 else 10;
         if (model_value != .object or
             model_value.object.count() != expected_model_fields)
@@ -2840,14 +3024,27 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
             .request_count = model_request_count,
             .billable_web_search_calls = model_web_search_calls,
         };
-        model_count += 1;
+        count += 1;
     }
+    return models;
+}
 
-    const pending = try alloc.alloc(PendingGeneration, pending_value.array.items.len);
-    errdefer alloc.free(pending);
-    var pending_count: usize = 0;
-    errdefer for (pending[0..pending_count]) |*generation| generation.deinit(alloc);
-    for (pending_value.array.items, 0..) |pending_entry, index| {
+fn deinitModelAggregates(alloc: Allocator, models: []ModelAggregate) void {
+    for (models) |*model| model.deinit(alloc);
+    mem_utils.free(alloc, models);
+}
+
+fn parsePendingGenerations(
+    alloc: Allocator,
+    values: []const std.json.Value,
+) ![]PendingGeneration {
+    const pending = try alloc.alloc(PendingGeneration, values.len);
+    var count: usize = 0;
+    errdefer {
+        for (pending[0..count]) |*generation| generation.deinit(alloc);
+        mem_utils.free(alloc, pending);
+    }
+    for (values, 0..) |pending_entry, index| {
         if (pending_entry != .object) return error.InvalidUsageSnapshot;
         const provider_scoped = pending_entry.object.contains("provider");
         const has_observed_at = pending_entry.object.contains("observed_at_ms");
@@ -2857,9 +3054,7 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
             5
         else
             4;
-        if (pending_entry != .object or
-            pending_entry.object.count() != expected_pending_fields)
-        {
+        if (pending_entry.object.count() != expected_pending_fields) {
             return error.InvalidUsageSnapshot;
         }
         const id_value = pending_entry.object.get("id") orelse return error.InvalidUsageSnapshot;
@@ -2874,15 +3069,15 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
         };
         if (team_value != .null and team_value != .string) return error.InvalidUsageSnapshot;
         const id = try alloc.dupe(u8, id_value.string);
-        errdefer alloc.free(id);
+        errdefer mem_utils.free(alloc, id);
         const origin = try alloc.dupe(u8, origin_value.string);
-        errdefer alloc.free(origin);
+        errdefer mem_utils.free(alloc, origin);
         const team = switch (team_value) {
             .null => null,
             .string => |text| try alloc.dupe(u8, text),
             else => unreachable,
         };
-        errdefer if (team) |text| alloc.free(text);
+        errdefer if (team) |text| mem_utils.free(alloc, text);
         const provider = if (provider_scoped) provider: {
             const field = pending_entry.object.get("provider") orelse return error.InvalidUsageSnapshot;
             if (field != .string) return error.InvalidUsageSnapshot;
@@ -2900,7 +3095,7 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
             try parseOptionalOwnedString(alloc, pending_entry.object.get("account_id"))
         else
             null;
-        errdefer if (account_id) |text| alloc.free(text);
+        errdefer if (account_id) |text| mem_utils.free(alloc, text);
         pending[index] = .{
             .id = id,
             .sequence = sequence,
@@ -2912,106 +3107,86 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
             .account_id = account_id,
             .observed_at_ms = observed_at_ms,
         };
-        pending_count += 1;
+        count += 1;
     }
+    return pending;
+}
 
-    const publication_backlog = if (legacy) blk: {
-        break :blk try alloc.alloc(usage_report.GenerationFact, 0);
-    } else blk: {
-        const backlog_value = value.object.get("publication_backlog") orelse
-            return error.InvalidUsageSnapshot;
-        if (backlog_value != .array or
-            backlog_value.array.items.len > max_publication_backlog)
-        {
-            return error.InvalidUsageSnapshot;
-        }
-        const backlog = try alloc.alloc(
-            usage_report.GenerationFact,
-            backlog_value.array.items.len,
-        );
-        errdefer alloc.free(backlog);
-        var backlog_count: usize = 0;
-        errdefer for (backlog[0..backlog_count]) |*fact| fact.deinit(alloc);
-        for (backlog_value.array.items, 0..) |fact_value, index| {
-            backlog[index] = generation_fact_codec.parse(
-                alloc,
-                fact_value,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidGenerationFact => return error.InvalidUsageSnapshot,
-            };
-            backlog_count += 1;
-        }
-        break :blk backlog;
-    };
+fn deinitPendingGenerations(
+    alloc: Allocator,
+    pending: []PendingGeneration,
+) void {
+    for (pending) |*generation| generation.deinit(alloc);
+    mem_utils.free(alloc, pending);
+}
+
+fn parsePublicationBacklog(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    legacy: bool,
+) ![]usage_report.GenerationFact {
+    if (legacy) return alloc.alloc(usage_report.GenerationFact, 0);
+    const value = object.get("publication_backlog") orelse
+        return error.InvalidUsageSnapshot;
+    if (value != .array or value.array.items.len > max_publication_backlog) {
+        return error.InvalidUsageSnapshot;
+    }
+    const backlog = try alloc.alloc(usage_report.GenerationFact, value.array.items.len);
+    var count: usize = 0;
     errdefer {
-        for (publication_backlog) |*fact| fact.deinit(alloc);
-        if (publication_backlog.len > 0) alloc.free(publication_backlog);
+        for (backlog[0..count]) |*fact| fact.deinit(alloc);
+        mem_utils.free(alloc, backlog);
     }
+    for (value.array.items, 0..) |fact, index| {
+        backlog[index] = generation_fact_codec.parse(alloc, fact) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidGenerationFact => return error.InvalidUsageSnapshot,
+        };
+        count += 1;
+    }
+    return backlog;
+}
 
-    const incidents = if (legacy) blk: {
-        break :blk try alloc.alloc(usage_report.Incident, 0);
-    } else blk: {
-        const incidents_value = value.object.get("incidents") orelse
-            return error.InvalidUsageSnapshot;
-        if (incidents_value != .array or
-            incidents_value.array.items.len > max_usage_incidents)
-        {
+fn deinitPublicationBacklog(
+    alloc: Allocator,
+    backlog: []usage_report.GenerationFact,
+) void {
+    for (backlog) |*fact| fact.deinit(alloc);
+    mem_utils.free(alloc, backlog);
+}
+
+fn parseUsageIncidents(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    legacy: bool,
+) ![]usage_report.Incident {
+    if (legacy) return alloc.alloc(usage_report.Incident, 0);
+    const value = object.get("incidents") orelse
+        return error.InvalidUsageSnapshot;
+    if (value != .array or value.array.items.len > max_usage_incidents) {
+        return error.InvalidUsageSnapshot;
+    }
+    const incidents = try alloc.alloc(usage_report.Incident, value.array.items.len);
+    errdefer mem_utils.free(alloc, incidents);
+    for (value.array.items, 0..) |incident, index| {
+        if (incident != .object or incident.object.count() != 2) {
             return error.InvalidUsageSnapshot;
         }
-        const owned_incidents = try alloc.alloc(
-            usage_report.Incident,
-            incidents_value.array.items.len,
-        );
-        errdefer alloc.free(owned_incidents);
-        for (incidents_value.array.items, 0..) |incident_value, index| {
-            if (incident_value != .object or incident_value.object.count() != 2) {
-                return error.InvalidUsageSnapshot;
-            }
-            const completeness_value = incident_value.object.get("completeness") orelse
-                return error.InvalidUsageSnapshot;
-            if (completeness_value != .string) return error.InvalidUsageSnapshot;
-            const completeness = std.meta.stringToEnum(
-                usage_report.Completeness,
-                completeness_value.string,
-            ) orelse return error.InvalidUsageSnapshot;
-            owned_incidents[index] = .{
-                .occurred_at_ms = try parseNonNegativeI64(
-                    incident_value.object.get("occurred_at_ms"),
-                ),
-                .completeness = completeness,
-            };
-        }
-        break :blk owned_incidents;
-    };
-    errdefer if (incidents.len > 0) alloc.free(incidents);
-
-    const snapshot = Snapshot{
-        .billing = billing,
-        .api_duration_complete = api_complete,
-        .wall_duration_complete = wall_complete,
-        .code_complete = code_complete,
-        .next_sequence = next_sequence,
-        .settled_through_sequence = settled_through_sequence,
-        .api_duration_ms = api_duration_ms,
-        .wall_duration_ms = wall_duration_ms,
-        .total_cost = total_cost,
-        .input_tokens = input_tokens,
-        .output_tokens = output_tokens,
-        .cache_read_tokens = cache_read_tokens,
-        .cache_write_tokens = cache_write_tokens,
-        .reasoning_tokens = reasoning_tokens,
-        .request_count = request_count,
-        .billable_web_search_calls = billable_web_search_calls,
-        .lines_added = lines_added,
-        .lines_removed = lines_removed,
-        .models = models,
-        .pending = pending,
-        .publication_backlog = publication_backlog,
-        .incidents = incidents,
-    };
-    try validateSnapshot(snapshot);
-    return snapshot;
+        const completeness_value = incident.object.get("completeness") orelse
+            return error.InvalidUsageSnapshot;
+        if (completeness_value != .string) return error.InvalidUsageSnapshot;
+        const completeness = std.meta.stringToEnum(
+            usage_report.Completeness,
+            completeness_value.string,
+        ) orelse return error.InvalidUsageSnapshot;
+        incidents[index] = .{
+            .occurred_at_ms = try parseNonNegativeI64(
+                incident.object.get("occurred_at_ms"),
+            ),
+            .completeness = completeness,
+        };
+    }
+    return incidents;
 }
 
 fn parseBool(value: ?std.json.Value) !bool {
@@ -3063,6 +3238,26 @@ fn reconciliationThreadMain(
     }
 }
 
+fn publicationDrainThreadMain(usage: *Usage) void {
+    defer usage.publication_drain_done.store(true, .seq_cst);
+    var observed_epoch = usage.publication_drain_epoch.load(.seq_cst);
+    while (!usage.publication_drain_cancel.load(.seq_cst)) {
+        usage.flushProfilePublications();
+        if (usage.publication_drain_cancel.load(.seq_cst)) return;
+        const current_epoch = usage.publication_drain_epoch.load(.seq_cst);
+        if (current_epoch != observed_epoch) {
+            observed_epoch = current_epoch;
+            continue;
+        }
+        usage.publication_drain_done.store(true, .seq_cst);
+        if (usage.publication_drain_cancel.load(.seq_cst)) return;
+        const confirmed_epoch = usage.publication_drain_epoch.load(.seq_cst);
+        if (confirmed_epoch == observed_epoch) return;
+        usage.publication_drain_done.store(false, .seq_cst);
+        observed_epoch = confirmed_epoch;
+    }
+}
+
 fn reconciliationKeyDigest(api_key: []const u8) [Sha256.digest_length]u8 {
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(api_key, &digest, .{});
@@ -3100,7 +3295,7 @@ fn reconcilePendingBlocking(
 
         var retry_needed = false;
         for (current.pending) |pending| {
-            if (pending.provider != authority.provider or
+            if (!pending.provider.same_authority(authority.provider) or
                 !optionalCredentialIdentitiesEqual(
                     pending.credential_identity,
                     authority.credential_identity,
@@ -3272,7 +3467,7 @@ fn addOptionalCounter(first: ?u64, second: ?u64) error{UsageOverflow}!?u64 {
 
 pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     const models = try alloc.alloc(ModelAggregate, source.models.len);
-    errdefer alloc.free(models);
+    errdefer mem_utils.free(alloc, models);
     var copied_models: usize = 0;
     errdefer for (models[0..copied_models]) |*model| model.deinit(alloc);
     for (source.models, 0..) |model, index| {
@@ -3281,7 +3476,7 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     }
 
     const pending = try alloc.alloc(PendingGeneration, source.pending.len);
-    errdefer alloc.free(pending);
+    errdefer mem_utils.free(alloc, pending);
     var copied_pending: usize = 0;
     errdefer for (pending[0..copied_pending]) |*generation| generation.deinit(alloc);
     for (source.pending, 0..) |generation, index| {
@@ -3293,7 +3488,7 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
         usage_report.GenerationFact,
         source.publication_backlog.len,
     );
-    errdefer alloc.free(publication_backlog);
+    errdefer mem_utils.free(alloc, publication_backlog);
     var copied_publications: usize = 0;
     errdefer for (publication_backlog[0..copied_publications]) |*fact| {
         fact.deinit(alloc);
@@ -3304,7 +3499,7 @@ pub fn dupeSnapshotOwned(alloc: Allocator, source: Snapshot) !Snapshot {
     }
 
     const incidents = try alloc.dupe(usage_report.Incident, source.incidents);
-    errdefer alloc.free(incidents);
+    errdefer mem_utils.free(alloc, incidents);
 
     return .{
         .billing = source.billing,
@@ -3344,7 +3539,8 @@ fn canonicalExactGenerationId(
     try validateExternalGenerationId(external_id);
     var digest: [Sha256.digest_length]u8 = undefined;
     var hash = Sha256.init(.{});
-    hash.update(@tagName(provider));
+    hash.update(provider.label());
+    if (provider == .configured) if (provider.configured.binding) |binding| hash.update(&binding);
     hash.update(&.{0});
     hash.update(external_id);
     hash.final(&digest);
@@ -3359,6 +3555,7 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
         .gateway => "exact/gateway",
         .codex => "exact/codex",
         .grok => "exact/grok",
+        .configured => "exact/configured",
     };
 }
 
@@ -4185,6 +4382,138 @@ test "fresh usage aggregates authoritative generations in invocation order" {
     try std.testing.expectError(error.InvalidUsageSnapshot, validateSnapshot(snapshot));
 }
 
+fn legacyUsageForTest(alloc: Allocator) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"billing":"complete","api_duration_complete":true,"wall_duration_complete":true,"code_complete":true,"next_sequence":2,"settled_through_sequence":1,
+        \\"api_duration_ms":10,"wall_duration_ms":20,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0,"lines_added":0,"lines_removed":0,
+        \\"models":[{"model":"test/model","first_sequence":1,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0}],"pending":[]}
+    , .{});
+}
+
+test "legacy usage compatibility preserves valid snapshots and strict parsing" {
+    const alloc = std.testing.allocator;
+    var parsed = try legacyUsageForTest(alloc);
+    defer parsed.deinit();
+    var strict = try parseSnapshotValue(alloc, parsed.value);
+    defer strict.deinit(alloc);
+    var compatible = try parseLegacySnapshotValue(alloc, parsed.value);
+    defer compatible.deinit(alloc);
+    try std.testing.expect(snapshotEql(strict, compatible));
+
+    for ([_][]const u8{ "cache_read_tokens", "cache_write_tokens" }) |field| {
+        const global = parsed.value.object.getPtr(field).?;
+        const model = parsed.value.object.getPtr("models").?.array.items[0].object.getPtr(field).?;
+        const saved = global.*;
+        global.* = .{ .integer = 11 };
+        model.* = global.*;
+        var unavailable = try parseLegacySnapshotValue(alloc, parsed.value);
+        defer unavailable.deinit(alloc);
+        try validateSnapshot(unavailable);
+        try std.testing.expectEqual(Availability.legacy, unavailable.billing);
+        try std.testing.expectEqual(@as(usize, 0), unavailable.models.len);
+        try std.testing.expectEqual(@as(usize, 0), unavailable.pending.len);
+        try std.testing.expectError(error.InvalidUsageSnapshot, parseSnapshotValue(alloc, parsed.value));
+        global.* = saved;
+        model.* = saved;
+    }
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRichSnapshot(&encoded.writer, strict);
+    var rich = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer rich.deinit();
+    var rich_copy = try parseLegacySnapshotValue(alloc, rich.value);
+    defer rich_copy.deinit(alloc);
+    try std.testing.expect(snapshotEql(strict, rich_copy));
+    rich.value.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    rich.value.object.getPtr("models").?.array.items[0].object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, rich.value));
+}
+
+test "legacy usage compatibility does not hide malformed accounting" {
+    const alloc = std.testing.allocator;
+    var parsed = try legacyUsageForTest(alloc);
+    defer parsed.deinit();
+    parsed.value.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    const model = &parsed.value.object.getPtr("models").?.array.items[0];
+    model.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+
+    const cases = [_]struct {
+        field: []const u8,
+        value: std.json.Value,
+        want: error{ InvalidGenerationRecord, InvalidUsageSnapshot },
+    }{
+        .{ .field = "total_cost", .value = .{ .float = -1 }, .want = error.InvalidGenerationRecord },
+        .{ .field = "total_cost", .value = .{ .float = std.math.inf(f64) }, .want = error.InvalidGenerationRecord },
+        .{ .field = "input_tokens", .value = .{ .integer = 9 }, .want = error.InvalidUsageSnapshot },
+        .{ .field = "next_sequence", .value = .{ .integer = 0 }, .want = error.InvalidUsageSnapshot },
+    };
+    for (cases) |case| {
+        const field = parsed.value.object.getPtr(case.field).?;
+        const saved = field.*;
+        field.* = case.value;
+        try std.testing.expectError(case.want, parseLegacySnapshotValue(alloc, parsed.value));
+        try std.testing.expectError(case.want, parseSnapshotValue(alloc, parsed.value));
+        field.* = saved;
+    }
+    model.object.getPtr("first_sequence").?.* = .{ .integer = 0 };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, parsed.value));
+    model.object.getPtr("first_sequence").?.* = .{ .integer = 1 };
+    const models = parsed.value.object.getPtr("models").?;
+    try models.array.append(models.array.items[0]);
+    const totals = [_]struct { field: []const u8, original: i64, doubled: i64 }{
+        .{ .field = "total_cost", .original = 1, .doubled = 2 },
+        .{ .field = "input_tokens", .original = 10, .doubled = 20 },
+        .{ .field = "output_tokens", .original = 3, .doubled = 6 },
+        .{ .field = "cache_read_tokens", .original = 11, .doubled = 22 },
+    };
+    for (totals) |field| parsed.value.object.getPtr(field.field).?.* = .{ .integer = field.doubled };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, parsed.value));
+    models.array.items.len = 1;
+    for (totals) |field| parsed.value.object.getPtr(field.field).?.* = .{ .integer = field.original };
+
+    var pending = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"id\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"sequence\":0,\"origin\":\"https://ai-gateway.vercel.sh\",\"team\":null}]", .{});
+    defer pending.deinit();
+    const pending_field = parsed.value.object.getPtr("pending").?;
+    const old_pending = pending_field.*;
+    pending_field.* = pending.value;
+    parsed.value.object.getPtr("billing").?.* = .{ .string = "pending" };
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, parsed.value));
+    pending_field.* = old_pending;
+    parsed.value.object.getPtr("billing").?.* = .{ .string = "complete" };
+    try parsed.value.object.put(parsed.arena.allocator(), "unknown", .null);
+    try std.testing.expectError(error.InvalidGenerationRecord, parseLegacySnapshotValue(alloc, parsed.value));
+    try std.testing.expectError(error.InvalidUsageSnapshot, parseLegacySnapshotValue(alloc, .null));
+}
+
+test "legacy usage compatibility releases rejected and unavailable allocations" {
+    const alloc = std.testing.allocator;
+    var parsed = try legacyUsageForTest(alloc);
+    defer parsed.deinit();
+    parsed.value.object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    parsed.value.object.getPtr("models").?.array.items[0].object.getPtr("cache_read_tokens").?.* = .{ .integer = 11 };
+    const Check = struct {
+        fn run(a: Allocator, value: std.json.Value, reject: bool) !void {
+            if (reject) {
+                if (parseLegacySnapshotValue(a, value)) |result| {
+                    var owned = result;
+                    owned.deinit(a);
+                    return error.ExpectedInvalidUsage;
+                } else |err| switch (err) {
+                    error.InvalidUsageSnapshot => return,
+                    else => return err,
+                }
+            }
+            var snapshot = try parseLegacySnapshotValue(a, value);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqual(Availability.legacy, snapshot.billing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, false });
+    parsed.value.object.getPtr("input_tokens").?.* = .{ .integer = 9 };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, true });
+}
+
 test "usage deduplicates terminal and generation callbacks" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
@@ -4719,7 +5048,7 @@ const TestGenerationUsageProvider = struct {
         return switch (self.outcome) {
             .found => blk: {
                 const id = try alloc.dupe(u8, input.generation_id);
-                errdefer alloc.free(id);
+                errdefer mem_utils.free(alloc, id);
                 const model = try alloc.dupe(u8, "provider/model");
                 break :blk .{ .found = .{
                     .id = id,
@@ -5881,4 +6210,34 @@ test "host-managed reconciliation records authority without credential bytes" {
         credential_authority.derive(.host_managed, null).?,
     ));
     try std.testing.expect(!usage.reconciliation_credential_blocked);
+}
+
+test "terminal checkpoint writer failure stops invocation completion and releases its lock" {
+    const Reject = struct {
+        calls: usize = 0,
+        fn persist(raw: *anyopaque, _: Snapshot) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 2) return error.SessionPersistenceUncertain;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |deferred| {
+        var reject = Reject{};
+        var usage = Usage.initFresh();
+        defer usage.deinit(alloc);
+        usage.configureCheckpointSink(.{ .context = &reject, .allocator = alloc, .persist = Reject.persist });
+        const observation = try InvocationObservation.begin(&usage);
+        try std.testing.expectError(error.SessionPersistenceUncertain, observation.complete(
+            alloc,
+            .{ .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
+            if (deferred) testGatewayUsageOutcome("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", false) else .{ .unavailable = .unbilled },
+        ));
+        try std.testing.expectEqual(@as(usize, 2), reject.calls);
+        try std.testing.expect(usage.checkpoint_mutex.tryLock());
+        usage.checkpoint_mutex.unlock(io_mod.getIo());
+        var snapshot = try usage.snapshot(alloc);
+        defer snapshot.deinit(alloc);
+        try std.testing.expectEqual(Availability.incomplete, snapshot.billing);
+    }
 }

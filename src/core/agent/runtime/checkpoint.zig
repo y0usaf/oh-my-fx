@@ -130,6 +130,54 @@ test "kernel checkpoint round trips history and usage" {
     try std.testing.expectEqual(@as(?u64, 3), decoded.usage.input_tokens);
 }
 
+test "kernel checkpoint round trips inline prompt images" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nkernel-checkpoint";
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(png, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    var images = [_]types.ImageAttachment{.{
+        .id = 5,
+        .path = @constCast("inline://image-5"),
+        .media_type = @constCast("image/png"),
+        .snapshot_sha256 = @constCast(&digest_hex),
+        .inline_data = @constCast(png),
+    }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("look [Image #5]"), .images = &images },
+        .assistant = @constCast("a red square"),
+    } }};
+    const bytes = try encode(alloc, &history, .{});
+    defer alloc.free(bytes);
+
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    const restored = decoded.history[0].assistant.user.images[0];
+    try std.testing.expectEqual(@as(usize, 5), restored.id);
+    try std.testing.expectEqual(@as(?[]const u8, null), restored.snapshot_path);
+    try std.testing.expectEqualStrings(png, restored.inline_data.?);
+    try std.testing.expectEqualStrings(&digest_hex, restored.snapshot_sha256.?);
+}
+
+test "kernel checkpoint bound applies to history carrying inline images" {
+    const alloc = std.testing.allocator;
+    const oversized = try alloc.alloc(u8, max_checkpoint_bytes);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    @memcpy(oversized[0..8], "\x89PNG\r\n\x1a\n");
+    var images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("inline://image-1"),
+        .media_type = @constCast("image/png"),
+        .inline_data = oversized,
+    }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("[Image #1]"), .images = &images },
+        .assistant = @constCast("done"),
+    } }};
+    try std.testing.expectError(error.CheckpointTooLarge, encode(alloc, &history, .{}));
+}
+
 test "kernel checkpoint rejects corruption and unsupported versions" {
     const alloc = std.testing.allocator;
     const bytes = try encode(alloc, &.{}, .{});

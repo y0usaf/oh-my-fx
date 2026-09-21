@@ -11,7 +11,6 @@ const model_catalog = @import("core/gateway/model_catalog.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const output_contracts = @import("core/output/output_contracts.zig");
-const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const provider_catalog = @import("core/auth/provider_catalog.zig");
 const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
@@ -39,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         .gateway_provider = js_host_gateway_provider,
         .provider_set = js_host_provider_set,
         .secret_store = host.unavailable_secret_store,
-        .prompt_policy = builtin_context.prompt_policy,
+        .prompt_policy = .{ .system_prompt = "" },
         .ignored_list_entries = &.{},
         .max_list_entries = 0,
         .max_read_file_bytes = 0,
@@ -48,10 +47,12 @@ pub fn main(init: std.process.Init) !void {
         .max_command_output_bytes = 0,
         .max_tool_result_bytes = 64 * 1024,
         .max_history_turns = 100,
-        .context_registry = .{ .default_provider = builtin_context.provider },
+        .context_registry = .{ .default_provider = context_contract.empty_provider },
         .mode_registry = builtin_modes.registry,
         .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
         .model_override = io_mod.getenv("FX_MODEL"),
+        .effort_override = io_mod.getenv("FX_EFFORT"),
+        .fast_override = fastOverrideFromEnv(io_mod.getenv("FX_FAST")),
         .workspace_root_override = "/",
         .allow_acp_mcp = false,
         .allow_native_tools = false,
@@ -113,4 +114,13 @@ fn fetchCredits(
     _: gateway_provider.CreditsLookupInput,
 ) output_contracts.CreditsSnapshot {
     return .{};
+}
+
+/// Parses the FX_FAST host toggle: "true"/"1" enable the fast lane,
+/// "false"/"0" disable it, anything else leaves the default in place.
+fn fastOverrideFromEnv(value: ?[]const u8) ?bool {
+    const raw = value orelse return null;
+    if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+    return null;
 }

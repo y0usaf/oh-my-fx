@@ -31,10 +31,10 @@ const mockFetch = async (url, init) => {
   }
   return new Response(new ReadableStream({
     start(controller) {
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n'));
-      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":3},"outputTokens":{"total":2}}}\n'));
-      controller.enqueue(encoded.encode("data: [DONE]\n"));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n\n'));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n\n'));
+      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":3},"outputTokens":{"total":2}}}\n\n'));
+      controller.enqueue(encoded.encode("data: [DONE]\n\n"));
       controller.close();
     },
   }), { status: 200, headers: { "content-type": "text/event-stream" } });

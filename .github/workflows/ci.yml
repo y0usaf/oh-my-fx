@@ -143,11 +143,11 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.2"
 
       - name: Build SDK artifacts
         run: |
-          zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu.2.34 -Dcpu=baseline
           zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
           zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
 
@@ -176,6 +176,77 @@ jobs:
           bun sdk/tests/test-mcp-adapter.mjs http wasm
           bun sdk/tests/test-skills-adapter.mjs disk native
           bun sdk/tests/test-skills-adapter.mjs host wasm
+
+      - name: Check Linux addon compatibility
+        run: |
+          python3 sdk/tests/test-linux-abi.py
+          python3 sdk/scripts/check-linux-abi.py zig-out/lib/libfx.node
+          docker run --rm --network none --entrypoint /bin/bash \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            public.ecr.aws/lambda/nodejs@sha256:2472f0273d8848d8b2aa6528f5526b8a514b70703596199efe5a4b84d3d59b0b -euc '
+              node sdk/tests/test-native-core-ready.mjs
+              node sdk/tests/test-host-tools.mjs native
+              node sdk/tests/test-host-tool-cancel.mjs native
+            '
+
+      - name: Build foreign addons for package qualification
+        run: |
+          mkdir -p native-addons
+          cp zig-out/lib/libfx.node native-addons/libfx.linux-x64.node
+          prefix="$(mktemp -d "$RUNNER_TEMP/libfx-linux-arm64.XXXXXX")"
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=baseline --prefix "$prefix"
+          cp "$prefix/lib/libfx.node" native-addons/libfx.linux-arm64.node
+          prefix="$(mktemp -d "$RUNNER_TEMP/libfx-darwin-x64.XXXXXX")"
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=x86_64-macos -Dcpu=baseline --prefix "$prefix"
+          cp "$prefix/lib/libfx.node" native-addons/libfx.darwin-x64.node
+          prefix="$(mktemp -d "$RUNNER_TEMP/libfx-darwin-arm64.XXXXXX")"
+          zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dtarget=aarch64-macos -Dcpu=baseline --prefix "$prefix"
+          cp "$prefix/lib/libfx.node" native-addons/libfx.darwin-arm64.node
+
+      - name: Test Node package and backend diagnostics
+        run: |
+          node --experimental-wasm-jspi sdk/tests/test-backend-info.mjs
+          node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
+          node sdk/tests/test-node-package.mjs
+          node sdk/tests/test-term-demo-package.mjs
+          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
+          node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
+          npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
+          mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
+          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm
+          node --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm esm
+          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
+
+      - name: Test package recovery and lifecycle boundaries
+        run: |
+          node sdk/tests/test-package-resilience.mjs --package /tmp/libfx-package.tgz \
+            --cheap-cycles 100 --tool-workflows 20 --duration-ms 5000 --concurrency 4 \
+            --json-out "${{ runner.temp }}/libfx-package-evidence/resilience.json"
+
+      - name: Install Next fixture package manager
+        run: npm install --global pnpm@11.1.1
+
+      - name: Test installed package through Next
+        env:
+          LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
+        run: |
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --webpack
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --next15
+
+      - name: Retain package qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libfx-next-package-evidence
+          path: |
+            ${{ runner.temp }}/libfx-package-evidence/resilience.json
+            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/*.log
+            ${{ runner.temp }}/libfx-package-evidence/libfx-next-*/results.json
+            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/*.log
+            ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/results.json
+          if-no-files-found: ignore
 
   sdk-browser-wasm:
     name: SDK (Browser + WASM)

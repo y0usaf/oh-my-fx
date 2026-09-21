@@ -107,6 +107,13 @@ pub const RenderRequestState = struct {
     animation_candidate_in_flight: bool = false,
     next_animation_generation: u64 = 1,
     consecutive_input_pending_aborts: u8 = 0,
+    observed_compaction_revision: u64 = 0,
+
+    pub fn observeCompactionRevision(self: *RenderRequestState, revision: u64) void {
+        if (self.observed_compaction_revision == revision) return;
+        self.observed_compaction_revision = revision;
+        self.request(.footer);
+    }
 
     pub fn request(self: *RenderRequestState, reason: Reason) void {
         self.pending_reasons.insert(reason);
@@ -357,6 +364,19 @@ fn reasonsAffectApproval(reasons: ReasonSet) bool {
     relevant.remove(.animation);
     relevant.remove(.notification);
     return relevant.count() > 0;
+}
+
+test "compaction revisions request footer repaint without restarting animation" {
+    var state: RenderRequestState = .{};
+    state.observeCompactionRevision(1);
+    try std.testing.expect(state.hasReason(.footer));
+    state.clearReason(.footer);
+    state.observeCompactionRevision(1);
+    try std.testing.expect(!state.hasPending());
+    state.animation_next_deadline_ms = 100;
+    state.observeCompactionRevision(2);
+    try std.testing.expect(state.hasReason(.footer));
+    try std.testing.expectEqual(@as(i64, 100), state.animation_next_deadline_ms);
 }
 
 test "render request state exposes the transaction operations" {

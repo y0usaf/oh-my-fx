@@ -3,6 +3,7 @@ const host_target = @import("../hosts/target.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const operation_control = @import("operation_control.zig");
 const browser_callback = @import("../auth/browser_callback.zig");
 const secret = @import("../auth/secret.zig");
@@ -46,7 +47,7 @@ pub const Challenge = struct {
             try alloc.dupe(u8, value)
         else
             null;
-        errdefer if (resource_metadata) |value| alloc.free(value);
+        errdefer if (resource_metadata) |value| mem_utils.free(alloc, value);
         return .{
             .resource_metadata = resource_metadata,
             .scope = if (self.scope) |value| try alloc.dupe(u8, value) else null,
@@ -104,13 +105,13 @@ pub const Credentials = struct {
 
     pub fn clone(self: Credentials, alloc: Allocator) !Credentials {
         const endpoint = try alloc.dupe(u8, self.endpoint);
-        errdefer alloc.free(endpoint);
+        errdefer mem_utils.free(alloc, endpoint);
         const resource = try alloc.dupe(u8, self.resource);
-        errdefer alloc.free(resource);
+        errdefer mem_utils.free(alloc, resource);
         const issuer = try alloc.dupe(u8, self.issuer);
-        errdefer alloc.free(issuer);
+        errdefer mem_utils.free(alloc, issuer);
         const client_id = try alloc.dupe(u8, self.client_id);
-        errdefer alloc.free(client_id);
+        errdefer mem_utils.free(alloc, client_id);
         const client_secret = if (self.client_secret) |value|
             try alloc.dupe(u8, value)
         else
@@ -124,15 +125,15 @@ pub const Credentials = struct {
             null;
         errdefer if (refresh_token) |value| secret.zeroAndFree(alloc, value);
         const scope = try alloc.dupe(u8, self.scope);
-        errdefer alloc.free(scope);
+        errdefer mem_utils.free(alloc, scope);
         const token_type = try alloc.dupe(u8, self.token_type);
-        errdefer alloc.free(token_type);
+        errdefer mem_utils.free(alloc, token_type);
         const auth_method = try alloc.dupe(u8, self.token_endpoint_auth_method);
-        errdefer alloc.free(auth_method);
+        errdefer mem_utils.free(alloc, auth_method);
         const authorization_endpoint = try alloc.dupe(u8, self.authorization_endpoint);
-        errdefer alloc.free(authorization_endpoint);
+        errdefer mem_utils.free(alloc, authorization_endpoint);
         const token_endpoint = try alloc.dupe(u8, self.token_endpoint);
-        errdefer alloc.free(token_endpoint);
+        errdefer mem_utils.free(alloc, token_endpoint);
         const revocation_endpoint = if (self.revocation_endpoint) |value|
             try alloc.dupe(u8, value)
         else
@@ -174,7 +175,7 @@ pub const IssuerMismatch = struct {
         returned: []const u8,
     ) !IssuerMismatch {
         const owned_expected = try alloc.dupe(u8, expected);
-        errdefer alloc.free(owned_expected);
+        errdefer mem_utils.free(alloc, owned_expected);
         return .{
             .owner_alloc = alloc,
             .source = source,
@@ -539,7 +540,7 @@ pub fn parseResourceMetadata(
     const object = parsed.value.object;
     const resource = try requiredString(object, "resource");
     const canonical_resource = try canonicalResource(alloc, resource);
-    errdefer alloc.free(canonical_resource);
+    errdefer mem_utils.free(alloc, canonical_resource);
     if (!resourceCoversEndpoint(canonical_resource, expected_resource)) {
         return error.McpAuthResourceMismatch;
     }
@@ -614,13 +615,13 @@ fn parseAuthorizationMetadataOutcome(
         ) };
     }
     const authorization_endpoint = try dupeRequiredUrl(alloc, object, "authorization_endpoint");
-    errdefer alloc.free(authorization_endpoint);
+    errdefer mem_utils.free(alloc, authorization_endpoint);
     const token_endpoint = try dupeRequiredUrl(alloc, object, "token_endpoint");
-    errdefer alloc.free(token_endpoint);
+    errdefer mem_utils.free(alloc, token_endpoint);
     const registration_endpoint = try dupeOptionalUrl(alloc, object, "registration_endpoint");
-    errdefer if (registration_endpoint) |value| alloc.free(value);
+    errdefer if (registration_endpoint) |value| mem_utils.free(alloc, value);
     const revocation_endpoint = try dupeOptionalUrl(alloc, object, "revocation_endpoint");
-    errdefer if (revocation_endpoint) |value| alloc.free(value);
+    errdefer if (revocation_endpoint) |value| mem_utils.free(alloc, value);
     const scopes_supported = try dupeOptionalStringArray(alloc, object, "scopes_supported");
     errdefer freeStrings(alloc, scopes_supported);
     const grant_types_supported = try dupeOptionalStringArray(alloc, object, "grant_types_supported");
@@ -760,20 +761,6 @@ fn encodeBase64UrlNoPad(output: []u8, input: []const u8) []const u8 {
         }
     }
     return output[0..encoded_len];
-}
-
-pub fn generatePkce(
-    verifier_buf: *[64]u8,
-    challenge_buf: *[43]u8,
-    random: std.Random,
-) struct { verifier: []const u8, challenge: []const u8 } {
-    var entropy: [48]u8 = undefined;
-    random.bytes(&entropy);
-    const verifier = encodeBase64UrlNoPad(verifier_buf, &entropy);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
-    const challenge = encodeBase64UrlNoPad(challenge_buf, &digest);
-    return .{ .verifier = verifier, .challenge = challenge };
 }
 
 test "PKCE base64url encoding covers complete and partial groups" {
@@ -933,7 +920,14 @@ fn refreshCredentialsCore(
         auth.headers(),
     );
     defer response.deinit(alloc);
-    if (response.status != .ok) return error.McpRefreshRejected;
+    if (response.status != .ok) {
+        // Only OAuth's terminal grant rejection means re-authenticate; a 429
+        // or 5xx from the token endpoint is transient and retries as-is.
+        if (response.status == .bad_request and try refreshRejectionIsFinal(alloc, response.body)) {
+            return error.McpRefreshRejected;
+        }
+        return error.McpRefreshUnavailable;
+    }
     try validateJsonContentType(response.content_type);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
@@ -945,9 +939,9 @@ fn refreshCredentialsCore(
     const refresh_replacement = try dupeOptionalSecret(alloc, object, "refresh_token");
     errdefer if (refresh_replacement) |value| secret.zeroAndFree(alloc, value);
     const scope_replacement = try dupeOptionalString(alloc, object, "scope");
-    errdefer if (scope_replacement) |value| alloc.free(value);
+    errdefer if (scope_replacement) |value| mem_utils.free(alloc, value);
     const token_type_replacement = try dupeOptionalString(alloc, object, "token_type");
-    errdefer if (token_type_replacement) |value| alloc.free(value);
+    errdefer if (token_type_replacement) |value| mem_utils.free(alloc, value);
     if (token_type_replacement) |value| {
         if (!std.ascii.eqlIgnoreCase(value, "Bearer")) {
             return error.InvalidTokenResponse;
@@ -985,6 +979,15 @@ fn waitForRefreshCancellation(
 
 fn waitForRefreshDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
     try deadline.wait(io_mod.getIo());
+}
+
+/// RFC 6749 §5.2: only invalid_grant marks the grant permanently dead.
+fn refreshRejectionIsFinal(alloc: Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const error_value = parsed.value.object.get("error") orelse return false;
+    return error_value == .string and std.mem.eql(u8, error_value.string, "invalid_grant");
 }
 
 pub fn revokeCredentials(alloc: Allocator, credentials: Credentials) !void {
@@ -1236,12 +1239,12 @@ fn authorizeWithRedirect(
 ) !AuthorizationResult {
     try checkAuthorizationCancellation(options.cancellation());
     const endpoint = try canonicalResource(alloc, options.endpoint);
-    errdefer alloc.free(endpoint);
+    errdefer mem_utils.free(alloc, endpoint);
     var resource = if (options.config.resource) |configured|
         try canonicalResource(alloc, configured)
     else
         try alloc.dupe(u8, endpoint);
-    errdefer alloc.free(resource);
+    errdefer mem_utils.free(alloc, resource);
 
     var prm = try discoverResourceMetadata(
         alloc,
@@ -1357,11 +1360,11 @@ fn authorizeWithRedirect(
     errdefer grant.deinit(alloc);
     try checkAuthorizationCancellation(options.cancellation());
     const owned_issuer = try alloc.dupe(u8, metadata.issuer);
-    errdefer alloc.free(owned_issuer);
+    errdefer mem_utils.free(alloc, owned_issuer);
     const authorization_endpoint = try alloc.dupe(u8, metadata.authorization_endpoint);
-    errdefer alloc.free(authorization_endpoint);
+    errdefer mem_utils.free(alloc, authorization_endpoint);
     const token_endpoint = try alloc.dupe(u8, metadata.token_endpoint);
-    errdefer alloc.free(token_endpoint);
+    errdefer mem_utils.free(alloc, token_endpoint);
     const revocation_endpoint = if (metadata.revocation_endpoint) |value|
         try alloc.dupe(u8, value)
     else
@@ -1629,7 +1632,7 @@ fn resolveClientRegistration(
 ) !ClientRegistration {
     if (config.client_id) |client_id| {
         const owned_client_id = try alloc.dupe(u8, client_id);
-        errdefer alloc.free(owned_client_id);
+        errdefer mem_utils.free(alloc, owned_client_id);
         const client_secret = if (config.client_secret) |value|
             try alloc.dupe(u8, value)
         else
@@ -1652,7 +1655,7 @@ fn resolveClientRegistration(
         if (config.client_metadata_url) |url| {
             try validateOAuthUrlForResource(url, resource);
             const client_id = try alloc.dupe(u8, url);
-            errdefer alloc.free(client_id);
+            errdefer mem_utils.free(alloc, client_id);
             return .{
                 .client_id = client_id,
                 .client_secret = null,
@@ -1698,7 +1701,7 @@ fn resolveClientRegistration(
     if (parsed.value != .object) return error.ClientRegistrationFailed;
     const object = parsed.value.object;
     const client_id = try dupeRequiredSecret(alloc, object, "client_id");
-    errdefer alloc.free(client_id);
+    errdefer mem_utils.free(alloc, client_id);
     const client_secret = try dupeOptionalSecret(alloc, object, "client_secret");
     errdefer if (client_secret) |value| secret.zeroAndFree(alloc, value);
     const returned_method = if (object.get("token_endpoint_auth_method")) |value|
@@ -1723,6 +1726,7 @@ fn chooseTokenEndpointAuthMethod(
     if (has_secret and metadata.supports(.client_secret_basic)) return "client_secret_basic";
     if (has_secret and metadata.supports(.client_secret_post)) return "client_secret_post";
     if (metadata.supports(.none)) return "none";
+    if (!has_secret and metadata.supports(.s256)) return "none";
     if (metadata.supports(.client_secret_basic)) return "client_secret_basic";
     if (metadata.supports(.client_secret_post)) return "client_secret_post";
     return error.UnsupportedTokenEndpointAuthenticationMethod;
@@ -1892,7 +1896,7 @@ fn exchangeAuthorizationCode(
     const refresh_token = try dupeOptionalSecret(alloc, object, "refresh_token");
     errdefer if (refresh_token) |value| secret.zeroAndFree(alloc, value);
     const token_type = try dupeOptionalStringDefault(alloc, object, "token_type", "Bearer");
-    errdefer alloc.free(token_type);
+    errdefer mem_utils.free(alloc, token_type);
     if (!std.ascii.eqlIgnoreCase(token_type, "Bearer")) return error.InvalidTokenResponse;
     const scope = try dupeOptionalStringDefault(
         alloc,
@@ -1900,11 +1904,11 @@ fn exchangeAuthorizationCode(
         "scope",
         requested_scope orelse "",
     );
-    errdefer alloc.free(scope);
+    errdefer mem_utils.free(alloc, scope);
     const expires_at_ms = try tokenExpiresAt(object, io_mod.milliTimestamp());
 
     const client_id = try alloc.dupe(u8, registration.client_id);
-    errdefer alloc.free(client_id);
+    errdefer mem_utils.free(alloc, client_id);
     const client_secret = if (registration.client_secret) |value|
         try alloc.dupe(u8, value)
     else
@@ -1914,7 +1918,7 @@ fn exchangeAuthorizationCode(
         u8,
         registration.token_endpoint_auth_method,
     );
-    errdefer alloc.free(auth_method);
+    errdefer mem_utils.free(alloc, auth_method);
     return .{
         .client_id = client_id,
         .client_secret = client_secret,
@@ -2044,7 +2048,7 @@ fn request(
         try alloc.dupe(u8, value)
     else
         null;
-    errdefer if (response_content_type) |value| alloc.free(value);
+    errdefer if (response_content_type) |value| mem_utils.free(alloc, value);
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
     const body = reader.allocRemaining(
@@ -2276,7 +2280,7 @@ fn dupeOptionalStringArrayDefault(
 ) ![][]u8 {
     const value = object.get(key) orelse {
         const result = try alloc.alloc([]u8, 1);
-        errdefer alloc.free(result);
+        errdefer mem_utils.free(alloc, result);
         result[0] = try alloc.dupe(u8, default_value);
         return result;
     };
@@ -2287,9 +2291,9 @@ fn dupeStringArray(alloc: Allocator, value: std.json.Value) ![][]u8 {
     if (value != .array) return error.InvalidMetadataField;
     if (value.array.items.len == 0) return &.{};
     const result = try alloc.alloc([]u8, value.array.items.len);
-    errdefer alloc.free(result);
+    errdefer mem_utils.free(alloc, result);
     var initialized: usize = 0;
-    errdefer for (result[0..initialized]) |item| alloc.free(item);
+    errdefer for (result[0..initialized]) |item| mem_utils.free(alloc, item);
     for (value.array.items, 0..) |item, index| {
         if (item != .string or item.string.len == 0) return error.InvalidMetadataField;
         result[index] = try alloc.dupe(u8, item.string);
@@ -2541,6 +2545,25 @@ test "authorization metadata defaults omitted token endpoint authentication to c
     try std.testing.expectEqualStrings(
         "client_secret_basic",
         try chooseTokenEndpointAuthMethod(metadata, false),
+    );
+}
+
+test "authorization metadata chooses none for secretless clients when S256 PKCE is supported" {
+    const alloc = std.testing.allocator;
+    var metadata = try parseAuthorizationMetadata(
+        alloc,
+        "{\"issuer\":\"https://mcp.slack.com\",\"authorization_endpoint\":\"https://slack.com/oauth/v2_user/authorize\",\"token_endpoint\":\"https://slack.com/api/oauth.v2.user.access\",\"token_endpoint_auth_methods_supported\":[\"client_secret_post\"],\"code_challenge_methods_supported\":[\"S256\"]}",
+        "https://mcp.slack.com",
+    );
+    defer metadata.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "none",
+        try chooseTokenEndpointAuthMethod(metadata, false),
+    );
+    try std.testing.expectEqualStrings(
+        "client_secret_post",
+        try chooseTokenEndpointAuthMethod(metadata, true),
     );
 }
 
@@ -2894,4 +2917,12 @@ test "interactive callback wait observes caller and lifecycle cancellation" {
         );
         try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
     }
+}
+
+test "refresh rejection is final only for invalid_grant" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try refreshRejectionIsFinal(alloc, "{\"error\":\"invalid_grant\"}"));
+    try std.testing.expect(!(try refreshRejectionIsFinal(alloc, "{\"error\":\"temporarily_unavailable\"}")));
+    try std.testing.expect(!(try refreshRejectionIsFinal(alloc, "<html>502</html>")));
+    try std.testing.expect(!(try refreshRejectionIsFinal(alloc, "{}")));
 }

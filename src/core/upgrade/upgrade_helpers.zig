@@ -68,10 +68,10 @@ fn platformFromTarget() ?[]const u8 {
     return null;
 }
 
-pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Target {
+pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, control: TransferControl) !Target {
     return switch (channel) {
         .stable => blk: {
-            const latest = try fetchLatestVersion(alloc, base_url);
+            const latest = try fetchLatestVersion(alloc, base_url, control);
             defer alloc.free(latest);
             break :blk Target.initStable(alloc, latest) catch return error.FetchFailed;
         },
@@ -88,6 +88,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Ta
                 alloc,
                 url,
                 update_target.max_manifest_bytes,
+                control,
             );
             defer alloc.free(manifest);
             break :blk Target.parseDevManifest(alloc, manifest) catch return error.FetchFailed;
@@ -95,7 +96,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Ta
     };
 }
 
-fn fetchLatestVersion(alloc: Allocator, base_url: []const u8) ![]u8 {
+fn fetchLatestVersion(alloc: Allocator, base_url: []const u8, control: TransferControl) ![]u8 {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
     const url = if (isLoopbackE2eUpgradeBase(base_url))
@@ -109,6 +110,7 @@ fn fetchLatestVersion(alloc: Allocator, base_url: []const u8) ![]u8 {
         alloc,
         url,
         latest_version_max_bytes,
+        control,
     );
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == raw.len) return raw;
@@ -139,18 +141,126 @@ pub fn artifactUrl(alloc: Allocator, base_url: []const u8, target: Target, suffi
     return std.fmt.allocPrint(alloc, "{s}/download/{s}/fx-{s}.tar.gz{s}", .{ base_url, release_tag, platform, suffix });
 }
 
+pub fn cancelRequested(cancel: ?*const std.atomic.Value(bool)) bool {
+    return if (cancel) |flag| flag.load(.acquire) else false;
+}
+
+/// Lets one thread interrupt another thread's blocking transfer read. The
+/// transfer publishes its socket before first use and clears it before the
+/// socket can be closed, both under the mutex, so interrupt() always acts on
+/// a live socket or none at all.
+pub const TransferInterrupt = struct {
+    mutex: std.Io.Mutex = .init,
+    handle: ?std.Io.net.Socket.Handle = null,
+
+    pub fn publish(self: *TransferInterrupt, handle: std.Io.net.Socket.Handle) void {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        self.handle = handle;
+    }
+
+    pub fn clear(self: *TransferInterrupt) void {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        self.handle = null;
+    }
+
+    pub fn interrupt(self: *TransferInterrupt) void {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        const handle = self.handle orelse return;
+        zio.vtable.netShutdown(zio.userdata, handle, .both) catch {};
+    }
+};
+
+pub const TransferControl = struct {
+    cancel: ?*const std.atomic.Value(bool) = null,
+    interrupt: ?*TransferInterrupt = null,
+};
+
+fn controlCancelled(control: TransferControl) bool {
+    return cancelRequested(control.cancel);
+}
+
+/// Registers the request socket with the interrupt slot; the matching clear
+/// runs before the request (and its connection) can be torn down.
+fn publishConnection(
+    control: TransferControl,
+    req: *std.http.Client.Request,
+) void {
+    const slot = control.interrupt orelse return;
+    const conn = req.connection orelse return;
+    slot.publish(conn.stream_writer.stream.socket.handle);
+}
+
+fn clearConnection(control: TransferControl) void {
+    const slot = control.interrupt orelse return;
+    slot.clear();
+}
+
+test "transfer interrupt wakes a blocked socket read" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const zio = io_mod.getIo();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(zio, .{});
+    defer server.deinit(zio);
+
+    const Ctx = struct {
+        server: *std.Io.net.Server,
+        slot: *TransferInterrupt,
+        woke_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    };
+    var slot: TransferInterrupt = .{};
+    var ctx: Ctx = .{ .server = &server, .slot = &slot };
+    const reader = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Ctx) void {
+            const z = io_mod.getIo();
+            const conn = c.server.accept(z) catch return;
+            defer conn.close(z);
+            c.slot.publish(conn.socket.handle);
+            defer c.slot.clear();
+            var buf: [16]u8 = undefined;
+            var stream_reader = conn.reader(z, &buf);
+            // Blocks until the interrupt shuts the socket down.
+            _ = stream_reader.interface.takeByte() catch {};
+            c.woke_ms.store(io_mod.milliTimestamp(), .release);
+        }
+    }.run, .{&ctx});
+
+    const client = try server.socket.address.connect(zio, .{ .mode = .stream });
+    defer client.close(zio);
+
+    const started_ms = io_mod.milliTimestamp();
+    io_mod.sleep(100 * std.time.ns_per_ms);
+    slot.interrupt();
+    reader.join();
+    const woke_ms = ctx.woke_ms.load(.acquire);
+    try std.testing.expect(woke_ms != 0);
+    try std.testing.expect(woke_ms - started_ms < 2000);
+
+    // Interrupting an idle slot is a no-op.
+    slot.interrupt();
+}
+
 fn fetchTextBounded(
     client: *std.http.Client,
     alloc: Allocator,
     url: []const u8,
     max_bytes: usize,
+    control: TransferControl,
 ) ![]u8 {
+    if (controlCancelled(control)) return error.Cancelled;
     const uri = std.Uri.parse(url) catch return error.FetchFailed;
 
     var req = client.request(.GET, uri, .{}) catch return error.FetchFailed;
     defer req.deinit();
 
     if (req.connection) |conn| setRecvTimeout(conn);
+    publishConnection(control, &req);
+    defer clearConnection(control);
     req.sendBodiless() catch return error.FetchFailed;
 
     var redirect_buf: [8192]u8 = undefined;
@@ -167,6 +277,7 @@ fn fetchTextBounded(
     const body_reader = response.reader(&transfer_buf);
     var chunk: [1024]u8 = undefined;
     while (true) {
+        if (controlCancelled(control)) return error.Cancelled;
         const n = body_reader.readSliceShort(&chunk) catch return error.FetchFailed;
         if (n == 0) break;
         if (n > max_bytes -| out.writer.buffered().len) return error.FetchFailed;
@@ -181,11 +292,12 @@ pub const DownloadProgress = struct {
     update: *const fn (*anyopaque, u64, ?u64) void,
 };
 
-pub fn downloadFileStreaming(client: *std.http.Client, url: []const u8, dest_path: []const u8) !void {
-    return downloadFileStreamingWithProgress(client, url, dest_path, null);
+pub fn downloadFileStreaming(client: *std.http.Client, url: []const u8, dest_path: []const u8, control: TransferControl) !void {
+    return downloadFileStreamingWithProgress(client, url, dest_path, null, control);
 }
 
-pub fn downloadFileStreamingWithProgress(client: *std.http.Client, url: []const u8, dest_path: []const u8, progress: ?DownloadProgress) !void {
+pub fn downloadFileStreamingWithProgress(client: *std.http.Client, url: []const u8, dest_path: []const u8, progress: ?DownloadProgress, control: TransferControl) !void {
+    if (controlCancelled(control)) return error.Cancelled;
     var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), dest_path, .{}) catch return error.DownloadFailed;
     defer file.close(io_mod.getIo());
 
@@ -197,6 +309,8 @@ pub fn downloadFileStreamingWithProgress(client: *std.http.Client, url: []const 
     defer req.deinit();
 
     if (req.connection) |conn| setRecvTimeout(conn);
+    publishConnection(control, &req);
+    defer clearConnection(control);
     req.sendBodiless() catch return error.DownloadFailed;
 
     var redirect_buf: [8192]u8 = undefined;
@@ -211,6 +325,7 @@ pub fn downloadFileStreamingWithProgress(client: *std.http.Client, url: []const 
     var copy_buf: [64 * 1024]u8 = undefined;
     var downloaded: u64 = 0;
     while (true) {
+        if (controlCancelled(control)) return error.Cancelled;
         const n = body_reader.readSliceShort(&copy_buf) catch return error.DownloadFailed;
         if (n == 0) break;
         file_writer.interface.writeAll(copy_buf[0..n]) catch return error.DownloadFailed;
@@ -221,13 +336,17 @@ pub fn downloadFileStreamingWithProgress(client: *std.http.Client, url: []const 
     file_writer.interface.flush() catch return error.DownloadFailed;
 }
 
-pub fn verifyChecksum(client: *std.http.Client, file_path: []const u8, checksum_url: []const u8) !void {
+pub fn verifyChecksum(client: *std.http.Client, file_path: []const u8, checksum_url: []const u8, control: TransferControl) !void {
     const raw = fetchTextBounded(
         client,
         client.allocator,
         checksum_url,
         checksum_max_bytes,
-    ) catch return error.ChecksumFetchFailed;
+        control,
+    ) catch |err| return switch (err) {
+        error.Cancelled => error.Cancelled,
+        else => error.ChecksumFetchFailed,
+    };
     defer client.allocator.free(raw);
 
     const expected_hex = extractChecksumHex(raw) orelse return error.ChecksumMismatch;

@@ -258,11 +258,11 @@ test "skill search ranks metadata and returns final-projection-stable JSON" {
     try std.testing.expectEqualStrings(output, projected_again);
 }
 
-test "skill search omits projected identities and permits redacted descriptions" {
+test "skill search preserves projected identities and verbatim descriptions" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{
-        .{ .name = "unsafe-location", .description = "Review files", .path = "/skills/TOKEN=runtime-location-secret/SKILL.md", .source = .workspace_fx },
-        .{ .name = "safe", .description = "API_KEY=runtime-description-secret", .path = "/skills/safe/SKILL.md", .source = .workspace_fx },
+        .{ .name = "unsafe-location", .description = "Review files", .path = "/skills/TOKEN=path-secret-value", .source = .workspace_fx },
+        .{ .name = "safe", .description = "API_KEY=description-secret-value", .path = "/skills/safe/SKILL.md", .source = .workspace_fx },
     };
     const query = try lexical_relevance.prepare("");
     const output = try renderProjectedSearch(
@@ -273,10 +273,10 @@ test "skill search omits projected identities and permits redacted descriptions"
         4096,
     );
     defer alloc.free(output);
-    try std.testing.expect(std.mem.find(u8, output, "unsafe-location") == null);
+    try std.testing.expect(std.mem.find(u8, output, "unsafe-location") != null);
     try std.testing.expect(std.mem.find(u8, output, "\"name\":\"safe\"") != null);
-    try std.testing.expect(std.mem.find(u8, output, "API_KEY=[redacted]") != null);
-    try std.testing.expect(std.mem.find(u8, output, "\"count\":1") != null);
+    try std.testing.expect(std.mem.find(u8, output, "API_KEY=description-secret-value") != null);
+    try std.testing.expect(std.mem.find(u8, output, "\"count\":2") != null);
     try std.testing.expect(std.mem.find(u8, output, "\"more_available\":false") != null);
 }
 

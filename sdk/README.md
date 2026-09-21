@@ -1,8 +1,8 @@
 # libfx
 
 `libfx` is the small fx agent kernel for JavaScript hosts. One agent is one
-in-memory conversation with three operations: `prompt`, `checkpoint`, and
-`close`.
+in-memory conversation with `prompt`, `checkpoint`, and `close` operations,
+plus mid-turn steering on each running turn.
 
 ```sh
 npm install libfx
@@ -21,6 +21,9 @@ import { createFxAgent } from "libfx";
 const agent = await createFxAgent({
   apiKey: process.env.AI_GATEWAY_API_KEY,
   model: "google/gemini-2.5-flash-lite",
+  onEvent(event) {
+    if (event.type === "transport.response") console.log(event.elapsedMs);
+  },
 });
 
 const turn = agent.prompt("Explain this project.");
@@ -38,25 +41,146 @@ await agent.close();
 Agent configuration uses named options; `env` is reserved for
 `createFxTerminal()`.
 
-`prompt(input, { signal? })` accepts a string or text/resource blocks. It
-returns an async iterable of normalized events:
+`effort` sets the reasoning effort for models that advertise effort levels. It
+uses the same vocabulary as the fx CLI's `--effort` flag: `"default"` leaves
+the choice to the model, and named levels such as `"low"`, `"medium"`,
+`"high"`, or `"xhigh"` request a specific level. A named level is validated
+against the selected model's advertised levels at creation; an unsupported
+level rejects with an error (code `LIBFX_UNSUPPORTED_EFFORT`) naming the
+supported set. When `effort` is omitted or `"default"`, the model default
+applies.
+
+`fast` enables the fast lane for models that advertise one, matching the fx
+CLI's `--fast` flag. Enabling it is validated against the selected model at
+creation; a model without a fast path rejects with an error (code
+`LIBFX_UNSUPPORTED_FAST`). When `fast` is omitted or `false`, the model
+default applies.
+
+The host selects the model. Agent creation does not fetch the Gateway model
+catalog unless `effort` requests a named level or `fast` is enabled. Prompting
+can resolve model capabilities and context capacity through the supplied
+`fetch`; fx caches that metadata for the agent.
+
+`onEvent` receives runtime diagnostics separately from model output. Transport
+events report request start, response status and elapsed time, safe Gateway
+request metadata, failures, and throttled `transport.activity` liveness while a
+response body is streaming. Activity events include the attempt, current chunk
+bytes, and cumulative response bytes. They call the host directly at most once
+per 250 ms rather than entering the normalized turn queue, so an unread turn
+cannot accumulate heartbeat events. Credentials and raw headers are never
+included.
+
+libfx makes at most one automatic retry after a retryable transport failure and
+only before model output or tool effects escape. Cancellation prevents a retry.
+
+`prompt(input, { signal? })` accepts a string or text, image, and resource
+blocks. It returns an async iterable of normalized events:
 
 - `text_delta`
 - `reasoning_delta` when supplied by the provider
-- `tool_start`
+- `tool_start` with `id`, `name`, and the tool's `input` object. Inputs over
+  64 KiB of JSON arrive as an `inputPreview` string prefix plus
+  `inputTruncated: true` instead; the tool still receives complete arguments.
 - `tool_end`
+- `user_message` with `text` when accepted mid-turn steering enters the turn
 
-Only one prompt may run at a time. `checkpoint()` is idle-only and returns
-opaque, bounded, versioned bytes. Restore them only when creating a fresh
-agent:
+Consume the turn while it runs, then await `turn.result`. Streamed text and
+tool results are lossless and backpressured: a slow reader pauses production
+instead of growing an unlimited event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
+If you only need the result, explicitly discard events:
+
+```js
+const turn = agent.prompt("Update the index.");
+for await (const _ of turn) {}
+const result = await turn.result;
+```
+
+A turn has one event consumer. Breaking out of its iterator cancels the turn;
+`turn.cancel()` and `agent.close()` also release blocked output. Transport or
+message-decoding failures reject the result instead of returning success with
+missing text.
+
+Native transport buffers at most 8 MiB of output bytes. Unread SDK events apply
+backpressure at 1 MiB of encoded messages or 256 events. One message can exceed
+that threshold when the queue is empty; an individual encoded ACP message is
+limited to 64 MiB on both backends. These are transport bounds, not a total
+answer-size limit or a bound on retained conversation history.
+
+Image blocks use ACP's content shape and carry canonical base64 (no line
+wrapping) of a PNG, JPEG, GIF, or WebP payload:
+
+```js
+const turn = agent.prompt([
+  { type: "text", text: "What does this screenshot show?" },
+  { type: "image", data: base64Png, mimeType: "image/png" },
+]);
+```
+
+A prompt may contain up to 8 images, each with up to 5 MiB of base64 data,
+with at most 8 MiB of image data per prompt; the SDK rejects larger input with
+typed `RangeError`s before any request. The kernel then validates the decoded
+bytes against the declared `mimeType` and fails the turn with
+`Invalid image prompt block` on a mismatch. Images are routed only to models
+that advertise image input; for any other model the turn fails with
+`Image prompts are unavailable for the selected model` and no image bytes
+leave the process. Prompt images are retained in checkpoints within the
+existing 4 MiB checkpoint bound, so a restored agent can refer to earlier
+images on either backend.
+
+Only one top-level prompt may run at a time. While it runs,
+`await turn.steer(text)` appends guidance at the next safe model boundary
+without discarding the in-flight response or completed tool work. Steering also
+accepts an array of text blocks; image and resource steering blocks are rejected.
+Each message is limited to 64 KiB, with at most 64 queued messages and 1 MiB of
+queued steering text. Accepted steering appears as a `user_message` event before
+the model's continued output. Calling `steer()` after the turn settles rejects
+with `no prompt is running`.
+
+```js
+const turn = agent.prompt("Build the feature.");
+for await (const event of turn) {
+  if (event.type === "tool_end" && event.name === "read_file") {
+    await turn.steer("Keep the public API backward compatible.");
+  }
+}
+```
+
+Cancelling a steered turn drops any guidance that has not reached a safe
+boundary and releases its queue. Applied guidance is part of the same history
+turn, so an idle `checkpoint()` includes the full steered conversation.
+`checkpoint()` returns opaque, bounded, versioned bytes. Restore them only when
+creating a fresh agent:
 
 ```js
 const restored = await createFxAgent({ apiKey, model, checkpoint });
 ```
 
+An already-aborted prompt signal returns `cancelled` without a model request
+or a history change. The next prompt can run normally.
+
 The checkpoint contains conversation history and usage only. The host owns
 durable storage and must resupply models, credentials, instructions, tools,
-MCP clients, and skill records.
+MCP clients, and skill records. Reasoning effort and fast mode are
+agent-creation options and are not stored in a checkpoint: recreate the agent
+with new `effort` or `fast` values to change them, the same path as switching
+models.
+
+## Models
+
+Model discovery is explicit and does not create an Agent or load native or Wasm
+artifacts:
+
+```js
+import { listModels } from "libfx";
+
+const models = await listModels({
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+});
+```
+
+`listModels()` performs one bounded Gateway request and returns sorted, unique
+language-model IDs. It accepts the same optional `fetch` override as the Agent
+API.
 
 ## JavaScript tools and instructions
 
@@ -80,15 +204,56 @@ const agent = await createFxAgent({
 });
 ```
 
-The JavaScript host is the authority for tool effects. The same descriptors,
-schemas, cancellation, results, and events are used by N-API and WebAssembly.
+Gateway web search can run at the provider instead of in the JavaScript host.
+Mark its canonical tool name with `providerExecuted: true` and omit `execute`:
+
+```js
+const agent = await createFxAgent({
+  apiKey,
+  tools: [{ name: "web_search", providerExecuted: true }],
+});
+```
+
+The kernel supplies the canonical schema and Gateway advertisement. Currently
+`web_search` is the supported provider-executed descriptor; unknown or local
+names reject agent creation. Provider-executed tools do not
+call host code or require a separate provider key; their `tool_start` and
+`tool_end` events, results, and checkpoint history use the same turn contract.
+Their built-in permission policy is enforced when the request is projected, as
+there is no local call-time effect to approve.
+
+For ordinary tools, the JavaScript host is the authority for effects. The same
+descriptors, schemas, cancellation, results, and events are used by N-API and
+WebAssembly.
+Cancelling a prompt aborts its tools' signals and stops waiting for their
+callbacks. Late results and rejections are ignored. Tools remain responsible
+for stopping their own work when their signal is aborted.
+
+A host tool may use any name, including the kernel's builtin names such as
+`write_file` and `edit_file`: the kernel routes by the registered executor, so
+a host-defined `write_file` calls the host's `execute()` rather than the
+builtin file mutation.
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
-the MCP and skills adapters.
+the MCP and skills adapters. They are the complete host-owned system context:
+libfx adds no hidden base prompt, and omitting `instructions` sends no system
+message.
 
 ## MCP
 
 `libfx/mcp` accepts a host-owned MCP client. Transport, authentication,
-elicitation, and cleanup remain outside the kernel.
+elicitation, and cleanup remain outside the kernel. The client uses the MCP
+TypeScript SDK v1 signature: `callTool(params, resultSchema?, options?)`, with
+cancellation passed in `options`. Tool text and structured data
+reach the model together. PNG, JPEG, GIF, and WebP tool images reach models that
+advertise image input support; other models receive an explicit omission notice.
+Images are retained in checkpoints within the existing checkpoint size limit.
+Each image may contain up to 5 MiB of base64 data, with at most eight images and
+an 8 MiB result frame. Ordinary host tool objects remain JSON text. Resource and
+prompt options supply text instructions; non-text context has an omission notice.
+Tool catalogs are paginated up to the existing 64-tool bound. Tool names are
+normalized for model APIs, with collisions kept distinct and original names used
+for calls to the MCP client. Each tool description and JSON schema may contain up
+to 64 KiB, within the control message's 8 MiB limit.
 
 ```js
 import { createMcpAdapter } from "libfx/mcp";
@@ -133,13 +298,108 @@ await createFxAgent({ apiKey, backend: "native" }); // require N-API
 await createFxAgent({ apiKey, backend: "wasm" });   // require Wasm + JSPI
 ```
 
-Within one JavaScript realm, libfx compiles each stable Wasm source once and
+CommonJS applications can load the same Node API with `require("libfx")`. The
+package chooses its generated CommonJS entry automatically and keeps asset
+paths relative to the installed package.
+
+Use `getBackendInfo()` to inspect backend availability without creating an
+Agent or terminal:
+
+```js
+import { getBackendInfo } from "libfx";
+
+const info = await getBackendInfo({ surface: "agent", backend: "auto" });
+// {
+//   surface: "agent",
+//   backend: "native" | "wasm-jspi" | "unavailable",
+//   attempts: [{ backend, available, reason }]
+// }
+```
+
+`surface` is `agent` by default and may also be `terminal`. `backend` has the
+same `auto`, `native`, and `wasm` selection as the factories. `nativeAddon` and
+`wasm` select explicit assets with the same meanings as their factory options.
+The probe loads and validates the native module or compiles the selected Wasm
+asset, then stops. It does not create a core, open a runtime socket, read
+credentials, start a model request, or write session state. A remote Wasm
+source can perform its normal asset fetch.
+
+Expected environmental failures resolve as structured attempts. Invalid
+options reject with `TypeError`. The stable reason codes are:
+
+| Code | Meaning |
+| --- | --- |
+| `LIBFX_UNSUPPORTED_PLATFORM` | No packaged native addon supports the current platform and architecture. |
+| `LIBFX_NATIVE_ARTIFACT_MISSING` | The selected native addon file is absent. |
+| `LIBFX_NATIVE_LOAD_FAILED` | Node could not load the selected native addon. |
+| `LIBFX_NATIVE_API_MISMATCH` | The addon API version is incompatible. |
+| `LIBFX_NATIVE_SURFACE_MISSING` | The addon does not implement the selected Agent or terminal surface. |
+| `LIBFX_NATIVE_DISABLED` | `nativeAddon: false` disabled native loading. |
+| `LIBFX_JSPI_UNAVAILABLE` | The current JavaScript runtime does not provide JSPI. |
+| `LIBFX_WASM_LOAD_FAILED` | The selected Wasm asset could not be loaded or compiled. |
+
+The optional `causeCode` field retains a Node error code such as `ENOENT` or
+`ERR_DLOPEN_FAILED` when one exists. Probe success establishes backend loading
+only; it does not validate credentials, a future Agent initialization, or a
+model request.
+
+Within one loaded SDK module, libfx compiles each stable Wasm source once and
 creates a separate WebAssembly instance for every Agent. Agent memory, history,
 tools, cancellation, and shutdown remain isolated. Workers and separate
-processes maintain their own module caches.
+processes maintain their own module caches, as do the ESM and CommonJS entries.
+
+Node factories and `getBackendInfo()` also accept a `wasm` Promise resolving
+to an HTTP(S) URL string, a `Response`, Wasm bytes, or a compiled
+`WebAssembly.Module`. Asset resolver failures propagate from factories and
+appear as `LIBFX_WASM_LOAD_FAILED` in diagnostics.
 
 Node.js 20+ is supported. Browser WebAssembly requires a JSPI-capable browser.
+The Linux x64 and arm64 native addons require glibc 2.34 or newer. Native
+agents do not require JSPI or experimental Node flags.
 Some Node versions require `--experimental-wasm-jspi`.
+Bun 1.4.2 is the tested recommendation for Bun's WebAssembly backend.
+Bun 1.3.14 can crash when a hot WebAssembly loop resumes through JSPI during
+JIT tier-up.
+
+### Next.js and Vercel
+
+Create agents in a server route using the Node.js runtime. Import `libfx`
+normally; the package includes its native assets and exposes both ESM and
+CommonJS Node entrypoints. Native agents support Next.js 15 with webpack and
+Next.js 16 with webpack or Turbopack, without `serverExternalPackages` or manual
+native-file inclusion. Webpack's emitted assets are resolved relative to the
+server bundle, including standalone builds with a custom `distDir` or `assetPrefix`.
+
+This native setup does not require JSPI. Explicit WebAssembly use still needs
+JSPI and available Wasm assets; Next.js's standalone tracer excludes `.wasm`
+files, so a standalone Wasm host must supply those assets separately.
+
+```js
+import { createFxAgent } from "libfx";
+
+export const runtime = "nodejs";
+
+export async function POST(request) {
+  const { prompt } = await request.json();
+  const agent = await createFxAgent({ apiKey: process.env.AI_GATEWAY_API_KEY });
+  try {
+    let text = "";
+    const turn = agent.prompt(prompt, { signal: request.signal });
+    for await (const event of turn) {
+      if (event.type === "text_delta") text += event.delta;
+    }
+    await turn.result;
+    return Response.json({ text });
+  } finally {
+    await agent.close();
+  }
+}
+```
+
+Use the application's normal authentication and request limits around the
+route. JavaScript tools and MCP clients remain host-owned and must be supplied
+when creating an agent, including after checkpoint restoration. The native
+backend does not enable the CLI's built-in shell or filesystem tools.
 
 ## Interactive terminal
 
@@ -157,9 +417,25 @@ const runtime = await createFxTerminal({
 await runtime.interactive;
 ```
 
+The xterm adapter preserves browser-style composer editing for Shift+Enter,
+Command+A, Command+C, Command+X, Command+Z, and Command+Shift+Z. Shift+Enter
+inserts a newline without submitting. A click inside the visible composer moves
+its caret; pointer drags remain xterm terminal-output selections.
+When xterm already has an output selection, Command+C copies that selection
+instead of the composer selection.
+
 The terminal runtime exposes `interactive`, `exited`, `write`, `resize`, and
-`abort`. Terminal session, config, OAuth, prompt-history, URL, and workspace
-stores remain terminal-only host integrations.
+`abort`. Terminal session, config, OAuth, prompt-history, clipboard, URL, and
+workspace stores remain terminal-only host integrations. Clipboard copy writes
+through the host `clipboard.writeText(text)` adapter and defaults to
+`navigator.clipboard`.
+
+During `/compact` and automatic compaction, the terminal shows a live
+`Compacting` activity row with elapsed time. Input and cancellation remain
+responsive while the summary request is pending. Compaction progress and
+outcomes do not add transcript entries, including cancellation after resume.
+Stored snapshots retain cancellation-origin metadata; keep them opaque and
+resume with the same or a newer SDK build. Older snapshots remain readable.
 
 ## Security
 

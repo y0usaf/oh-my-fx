@@ -39,7 +39,7 @@ pub const Config = struct {
     gateway_team: ?[]const u8 = null,
     worker_model: []const u8 = "",
     gateway_retry_count: usize = 3,
-    gateway_chat_url: []const u8 = "https://ai-gateway.vercel.sh/v3/ai/language-model",
+    gateway_chat_url: []const u8 = "https://ai-gateway.vercel.sh/v4/ai/language-model",
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
 };

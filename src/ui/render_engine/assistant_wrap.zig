@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_checkpoint = @import("build_checkpoint.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const assistant_pacer = @import("../assistant/pacer.zig");
 
 const Allocator = std.mem.Allocator;
@@ -13,6 +14,7 @@ pub const literal_command_zero_width_row_byte_limit: usize = 256;
 const WordBreak = struct {
     start: usize,
     end: usize,
+    source_end: usize,
     sgr: assistant_pacer.SgrState,
     hyperlink: ?[]const u8,
     has_preceding_word: bool,
@@ -29,6 +31,7 @@ const WordBreaks = struct {
         if (self.last) |*last| {
             if (last.end == word_break.start) {
                 last.end = word_break.end;
+                last.source_end = word_break.source_end;
                 return;
             }
             self.previous = last.*;
@@ -56,7 +59,7 @@ const AssistantContinuation = union(enum) {
 /// Pre-existing hard newlines in `text` are honoured. The returned slice is
 /// owned by the caller and freed with `alloc`.
 pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
-    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null, null);
+    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null, null, null);
 }
 
 fn wrapAssistantTextWithBaseGutter(
@@ -68,6 +71,7 @@ fn wrapAssistantTextWithBaseGutter(
     literal_command: bool,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
     finalized_prefix_bytes: ?*usize,
+    source_map: ?*RetentionSourceMap,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -96,6 +100,7 @@ fn wrapAssistantTextWithBaseGutter(
         return out.toOwnedSlice(alloc);
     }
 
+    if (source_map) |map| try map.rows.append(alloc, 0);
     var sgr: assistant_pacer.SgrState = .{};
     var hyperlink: ?[]const u8 = null;
     const content_cols = cols -| base_gutter;
@@ -115,6 +120,7 @@ fn wrapAssistantTextWithBaseGutter(
             }
         }
 
+        if (source_map) |map| try map.record(alloc, i, out.items.len);
         const ch = text[i];
 
         if (ch == 0x1b) {
@@ -143,6 +149,7 @@ fn wrapAssistantTextWithBaseGutter(
             try out.append(alloc, ch);
             col = base_gutter + 1;
             i += 1;
+            if (ch == '\n') if (source_map) |map| try map.rows.append(alloc, i);
             if (finalized_prefix_bytes) |bytes| {
                 if (i == finalized_source_end) bytes.* = out.items.len;
             }
@@ -192,11 +199,13 @@ fn wrapAssistantTextWithBaseGutter(
                 has_word_on_row = false;
                 row_has_content = true;
                 zero_width_run_bytes = 0;
+                if (source_map) |map| try map.rows.append(alloc, i);
             }
             if (base_gutter > 0 and !row_has_content) {
                 try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal_command);
                 row_has_content = true;
             }
+            if (source_map) |map| try map.record(alloc, i, out.items.len);
             try out.appendSlice(alloc, text[i .. i + unit.byte_len]);
             if (literal_command) zero_width_run_bytes += unit.byte_len;
             i += unit.byte_len;
@@ -225,12 +234,14 @@ fn wrapAssistantTextWithBaseGutter(
                         base_gutter,
                         next_width,
                         literal_command,
+                        source_map,
                     )) |reflowed_col| {
                         col = reflowed_col;
                         word_breaks = .{};
                         has_word_on_row = true;
                         row_has_content = true;
                         moved_for_orphan = true;
+                        if (source_map) |map| try map.rows.append(alloc, word_break.source_end);
                     }
                 }
             }
@@ -250,6 +261,7 @@ fn wrapAssistantTextWithBaseGutter(
                 has_word_on_row = false;
                 row_has_content = true;
                 i += unit.byte_len;
+                if (source_map) |map| try map.rows.append(alloc, i);
                 continue;
             }
         }
@@ -275,10 +287,12 @@ fn wrapAssistantTextWithBaseGutter(
                     base_gutter,
                     w,
                     literal_command,
+                    source_map,
                 )) |reflowed_col| {
                     col = reflowed_col;
                     word_breaks = .{};
                     row_has_content = true;
+                    if (source_map) |map| try map.rows.append(alloc, break_to_use.source_end);
                 }
             }
         }
@@ -298,6 +312,7 @@ fn wrapAssistantTextWithBaseGutter(
             word_breaks = .{};
             has_word_on_row = false;
             row_has_content = true;
+            if (source_map) |map| try map.rows.append(alloc, i);
         }
 
         if (base_gutter > 0 and !row_has_content) {
@@ -305,6 +320,7 @@ fn wrapAssistantTextWithBaseGutter(
             row_has_content = true;
         }
 
+        if (source_map) |map| try map.record(alloc, i, out.items.len);
         const space_start = out.items.len;
         if (replace_wide_unit) {
             try out.append(alloc, '?');
@@ -316,6 +332,7 @@ fn wrapAssistantTextWithBaseGutter(
             word_breaks.record(.{
                 .start = space_start,
                 .end = out.items.len,
+                .source_end = i + unit.byte_len,
                 .sgr = sgr,
                 .hyperlink = hyperlink,
                 .has_preceding_word = word_breaks.last != null,
@@ -326,6 +343,7 @@ fn wrapAssistantTextWithBaseGutter(
         i += unit.byte_len;
     }
 
+    if (source_map) |map| try map.record(alloc, text.len, out.items.len);
     if (literal_command and !row_has_content) {
         try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, true);
     }
@@ -403,6 +421,7 @@ pub fn wrapTranscriptAssistantTextInterruptible(
         false,
         checkpoint,
         null,
+        null,
     );
 }
 
@@ -429,11 +448,77 @@ pub fn wrapTranscriptAssistantTextWithFinalityInterruptible(
         false,
         checkpoint,
         &finalized_prefix_bytes,
+        null,
     );
     return .{
         .bytes = bytes,
         .finalized_prefix_bytes = finalized_prefix_bytes,
     };
+}
+
+pub const RetentionSourceMap = struct {
+    pub const Point = struct { source: usize, rendered: usize };
+    rows: std.ArrayList(usize) = .empty,
+    points: std.ArrayList(Point) = .empty,
+
+    pub fn deinit(self: *RetentionSourceMap, alloc: Allocator) void {
+        self.rows.deinit(alloc);
+        self.points.deinit(alloc);
+    }
+
+    fn record(self: *RetentionSourceMap, alloc: Allocator, source: usize, rendered: usize) !void {
+        try self.points.append(alloc, .{ .source = source, .rendered = rendered });
+    }
+
+    fn boundary(self: RetentionSourceMap, comptime field: enum { source, rendered }, offset: usize) Point {
+        var lo: usize = 0;
+        var hi = self.points.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (@field(self.points.items[mid], @tagName(field)) <= offset) lo = mid + 1 else hi = mid;
+        }
+        return if (lo == 0) .{ .source = 0, .rendered = 0 } else self.points.items[lo - 1];
+    }
+
+    pub fn sourceAt(self: RetentionSourceMap, rendered: usize) usize {
+        return self.boundary(.rendered, rendered).source;
+    }
+
+    pub fn renderedAt(self: RetentionSourceMap, source: usize) usize {
+        return self.boundary(.source, source).rendered;
+    }
+};
+
+/// Caller-owned source coordinates emitted by the actual wrapping decisions.
+/// Generated gutters and presentation controls never split an input display unit.
+pub fn retentionSourceMap(alloc: Allocator, text: []const u8, cols: u16) !RetentionSourceMap {
+    var map: RetentionSourceMap = .{};
+    errdefer map.deinit(alloc);
+    const wrapped = try wrapAssistantTextWithBaseGutter(
+        alloc,
+        text,
+        cols,
+        gutterWidth(cols),
+        true,
+        false,
+        null,
+        null,
+        &map,
+    );
+    defer alloc.free(wrapped);
+    var leading: usize = 0;
+    while (leading < wrapped.len and wrapped[leading] == '\n') : (leading += 1) {}
+    const skip = @min(leading, map.rows.items.len);
+    std.mem.copyForwards(usize, map.rows.items, map.rows.items[skip..]);
+    map.rows.items.len -= skip;
+    for (map.points.items) |*point| point.rendered -|= leading;
+    return map;
+}
+
+pub fn retentionSourceRows(alloc: Allocator, text: []const u8, cols: u16) ![]usize {
+    var map = try retentionSourceMap(alloc, text, cols);
+    defer map.deinit(alloc);
+    return map.rows.toOwnedSlice(alloc);
 }
 
 /// Reflow canonical command output as literal terminal text. Every physical
@@ -454,6 +539,7 @@ pub fn wrapLiteralCommandOutput(
         gutter,
         true,
         true,
+        null,
         null,
         null,
     );
@@ -487,6 +573,7 @@ pub fn wrapLiteralToolOutputInterruptible(
         true,
         true,
         checkpoint,
+        null,
         null,
     );
 }
@@ -648,6 +735,7 @@ fn reflowAtWordBreak(
     base_gutter: u16,
     next_width: u16,
     literal_command: bool,
+    source_map: ?*RetentionSourceMap,
 ) !?u16 {
     const suffix = out.items[word_break.end..];
     const suffix_width = display_width.visibleWidthIgnoringAnsi(suffix);
@@ -670,6 +758,19 @@ fn reflowAtWordBreak(
         literal_command,
     );
     try out.replaceRange(alloc, word_break.start, word_break.end - word_break.start, replacement.items);
+    if (source_map) |map| {
+        var index = map.points.items.len;
+        while (index > 0) {
+            index -= 1;
+            const point = &map.points.items[index];
+            if (point.rendered <= word_break.start) break;
+            if (point.rendered >= word_break.end) {
+                point.rendered = word_break.start + replacement.items.len + point.rendered - word_break.end;
+            } else {
+                point.rendered = word_break.start;
+            }
+        }
+    }
     return col + @as(u16, @intCast(suffix_width));
 }
 
@@ -812,8 +913,39 @@ fn assistantContinuation(text: []const u8, line_start: usize) ?AssistantContinua
         depth += 1;
         i = end;
     }
-    if (depth == 0) return null;
-    return .{ .blockquote = .{ .indent = indent, .depth = depth } };
+    if (depth > 0) return .{ .blockquote = .{ .indent = indent, .depth = depth } };
+    return if (proseIndent(text, line_start)) |width| .{ .list_indent = width } else null;
+}
+
+fn proseIndent(text: []const u8, line_start: usize) ?usize {
+    var i = line_start;
+    var width: usize = 0;
+    var line_end: ?usize = null;
+    while (i < text.len) {
+        switch (text[i]) {
+            ' ' => {
+                width += 1;
+                i += 1;
+            },
+            0x1b => {
+                // Bound control parsing to this logical line, including incomplete tails.
+                if (line_end == null) {
+                    var end = i;
+                    while (end < text.len and text[end] != '\r' and text[end] != '\n') : (end += 1) {}
+                    line_end = end;
+                }
+                const sequence_end = display_width.ansiSequenceEnd(text[0..line_end.?], i);
+                const seq = text[i..sequence_end];
+                if (seq.len < 3) return null;
+                const sgr = std.mem.startsWith(u8, seq, "\x1b[") and seq[seq.len - 1] == 'm';
+                if (!sgr and osc8Update(seq) == null) return null;
+                i = sequence_end;
+            },
+            0...8, 9...13, 14...26, 28...31, 127 => return null,
+            else => return if (width > 0) width else null,
+        }
+    }
+    return null;
 }
 
 fn definitionPrefixEnd(text: []const u8, start: usize) ?usize {
@@ -951,7 +1083,7 @@ fn listContinuationIndentWidth(text: []const u8, line_start: usize) ?usize {
         marker_width += 1;
         i = skipPacerDimReassertions(text, i);
     }
-    if (marker_width == 0 or i >= text.len or text[i] != '.') return null;
+    if (marker_width == 0 or i >= text.len or (text[i] != '.' and text[i] != ')')) return null;
     i += 1;
     marker_width += 1;
     i = skipPacerDimReassertions(text, i);
@@ -986,7 +1118,9 @@ fn dimTaskMarkerWidth(text: []const u8, start: usize) ?usize {
 
 fn taskMarkerWidth(text: []const u8, start: usize) ?usize {
     const dim_open = "\x1b[2m";
-    const completed_opens = [_][]const u8{ "\x1b[38;5;252m", "\x1b[38;5;238m" };
+    // Recognize both builtin variants plus whatever the active theme set, so
+    // completed markers keep measuring correctly under custom themes.
+    const completed_opens = [_][]const u8{ "\x1b[38;5;252m", "\x1b[38;5;238m", shared_theme.current().task_completed_open };
     const completed_close = "\x1b[39m";
     const completed = "\xe2\x9c\x93";
 
@@ -1017,6 +1151,56 @@ fn skipPacerDimReassertions(text: []const u8, start: usize) usize {
     var i = start;
     while (std.mem.startsWith(u8, text[i..], reassert)) : (i += reassert.len) {}
     return i;
+}
+
+test "wrapAssistantText preserves explicit paragraph indentation" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "1. Heading\n   alpha beta gamma delta\n\n  alpha beta gamma delta\nalpha beta gamma delta", 16);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "1. Heading\n   alpha beta\n   gamma delta\n\n  alpha beta\n  gamma delta\nalpha beta\ngamma delta",
+        out,
+    );
+}
+
+test "wrapAssistantText preserves paced paragraph indentation and links" {
+    const alloc = std.testing.allocator;
+    const prefix = "\x1b[1m \x1b[0m\x1b[1m  ";
+    const link = "\x1b]8;;https://example.com\x1b\\";
+    const close = "\x1b]8;;\x1b\\";
+    const out = try wrapAssistantText(alloc, prefix ++ link ++ "alpha beta gamma delta" ++ close ++ "\x1b[0m", 16);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(prefix ++ link ++ "alpha beta\x1b[0m" ++ close ++ "\n   \x1b[1m" ++ link ++ "gamma delta" ++ close ++ "\x1b[0m", out);
+}
+
+test "paragraph indentation ignores blank incomplete and non-prose prefixes" {
+    for ([_][]const u8{ "   ", "   \nnext", "   \rnext", "  \ttext", "  \x1b[", "  \x1b[\ntext", "  \x1b]8;;unfinished", "  \x1b[Atext" }) |text| {
+        try std.testing.expectEqual(@as(?usize, null), proseIndent(text, 0));
+    }
+    try std.testing.expectEqual(@as(?usize, 3), proseIndent("\x1b[2m \x1b[0m  text", 0));
+    try std.testing.expectEqual(@as(?usize, 2), proseIndent(" \x1b]8;;https://example.com\x07 text", 0));
+}
+
+test "wrapAssistantText explicit indentation respects narrow widths and wide units" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "   abcdef", 3);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("   \nabc\ndef", out);
+    const wide = try wrapAssistantText(alloc, "  界界界", 4);
+    defer alloc.free(wide);
+    try std.testing.expectEqualStrings("  界\n  界\n  界", wide);
+}
+
+test "paragraph indentation preserves finalized source boundaries" {
+    const alloc = std.testing.allocator;
+    const text = "   alpha beta gamma delta\n  unfinished";
+    const partial = try wrapTranscriptAssistantTextWithFinalityInterruptible(alloc, text, 18, null);
+    defer alloc.free(partial.bytes);
+    const finished = try wrapTranscriptAssistantTextWithFinalityInterruptible(alloc, text ++ "\n", 18, null);
+    defer alloc.free(finished.bytes);
+    try std.testing.expectEqualStrings("     alpha beta\n     gamma delta\n", partial.bytes[0..partial.finalized_prefix_bytes]);
+    try std.testing.expectEqualStrings(partial.bytes, finished.bytes[0 .. finished.bytes.len - 1]);
+    try std.testing.expectEqual(finished.bytes.len, finished.finalized_prefix_bytes);
 }
 
 test "wrapAssistantText wraps plain ascii at cols" {
@@ -1205,6 +1389,13 @@ test "wrapAssistantText recognizes paced list markers" {
     );
     defer alloc.free(blockquote);
     try std.testing.expectEqualStrings("\x1b[2m\xe2\x94\x82\x1b[0m\x1b[2m \x1b[0m\x1b[2m\x1b[22mabcde\n\x1b[2m\xe2\x94\x82 \x1b[22mfghij", blockquote);
+}
+
+test "wrapAssistantText indents paren-style ordered list continuations" {
+    const alloc = std.testing.allocator;
+    const out = try wrapAssistantText(alloc, "\x1b[2m12)\x1b[22m abcdefghij", 10);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("\x1b[2m12)\x1b[22m abcdef\n    ghij", out);
 }
 
 test "wrapAssistantText indents ordered and nested list continuations" {
@@ -1573,4 +1764,18 @@ test "wrapLiteralCommandOutput preserves and rows a pathological zero width run"
     defer alloc.free(out);
     try std.testing.expectEqual(combining_count, std.mem.count(u8, out, "\xcc\x81"));
     try std.testing.expect(std.mem.count(u8, out, "\n") > 1);
+}
+
+test "a link opening a guttered row keeps its theme color" {
+    const alloc = std.testing.allocator;
+    const link_style = shared_theme.current().link_style;
+    const input = try std.fmt.allocPrint(alloc, "\x1b]8;id=fx-1;https://example.com\x1b\\{s}\x1b[4mdocs\x1b[24m\x1b[39m\x1b]8;;\x1b\\", .{link_style});
+    defer alloc.free(input);
+    const out = try wrapAssistantTextWithBaseGutter(alloc, input, 40, 2, false, false, null, null, null);
+    defer alloc.free(out);
+    // Pre-content escapes are not copied verbatim into a guttered row; the
+    // row-start restore must re-emit the link color with the underline.
+    try std.testing.expect(std.mem.indexOf(u8, out, link_style) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[4m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "docs") != null);
 }

@@ -1,5 +1,4 @@
 const std = @import("std");
-const change_tracker = @import("../core/workspace/change_tracker.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
@@ -91,6 +90,39 @@ const RuleLoad = union(enum) {
     omitted: context_contract.OmissionReason,
 };
 
+const ReconstructionBudget = struct {
+    const candidate_limit = 128;
+    const read_limit = 64 * 1024 * 1024;
+    const Admission = enum { admitted, duplicate, exhausted };
+
+    // Source paths borrow selection-arena storage, including missing candidates.
+    sources: [candidate_limit][]const u8 = undefined,
+    candidate_count: usize = 0,
+    admitted_read_bytes: usize = 0,
+
+    fn admit_candidate(self: *ReconstructionBudget, source: []const u8) Admission {
+        if (containsString(self.sources[0..self.candidate_count], source)) return .duplicate;
+        if (self.candidate_count == candidate_limit) {
+            debug_trace.logf("context", "reconstruction_work_omitted reason=selection_cap candidates={d}", .{self.candidate_count});
+            return .exhausted;
+        }
+        self.sources[self.candidate_count] = source;
+        self.candidate_count += 1;
+        return .admitted;
+    }
+
+    fn admit_reads(self: *ReconstructionBudget, validation_bytes: usize, prefix_bytes: usize) bool {
+        const remaining = read_limit - self.admitted_read_bytes;
+        if (validation_bytes > remaining or prefix_bytes > remaining - validation_bytes) {
+            debug_trace.logf("context", "reconstruction_work_omitted reason=oversized admitted_read_bytes={d} validation_bytes={d} prefix_bytes={d}", .{ self.admitted_read_bytes, validation_bytes, prefix_bytes });
+            return false;
+        }
+        // Reserve both reads before validation. Failed or blank files do not refund work.
+        self.admitted_read_bytes += validation_bytes + prefix_bytes;
+        return true;
+    }
+};
+
 const SelectionOptions = struct {
     workspace_root: []const u8,
     targets: []const context_contract.ApplicableTarget,
@@ -100,12 +132,14 @@ const SelectionOptions = struct {
     initial_omission_summary: ?context_contract.ContextOmissionSummary = null,
     home: ?[]const u8 = null,
     initial: bool,
+    bounded_reconstruction: bool = false,
     load_project_instruction_files: bool = true,
     context_limits: context_limits.Values = .{},
 };
 
 const SelectionScratch = struct {
     arena: Allocator,
+    work_budget: ?ReconstructionBudget = null,
     candidates: std.ArrayList(RuleCandidate) = .empty,
     ranking_endpoints: std.ArrayList([]const u8) = .empty,
     delivered_sources: std.ArrayList([]const u8) = .empty,
@@ -183,6 +217,7 @@ fn gatherProjectContextWithHome(
         .initial_omission_summary = input.omission_summary,
         .home = home,
         .initial = true,
+        .bounded_reconstruction = input.bounded_reconstruction,
         .load_project_instruction_files = loadsProjectInstructionFiles(),
         .context_limits = input.context_limits,
     });
@@ -204,7 +239,10 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var scratch: SelectionScratch = .{ .arena = arena };
+    var scratch: SelectionScratch = .{
+        .arena = arena,
+        .work_budget = if (options.bounded_reconstruction) .{} else null,
+    };
 
     for (options.initial_omissions) |omission| {
         try scratch.addOmission(omission.source, omission.reason);
@@ -222,6 +260,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
 
     if (options.load_project_instruction_files) {
         if (options.initial) {
+            var launch_home: ?[]const u8 = null;
             if (options.home) |home| {
                 const canonical_home: ?[]u8 = io_mod.realpathAlloc(arena, home) catch |err| blk: {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -232,7 +271,11 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                     global_source_path = try std.fs.path.join(arena, &.{ home_root, ".fx", "AGENTS.md" });
                     global_rule = try loadRuleForSelection(arena, &scratch, global_source_path.?, options.context_limits.project_instruction_file_bytes);
                     if (pathing.pathInside(home_root, options.workspace_root)) {
-                        try collectLaunchAncestorCandidates(arena, &scratch, home_root, options.workspace_root, options.delivered_sources);
+                        if (options.bounded_reconstruction) {
+                            launch_home = home_root;
+                        } else {
+                            try collectLaunchAncestorCandidates(arena, &scratch, home_root, options.workspace_root, options.delivered_sources);
+                        }
                     } else {
                         try scratch.addOmission(options.workspace_root, .home_outside_workspace);
                     }
@@ -251,6 +294,10 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
             } else {
                 try scratch.addOmission(options.workspace_root, .unsafe_target);
             }
+            // Admit the explicit global and workspace sources before bounded ancestor work.
+            if (launch_home) |home_root| {
+                try collectLaunchAncestorCandidates(arena, &scratch, home_root, options.workspace_root, options.delivered_sources);
+            }
         }
 
         for (options.targets) |target| {
@@ -260,7 +307,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
 
     var usable: std.ArrayList(*RuleCandidate) = .empty;
     for (scratch.candidates.items) |*candidate| {
-        switch (try loadRule(arena, candidate.source, options.context_limits.project_instruction_file_bytes)) {
+        switch (try loadRuleWithBudget(arena, candidate.source, options.context_limits.project_instruction_file_bytes, if (scratch.work_budget) |*budget| budget else null)) {
             .body => |body| {
                 candidate.body = body.text;
                 candidate.observed_bytes = body.observed_bytes;
@@ -349,7 +396,11 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         }
     }
     result.delivered_sources = try dupeOwnedStringSlice(alloc, scratch.delivered_sources.items);
-    result.evaluated_endpoints = try dupeOwnedStringSlice(alloc, scratch.evaluated_endpoints.items);
+    // A bounded reconstruction may leave ancestors unread. Only delivered rules
+    // may suppress live discovery, not completion of these directory scans.
+    if (!options.bounded_reconstruction) {
+        result.evaluated_endpoints = try dupeOwnedStringSlice(alloc, scratch.evaluated_endpoints.items);
+    }
     result.notices = try dupeOwnedStringSlice(alloc, scratch.notices.items);
     return result;
 }
@@ -360,7 +411,17 @@ fn loadRuleForSelection(
     source: []const u8,
     limit: context_limits.Resolved,
 ) !?LoadedRule {
-    switch (try loadRule(arena, source, limit)) {
+    if (scratch.work_budget) |*budget| {
+        switch (budget.admit_candidate(source)) {
+            .admitted => {},
+            .duplicate => return null,
+            .exhausted => {
+                try scratch.addOmission(source, .selection_cap);
+                return null;
+            },
+        }
+    }
+    switch (try loadRuleWithBudget(arena, source, limit, if (scratch.work_budget) |*budget| budget else null)) {
         .body => |body| {
             try scratch.addDelivered(source);
             return .{ .source = source, .body = body.text, .observed_bytes = body.observed_bytes };
@@ -384,7 +445,7 @@ fn collectLaunchAncestorCandidates(
     while (current) |scope| : (current = std.fs.path.dirname(scope)) {
         if (std.mem.eql(u8, scope, home)) break;
         if (!pathing.pathInside(home, scope)) break;
-        try appendRuleCandidate(arena, scratch, scope, .ancestor, prior_delivered);
+        if (!try appendRuleCandidate(arena, scratch, scope, .ancestor, prior_delivered)) break;
     }
 }
 
@@ -414,7 +475,7 @@ fn collectTargetCandidates(
     while (current) |scope| : (current = std.fs.path.dirname(scope)) {
         if (std.mem.eql(u8, scope, options.workspace_root)) break;
         if (!pathing.pathInside(options.workspace_root, scope)) break;
-        try appendRuleCandidate(arena, scratch, scope, .target, options.delivered_sources);
+        if (!try appendRuleCandidate(arena, scratch, scope, .target, options.delivered_sources)) break;
     }
 }
 
@@ -424,20 +485,42 @@ fn appendRuleCandidate(
     scope: []const u8,
     class: CandidateClass,
     prior_delivered: []const []const u8,
-) !void {
+) !bool {
     const source = try std.fs.path.join(arena, &.{ scope, "AGENTS.md" });
-    if (containsString(prior_delivered, source) or containsString(scratch.delivered_sources.items, source)) return;
+    if (containsString(prior_delivered, source) or containsString(scratch.delivered_sources.items, source)) return true;
     for (scratch.candidates.items) |candidate| {
-        if (std.mem.eql(u8, candidate.source, source)) return;
+        // A previous walk already covered these ancestors, or stopped at the work cap.
+        if (std.mem.eql(u8, candidate.source, source)) return scratch.work_budget == null;
+    }
+    if (scratch.work_budget) |*budget| {
+        switch (budget.admit_candidate(source)) {
+            .admitted => {},
+            // Initial global/workspace probes need not have walked this scope's ancestors.
+            .duplicate => return true,
+            .exhausted => {
+                try scratch.addOmission(source, .selection_cap);
+                return false;
+            },
+        }
     }
     try scratch.candidates.append(arena, .{
         .source = source,
         .scope = scope,
         .class = class,
     });
+    return true;
 }
 
 fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) Allocator.Error!RuleLoad {
+    return loadRuleWithBudget(arena, path, limit, null);
+}
+
+fn loadRuleWithBudget(
+    arena: Allocator,
+    path: []const u8,
+    limit: context_limits.Resolved,
+    work_budget: ?*ReconstructionBudget,
+) Allocator.Error!RuleLoad {
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch |err| {
         return switch (err) {
             error.FileNotFound, error.NotDir => .missing,
@@ -491,13 +574,16 @@ fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) 
     const observed_bytes = std.math.cast(usize, opened_stat.size) orelse return .{ .omitted = .oversized };
     if (observed_bytes > context_limits.emergency_ceiling_bytes) return .{ .omitted = .oversized };
 
-    const has_content = validateRuleUtf8(&file, observed_bytes) catch
-        return .{ .omitted = .unreadable };
-    if (!has_content) return .blank;
     const read_len = @min(
         observed_bytes,
         @min(limit.effectiveBytes() +| 3, context_limits.emergency_ceiling_bytes),
     );
+    if (work_budget) |budget| {
+        if (!budget.admit_reads(observed_bytes, read_len)) return .{ .omitted = .oversized };
+    }
+    const has_content = validateRuleUtf8(&file, observed_bytes) catch
+        return .{ .omitted = .unreadable };
+    if (!has_content) return .blank;
     const content = try arena.alloc(u8, read_len);
     const bytes_read = file.readPositionalAll(io_mod.getIo(), content, 0) catch
         return .{ .omitted = .unreadable };
@@ -909,6 +995,68 @@ fn createSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []co
         if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
         return err;
     };
+}
+
+test "reconstruction budget bounds distinct candidates and both file reads" {
+    var budget = ReconstructionBudget{};
+    var names: [129][8]u8 = undefined;
+    for (&names, 0..) |*name, index| {
+        const source = try std.fmt.bufPrint(name, "r{d}", .{index});
+        try std.testing.expectEqual(if (index < 128) ReconstructionBudget.Admission.admitted else .exhausted, budget.admit_candidate(source));
+    }
+    try std.testing.expectEqual(ReconstructionBudget.Admission.duplicate, budget.admit_candidate("r0"));
+    try std.testing.expect(budget.admit_reads(ReconstructionBudget.read_limit - 4, 3));
+    try std.testing.expect(!budget.admit_reads(1, 1));
+    try std.testing.expectEqual(ReconstructionBudget.read_limit - 1, budget.admitted_read_bytes);
+    try std.testing.expect(budget.admit_reads(1, 0));
+}
+
+test "reconstruction budget omits file before validation and does not deliver it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "AGENTS.md", "RULE");
+    const source = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "AGENTS.md");
+    defer alloc.free(source);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var scratch = SelectionScratch{
+        .arena = arena_state.allocator(),
+        .work_budget = .{ .admitted_read_bytes = ReconstructionBudget.read_limit - 7 },
+    };
+    try std.testing.expectEqual(@as(?LoadedRule, null), try loadRuleForSelection(scratch.arena, &scratch, source, (context_limits.Values{}).project_instruction_file_bytes));
+    try std.testing.expectEqual(@as(usize, 0), scratch.delivered_sources.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scratch.omissions.items.len);
+    try std.testing.expectEqual(context_contract.OmissionReason.oversized, scratch.omissions.items[0].reason);
+    try std.testing.expectEqual(ReconstructionBudget.read_limit - 7, scratch.work_budget.?.admitted_read_bytes);
+}
+
+test "reconstruction budget keeps live discovery eligible while retaining delivered rules" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "workspace/nested/AGENTS.md", "BOUNDED_RULE");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const nested = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/nested");
+    defer alloc.free(nested);
+    var reconstructed = try gatherProjectContextWithHome(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = nested, .kind = .directory }},
+        .bounded_reconstruction = true,
+    }, null);
+    defer reconstructed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), reconstructed.evaluated_endpoints.len);
+    try std.testing.expectEqual(@as(usize, 1), reconstructed.delivered_sources.len);
+    var later = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = nested, .kind = .directory }},
+        .delivered_sources = reconstructed.delivered_sources,
+        .evaluated_endpoints = reconstructed.evaluated_endpoints,
+    });
+    defer later.deinit(alloc);
+    try std.testing.expect(later.content == null);
+    try std.testing.expectEqual(@as(usize, 1), later.evaluated_endpoints.len);
 }
 
 test "context formatting preserves section order and separators" {
@@ -2825,9 +2973,12 @@ fn permissionModeContext(permission_mode: types.PermissionMode) []const u8 {
     return switch (permission_mode) {
         .ask => "Runtime context: permission mode is ask. Sensitive tool calls may require user approval unless configured rules or session grants already decide them. Tool admission remains authoritative.",
         .auto => "Runtime context: permission mode is auto. After configured rules, session grants, and deterministic safe-tool authority, fx sends each unresolved action to a narrow safety reviewer. A clear result authorizes only that exact action. A caution or unavailable result holds only that action and returns advice without opening a permission screen, disabling tools, or ending the turn. Exact cautions are reused for this turn; choose a materially different safe action or explain why no safe path remains. Tool admission and exact live revalidation remain authoritative.",
-        .yolo => "Runtime context: permission mode is yolo. fx permission policy is disabled. Tool lookup, argument validation, execution authority, cancellation, limits, operating-system permissions, and remote authentication remain authoritative.",
+        .yolo => "Runtime context: permission mode is full access. fx permission policy is disabled. Tool lookup, argument validation, execution authority, cancellation, limits, operating-system permissions, and remote authentication remain authoritative.",
     };
 }
+
+const stale_shell_handles_context =
+    "Runtime context: fx restarted since this session was last active, so earlier shell session_id handles no longer exist; stopping or interacting with them fails with ExecutionNotFound. Their processes are normally terminated when fx exits but can survive an unclean exit, so check for a survivor before starting a duplicate. Otherwise start fresh shell sessions instead of reusing earlier handles.";
 
 fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const turn_context = try buildTurnContextFragmentForHost(
@@ -2846,7 +2997,14 @@ fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *st
     try messages.append(arena, .{ .role = .system, .content = content });
     try appendWorkspaceAccessContext(input.access_scope, arena, messages);
     try messages.append(arena, .{ .role = .system, .content = permissionModeContext(input.permission_mode) });
-    try appendFocusedVerificationContext(input.tracker, arena, messages);
+    if (input.stale_shell_handles) try messages.append(arena, .{
+        .role = .system,
+        .content = stale_shell_handles_context,
+    });
+    if (input.interactive) try messages.append(arena, .{
+        .role = .system,
+        .content = "Runtime context: if this turn changes files, choose focused verification from the touched areas first. Use changed paths in tool calls and results to select checks; avoid generic or expensive verification unless those paths justify it or the user requested it. Tests under tests/evals can be deterministic; do not assume they require live models. Preserve exact verification evidence in the final summary.",
+    });
 }
 
 fn appendWorkspaceAccessContext(
@@ -2875,55 +3033,11 @@ fn appendWorkspaceAccessContext(
     try messages.append(arena, .{ .role = .system, .content = try note.toOwnedSlice() });
 }
 
-fn appendFocusedVerificationContext(tracker: ?*change_tracker.ChangeTracker, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
-    const current_tracker = tracker orelse return;
-    if (current_tracker.stack.items.len == 0) return;
-
-    var note: std.Io.Writer.Allocating = .init(arena);
-    defer note.deinit();
-
-    try note.writer.writeAll("Runtime context: this turn has tracked file changes. Choose focused verification from the touched areas first; do not run generic or expensive verification commands unless the touched paths justify them or the user asked for them. Preserve exact evidence from verification commands in the final summary.\n");
-    try note.writer.print("- tracked_changes={d}\n", .{current_tracker.stack.items.len});
-    var wrote_zig = false;
-    var wrote_tests = false;
-    var wrote_docs = false;
-    var wrote_evals = false;
-    var wrote_test_paths: usize = 0;
-    for (current_tracker.stack.items) |op| {
-        const path = op.path;
-        if (!wrote_zig and std.mem.endsWith(u8, path, ".zig")) {
-            try note.writer.writeAll("- touched_area=zig: run focused Zig tests/build checks for the changed module before broader verification.\n");
-            wrote_zig = true;
-        }
-        if (!wrote_tests and (std.mem.find(u8, path, "/tests/") != null or std.mem.startsWith(u8, path, "tests/"))) {
-            try note.writer.writeAll("- touched_area=tests: run the focused test file or suite that owns the changed test.\n");
-            wrote_tests = true;
-        }
-        if (!wrote_evals and std.mem.find(u8, path, "tests/evals/") != null) {
-            try note.writer.writeAll("- touched_area=evals: run the focused Bun eval or matrix test before considering model-backed evals. Do not treat tests/evals/agent-quality-matrix.test.ts as model-backed; it is deterministic.\n");
-            wrote_evals = true;
-        }
-        if (wrote_test_paths < 5 and std.mem.endsWith(u8, path, ".test.ts")) {
-            try note.writer.writeAll("- touched_test_file=");
-            try model_context_encoding.writeScalar(&note.writer, path);
-            try note.writer.writeAll(": run this test file directly before any broad suite.\n");
-            wrote_test_paths += 1;
-        }
-        if (!wrote_docs and (std.mem.endsWith(u8, path, ".md") or std.mem.find(u8, path, "/docs/") != null)) {
-            try note.writer.writeAll("- touched_area=docs: verify references and examples rather than running unrelated builds by default.\n");
-            wrote_docs = true;
-        }
-    }
-
-    try messages.append(arena, .{ .role = .system, .content = try note.toOwnedSlice() });
-}
-
 const PromptContextFixture = struct {
     session: SessionRuntime = .{ .max_history_turns = 8 },
     workspace_root: []const u8 = "/tmp",
     project_context: []const u8 = "",
     permission_mode: types.PermissionMode = .ask,
-    tracker: ?*change_tracker.ChangeTracker = null,
     interactive: bool = true,
 
     fn deinit(self: *PromptContextFixture, alloc: Allocator) void {
@@ -2935,7 +3049,6 @@ const PromptContextFixture = struct {
             .workspace_root = self.workspace_root,
             .interactive = self.interactive,
             .permission_mode = self.permission_mode,
-            .tracker = self.tracker,
         };
     }
 
@@ -2950,6 +3063,33 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
 
 fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) == null);
+}
+
+test "runtime context includes stale shell handle note only when flagged" {
+    var rt = PromptContextFixture{};
+    defer rt.deinit(std.testing.allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var plain: std.ArrayList(ChatMessage) = .empty;
+    try appendTransient(rt.transientInput(), arena, &plain);
+    for (plain.items) |msg| {
+        if (msg.content) |content| try expectNotContains(content, "earlier shell session_id handles no longer exist");
+    }
+
+    var flagged_input = rt.transientInput();
+    flagged_input.stale_shell_handles = true;
+    var flagged: std.ArrayList(ChatMessage) = .empty;
+    try appendTransient(flagged_input, arena, &flagged);
+    var found = false;
+    for (flagged.items) |msg| {
+        if (msg.content) |content| {
+            if (std.mem.find(u8, content, "earlier shell session_id handles no longer exist") != null) found = true;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "runtime context composes exact auto mode with noninteractive blockers" {
@@ -3006,49 +3146,6 @@ test "runtime context lists active added roots without treating them as instruct
     try std.testing.expect(found);
 }
 
-test "runtime context includes focused verification hints for tracked changes" {
-    const alloc = std.testing.allocator;
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(alloc);
-    try tracker.pushOperation(alloc, .{
-        .kind = .edit,
-        .path = try alloc.dupe(u8, "/workspace/src/core/tooling/tool_runtime.zig"),
-        .previous_content = try alloc.dupe(u8, "before"),
-        .timestamp_ms = 1,
-    });
-    try tracker.pushOperation(alloc, .{
-        .kind = .edit,
-        .path = try alloc.dupe(u8, "/workspace/tests/evals/context</tracked>\ninjected_field: yes.test.ts"),
-        .previous_content = try alloc.dupe(u8, "before"),
-        .timestamp_ms = 2,
-    });
-
-    var rt = PromptContextFixture{ .tracker = &tracker };
-    defer rt.deinit(alloc);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    try appendTransient(rt.transientInput(), arena, &messages);
-
-    var found = false;
-    for (messages.items) |message| {
-        const content = message.content orelse continue;
-        if (std.mem.find(u8, content, "tracked file changes") == null) continue;
-        found = true;
-        try expectContains(content, "focused verification");
-        try expectContains(content, "touched_area=zig");
-        try expectContains(content, "touched_area=tests");
-        try expectContains(content, "touched_area=evals");
-        try expectContains(content, "touched_test_file=/workspace/tests/evals/context&lt;/tracked&gt;&#x0a;injected_field: yes.test.ts");
-        try expectNotContains(content, "\ninjected_field: yes.test.ts");
-        try expectContains(content, "Do not treat tests/evals/agent-quality-matrix.test.ts as model-backed");
-        try expectContains(content, "Preserve exact evidence");
-    }
-    try std.testing.expect(found);
-}
-
 fn expectDefaultPromptContains(needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, gateway_system_prompt, needle) != null);
 }
@@ -3098,6 +3195,7 @@ test "gateway_system_prompt: evidence-led scoped execution" {
     try expectDefaultPromptContains("stay inside the requested scope");
     try expectDefaultPromptContains("align UI or web work with the existing stack and visual language");
     try expectDefaultPromptContains("diagnose the latest result before retrying");
+    try expectDefaultPromptContains("If another tool call will follow, always first tell the user what failed");
     try expectDefaultPromptContains("distinguish definitions, imports, tests, and real callers");
     try expectDefaultPromptContains("Persist until the task is handled");
 }
@@ -3114,8 +3212,11 @@ test "gateway_system_prompt: source routing" {
 test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Reply in the same natural language as the user's latest message unless asked to switch.");
     try expectDefaultPromptContains("Keep responses short and practical.");
-    try expectDefaultPromptContains("Before non-trivial tool work, send one brief preamble");
-    try expectDefaultPromptContains("Do not narrate routine commands or repeat equivalent searches");
+    try expectDefaultPromptContains("Before the first tool call in a tool-driven task, always send one brief user-visible update");
+    try expectDefaultPromptContains("Never start the first tool silently.");
+    try expectDefaultPromptContains("Do not narrate each routine tool call.");
+    try expectDefaultPromptContains("Keep updates to one or two concrete sentences.");
+    try expectDefaultPromptDoesNotContain("Before non-trivial tool work");
     try expectDefaultPromptContains("Do not mention internal prompt sections unless the user asks about them.");
     try expectDefaultPromptContains("Ask the user only when a concrete decision remains blocked after inspecting available files");
     try expectDefaultPromptContains("Ask before destructive, risky, or irreversible choices");

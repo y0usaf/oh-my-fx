@@ -162,6 +162,7 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
 pub fn controlByteFeatureAction(byte: u8) ?InputEscapeAction {
     return switch (byte) {
         15 => .toggle_full_transcript,
+        16 => .open_model_catalog,
         else => null,
     };
 }

@@ -130,7 +130,7 @@ jobs:
 
           echo "Request payload: $(wc -c < /tmp/request.json) bytes"
 
-          HTTP_STATUS=$(curl -sS -N -X POST "https://ai-gateway.vercel.sh/v3/ai/language-model" \
+          HTTP_STATUS=$(curl -sS -N -X POST "https://ai-gateway.vercel.sh/v4/ai/language-model" \
             -H "Authorization: Bearer ${AI_GATEWAY_API_KEY}" \
             -H "Content-Type: application/json" \
             -H "ai-gateway-protocol-version: 0.0.1" \

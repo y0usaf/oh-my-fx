@@ -12,7 +12,6 @@ pub const max_prompt_bytes: usize = 64 * 1024;
 pub const max_message_bytes: usize = 64 * 1024;
 pub const max_agent_name_bytes: usize = 64;
 pub const max_instructions_bytes: usize = 64 * 1024;
-pub const max_cancellation_reason_bytes: usize = 512;
 pub const max_admission_items: usize = 256;
 pub const max_admission_item_bytes: usize = 4096;
 

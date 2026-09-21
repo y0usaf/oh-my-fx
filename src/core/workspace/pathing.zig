@@ -223,6 +223,26 @@ pub fn resolveWorkspaceOrExternalPath(
     );
 }
 
+/// Resolves decoded filename bytes without trimming or unescaping them.
+/// The returned path is owned by `arena`; root and containment policy are unchanged.
+pub fn resolve_workspace_or_external_literal_path(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    path: []const u8,
+) ![]const u8 {
+    return resolve_workspace_or_external_literal_path_with_home(arena, workspace_root, path, io_mod.getenv("HOME"));
+}
+
+/// Same literal policy with captured HOME bytes. The caller owns the result.
+pub fn resolve_workspace_or_external_literal_path_with_home(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    path: []const u8,
+    home_dir: ?[]const u8,
+) ![]const u8 {
+    return resolve_literal_path(arena, workspace_root, path, home_dir, .existing, .workspace_or_external);
+}
+
 pub fn resolveWorkspaceOrExternalCreatePath(
     arena: std.mem.Allocator,
     workspace_root: []const u8,
@@ -282,10 +302,19 @@ fn resolvePath(
     mode: types.ResolveMode,
     scope: PathScope,
 ) ![]const u8 {
-    const cleaned = std.mem.trim(u8, input_path, path_entry_whitespace);
-    if (cleaned.len == 0) return error.InvalidPath;
+    return resolve_literal_path(arena, workspace_root, std.mem.trim(u8, input_path, path_entry_whitespace), home_dir, mode, scope);
+}
 
-    const input = try resolveInput(arena, workspace_root, cleaned, home_dir, scope);
+fn resolve_literal_path(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    path: []const u8,
+    home_dir: ?[]const u8,
+    mode: types.ResolveMode,
+    scope: PathScope,
+) ![]const u8 {
+    if (path.len == 0) return error.InvalidPath;
+    const input = try resolveInput(arena, workspace_root, path, home_dir, scope);
 
     const resolved = switch (mode) {
         .existing => try io_mod.realpathAlloc(arena, input.absolute),
@@ -1567,6 +1596,27 @@ test "resolveWorkspacePath rejects absolute paths outside the workspace" {
 
     const result = resolveWorkspacePath(arena, workspace, outside, .existing);
     try std.testing.expectError(error.PathOutsideWorkspace, result);
+}
+
+test "literal path resolution preserves filename spaces while raw entry trims" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = " name ", .data = "literal" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "name", .data = "raw" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const literal = try resolve_workspace_or_external_literal_path(alloc, root, " name ");
+    defer alloc.free(literal);
+    const raw = try resolveWorkspaceOrExternalPath(alloc, root, " name ");
+    defer alloc.free(raw);
+    const expected = try std.fs.path.join(alloc, &.{ root, " name " });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, literal);
+    try std.testing.expectEqualStrings("name", std.fs.path.basename(raw));
+    try std.testing.expectError(error.InvalidPath, resolve_workspace_or_external_literal_path(alloc, root, ""));
 }
 
 test "resolveWorkspaceOrExternalPath allows explicit absolute existing paths outside the workspace" {

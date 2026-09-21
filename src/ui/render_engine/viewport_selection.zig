@@ -20,12 +20,6 @@ pub const LineRef = struct {
     }
 };
 
-pub const HardLinePolicy = enum {
-    eof_after_trailing_newline_is_cursor_only,
-};
-
-pub const hard_line_policy: HardLinePolicy = .eof_after_trailing_newline_is_cursor_only;
-
 pub const HardLineStarts = struct {
     starts: []usize,
     ends_with_newline: bool,
@@ -320,16 +314,6 @@ pub fn hardLineAt(bytes: []const u8, index: usize) []const u8 {
     if (line == index and start < bytes.len) return bytes[start..];
     if (line == index and bytes.len > 0 and bytes[bytes.len - 1] == '\n') return bytes[start .. bytes.len - 1];
     return "";
-}
-
-pub fn unusedRowsBudget(line_visual_rows: []const u16, start_line: usize, total_lines: usize, visible_rows: u16) u16 {
-    var used: u32 = 0;
-    var line = start_line;
-    while (line < total_lines) : (line += 1) {
-        used += line_visual_rows[line];
-        if (used >= visible_rows) return 0;
-    }
-    return @intCast(@as(u32, visible_rows) - used);
 }
 
 pub fn sumVisualRows(line_visual_rows: []const u16, start_line: usize, end_line: usize) u16 {

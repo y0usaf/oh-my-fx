@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import pathlib
 import tempfile
@@ -151,6 +152,108 @@ class PgsoCliTests(unittest.TestCase):
         self.assertEqual("failed", payload["status"])
         self.assertEqual("validate", payload["stage"])
         self.assertFalse(payload["eligible"])
+
+    def test_all_command_supplies_hyperfine_to_heavy_measurement(self) -> None:
+        @dataclasses.dataclass(frozen=True)
+        class ToolchainInfo:
+            host_arch: str = "arm64"
+            target: str = "aarch64-macos"
+            zig_version: str = "0.16.0"
+            llvm_version: str = "21.1.8"
+
+        @dataclasses.dataclass(frozen=True)
+        class CorpusInfo:
+            manifest_path: pathlib.Path
+            manifest_sha256: str
+            intentional_exclusions: tuple[str, ...] = ()
+
+        @dataclasses.dataclass(frozen=True)
+        class CorpusResult:
+            merged_raw_profiles: int = 0
+
+        @dataclasses.dataclass(frozen=True)
+        class ArtifactInfo:
+            preferred_headroom_met: bool = True
+
+        @dataclasses.dataclass(frozen=True)
+        class MetadataInfo:
+            architecture: str = "arm64"
+            min_macos: str = "15.0"
+            signature_valid: bool = True
+
+        @dataclasses.dataclass(frozen=True)
+        class CandidateInfo:
+            sha256: str
+            artifact: ArtifactInfo
+            metadata: MetadataInfo
+            version_output: str = "0.0.9"
+
+        arguments = parse_args(self.required_arguments())
+        control = self.root / "control"
+        control.write_bytes(b"control")
+        hyperfine = self.root / "hyperfine"
+        heavy_kwargs: list[dict[str, object]] = []
+
+        def merge_profile(_toolchain, _profiles, output, _log):
+            output.write_bytes(b"profile")
+            return 0
+
+        def write_profile_use_ir(_toolchain, paths, _sha):
+            paths.profile_use_ir.write_text("ir\n", encoding="utf-8")
+
+        def link_candidate(_toolchain, paths):
+            (paths.logs / "candidate-layout.json").write_text(
+                json.dumps({"linker": "test"}),
+                encoding="utf-8",
+            )
+
+        def capture_heavy(**kwargs):
+            heavy_kwargs.append(kwargs)
+            return ()
+
+        toolchain = ToolchainInfo()
+        corpus = CorpusInfo(self.root / "corpus.json", "c" * 64)
+        linked: dict[str, object] = {}
+        candidate = CandidateInfo("d" * 64, ArtifactInfo(), MetadataInfo())
+        with mock.patch.multiple(
+            "scripts.pgso.__main__",
+            Toolchain=mock.DEFAULT,
+            _runtime_versions=mock.Mock(
+                return_value=(self.root / "bun", hyperfine, {"runtime": "ok"})
+            ),
+            load_corpus=mock.Mock(return_value=corpus),
+            _git_output=mock.Mock(side_effect=["a" * 40, ""]),
+            build_control=mock.Mock(return_value=control),
+            read_macos_minos=mock.Mock(return_value="15.0"),
+            sha256_file=mock.Mock(return_value="s" * 64),
+            emit_bitcode=mock.Mock(return_value="b" * 64),
+            build_instrumented=mock.Mock(return_value=()),
+            merge_profile_batch=mock.Mock(side_effect=merge_profile),
+            profile_evidence=mock.Mock(return_value={}),
+            run_corpus=mock.Mock(return_value=CorpusResult()),
+            _profile_summary=mock.Mock(return_value={}),
+            build_profile_linked_benchmarks=mock.Mock(return_value=linked),
+            apply_profile=mock.Mock(side_effect=write_profile_use_ir),
+            link_candidate=mock.Mock(side_effect=link_candidate),
+            relink_profile_linked_benchmarks=mock.Mock(return_value=linked),
+            verify_candidate=mock.Mock(return_value=candidate),
+            profile_linked_benchmark_evidence=mock.Mock(return_value={}),
+            run_behavior_corpus=mock.Mock(return_value=CorpusResult()),
+            measure_startup=mock.Mock(return_value=()),
+            measure_heavy_workloads=mock.Mock(side_effect=capture_heavy),
+        ) as mocks:
+            mocks["Toolchain"].discover.return_value = toolchain
+            manifest_path = run_command(arguments)
+
+        self.assertEqual(
+            (arguments.output_dir / "manifest.json").resolve(),
+            manifest_path.resolve(),
+        )
+        self.assertEqual(1, len(heavy_kwargs))
+        self.assertIs(hyperfine, heavy_kwargs[0].get("hyperfine_binary"))
+        payload = json.loads(manifest_path.read_text())
+        self.assertEqual("passed", payload["status"])
+        self.assertTrue(payload["eligible"])
 
     def test_runtime_validation_rejects_the_wrong_bun_version(self) -> None:
         arguments = parse_args(self.required_arguments())

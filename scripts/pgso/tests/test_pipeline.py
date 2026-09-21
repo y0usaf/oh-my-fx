@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import pathlib
 import tempfile
@@ -11,20 +12,33 @@ from scripts.pgso.pipeline import (
     BENCHMARK_USE_FLAGS,
     FX_MACHINE_OUTLINER_FLAGS,
     GENERATION_FLAGS,
+    IR_OUTLINER_FLAGS,
+    OUTLINE_CLEANUP_FLAGS,
+    OUTLINE_PARTITIONS,
     PROFILE_SECTION_ALIGNMENTS,
     USE_FLAGS,
     ArtifactSpec,
     CandidateMetadata,
+    MacosLinkContract,
     PipelinePaths,
     apply_profile,
+    cleanup_outlined_ir_argv,
     candidate_object_argv,
     candidate_link_argv,
+    candidate_runtime_probe_argv,
+    temporal_candidate_link_argv,
+    map_temporal_symbols,
+    parse_macos_link_contract,
+    validate_temporal_link_map,
     instrumentation_argv,
     instrumented_run_argv,
     instrumented_link_argv,
+    link_outlined_ir_argv,
     link_candidate,
     merge_profile_batch,
     parse_compiler_runtime,
+    outline_ir_argv,
+    order_outlined_ir_helpers,
     profile_use_argv,
     reject_profile_outputs,
     validate_archive_unchanged,
@@ -32,6 +46,7 @@ from scripts.pgso.pipeline import (
     validate_candidate_metadata,
     validate_candidate_size,
     validate_profile_section_alignment,
+    split_ir_argv,
     verify_release_safe_ir,
     zig_build_argv,
 )
@@ -39,6 +54,130 @@ from scripts.pgso.toolchain import Toolchain
 
 
 class PgsoPipelineTests(unittest.TestCase):
+    def test_temporal_order_binds_real_text_symbols_and_accounts_for_unmapped_names(self) -> None:
+        ordered, evidence = map_temporal_symbols(
+            "# Ordered 4 functions\n# fx\nalpha\nbeta\nalias\nmissing\n",
+            "_alpha T 0 0\nl_beta t 8 0\nl_alias t 8 0\n_missing d 20 0\n",
+        )
+        self.assertEqual(("_alpha", "l_beta"), ordered)
+        self.assertEqual(4, evidence["profile_functions"])
+        self.assertEqual(3, len(evidence["bindings"]))
+        self.assertEqual(["missing"], evidence["unmapped_symbols"])
+
+    def test_temporal_order_preserves_symbol_names_with_spaces(self) -> None:
+        ordered, _ = map_temporal_symbols("# Ordered 1 functions\nname with spaces\n", "l_name with spaces t 0 0\n")
+        self.assertEqual(("l_name with spaces",), ordered)
+
+    def test_outlined_helpers_follow_profile_rank_in_one_dense_cluster(self) -> None:
+        ir = self.root / "outlined.ll"
+        ir.write_text(
+            "define private void @hot() {\n"
+            "  call void @outlined_ir_func_2()\n"
+            "  ret void\n"
+            "}\n"
+            "define internal void @\"cold path\"() {\n"
+            "  call void @outlined_ir_func_1()\n"
+            "  ret void\n"
+            "}\n"
+            "define internal void @outlined_ir_func_2() {\n"
+            "  call void @outlined_ir_func_0()\n"
+            "  ret void\n"
+            "}\n"
+            "define internal void @outlined_ir_func_0() { ret void }\n"
+            "define internal void @outlined_ir_func_1() { ret void }\n"
+            "define internal void @outlined_ir_func_3() { ret void }\n"
+        )
+        symbols = (
+            "_hot T 10 0\n"
+            "l_cold path t 20 0\n"
+            "_outlined_ir_func_0 t 30 0\n"
+            "_outlined_ir_func_1 t 40 0\n"
+            "_outlined_ir_func_2 t 50 0\n"
+            "_outlined_ir_func_3 t 60 0\n"
+            "_ordinary t 70 0\n"
+        )
+
+        ordered, evidence = order_outlined_ir_helpers(
+            ("_hot", "l_cold path"),
+            symbols,
+            ir,
+        )
+
+        self.assertEqual(
+            (
+                "_hot",
+                "l_cold path",
+                "_outlined_ir_func_0",
+                "_outlined_ir_func_2",
+                "_outlined_ir_func_1",
+                "_outlined_ir_func_3",
+            ),
+            ordered,
+        )
+        self.assertEqual(
+            {
+                "outlined_helpers": 4,
+                "profile_ranked_outlined_helpers": 3,
+            },
+            evidence,
+        )
+
+    def test_temporal_order_rejects_ambiguous_empty_or_malformed_input(self) -> None:
+        for order, symbols in (
+            ("# Ordered 1 functions\nalpha\n", "_alpha T 0 0\nl_alpha t 8 0\n"),
+            ("# Ordered 1 functions\nalpha\n", "_alpha T 0 0\n_alpha T 8 0\n"),
+            ("# Ordered 1 functions\nmissing\n", "_alpha T 0 0\n"),
+            ("# Ordered 2 functions\nalpha\n", "_alpha T 0 0\n"),
+            ("# Ordered 2 functions\nalpha\nalpha\n", "_alpha T 0 0\n"),
+            ("# Ordered 0 functions\n", "_alpha T 0 0\n"),
+            ("# Ordered 1 functions\nalpha\n", "[truncated output]\n"),
+        ):
+            with self.subTest(order=order, symbols=symbols), self.assertRaises(PgsoError):
+                map_temporal_symbols(order, symbols)
+
+    def test_link_map_proves_applied_order_in_the_original_object(self) -> None:
+        link_map = (
+            f"# Object files:\n[ 1] {self.paths.profile_use_object}\n[ 2] /runtime.o\n"
+            "# Sections:\n0x1000 0x18 __TEXT __text\n0x2000 0x10 __TEXT __const\n"
+            "# Symbols:\n0x1000 0x8 [ 1] _alpha\n0x1000 0x0 [ 1] l_alias\n"
+            "0x1008 0x10 [ 1] l_beta\n0x10 0x100 [ 2] l_beta\n"
+            "0x2000 0x8 [ 1] 8-byte-literal\n0x2008 0x8 [ 1] 8-byte-literal\n"
+            "# Dead Stripped Symbols:\n<<dead>> 0x8 [ 1] l_removed\n"
+        )
+        self.assertEqual(
+            {"ordered_sections": 2, "ordered_bytes": 24, "linker_removed_symbols": ["l_removed"]},
+            validate_temporal_link_map(link_map, self.paths.profile_use_object, ("l_alias", "l_beta", "l_removed")),
+        )
+        for names in (("l_beta", "_alpha"), ("unknown",), ("l_alias", "_alpha")):
+            with self.subTest(names=names), self.assertRaises(PgsoError):
+                validate_temporal_link_map(link_map, self.paths.profile_use_object, names)
+        with self.assertRaises(PgsoError):
+            validate_temporal_link_map(link_map, self.root / "other.o", ("_alpha",))
+
+    def test_temporal_link_preserves_the_control_platform_and_original_object(self) -> None:
+        runtime = self.root / "libcompiler_rt_zcu.o"
+        contract = MacosLinkContract(1, "13.3", "26.4", 16 * 1024 * 1024, ())
+        toolchain = dataclasses.replace(self.toolchain, sdk_version="15.5")
+        command = temporal_candidate_link_argv(toolchain, self.paths, runtime, contract)
+        self.assertEqual(str(self.toolchain.apple_ld), command[0])
+        platform = command.index("-platform_version")
+        self.assertEqual(("macos", "13.3", "26.4"), command[platform + 1:platform + 4])
+        self.assertIn(str(self.paths.profile_use_object), command)
+        self.assertIn(str(runtime), command)
+        self.assertNotIn(str(self.paths.instrumented_object), command)
+        self.assertNotIn(str(self.toolchain.profile_runtime), command)
+        self.assertEqual("1000000", command[command.index("-stack_size") + 1])
+        self.assertIn(str(toolchain.zig_darwin_sdk / "libSystem.tbd"), command)
+        self.assertIn(str(self.paths.logs / "candidate-order.txt"), command)
+        for flag in ("-order_file", "-no_deduplicate", "-no_function_starts", "-map"):
+            self.assertIn(flag, command)
+        original = candidate_link_argv(self.toolchain, self.paths)
+        probe = candidate_runtime_probe_argv(self.toolchain, self.paths)
+        self.assertEqual(original, tuple(arg for arg in probe if arg != "-###"))
+        self.assertEqual(1, probe.count("-###"))
+        self.assertIn("-O2", probe)
+        self.assertIn("-s", probe)
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory(
             prefix="fx-pgso-pipeline-"
@@ -70,12 +209,20 @@ class PgsoPipelineTests(unittest.TestCase):
             "llc": tool_root / "llc",
             "llvm_profdata": tool_root / "llvm-profdata",
             "llvm_ar": tool_root / "llvm-ar",
+            "llvm_nm": tool_root / "llvm-nm",
+            "llvm_link": tool_root / "llvm-link",
+            "llvm_split": tool_root / "llvm-split",
             "clang": tool_root / "clang",
+            "apple_ld": tool_root / "ld",
+            "apple_ld_version": "1167.5",
             "strip": tool_root / "strip",
             "codesign": tool_root / "codesign",
             "otool": tool_root / "otool",
             "xcrun": tool_root / "xcrun",
             "sdk": self.root / "MacOSX.sdk",
+            "sdk_version": "26.4",
+            "zig_darwin_sdk": self.root / "ZigDarwin.sdk",
+            "zig_sdk_version": "26.4",
             "profile_runtime": self.root / "libclang_rt.profile_osx.a",
             "zig_version": "0.16.0",
             "llvm_version": "21.1.8",
@@ -96,6 +243,7 @@ class PgsoPipelineTests(unittest.TestCase):
             (
                 "--disable-vp",
                 "--runtime-counter-relocation",
+                "--pgo-temporal-instrumentation",
                 "-pgo-kind=pgo-instr-gen-pipeline",
                 "-passes=default<O2>",
             ),
@@ -107,10 +255,19 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-pgo-kind=pgo-instr-use-pipeline",
                 "-pgo-cold-func-opt=minsize",
                 "-profile-summary-cutoff-cold=600000",
-                "-passes=default<O2>,mergefunc,iroutliner",
+                "-passes=default<O2>,mergefunc",
             ),
             USE_FLAGS,
         )
+        self.assertEqual(("-passes=iroutliner",), IR_OUTLINER_FLAGS)
+        self.assertEqual(
+            (
+                "-passes=internalize,constmerge,globaldce,mergefunc,verify",
+                "-internalize-public-api-list=main,_mh_execute_header",
+            ),
+            OUTLINE_CLEANUP_FLAGS,
+        )
+        self.assertEqual(2, OUTLINE_PARTITIONS)
         self.assertEqual(
             (
                 "--disable-vp",
@@ -145,7 +302,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 f"-profile-file={self.paths.merged_profile}",
                 str(self.paths.bitcode),
                 "-o",
-                str(self.paths.profile_use_bitcode),
+                str(self.paths.profile_use_base_bitcode),
             ),
             profile_use_argv(self.toolchain, self.paths),
         )
@@ -173,6 +330,53 @@ class PgsoPipelineTests(unittest.TestCase):
                 mapped_profile,
             )[len(USE_FLAGS) + 1],
         )
+        self.assertEqual(
+            (
+                str(self.toolchain.llvm_split),
+                "-j",
+                "2",
+                "-o",
+                str(self.paths.outline_split_prefix),
+                str(self.paths.profile_use_base_bitcode),
+            ),
+            split_ir_argv(self.toolchain, self.paths),
+        )
+        for index, (split, outlined) in enumerate(
+            zip(self.paths.outline_split_bitcodes, self.paths.outlined_bitcodes)
+        ):
+            with self.subTest(index=index):
+                self.assertEqual(
+                    (
+                        str(self.toolchain.opt),
+                        *IR_OUTLINER_FLAGS,
+                        str(split),
+                        "-o",
+                        str(outlined),
+                    ),
+                    outline_ir_argv(self.toolchain, split, outlined),
+                )
+        self.assertEqual(
+            (
+                str(self.toolchain.llvm_link),
+                *map(str, self.paths.outlined_bitcodes),
+                "-o",
+                str(self.paths.linked_outlined_bitcode),
+            ),
+            link_outlined_ir_argv(self.toolchain, self.paths),
+        )
+        self.assertEqual(
+            (
+                str(self.toolchain.opt),
+                *OUTLINE_CLEANUP_FLAGS,
+                str(self.paths.linked_outlined_bitcode),
+                "-o",
+                str(self.paths.profile_use_bitcode),
+            ),
+            cleanup_outlined_ir_argv(self.toolchain, self.paths),
+        )
+        split_command = split_ir_argv(self.toolchain, self.paths)
+        self.assertNotIn("--round-robin", split_command)
+        self.assertNotIn("--preserve-locals", split_command)
         self.assertEqual(
             (str(self.paths.instrumented_binary), "help"),
             instrumented_run_argv(self.paths, ("help",)),
@@ -293,6 +497,14 @@ class PgsoPipelineTests(unittest.TestCase):
 
     def test_candidate_object_and_signing_contract(self) -> None:
         actions = self.root / "candidate-actions.txt"
+        runtime = self.root / "libcompiler_rt.a"
+        runtime.write_bytes(b"compiler runtime")
+        self.toolchain.zig_darwin_sdk.mkdir()
+        (self.toolchain.zig_darwin_sdk / "libSystem.tbd").write_bytes(b"system stub")
+        (self.paths.compiler_runtime / "instrumented.o").write_bytes(b"instrumented runtime")
+        self.paths.merged_profile.write_bytes(b"temporal profile")
+        self.paths.control_binary.parent.mkdir(parents=True)
+        self.paths.control_binary.write_bytes(b"control")
         artifact_tool = self.write_executable(
             "artifact-tool",
             f"""import pathlib,sys
@@ -314,9 +526,56 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('codesign ' + ' '.join(sys.argv[1:]) + '\\n')""",
         )
+        zig = self.write_executable(
+            "zig-probe",
+            f"""import pathlib,sys
+assert '-###' in sys.argv and '-O2' in sys.argv and '-s' in sys.argv
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('probe ' + ' '.join(sys.argv[1:]) + '\\n')
+print('zig ld -platform_version macos 13.0.0 26.4 {runtime}')""",
+        )
+        otool = self.write_executable("otool", f"print({self.good_candidate_metadata().load_commands!r})")
+        ar = self.write_executable(
+            "ar-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('ar ' + ' '.join(sys.argv[1:]) + '\\n')
+if sys.argv[1] == 't': print('libcompiler_rt_zcu.o')
+elif sys.argv[1] == 'x': pathlib.Path('libcompiler_rt_zcu.o').write_bytes(b'optimized runtime object')
+else: sys.exit(2)""",
+        )
+        profiler = self.write_executable(
+            "profile-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('order ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text('# Ordered 1 functions\\n# fx\\nalpha\\n')""",
+        )
+        nm = self.write_executable(
+            "nm-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('symbols ' + ' '.join(sys.argv[1:]) + '\\n')
+print('_alpha T 0 0')""",
+        )
+        link_map = f"# Object files:\n[ 1] {self.paths.profile_use_object}\n# Sections:\n0x1000 0x8 __TEXT __text\n# Symbols:\n0x1000 0x8 [ 1] _alpha\n"
+        linker = self.write_executable(
+            "ld-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('link ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')
+pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.encode() + b'\\x89 literal data\\n')""",
+        )
         toolchain = dataclasses.replace(
             self.toolchain,
-            zig=artifact_tool,
+            zig=zig,
+            otool=otool,
+            apple_ld=linker,
+            llvm_ar=ar,
+            llvm_profdata=profiler,
+            llvm_nm=nm,
+            sdk_version="15.5",
             opt=artifact_tool,
             llc=artifact_tool,
             strip=strip,
@@ -339,15 +598,54 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
                 "-machine-outliner-reruns=1 "
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_object}",
-                "artifact cc -target aarch64-macos -O2 -Wl,-dead_strip -s "
+                "probe cc -### -target aarch64-macos -O2 -Wl,-dead_strip -s "
                 f"{self.paths.profile_use_object} -o "
                 f"{self.paths.candidate_binary} -lc",
+                f"ar t {runtime}",
+                f"ar x {runtime}",
+                f"order order {self.paths.merged_profile} -o {self.paths.logs / 'candidate-profile.order'}",
+                f"symbols --defined-only --format=posix --radix=x {self.paths.profile_use_object}",
+                "link " + " ".join(temporal_candidate_link_argv(
+                    toolchain, self.paths,
+                    self.paths.candidate_binary.parent / "compiler-runtime" / "libcompiler_rt_zcu.o",
+                    self.good_link_contract(),
+                )[1:]),
                 f"strip -S -x {self.paths.candidate_binary}",
                 "codesign --force --sign - --options linker-signed "
                 f"--pagesize 16384 {self.paths.candidate_binary}",
             ],
             actions.read_text().splitlines(),
         )
+        self.assertEqual(b"compiler runtime", runtime.read_bytes())
+        self.assertEqual(b"instrumented runtime", (self.paths.compiler_runtime / "instrumented.o").read_bytes())
+        layout = json.loads((self.paths.logs / "candidate-layout.json").read_text())
+        self.assertEqual("26.4", layout["sdk_version"])
+        self.assertEqual("15.5", layout["sysroot_sdk_version"])
+        self.assertEqual(16777216, layout["main_stack_size"])
+        self.assertEqual(8, layout["ordered_bytes"])
+        self.assertIn(
+            sha256_file(runtime),
+            (self.paths.logs / "candidate-layout.json").read_text(),
+        )
+
+    def test_benchmark_candidate_keeps_the_zig_linker(self) -> None:
+        paths = PipelinePaths.create(self.root / "benchmark-link", selector="ui_activity")
+        artifact = self.write_executable(
+            "benchmark-tool",
+            """import pathlib,sys
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
+        )
+        noop = self.write_executable("noop", "pass")
+        toolchain = dataclasses.replace(
+            self.toolchain, zig=artifact, opt=artifact, llc=artifact,
+            strip=noop, codesign=noop,
+        )
+        paths.profile_use_bitcode.write_bytes(b'bitcode')
+        self.assertEqual(paths.candidate_binary, link_candidate(
+            toolchain, paths, require_release_safe_evidence=False,
+        ))
+        self.assertFalse((paths.logs / "candidate-runtime-probe.json").exists())
+        self.assertFalse((paths.logs / "candidate-layout.json").exists())
 
     def test_bitcode_hash_must_match_the_original(self) -> None:
         bitcode = self.root / "fx.bc"
@@ -426,6 +724,73 @@ output.write_bytes(b'merged profile')""",
                 self.paths,
                 "0" * 64,
             )
+
+    def test_fx_profile_use_outlines_two_name_hashed_partitions_in_sequence(self) -> None:
+        actions = self.root / "profile-actions"
+        opt = self.write_executable(
+            "profile-opt",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
+        )
+        split = self.write_executable(
+            "llvm-split",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('split ' + ' '.join(sys.argv[1:]) + '\\n')
+prefix = sys.argv[sys.argv.index('-o') + 1]
+pathlib.Path(prefix + '0').write_bytes(b'part zero')
+pathlib.Path(prefix + '1').write_bytes(b'part one')""",
+        )
+        link = self.write_executable(
+            "llvm-link",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('link ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'linked')""",
+        )
+        nm = self.write_executable(
+            "public-nm",
+            f"""import pathlib
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('nm\\n')
+print('__mh_execute_header W ---------------- 0')
+print('_main T ---------------- 0')""",
+        )
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            opt=opt,
+            llvm_split=split,
+            llvm_link=link,
+            llvm_nm=nm,
+        )
+        self.paths.bitcode.write_bytes(b"same bitcode")
+        self.paths.merged_profile.write_bytes(b"profile")
+
+        result = apply_profile(
+            toolchain,
+            self.paths,
+            sha256_file(self.paths.bitcode),
+        )
+
+        self.assertEqual(self.paths.profile_use_bitcode, result)
+        self.assertEqual(b"bitcode", result.read_bytes())
+        lines = actions.read_text().splitlines()
+        self.assertEqual(8, len(lines))
+        self.assertIn("-passes=default<O2>,mergefunc", lines[0])
+        self.assertNotIn("iroutliner", lines[0])
+        self.assertEqual("nm", lines[1])
+        self.assertTrue(lines[2].startswith("split -j 2 -o "))
+        self.assertIn("-passes=iroutliner", lines[3])
+        self.assertIn(str(self.paths.outline_split_bitcodes[0]), lines[3])
+        self.assertIn("-passes=iroutliner", lines[4])
+        self.assertIn(str(self.paths.outline_split_bitcodes[1]), lines[4])
+        self.assertTrue(lines[5].startswith("link "))
+        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[6])
+        self.assertEqual("nm", lines[7])
+        self.assertTrue((self.paths.logs / "public-symbols-before.json").is_file())
+        self.assertTrue((self.paths.logs / "public-symbols-after.json").is_file())
 
     def test_profile_use_rejects_optimizer_warnings(self) -> None:
         opt = self.write_executable(
@@ -528,9 +893,58 @@ sys.stderr.write('optimizer warning')""",
             signature_valid=True,
             architecture="arm64",
             min_macos="13.0",
-            load_commands="LC_BUILD_VERSION\nminos 13.0",
-            dependencies="/usr/lib/libSystem.B.dylib",
+            load_commands=(
+                "Load command 0\ncmd LC_BUILD_VERSION\nplatform 1\nminos 13.0\nsdk 26.4\n"
+                "Load command 1\ncmd LC_MAIN\nentryoff 1736\nstacksize 16777216\n"
+                "Load command 2\ncmd LC_LOAD_DYLIB\nname /usr/lib/libSystem.B.dylib (offset 24)\n"
+                "current version 1356.0.0\ncompatibility version 1.0.0\n"
+            ),
+            dependencies="fx:\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)",
         )
+
+    def good_link_contract(self) -> MacosLinkContract:
+        return parse_macos_link_contract(self.good_candidate_metadata().load_commands)
+
+    def test_candidate_metadata_accepts_the_complete_control_contract(self) -> None:
+        validate_candidate_metadata(self.good_candidate_metadata(), expected_minos="13.0", expected_contract=self.good_link_contract())
+
+    def test_link_contract_rejects_missing_or_duplicate_commands(self) -> None:
+        commands = self.good_candidate_metadata().load_commands
+        for invalid in (
+            commands.replace("sdk 26.4\n", ""),
+            commands.replace("platform 1", "platform 2"),
+            commands.replace("stacksize 16777216", "stacksize -1"),
+            commands.replace("stacksize 16777216", f"stacksize {1 << 64}"),
+            commands + "Load command 3\ncmd LC_MAIN\nentryoff 1736\nstacksize 16777216\n",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(PgsoError):
+                parse_macos_link_contract(invalid)
+
+    def test_candidate_metadata_rejects_library_version_drift(self) -> None:
+        metadata = self.good_candidate_metadata()
+        with self.assertRaisesRegex(PgsoError, "library dependencies"):
+            validate_candidate_metadata(
+                dataclasses.replace(metadata, load_commands=metadata.load_commands.replace("1356.0.0", "1351.0.0")),
+                expected_minos="13.0", expected_contract=self.good_link_contract(),
+            )
+
+    def test_candidate_metadata_rejects_sdk_compatibility_drift(self) -> None:
+        metadata = self.good_candidate_metadata()
+        with self.assertRaisesRegex(PgsoError, "SDK"):
+            validate_candidate_metadata(
+                dataclasses.replace(metadata, load_commands=metadata.load_commands.replace("sdk 26.4", "sdk 15.5")),
+                expected_minos="13.0",
+                expected_contract=self.good_link_contract(),
+            )
+
+    def test_candidate_metadata_rejects_lost_main_stack_request(self) -> None:
+        metadata = self.good_candidate_metadata()
+        with self.assertRaisesRegex(PgsoError, "stack"):
+            validate_candidate_metadata(
+                dataclasses.replace(metadata, load_commands=metadata.load_commands.replace("stacksize 16777216", "stacksize 0")),
+                expected_minos="13.0",
+                expected_contract=self.good_link_contract(),
+            )
 
     def test_candidate_metadata_rejects_missing_signature(self) -> None:
         with self.assertRaisesRegex(PgsoError, "code signature"):
@@ -540,6 +954,7 @@ sys.stderr.write('optimizer warning')""",
                     signature_valid=False,
                 ),
                 expected_minos="13.0",
+                expected_contract=self.good_link_contract(),
             )
 
     def test_candidate_metadata_rejects_wrong_architecture_or_minos(self) -> None:
@@ -556,6 +971,7 @@ sys.stderr.write('optimizer warning')""",
                             **{field: value},
                         ),
                         expected_minos="13.0",
+                        expected_contract=self.good_link_contract(),
                     )
 
     def test_candidate_metadata_rejects_profile_runtime_or_sections(self) -> None:
@@ -580,6 +996,7 @@ sys.stderr.write('optimizer warning')""",
                             **{field: value},
                         ),
                         expected_minos="13.0",
+                        expected_contract=self.good_link_contract(),
                     )
 
     def test_candidate_size_rejects_more_than_7_800_mib(self) -> None:

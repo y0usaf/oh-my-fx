@@ -2145,6 +2145,68 @@ pub const Grid = struct {
         if (!active_style.eql(.{})) try out.writeAll("\x1b[0m");
     }
 
+    /// Re-emit the occupied margin glyph without advancing, restoring lazy wrap
+    /// after cursor addressing. The caller enables autowrap and resumes source
+    /// presentation after this sequence; no terminal state is mutated here.
+    pub fn writePendingWrapRestore(self: Grid, row: u16, out: *std.Io.Writer) !void {
+        var col = self.cols;
+        var cell = self.cellAt(row, col) orelse return error.InvalidTranscriptTransition;
+        if (cell.width == 0 and col > 1) {
+            col -= 1;
+            cell = self.cellAt(row, col).?;
+        }
+        if (cell.width == 0 or cell.width - 1 != self.cols - col) {
+            return error.InvalidTranscriptTransition;
+        }
+        try out.print("\x1b[{d};{d}H", .{ row, col });
+        try emitSgrTransition(out, cell.style);
+        try emitHyperlinkTransition(out, self, 0, cell.style.hyperlink_id);
+        try emitCodepoint(out, cell.codepoint);
+        if (self.combiningSuffix(cell.combining_suffix_id)) |suffix| try out.writeAll(suffix);
+        if (cell.style.hyperlink_id != 0) try emitHyperlinkTransition(out, self, cell.style.hyperlink_id, 0);
+        if (!cell.style.eql(.{})) try out.writeAll("\x1b[0m");
+    }
+
+    test "append pending wrap restore accepts maximum terminal width" {
+        const alloc = std.testing.allocator;
+        var source = try Grid.init(alloc, std.math.maxInt(u16), 1);
+        defer source.deinit();
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try source.writePendingWrapRestore(1, &out.writer);
+        try std.testing.expect(std.mem.startsWith(u8, out.written(), "\x1b[1;65535H"));
+        try std.testing.expectEqual(@as(u8, ' '), out.written()[out.written().len - 1]);
+    }
+
+    test "append pending wrap restore preserves margin display cells and presentation" {
+        const alloc = std.testing.allocator;
+        const cases = [_][]const u8{
+            "12345678",
+            "123456界",
+            "1234567e\u{301}",
+            "123456\x1b[31m\x1b]8;;https://example.com\x1b\\界",
+        };
+        for (cases) |seed| {
+            var source = try Grid.init(alloc, 8, 2);
+            defer source.deinit();
+            try source.feed(seed);
+            var physical = try source.clone(alloc);
+            defer physical.deinit();
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try source.writePendingWrapRestore(1, &out.writer);
+            try physical.feed(out.written());
+            try std.testing.expect(physical.pending_wrap);
+            for (1..9) |col| {
+                try std.testing.expect(cellsEqual(source, source.cellAt(1, @intCast(col)).?, physical, physical.cellAt(1, @intCast(col)).?));
+            }
+            try std.testing.expect(physical.current_style.eql(.{}));
+            try physical.feed("X");
+            try std.testing.expectEqual(@as(u21, 'X'), physical.cellAt(2, 1).?.codepoint);
+            try std.testing.expect(physical.cellAt(2, 1).?.style.eql(.{}));
+        }
+    }
+
     /// Produce a deep copy of the cell grid. Cursor and parser state
     /// are reset to initial values — the clone is intended as a
     /// frame-buffer snapshot, not a resume point for the emulator.

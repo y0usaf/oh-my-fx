@@ -40,10 +40,10 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 35", 5_000);
+      const pane = await session.waitForText("Commands 34", 5_000);
       expect(pane).toContain("[All]");
-      expect(pane).toContain("Tab Category");
-      expect(pane).toContain("Enter Open");
+      expect(pane).toContain("tab category");
+      expect(pane).toContain("enter open");
       expect(pane).toContain("Run /help for commands");
     },
     TIMEOUT,
@@ -312,7 +312,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         port: 0,
         async fetch(request) {
           const body = await request.text();
-          if (body.includes('"method":"server/discover"')) discoveryRequests += 1;
+          if (body.includes('"method":"initialize"')) discoveryRequests += 1;
           return await new Promise<Response>(() => {});
         },
       });
@@ -437,7 +437,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       const initial = await session.waitForText("Welcome to fx", TIMEOUT);
       expect(initial).toContain("Sign in with Vercel");
       expect(initial).toContain("Add an API key");
-      expect(initial).toContain("Esc to set up later");
+      expect(initial).toContain("esc to set up later");
       expect(initial).not.toContain("Change team");
       expect(initial).not.toContain("Switch credential");
       expect(initial).not.toContain("Skip for now");
@@ -456,5 +456,280 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       expect(restarted).toContain("Add an API key");
     },
     60_000,
+  );
+});
+
+describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
+  async function startThemedSession(
+    root: string,
+    themeFiles: Record<string, unknown>,
+    options: { fxTheme?: string; settingsTheme?: string; colorFgBg: string },
+  ): Promise<{ pane: string; escapes: string; stderrPath: string }> {
+    const home = join(root, "home");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx", "themes"), { recursive: true });
+    for (const [file, contents] of Object.entries(themeFiles)) {
+      writeFileSync(join(home, ".fx", "themes", file), JSON.stringify(contents));
+    }
+    if (options.settingsTheme) {
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ theme: options.settingsTheme }),
+      );
+    }
+    writeFileSync(stderrPath, "");
+
+    session = await TmuxSession.create({
+      cwd: root,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "1",
+        FX_THEME: options.fxTheme,
+        COLORFGBG: options.colorFgBg,
+        COLORTERM: undefined,
+        TERM_PROGRAM: "Apple_Terminal",
+      },
+      stderrPath,
+      width: 100,
+      height: 30,
+    });
+    const pane = await session.waitForComposer(10_000);
+    const escapes = await session.capturePaneEscapes();
+    return { pane, escapes, stderrPath };
+  }
+
+  test(
+    "FX_THEME loads a VS Code theme file from ~/.fx/themes",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx", "themes"), { recursive: true });
+      writeFileSync(
+        join(home, ".fx", "themes", "e2e-accent.json"),
+        JSON.stringify({
+          name: "E2E Accent",
+          colors: { "editor.foreground": "#FF0000" },
+        }),
+      );
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+            FX_THEME: "e2e-accent",
+            COLORFGBG: "15;0",
+            COLORTERM: undefined,
+            TERM_PROGRAM: "Apple_Terminal",
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        const pane = await session.waitForComposer(10_000);
+        expect(pane).toContain("Run /help for commands");
+        const escapes = await session.capturePaneEscapes();
+        // editor.foreground #FF0000 quantizes to xterm-256 color 196 without
+        // truecolor (Apple_Terminal), and themes the hint text at startup.
+        expect(escapes).toContain("38;5;196");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "pinned theme swaps to its sibling variant on a mismatched terminal",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-swap-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-pair-dark.json": { name: "Pair Dark", type: "dark", colors: { hint: "#0000FF" } },
+            "e2e-pair-light.json": { name: "Pair Light", type: "light", colors: { hint: "#00FF00" } },
+          },
+          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal
+        );
+        expect(pane).toContain("Run /help for commands");
+        // The light sibling's hint (#00FF00 -> xterm-256 46) applies, not the
+        // pinned dark theme's (#0000FF -> 21).
+        expect(escapes).toContain("38;5;46");
+        expect(escapes).not.toContain("38;5;21");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "pinned theme falls back to the builtin variant when no sibling exists",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-fallback-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-pair-dark.json": { name: "Pair Dark", type: "dark", colors: { hint: "#0000FF" } },
+          },
+          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal, no e2e-pair-light.json on disk
+        );
+        expect(pane).toContain("Run /help for commands");
+        // Builtin fx-light hint, not the mismatched dark theme's blue.
+        expect(escapes).toContain("38;5;235");
+        expect(escapes).not.toContain("38;5;21");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a sibling whose declared variant also mismatches falls back to builtin",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-misdeclared-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-pair-dark.json": { name: "Pair Dark", type: "dark", colors: { hint: "#0000FF" } },
+            // Misdeclared: named -light but says dark, with a green marker.
+            "e2e-pair-light.json": { name: "Pair Light", type: "dark", colors: { hint: "#00FF00" } },
+          },
+          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal
+        );
+        expect(pane).toContain("Run /help for commands");
+        expect(escapes).toContain("38;5;235");
+        expect(escapes).not.toContain("38;5;46");
+        expect(escapes).not.toContain("38;5;21");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "settings.json theme applies without FX_THEME",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-settings-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-accent.json": { name: "E2E Accent", type: "dark", colors: { hint: "#FF0000" } },
+          },
+          { settingsTheme: "e2e-accent", colorFgBg: "15;0" }, // dark terminal, no FX_THEME
+        );
+        expect(pane).toContain("Run /help for commands");
+        // The configured theme's hint (#FF0000 -> xterm-256 196) applies.
+        expect(escapes).toContain("38;5;196");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "FX_THEME wins over the settings.json theme",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-precedence-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-accent.json": { name: "E2E Accent", type: "dark", colors: { hint: "#FF0000" } },
+          },
+          { settingsTheme: "e2e-accent", fxTheme: "dark", colorFgBg: "15;0" },
+        );
+        expect(pane).toContain("Run /help for commands");
+        // Builtin fx-dark hint (255), not the configured theme's red.
+        expect(escapes).toContain("38;5;255");
+        expect(escapes).not.toContain("38;5;196");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "settings-pinned variant ignores live terminal mode flips",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-pin-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {},
+          { settingsTheme: "dark", colorFgBg: "15;0" }, // dark terminal, pinned dark
+        );
+        expect(pane).toContain("Run /help for commands");
+        expect(escapes).toContain("38;5;255"); // fx-dark hint
+        expect(escapes).not.toContain("38;5;235"); // fx-light hint
+
+        // The terminal reports a light-mode change mid-session (DEC 997);
+        // a pinned variant must not follow it.
+        session!.sendKeysImmediate(["-H", "1b", "5b", "3f", "39", "39", "37", "3b", "32", "6e"]);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+
+        const after = await session!.capturePaneEscapes();
+        expect(after).toContain("38;5;255");
+        expect(after).not.toContain("38;5;235");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
   );
 });

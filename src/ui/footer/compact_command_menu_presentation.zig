@@ -172,7 +172,7 @@ fn composeUsageRow(
         return composeStyledRow(
             alloc,
             if (projection.refresh_error != null)
-                "Usage unavailable · press R to retry"
+                "Usage unavailable · press r to retry"
             else
                 "Loading usage",
             width,
@@ -262,7 +262,7 @@ fn composeUsagePriorityRow(
     const snapshot = projection.snapshot orelse return composeStyledRow(
         alloc,
         if (projection.refresh_error != null)
-            "Usage unavailable · press R to retry"
+            "Usage unavailable · press r to retry"
         else
             "Loading usage",
         width,

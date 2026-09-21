@@ -1,3 +1,6 @@
+import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { loadModule } from "./wasm-module.js";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const strictDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -7,8 +10,31 @@ const workspaceOutputLimit = 64 * 1024;
 const maxInstructionsBytes = 64 * 1024;
 const maxApiKeyBytes = 64 * 1024;
 const maxModelBytes = 1024;
+// Matches the kernel's ReasoningEffort.max_name_bytes.
+const maxEffortBytes = 64;
 const maxUrlBytes = 16 * 1024;
+const maxModelCatalogBytes = 4 * 1024 * 1024;
+const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
+const transportActivityIntervalMs = 250;
+const maxUnreadEventBytes = 1024 * 1024;
+const maxUnreadEvents = 256;
+// Prompt image limits mirror the host tool result image contract: the kernel
+// validates content, the SDK bounds the frame before it reaches the core.
+const maxPromptImages = 8;
+const maxPromptImageDataBytes = 5 * 1024 * 1024;
+const maxPromptImagesBytes = 8 * 1024 * 1024;
+// The core's ACP reader drops frames over 8 MiB without a request id to answer
+// (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. The
+// envelope allowance covers the method key and request id.
+const maxPromptFrameBytes = 8 * 1024 * 1024;
+const promptFrameEnvelopeBytes = 128;
+const maxSteeringMessageBytes = 64 * 1024;
+const maxSteeringMessages = 64;
+const maxSteeringQueueBytes = 1024 * 1024;
+// tool_start events carry a bounded preview of the tool input; larger inputs
+// are marked truncated instead of dropped or sent whole.
+const maxToolStartInputBytes = 64 * 1024;
 
 function boundedString(value, name, maxBytes, required) {
   if (value === undefined && !required) return undefined;
@@ -29,11 +55,33 @@ function validateGatewayChatUrl(value) {
   if (url.username || url.password || url.hash) {
     throw new TypeError("gatewayChatUrl must not contain credentials or a fragment");
   }
+  if (url.href === "https://ai-gateway.vercel.sh/v4/ai/language-model") return;
   if (url.href === "https://ai-gateway.vercel.sh/v3/ai/language-model") return;
   const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
   if (url.protocol !== "http:" || !loopback || !url.port) {
     throw new TypeError("gatewayChatUrl must use the canonical Gateway or explicit loopback HTTP");
   }
+}
+
+// Mirrors the kernel's ReasoningEffort.parse: "auto"/"adaptive"/"default" pick
+// the model default; anything else must be a bounded effort name.
+function normalizeEffort(value) {
+  if (value === undefined) return undefined;
+  boundedString(value, "effort", maxEffortBytes, false);
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new TypeError('effort must use only letters, digits, ".", "-", or "_"');
+  }
+  return value;
+}
+
+// Mirrors the CLI's --fast/--no-fast toggle: a strict boolean, with undefined
+// leaving the model default in place.
+function normalizeFast(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new TypeError("fast must be a boolean");
+  }
+  return value;
 }
 
 function normalizeAgentOptions(value) {
@@ -46,6 +94,8 @@ function normalizeAgentOptions(value) {
   }
   options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
   options.model = boundedString(options.model, "model", maxModelBytes, false);
+  options.effort = normalizeEffort(options.effort);
+  options.fast = normalizeFast(options.fast);
   validateGatewayChatUrl(options.gatewayChatUrl);
   return options;
 }
@@ -54,8 +104,108 @@ function agentEnvironment(options) {
   return {
     AI_GATEWAY_API_KEY: options.apiKey,
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
+    ...(options.effort === undefined ? {} : { FX_EFFORT: options.effort }),
+    ...(options.fast === undefined ? {} : { FX_FAST: options.fast ? "true" : "false" }),
     ...(options.gatewayChatUrl === undefined ? {} : { FX_GATEWAY_CHAT_URL: options.gatewayChatUrl }),
   };
+}
+
+// The kernel rejects an unsupported effort or fast lane during initialize;
+// these messages originate only from that validation, so the rejection is
+// safe to retype.
+function agentBootstrapError(error) {
+  if (error instanceof Error &&
+    (error.message === "Invalid reasoning effort" || error.message.startsWith("Reasoning effort"))) {
+    error.code ??= "LIBFX_UNSUPPORTED_EFFORT";
+  }
+  if (error instanceof Error && error.message.startsWith("Fast mode")) {
+    error.code ??= "LIBFX_UNSUPPORTED_FAST";
+  }
+  return error;
+}
+
+async function cancelResponseBody(response) {
+  try {
+    await response.body?.cancel();
+  } catch {}
+}
+
+async function readBoundedResponseText(response, limit) {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) {
+    await cancelResponseBody(response);
+    throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
+  }
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.length > limit) throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
+    return strictDecoder.decode(bytes);
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.length) continue;
+    total += value.length;
+    if (total > limit) {
+      try {
+        await reader.cancel();
+      } catch {}
+      throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return strictDecoder.decode(bytes);
+}
+
+export async function listModels(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("listModels() options must be an object");
+  }
+  const apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  const fetchModels = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  if (typeof fetchModels !== "function") throw new TypeError("fetch is unavailable");
+  const response = await fetchModels("https://ai-gateway.vercel.sh/coding-agent/v1/models", {
+    method: "GET",
+    headers: { authorization: `Bearer ${apiKey}` },
+  });
+  if (!response.ok) {
+    await cancelResponseBody(response);
+    throw new Error(`model catalog request failed with HTTP ${response.status}`);
+  }
+
+  let catalog;
+  try {
+    catalog = JSON.parse(await readBoundedResponseText(response, maxModelCatalogBytes));
+  } catch (error) {
+    if (error instanceof RangeError) throw error;
+    throw new TypeError("model catalog response is malformed");
+  }
+  if (!catalog || typeof catalog !== "object" || !Array.isArray(catalog.data)) {
+    throw new TypeError("model catalog response is malformed");
+  }
+  if (catalog.data.length > maxModelCatalogEntries) {
+    throw new RangeError(`model catalog exceeds the ${maxModelCatalogEntries} entry libfx limit`);
+  }
+
+  const ids = new Set();
+  for (const entry of catalog.data) {
+    if (!entry || typeof entry !== "object") continue;
+    if (typeof entry.type === "string" && entry.type.toLowerCase() !== "language") continue;
+    if (typeof entry.id !== "string" || entry.id.length === 0) continue;
+    if (encoder.encode(entry.id).length > maxModelBytes) continue;
+    ids.add(entry.id);
+  }
+  return [...ids].sort();
 }
 
 function validWorkspacePath(path) {
@@ -117,14 +267,83 @@ export function encodeXtermKeyEvent(event) {
     if (event.key === "Backspace") return `\x1b[127;${modifiers + 1}u`;
     const arrow = { ArrowUp: "A", ArrowDown: "B", ArrowRight: "C", ArrowLeft: "D" }[event.key];
     if (arrow) return `\x1b[1;${modifiers + 1}${arrow}`;
+    const shortcut = { a: 97, c: 99, x: 120, z: 122 }[event.key.toLowerCase()];
+    if (shortcut) return `\x1b[${shortcut};${modifiers + 1}u`;
   }
   return null;
+}
+
+function xtermPointerCell(term, event) {
+  const root = term.element;
+  const screen = root?.querySelector?.(".xterm-screen") || root;
+  const rect = screen?.getBoundingClientRect?.();
+  if (!rect || rect.width <= 0 || rect.height <= 0 || term.cols <= 0 || term.rows <= 0) return null;
+  if (event.clientX < rect.left || event.clientX >= rect.right ||
+    event.clientY < rect.top || event.clientY >= rect.bottom) return null;
+  return {
+    column: Math.min(term.cols, Math.floor((event.clientX - rect.left) * term.cols / rect.width) + 1),
+    row: Math.min(term.rows, Math.floor((event.clientY - rect.top) * term.rows / rect.height) + 1),
+  };
+}
+
+function installXtermClickHandler(term, callback) {
+  const element = term.element;
+  if (typeof element?.addEventListener !== "function") return () => {};
+  let pointerDown = null;
+  const down = (event) => {
+    if (event.button !== 0) return;
+    pointerDown = { id: event.pointerId, x: event.clientX, y: event.clientY };
+  };
+  const up = (event) => {
+    const start = pointerDown;
+    pointerDown = null;
+    if (!start || event.button !== 0 || event.pointerId !== start.id ||
+      event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+    const dx = event.clientX - start.x;
+    const dy = event.clientY - start.y;
+    if (dx * dx + dy * dy > 16) return;
+    if (term.modes?.mouseTrackingMode && term.modes.mouseTrackingMode !== "none") return;
+    const cell = xtermPointerCell(term, event);
+    if (!cell) return;
+    callback(`\x1b[<0;${cell.column};${cell.row}M\x1b[<0;${cell.column};${cell.row}m`);
+  };
+  const cancel = () => { pointerDown = null; };
+  element.addEventListener("pointerdown", down);
+  element.addEventListener("pointerup", up);
+  element.addEventListener("pointercancel", cancel);
+  return () => {
+    element.removeEventListener("pointerdown", down);
+    element.removeEventListener("pointerup", up);
+    element.removeEventListener("pointercancel", cancel);
+  };
+}
+
+function installXtermShortcutHandler(term, callback) {
+  const element = term.element;
+  if (typeof element?.addEventListener !== "function") return () => {};
+  const keydown = (event) => {
+    if (xtermSelectionOwnsShortcut(term, event)) return;
+    const data = encodeXtermKeyEvent(event);
+    if (data === null) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    callback(data);
+  };
+  element.addEventListener("keydown", keydown, true);
+  return () => element.removeEventListener("keydown", keydown, true);
+}
+
+function xtermSelectionOwnsShortcut(term, event) {
+  return event.type === "keydown" && event.metaKey &&
+    (event.key.toLowerCase() === "c" || event.key.toLowerCase() === "x") &&
+    term.hasSelection?.();
 }
 
 export function xtermAdapter(term) {
   let keyDataHandler = null;
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
+      if (xtermSelectionOwnsShortcut(term, event)) return true;
       const data = encodeXtermKeyEvent(event);
       if (data === null || keyDataHandler === null) return true;
       keyDataHandler(data);
@@ -136,7 +355,13 @@ export function xtermAdapter(term) {
     onData(callback) { const disposable = term.onData(callback); return () => disposable.dispose(); },
     onKeyData(callback) {
       keyDataHandler = callback;
-      return () => { if (keyDataHandler === callback) keyDataHandler = null; };
+      const removeShortcutHandler = installXtermShortcutHandler(term, callback);
+      const removeClickHandler = installXtermClickHandler(term, callback);
+      return () => {
+        removeShortcutHandler();
+        removeClickHandler();
+        if (keyDataHandler === callback) keyDataHandler = null;
+      };
     },
     get cols() { return term.cols; },
     get rows() { return term.rows; },
@@ -199,43 +424,6 @@ class ByteQueue {
   }
 }
 
-const modulePromisesBySource = new Map();
-const modulePromisesByObject = new WeakMap();
-
-async function compileModule(input) {
-  if (input instanceof WebAssembly.Module) return input;
-  if (typeof input === "string") input = fetch(input);
-  if (input instanceof Promise) input = await input;
-  if (input instanceof WebAssembly.Module) return input;
-  if (input instanceof Response) {
-    const contentType = input.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
-    if (contentType === "application/wasm" && typeof WebAssembly.compileStreaming === "function") {
-      return WebAssembly.compileStreaming(input);
-    }
-    const bytes = await input.arrayBuffer();
-    return WebAssembly.compile(bytes);
-  }
-  if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
-    return WebAssembly.compile(input);
-  }
-  throw new TypeError("wasm must be a URL, Response, ArrayBuffer, typed array, or WebAssembly.Module");
-}
-
-function loadModule(input) {
-  if (input instanceof WebAssembly.Module) return Promise.resolve(input);
-  const isString = typeof input === "string";
-  if (!isString && (typeof input !== "object" || input === null)) return compileModule(input);
-  const cache = isString ? modulePromisesBySource : modulePromisesByObject;
-  const cached = cache.get(input);
-  if (cached) return cached;
-  const pending = compileModule(input);
-  cache.set(input, pending);
-  pending.catch(() => {
-    if (cache.get(input) === pending) cache.delete(input);
-  });
-  return pending;
-}
-
 function raceWithTimeout(promise, timeoutMs, timeoutValue) {
   let timer;
   return new Promise((resolve, reject) => {
@@ -255,8 +443,14 @@ function yieldToHostTask() {
 }
 
 function createRuntime(options) {
+  // Creating this inside a Wasm call would retain that instance through the error stack.
+  const abortReason = new DOMException("This operation was aborted", "AbortError");
   const stdin = new ByteQueue();
   const streams = new Map();
+  const httpRequests = new Set();
+  const steering = [];
+  let steeringBytes = 0;
+  let steeringOpen = false;
   const workspaceExecs = new Set();
   const workspace = prepareWorkspaceAdapter(options.workspace);
   const args = ["fx", ...(options.args || [])];
@@ -266,7 +460,8 @@ function createRuntime(options) {
   let exitedResolve;
   let exitCode = null;
   let aborted = false;
-  let lineBuffer = "";
+  let coreOutput;
+  let outputError;
   const exited = new Promise((resolve) => { exitedResolve = resolve; });
   const markExited = (code) => {
     if (exitCode !== null) return;
@@ -296,7 +491,7 @@ function createRuntime(options) {
   }
 
   function emitStdout(chunk) {
-    if (options.stdout) options.stdout(chunk);
+    if (options.stdout) return options.stdout(chunk);
   }
 
   function fdWrite(fd, iovs, count, nwritten) {
@@ -306,6 +501,7 @@ function createRuntime(options) {
     for (let index = 0; index < count; index++) {
       total += view.getUint32(iovs + index * 8 + 4, true);
     }
+    if (coreOutput && total > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
     if (fd === 1 || fd === 2) {
       const chunk = new Uint8Array(total);
       let offset = 0;
@@ -315,7 +511,13 @@ function createRuntime(options) {
         chunk.set(bytes(ptr, len), offset);
         offset += len;
       }
-      if (fd === 1) emitStdout(chunk);
+      if (fd === 1) {
+        const pending = emitStdout(chunk);
+        if (coreOutput && pending) return Promise.resolve(pending).then(() => {
+          writeU32(nwritten, total);
+          return 0;
+        });
+      }
       else if (typeof options.stderr === "function") options.stderr(chunk);
       else console.warn(decoder.decode(chunk));
     }
@@ -461,6 +663,7 @@ function createRuntime(options) {
       state.readResult = null;
       if (done) return 0;
       if (!value?.length) return null;
+      options.onTransportChunk?.(value.length);
       return copy(value);
     };
     const immediate = consume();
@@ -483,20 +686,70 @@ function createRuntime(options) {
   }
 
   function httpRequest(methodPtr, methodLen, urlPtr, urlLen, headersPtr, headersLen, bodyPtr, bodyLen, statusOut, responsePtr, responseCap) {
-    return options.fetch(text(urlPtr, urlLen), {
-      method: text(methodPtr, methodLen),
-      headers: headersFromJson(headersPtr, headersLen),
-      body: bodyLen ? bytes(bodyPtr, bodyLen).slice() : undefined,
-    }).then(async (response) => {
+    const controller = new AbortController();
+    httpRequests.add(controller);
+    let onAbort;
+    const cancelled = new Promise((resolve) => {
+      onAbort = () => resolve(-1);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    const request = (async () => {
+      const response = await options.fetch(text(urlPtr, urlLen), {
+        method: text(methodPtr, methodLen),
+        headers: headersFromJson(headersPtr, headersLen),
+        body: bodyLen ? bytes(bodyPtr, bodyLen).slice() : undefined,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) {
+        void cancelResponseBody(response);
+        return -1;
+      }
       const body = new Uint8Array(await response.arrayBuffer());
+      if (controller.signal.aborted) return -1;
       new DataView(memory().buffer).setUint16(statusOut, response.status, true);
       if (body.length > responseCap) return -2;
       bytes(responsePtr, body.length).set(body);
       return body.length;
-    }).catch(() => -1);
+    })().catch(() => -1);
+    return Promise.race([request, cancelled]).finally(() => {
+      controller.signal.removeEventListener("abort", onAbort);
+      httpRequests.delete(controller);
+    });
   }
 
+  function clearSteering() {
+    steering.length = 0;
+    steeringBytes = 0;
+  }
+
+  function queueSteering(text) {
+    if (!steeringOpen) throw new Error("no prompt is running");
+    const value = encoder.encode(text);
+    if (value.length === 0) throw new TypeError("steering text cannot be empty");
+    if (value.length > maxSteeringMessageBytes) {
+      throw new RangeError(`steering text exceeds the ${maxSteeringMessageBytes} byte libfx limit`);
+    }
+    if (steering.length >= maxSteeringMessages || value.length > maxSteeringQueueBytes - steeringBytes) {
+      throw new Error("steering queue is full");
+    }
+    steering.push(value);
+    steeringBytes += value.length;
+  }
+
+  function steeringTake(outputPtr, outputCap) {
+    const value = steering[0];
+    if (!value) return 0;
+    const output = checkedBytes(outputPtr, outputCap);
+    if (!output || value.length > output.length) return -1;
+    output.subarray(0, value.length).set(value);
+    steering.shift();
+    steeringBytes -= value.length;
+    return value.length;
+  }
+
+  let pendingHostToolResult = null;
   function hostToolCall(namePtr, nameLen, argumentsPtr, argumentsLen, outputPtr, outputCap, statusPtr) {
+    pendingHostToolResult = null;
     if (typeof options.hostToolExecutor !== "function") return -1;
     if (options.traceWasi) console.error("fx host tool call start");
     let input;
@@ -505,9 +758,13 @@ function createRuntime(options) {
       if (options.traceWasi) console.error("fx host tool call settled", result.cancelled, result.isError);
       if (result.cancelled) return -2;
       const output = encoder.encode(result.content);
-      if (output.length > outputCap) return -3;
+      bytes(statusPtr, 1)[0] = (result.isError ? 1 : 0) + (result.rich ? 2 : 0);
+      if (output.length > outputCap) {
+        if (!result.rich || output.length > 8 * 1024 * 1024) return -3;
+        pendingHostToolResult = output;
+        return output.length;
+      }
       bytes(outputPtr, output.length).set(output);
-      bytes(statusPtr, 1)[0] = result.isError ? 1 : 0;
       return output.length;
     }).catch(() => -1);
   }
@@ -516,6 +773,23 @@ function createRuntime(options) {
     if (typeof options.openUrl !== "function") return 0;
     return Promise.resolve().then(() => options.openUrl(text(urlPtr, urlLen))).then((accepted) =>
       accepted === false ? 0 : 1).catch(() => 0);
+  }
+
+  function clipboardCopy(valuePtr, valueLen) {
+    let clipboard = options.clipboard;
+    if (clipboard === undefined) {
+      try { clipboard = globalThis.navigator?.clipboard; } catch { clipboard = null; }
+    }
+    if (typeof clipboard?.writeText !== "function") return Promise.resolve(0);
+    const value = text(valuePtr, valueLen);
+    return Promise.resolve().then(() => clipboard.writeText(value)).then((accepted) => {
+      if (accepted === false) return 0;
+      options.emit?.("clipboard.copy", { length: value.length });
+      return 1;
+    }).catch((error) => {
+      options.emit?.("clipboard.copy_error", { error });
+      return 0;
+    });
   }
 
   function oauthSessionLoad(outPtr, outCap, revisionPtr, revisionCap, revisionLenOut) {
@@ -771,7 +1045,9 @@ function createRuntime(options) {
   }
 
   function abortHostEffects() {
-    streams.forEach((state) => state.controller.abort());
+    pendingHostToolResult = null;
+    streams.forEach((state) => state.controller.abort(abortReason));
+    httpRequests.forEach((controller) => controller.abort(abortReason));
     workspaceExecs.forEach((state) => state.abort(-3));
   }
 
@@ -781,7 +1057,7 @@ function createRuntime(options) {
     args_get(ptrs, data) { if (options.traceWasi) console.error("wasi args_get"); writeVector(args, ptrs, data); return 0; },
     environ_sizes_get(count, size) { if (options.traceWasi) console.error("wasi environ_sizes_get"); writeU32(count, env.length); writeU32(size, env.reduce((n, v) => n + encoder.encode(v).length + 1, 0)); return 0; },
     environ_get(ptrs, data) { if (options.traceWasi) console.error("wasi environ_get"); writeVector(env, ptrs, data); return 0; },
-    fd_write: fdWrite,
+    fd_write: options.args?.[0] === "acp" ? new WebAssembly.Suspending(fdWrite) : fdWrite,
     fd_read: new WebAssembly.Suspending(fdRead),
     fd_close() { return 0; },
     fd_fdstat_get(fd, out) {
@@ -822,6 +1098,7 @@ function createRuntime(options) {
 
   const fx = {
     fx_term_poll_input: new WebAssembly.Suspending(termPollInput),
+    fx_clipboard_copy: new WebAssembly.Suspending(clipboardCopy),
     fx_prompt_history_available() { return options.promptHistoryStore ? 1 : 0; },
     fx_workspace_available() { return workspace.present ? 1 : 0; },
     fx_workspace_info: workspaceInfo,
@@ -829,9 +1106,18 @@ function createRuntime(options) {
     fx_http_stream_open: streamOpen,
     fx_http_stream_status: new WebAssembly.Suspending(streamStatus),
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),
-    fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(); streams.delete(handle); },
+    fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
     fx_http_request: new WebAssembly.Suspending(httpRequest),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
+    fx_host_tool_result_read(offset, ptr, cap) {
+      if (!pendingHostToolResult || offset < 0 || offset > pendingHostToolResult.length) return -1;
+      const chunk = pendingHostToolResult.subarray(offset, offset + cap);
+      bytes(ptr, chunk.length).set(chunk);
+      return chunk.length;
+    },
+    fx_host_tool_result_release() { pendingHostToolResult = null; },
+    fx_steering_take: steeringTake,
+    fx_steering_close() { steeringOpen = false; clearSteering(); },
     fx_open_url: new WebAssembly.Suspending(openUrl),
     fx_oauth_session_load: new WebAssembly.Suspending(oauthSessionLoad),
     fx_oauth_session_commit: new WebAssembly.Suspending(oauthSessionCommit),
@@ -859,10 +1145,15 @@ function createRuntime(options) {
     setInstance(value) { instance = value; },
     write(data) { stdin.push(typeof data === "string" ? encoder.encode(data) : data); },
     wake() { stdin.wake(); },
-    closeStdin() { stdin.close(); },
+    closeStdin() { steeringOpen = false; clearSteering(); stdin.close(); },
+    openSteering() { clearSteering(); steeringOpen = true; },
+    steer: queueSteering,
+    closeSteering() { steeringOpen = false; clearSteering(); },
     abortHostEffects,
-    abort() {
+    abort(error) {
       aborted = true;
+      outputError = error;
+      coreOutput?.close();
       abortHostEffects();
       stdin.close();
       markExited(130);
@@ -870,17 +1161,12 @@ function createRuntime(options) {
     markExited,
     get aborted() { return aborted; },
     get exitCode() { return exitCode; },
+    get error() { return outputError; },
     setLineHandler(handler) {
-      options.stdout = (chunk) => {
-        lineBuffer += decoder.decode(chunk, { stream: true });
-        for (;;) {
-          const newline = lineBuffer.indexOf("\n");
-          if (newline < 0) break;
-          const line = lineBuffer.slice(0, newline); lineBuffer = lineBuffer.slice(newline + 1);
-          if (line) handler(JSON.parse(line));
-        }
-      };
+      coreOutput = new CoreOutput(handler);
+      options.stdout = (chunk) => coreOutput.write(chunk);
     },
+    finishOutput() { coreOutput?.finish(); },
   };
 }
 
@@ -892,10 +1178,21 @@ async function instantiate(options) {
   runtime.setInstance(instance);
   const start = WebAssembly.promising(instance.exports._start);
   start().then(
-    () => runtime.markExited(0),
+    () => {
+      runtime.setInstance(null);
+      try { runtime.finishOutput(); runtime.markExited(0); }
+      catch (error) { runtime.abort(error); }
+    },
     (error) => {
-      if (!String(error).includes("proc_exit")) console.error(error);
-      runtime.markExited(runtime.aborted ? 130 : 1);
+      runtime.setInstance(null);
+      if (options.args?.[0] === "acp" && !String(error).includes("proc_exit")) runtime.abort(error);
+      else {
+        if (!String(error).includes("proc_exit")) {
+          runtime.abortHostEffects();
+          console.error(error);
+        }
+        runtime.markExited(runtime.aborted ? 130 : 1);
+      }
     },
   );
   return runtime;
@@ -937,13 +1234,13 @@ export async function createFxTerminal(options) {
     if (interruptKey && data.includes(interruptKey)) runtime.abortHostEffects();
     runtime.write(data);
   };
-  const unsubscribeData = options.terminal.onData(forwardData);
-  const unsubscribeKeyData = options.terminal.onKeyData?.(forwardData) ?? (() => {});
   const signalResize = () => {
     emit("terminal.resize", { cols: options.terminal.cols, rows: options.terminal.rows });
     runtime.wake();
   };
-  const unsubscribeResize = options.terminal.onResize(signalResize);
+  let unsubscribeData;
+  let unsubscribeKeyData;
+  let unsubscribeResize;
   let subscriptionsReleased = false;
   const releaseSubscriptions = () => {
     if (subscriptionsReleased) return;
@@ -956,6 +1253,17 @@ export async function createFxTerminal(options) {
     releaseSubscriptions();
     emit("runtime.exit", { surface: "terminal", code });
   });
+  try {
+    unsubscribeData = options.terminal.onData(forwardData);
+    unsubscribeKeyData = options.terminal.onKeyData?.(forwardData);
+    unsubscribeResize = options.terminal.onResize(signalResize);
+  } catch (error) {
+    // The rejected factory never transfers this promise to a caller.
+    interactive.catch(() => {});
+    releaseSubscriptions();
+    runtime.abort();
+    throw error;
+  }
   return {
     interactive,
     exited: runtime.exited,
@@ -971,9 +1279,30 @@ export async function createFxTerminal(options) {
 function normalizePromptInput(input) {
   if (typeof input === "string") return [{ type: "text", text: input }];
   if (!Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of prompt blocks");
+  let imageCount = 0;
+  let imageBytes = 0;
   return input.map((block, index) => {
     if (!block || typeof block !== "object") throw new TypeError(`prompt block ${index} must be an object`);
-    if (block.type === "image") throw new TypeError("image prompt blocks are unsupported");
+    if (block.type === "image") {
+      if (typeof block.data !== "string" || block.data.length === 0) {
+        throw new TypeError(`image prompt block ${index} requires base64 data`);
+      }
+      if (typeof block.mimeType !== "string" || block.mimeType.length === 0 || block.mimeType.length > 128) {
+        throw new TypeError(`image prompt block ${index} requires a mimeType`);
+      }
+      if (block.data.length > maxPromptImageDataBytes) {
+        throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageDataBytes} byte per-image libfx limit`);
+      }
+      imageCount += 1;
+      if (imageCount > maxPromptImages) {
+        throw new RangeError(`prompt cannot contain more than ${maxPromptImages} images`);
+      }
+      imageBytes += block.data.length;
+      if (imageBytes > maxPromptImagesBytes) {
+        throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
+      }
+      return { type: "image", data: block.data, mimeType: block.mimeType };
+    }
     if (block.type === "text") {
       if (typeof block.text !== "string") throw new TypeError(`text prompt block ${index} requires text`);
       return { type: "text", text: block.text };
@@ -988,19 +1317,42 @@ function normalizePromptInput(input) {
   });
 }
 
+function normalizeSteeringInput(input) {
+  const blocks = normalizePromptInput(input);
+  if (blocks.some((block) => block.type !== "text")) {
+    throw new TypeError("steering accepts only text blocks");
+  }
+  const text = blocks.map((block) => block.text).join("\n");
+  if (text.length === 0) throw new TypeError("steering text cannot be empty");
+  if (encoder.encode(text).length > maxSteeringMessageBytes) {
+    throw new RangeError(`steering text exceeds the ${maxSteeringMessageBytes} byte libfx limit`);
+  }
+  return text;
+}
+
 function normalizeHostTools(value) {
   if (value === undefined) return { descriptors: [], executors: new Map() };
   if (!Array.isArray(value)) throw new TypeError("tools must be an array");
   if (value.length > 64) throw new RangeError("tools cannot contain more than 64 entries");
   const descriptors = [];
   const executors = new Map();
+  const names = new Set();
   for (const [index, tool] of value.entries()) {
     if (!tool || typeof tool !== "object") throw new TypeError(`tool ${index} must be an object`);
-    const { name, description, inputSchema, execute } = tool;
+    const { name, description, inputSchema, execute, providerExecuted } = tool;
     if (typeof name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
       throw new TypeError(`tool ${index} has an invalid name`);
     }
-    if (executors.has(name)) throw new TypeError(`duplicate tool name: ${name}`);
+    if (names.has(name)) throw new TypeError(`duplicate tool name: ${name}`);
+    names.add(name);
+    if (providerExecuted !== undefined && typeof providerExecuted !== "boolean") {
+      throw new TypeError(`tool ${name} providerExecuted must be a boolean`);
+    }
+    if (providerExecuted === true) {
+      if (execute !== undefined) throw new TypeError(`provider-executed tool ${name} must not define execute()`);
+      descriptors.push({ name, providerExecuted: true });
+      continue;
+    }
     if (typeof description !== "string") throw new TypeError(`tool ${name} requires a description`);
     if (typeof execute !== "function") throw new TypeError(`tool ${name} requires execute()`);
     if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
@@ -1033,10 +1385,27 @@ function normalizeInstructions(value) {
 }
 
 function hostToolContent(value) {
-  if (typeof value === "string") return value;
-  if (value === undefined) return "null";
+  if (value?.type === "libfx.tool-result") {
+    if (typeof value.text !== "string" || !Array.isArray(value.images) || value.images.length > 8) {
+      throw new TypeError("invalid typed tool result");
+    }
+    let imageBytes = 0;
+    const images = value.images.map((image) => {
+      if (image?.type !== "image" || typeof image.data !== "string" || typeof image.mimeType !== "string" || image.mimeType.length > 128 || image.data.length > 5 * 1024 * 1024) {
+        throw new TypeError("invalid tool image");
+      }
+      imageBytes += image.data.length;
+      if (imageBytes > 8 * 1024 * 1024) throw new RangeError("tool images exceed the result limit");
+      return { type: "image", data: image.data, mimeType: image.mimeType };
+    });
+    const content = JSON.stringify({ text: value.text, images });
+    if (new TextEncoder().encode(content).length > 8 * 1024 * 1024) throw new RangeError("typed tool result exceeds the result limit");
+    return { content, rich: true, isError: value.isError === true };
+  }
+  if (typeof value === "string") return { content: value, rich: false };
+  if (value === undefined) return { content: "null", rich: false };
   const encoded = JSON.stringify(value);
-  return encoded === undefined ? "null" : encoded;
+  return { content: encoded === undefined ? "null" : encoded, rich: false };
 }
 
 function checkpointBytes(value) {
@@ -1074,35 +1443,127 @@ export async function createFxAgent(options = {}) {
   let sessionId = null;
   let activeTurn = null;
   let closing = false;
+  const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
+  };
+  const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  const transportFetch = async (input, init = {}) => {
+    const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
+    let endpoint = String(input?.url ?? input);
+    try {
+      const url = new URL(endpoint);
+      endpoint = `${url.origin}${url.pathname}`;
+    } catch {}
+    for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
+      const startedAt = performance.now();
+      const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
+      if (activeTurn) {
+        activeTurn.transportBytes = 0;
+        activeTurn.lastTransportActivityAt = null;
+      }
+      emit("transport.start", { attempt, method, endpoint, model: options.model });
+      try {
+        if (activeTurn?.cancelled) {
+          runtime.abortHostEffects();
+          throw new DOMException("Aborted", "AbortError");
+        }
+        if (!hostFetch) throw new TypeError("fetch is unavailable");
+        const response = await hostFetch(input, init);
+        const headers = response.headers;
+        emit("transport.response", {
+          attempt,
+          status: response.status,
+          elapsedMs: performance.now() - startedAt,
+          requestId: headers.get("x-vercel-id"),
+          generationId: headers.get("x-generation-id"),
+          model: headers.get("x-model-id") ?? options.model,
+          provider: headers.get("x-vercel-ai-gateway-provider") ?? headers.get("x-ai-gateway-provider"),
+        });
+        return response;
+      } catch (error) {
+        const errorName = error instanceof Error ? error.name : "Error";
+        const elapsedMs = performance.now() - startedAt;
+        emit("transport.error", { attempt, elapsedMs, error: errorName });
+        if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        if (attemptIndex === 1) throw error;
+        emit("transport.retry", {
+          attempt,
+          nextAttempt: attempt + 1,
+          elapsedMs,
+          error: errorName,
+        });
+        if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      }
+    }
+    throw new Error("transport retry exhausted");
   };
   const executeHostTool = async (name, input, requestedSessionId) => {
     const execute = hostTools.executors.get(name);
     const turn = requestedSessionId === undefined || requestedSessionId === sessionId
       ? activeTurn
       : null;
+    if (!isCurrentTurn(turn)) return { content: "", isError: true, cancelled: true };
     const controller = new AbortController();
-    turn?.toolControllers.add(controller);
-    let content;
+    turn.toolControllers.add(controller);
+    let onAbort;
+    const aborted = new Promise((resolve) => { onAbort = () => resolve(); });
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    let content = "";
+    let rich = false;
     let isError = false;
     try {
       if (!execute) throw new Error(`unknown host tool: ${String(name)}`);
-      content = hostToolContent(await execute(input, { signal: controller.signal }));
+      const execution = Promise.resolve().then(() => {
+        if (controller.signal.aborted || !isCurrentTurn(turn)) return;
+        return execute(input, { signal: controller.signal });
+      });
+      const value = await Promise.race([execution, aborted]);
+      if (!controller.signal.aborted) {
+        const normalized = hostToolContent(value);
+        content = normalized.content;
+        rich = normalized.rich;
+        isError = normalized.isError === true;
+      }
     } catch (error) {
       isError = true;
-      content = error instanceof Error ? error.message : String(error);
+      if (error?.toolResult?.type === "libfx.tool-result") {
+        try {
+          const normalized = hostToolContent(error.toolResult);
+          content = normalized.content;
+          rich = normalized.rich;
+        } catch {
+          content = error instanceof Error ? error.message : String(error);
+        }
+      } else {
+        content = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      turn?.toolControllers.delete(controller);
+      controller.signal.removeEventListener("abort", onAbort);
+      turn.toolControllers.delete(controller);
     }
-    return { content, isError, cancelled: controller.signal.aborted };
+    return { content, isError, rich, cancelled: controller.signal.aborted || !isCurrentTurn(turn) };
   };
   emit("runtime.start");
   const runtimeOptions = {
     ...options,
+    fetch: transportFetch,
     args: ["acp"],
     env: agentEnvironment(options),
     hostToolExecutor: executeHostTool,
+    onTransportChunk(byteLength) {
+      const turn = activeTurn;
+      if (!isCurrentTurn(turn) || !Number.isSafeInteger(byteLength) || byteLength <= 0) return;
+      turn.transportBytes += byteLength;
+      const now = performance.now();
+      if (turn.lastTransportActivityAt !== null && now - turn.lastTransportActivityAt < transportActivityIntervalMs) return;
+      turn.lastTransportActivityAt = now;
+      emit("transport.activity", {
+        attempt: turn.transportAttempts,
+        chunkBytes: byteLength,
+        totalBytes: turn.transportBytes,
+      });
+    },
   };
   const runtime = options.runtimeFactory
     ? await options.runtimeFactory(runtimeOptions)
@@ -1120,37 +1581,50 @@ export async function createFxAgent(options = {}) {
   });
   runtime.exited.then((code) => {
     emit("runtime.exit", { code });
-    const error = new Error(`fx-core exited with code ${code} before completing the ACP request`);
+    closing = true;
+    const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
   });
-  runtime.setLineHandler(async (message) => {
+  runtime.setLineHandler((message, size) => {
     emit("acp.receive", { message });
     if (message.method === "session/update") {
-      if (message.params.sessionId === sessionId) activeTurn?.push(message.params.update);
+      if (message.params.sessionId === sessionId) return activeTurn?.push(message.params.update, size);
       return;
     }
+    void handleControlMessage(message).catch((error) => runtime.abort(error));
+  });
+  async function handleControlMessage(message) {
     if (message.method === "session/request_permission") {
+      const turn = activeTurn;
+      if (!isCurrentTurn(turn)) return;
       emit("permission.request", { request: message.params });
+      if (!isCurrentTurn(turn)) return;
       let optionId = null;
       try { optionId = await options.onPermission?.(message.params); } catch {}
+      if (!isCurrentTurn(turn)) return;
       emit("permission.resolve", { optionId });
+      if (!isCurrentTurn(turn)) return;
       send({ jsonrpc: "2.0", id: message.id, result: optionId ? { outcome: { outcome: "selected", optionId } } : { outcome: { outcome: "cancelled" } } });
       return;
     }
     if (message.method === "libfx/tool_call") {
-      const { content, isError, cancelled } = await executeHostTool(
+      const { content, isError, rich, cancelled } = await executeHostTool(
         message.params?.name,
         message.params?.input,
         message.params?.sessionId,
       );
       if (cancelled || closing) return;
-      send({ jsonrpc: "2.0", id: message.id, result: { content, isError } });
+      const response = { jsonrpc: "2.0", id: message.id, result: { content, isError, ...(rich ? { contentType: "rich" } : {}) } };
+      if (encoder.encode(JSON.stringify(response)).length + 1 > 8 * 1024 * 1024) {
+        response.result = { content: "Host tool result exceeded the response frame limit", isError: true };
+      }
+      send(response);
       return;
     }
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);
     if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
-  });
+  }
   try {
     await request("initialize", {
       protocolVersion: 1,
@@ -1174,7 +1648,7 @@ export async function createFxAgent(options = {}) {
     try { runtime.abortHostEffects(); } catch {}
     try { runtime.closeStdin(); } catch {}
     try { await runtime.exited; } catch {}
-    throw error;
+    throw agentBootstrapError(error);
   }
 
   const agent = {
@@ -1215,6 +1689,9 @@ export async function createFxAgent(options = {}) {
         const delta = update.content?.text;
         return delta ? { type: "reasoning_delta", delta } : null;
       }
+      if (update.sessionUpdate === "user_message_chunk" && update.content?.type === "text") {
+        return { type: "user_message", text: update.content.text };
+      }
       if (update.sessionUpdate === "tool_call") {
         toolNames.set(update.toolCallId, update.name || update.toolName || update.title || "tool");
         if (started.has(update.toolCallId)) return null;
@@ -1223,6 +1700,7 @@ export async function createFxAgent(options = {}) {
           type: "tool_start",
           id: update.toolCallId,
           name: toolNames.get(update.toolCallId),
+          ...toolStartInput(update.rawInput),
         };
       }
       if (update.sessionUpdate === "tool_call_update" &&
@@ -1238,18 +1716,29 @@ export async function createFxAgent(options = {}) {
       }
       return null;
     };
+    const result = rawTurn.result.then((value) => ({
+      stopReason: value.stopReason,
+      usage: normalizeTurnUsage(value.usage),
+    }));
+    void result.catch(() => {});
     return {
       cancel() { rawTurn.cancel(); },
-      async *[Symbol.asyncIterator]() {
-        for await (const update of rawTurn) {
-          const event = eventFor(update);
-          if (event) yield event;
-        }
+      steer(input) { return rawTurn.steer(normalizeSteeringInput(input)); },
+      [Symbol.asyncIterator]() {
+        const iterator = (async function* () {
+          for await (const update of rawTurn) {
+            const event = eventFor(update);
+            if (event) yield event;
+          }
+        })();
+        return {
+          next(value) { return iterator.next(value); },
+          return(value) { rawTurn.cancel(); return iterator.return(value); },
+          throw(error) { rawTurn.cancel(); return iterator.throw(error); },
+          [Symbol.asyncIterator]() { return this; },
+        };
       },
-      result: rawTurn.result.then((result) => ({
-        stopReason: result.stopReason,
-        usage: normalizeTurnUsage(result.usage),
-      })),
+      result,
     };
   }
 
@@ -1263,44 +1752,139 @@ export async function createFxAgent(options = {}) {
     return result;
   }
 
+  // The input object rides the event when it fits the preview budget; larger
+  // inputs become a bounded JSON prefix plus an explicit marker.
+  function toolStartInput(rawInput) {
+    if (rawInput === undefined || rawInput === null) return {};
+    const serialized = JSON.stringify(rawInput);
+    if (serialized === undefined) return {};
+    const bytes = encoder.encode(serialized);
+    if (bytes.length <= maxToolStartInputBytes) return { input: rawInput };
+    return { inputTruncated: true, inputPreview: decoder.decode(utf8Prefix(bytes, maxToolStartInputBytes)) };
+  }
+
   function startTurn(input, promptOptions) {
     const prompt = normalizePromptInput(input);
+    if (encoder.encode(JSON.stringify({ sessionId: "", prompt })).length + promptFrameEnvelopeBytes > maxPromptFrameBytes) {
+      throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
+    }
     const signal = promptOptions.signal;
     if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
     const queue = [];
     const waiters = [];
+    let queuedBytes = 0;
+    let resumeOutput;
+    let iteratorTaken = false;
+    let terminalError;
+    let reportedPressure = false;
+    let discardedBytes = 0;
     const toolControllers = new Set();
     let finished = false;
     let cancelled = false;
     const turn = {
-      push(update) { const waiter = waiters.shift(); if (waiter) waiter({ value: update, done: false }); else queue.push(update); },
+      push(update, size = encoder.encode(JSON.stringify(update)).length) {
+        if (cancelled || finished) { discardedBytes += size; return; }
+        if (size > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
+        if (queue.length && (queue.length >= maxUnreadEvents || size > maxUnreadEventBytes - queuedBytes)) {
+          const capacity = new Promise((resolveCapacity) => { resumeOutput = resolveCapacity; });
+          if (!reportedPressure) {
+            reportedPressure = true;
+            emit("output.backpressure", { bufferedBytes: queuedBytes, bufferedEvents: queue.length });
+          }
+          return capacity.then(() => turn.push(update, size));
+        }
+        const waiter = waiters.shift();
+        if (waiter) waiter.resolve({ value: update, done: false });
+        else { queue.push({ update, size }); queuedBytes += size; }
+      },
       toolControllers,
+      transportAttempts: 0,
+      transportBytes: 0,
+      lastTransportActivityAt: null,
+      get cancelled() { return cancelled; },
+      steer(text) {
+        if (finished || cancelled || activeTurn !== turn) {
+          return Promise.reject(new Error("no prompt is running"));
+        }
+        let accepted;
+        try {
+          if (typeof runtime.steer === "function") {
+            runtime.steer(text);
+            void turn.push({
+              sessionUpdate: "user_message_chunk",
+              content: { type: "text", text },
+            });
+            accepted = Promise.resolve();
+          } else {
+            accepted = request("libfx/steer", { sessionId, text });
+          }
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        return accepted;
+      },
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
+        runtime.closeSteering?.();
+        resumeOutput?.();
+        resumeOutput = null;
         send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
         for (const controller of toolControllers) controller.abort();
         runtime.abortHostEffects();
       },
-      [Symbol.asyncIterator]() { return { next() { if (queue.length) return Promise.resolve({ value: queue.shift(), done: false }); if (finished) return Promise.resolve({ done: true }); return new Promise((resolve) => waiters.push(resolve)); } }; },
+      [Symbol.asyncIterator]() {
+        if (iteratorTaken) throw new Error("a turn has only one event consumer");
+        iteratorTaken = true;
+        return {
+          next() {
+            if (queue.length) {
+              const { update, size } = queue.shift();
+              queuedBytes -= size;
+              resumeOutput?.();
+              resumeOutput = null;
+              return Promise.resolve({ value: update, done: false });
+            }
+            if (terminalError) return Promise.reject(terminalError);
+            if (finished) return Promise.resolve({ done: true });
+            return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+          },
+          return() { turn.cancel(); return Promise.resolve({ done: true }); },
+        };
+      },
     };
+    if (signal?.aborted) {
+      finished = true;
+      turn.result = Promise.resolve({ stopReason: "cancelled" });
+      return turn;
+    }
     activeTurn = turn;
+    runtime.openSteering?.();
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });
     turn.result = request("session/prompt", { sessionId, prompt })
-      .then((response) => ({ stopReason: response.stopReason, usage: response.usage }))
+      .then((response) => ({ stopReason: cancelled ? "cancelled" : response.stopReason, usage: response.usage }))
       .catch((error) => {
         if (error.message === "Cancelled") return { stopReason: "cancelled" };
+        terminalError = error;
         throw error;
       })
       .finally(() => {
         finished = true;
+        resumeOutput?.();
+        resumeOutput = null;
         signal?.removeEventListener("abort", abort);
         if (activeTurn === turn) activeTurn = null;
+        runtime.closeSteering?.();
         toolControllers.clear();
-        waiters.splice(0).forEach((resolve) => resolve({ done: true }));
+        if (discardedBytes) emit("output.discarded", { reason: "cancelled", bytes: discardedBytes });
+        for (const waiter of waiters.splice(0)) {
+          if (terminalError) waiter.reject(terminalError);
+          else waiter.resolve({ done: true });
+        }
       });
     if (signal?.aborted) turn.cancel();
+    void turn.result.catch(() => {});
     return turn;
   }
 }

@@ -23,6 +23,11 @@ pub fn deinitList(alloc: std.mem.Allocator, list: anytype) void {
     list.* = undefined;
 }
 
+/// Drop-in replacement for `arena.deinit()` at cleanup-heavy call sites.
+pub noinline fn deinit_arena(arena: std.heap.ArenaAllocator) void {
+    arena.deinit();
+}
+
 noinline fn freeErased(
     alloc: std.mem.Allocator,
     ptr: [*]u8,
@@ -60,4 +65,10 @@ test "deinitList on a never-grown list is a no-op" {
     const alloc = std.testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     deinitList(alloc, &list);
+}
+
+test "deinit_arena releases arena allocations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    _ = try arena.allocator().alloc(u8, 16);
+    deinit_arena(arena);
 }

@@ -297,7 +297,7 @@ pub fn migrateV1ToV2(alloc: Allocator, state: State) !State {
         try mergeMigrationCandidate(alloc, &migrated, rule, key);
     }
 
-    std.mem.sort(Rule, migrated.rules.items, {}, ruleIdLessThan);
+    std.mem.sortUnstable(Rule, migrated.rules.items, {}, ruleIdLessThan);
     try validateSchema(migrated, schema_version);
     return migrated;
 }

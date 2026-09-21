@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
   composerContains,
@@ -21,6 +21,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewayToolCall,
   hasEmptyComposer,
+  heldFakeGatewayFinalText,
   isComposerLine,
   startFakeGateway,
   TmuxSession,
@@ -83,6 +84,12 @@ function captureViewportEscapes(session: TmuxSession): string {
   });
 }
 
+function runningBinaryTitle(workspace: string): string {
+  const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+  expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
+  return `fx v${version} | ${basename(workspace)}`;
+}
+
 async function waitForPaneTitle(
   session: TmuxSession,
   expected: string,
@@ -138,7 +145,7 @@ async function waitForSettingsMenu(session: TmuxSession): Promise<string[]> {
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
     if (
-      pane.includes("←→ Change") &&
+      pane.includes("←→ change") &&
       (pane.includes("Settings") || pane.includes("Status line context"))
     ) return latest;
     await Bun.sleep(100);
@@ -195,8 +202,8 @@ async function waitForStatuslineMenu(
     const pane = latest.join("\n");
     if (
       pane.includes("Status line") &&
-      pane.includes("↑↓ Navigate") &&
-      pane.includes("←→ Change") &&
+      pane.includes("↑↓ navigate") &&
+      pane.includes("←→ change") &&
       (expectedSelection === undefined || pane.includes(expectedSelection))
     ) return latest;
     await Bun.sleep(100);
@@ -212,7 +219,7 @@ async function waitForUsageMenu(session: TmuxSession): Promise<string[]> {
     const pane = latest.join("\n");
     if (
       pane.includes("[30 days]") &&
-      pane.includes("Esc Close") &&
+      pane.includes("esc close") &&
       !pane.includes("Loading usage")
     ) return latest;
     await Bun.sleep(100);
@@ -226,7 +233,12 @@ async function waitForWorkspaceMenu(session: TmuxSession): Promise<string[]> {
   while (Date.now() < deadline) {
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
-    if (pane.includes("Workspace") && pane.includes("Enter Use")) return latest;
+    if (
+      pane.includes("Workspace") &&
+      pane.includes("Additional directories") &&
+      pane.includes("Add directory…") &&
+      pane.includes("enter use")
+    ) return latest;
     await Bun.sleep(100);
   }
   throw new Error(`Timed out waiting for workspace menu.\nPane:\n${latest.join("\n")}`);
@@ -580,7 +592,7 @@ function composerRow(grid: string[]): number {
 function footerStatusRow(grid: string[]): number {
   return lastRowMatching(
     grid,
-    (line) => line.includes("gpt-5") || line.includes("↑↓ Navigate"),
+    (line) => line.includes("gpt-5") || line.includes("↑↓ navigate"),
   );
 }
 
@@ -729,7 +741,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
 
       await session.waitForText(
-        "Skills: 1 discovery issue; some skills may be missing (ctrl o to view)",
+        "skills: 1 discovery issue; some skills may be missing (ctrl+o to view)",
         10_000,
       );
       await session.waitForComposer(10_000);
@@ -795,14 +807,17 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "terminal tab title follows the session name across rename and resume",
+    "terminal tab title shows the session title across rename, resume, and new session",
     async () => {
       const workDir = mkdtempSync(join(tmpdir(), "fx-title-rename-e2e-"));
       workDirs.push(workDir);
       const home = join(workDir, "home");
-      const workspace = join(workDir, "workspace");
+      const workspace = join(workDir, "fx");
+      const resumedWorkspace = join(workDir, "another project é");
+      const fallbackTitle = (dir: string) => runningBinaryTitle(dir);
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
+      mkdirSync(resumedWorkspace, { recursive: true });
       writeFileSync(
         join(home, ".fx", "settings.json"),
         JSON.stringify({ sandbox: "none", permission: {} }),
@@ -832,27 +847,32 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         width: 120,
         height: 32,
         isolated: true,
+        remainOnExit: true,
       });
       await session.waitForComposer(10_000);
+      // Before any title exists, the tab falls back to the build and folder.
+      await waitForPaneTitle(session, fallbackTitle(workspace), 5_000);
 
-      // Before the first turn names the session, the workspace distinguishes
-      // parallel tabs while the model remains visible.
-      expect(await session.paneTitle()).toBe(`fx · workspace · ${model}`);
-
-      // The first prompt names the session, and the tab follows it.
+      // The first prompt's derived title becomes the tab title.
       await session.sendText("generate the release notes");
       await session.waitForText("TITLE_RENAME_COMPLETE", 30_000);
-      await waitForPaneTitle(session, `fx · generate the release notes · ${model}`, 5_000);
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, "generate the release notes", 5_000);
 
+      // A rename replaces the tab title.
       await session.sendText("/rename deploy pipeline fix");
-      await session.waitForText("renamed: deploy pipeline fix", 10_000);
-      await waitForPaneTitle(session, `fx · deploy pipeline fix · ${model}`, 5_000);
+      await session.waitForText("renamed to \"deploy pipeline fix\"", 10_000);
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
 
       await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(session.isAlive()).toBe(true);
+      expect(await session.paneTitle()).toBe("");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
       await session.kill();
       session = null;
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
         withFileTypes: true,
@@ -861,12 +881,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         .map((entry) => entry.name);
       expect(sessionIds).toHaveLength(1);
 
-      // Resuming restores both the chosen name and active model context.
+      // A resumed session keeps its title in the tab, even in a new folder.
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
         cmd: `${FX_BIN} resume ${sessionIds[0]}`,
-        cwd: workspace,
+        cwd: resumedWorkspace,
         env: {
           ...env,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
@@ -876,15 +896,25 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         width: 120,
         height: 32,
         isolated: true,
+        remainOnExit: true,
       });
       await session.waitForComposer(10_000);
-      await waitForPaneTitle(session, `fx · deploy pipeline fix · ${model}`, 5_000);
+      await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
+      expect(await session.captureFullScrollback()).toContain("TITLE_RENAME_COMPLETE");
+
+      // A fresh session resets the tab to the build and current folder.
+      await session.sendText("/new");
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, fallbackTitle(resumedWorkspace), 5_000);
 
       await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(session.isAlive()).toBe(true);
+      expect(await session.paneTitle()).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
       await session.kill();
       session = null;
-      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },
     TEST_TIMEOUT,
   );
@@ -1006,7 +1036,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForText("Commands 34", 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1207,7 +1237,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
       expect(mcpRow!.indexOf("Extensions") + "Extensions".length).toBe(99);
       expect(modelRow).toContain("Model");
-      expect(scrolledGrid.join("\n")).toContain("↑↓ Navigate     Enter Use     Esc Close");
+      expect(scrolledGrid.join("\n")).toContain("↑↓ navigate     enter use     esc close");
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
@@ -1253,7 +1283,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (pane) => hasEmptyComposer(pane) && !pane.includes("←→ Change"),
+        (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
         5_000,
       );
       await session.sendLiteralText("/m");
@@ -1406,12 +1436,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await Bun.sleep(100);
       let pane = await session.capturePane();
       expect(composerContains(pane, "/hezzzzz")).toBe(true);
-      expect(pane).not.toContain("Enter Use");
+      expect(pane).not.toContain("enter use");
       expect(pane).not.toContain("no matching slash commands");
 
       for (let index = 0; index < 5; index++) await session.sendKeys("BSpace");
       await session.waitForPane(
-        (current) => composerContains(current, "/he") && current.includes("Enter Use"),
+        (current) => composerContains(current, "/he") && current.includes("enter use"),
         5_000,
       );
 
@@ -1425,7 +1455,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await Bun.sleep(100);
       pane = await session.capturePane();
       expect(pane).not.toContain("no matching slash commands");
-      expect(pane).not.toContain("Enter Use");
+      expect(pane).not.toContain("enter use");
 
       await session.sendKeys("C-u");
       await session.sendLiteralText("/name");
@@ -1443,7 +1473,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Enter");
       pane = await session.waitForText("Commands", 5_000);
       expect(pane).toContain("/help");
-      expect(pane).toContain("Enter Open");
+      expect(pane).toContain("enter open");
 
       await session.sendKeys("Escape");
       await session.waitForPane(
@@ -1455,7 +1485,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           composerContains(current, "/resume") &&
           !current.includes("resume-helper") &&
-          !current.includes("Enter Use"),
+          !current.includes("enter use"),
         5_000,
       );
       expect(pane).not.toContain("no matching slash commands");
@@ -1487,12 +1517,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-u");
       await session.pasteText("\n   ");
       await session.sendLiteralText("/resume-helper");
-      await session.waitForText("Enter Use", 5_000);
+      await session.waitForText("enter use", 5_000);
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
         (current) =>
           current.includes("resume-helper") &&
-          !current.includes("Enter Use") &&
+          !current.includes("enter use") &&
           !current.includes("fx needs access to Vercel AI Gateway"),
         5_000,
       );
@@ -1531,7 +1561,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 35);
+      let grid = await waitForHelpMenu(session, 34);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
@@ -1539,15 +1569,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       expect(pane).toContain("show available slash commands");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("Tab Category");
-      expect(pane).toContain("Enter Open");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("tab category");
+      expect(pane).toContain("enter open");
 
       await session.sendKeys("Tab");
       grid = await waitForHelpMenu(session, 5);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
-      grid = await waitForHelpMenu(session, 35);
+      grid = await waitForHelpMenu(session, 34);
       expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
@@ -1558,20 +1588,20 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 35);
+      await waitForHelpMenu(session, 34);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 35"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 34"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
-      expect(capturePaneHistory(session, -1000)).not.toContain("● Help:");
+      expect(capturePaneHistory(session, -1000)).not.toMatch(/[*✓!✗⊘i] help:/);
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 35);
+      await waitForHelpMenu(session, 34);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1588,12 +1618,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 35);
+      await waitForHelpMenu(session, 34);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("Enter Open"),
+        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("enter open"),
         5_000,
       );
 
@@ -1642,10 +1672,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Settings");
       expect(pane).toContain("Interface");
       expect(pane).toContain("[All]");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("Tab Category");
-      expect(pane).toContain("←→ Change");
-      expect(pane).toContain("Esc Close");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("tab category");
+      expect(pane).toContain("←→ change");
+      expect(pane).toContain("esc close");
       expect(pane).not.toContain("Enter Change");
 
       expect(pane).not.toContain("Input appearance");
@@ -1667,10 +1697,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
           current.includes("workspace-statusline-visible") &&
-          !current.includes("←→ Change"),
+          !current.includes("←→ change"),
         5_000,
       );
-      expect(capturePaneHistory(session, -1000)).not.toContain("● Settings:");
+      expect(capturePaneHistory(session, -1000)).not.toMatch(/[*✓!✗⊘i] settings:/);
 
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(10_000)).toBe(true);
@@ -1720,7 +1750,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Status line context");
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("←→ Change"),
+        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
         5_000,
       );
 
@@ -1770,21 +1800,21 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("off  on");
       expect(pane).not.toContain("❯");
       expect(pane).not.toContain("Choose what appears");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("←→ Change");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("←→ change");
 
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "off  on");
       pane = grid.join("\n");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.context).toBe(true);
+      await waitForStatuslineValue(settingsPath, "context", true);
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Context");
       pane = grid.join("\n");
       expect(pane).not.toContain("saved to user settings");
-      expect(pane).not.toContain("● Statusline:");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.session).toBe(true);
+      expect(pane).not.toMatch(/[*✓!✗⊘i] statusline:/);
+      await waitForStatuslineValue(settingsPath, "session", true);
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");
@@ -1799,13 +1829,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
           current.includes("compact-statusline-workspace") &&
-          !current.includes("←→ Change"),
+          !current.includes("←→ change"),
         5_000,
       );
       expect(session.isAlive()).toBe(true);
 
       await session.sendText("/statusline workspace");
-      await session.waitForText("● Statusline: workspace: off", 5_000);
+      await session.waitForText("* statusline: workspace: off", 5_000);
       await waitForStatuslineValue(settingsPath, "workspace", false);
       await session.waitForPane(
         (current) => hasEmptyComposer(current) && !current.includes("compact-statusline-workspace"),
@@ -1846,7 +1876,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForUsageMenu(session);
       let pane = grid.join("\n");
       expect(pane).toContain("Tracking has not started");
-      expect(pane).not.toMatch(/^● Usage/m);
+      expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -2013,7 +2043,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
       await session.waitForText(
-        "Usage unavailable · press R to retry",
+        "Usage unavailable · press r to retry",
         TIMEOUT,
       );
 
@@ -2091,17 +2121,17 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
       let pane = await session.waitForText(
-        "Usage unavailable · press R to retry",
+        "Usage unavailable · press r to retry",
         TIMEOUT,
       );
       expect(pane).toContain("[30 days]");
 
       await session.sendKeys("Left");
       pane = await session.waitForText("[7 days]", TIMEOUT);
-      expect(pane).toContain("Usage unavailable · press R to retry");
+      expect(pane).toContain("Usage unavailable · press r to retry");
       await session.sendKeys("Left");
       pane = await session.waitForText("[24 hours]", TIMEOUT);
-      expect(pane).toContain("Usage unavailable · press R to retry");
+      expect(pane).toContain("Usage unavailable · press r to retry");
       await session.sendKeys("Left");
       pane = await session.waitForText("[Session]", TIMEOUT);
       expect(pane).toMatch(/0 tokens/);
@@ -2325,7 +2355,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForPane(
         (current) =>
           composerContains(current, "/workspace add") &&
-          !current.includes("Enter Use"),
+          !current.includes("enter use"),
         5_000,
       );
 
@@ -2337,7 +2367,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       pane = await session.waitForPane(
         (current) =>
           composerContains(current, `/workspace remove ${sharedRoot}`) &&
-          !current.includes("Enter Use"),
+          !current.includes("enter use"),
         5_000,
       );
       expect(composerContains(pane, `/workspace remove ${sharedRoot}`)).toBe(true);
@@ -2397,8 +2427,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("fx · Global");
       expect(pane).toContain("workspace-menu");
       expect(pane).toContain("fx · Workspace");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("Enter Use");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("enter use");
 
       const deep_history = capturePaneHistory(session, -1000);
       const tail_history = capturePaneHistory(session, -80);
@@ -2421,7 +2451,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
-          !current.includes("↑↓ Navigate"),
+          !current.includes("↑↓ navigate"),
         5_000,
       );
 
@@ -2439,7 +2469,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           composerContains(current, "$work") &&
           current.includes("𝒇x") &&
-          !current.includes("↑↓ Navigate"),
+          !current.includes("↑↓ navigate"),
         5_000,
       );
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeDollar);
@@ -2492,7 +2522,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           composerContains(current, "explain $manzzzzzz") &&
           !current.includes("Skills ") &&
           !current.includes("No skills found.") &&
-          !current.includes("Enter Use"),
+          !current.includes("enter use"),
         5_000,
       );
 
@@ -2594,7 +2624,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await session.capturePaneGrid();
       expect(composerContains(grid.join("\n"), "workspace-menu")).toBe(true);
       expect(grid.join("\n")).toContain("𝒇x");
-      expect(grid.join("\n")).not.toContain("↑↓ Navigate");
+      expect(grid.join("\n")).not.toContain("↑↓ navigate");
       expect(capturePaneHistory(session, -1000)).not.toContain("Unknown command");
       expect(session.isAlive()).toBe(true);
 
@@ -2612,18 +2642,18 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(codexPane).toContain("Codex · Global");
 
       await session.sendKeys("C-[");
-      await session.waitForPane((current) => !current.includes("↑↓ Navigate"), 5_000);
+      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
       await session.sendText("/help");
-      grid = await waitForHelpMenu(session, 35);
+      grid = await waitForHelpMenu(session, 34);
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Enter Open"),
+        (current) => hasEmptyComposer(current) && !current.includes("enter open"),
         5_000,
       );
 
@@ -2634,7 +2664,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("←→ Change"),
+        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
         5_000,
       );
 
@@ -2646,7 +2676,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Enter Resume"),
+        (current) => hasEmptyComposer(current) && !current.includes("enter resume"),
         5_000,
       );
 
@@ -2720,7 +2750,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(capturePaneHistory(session, -1000)).not.toContain("Unknown command");
 
       await session.sendKeys("C-[");
-      await session.waitForPane((current) => !current.includes("↑↓ Navigate"), 5_000);
+      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
       await session.sendKeys("C-u");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -2790,7 +2820,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         height: 32,
       });
       await session.waitForComposer(10_000);
-      expect(await session.paneTitle()).toBe(`fx · workspace · ${currentModel}`);
+      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
 
       const alternateCount = (sequence: string) =>
         countOccurrences(readFileSync(fixture.tapePath).toString("latin1"), sequence);
@@ -2800,10 +2830,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendLiteralText("/mode");
       await session.sendKeys("Enter");
       await waitForModelsMenu(session, 4);
-      expect(await session.captureFullScrollback()).not.toContain(`● Model: ${currentModel}`);
+      expect(await session.captureFullScrollback()).not.toContain(`* model: ${currentModel}`);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Tab Provider"),
+        (current) => hasEmptyComposer(current) && !current.includes("tab provider"),
         5_000,
       );
 
@@ -2813,7 +2843,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           composerContains(current, "/model") &&
           current.includes(currentModel) &&
-          !current.includes("Tab Provider"),
+          !current.includes("tab provider"),
         5_000,
       );
       expect(stagedPane).not.toContain("Models 4");
@@ -2857,8 +2887,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("Authenticated model catalog loaded.");
       expect(pane).not.toContain("Current");
       expect(pane).not.toContain("Reasoning");
-      expect(pane).toContain("↑↓ Navigate");
-      expect(pane).toContain("Tab Provider");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("tab provider");
 
       await session.sendKeys("Tab");
       grid = await waitForModelsMenu(session, 1);
@@ -2879,7 +2909,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-[");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("Tab Provider"),
+        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("tab provider"),
         5_000,
       );
 
@@ -2901,11 +2931,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
-      await session.waitForText(`● Switched to ${selectedModel}`, 5_000);
+      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
 
       const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
       expect(settings.models?.gateway).toBe(selectedModel);
-      expect(await session.paneTitle()).toBe(`fx · workspace · ${selectedModel}`);
+      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
       expect(session.isAlive()).toBe(true);
 
       await session.sendText("/quit");
@@ -2917,6 +2947,106 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ) as { frame_count: number; stdout_bytes: number };
       expect(replay.frame_count).toBeGreaterThan(0);
       expect(replay.stdout_bytes).toBeGreaterThan(0);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "Ctrl+P opens the model picker and returns the draft untouched",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const currentModel = "anthropic/claude-opus-4.8";
+      const selectedModel = "private-team/plain-model";
+      gateway = startFakeGateway([], {
+        models: [
+          {
+            id: currentModel,
+            type: "language",
+            released: 200,
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+            max_tokens: 32_000,
+          },
+          {
+            id: selectedModel,
+            type: "language",
+            released: 100,
+            tags: ["tool-use"],
+            context_window: 128_000,
+          },
+        ],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-shortcut-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: currentModel,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendLiteralText("hello draft");
+      await session.sendKeys("Left");
+      await session.sendKeys("Left");
+      await session.sendKeys("Left");
+
+      await session.sendKeys("C-p");
+      let grid = await waitForModelsMenu(session, 2);
+      let pane = grid.join("\n");
+      expect(pane).toContain("[All]");
+      expect(pane).toContain("tab provider");
+      expect(pane).not.toContain("hello draft");
+      expect(hasEmptyComposer(pane)).toBe(true);
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => composerContains(current, "hello draft") && !current.includes("tab provider"),
+        5_000,
+      );
+      // The cursor is restored with the text: typing lands mid-draft.
+      await session.sendLiteralText("X");
+      await session.waitForPane(
+        (current) => composerContains(current, "hello drXaft"),
+        5_000,
+      );
+
+      // Enter on a filtered row applies the model directly and still returns
+      // the draft instead of seeding the inline /model stages.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await session.sendLiteralText("plain");
+      await session.waitForPane(
+        (current) => current.includes(selectedModel) && !current.includes(currentModel),
+        5_000,
+      );
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
+      pane = await session.capturePane();
+      expect(composerContains(pane, "hello drXaft")).toBe(true);
+      expect(composerContains(pane, "/model")).toBe(false);
+
+      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
+      expect(settings.models?.gateway).toBe(selectedModel);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      // The restored cursor sits mid-draft; clear the whole line before /quit.
+      await session.sendKeys("C-e");
+      await session.sendKeys("C-u");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
     },
     TEST_TIMEOUT,
   );
@@ -3012,20 +3142,115 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForText(selectedModel, 10_000);
       await session.sendLiteralText(selectedModel);
       await session.sendKeys("Enter");
-      await session.waitForText(`● Switched to ${selectedModel}`, 5_000);
+      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
 
       const pane = (await session.capturePaneGrid()).join("\n");
       expect(hasEmptyComposer(pane)).toBe(true);
       expect(pane).not.toContain("Reasoning effort");
       expect(pane).not.toContain("default");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
-      expect(await session.paneTitle()).toBe(`fx · workspace · ${selectedModel}`);
+      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker completes every stage while a turn is in flight",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const currentModel = "anthropic/claude-opus-4.8";
+      const fastOnlyModel = "provider/fast-only-model";
+      const held = heldFakeGatewayFinalText();
+      gateway = startFakeGateway([held.response], {
+        models: [
+          {
+            id: currentModel,
+            type: "language",
+            released: 100,
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+            max_tokens: 32_000,
+          },
+          {
+            id: fastOnlyModel,
+            type: "language",
+            released: 90,
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+            context_window: 128_000,
+          },
+        ],
+      });
+
+      try {
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          stderrPath: fixture.stderrPath,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-in-flight-model-picker-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_MODEL: currentModel,
+            FX_AUTO_UPGRADE: "0",
+          },
+          width: 120,
+          height: 32,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("Keep this model turn active.");
+        await session.waitForText("Thinking", 10_000);
+
+        await session.sendLiteralText("/model");
+        await session.sendKeys("Tab");
+        await session.waitForPane(
+          (pane) => pane.split("\n").some((line) =>
+            !isComposerLine(line) && line.includes(currentModel)
+          ),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("default") && pane.includes("xhigh"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("normal") && pane.includes("fast"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForText(`Next turn will use ${currentModel}`, 5_000);
+
+        await session.sendLiteralText(`/model ${fastOnlyModel}`);
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("normal") && pane.includes("fast"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForText(`Next turn will use ${fastOnlyModel}`, 5_000);
+
+        expect(gateway.requests).toHaveLength(1);
+        held.release("IN_FLIGHT_MODEL_PICKER_COMPLETE");
+        await session.waitForText("IN_FLIGHT_MODEL_PICKER_COMPLETE", 10_000);
+        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        held.dispose();
+      }
     },
     TEST_TIMEOUT,
   );
@@ -3053,11 +3278,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-x");
 
       const grid = await waitForSkillsMenu(session, 4);
-      expect(grid.join("\n")).toContain("↑↓ Navigate");
+      expect(grid.join("\n")).toContain("↑↓ navigate");
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-[");
-      await session.waitForPane((current) => !current.includes("↑↓ Navigate"), 5_000);
+      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
       await session.sendText("/skills");
       await waitForSkillsMenu(session, 4);
       await session.sendHexBytes(["1b", "18"]);
@@ -3100,7 +3325,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-[");
       await session.waitForPane(
-        (pane) => pane.includes("Generating") && !pane.includes("↑↓ Navigate"),
+        (pane) => pane.includes("Generating") && !pane.includes("↑↓ navigate"),
         5_000,
       );
       expect(stream.cancelled).toBe(false);
@@ -3145,14 +3370,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForHeldSkillStream(stream);
       await session.waitForText("Generating", 10_000);
       await session.sendLiteralText("/he");
-      await session.waitForText("Esc Close", 10_000);
+      await session.waitForText("esc close", 10_000);
 
       await session.sendKeys("Escape");
       await session.waitForPane(
         (pane) =>
           pane.includes("Generating") &&
           pane.includes("/he") &&
-          !pane.includes("Esc Close"),
+          !pane.includes("esc close"),
         5_000,
       );
       expect(stream.cancelled).toBe(false);
@@ -3212,7 +3437,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       releaseApproval();
       await session.waitForText("catalog-approval.txt", 10_000);
-      expect(await session.capturePane()).not.toContain("↑↓ Navigate");
+      expect(await session.capturePane()).not.toContain("↑↓ navigate");
 
       await session.sendKeys("3");
       let grid = await waitForSkillsMenu(session, 4);
@@ -3416,7 +3641,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
 
       const diagnosticSummary =
-        "Skills: 1 discovery issue; some skills may be missing (ctrl o to view)";
+        "skills: 1 discovery issue; some skills may be missing (ctrl+o to view)";
       await session.waitForText(diagnosticSummary, 10_000);
       await session.waitForComposer(10_000);
       expect(await session.captureFullScrollback()).not.toContain(
@@ -3465,15 +3690,23 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(gateway.requests).toHaveLength(1);
       const firstPrompt = gatewayPromptText(gateway.requests[0]!.body);
       expect(firstPrompt).toContain(
-        "Every skill below is already loaded and must be used for this query.",
+        "Use every successfully loaded skill for this query.",
       );
       expect(firstPrompt).toContain(
-        "If a skill cannot be followed, state the blocker instead of silently substituting another workflow.",
+        "Report blocked or ambiguous requests.",
       );
       expect(firstPrompt).toContain('<skill_content name="exact-picker"');
       expect(firstPrompt).toContain(fixture.workspaceDescription);
       expect(firstPrompt).toContain(fixture.bodyB);
       expect(firstPrompt).not.toContain(fixture.bodyA);
+
+      const loadScrollback = await session.captureFullScrollback();
+      expect(countOccurrences(loadScrollback, "1 requested skill loaded")).toBe(1);
+      expect(loadScrollback).toContain("Loaded skill exact-picker");
+      expect(loadScrollback.indexOf("1 requested skill loaded")).toBeLessThan(
+        loadScrollback.indexOf("exact picker selection complete"),
+      );
+      expect(loadScrollback).not.toContain("1 tool call");
 
       expect(
         countOccurrences(
@@ -3513,7 +3746,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForText("Commands 34", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");

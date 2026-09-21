@@ -5,6 +5,7 @@ const command_contract = @import("../execution/command_contract.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
 
 pub const direct_output_limit_bytes: usize = 65_536;
@@ -199,7 +200,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var children = try scratch.alloc(std.process.Child, plan.stages.len);

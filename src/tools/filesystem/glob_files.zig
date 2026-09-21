@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const glob_pattern = @import("../../core/workspace/glob_pattern.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
@@ -97,7 +98,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
     const input = erased.as(Input);
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
 
     const requested_root = resolveSearchRoot(arena, ctx.workspace_root, input.path) catch |err| {
@@ -659,6 +660,7 @@ test "glob_files reports overlong patterns during matching" {
     const expected = try std.fmt.allocPrint(alloc, "glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
     defer alloc.free(expected);
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| try std.testing.expectEqualStrings(expected, body),
         .success => try std.testing.expect(false),
     }
@@ -882,6 +884,7 @@ test "glob_files path narrowing applies before candidate cap" {
     defer result.deinit(alloc);
 
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| try std.testing.expectEqualStrings("[glob] 1 matches for target.zig\n - src/core/workspace/target.zig\n", body),
         .failure => try std.testing.expect(false),
     }
@@ -918,6 +921,7 @@ test "glob_files extracts static base before candidate cap" {
     defer result.deinit(alloc);
 
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| try std.testing.expectEqualStrings("[glob] 1 matches for src/tools/**/*.zig\n - src/tools/target.zig\n", body),
         .failure => try std.testing.expect(false),
     }

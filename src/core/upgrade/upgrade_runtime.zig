@@ -30,6 +30,7 @@ const RunError = error{
     SelfExeNotFound,
     ReplaceFailed,
     OutOfMemory,
+    Cancelled,
 };
 
 pub fn run(
@@ -138,6 +139,7 @@ fn failureMessage(err: RunError) []const u8 {
         error.SelfExeNotFound => "could not determine path of running binary",
         error.ReplaceFailed => "failed to replace binary (permission denied?)",
         error.OutOfMemory => "out of memory",
+        error.Cancelled => "upgrade cancelled",
     };
 }
 
@@ -151,6 +153,7 @@ fn workerErrorToRunError(err: UpgradeError) RunError {
         .self_exe_not_found => error.SelfExeNotFound,
         .replace_failed => error.ReplaceFailed,
         .out_of_memory => error.OutOfMemory,
+        .cancelled => error.Cancelled,
     };
 }
 
@@ -178,7 +181,7 @@ fn upgradeWorkerInner(
     show_progress: bool,
 ) !void {
     const cdn_base = helpers.resolveCdnBase();
-    const fetched_target = helpers.fetchTarget(alloc, channel, cdn_base) catch {
+    const fetched_target = helpers.fetchTarget(alloc, channel, cdn_base, .{}) catch {
         result.err = .fetch_failed;
         return;
     };
@@ -215,7 +218,7 @@ fn upgradeWorkerInner(
         .ctx = progress,
         .start = progressDownloadStart,
         .update = progressDownloadUpdate,
-    }) catch {
+    }, .{}) catch {
         result.err = .download_failed;
         return;
     };
@@ -224,10 +227,11 @@ fn upgradeWorkerInner(
     const checksum_url = try helpers.artifactUrl(alloc, cdn_base, target, ".sha256");
     defer alloc.free(checksum_url);
 
-    helpers.verifyChecksum(&client, archive_path, checksum_url) catch |err| {
+    helpers.verifyChecksum(&client, archive_path, checksum_url, .{}) catch |err| {
         result.err = switch (err) {
             error.ChecksumFetchFailed => .checksum_fetch_failed,
             error.ChecksumMismatch => .checksum_mismatch,
+            error.Cancelled => .cancelled,
         };
         return;
     };
@@ -399,6 +403,7 @@ const UpgradeError = enum {
     self_exe_not_found,
     replace_failed,
     out_of_memory,
+    cancelled,
 };
 
 fn versionLabel(v: []const u8) []const u8 {

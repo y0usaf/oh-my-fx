@@ -168,12 +168,6 @@ fn expectSignalHandlerEqual(expected: std.posix.Sigaction, actual: std.posix.Sig
     try std.testing.expectEqual(expected.handler.handler, actual.handler.handler);
 }
 
-fn readUndoTrace(alloc: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
-    const path = try tmpPath(alloc, tmp.dir, name);
-    defer alloc.free(path);
-    return readAbsolute(alloc, path);
-}
-
 test "file size limit guard restores SIGXFSZ after normal use" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
