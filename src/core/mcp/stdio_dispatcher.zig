@@ -6,17 +6,96 @@ const io_mod = @import("../shared/io.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const docker_run = @import("docker_run.zig");
 const operation_control = @import("operation_control.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const request_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const shutdown_grace_ms: i64 = 1_000;
 const termination_grace_ms: i64 = 1_000;
-/// Process-exit drain window: after stdin closes, give the child a short
+/// Immediate-shutdown drain window: after stdin closes, give the child a short
 /// beat to read already-written frames (for example a cancellation
 /// notification) and exit before the kill lands.
 const immediate_drain_ms: i64 = 50;
 const cancellation_write_timeout_ms: u32 = 100;
 const server_request_write_timeout_ms: u32 = 1_000;
+/// Leading bytes of child stderr kept for diagnostics; the first line usually
+/// names the failure.
+const stderr_head_capacity: usize = 1024;
+/// Newest bytes of child stderr kept after the head.
+const stderr_tail_capacity: usize = 3072;
+/// After the child is reaped, how long its stderr may take to reach EOF.
+const stderr_eof_grace_ms: i64 = 100;
+const diagnostics_settle_ms: i64 = 2 * stderr_eof_grace_ms;
+
+/// A bounded record of a child's stderr: the first `stderr_head_capacity`
+/// bytes, then the newest `stderr_tail_capacity` bytes after them. `omitted`
+/// is set once bytes between the two have been dropped.
+pub const StderrCapture = struct {
+    head: [stderr_head_capacity]u8 = undefined,
+    head_len: usize = 0,
+    tail: [stderr_tail_capacity]u8 = undefined,
+    tail_len: usize = 0,
+    omitted: bool = false,
+
+    pub fn append(self: *StderrCapture, bytes: []const u8) void {
+        const head_take = @min(bytes.len, stderr_head_capacity - self.head_len);
+        @memcpy(self.head[self.head_len..][0..head_take], bytes[0..head_take]);
+        self.head_len += head_take;
+        const rest = bytes[head_take..];
+        if (rest.len >= stderr_tail_capacity) {
+            self.omitted = self.omitted or self.tail_len > 0 or rest.len > stderr_tail_capacity;
+            @memcpy(&self.tail, rest[rest.len - stderr_tail_capacity ..]);
+            self.tail_len = stderr_tail_capacity;
+            return;
+        }
+        const overflow = (self.tail_len + rest.len) -| stderr_tail_capacity;
+        if (overflow > 0) {
+            @memmove(self.tail[0 .. self.tail_len - overflow], self.tail[overflow..self.tail_len]);
+            self.tail_len -= overflow;
+            self.omitted = true;
+        }
+        @memcpy(self.tail[self.tail_len..][0..rest.len], rest);
+        self.tail_len += rest.len;
+    }
+
+    pub fn headSlice(self: *const StderrCapture) []const u8 {
+        return self.head[0..self.head_len];
+    }
+
+    pub fn tailSlice(self: *const StderrCapture) []const u8 {
+        return self.tail[0..self.tail_len];
+    }
+};
+
+const rejected_output_capacity: usize = 256;
+
+/// The start of a stdout line fx rejected because it is not an MCP message.
+pub const RejectedOutput = struct {
+    bytes: [rejected_output_capacity]u8 = undefined,
+    len: usize = 0,
+    truncated: bool = false,
+
+    fn init(line: []const u8) RejectedOutput {
+        var rejected: RejectedOutput = .{
+            .len = @min(line.len, rejected_output_capacity),
+            .truncated = line.len > rejected_output_capacity,
+        };
+        @memcpy(rejected.bytes[0..rejected.len], line[0..rejected.len]);
+        return rejected;
+    }
+
+    pub fn slice(self: *const RejectedOutput) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// How a stdio child ended, once reaped, and what it wrote to stderr.
+pub const ChildDiagnostics = struct {
+    term: ?std.process.Child.Term = null,
+    stderr: StderrCapture = .{},
+    /// Set when the connection ended on stdout output that is not an MCP message.
+    rejected_output: ?RejectedOutput = null,
+};
 
 pub const Progress = mcp_contract.Progress;
 pub const ProgressSink = mcp_contract.ProgressSink;
@@ -247,6 +326,15 @@ pub const StdioDispatcher = struct {
     stdin: ?std.Io.File,
     stdout: ?std.Io.File,
     reader_thread: ?std.Thread = null,
+    /// Read end of the child's stderr, drained only by `stderr_thread`.
+    stderr: ?std.Io.File = null,
+    /// Close-on-exec pipe whose write end wakes `stderr_thread` for shutdown.
+    stderr_wake: ?[2]std.posix.fd_t = null,
+    stderr_thread: ?std.Thread = null,
+    /// Guarded by `state_mutex`.
+    stderr_done: bool = true,
+    /// Guarded by `state_mutex`.
+    diagnostics: ChildDiagnostics = .{},
     state_mutex: std.Io.Mutex = .init,
     write_mutex: std.Io.Mutex = .init,
     state: ConnectionState = .running,
@@ -270,6 +358,12 @@ pub const StdioDispatcher = struct {
     ) !*StdioDispatcher {
         if (comptime host_target.is_wasm) return error.McpTransportUnavailable;
         var child = child_value;
+        const stderr = child.stderr;
+        child.stderr = null;
+        var stderr_owned = true;
+        defer if (stderr_owned) {
+            if (stderr) |file| file.close(io_mod.getIo());
+        };
         const child_id = child.id orelse return error.McpProcessNotStarted;
         const stdin = child.stdin orelse {
             terminateChild(child_id);
@@ -300,18 +394,24 @@ pub const StdioDispatcher = struct {
             .child_id = child_id,
             .stdin = stdin,
             .stdout = stdout,
+            .stderr = stderr,
             .pending = std.AutoHashMap(u64, *Pending).init(shared_allocator),
             .generation = generation,
             .max_frame_bytes = .init(initial_max_frame_bytes),
         };
+        stderr_owned = false;
         errdefer {
             self.closePipes();
             terminateChild(self.child_id);
+            self.stopStderrDrain();
             _ = self.child.wait(io_mod.getIo()) catch {};
             self.pending.deinit();
             owner_allocator.destroy(self);
         }
+        registerForProcessExit(self);
+        errdefer unregisterForProcessExit(self);
 
+        if (self.stderr != null) try self.startStderrDrain();
         self.reader_thread = try std.Thread.spawn(.{}, readerMain, .{self});
         debug_trace.logf(
             "mcp",
@@ -337,10 +437,13 @@ pub const StdioDispatcher = struct {
     ) void {
         std.debug.assert(self.docker_cleanup == null);
         self.docker_cleanup = cleanup;
+        requireProcessExitTeardown(self);
     }
 
     fn destroy(self: *StdioDispatcher) void {
+        unregisterForProcessExit(self);
         std.debug.assert(self.docker_cleanup == null);
+        std.debug.assert(self.stderr_thread == null and self.stderr == null and self.stderr_wake == null);
         self.pending.deinit();
         const owner_allocator = self.owner_allocator;
         owner_allocator.destroy(self);
@@ -485,8 +588,10 @@ pub const StdioDispatcher = struct {
             error.McpRequestTimedOut => write_control = .timed_out,
             else => {
                 if (write_outcome.phase == .waiting) return err;
-                self.failConnection(err);
-                terminateChild(self.child_id);
+                // A closed stdin means the child already ended; fail like the
+                // reader's end of stream so waiters see one consistent reason.
+                self.failConnection(if (err == error.BrokenPipe) error.McpConnectionClosed else err);
+                if (self.childMayBeRunning()) terminateChild(self.child_id);
             },
         };
         if (write_outcome.phase == .committed) {
@@ -804,14 +909,22 @@ pub const StdioDispatcher = struct {
         self.destroy();
     }
 
-    /// Process-exit path: kill the child immediately instead of waiting out
+    /// Discard path: kill the child after a short drain instead of waiting out
     /// the grace windows; the reader thread unblocks as soon as the child
     /// dies, so the join below stays bounded.
     fn shutdownImmediate(self: *StdioDispatcher) void {
         self.shutdownWithMode(.immediate);
     }
 
-    const ShutdownMode = enum { graceful, forced, immediate };
+    /// Kills the child without the drain window, for connections whose
+    /// written frames no longer matter: a cancelled startup, or a process
+    /// that is about to exit.
+    pub fn deinitAbandoned(self: *StdioDispatcher) void {
+        self.shutdownWithMode(.abandon);
+        self.destroy();
+    }
+
+    const ShutdownMode = enum { graceful, forced, immediate, abandon };
 
     fn shutdownWithMode(self: *StdioDispatcher, mode: ShutdownMode) void {
         var should_join = false;
@@ -829,6 +942,7 @@ pub const StdioDispatcher = struct {
 
         self.closeStdin();
         if (!should_join) {
+            self.stopStderrDrain();
             self.markStopped();
             self.runDockerCleanupOnce();
             return;
@@ -854,7 +968,7 @@ pub const StdioDispatcher = struct {
                 io_mod.sleep(request_poll_ns);
             }
         }
-        if (mode != .immediate and !self.readerIsDone()) {
+        if ((mode == .graceful or mode == .forced) and self.childMayBeRunning()) {
             debug_trace.logf(
                 "mcp",
                 "stdio dispatcher requesting child termination generation={d}",
@@ -870,7 +984,7 @@ pub const StdioDispatcher = struct {
                 io_mod.sleep(request_poll_ns);
             }
         }
-        if (!self.readerIsDone()) {
+        if (self.childMayBeRunning()) {
             debug_trace.logf(
                 "mcp",
                 "stdio dispatcher forcing child termination generation={d}",
@@ -883,6 +997,7 @@ pub const StdioDispatcher = struct {
             thread.join();
             self.reader_thread = null;
         }
+        self.stopStderrDrain();
         while (!self.serverRequestWorkersDone()) io_mod.sleep(request_poll_ns);
         while (!self.usersDone()) io_mod.sleep(request_poll_ns);
         self.stdout = null;
@@ -988,25 +1103,174 @@ pub const StdioDispatcher = struct {
                 break;
             };
             self.dispatchFrame(frame) catch |err| {
+                // Record it before failing waiters so startup can report it.
+                if (err == error.McpInvalidJson) self.recordRejectedOutput(frame);
                 self.shared_allocator.free(frame);
                 terminal_error = err;
                 break;
             };
         }
 
-        const stopping = self.isStopping();
-        if (!stopping) {
-            const err = terminal_error orelse error.McpConnectionClosed;
-            self.failConnection(err);
-            terminateChild(self.child_id);
+        if (self.isStopping()) {
+            self.reapChild();
+            return;
         }
-        _ = self.child.wait(io_mod.getIo()) catch |err| {
+        // Fail waiters first so no new request writes into the ended child.
+        // childDiagnostics waits for the reap and stderr below.
+        self.failConnection(terminal_error orelse error.McpConnectionClosed);
+        terminateChild(self.child_id);
+        self.reapChild();
+        self.awaitStderrEof();
+    }
+
+    /// True once the reader rejected a stdout line. It records the line
+    /// before failing waiters, so callers need not wait for diagnostics.
+    pub fn hasRejectedOutput(self: *StdioDispatcher) bool {
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        return self.diagnostics.rejected_output != null;
+    }
+
+    fn recordRejectedOutput(self: *StdioDispatcher, line: []const u8) void {
+        const rejected = RejectedOutput.init(line);
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        self.diagnostics.rejected_output = rejected;
+    }
+
+    fn reapChild(self: *StdioDispatcher) void {
+        const term = self.child.wait(io_mod.getIo()) catch |err| {
             debug_trace.logf(
                 "mcp",
                 "stdio dispatcher child wait failed generation={d} err={s}",
                 .{ self.generation, @errorName(err) },
             );
+            return;
         };
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        self.diagnostics.term = term;
+        self.state_mutex.unlock(io_mod.getIo());
+    }
+
+    /// Copy of how the child ended (once reaped) and what it wrote to stderr.
+    /// After the connection fails, briefly waits for the reader to record both.
+    pub fn childDiagnostics(self: *StdioDispatcher) ChildDiagnostics {
+        const deadline_ms = std.math.add(
+            i64,
+            io_mod.milliTimestamp(),
+            diagnostics_settle_ms,
+        ) catch std.math.maxInt(i64);
+        while (self.diagnosticsPending() and io_mod.milliTimestamp() < deadline_ms) {
+            io_mod.sleep(request_poll_ns);
+        }
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        return self.diagnostics;
+    }
+
+    fn diagnosticsPending(self: *StdioDispatcher) bool {
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        return self.state == .failed and !self.reader_done;
+    }
+
+    /// False once the reader has reaped the child, so no signal can reach a
+    /// process group that reused its id.
+    fn childMayBeRunning(self: *StdioDispatcher) bool {
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        return !self.reader_done and self.diagnostics.term == null;
+    }
+
+    fn awaitStderrEof(self: *StdioDispatcher) void {
+        const deadline_ms = std.math.add(
+            i64,
+            io_mod.milliTimestamp(),
+            stderr_eof_grace_ms,
+        ) catch std.math.maxInt(i64);
+        while (!self.stderrDrainDone() and io_mod.milliTimestamp() < deadline_ms) {
+            io_mod.sleep(request_poll_ns);
+        }
+    }
+
+    fn stderrDrainDone(self: *StdioDispatcher) bool {
+        self.state_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state_mutex.unlock(io_mod.getIo());
+        return self.stderr_done;
+    }
+
+    fn startStderrDrain(self: *StdioDispatcher) !void {
+        if (comptime builtin.target.os.tag == .windows or host_target.is_wasm) return;
+        self.stderr_wake = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+        self.stderr_done = false;
+        self.stderr_thread = try std.Thread.spawn(.{}, stderrMain, .{self});
+    }
+
+    /// Keeps reading the child's stderr so a chatty child never blocks on a
+    /// full pipe. Waits on the wake pipe too, so shutdown never depends on a
+    /// detached descendant closing the stderr pipe.
+    fn stderrMain(self: *StdioDispatcher) void {
+        defer {
+            self.state_mutex.lockUncancelable(io_mod.getIo());
+            self.stderr_done = true;
+            self.state_mutex.unlock(io_mod.getIo());
+        }
+        if (comptime builtin.target.os.tag == .windows or host_target.is_wasm) return;
+        const file = self.stderr orelse return;
+        const wake = self.stderr_wake orelse return;
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = file.handle, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = wake[0], .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        var buffer: [1024]u8 = undefined;
+        while (true) {
+            _ = std.posix.poll(&fds, -1) catch |err| {
+                logStderrFailure(self.generation, "poll", "err", @errorName(err));
+                return;
+            };
+            if (fds[1].revents != 0) return;
+            if (fds[0].revents == 0) continue;
+            const count = std.posix.read(file.handle, &buffer) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => {
+                    logStderrFailure(self.generation, "read", "err", @errorName(err));
+                    return;
+                },
+            };
+            if (count == 0) return;
+            self.state_mutex.lockUncancelable(io_mod.getIo());
+            self.diagnostics.stderr.append(buffer[0..count]);
+            self.state_mutex.unlock(io_mod.getIo());
+        }
+    }
+
+    /// Idempotent: wakes and joins the stderr drain, then closes its pipes.
+    fn stopStderrDrain(self: *StdioDispatcher) void {
+        if (comptime builtin.target.os.tag != .windows and !host_target.is_wasm) {
+            if (self.stderr_wake) |wake| {
+                if (self.stderr_thread) |thread| {
+                    const byte = [_]u8{0};
+                    switch (std.posix.errno(std.posix.system.write(wake[1], &byte, byte.len))) {
+                        .SUCCESS => {},
+                        else => |err| logStderrFailure(self.generation, "wake", "errno", @tagName(err)),
+                    }
+                    thread.join();
+                    self.stderr_thread = null;
+                }
+                for (wake) |fd| (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(io_mod.getIo());
+                self.stderr_wake = null;
+            }
+        }
+        if (self.stderr) |file| file.close(io_mod.getIo());
+        self.stderr = null;
+    }
+
+    fn logStderrFailure(generation: u64, operation: []const u8, reason_name: []const u8, reason: []const u8) void {
+        debug_trace.logf(
+            "mcp",
+            "stdio dispatcher stderr {s} failed generation={d} {s}={s}",
+            .{ operation, generation, reason_name, reason },
+        );
     }
 
     fn dispatchFrame(self: *StdioDispatcher, frame: []u8) !void {
@@ -1443,7 +1707,7 @@ pub const StdioDispatcher = struct {
                 "stdio dispatcher interrupting active writer generation={d}",
                 .{self.generation},
             );
-            terminateChild(self.child_id);
+            if (self.childMayBeRunning()) terminateChild(self.child_id);
             self.write_mutex.lockUncancelable(io_mod.getIo());
         }
         defer self.write_mutex.unlock(io_mod.getIo());
@@ -1722,10 +1986,10 @@ fn jsonNumber(value: std.json.Value) !f64 {
 }
 
 fn terminateChild(child_id: std.process.Child.Id) void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows => {
             const windows = std.os.windows;
-            switch (windows.ntdll.NtTerminateProcess(child_id, @enumFromInt(1))) {
+            switch (windows.ntdll.NtTerminateProcess(child_id, @fromBackingInt(@intCast(1)))) {
                 .SUCCESS, .PROCESS_IS_TERMINATING, .ACCESS_DENIED => {},
                 else => |status| debug_trace.logf(
                     "mcp",
@@ -1749,7 +2013,7 @@ fn terminateChild(child_id: std.process.Child.Id) void {
 }
 
 fn terminateChildGracefully(child_id: std.process.Child.Id) void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows => terminateChild(child_id),
         .wasi => {},
         else => std.posix.kill(child_id, .TERM) catch |err| switch (err) {
@@ -1761,6 +2025,148 @@ fn terminateChildGracefully(child_id: std.process.Child.Id) void {
             ),
         },
     }
+}
+
+/// Every live stdio dispatcher, so process exit can kill all children at once
+/// instead of stopping servers one at a time and waiting for each killed child
+/// to be reaped. Guarded by `mutex`; lock it before any dispatcher's
+/// `state_mutex`.
+const ProcessExitKills = struct {
+    mutex: std.Io.Mutex = .init,
+    entries: [capacity]Entry = undefined,
+    len: usize = 0,
+    /// Launches between `beginChildLaunch` and `endChildLaunch`.
+    launching: usize = 0,
+    /// A dispatcher did not fit, so only a full teardown reaches every child.
+    overflowed: bool = false,
+    /// Set by `killAllForProcessExit`; no launch may begin afterwards.
+    closed: bool = false,
+
+    const capacity = 64;
+
+    const Entry = struct {
+        dispatcher: *StdioDispatcher,
+        /// Its docker container is removed only by the full teardown.
+        needs_teardown: bool = false,
+    };
+};
+
+var process_exit_kills: ProcessExitKills = .{};
+
+/// How long process exit waits for launches already under way to register.
+const process_exit_launch_settle_ms: i64 = 1_000;
+
+/// Marks the start of a stdio child launch. Fails once process exit has begun,
+/// so no child can start after `killAllForProcessExit` returns.
+pub fn beginChildLaunch() error{Cancelled}!void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    if (process_exit_kills.closed) return error.Cancelled;
+    process_exit_kills.launching += 1;
+}
+
+/// Ends a launch begun by `beginChildLaunch`, after its dispatcher exists and
+/// any docker cleanup is installed, or after the launch failed.
+pub fn endChildLaunch() void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    std.debug.assert(process_exit_kills.launching > 0);
+    process_exit_kills.launching -= 1;
+}
+
+fn registerForProcessExit(dispatcher: *StdioDispatcher) void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    if (process_exit_kills.len == ProcessExitKills.capacity) {
+        process_exit_kills.overflowed = true;
+        debug_trace.logf(
+            "mcp",
+            "stdio child not tracked for process exit generation={d} capacity={d}",
+            .{ dispatcher.generation, ProcessExitKills.capacity },
+        );
+        return;
+    }
+    process_exit_kills.entries[process_exit_kills.len] = .{ .dispatcher = dispatcher };
+    process_exit_kills.len += 1;
+}
+
+fn requireProcessExitTeardown(dispatcher: *StdioDispatcher) void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    for (process_exit_kills.entries[0..process_exit_kills.len]) |*entry| {
+        if (entry.dispatcher == dispatcher) entry.needs_teardown = true;
+    }
+}
+
+fn unregisterForProcessExit(dispatcher: *StdioDispatcher) void {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    const entries = process_exit_kills.entries[0..process_exit_kills.len];
+    for (entries, 0..) |entry, index| {
+        if (entry.dispatcher != dispatcher) continue;
+        entries[index] = entries[entries.len - 1];
+        process_exit_kills.len -= 1;
+        return;
+    }
+}
+
+/// Process exit: SIGKILLs the process group of every stdio child that may
+/// still run, without waiting for any to be reaped, and refuses later
+/// launches. Returns false without killing anything when only a full teardown
+/// reaches every child: a docker container needs its cleanup, a dispatcher did
+/// not fit, or a launch under way did not settle in time.
+pub fn killAllForProcessExit() bool {
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    process_exit_kills.closed = true;
+    const deadline_ms = io_mod.milliTimestamp() + process_exit_launch_settle_ms;
+    while (process_exit_kills.launching > 0) {
+        if (io_mod.milliTimestamp() >= deadline_ms) {
+            debug_trace.logf(
+                "mcp",
+                "process exit fell back to stdio teardown reason=launch_unsettled launching={d}",
+                .{process_exit_kills.launching},
+            );
+            return false;
+        }
+        process_exit_kills.mutex.unlock(io);
+        io_mod.sleep(std.time.ns_per_ms);
+        process_exit_kills.mutex.lockUncancelable(io);
+    }
+    const entries = process_exit_kills.entries[0..process_exit_kills.len];
+    for (entries) |entry| {
+        if (!entry.needs_teardown) continue;
+        debug_trace.logf("mcp", "process exit fell back to stdio teardown reason=docker", .{});
+        return false;
+    }
+    if (process_exit_kills.overflowed) {
+        debug_trace.logf("mcp", "process exit fell back to stdio teardown reason=untracked_child", .{});
+        return false;
+    }
+    var killed: usize = 0;
+    for (entries) |entry| {
+        if (!entry.dispatcher.childMayBeRunning()) continue;
+        terminateChild(entry.dispatcher.child_id);
+        killed += 1;
+    }
+    debug_trace.logf("mcp", "process exit killed stdio children count={d}", .{killed});
+    return true;
+}
+
+fn resetProcessExitKillsForTest() void {
+    std.debug.assert(builtin.is_test);
+    const io = io_mod.getIo();
+    process_exit_kills.mutex.lockUncancelable(io);
+    defer process_exit_kills.mutex.unlock(io);
+    process_exit_kills.launching = 0;
+    process_exit_kills.overflowed = false;
+    process_exit_kills.closed = false;
 }
 
 test "classifyInbound separates responses notifications progress and requests" {
@@ -1868,8 +2274,7 @@ const ConcurrentRequest = struct {
             return;
         };
         self.request_id = request_id;
-        const body = std.fmt.allocPrint(
-            std.heap.c_allocator,
+        const body = std.heap.c_allocator.print(
             "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"fixture/call\"}}",
             .{request_id},
         ) catch |err| {
@@ -1924,14 +2329,14 @@ fn createShellDispatcher(script: []const u8) !struct {
     dispatcher: *StdioDispatcher,
     pid: std.posix.pid_t,
 } {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const child = try std.process.spawn(io_mod.getIo(), .{
         .argv = &.{ "sh", "-c", script },
         .stdin = .pipe,
         .stdout = .pipe,
-        .stderr = .ignore,
+        .stderr = .pipe,
         .pgid = 0,
     });
     const pid = child.id.?;
@@ -1949,7 +2354,7 @@ fn createShellDispatcher(script: []const u8) !struct {
 
 fn expectProcessReaped(pid: std.posix.pid_t) !void {
     for (0..100) |_| {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
             else => {},
         };
@@ -1981,14 +2386,12 @@ test "one dispatcher keeps reversed concurrent responses with their requests" {
     try std.testing.expect(second.err == null);
     defer std.heap.c_allocator.free(first.response.?);
     defer std.heap.c_allocator.free(second.response.?);
-    const first_owner = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const first_owner = try std.testing.allocator.print(
         "\"owner\":{d}",
         .{first.request_id.?},
     );
     defer std.testing.allocator.free(first_owner);
-    const second_owner = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const second_owner = try std.testing.allocator.print(
         "\"owner\":{d}",
         .{second.request_id.?},
     );
@@ -2395,8 +2798,210 @@ test "operation timeout returns and shutdown joins an uncooperative child" {
     try expectProcessReaped(fixture.pid);
 }
 
+test "stderr capture keeps the leading bytes and the newest trailing bytes" {
+    const window = stderr_head_capacity + stderr_tail_capacity;
+    const sizes = [_]usize{
+        0,                        1,                    100,
+        stderr_head_capacity - 1, stderr_head_capacity, stderr_head_capacity + 1,
+        stderr_tail_capacity,     window,               window + 1,
+        3 * window,
+    };
+    var source: [6 * window]u8 = undefined;
+    for (&source, 0..) |*byte, index| byte.* = @truncate(index *% 31 +% 7);
+    for (sizes) |first| {
+        for (sizes) |second| {
+            var capture: StderrCapture = .{};
+            capture.append(source[0..first]);
+            capture.append(source[first..][0..second]);
+            const total = first + second;
+            const head_len = @min(total, stderr_head_capacity);
+            const tail_len = @min(total - head_len, stderr_tail_capacity);
+            try std.testing.expectEqualSlices(u8, source[0..head_len], capture.headSlice());
+            try std.testing.expectEqualSlices(u8, source[total - tail_len .. total], capture.tailSlice());
+            try std.testing.expectEqual(total > window, capture.omitted);
+        }
+    }
+}
+
+test "MCP stdio records how a child that exits before replying ended and what it printed" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\printf 'npm error code E401\nnpm error Incorrect or missing password.\n' >&2
+        \\exit 3
+    );
+    const dispatcher = fixture.dispatcher;
+    defer dispatcher.deinit();
+
+    const request_id = try dispatcher.reserveRequestId();
+    try std.testing.expectError(
+        error.McpConnectionClosed,
+        dispatcher.request(
+            std.testing.allocator,
+            request_id,
+            "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}",
+            4096,
+            .{ .timeout_ms = 5_000 },
+        ),
+    );
+    const diagnostics = dispatcher.childDiagnostics();
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 3 }, diagnostics.term orelse return error.TestExpectedExit);
+    try std.testing.expectEqualStrings(
+        "npm error code E401\nnpm error Incorrect or missing password.\n",
+        diagnostics.stderr.headSlice(),
+    );
+    try std.testing.expect(!diagnostics.stderr.omitted);
+}
+
+test "MCP stdio keeps the stdout line it rejected as not an MCP message" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\read line
+        \\printf 'Server started on stdio\n'
+        \\exec sleep 30
+    );
+    const dispatcher = fixture.dispatcher;
+    defer dispatcher.deinit();
+
+    const request_id = try dispatcher.reserveRequestId();
+    try std.testing.expectError(
+        error.McpInvalidJson,
+        dispatcher.request(
+            std.testing.allocator,
+            request_id,
+            "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}",
+            4096,
+            .{ .timeout_ms = 5_000 },
+        ),
+    );
+    const diagnostics = dispatcher.childDiagnostics();
+    const rejected = diagnostics.rejected_output orelse return error.TestExpectedRejectedOutput;
+    try std.testing.expectEqualStrings("Server started on stdio", rejected.slice());
+    try std.testing.expect(!rejected.truncated);
+}
+
+test "rejected stdout keeps a bounded prefix of the line" {
+    const long_line = text_utils.repeat("x", rejected_output_capacity + 10);
+    const rejected = RejectedOutput.init(long_line);
+    try std.testing.expectEqual(rejected_output_capacity, rejected.slice().len);
+    try std.testing.expect(rejected.truncated);
+    const exact = RejectedOutput.init(long_line[0..rejected_output_capacity]);
+    try std.testing.expect(!exact.truncated);
+}
+
+test "MCP stdio reports a write to a child that closed stdin as a closed connection" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\exec 0<&-
+        \\printf 'stdin closed\n' >&2
+        \\exec sleep 30
+    );
+    const dispatcher = fixture.dispatcher;
+    defer dispatcher.deinit();
+    for (0..400) |_| {
+        const early = dispatcher.childDiagnostics();
+        if (std.mem.startsWith(u8, early.stderr.headSlice(), "stdin closed")) break;
+        io_mod.sleep(5 * std.time.ns_per_ms);
+    } else return error.TestExpectedClosedStdin;
+
+    const request_id = try dispatcher.reserveRequestId();
+    try std.testing.expectError(
+        error.McpConnectionClosed,
+        dispatcher.request(
+            std.testing.allocator,
+            request_id,
+            "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}",
+            4096,
+            .{ .timeout_ms = 5_000 },
+        ),
+    );
+    // fx ends a child it can no longer write to; the details still arrive.
+    const diagnostics = dispatcher.childDiagnostics();
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, diagnostics.term orelse return error.TestExpectedExit);
+    try std.testing.expectEqualStrings("stdin closed\n", diagnostics.stderr.headSlice());
+}
+
+test "MCP stdio keeps draining stderr so a chatty child stays responsive" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\head -c 1048576 /dev/zero | tr '\0' 'x' >&2
+        \\read line
+        \\printf '{"jsonrpc":"2.0","id":0,"result":{}}\n'
+        \\exec sleep 30
+    );
+    const dispatcher = fixture.dispatcher;
+    defer dispatcher.deinitAbandoned();
+
+    const request_id = try dispatcher.reserveRequestId();
+    const response = try dispatcher.request(
+        std.testing.allocator,
+        request_id,
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\"}",
+        4096,
+        .{ .timeout_ms = 10_000 },
+    );
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.find(u8, response, "\"result\"") != null);
+    const diagnostics = dispatcher.childDiagnostics();
+    try std.testing.expectEqual(stderr_head_capacity, diagnostics.stderr.head_len);
+    try std.testing.expectEqual(stderr_tail_capacity, diagnostics.stderr.tail_len);
+    try std.testing.expect(diagnostics.stderr.omitted);
+}
+
+test "MCP stdio exit is not held by a detached descendant that keeps stderr open" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const pid_path = try alloc.print("{s}/descendant.pid", .{root});
+    defer alloc.free(pid_path);
+    // The descendant publishes its pid only after leaving the process group,
+    // and it keeps the inherited stderr pipe open.
+    const script = try alloc.print(
+        "perl -MPOSIX -e 'setsid(); open(my $f, \">\", \"$ARGV[0].tmp\") or die; print $f \"$$\\n\"; close $f; rename(\"$ARGV[0].tmp\", $ARGV[0]) or die; sleep 30' \"{s}\" </dev/null >/dev/null &\nexec sleep 30",
+        .{pid_path},
+    );
+    defer alloc.free(script);
+
+    const fixture = try createShellDispatcher(script);
+    var dispatcher_live = true;
+    defer if (dispatcher_live) fixture.dispatcher.deinitAbandoned();
+    var descendant: ?std.posix.pid_t = null;
+    defer if (descendant) |pid| std.posix.kill(pid, .KILL) catch {};
+    for (0..200) |_| {
+        const text = std.Io.Dir.cwd().readFileAlloc(std.testing.io, pid_path, alloc, .limited(64)) catch {
+            io_mod.sleep(5 * std.time.ns_per_ms);
+            continue;
+        };
+        defer alloc.free(text);
+        descendant = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \n"), 10) catch null;
+        if (descendant != null) break;
+        io_mod.sleep(5 * std.time.ns_per_ms);
+    } else return error.TestExpectedDescendant;
+
+    const started_ms = io_mod.milliTimestamp();
+    dispatcher_live = false;
+    fixture.dispatcher.deinitAbandoned();
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try expectProcessReaped(fixture.pid);
+    try std.testing.expect(elapsed_ms < shutdown_grace_ms);
+    // Still alive: it escaped the group kill and held stderr the whole time.
+    try std.posix.kill(descendant.?, @fromBackingInt(@intCast(0)));
+}
+
 test "MCP immediate shutdown kills an uncooperative child without grace waits" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const fixture = try createShellDispatcher(
@@ -2411,8 +3016,110 @@ test "MCP immediate shutdown kills an uncooperative child without grace waits" {
     try std.testing.expect(elapsed_ms < shutdown_grace_ms);
 }
 
+test "MCP immediate shutdown waits out the drain window before the kill" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\trap '' TERM
+        \\while :; do sleep 1; done
+    );
+    const started_ms = io_mod.milliTimestamp();
+    fixture.dispatcher.deinitImmediate();
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try expectProcessReaped(fixture.pid);
+    try std.testing.expect(elapsed_ms >= immediate_drain_ms);
+}
+
+test "MCP abandoned shutdown kills an uncooperative child without grace waits" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const fixture = try createShellDispatcher(
+        \\trap '' TERM
+        \\while :; do sleep 1; done
+    );
+    const started_ms = io_mod.milliTimestamp();
+    fixture.dispatcher.deinitAbandoned();
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try expectProcessReaped(fixture.pid);
+    try std.testing.expect(elapsed_ms < shutdown_grace_ms);
+}
+
+const uncooperative_child_script =
+    \\trap '' TERM
+    \\while :; do sleep 1; done
+;
+
+test "process exit kills every stdio child at once without waiting to reap them" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    defer resetProcessExitKillsForTest();
+    const first = try createShellDispatcher(uncooperative_child_script);
+    defer first.dispatcher.deinitAbandoned();
+    const second = try createShellDispatcher(uncooperative_child_script);
+    defer second.dispatcher.deinitAbandoned();
+
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expect(killAllForProcessExit());
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+
+    try expectProcessReaped(first.pid);
+    try expectProcessReaped(second.pid);
+    try std.testing.expect(elapsed_ms < immediate_drain_ms);
+}
+
+test "process exit refuses stdio launches that begin after it" {
+    defer resetProcessExitKillsForTest();
+    try std.testing.expect(killAllForProcessExit());
+    try std.testing.expectError(error.Cancelled, beginChildLaunch());
+}
+
+test "process exit leaves a docker-backed child to the full teardown" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    defer resetProcessExitKillsForTest();
+    const fixture = try createShellDispatcher(uncooperative_child_script);
+    defer fixture.dispatcher.deinitAbandoned();
+    requireProcessExitTeardown(fixture.dispatcher);
+
+    try std.testing.expect(!killAllForProcessExit());
+    try std.testing.expect(fixture.dispatcher.childMayBeRunning());
+    try std.posix.kill(fixture.pid, @fromBackingInt(@intCast(0)));
+}
+
+test "process exit waits for a stdio launch under way before killing" {
+    defer resetProcessExitKillsForTest();
+    try beginChildLaunch();
+    const Launch = struct {
+        fn finish() void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            endChildLaunch();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Launch.finish, .{});
+    defer thread.join();
+
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expect(killAllForProcessExit());
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 20);
+}
+
+test "process exit falls back to the full teardown when a child was not tracked" {
+    defer resetProcessExitKillsForTest();
+    {
+        const io = io_mod.getIo();
+        process_exit_kills.mutex.lockUncancelable(io);
+        defer process_exit_kills.mutex.unlock(io);
+        process_exit_kills.overflowed = true;
+    }
+    try std.testing.expect(!killAllForProcessExit());
+}
+
 test "MCP normal shutdown gives a cooperative child TERM before forced cleanup" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const alloc = std.testing.allocator;
@@ -2420,12 +3127,11 @@ test "MCP normal shutdown gives a cooperative child TERM before forced cleanup" 
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const sentinel = try std.fmt.allocPrint(alloc, "{s}/term-sentinel", .{root});
+    const sentinel = try alloc.print("{s}/term-sentinel", .{root});
     defer alloc.free(sentinel);
-    const ready = try std.fmt.allocPrint(alloc, "{s}/ready", .{root});
+    const ready = try alloc.print("{s}/ready", .{root});
     defer alloc.free(ready);
-    const script = try std.fmt.allocPrint(
-        alloc,
+    const script = try alloc.print(
         "trap 'printf term > \"{s}\"; exit 0' TERM\nprintf ready > \"{s}\"\nwhile :; do :; done",
         .{ sentinel, ready },
     );
@@ -2441,7 +3147,7 @@ test "MCP normal shutdown gives a cooperative child TERM before forced cleanup" 
 }
 
 test "MCP forced shutdown gives launchers bounded TERM before KILL" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const alloc = std.testing.allocator;
@@ -2449,12 +3155,11 @@ test "MCP forced shutdown gives launchers bounded TERM before KILL" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const sentinel = try std.fmt.allocPrint(alloc, "{s}/term-sentinel", .{root});
+    const sentinel = try alloc.print("{s}/term-sentinel", .{root});
     defer alloc.free(sentinel);
-    const ready = try std.fmt.allocPrint(alloc, "{s}/ready", .{root});
+    const ready = try alloc.print("{s}/ready", .{root});
     defer alloc.free(ready);
-    const script = try std.fmt.allocPrint(
-        alloc,
+    const script = try alloc.print(
         "trap 'printf term > \"{s}\"; exit 0' TERM\nprintf ready > \"{s}\"\nwhile :; do :; done",
         .{ sentinel, ready },
     );

@@ -5,7 +5,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
-const diagnostics = @import("../workspace/diagnostics.zig");
+const compactor = @import("../compactor/compactor.zig");
 
 fn compactionErrorHandled(work: worker_runtime.WorkItem, provenance: ?compaction_activity.ErrorProvenance, err: anyerror) bool {
     const failure = provenance orelse return false;
@@ -41,8 +41,18 @@ pub fn Runtime(comptime App: type) type {
             const work = (try app.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return;
             defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
             defer app.worker.finishProcessing();
-            errdefer |err| settleCompactionWorkFailure(&app.worker, work, err);
+            processCooperativeWork(app, event_handlers, flush_frame, work) catch |err| {
+                settleCompactionWorkFailure(&app.worker, work, err);
+                return err;
+            };
+        }
 
+        fn processCooperativeWork(
+            app: *App,
+            event_handlers: app_worker_runtime.WorkerEventHandlers,
+            flush_frame: *const fn (*App) anyerror!void,
+            work: worker_runtime.WorkItem,
+        ) !void {
             try app_worker_runtime.Runtime(App).tick(
                 app,
                 event_handlers,
@@ -53,7 +63,7 @@ pub fn Runtime(comptime App: type) type {
             app.processQueuedWork(work, &failure_provenance) catch |err| {
                 settleCompactionWorkFailure(&app.worker, work, err);
                 if (compactionErrorHandled(work, failure_provenance, err)) {
-                    diagnostics.traceCompactionLog(true, "interactive error retained err={s}", .{@errorName(err)});
+                    compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
                 } else if (err != error.RouteRecoveryStopped) {
                     const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                     defer std.heap.c_allocator.free(body);
@@ -116,21 +126,13 @@ pub fn Runtime(comptime App: type) type {
                 error.ConnectionSetupTimedOut => return alloc.dupe(u8, "Connection setup timed out after 30 seconds."),
                 error.TlsInitializationFailed => return alloc.dupe(u8, "Connection setup failed: TLS could not be initialized."),
                 error.ModelImageCapabilityUnavailable => return alloc.dupe(u8, image_attachments.model_image_capability_unavailable_notice),
-                error.InvalidCompactionHandoff => return alloc.dupe(
-                    u8,
-                    "The model did not return a usable context summary. Your existing context was kept. Try /compact again or send a follow-up.",
-                ),
-                error.CompactionResultStorageUnavailable => return alloc.dupe(
-                    u8,
-                    "Context could not be compacted because older tool results could not be preserved. Save the session or restore writable session storage, then try again.",
-                ),
                 else => {},
             }
             if (detailedErrorSummary(err)) |detail| {
-                return std.fmt.allocPrint(alloc, "{s}: {s} ({s})", .{ context, detail, @errorName(err) });
+                return alloc.print("{s}: {s} ({s})", .{ context, detail, @errorName(err) });
             }
 
-            return std.fmt.allocPrint(alloc, "{s}: {s}", .{ context, @errorName(err) });
+            return alloc.print("{s}: {s}", .{ context, @errorName(err) });
         }
 
         fn workerThreadMain(app: *App) void {
@@ -155,7 +157,7 @@ pub fn Runtime(comptime App: type) type {
                 app.processQueuedWork(work, &failure_provenance) catch |err| {
                     settleCompactionWorkFailure(&app.worker, work, err);
                     if (compactionErrorHandled(work, failure_provenance, err)) {
-                        diagnostics.traceCompactionLog(true, "interactive error retained err={s}", .{@errorName(err)});
+                        compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
                     } else if (err != error.RouteRecoveryStopped) {
                         const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                         defer std.heap.c_allocator.free(body);
@@ -172,7 +174,7 @@ pub fn Runtime(comptime App: type) type {
 }
 
 test "compaction activity error routing requires exact operation and turn provenance" {
-    const id: compaction_activity.OperationId = @enumFromInt(1);
+    const id: compaction_activity.OperationId = @fromBackingInt(@intCast(1));
     const task: worker_runtime.WorkItem = .{ .compact_context = .{
         .operation_id = id,
         .turn_id = 7,
@@ -180,12 +182,12 @@ test "compaction activity error routing requires exact operation and turn proven
         .api_key = @constCast("fixture"),
         .history = &.{},
     } };
-    const provenance: compaction_activity.ErrorProvenance = .{ .operation_id = id, .turn_id = 7, .err = error.InvalidCompactionHandoff };
-    try std.testing.expect(compactionErrorHandled(task, provenance, error.InvalidCompactionHandoff));
-    try std.testing.expect(!compactionErrorHandled(task, null, error.InvalidCompactionHandoff));
+    const provenance: compaction_activity.ErrorProvenance = .{ .operation_id = id, .turn_id = 7, .err = error.ModelFailed };
+    try std.testing.expect(compactionErrorHandled(task, provenance, error.ModelFailed));
+    try std.testing.expect(!compactionErrorHandled(task, null, error.ModelFailed));
     try std.testing.expect(!compactionErrorHandled(task, provenance, error.OutOfMemory));
     var stale = provenance;
-    stale.operation_id = @enumFromInt(2);
+    stale.operation_id = @fromBackingInt(@intCast(2));
     try std.testing.expect(!compactionErrorHandled(task, stale, provenance.err));
     stale = provenance;
     stale.turn_id = 8;
@@ -281,31 +283,6 @@ test "formatErrorBody describes terminal connection setup failures plainly" {
     const unrelated_timeout = try Rt.formatErrorBody(alloc, "request failed", error.ConnectionTimedOut);
     defer alloc.free(unrelated_timeout);
     try std.testing.expectEqualStrings("request failed: ConnectionTimedOut", unrelated_timeout);
-}
-
-test "formatErrorBody explains how to retry an unusable compaction summary" {
-    const alloc = std.testing.allocator;
-    const body = try Runtime(DummyApp).formatErrorBody(alloc, "request failed", error.InvalidCompactionHandoff);
-    defer alloc.free(body);
-    try std.testing.expect(std.mem.find(u8, body, "context was kept") != null);
-    try std.testing.expect(std.mem.find(u8, body, "/compact") != null);
-    try std.testing.expect(std.mem.find(u8, body, "follow-up") != null);
-}
-
-test "formatErrorBody explains compaction result storage failure" {
-    const alloc = std.testing.allocator;
-    const Rt = Runtime(DummyApp);
-    const body = try Rt.formatErrorBody(
-        alloc,
-        "request failed",
-        error.CompactionResultStorageUnavailable,
-    );
-    defer alloc.free(body);
-
-    try std.testing.expectEqualStrings(
-        "Context could not be compacted because older tool results could not be preserved. Save the session or restore writable session storage, then try again.",
-        body,
-    );
 }
 
 test "formatToolExecutionError includes detail for MissingField" {

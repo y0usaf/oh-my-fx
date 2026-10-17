@@ -38,7 +38,8 @@ const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 pub const file_name = "history-cache.bin";
 
 const magic = "fx-history-cache\x1a\n"; // 18 bytes; all offsets use magic.len
-const format_version: u16 = 1;
+// Image source references extend the binary payload without changing the log schema.
+const format_version: u16 = 3;
 /// Frames carry 32-bit lengths; a single log line can be large (embedded tool
 /// output), so the cap stays generous. Anything larger is a corrupt cache.
 const max_frame_bytes: u32 = 1024 * 1024 * 1024;
@@ -73,7 +74,7 @@ fn encodeAny(out: *std.ArrayList(u8), alloc: Allocator, value: anytype) EncodeEr
         },
         .@"enum" => |info| {
             if (@bitSizeOf(info.tag_type) > 8) @compileError("snapshot codec: enum tag too wide: " ++ @typeName(T));
-            try out.append(alloc, std.math.cast(u8, @intFromEnum(value)) orelse return error.PayloadTooLarge);
+            try out.append(alloc, std.math.cast(u8, @backingInt(value)) orelse return error.PayloadTooLarge);
         },
         .optional => {
             if (value) |inner| {
@@ -103,8 +104,8 @@ fn encodeAny(out: *std.ArrayList(u8), alloc: Allocator, value: anytype) EncodeEr
             }
         },
         .@"struct" => |info| {
-            inline for (info.fields) |field| {
-                try encodeAny(out, alloc, @field(value, field.name));
+            inline for (info.field_names) |field_name| {
+                try encodeAny(out, alloc, @field(value, field_name));
             }
         },
         .@"union" => |info| {
@@ -112,7 +113,7 @@ fn encodeAny(out: *std.ArrayList(u8), alloc: Allocator, value: anytype) EncodeEr
                 @compileError("snapshot codec: untagged union: " ++ @typeName(T))).@"enum";
             if (@bitSizeOf(tag_info.tag_type) > 8) @compileError("snapshot codec: union tag too wide: " ++ @typeName(T));
             const active = std.meta.activeTag(value);
-            try out.append(alloc, std.math.cast(u8, @intFromEnum(active)) orelse return error.PayloadTooLarge);
+            try out.append(alloc, std.math.cast(u8, @backingInt(active)) orelse return error.PayloadTooLarge);
             switch (value) {
                 inline else => |payload| try encodeAny(out, alloc, payload),
             }
@@ -158,8 +159,8 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
         .@"enum" => |info| {
             const tag = (try cur.take(1))[0];
             const raw = std.math.cast(info.tag_type, tag) orelse return error.InvalidCache;
-            inline for (@typeInfo(T).@"enum".fields) |field| {
-                if (field.value == raw) return @enumFromInt(raw);
+            inline for (@typeInfo(T).@"enum".field_values) |field_value| {
+                if (field_value == raw) return @fromBackingInt(@intCast(raw));
             }
             return error.InvalidCache;
         },
@@ -204,8 +205,8 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
         },
         .@"struct" => |info| {
             var value: T = undefined;
-            inline for (info.fields) |field| {
-                @field(value, field.name) = try decodeAny(field.type, alloc, cur);
+            inline for (info.field_names, info.field_types) |field_name, field_type| {
+                @field(value, field_name) = try decodeAny(field_type, alloc, cur);
             }
             return value;
         },
@@ -215,10 +216,9 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
             const raw = (try cur.take(1))[0];
             _ = tag_type;
             const tag: std.meta.Tag(T) = tagblk: {
-                const fields = @typeInfo(T).@"union".fields;
-                inline for (fields) |field| {
-                    const candidate = @field(std.meta.Tag(T), field.name);
-                    if (@as(u64, @intFromEnum(candidate)) == raw) break :tagblk candidate;
+                inline for (@typeInfo(T).@"union".field_names) |field_name| {
+                    const candidate = @field(std.meta.Tag(T), field_name);
+                    if (@as(u64, @backingInt(candidate)) == raw) break :tagblk candidate;
                 }
                 return error.InvalidCache;
             };
@@ -248,8 +248,8 @@ fn freeAny(alloc: Allocator, comptime T: type, value: T) void {
             },
             else => unreachable,
         },
-        .@"struct" => |info| inline for (info.fields) |field| {
-            freeAny(alloc, field.type, @field(value, field.name));
+        .@"struct" => |info| inline for (info.field_names, info.field_types) |field_name, field_type| {
+            freeAny(alloc, field_type, @field(value, field_name));
         },
         .@"union" => switch (value) {
             inline else => |payload| freeAny(alloc, @TypeOf(payload), payload),
@@ -700,6 +700,7 @@ test "history snapshot codec round trips every event kind" {
                 .media_type = @constCast("image/png"),
                 .snapshot_path = @constCast("/tmp/s.png"),
                 .snapshot_sha256 = @constCast("abc123"),
+                .source_ref = @constCast("host:original"),
             }},
             .work_id = null,
         } },
@@ -885,6 +886,53 @@ test "history snapshot verify, cursor, and watermark authority" {
         try mutable.writePositionalAll(std.testing.io, "X", log_len - 2);
     }
     try std.testing.expect((try openAndVerify(alloc, &verified_dir, "sess-1", log_file, log_len)) == null);
+}
+
+test "history snapshot rejects version two image caches before decoding" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    const line = "{\"seq\":1}\n";
+    var log_file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+    defer log_file.close(std.testing.io);
+    try log_file.writeStreamingAll(std.testing.io, line);
+
+    var writer = try Writer.beginReplace(alloc, &dir, "legacy-images");
+    defer writer.finalize();
+    const file = writer.file.?;
+    var version: [8]u8 = undefined;
+    std.mem.writeInt(u64, &version, 2, .little);
+    try file.writePositionalAll(std.testing.io, &version, magic.len);
+
+    const envelope: session_event.ConversationEnvelope = .{
+        .seq = 1,
+        .timestamp_ms = 1,
+        .event = .{ .user = .{
+            .text = "with image",
+            .images = &.{.{ .id = 3, .path = @constCast("/tmp/a.png"), .media_type = @constCast("image/png") }},
+        } },
+    };
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+    try encodeFramePayload(&payload, alloc, envelope, 0, line.len, std.hash.Crc32.hash(line));
+    payload.items.len = envelope_seq_offset + 8 + 8 + 1;
+    // Frozen version-2 user payload: the image has no source_ref tag.
+    const legacy_user = "\x0a\x00\x00\x00\x00\x00\x00\x00" ++ "with image" ++
+        "\x01\x00\x00\x00\x00\x00\x00\x00" ++ "\x03\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x0a\x00\x00\x00\x00\x00\x00\x00" ++ "/tmp/a.png" ++
+        "\x09\x00\x00\x00\x00\x00\x00\x00" ++ "image/png" ++ "\x00\x00\x00\x00";
+    try payload.appendSlice(alloc, legacy_user);
+    var frame_header: [8]u8 = undefined;
+    std.mem.writeInt(u32, frame_header[0..4], @intCast(payload.items.len + 4), .little);
+    std.mem.writeInt(u32, frame_header[4..8], std.hash.Crc32.hash(payload.items), .little);
+    try file.writePositionalAll(std.testing.io, &frame_header, writer.len);
+    try file.writePositionalAll(std.testing.io, payload.items, writer.len + frame_header.len);
+    writer.finalize();
+
+    var verified = try openAndVerify(alloc, &dir, "legacy-images", log_file, line.len);
+    defer if (verified) |*cache| cache.deinit(alloc);
+    try std.testing.expect(verified == null);
 }
 
 test "history snapshot verification tolerates a torn tail as a shorter prefix" {

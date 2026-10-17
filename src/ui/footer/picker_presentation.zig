@@ -392,7 +392,7 @@ fn composeOnboardingPickerRow(
         const selected = view.choiceIsSelected(choice);
         try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
         var label_buf: [96]u8 = undefined;
-        const label = std.fmt.bufPrint(
+        const label = std.mem.print(
             &label_buf,
             "{s}{s}",
             .{ if (selected) "   › " else "     ", view.choiceLabel(choice) },
@@ -554,7 +554,7 @@ fn composeSignInPickerRow(
         else
             "   Sign in with Vercel",
         1, 4 => "",
-        2 => std.fmt.bufPrint(
+        2 => std.mem.print(
             &label_buf,
             "   Open   {s}",
             .{snapshot.verification_uri},
@@ -567,7 +567,7 @@ fn composeSignInPickerRow(
         3 => if (snapshot.user_code.len == 0)
             ""
         else
-            std.fmt.bufPrint(
+            std.mem.print(
                 &label_buf,
                 "   Code   {s}",
                 .{snapshot.user_code},
@@ -618,7 +618,7 @@ fn composeApiKeyPickerRow(
         2 => try row_text.appendClipped(alloc, &row, "   enter saves · esc cancels", width),
         3 => {
             var label_buf: [128]u8 = undefined;
-            const label = std.fmt.bufPrint(
+            const label = std.mem.print(
                 &label_buf,
                 "   Saves to {s}",
                 .{credentials.stored_key_backend_label},
@@ -636,6 +636,26 @@ pub fn activeListPickerReservedRows(terminal_rows: u16, input_extra: u16, banner
     const available_rows = terminal_rows -| fixed_rows;
     if (available_rows == 0) return 1;
     return @min(input_presentation.max_model_picker_rows, available_rows);
+}
+
+/// The @ file picker grows past the list picker's six rows when the terminal
+/// has room, because the file a user wants is often just below row 6.
+const max_file_picker_rows: u16 = 10;
+
+/// The @ file picker keeps the list picker's height, and grows up to
+/// `max_file_picker_rows` while at least five transcript rows stay visible
+/// above it.
+pub fn filePickerReservedRows(terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
+    const fixed_rows: u16 = 5 +| input_extra +| banner_rows;
+    const minimum_transcript_rows: u16 = 5;
+    const grown = @min(max_file_picker_rows, (terminal_rows -| fixed_rows) -| minimum_transcript_rows);
+    return @max(activeListPickerReservedRows(terminal_rows, input_extra, banner_rows), grown);
+}
+
+/// File rows in a file picker of `picker_rows` rows; a status line, when
+/// shown, takes the first row.
+pub fn filePickerItemRows(picker_rows: u16, has_status: bool) u16 {
+    return picker_rows -| @intFromBool(has_status and picker_rows > 1);
 }
 
 pub fn authPickerReservedRows(view: auth_runtime.PickerView, terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
@@ -800,7 +820,7 @@ pub noinline fn composePickerOptionRowAnnotated(
     // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
         .model_stage, .provider_stage, .models => ui_render.selected_completion_style,
-        .file, .slash, .skills, .help, .settings, .sessions, .mcp, .auth => ui_render.approval_button_inactive_style,
+        .file, .slash, .skills, .help, .settings, .sessions, .fork, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
     const available = width_usize - @as(usize, start_col - 1);
@@ -908,6 +928,7 @@ pub fn composePickerStatusRowWithProvider(
         .help => "no matching commands",
         .settings => "no matching settings",
         .sessions => "no matching sessions",
+        .fork => "nothing to fork yet",
         .mcp => "no MCP items available",
         .auth => "authentication actions unavailable",
     };
@@ -933,9 +954,9 @@ fn appendFilePickerLabel(
         return;
     }
 
-    const basename = std.fs.path.basename(path);
+    const basename = std.Io.Dir.path.basename(path);
     const basename_start = @intFromPtr(basename.ptr) - @intFromPtr(path.ptr);
-    const dirname = std.fs.path.dirname(path) orelse {
+    const dirname = std.Io.Dir.path.dirname(path) orelse {
         try appendBasenameProjection(alloc, row, item, basename_start, width_usize, base_style);
         return;
     };
@@ -1204,13 +1225,13 @@ pub fn composeSlashMenuHeaderRow(
     const noun = if (layout.command_count == layout.result_count) "Commands" else "Results";
     var left_buf: [96]u8 = undefined;
     const left = if (std.mem.eql(u8, prefix, "/"))
-        std.fmt.bufPrint(&left_buf, "{s} {d} · type to filter", .{ noun, layout.result_count }) catch noun
+        std.mem.print(&left_buf, "{s} {d} · type to filter", .{ noun, layout.result_count }) catch noun
     else
-        std.fmt.bufPrint(&left_buf, "{s} {d}", .{ noun, layout.result_count }) catch noun;
+        std.mem.print(&left_buf, "{s} {d}", .{ noun, layout.result_count }) catch noun;
 
     var range_buf: [48]u8 = undefined;
     const range = if (layout.result_count > layout.selectable_rows)
-        std.fmt.bufPrint(&range_buf, "{d}–{d}", .{ layout.window.start + 1, layout.window.end }) catch ""
+        std.mem.print(&range_buf, "{d}–{d}", .{ layout.window.start + 1, layout.window.end }) catch ""
     else
         "";
 
@@ -1548,6 +1569,17 @@ test "slash menu layout keeps six selectable rows below its header" {
     const scrolled = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 6, 0, 24, 0, 0).?;
     try std.testing.expectEqual(@as(usize, 1), scrolled.window.start);
     try std.testing.expectEqual(@as(usize, 7), scrolled.window.end);
+}
+
+test "file picker grows to ten rows while five transcript rows stay visible" {
+    try std.testing.expectEqual(@as(u16, 10), filePickerReservedRows(40, 0, 0));
+    try std.testing.expectEqual(@as(u16, 10), filePickerReservedRows(24, 0, 0));
+    try std.testing.expectEqual(@as(u16, 8), filePickerReservedRows(18, 0, 0));
+    // Short terminals keep the list picker's height.
+    try std.testing.expectEqual(@as(u16, 6), filePickerReservedRows(16, 0, 0));
+    try std.testing.expectEqual(@as(u16, 6), filePickerReservedRows(12, 0, 0));
+    try std.testing.expectEqual(@as(u16, 1), filePickerReservedRows(6, 0, 0));
+    try std.testing.expectEqual(@as(u16, 6), filePickerReservedRows(20, 2, 4));
 }
 
 test "inline picker row budget preserves six roomy choices and shrinks with height" {

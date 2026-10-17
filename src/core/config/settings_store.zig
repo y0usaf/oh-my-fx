@@ -5,6 +5,7 @@ const mem_utils = @import("../shared/mem_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
@@ -102,6 +103,7 @@ pub const UserSettingsPatch = struct {
     yolo_acknowledged: ?bool = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
+    ultrafast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
     update_channel: ?update_target.Channel = null,
@@ -122,6 +124,7 @@ pub const UserSettingsPatch = struct {
             self.yolo_acknowledged == null and
             self.effort == null and
             self.fast_mode == null and
+            self.ultrafast_mode == null and
             self.slash_menu_categories == null and
             self.collapse_tool_calls == null and
             self.update_channel == null and
@@ -216,6 +219,7 @@ const UserPreferenceField = enum(u4) {
     permission_mode,
     effort,
     fast_mode,
+    ultrafast_mode,
     slash_menu_categories,
     collapse_tool_calls,
     update_channel,
@@ -226,7 +230,7 @@ const UserPreferenceField = enum(u4) {
     session_titles,
 
     fn mask(self: UserPreferenceField) u16 {
-        return @as(u16, 1) << @intFromEnum(self);
+        return @as(u16, 1) << @backingInt(self);
     }
 
     fn snapshotName(self: UserPreferenceField) []const u8 {
@@ -235,6 +239,7 @@ const UserPreferenceField = enum(u4) {
             .permission_mode => "settings.json.preference-migration.permission_mode.json",
             .effort => "settings.json.preference-migration.effort.json",
             .fast_mode => "settings.json.preference-migration.fast_mode.json",
+            .ultrafast_mode => "settings.json.preference-migration.ultrafast_mode.json",
             .slash_menu_categories => "settings.json.preference-migration.slash_menu_categories.json",
             .collapse_tool_calls => "settings.json.preference-migration.collapse_tool_calls.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
@@ -252,6 +257,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .permission_mode,
     .effort,
     .fast_mode,
+    .ultrafast_mode,
     .slash_menu_categories,
     .collapse_tool_calls,
     .update_channel,
@@ -702,7 +708,7 @@ pub const Store = struct {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch continue;
             defer parsed.deinit();
             if (parsed.value != .object) continue;
-            return try std.fs.path.join(alloc, &.{ self.display_root, profile_paths.backups_dir_name, name });
+            return try std.Io.Dir.path.join(alloc, &.{ self.display_root, profile_paths.backups_dir_name, name });
         }
         return null;
     }
@@ -773,8 +779,7 @@ pub const Store = struct {
         var random_bytes: [16]u8 = undefined;
         io_mod.getIo().random(&random_bytes);
         const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-        const name = try std.fmt.allocPrint(
-            alloc,
+        const name = try alloc.print(
             "settings.json.{s}.{d}-{x:0>16}-{s}",
             .{ kind, io_mod.milliTimestamp(), sequence, random_hex },
         );
@@ -806,7 +811,7 @@ pub const Store = struct {
             try io_mod.durableReplaceVerified(alloc, &backups, name, bytes);
             try paths.append(
                 alloc,
-                try std.fs.path.join(alloc, &.{ self.display_root, profile_paths.backups_dir_name, name }),
+                try std.Io.Dir.path.join(alloc, &.{ self.display_root, profile_paths.backups_dir_name, name }),
             );
         }
         return paths.toOwnedSlice(alloc);
@@ -823,8 +828,8 @@ fn failStoreParentSync(_: ?*anyopaque, _: std.Io.Dir) anyerror!void {
 }
 
 fn validateWorkspaceRoot(workspace_root: []const u8) !void {
-    if (workspace_root.len == 0 or workspace_root.len > std.fs.max_path_bytes) return error.InvalidDurableField;
-    if (!std.fs.path.isAbsolute(workspace_root) or !std.unicode.utf8ValidateSlice(workspace_root)) {
+    if (workspace_root.len == 0 or workspace_root.len > std.Io.Dir.max_path_bytes) return error.InvalidDurableField;
+    if (!std.Io.Dir.path.isAbsolute(workspace_root) or !std.unicode.utf8ValidateSlice(workspace_root)) {
         return error.InvalidDurableField;
     }
 }
@@ -916,8 +921,8 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
 }
 
 fn validAdditionalDirectoryPath(path: []const u8) bool {
-    return path.len > 0 and path.len <= std.fs.max_path_bytes and
-        std.fs.path.isAbsolute(path) and std.unicode.utf8ValidateSlice(path) and
+    return path.len > 0 and path.len <= std.Io.Dir.max_path_bytes and
+        std.Io.Dir.path.isAbsolute(path) and std.unicode.utf8ValidateSlice(path) and
         std.mem.findScalar(u8, path, 0) == null;
 }
 
@@ -939,6 +944,19 @@ test "clearing the credential choice removes the key rather than blanking it" {
 
     application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .clear_credential_source = true });
     try std.testing.expect(!application.changed);
+}
+
+test "ultrafast user patch writes a profile-owned bool" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{}", .{});
+    defer parsed.deinit();
+    var root = parsed.value;
+
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .ultrafast_mode = false });
+    try std.testing.expect(application.changed);
+    try std.testing.expect(!root.object.get("ultrafast_mode").?.bool);
 }
 
 test "collapse tool calls user patch writes the profile preference" {
@@ -1041,6 +1059,7 @@ fn applyUserPatchToRoot(
     if (patch.yolo_acknowledged) |value| application.changed = try putBool(arena, &root.object, "yolo_acknowledged", value) or application.changed;
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
+    if (patch.ultrafast_mode) |value| application.changed = try putBool(arena, &root.object, "ultrafast_mode", value) or application.changed;
     if (patch.model_preference != null and patch.fast_mode != null) {
         application.changed = try putBool(arena, &root.object, "fast_mode_model_bound", true) or application.changed;
     } else if ((patch.model_preference != null or patch.fast_mode != null) and root.object.contains("fast_mode_model_bound")) {
@@ -1166,6 +1185,13 @@ fn cleanupLegacyWorkspacePreferences(
             "fast_mode",
             .fast_mode,
             patch.fast_mode != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "ultrafast_mode",
+            .ultrafast_mode,
+            patch.ultrafast_mode != null,
             application,
         );
         if ((patch.model_preference != null or patch.fast_mode != null) and
@@ -1924,6 +1950,11 @@ fn validateKnownSettingsObject(
             return error.InvalidSettingsFormat;
         }
     }
+    if (object.get("auto_compact_percent")) |value| {
+        if (value != .integer or value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (object.get("skill_match_fuzzy")) |value| {
         if (value != .bool) return error.InvalidSettingsFormat;
     }
@@ -1944,7 +1975,7 @@ fn validateKnownSettingsObject(
             }
         }
     }
-    inline for (&.{ "context", "fast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
+    inline for (&.{ "context", "fast_mode", "ultrafast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
         }
@@ -2019,7 +2050,7 @@ fn parseSequence(name: []const u8) ?u64 {
     {
         return null;
     }
-    const first_dash = std.mem.indexOfScalar(u8, name, '-') orelse return null;
+    const first_dash = std.mem.findScalar(u8, name, '-') orelse return null;
     const sequence_start = first_dash + 1;
     if (sequence_start + 16 >= name.len or name[sequence_start + 16] != '-') return null;
     return std.fmt.parseInt(u64, name[sequence_start .. sequence_start + 16], 16) catch null;
@@ -2038,7 +2069,7 @@ fn parseBackupTimestamp(name: []const u8) ?i64 {
         }
     }
     const text = suffix orelse return null;
-    const end = std.mem.indexOfScalar(u8, text, '-') orelse text.len;
+    const end = std.mem.findScalar(u8, text, '-') orelse text.len;
     if (end == 0) return null;
     return std.fmt.parseInt(i64, text[0..end], 10) catch null;
 }
@@ -2076,7 +2107,7 @@ fn containsCopyWithFingerprint(
     bytes: []const u8,
 ) !bool {
     const expected = fingerprintOptional(bytes);
-    const prefix = try std.fmt.allocPrint(alloc, "settings.json.{s}.", .{kind});
+    const prefix = try alloc.print("settings.json.{s}.", .{kind});
     defer alloc.free(prefix);
     var iterator = dir.iterate();
     while (try iterator.next(io_mod.getIo())) |entry| {
@@ -2103,7 +2134,7 @@ fn pruneSequencedCopies(
     kind: []const u8,
     keep_count: usize,
 ) !void {
-    const prefix = try std.fmt.allocPrint(alloc, "settings.json.{s}.", .{kind});
+    const prefix = try alloc.print("settings.json.{s}.", .{kind});
     defer alloc.free(prefix);
     var names: std.ArrayList([]u8) = .empty;
     defer {
@@ -2146,7 +2177,7 @@ test "user patch accepts existing full access aliases and preserves their spelli
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-        const original = try std.fmt.allocPrint(alloc, "{{\"permission_mode\":\"{s}\"}}\n", .{mode});
+        const original = try alloc.print("{{\"permission_mode\":\"{s}\"}}\n", .{mode});
         defer alloc.free(original);
         try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
         const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -2702,8 +2733,7 @@ test "user permission mutation preserves local rules" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"permission\":{{\"bash\":{{\"global *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}}}}}}}\n",
         .{workspace},
     );
@@ -2743,8 +2773,7 @@ test "permission mutation validates scope paths and isolates remove and reset" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\",\"deny *\":\"deny\"}},\"read\":{{\"*\":\"allow\"}}}}}}}}}}\n",
         .{workspace},
     );
@@ -2895,7 +2924,7 @@ test "user patch traces metadata without settings content" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const trace_path = try std.fs.path.join(alloc, &.{ home, "settings-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ home, "settings-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -3094,7 +3123,7 @@ test "startup scrollback user patch removes matching legacy workspace value" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try std.fmt.allocPrint(alloc, "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{workspace});
+    const fixture = try alloc.print("{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{workspace});
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -3117,8 +3146,7 @@ test "unrelated user patch preserves inert output level values" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"output_level\":{{\"legacy\":true}},\"workspaces\":{{\"{s}\":{{\"output_level\":[\"quiet\",7],\"future\":true}}}}}}\n",
         .{workspace},
     );
@@ -3451,7 +3479,7 @@ test "read-only settings load under missing home is absent without creating stat
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const home = try std.fs.path.join(alloc, &.{ root, "missing-home" });
+    const home = try std.Io.Dir.path.join(alloc, &.{ root, "missing-home" });
     defer alloc.free(home);
 
     var store = try Store.initFromHome(alloc, home, .read_only);
@@ -3581,12 +3609,11 @@ test "workspace directory mutations use workspace access path identity" {
     defer alloc.free(primary);
     const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
     defer alloc.free(shared);
-    const shared_dot = try std.fmt.allocPrint(alloc, "{s}{c}.", .{ shared, std.fs.path.sep });
+    const shared_dot = try alloc.print("{s}{c}.", .{ shared, std.Io.Dir.path.sep });
     defer alloc.free(shared_dot);
-    const shared_link = try std.fs.path.resolve(alloc, &.{ primary, "../shared-link" });
+    const shared_link = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../shared-link" });
     defer alloc.free(shared_link);
-    const available_fixture = try std.fmt.allocPrint(
-        alloc,
+    const available_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, shared_dot, shared_link },
     );
@@ -3622,18 +3649,16 @@ test "workspace directory mutations use workspace access path identity" {
     defer alloc.free(available_removed);
     try std.testing.expect(std.mem.find(u8, available_removed, "additional_directories") == null);
 
-    const missing = try std.fs.path.resolve(alloc, &.{ primary, "../missing" });
+    const missing = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../missing" });
     defer alloc.free(missing);
-    const missing_dot = try std.fmt.allocPrint(alloc, "{s}{c}.", .{ missing, std.fs.path.sep });
+    const missing_dot = try alloc.print("{s}{c}.", .{ missing, std.Io.Dir.path.sep });
     defer alloc.free(missing_dot);
-    const missing_parent = try std.fmt.allocPrint(
-        alloc,
+    const missing_parent = try alloc.print(
         "{s}{c}child{c}..",
-        .{ missing, std.fs.path.sep, std.fs.path.sep },
+        .{ missing, std.Io.Dir.path.sep, std.Io.Dir.path.sep },
     );
     defer alloc.free(missing_parent);
-    const unavailable_fixture = try std.fmt.allocPrint(
-        alloc,
+    const unavailable_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, missing_dot, missing_parent },
     );
@@ -3675,9 +3700,9 @@ test "workspace directory removal uses observed sources and preserves unseen con
     defer alloc.free(primary);
     const first = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "first");
     defer alloc.free(first);
-    const observed_source = try std.fs.path.resolve(alloc, &.{ primary, "../observed-link" });
+    const observed_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../observed-link" });
     defer alloc.free(observed_source);
-    const unseen_source = try std.fs.path.resolve(alloc, &.{ primary, "../unseen-link" });
+    const unseen_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../unseen-link" });
     defer alloc.free(unseen_source);
     const observed_sources = [_]workspace_access.SavedSource{.{
         .source = observed_source,
@@ -3688,8 +3713,7 @@ test "workspace directory removal uses observed sources and preserves unseen con
     try tmp.dir.symLink(std.testing.io, "second", "observed-link", .{ .is_directory = true });
     try tmp.dir.symLink(std.testing.io, "first", "unseen-link", .{ .is_directory = true });
 
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, observed_source, unseen_source },
     );
@@ -3741,16 +3765,15 @@ test "workspace directory removal stabilizes observed survivor identity" {
     defer alloc.free(removed);
     const survivor = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "survivor");
     defer alloc.free(survivor);
-    const removed_source = try std.fs.path.resolve(alloc, &.{ primary, "../removed-link" });
+    const removed_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../removed-link" });
     defer alloc.free(removed_source);
-    const survivor_source = try std.fs.path.resolve(alloc, &.{ primary, "../survivor-link" });
+    const survivor_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../survivor-link" });
     defer alloc.free(survivor_source);
     const observed_sources = [_]workspace_access.SavedSource{
         .{ .source = removed_source, .identity = removed },
         .{ .source = survivor_source, .identity = survivor },
     };
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, removed_source, survivor_source },
     );
@@ -3929,7 +3952,7 @@ test "workspace directory add counts an unseen command line root once" {
         .get("additional_directories").?.array.items;
     try std.testing.expectEqual(workspace_access.max_additional_directories, directories.len);
     for (directories[0 .. directories.len - 1], 0..) |directory, index| {
-        const expected = try std.fmt.allocPrint(alloc, "/unseen-{d}", .{index});
+        const expected = try alloc.print("/unseen-{d}", .{index});
         defer alloc.free(expected);
         try std.testing.expectEqualStrings(expected, directory.string);
     }
@@ -3955,14 +3978,13 @@ test "workspace directory existing add stabilizes a retargeted observed source" 
     defer alloc.free(primary);
     const first = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "first");
     defer alloc.free(first);
-    const source = try std.fs.path.resolve(alloc, &.{ primary, "../saved-link" });
+    const source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../saved-link" });
     defer alloc.free(source);
     const observed_sources = [_]workspace_access.SavedSource{.{
         .source = source,
         .identity = first,
     }};
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ primary, source },
     );
@@ -4018,13 +4040,13 @@ test "workspace directory capacity compaction uses observed source identities" {
     var initialized: usize = 0;
     defer for (aliases[0..initialized]) |path| alloc.free(path);
     for (&aliases, &observed, 0..) |*alias, *source, index| {
-        const name = try std.fmt.allocPrint(alloc, "stable-link-{d}", .{index});
+        const name = try alloc.print("stable-link-{d}", .{index});
         defer alloc.free(name);
         tmp.dir.symLink(std.testing.io, "shared", name, .{ .is_directory = true }) catch |err| switch (err) {
             error.AccessDenied => return error.SkipZigTest,
             else => return err,
         };
-        alias.* = try std.fs.path.resolve(alloc, &.{ primary, "..", name });
+        alias.* = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "..", name });
         source.* = .{ .source = alias.*, .identity = shared };
         initialized += 1;
     }
@@ -4090,13 +4112,13 @@ test "workspace directory add compacts saved aliases before applying effective c
     var initialized: usize = 0;
     defer for (aliases[0..initialized]) |path| alloc.free(path);
     for (&aliases, &observed, 0..) |*alias, *source, index| {
-        const name = try std.fmt.allocPrint(alloc, "shared-link-{d}", .{index});
+        const name = try alloc.print("shared-link-{d}", .{index});
         defer alloc.free(name);
         tmp.dir.symLink(std.testing.io, "shared", name, .{ .is_directory = true }) catch |err| switch (err) {
             error.AccessDenied => return error.SkipZigTest,
             else => return err,
         };
-        alias.* = try std.fs.path.resolve(alloc, &.{ primary, "..", name });
+        alias.* = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "..", name });
         source.* = .{ .source = alias.*, .identity = shared };
         initialized += 1;
     }

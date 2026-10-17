@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
@@ -95,6 +96,7 @@ pub const ModelMenuCatalogState = struct {
     source: ?credentials.Source = null,
     public_only_reason: ?credentials.CatalogPublicOnlyReason = null,
     private_models_hidden: bool = false,
+    from_profile_settings: bool = false,
     failure: ?Failure = null,
 
     pub const Failure = struct {
@@ -112,7 +114,7 @@ pub const ModelProviderFilter = enum {
     others,
 };
 
-pub const model_provider_filter_count = std.meta.fields(ModelProviderFilter).len;
+pub const model_provider_filter_count = @typeInfo(ModelProviderFilter).@"enum".field_names.len;
 
 pub const ModelMenuItem = struct {
     id: []u8,
@@ -146,14 +148,14 @@ pub const ModelMenu = struct {
 
     pub fn setQuery(self: *ModelMenu, query_text: []const u8) void {
         const len = @min(query_text.len, self.query_buf.len);
-        if (len > 0) std.mem.copyForwards(u8, self.query_buf[0..len], query_text[0..len]);
+        if (len > 0) @memmove(self.query_buf[0..len], query_text[0..len]);
         self.query_len = len;
         self.selected_index = 0;
         self.window_start = 0;
     }
 
     pub fn providerFilter(self: *const ModelMenu) ModelProviderFilter {
-        return @enumFromInt(@min(self.provider_index, model_provider_filter_count - 1));
+        return @fromBackingInt(@intCast(@min(self.provider_index, model_provider_filter_count - 1)));
     }
 
     pub fn filteredItemCount(self: *const ModelMenu) usize {
@@ -194,7 +196,7 @@ pub const ModelMenu = struct {
             next += direction;
             if (next < 0) next = @as(i32, @intCast(filter_count)) - 1;
             if (next >= @as(i32, @intCast(filter_count))) next = 0;
-            const filter: ModelProviderFilter = @enumFromInt(@as(usize, @intCast(next)));
+            const filter: ModelProviderFilter = @fromBackingInt(@intCast(next));
             if (!modelProviderFilterAvailable(self.items.items, filter)) continue;
             if (next == current) return false;
             self.provider_index = @intCast(next);
@@ -275,12 +277,12 @@ fn providerFilter(provider: []const u8) ModelProviderFilter {
 
 pub fn modelProviderFilterAvailable(items: []const ModelMenuItem, filter: ModelProviderFilter) bool {
     if (filter == .all) return true;
-    var seen = [_]bool{false} ** model_provider_filter_count;
-    for (items) |item| seen[@intFromEnum(providerFilter(item.provider))] = true;
+    var seen: [model_provider_filter_count]bool = @splat(false);
+    for (items) |item| seen[@backingInt(providerFilter(item.provider))] = true;
 
     var specific_count: usize = 0;
     for (seen[1..]) |available| specific_count += @intFromBool(available);
-    return specific_count > 1 and seen[@intFromEnum(filter)];
+    return specific_count > 1 and seen[@backingInt(filter)];
 }
 
 fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool {
@@ -301,6 +303,7 @@ pub const Runtime = struct {
     cancel_requested: std.atomic.Value(bool) = .init(false),
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
+    from_profile_settings: bool = false,
     menu: ModelMenu = .{},
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
@@ -321,6 +324,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
@@ -351,6 +355,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
@@ -417,7 +422,7 @@ pub const Runtime = struct {
                     loaded.* = .{ .access = requested_access };
                     self.outcome.last_failure = null;
                     if (self.menu.active) {
-                        self.menu.catalog_state = modelMenuCatalogState(self.outcome);
+                        self.menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
                     }
                     reused_public_catalog = true;
                 }
@@ -484,6 +489,7 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = .empty;
         self.outcome = .{};
+        self.from_profile_settings = false;
     }
 
     /// Installs a catalog that was completely fetched and validated before the
@@ -504,6 +510,7 @@ pub const Runtime = struct {
         self.outcome = .{ .loaded = .{
             .access = model_catalog.AccessMetadata.init(access),
         } };
+        self.from_profile_settings = false;
         self.state = .ready;
         self.completion_pending = true;
         self.last_attempt_ms = io_mod.milliTimestamp();
@@ -754,7 +761,7 @@ pub const Runtime = struct {
         self.mutex.unlock(io_mod.getIo());
         diagnostics.recordModelCatalogEvent(true, .load, "outcome=failed category={s} status={d} retryable={s} anonymous_fallback={s} kept_previous_catalog={s}", .{
             @tagName(failure.failure.category),
-            if (failure.failure.http_status) |status| @intFromEnum(status) else 0,
+            if (failure.failure.http_status) |status| @backingInt(status) else 0,
             boolLabel(failure.failure.retryable),
             boolLabel(failure.anonymous_fallback_used),
             boolLabel(kept_previous),
@@ -796,7 +803,7 @@ pub const Runtime = struct {
             },
             .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
         }
-        menu.catalog_state = modelMenuCatalogState(self.outcome);
+        menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
 };
 
@@ -804,7 +811,7 @@ fn boolLabel(value: bool) []const u8 {
     return if (value) "true" else "false";
 }
 
-fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
+fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) ModelMenuCatalogState {
     const access = if (outcome.last_failure) |failed|
         if (outcome.loaded == null or failed.anonymous_fallback_used)
             failed.access
@@ -825,6 +832,7 @@ fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
         .source = access.source,
         .public_only_reason = access.public_only_reason,
         .private_models_hidden = access.private_models_may_be_hidden,
+        .from_profile_settings = from_profile_settings,
         .failure = if (failure) |failed| .{
             .category = failed.category,
             .retryable = failed.retryable,
@@ -1294,7 +1302,7 @@ test "model cache access copies clean up every induced allocation failure" {
     const access = authenticatedCatalogAccess("copied-secret", "copied-team");
     for (0..2) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
 
@@ -1316,7 +1324,7 @@ test "model cache access owns Grok account identity with its credential" {
     );
     for (0..2) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         try std.testing.expectError(
@@ -1371,8 +1379,7 @@ test "model cache warmup publishes a snapshot and filtered completion" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const models_url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const models_url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/v1/models",
         .{fixture.port()},
     );
@@ -1450,6 +1457,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
             .has_file_input = true,
             .has_web_search = true,
             .supports_fast_mode = true,
+            .supports_ultrafast_mode = true,
         },
         .{
             .id = @constCast("private/blue-hornbill"),
@@ -1472,6 +1480,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expect(runtime.menu.itemAt(0).?.capabilities.supports_vision);
     try std.testing.expectEqual(@as(?u32, 256_000), runtime.menu.itemAt(0).?.capabilities.context_window);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_fast_mode);
+    try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_ultrafast_mode);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_file_input);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_web_search);
 
@@ -1486,11 +1495,11 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expect(runtime.menu.moveProvider(-1));
     try std.testing.expectEqual(ModelProviderFilter.all, runtime.menu.providerFilter());
 
-    runtime.menu.provider_index = @intFromEnum(ModelProviderFilter.others);
+    runtime.menu.provider_index = @backingInt(ModelProviderFilter.others);
     try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
     try std.testing.expectEqualStrings("private/blue-hornbill", runtime.menu.itemAt(0).?.id);
     try std.testing.expectEqualStrings("standalone", runtime.menu.itemAt(1).?.id);
-    runtime.menu.provider_index = @intFromEnum(ModelProviderFilter.all);
+    runtime.menu.provider_index = @backingInt(ModelProviderFilter.all);
 
     try std.testing.expect(runtime.menu.moveVisibleItems(-1, 2));
     try std.testing.expectEqual(@as(usize, 3), runtime.menu.selected_index);
@@ -1532,7 +1541,7 @@ test "model menu provider navigation skips absent and redundant filters" {
 }
 
 test "model menu snapshot construction cleans every allocation failure" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     const entries = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("openai/gpt-5"), .model_type = @constCast("language") },
         .{ .id = @constCast("anthropic/claude-opus-4.8"), .model_type = @constCast("language") },
@@ -1561,8 +1570,7 @@ test "model cache completion hydrates an open menu and reports once" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const models_url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const models_url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/v1/models",
         .{fixture.port()},
     );
@@ -1632,8 +1640,7 @@ test "model cache reset replaces ready public catalog with team catalog" {
         try fixture.start();
         try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-        const models_url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const models_url = try std.testing.allocator.print(
             "http://127.0.0.1:{d}/v1/models",
             .{fixture.port()},
         );
@@ -1660,8 +1667,7 @@ test "model cache reset replaces ready public catalog with team catalog" {
         try fixture.start();
         try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-        const models_url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const models_url = try std.testing.allocator.print(
             "http://127.0.0.1:{d}/v1/models",
             .{fixture.port()},
         );

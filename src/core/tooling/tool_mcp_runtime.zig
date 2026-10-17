@@ -1,4 +1,5 @@
 const std = @import("std");
+const observation = @import("../agent/runtime/observation.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
@@ -86,6 +87,9 @@ pub const SnapshotToolFn = *const fn (*anyopaque, Allocator, []const u8, Binding
 pub const Binding = types.McpToolBinding;
 
 pub const CallOptions = struct {
+    observer: ?*observation.Observer = null,
+    call_id: ?[]const u8 = null,
+    mcp_observation: ?*observation.McpCall = null,
     expected_binding: ?Binding = null,
     expected_runtime_generation: ?u64 = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
@@ -182,6 +186,27 @@ pub const LegacyUrlCompletionSink = struct {
     accept: *const fn (*anyopaque, InputOrigin, []const u8) LegacyUrlAcceptTransition,
     consume: *const fn (*anyopaque, LegacyUrlCompletion) LegacyUrlConsumeTransition,
     publish: *const fn (*anyopaque, []u8) void,
+
+    /// Publishes a completion that came before the client's consent, and says
+    /// what is left; null when the sink no longer knows the elicitation.
+    pub fn settleAccept(sink: LegacyUrlCompletionSink, accepted: LegacyUrlAcceptTransition) ?LegacyUrlAcceptStatus {
+        return switch (accepted) {
+            .missing => null,
+            .awaiting_completion => .awaiting_completion,
+            .completed => |id| completed: {
+                sink.publish(sink.context, id);
+                break :completed .completed;
+            },
+        };
+    }
+
+    /// A server's completion, published once the client has consented.
+    pub fn complete(sink: LegacyUrlCompletionSink, completion: LegacyUrlCompletion) void {
+        switch (sink.consume(sink.context, completion)) {
+            .missing => {},
+            .consumed => |id| if (id) |owned| sink.publish(sink.context, owned),
+        }
+    }
 };
 
 pub const LegacyUrlConsumeTransition = union(enum) {
@@ -258,7 +283,22 @@ pub const CallStatus = enum {
     tool_failure,
     protocol_failure,
     input_required,
+
+    pub fn observed(self: CallStatus) observation.McpStatus {
+        return switch (self) {
+            .success => .success,
+            .tool_failure, .protocol_failure => .failure,
+            .input_required => .input_required,
+        };
+    }
 };
+
+test "MCP hook statuses normalize tool and protocol failures" {
+    try std.testing.expectEqual(observation.McpStatus.success, CallStatus.success.observed());
+    try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.tool_failure.observed());
+    try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.protocol_failure.observed());
+    try std.testing.expectEqual(observation.McpStatus.input_required, CallStatus.input_required.observed());
+}
 
 pub const CallResult = struct {
     model_output: []const u8,
@@ -421,8 +461,7 @@ fn callAdvertisedDynamicTool(
     );
 }
 pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(
-        arena,
+    return arena.print(
         "Dynamic MCP tool not selected for this model step: {s}. Use capability_search or mcp_select_tool to load its definition; the selected tool can be called on the next model step after its schema is advertised.",
         .{name},
     );

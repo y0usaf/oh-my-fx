@@ -2,7 +2,7 @@
 
 This directory owns the non-publishing Stage 1 build for a smaller macOS arm64 `fx` candidate. It preserves Zig ReleaseSafe semantics and the complete product feature set, then uses native LLVM profiles to keep measured hot code speed-oriented and compile profile-proven cold functions for size.
 
-The candidate is accepted only when it is no larger than **7.800 MiB**, has the preferred **0.250 MiB** of size headroom, passes the deterministic product corpus, and stays within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
+The candidate is accepted only when it is no larger than **7.000 MiB**, has the preferred **0.250 MiB** of size headroom, passes the deterministic product corpus, and stays within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
 
 ## Toolchain and target
 
@@ -10,8 +10,8 @@ The driver requires:
 
 - macOS on an arm64 host
 - generic `aarch64-macos` output
-- Zig `0.16.0`
-- LLVM `21.1.8` tools and profile runtime from one configured LLVM root
+- Zig `0.17.0`
+- LLVM `22.1.8` tools, profile runtime, and C library (`lib/libLLVM.dylib`) from one configured LLVM root
 - the selected Xcode macOS SDK and native Apple linker with arm64 support
 - Bun `1.3.14`
 - Hyperfine `1.20.0`
@@ -37,18 +37,18 @@ output fail closed.
 Every mutating command requires a fresh or empty output directory. State from separate runs is never merged implicitly.
 
 ```bash
-brew install llvm@21
+brew install llvm@22
 
 python3 -m scripts.pgso build \
-  --llvm-bin "$(brew --prefix llvm@21)/bin" \
+  --llvm-bin "$(brew --prefix llvm@22)/bin" \
   --output-dir /tmp/fx-pgso-build
 
 python3 -m scripts.pgso train \
-  --llvm-bin "$(brew --prefix llvm@21)/bin" \
+  --llvm-bin "$(brew --prefix llvm@22)/bin" \
   --output-dir /tmp/fx-pgso-train
 
 python3 -m scripts.pgso all \
-  --llvm-bin "$(brew --prefix llvm@21)/bin" \
+  --llvm-bin "$(brew --prefix llvm@22)/bin" \
   --output-dir /tmp/fx-pgso-candidate \
   --target aarch64-macos \
   --update-channel stable \
@@ -78,6 +78,25 @@ the training corpus, benchmark candidates, or performance measurement hardware.
 Generated IR helpers are kept in one dense linker cluster ordered by their
 hottest profiled caller so outlining does not scatter startup code across cold
 pages.
+
+Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
+library. Right after Zig emits bitcode, `outline-helpers` marks small shared
+std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
+allocation, the writer's `write`, `writeAll`, and allocating-writer setup and
+teardown, and the byte list's `appendSlice` and `deinit`. Zig otherwise copies
+them into thousands of call sites (`free` alone into about 11,000). The pass
+runs before instrumentation, so training, profile use, and the recorded
+bitcode identity all include it. It reports matches per pattern and fails if
+the allocator `free` helper does not match. After profile use and outlining,
+`sparse-constants` rewrites copies from mostly undefined internal constants
+into stores of their defined bytes, then `globaldce,verify` drops the dead
+constants. Zig emits such a constant for each `return error.X` from a
+function returning a large error union. Undefined bytes become "destination
+unchanged", a refinement of copying undefined bytes; explicit values,
+including zeros, are still stored. Benchmark artifacts receive both passes so
+their candidates keep the production code shape. The candidate link passes
+`-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
+otherwise emit about 160 KB of compact unwind data.
 
 `python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
 GitHub Actions matrices. The remaining distributed subcommands are workflow
@@ -161,7 +180,8 @@ manual branch head with its exact main ancestor, dispatch the
 **Benchmarks** workflow on the comparison branch with `pgso_control_artifact`
 and `pgso_candidate_artifact` set to the two qualified aggregate artifact IDs.
 The main control may come from the dedicated PGSO workflow or the Release
-workflow that invokes it. Both artifacts must have completed qualification.
+workflow that invokes it. Release runs keep their aggregate evidence for 90
+days, so the last release can serve as the control. Both artifacts must have completed qualification.
 The candidate must come from the dedicated PGSO workflow. For source-only PRs,
 run that workflow manually on the PR branch. Its manifest source must match the
 run head, and GitHub's immutable SHA comparison must prove that exact control

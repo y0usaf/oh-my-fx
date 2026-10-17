@@ -19,11 +19,12 @@ import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
-import { equivalentPngEncodings } from "./fixtures/image-encoding";
+import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  fakeGatewayToolCall,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -158,12 +159,22 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
       const parsed = JSON.parse(body) as { tools?: unknown[] };
       const compacting = (parsed.tools?.length ?? 0) === 0;
       if (!compacting) workingRequests += 1;
-      if (!compacting && workingRequests === 2) {
+      if (!compacting && workingRequests === 3) {
         return Response.json({ error: { code: "context_length_exceeded", message: "maximum context length exceeded" } }, { status: 400 });
       }
+      // The first turn reads a file before its reply, so compaction has work
+      // to note and must ask this provider for the notes.
+      if (!compacting && workingRequests === 1) {
+        return new Response(
+          `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: "call_provider_facts", name: "read_file" } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 0, arguments: JSON.stringify({ path: "provider-facts.txt" }) })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.completed", response: { id: `response-${bodies.length}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
       const text = compacting
-        ? "The earlier request established the saved facts."
-        : workingRequests === 1 ? "SAVED_PROVIDER_FACTS" : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
+        ? "Turn 1\nIn between: Read the saved provider facts.\nT1: read the saved provider facts"
+        : workingRequests === 2 ? "SAVED_PROVIDER_FACTS ".repeat(2_000) : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
       return new Response(
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
           `data: ${JSON.stringify({ type: "response.completed", response: { id: `response-${bodies.length}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
@@ -249,36 +260,6 @@ function writeSeededGrokLogin(
     account_id: accountId,
   }) + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
-}
-
-function readSingleUsageSnapshot(testHome: string): {
-  billing: string;
-  next_sequence: number;
-  settled_through_sequence: number;
-  input_tokens: number;
-  output_tokens: number;
-  request_count: number | null;
-  models: Array<{ model: string; request_count: number | null }>;
-  pending: unknown[];
-} {
-  const sessionsDir = join(testHome, ".fx", "sessions");
-  const usagePaths = readdirSync(sessionsDir, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => join(sessionsDir, entry.name, "usage-v2.json"))
-    .filter((path) => existsSync(path));
-  expect(usagePaths).toHaveLength(1);
-  return (JSON.parse(readFileSync(usagePaths[0]!, "utf8")) as {
-    snapshot: {
-      billing: string;
-      next_sequence: number;
-      settled_through_sequence: number;
-      input_tokens: number;
-      output_tokens: number;
-      request_count: number | null;
-      models: Array<{ model: string; request_count: number | null }>;
-      pending: unknown[];
-    };
-  }).snapshot;
 }
 
 function writeSeededFxLogin(
@@ -2219,7 +2200,7 @@ tmuxTest(
     expect(signInScreen).not.toContain("Code   ");
     expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/oauth/authorize?`);
     const signInEscapes = await session.capturePaneEscapes();
-    expect(signInEscapes).toContain(`\x1b]8;;${chatgptOauth.baseUrl}/oauth/authorize?`);
+    expect(signInEscapes).toContain(`\x1b]8;id=fx-codex-auth;${chatgptOauth.baseUrl}/oauth/authorize?`);
     expect(signInEscapes).toContain("\x1b]8;;\x1b\\");
     await session.sendKeys("C-c");
     await session.waitForComposer(TIMEOUT);
@@ -4110,6 +4091,219 @@ test(
   60_000,
 );
 
+function withoutSavedModelEnv(
+  testHome: string,
+  provider: "codex" | "grok",
+  providerEnv: Record<string, string>,
+): Record<string, string | undefined> {
+  return {
+    HOME: testHome,
+    AI_GATEWAY_API_KEY: undefined,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_SKIP_ONBOARDING: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_NO_OPEN_BROWSER: "1",
+    FX_PROVIDER: provider,
+    FX_MODEL: undefined,
+    ...providerEnv,
+  };
+}
+
+function codexResponseModels(oauth: ReturnType<typeof startFakeChatGptOAuth>): Array<string | undefined> {
+  return oauth.requests
+    .filter((request) => request.path === "/chatgpt/responses")
+    .map((request) => (JSON.parse(request.body ?? "{}") as { model?: string }).model);
+}
+
+test("Codex runs from FX_MODEL or --model without a saved model and saves neither", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-run-model-"));
+  writeSeededChatGptLogin(home);
+  chatgptOauth = startFakeChatGptOAuth();
+  const env = withoutSavedModelEnv(home, "codex", chatgptOauth.env);
+
+  const status = await runFx(["status", "--json"], { env: { ...env, FX_MODEL: "gpt-5.6-luna" }, timeoutMs: TIMEOUT });
+  expect(status.code, `stdout: ${status.stdout}\nstderr: ${status.stderr}`).toBe(0);
+  expect(JSON.parse(status.stdout)).toMatchObject({ model: "gpt-5.6-luna", model_origin: "FX_MODEL" });
+
+  const envAsk = await runFx(["ask", "--json", "--no-save", "Answer directly."], {
+    env: { ...env, FX_MODEL: "gpt-5.6-luna" },
+    timeoutMs: TIMEOUT,
+  });
+  expect(envAsk.code, `stdout: ${envAsk.stdout}\nstderr: ${envAsk.stderr}`).toBe(0);
+  expect(envAsk.stdout).toContain("CHATGPT_DIRECT_RESPONSE");
+
+  const flagAsk = await runFx(["ask", "--json", "--no-save", "--model", "gpt-5.4-mini", "Answer directly."], {
+    env,
+    timeoutMs: TIMEOUT,
+  });
+  expect(flagAsk.code, `stdout: ${flagAsk.stdout}\nstderr: ${flagAsk.stderr}`).toBe(0);
+  expect(flagAsk.stdout).toContain("CHATGPT_DIRECT_RESPONSE");
+
+  expect(codexResponseModels(chatgptOauth)).toEqual(["gpt-5.6-luna", "gpt-5.4-mini"]);
+  expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
+});
+
+test("Codex without a model explains the fix and fx provider codex saves one", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-missing-model-"));
+  writeSeededChatGptLogin(home);
+  chatgptOauth = startFakeChatGptOAuth();
+  const env = withoutSavedModelEnv(home, "codex", chatgptOauth.env);
+  const guidance = "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL";
+
+  const status = await runFx(["status"], { env, timeoutMs: TIMEOUT });
+  expect(status.code).toBe(1);
+  expect(status.stderr).toBe(`fx: ${guidance}\n`);
+
+  const ask = await runFx(["ask", "--no-save", "Answer directly."], { env, timeoutMs: TIMEOUT });
+  expect(ask.code).toBe(1);
+  expect(ask.stderr).toContain(`fx ask: ${guidance}`);
+
+  const askJson = await runFx(["ask", "--json", "--no-save", "Answer directly."], { env, timeoutMs: TIMEOUT });
+  expect(askJson.code).toBe(1);
+  expect((JSON.parse(askJson.stdout) as { error: string }).error).toBe("CodexModelNotSelected");
+  expect(codexResponseModels(chatgptOauth)).toEqual([]);
+
+  // FX_PROVIDER=codex makes Codex the selected provider, but it has no saved model yet.
+  const repair = await runFx(["provider", "codex"], { env, timeoutMs: TIMEOUT });
+  expect(repair.code, `stdout: ${repair.stdout}\nstderr: ${repair.stderr}`).toBe(0);
+  expect(repair.stdout).not.toContain("already selected");
+  const saved = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+  expect(saved.provider).toBe("codex");
+  expect(saved.models.codex).toBe("gpt-5.6-sol");
+
+  const repaired = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
+  expect(repaired.code, repaired.stderr).toBe(0);
+  expect(JSON.parse(repaired.stdout)).toMatchObject({ model: "gpt-5.6-sol", model_origin: "settings" });
+
+  const again = await runFx(["provider", "codex"], { env, timeoutMs: TIMEOUT });
+  expect(again.code).toBe(0);
+  expect(again.stdout).toContain("Codex is already selected.");
+});
+
+test("Grok runs from FX_MODEL or --model without a saved model and fx provider grok saves one", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-run-model-"));
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    const env = withoutSavedModelEnv(home, "grok", grok.env);
+    const responseModels = () => grok.requests
+      .filter((request) => request.path === "/v1/responses")
+      .map((request) => (JSON.parse(request.body ?? "{}") as { model?: string }).model);
+
+    const missing = await runFx(["status"], { env, timeoutMs: TIMEOUT });
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toBe("fx: no Grok model is selected; run `fx provider grok` to choose one, or set a model for this run with --model or FX_MODEL\n");
+
+    const status = await runFx(["status", "--json"], { env: { ...env, FX_MODEL: "grok-4.6" }, timeoutMs: TIMEOUT });
+    expect(status.code, status.stderr).toBe(0);
+    expect(JSON.parse(status.stdout)).toMatchObject({ model: "grok-4.6", model_origin: "FX_MODEL" });
+
+    const flagAsk = await runFx(["ask", "--json", "--no-save", "--model", "grok-4.6", "Answer directly."], { env, timeoutMs: TIMEOUT });
+    expect(flagAsk.code, `stdout: ${flagAsk.stdout}\nstderr: ${flagAsk.stderr}`).toBe(0);
+    expect(flagAsk.stdout).toContain("GROK_DIRECT_RESPONSE");
+    const envAsk = await runFx(["ask", "--json", "--no-save", "Answer directly."], { env: { ...env, FX_MODEL: "grok-4.20" }, timeoutMs: TIMEOUT });
+    expect(envAsk.code, `stdout: ${envAsk.stdout}\nstderr: ${envAsk.stderr}`).toBe(0);
+    expect(responseModels()).toEqual(["grok-4.6", "grok-4.20"]);
+    expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
+
+    const repair = await runFx(["provider", "grok"], { env, timeoutMs: TIMEOUT });
+    expect(repair.code, `stdout: ${repair.stdout}\nstderr: ${repair.stderr}`).toBe(0);
+    expect(repair.stdout).not.toContain("already selected");
+    const saved = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+    expect(saved.provider).toBe("grok");
+    expect(typeof saved.models.grok).toBe("string");
+    const repaired = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
+    expect(repaired.code, repaired.stderr).toBe(0);
+    expect(JSON.parse(repaired.stdout)).toMatchObject({ model: saved.models.grok, model_origin: "settings" });
+  } finally {
+    grok.stop();
+  }
+});
+
+tmuxTest(
+  "a Codex session started from FX_PROVIDER and FX_MODEL resumes from them alone",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-codex-env-resume-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    writeSeededChatGptLogin(home);
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth();
+    const workspace = join(home, "workspace");
+    mkdirSync(workspace);
+    const env = { ...withoutSavedModelEnv(home, "codex", chatgptOauth.env), FX_MODEL: "gpt-5.6-luna" };
+
+    const first = await runFx(["ask", "--json", "Answer directly."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
+    const sessionId = (JSON.parse(first.stdout) as { session_id: string }).session_id;
+    const resumed = await runFx(["ask", "--json", "--resume", sessionId, "Continue."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(resumed.code, `stdout: ${resumed.stdout}\nstderr: ${resumed.stderr}`).toBe(0);
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      { ...chatgptOauth.env, FX_PROVIDER: "codex", FX_MODEL: "gpt-5.6-luna" },
+      workspace,
+      sessionId,
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Continue again.");
+    const deadline = Date.now() + TIMEOUT;
+    while (codexResponseModels(chatgptOauth).length < 3 && Date.now() < deadline) await Bun.sleep(50);
+
+    expect(codexResponseModels(chatgptOauth)).toEqual(["gpt-5.6-luna", "gpt-5.6-luna", "gpt-5.6-luna"]);
+    expect(gateway.requests).toHaveLength(0);
+    const settingsPath = join(home, ".fx", "settings.json");
+    if (existsSync(settingsPath)) {
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).models?.codex).toBeUndefined();
+    }
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "interactive --provider codex --model starts without a saved Codex model",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-codex-launch-model-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    writeSeededChatGptLogin(home);
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth();
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      { ...chatgptOauth.env, FX_MODEL: undefined },
+      undefined,
+      undefined,
+      ["--provider", "codex", "--model", "gpt-5.6-luna"],
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer directly.");
+    await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
+
+    const models = codexResponseModels(chatgptOauth);
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.every((model) => model === "gpt-5.6-luna")).toBe(true);
+    expect(gateway.requests).toHaveLength(0);
+    const settingsPath = join(home, ".fx", "settings.json");
+    if (existsSync(settingsPath)) {
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).models?.codex).toBeUndefined();
+    }
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
 test(
   "Grok CLI browser login fetches subscription models and replays one account-stable 401",
   async () => {
@@ -4353,7 +4547,8 @@ test("Grok CLI sends verified images directly without advertising the vision fal
       { mode: 0o600 },
     );
     const imagePath = join(home, "attachment.png");
-    writeFileSync(imagePath, Buffer.from("89504e470d0a1a0a72657374", "hex"));
+    const image = solidPng(2, 2);
+    writeFileSync(imagePath, image);
     const ask = await runFx([
       "ask",
       "--json",
@@ -4379,6 +4574,7 @@ test("Grok CLI sends verified images directly without advertising the vision fal
     const responses = grok.requests.filter((request) => request.path === "/v1/responses");
     expect(responses).toHaveLength(1);
     expect(responses[0]!.body).toContain('"type":"input_image"');
+    expect(responses[0]!.body).toContain(`data:image/png;base64,${image.toString("base64")}`);
     expect(responses[0]!.body).not.toContain('"name":"vision"');
     expect(gateway.requests).toHaveLength(0);
   } finally {
@@ -5107,10 +5303,6 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
       expect(direct ? direct.bodies.length : gateway.requests.length).toBe(rejected || limited ? 1 : 2);
       const output = JSON.parse(result.stdout);
       expect(output.tool_calls).toEqual([]);
-      if (native && !limited) {
-        const usage = JSON.parse(readFileSync(join(profile, ".fx", "sessions", output.session_id, "usage-v2.json"), "utf8"));
-        expect(usage.snapshot.billing).toBe("incomplete");
-      }
       if (rejected) {
         expect(result.stderr).toContain("invalid_prompt: OUTCOME_REJECTED");
         expect(result.stderr).not.toContain("retrying");
@@ -5819,127 +6011,6 @@ test(
 );
 
 test(
-  "saved provider switching publishes Gateway, Codex, and Grok usage to one profile ledger",
-  async () => {
-    home = mkdtempSync(join(tmpdir(), "fx-provider-usage-ledger-"));
-    const workspace = join(home, "workspace");
-    mkdirSync(workspace, { recursive: true });
-    gateway = startFakeGateway([
-      fakeGatewaySse([
-        {
-          type: "response-metadata",
-          modelId: FAKE_GATEWAY_MODEL,
-          timestamp: new Date().toISOString(),
-        },
-        {
-          type: "text-start",
-          id: "gateway_answer",
-          providerMetadata: {
-            gateway: { generationId: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
-          },
-        },
-        { type: "text-delta", id: "gateway_answer", delta: "GATEWAY_USAGE_OK" },
-        { type: "text-end", id: "gateway_answer" },
-        {
-          type: "finish",
-          finishReason: { unified: "stop", raw: "stop" },
-          usage: {
-            inputTokens: { total: 13 },
-            outputTokens: { total: 4 },
-          },
-          providerMetadata: {
-            gateway: {
-              generationId: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              cost: "0.01",
-              routing: { canonicalSlug: FAKE_GATEWAY_MODEL },
-            },
-          },
-        },
-      ]),
-    ]);
-    const codex = startFakeDirectUsageProvider(
-      "codex",
-      "gpt-5.6-sol",
-      "response-codex-profile",
-      17,
-      7,
-    );
-    const grok = startFakeDirectUsageProvider(
-      "grok",
-      "grok-4.20",
-      "response-grok-profile",
-      19,
-      5,
-    );
-    try {
-      writeSeededChatGptLogin(home, chatgptAccessToken("acct_usage"));
-      writeSeededGrokLogin(home, "grok-usage-token", "acct_usage");
-      const env = {
-        HOME: home,
-        AI_GATEWAY_API_KEY: "gateway-usage-key",
-        VERCEL_OIDC_TOKEN: undefined,
-        FX_DISABLE_KEYCHAIN: "1",
-        FX_AUTO_UPGRADE: "0",
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
-        FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
-      };
-      const settingsPath = join(home, ".fx", "settings.json");
-      const routes = [
-        { settings: { provider: "gateway", model: FAKE_GATEWAY_MODEL }, text: "GATEWAY_USAGE_OK" },
-        { settings: { provider: "codex", codex_model: "gpt-5.6-sol" }, text: "CODEX_USAGE_OK" },
-        { settings: { provider: "grok", grok_model: "grok-4.20" }, text: "GROK_USAGE_OK" },
-      ];
-      for (const route of routes) {
-        writeFileSync(settingsPath, JSON.stringify(route.settings) + "\n", { mode: 0o600 });
-        const result = await runFx(
-          ["ask", "--json", `Return ${route.text}.`],
-          { cwd: workspace, env, timeoutMs: TIMEOUT },
-        );
-        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-        expect(result.stdout).toContain(route.text);
-      }
-
-      const usage = await runFx(
-        ["usage", "--json", "--period", "24h"],
-        { cwd: workspace, env: { HOME: home }, timeoutMs: TIMEOUT },
-      );
-      expect(usage.code, usage.stderr).toBe(0);
-      const report = JSON.parse(usage.stdout) as {
-        completeness: string;
-        totals: { input_tokens: number; output_tokens: number; request_count: number };
-        models: Array<{ model: string; totals: { request_count: number } }>;
-      };
-      expect(report.completeness).toBe("complete");
-      expect(report.totals).toMatchObject({
-        input_tokens: 49,
-        output_tokens: 16,
-        request_count: 3,
-      });
-      expect(Object.fromEntries(
-        report.models.map((model) => [model.model, model.totals.request_count]),
-      )).toEqual({
-        [FAKE_GATEWAY_MODEL]: 1,
-        "codex/gpt-5.6-sol": 1,
-        "grok/grok-4.20": 1,
-      });
-      expect(gateway.requests).toHaveLength(1);
-      expect(codex.responses).toBe(1);
-      expect(grok.responses).toBe(1);
-    } finally {
-      codex.stop();
-      grok.stop();
-    }
-  },
-  60_000,
-);
-
-test(
   "Codex automatic review uses gpt-5.6-luna while Gateway review stays untouched",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-codex-auto-review-"));
@@ -5987,20 +6058,6 @@ test(
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }
-      expect(readSingleUsageSnapshot(home)).toMatchObject({
-        billing: "complete",
-        api_duration_complete: true,
-        next_sequence: 4,
-        settled_through_sequence: 3,
-        input_tokens: 20,
-        output_tokens: 8,
-        request_count: 3,
-        models: [
-          { model: "codex/gpt-5.6-sol", request_count: 2 },
-          { model: "codex/gpt-5.6-luna", request_count: 1 },
-        ],
-        pending: [],
-      });
     } finally {
       codex.stop();
     }
@@ -6028,6 +6085,7 @@ test(
             : { provider, grok_model: direct.workingModel }) + "\n",
           { mode: 0o600 },
         );
+        writeFileSync(join(testHome, "provider-facts.txt"), "Provider facts.\n");
         const options = {
             cwd: testHome,
             env: {
@@ -6062,10 +6120,13 @@ test(
             body_lengths: direct.bodies.map((body) => body.length),
           }),
         )
-          .toEqual(Array(4).fill(direct.workingModel));
-        expect(direct.authorizations).toEqual(Array(4).fill(`Bearer ${direct.accessToken}`));
+          .toEqual(Array(5).fill(direct.workingModel));
+        // The fourth request is the compaction's own, sent without tools.
+        expect(direct.bodies.map((body) => ((JSON.parse(body) as { tools?: unknown[] }).tools?.length ?? 0) === 0))
+          .toEqual([false, false, false, true, false]);
+        expect(direct.authorizations).toEqual(Array(5).fill(`Bearer ${direct.accessToken}`));
         if (provider === "grok") {
-          expect(direct.modelOverrides).toEqual(Array(4).fill(direct.workingModel));
+          expect(direct.modelOverrides).toEqual(Array(5).fill(direct.workingModel));
         }
         expect(testGateway.requests).toHaveLength(0);
       } finally {
@@ -6136,20 +6197,6 @@ test(
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }
-      expect(readSingleUsageSnapshot(home)).toMatchObject({
-        billing: "complete",
-        api_duration_complete: true,
-        next_sequence: 4,
-        settled_through_sequence: 3,
-        input_tokens: 20,
-        output_tokens: 8,
-        request_count: 3,
-        models: [
-          { model: "grok/grok-4.20", request_count: 2 },
-          { model: "grok/grok-4.5", request_count: 1 },
-        ],
-        pending: [],
-      });
     } finally {
       grok.stop();
     }
@@ -6559,7 +6606,11 @@ tmuxTest(
     stderrPath = join(home, "stderr.log");
     const tracePath = join(home, "trace.log");
     writeFileSync(stderrPath, "");
+    // The first turn reads a file, so compaction has work to summarize and
+    // asks the model with the refreshed login.
+    writeFileSync(join(home, "compact-auth-notes.txt"), "notes\n");
     gateway = startFakeGateway([
+      fakeGatewayToolCall("compact-auth-read", "read_file", { path: "compact-auth-notes.txt" }),
       fakeGatewayFinalText("COMPACT_AUTH_FIRST_REPLY"),
       fakeGatewayFinalText("COMPACT_AUTH_SECOND_REPLY"),
       fakeGatewayFinalText("The conversation established COMPACT_AUTH_FIRST and COMPACT_AUTH_SECOND."),
@@ -6577,7 +6628,7 @@ tmuxTest(
     await session.waitForText("COMPACT_AUTH_FIRST_REPLY", TIMEOUT);
     await session.sendText("Remember COMPACT_AUTH_SECOND.");
     await session.waitForText("COMPACT_AUTH_SECOND_REPLY", TIMEOUT);
-    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests).toHaveLength(3);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
     await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
     await session.sendText("/status");
@@ -6588,7 +6639,7 @@ tmuxTest(
     const before = readFileSync(historyPath, "utf8");
     await session.sendText("/compact");
     await waitForTrace(tracePath, "manual_compaction_auth_pending", TIMEOUT);
-    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests).toHaveLength(3);
     await session.sendText("/compact");
     await session.sendLiteral("PRESERVE_COMPACTION_DRAFT");
     await session.waitForText("PRESERVE_COMPACTION_DRAFT", 1_000);
@@ -6602,16 +6653,16 @@ tmuxTest(
     expect(scrollback).toContain("PRESERVE_COMPACTION_DRAFT");
     expect(scrollback).not.toContain("Context compacted.");
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
-    expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
-    expect(JSON.parse(gateway.requests[2].body).tools ?? []).toHaveLength(0);
+    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests[3].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
+    expect(JSON.parse(gateway.requests[3].body).tools ?? []).toHaveLength(0);
     expect(readFileSync(historyPath, "utf8").startsWith(before)).toBe(true);
     const records = readFileSync(historyPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
     await session.sendKeys("C-u");
     await session.sendText("Continue after the manual compaction.");
     await session.waitForText("COMPACT_AUTH_CONTINUED", TIMEOUT);
-    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests).toHaveLength(5);
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
     expect(readFileSync(stderrPath, "utf8")).toBe("");

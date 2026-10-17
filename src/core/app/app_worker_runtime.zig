@@ -22,6 +22,7 @@ const render_input = @import("../../ui/footer/render_input.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const render_request = @import("../../ui/render_request.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const program_status = @import("../../ui/terminal/program_status.zig");
 
 const WorkerEvent = worker_runtime.WorkerEvent;
 const InputRuntime = core_input_runtime.Runtime;
@@ -204,24 +205,6 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
             .consumed_provider_attempts = 1,
         };
         try app_session_runtime.Runtime(ShutdownApp).setRecoveryCheckpoint(&app, checkpoint);
-        var usage = try app.session.usage.snapshot(alloc);
-        defer usage.deinit(alloc);
-        var models = [_]@import("../session/session_usage.zig").ModelAggregate{.{
-            .model = @constCast("test-model"),
-            .first_sequence = 1,
-            .input_tokens = 7,
-            .output_tokens = 11,
-            .reasoning_tokens = usage.reasoning_tokens,
-            .request_count = usage.request_count,
-        }};
-        const empty_models = usage.models;
-        usage.models = &models;
-        defer usage.models = empty_models;
-        usage.input_tokens = 7;
-        usage.output_tokens = 11;
-        usage.next_sequence = 2;
-        usage.settled_through_sequence = 1;
-        try app_session_runtime.Runtime(ShutdownApp).persistUsageCheckpoint(&app, usage);
 
         var ownership: Ownership = .{};
         const summary: types.TurnSummary = .{ .token_progress = .{ .input_tokens = 7, .output_tokens = 11 } };
@@ -269,10 +252,6 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         try std.testing.expectEqualDeep(summary, types.historyTurnSummary(loaded.history[0]).?);
         try std.testing.expectEqualStrings("later answer", loaded.history[1].assistant.assistant);
         try std.testing.expect(loaded.recovery_checkpoint == null);
-        try std.testing.expectEqual(@as(u64, 7), loaded.usage.?.input_tokens);
-        try std.testing.expectEqual(@as(u64, 11), loaded.usage.?.output_tokens);
-        try std.testing.expectEqual(@as(u64, 2), loaded.usage.?.next_sequence);
-        try std.testing.expectEqual(@as(u64, 1), loaded.usage.?.settled_through_sequence);
     }
 }
 
@@ -460,12 +439,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn persistFinishedPrompt(app: *App, finished: types.FinishedPrompt) !void {
-            errdefer |err| app_session_runtime.Runtime(App).recordFailedHistoryDelivery(app, err);
-            if (comptime @hasField(App, "session")) {
-                try app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished);
-            } else {
-                try app.appendFinishedPrompt(finished);
-            }
+            const appended = if (comptime @hasField(App, "session"))
+                app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished)
+            else
+                app.appendFinishedPrompt(finished);
+            appended catch |err| {
+                app_session_runtime.Runtime(App).recordFailedHistoryDelivery(app, err);
+                return err;
+            };
         }
 
         fn settleDeferredFinish(app: *App) !void {
@@ -809,6 +790,46 @@ pub fn Runtime(comptime App: type) type {
             // Waiting on an approval or question is not thinking: freeze the
             // elapsed clock for the duration of the wait.
             activity_status.syncWaitingClock(&app.stream, modal_active, io_mod.milliTimestamp());
+
+            if (comptime @hasField(App, "program_status")) {
+                reportProgramStatus(app, !cancellation_stops_turn and
+                    (app.stream.active or snapshot.processing or snapshot.queued_count > 0));
+            }
+        }
+
+        /// Tells the terminal what the user would see: a decision prompt,
+        /// running work, or the result of the last turn.
+        fn reportProgramStatus(app: *App, busy: bool) void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) {
+                app.program_status.noteCompaction(app.worker.compactionActivitySnapshot());
+            }
+            const activity: program_status.Activity = if (app.approval_prompt.isActive())
+                .{ .blocked = .{
+                    .kind = .permission,
+                    .message = if (app.approval_prompt.request) |*request| request.view().label else "",
+                } }
+            else if (app.question_prompt.isActive())
+                .{ .blocked = .{ .kind = .question, .message = activeQuestionText(app) } }
+            else if (busy)
+                .working
+            else
+                .settled;
+            const report = app.program_status.update(activity) orelse return;
+            debug_trace.logf("program_status", "report activity={s} settled={s}", .{
+                @tagName(activity),
+                @tagName(app.program_status.settled),
+            });
+            app.writeProgramStatus(report);
+        }
+
+        fn activeQuestionText(app: *const App) []const u8 {
+            const projection = app.question_prompt.projection() orelse return "";
+            const entry = projection.current_entry orelse return "";
+            return entry.question;
+        }
+
+        fn noteTurnStarted(app: *App) void {
+            if (comptime @hasField(App, "program_status")) app.program_status.noteTurnStarted();
         }
 
         fn activeToolStatusCount(
@@ -980,6 +1001,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, true);
+                        noteTurnStarted(app);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -992,6 +1014,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, true);
+                        noteTurnStarted(app);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -1008,6 +1031,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, true);
+                        noteTurnStarted(app);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -1223,6 +1247,9 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, false);
+                        if (comptime @hasField(App, "program_status")) {
+                            if (notice.tone == .@"error") app.program_status.noteFailure();
+                        }
                         app.shell.render_requests.request(.footer);
                         try handlers.error_text(handlers.ctx, notice);
                     },
@@ -1298,6 +1325,9 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 lifecycle,
             );
+            if (comptime @hasField(App, "program_status")) {
+                if (lifecycle == .turn_finished) app.program_status.noteTurnFinished(lifecycle.turn_finished.outcome);
+            }
             if (transition.applied_activity_kind) |kind| {
                 applyToolActivity(&app.stream, kind);
             }
@@ -1375,13 +1405,11 @@ pub fn Runtime(comptime App: type) type {
 fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchProgress) ![]u8 {
     var query_buf: [160]u8 = undefined;
     return switch (progress) {
-        .query_started => |query| std.fmt.allocPrint(
-            alloc,
+        .query_started => |query| alloc.print(
             "● Searching\x1b[0m {s}{s}\x1b[0m",
             .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&query_buf, query, 120) },
         ),
-        .results_received => |entry| std.fmt.allocPrint(
-            alloc,
+        .results_received => |entry| alloc.print(
             "● Found {d} result{s}\x1b[0m {s}{s}\x1b[0m",
             .{ entry.result_count, if (entry.result_count == 1) "" else "s", shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&query_buf, entry.query, 120) },
         ),
@@ -1391,13 +1419,11 @@ fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchPr
 fn formatWebFetchProgress(alloc: std.mem.Allocator, progress: types.WebFetchProgress) ![]u8 {
     var url_buf: [types.WebFetchCompletion.max_url_len]u8 = undefined;
     return switch (progress) {
-        .fetching => |url| std.fmt.allocPrint(
-            alloc,
+        .fetching => |url| alloc.print(
             "● Fetching\x1b[0m {s}{s}\x1b[0m",
             .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
-        .converting => |url| std.fmt.allocPrint(
-            alloc,
+        .converting => |url| alloc.print(
             "● Converting\x1b[0m {s}{s}\x1b[0m",
             .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
@@ -1492,12 +1518,12 @@ const FakeWorker = struct {
     reset_cancel_after_take_events: bool = false,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
 
-    fn compactionActivitySnapshot(self: *FakeWorker) @import("../output/compaction_activity.zig").Snapshot {
+    pub fn compactionActivitySnapshot(self: *FakeWorker) @import("../output/compaction_activity.zig").Snapshot {
         self.compaction_reads += 1;
         return self.compaction.snapshot;
     }
 
-    fn expireCompactionActivity(self: *FakeWorker, id: @import("../output/compaction_activity.zig").OperationId, revision: u64, now_ms: i64) bool {
+    pub fn expireCompactionActivity(self: *FakeWorker, id: @import("../output/compaction_activity.zig").OperationId, revision: u64, now_ms: i64) bool {
         return self.compaction.expire(id, revision, now_ms);
     }
 
@@ -1572,7 +1598,7 @@ const FakeWorker = struct {
         };
     }
 
-    fn interactiveAdmissionSnapshot(self: *FakeWorker) worker_runtime.InteractiveAdmissionSnapshot {
+    pub fn interactiveAdmissionSnapshot(self: *FakeWorker) worker_runtime.InteractiveAdmissionSnapshot {
         return self.admission_snapshot;
     }
 
@@ -1605,14 +1631,14 @@ const FakeWorker = struct {
         return self.active_turn_id;
     }
 
-    fn propagateHistoryTurn(self: *FakeWorker, alloc: std.mem.Allocator, turn: types.HistoryTurn, max_history_turns: usize) !void {
+    pub fn propagateHistoryTurn(self: *FakeWorker, alloc: std.mem.Allocator, turn: types.HistoryTurn, max_history_turns: usize) !void {
         _ = alloc;
         _ = turn;
         _ = max_history_turns;
         self.propagated_history_turns += 1;
     }
 
-    fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
         _ = alloc;
         _ = tool_name;
         _ = target_path;
@@ -1652,7 +1678,7 @@ const FakeApprovalPrompt = struct {
         return changed;
     }
 
-    fn syncReview(self: *FakeApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
+    pub fn syncReview(self: *FakeApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
         const request = self.request orelse {
             const changed = self.review != null;
             self.review = null;
@@ -1675,6 +1701,12 @@ const FakeQuestionPrompt = struct {
     activate_on_sync: bool = true,
     sync_count: usize = 0,
     clear_count: usize = 0,
+    question: []const u8 = "",
+
+    fn projection(self: *const FakeQuestionPrompt) ?struct { current_entry: ?struct { question: []const u8 } } {
+        if (!self.active) return null;
+        return .{ .current_entry = .{ .question = self.question } };
+    }
 
     fn syncFrom(self: *FakeQuestionPrompt, alloc: std.mem.Allocator, entries: anytype) !void {
         _ = alloc;
@@ -1849,7 +1881,7 @@ const FakeShell = struct {
         self.command_output_display = .{};
     }
 
-    fn openCommandOutputLifecycleId(self: *const FakeShell) ?types.ToolLifecycleId {
+    pub fn openCommandOutputLifecycleId(self: *const FakeShell) ?types.ToolLifecycleId {
         return self.lifecycle.openCommandOutputLifecycleId();
     }
 };
@@ -1917,6 +1949,9 @@ const FakeApp = struct {
     last_attention_kind: ?@import("../hooks/hooks.zig").AttentionKind = null,
     persisted_finishes: std.ArrayList(types.FinishedPrompt) = .empty,
     finish_persistence_error: ?anyerror = null,
+    program_status: program_status.Reporter = .{},
+    program_status_reports: std.ArrayList(u8) = .empty,
+    program_status_capture_failed: bool = false,
 
     fn init(alloc: std.mem.Allocator) FakeApp {
         return .{ .alloc = alloc };
@@ -1925,6 +1960,7 @@ const FakeApp = struct {
     fn deinit(self: *FakeApp) void {
         for (self.persisted_finishes.items) |finished| types.freeFinishedPrompt(self.alloc, finished);
         self.persisted_finishes.deinit(self.alloc);
+        self.program_status_reports.deinit(self.alloc);
         self.session_persistence.deinit(self.alloc);
         self.worker.deinit();
         self.approval_prompt.deinit(self.alloc);
@@ -1996,7 +2032,7 @@ const FakeApp = struct {
         return false;
     }
 
-    fn dispatchAttentionRequired(
+    pub fn dispatchAttentionRequired(
         self: *FakeApp,
         turn_id: u64,
         kind: @import("../hooks/hooks.zig").AttentionKind,
@@ -2005,7 +2041,107 @@ const FakeApp = struct {
         self.last_attention_turn_id = turn_id;
         self.last_attention_kind = kind;
     }
+
+    fn writeProgramStatus(self: *FakeApp, report: []const u8) void {
+        self.program_status_reports.appendSlice(self.alloc, report) catch {
+            self.program_status_capture_failed = true;
+        };
+    }
 };
+
+fn expectProgramStatusReports(app: *FakeApp, expected: []const u8) !void {
+    try std.testing.expect(!app.program_status_capture_failed);
+    const reports = try app.program_status_reports.toOwnedSlice(app.alloc);
+    defer app.alloc.free(reports);
+    try std.testing.expectEqualStrings(expected, reports);
+}
+
+test "core.app_worker_runtime program status follows decision prompts to the turn result" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=idle:app=fx\x1b\\");
+
+    app.worker.processing = true;
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("push it") } });
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=working:app=fx\x1b\\");
+
+    app.worker.pending_permission_request = .{ .label = "shell.run git push" };
+    try tickNoop(&app);
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=blocked:kind=permission:app=fx:msg=c2hlbGwucnVuIGdpdCBwdXNo\x1b\\",
+    );
+
+    app.worker.pending_permission_request = null;
+    app.worker.pending_question = true;
+    app.question_prompt.question = "Which branch?";
+    try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=blocked:kind=question:app=fx:msg=V2hpY2ggYnJhbmNoPw==\x1b\\");
+
+    app.worker.pending_question = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=working:app=fx\x1b\\");
+
+    try queueTurnFinished(&app, 1, .completed);
+    app.worker.processing = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=done:app=fx\x1b\\");
+
+    // Work that starts no turn and reports no result settles as idle instead
+    // of reporting the earlier result again.
+    app.worker.processing = true;
+    try tickNoop(&app);
+    app.worker.processing = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=working:app=fx\x1b\\\x1b]7501;state=idle:app=fx\x1b\\",
+    );
+
+    // A failed `/compact` reports an error although no turn ran.
+    app.worker.processing = true;
+    const compaction = app.worker.compaction.begin(.manual, null, 0);
+    try tickNoop(&app);
+    app.worker.compaction.settle(compaction, @import("../output/compaction_activity.zig").failure(error.ConnectionRefused, .summary, false), 1);
+    app.worker.processing = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=working:app=fx\x1b\\\x1b]7501;state=error:app=fx\x1b\\",
+    );
+
+    app.worker.processing = true;
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("again") } });
+    try tickNoop(&app);
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+        .topic = "system",
+        .tone = .@"error",
+        .body = "request failed: ConnectionRefused",
+    } });
+    app.worker.processing = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=working:app=fx\x1b\\\x1b]7501;state=error:app=fx\x1b\\",
+    );
+
+    // An approval prompt that opens outside a turn does not bring the
+    // reported error back once it closes.
+    app.worker.pending_permission_request = .{ .label = "Remember allow for this saved session" };
+    try tickNoop(&app);
+    app.worker.pending_permission_request = null;
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=blocked:kind=permission:app=fx:msg=UmVtZW1iZXIgYWxsb3cgZm9yIHRoaXMgc2F2ZWQgc2Vzc2lvbg==\x1b\\" ++
+            "\x1b]7501;state=idle:app=fx\x1b\\",
+    );
+}
 
 const NoopBridge = struct {
     fn user(_: *anyopaque, _: types.UserTurn) !void {}
@@ -2371,7 +2507,7 @@ test "core.app_worker_runtime assistant chunk trace is metadata only" {
         ".",
     );
     defer alloc.free(trace_path);
-    const trace_file_path = try std.fs.path.join(
+    const trace_file_path = try std.Io.Dir.path.join(
         alloc,
         &.{ trace_path, "worker-trace.log" },
     );
@@ -4423,7 +4559,7 @@ test "core.app_worker_runtime failed turn terminalizes tool lifecycle before err
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecyclePinCount());
     var failed_status_expected: [64]u8 = undefined;
     try std.testing.expectEqualStrings(
-        try std.fmt.bufPrint(
+        try std.mem.print(
             &failed_status_expected,
             "{s}●{s} Tool failed",
             .{ ui_render.red_style, reset_style },

@@ -6,6 +6,7 @@ import os
 import pathlib
 import re
 import stat
+import sys
 import uuid
 from collections.abc import Sequence
 
@@ -19,12 +20,23 @@ from scripts.pgso.runner import hermetic_environment, run_checked
 from scripts.pgso.toolchain import SUPPORTED_TARGET, Toolchain
 
 
+# Zig 0.17 emits array bitcasts as per-element loops that the optimizer later
+# folds into single loads. Instrumentation runs before loop unrolling, so it
+# would count every element. Unroll constant-trip loops first, in both the
+# generation and use pipelines, so their CFG hashes keep matching. Unrolling
+# without the surrounding instcombine and simplifycfg left the ui-activity
+# benchmark about 11% slower than a plain O2 build.
+PROFILE_PREPARATION_PASSES = (
+    "function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,"
+    "instcombine<no-verify-fixpoint>,simplifycfg)"
+)
+
 GENERATION_FLAGS = (
     "--disable-vp",
     "--runtime-counter-relocation",
     "--pgo-temporal-instrumentation",
     "-pgo-kind=pgo-instr-gen-pipeline",
-    "-passes=default<O2>",
+    f"-passes={PROFILE_PREPARATION_PASSES},default<O2>",
 )
 
 # Apply the profile before partitioning so every part inherits the accepted
@@ -34,7 +46,7 @@ USE_FLAGS = (
     "-pgo-kind=pgo-instr-use-pipeline",
     "-pgo-cold-func-opt=minsize",
     "-profile-summary-cutoff-cold=600000",
-    "-passes=default<O2>,mergefunc",
+    f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc",
 )
 
 OUTLINE_PARTITIONS = 2
@@ -48,12 +60,21 @@ OUTLINE_CLEANUP_FLAGS = (
     "-internalize-public-api-list=main,_mh_execute_header",
 )
 
+# Zig writes raw bitcode. LLVM's own writer, which the IR size passes use,
+# wraps Darwin bitcode in the 0x0B17C0DE wrapper header.
+BITCODE_MAGICS = (b"BC\xc0\xde", b"\xde\xc0\x17\x0b")
+
+# Drop the constants that `ir_size.py sparse-constants` left without uses.
+SPARSE_CLEANUP_FLAGS = (
+    "-passes=globaldce,verify",
+)
+
 BENCHMARK_USE_FLAGS = (
     "--disable-vp",
     "-pgo-kind=pgo-instr-use-pipeline",
     "-pgo-cold-func-opt=minsize",
     "-profile-summary-cutoff-cold=990000",
-    "-passes=default<O2>,mergefunc,iroutliner",
+    f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc,iroutliner",
 )
 
 FX_MACHINE_OUTLINER_FLAGS = (
@@ -333,11 +354,33 @@ def zig_build_argv(
             str(prefix),
             "--cache-dir",
             str(cache),
-            "--global-cache-dir",
-            str(paths.global_cache),
         )
     )
     return tuple(argv)
+
+
+def zig_build_env(paths: PipelinePaths) -> dict[str, str]:
+    # `zig build` takes its global cache only from the environment.
+    environment = os.environ.copy()
+    environment["ZIG_GLOBAL_CACHE_DIR"] = str(paths.global_cache)
+    return environment
+
+
+def ir_size_argv(
+    toolchain: Toolchain,
+    command: str,
+    source: pathlib.Path,
+    output: pathlib.Path,
+) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        str(toolchain.ir_size),
+        "--libllvm",
+        str(toolchain.libllvm),
+        command,
+        str(source),
+        str(output),
+    )
 
 
 def instrumentation_argv(
@@ -487,11 +530,31 @@ def candidate_runtime_probe_argv(
     return (*command[:2], "-###", *command[2:])
 
 
+_STUB_TARGET_LIST = re.compile(r"(targets:\s*)\[([^\]]*)\]")
+
+
+def apple_ld_system_stub(text: str) -> str:
+    # Zig 0.17's macOS 27 stub lists arm64e.x1 targets, which the Xcode 16.4
+    # linker rejects as an unknown architecture. An arm64 link never uses them.
+    def drop_arm64e_x1(match: re.Match[str]) -> str:
+        targets = [target.strip() for target in match.group(2).split(",")]
+        kept = [t for t in targets if t and not t.startswith("arm64e.x1-")]
+        if not kept:
+            raise PgsoError("system stub section targets only arm64e.x1")
+        return f"{match.group(1)}[ {', '.join(kept)} ]"
+
+    result = _STUB_TARGET_LIST.sub(drop_arm64e_x1, text)
+    if "arm64e.x1" in result:
+        raise PgsoError("system stub names arm64e.x1 outside a target list")
+    return result
+
+
 def temporal_candidate_link_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
     compiler_runtime: pathlib.Path,
     contract: MacosLinkContract,
+    system_stub: pathlib.Path,
 ) -> tuple[str, ...]:
     return (
         str(toolchain.apple_ld),
@@ -510,13 +573,15 @@ def temporal_candidate_link_argv(
         "_main",
         "-no_deduplicate",
         "-no_function_starts",
+        # fx builds without unwind tables; newer ld otherwise emits ~160 KB.
+        "-no_compact_unwind",
         "-order_file",
         str(paths.logs / "candidate-order.txt"),
         "-map",
         str(paths.logs / "candidate-link.map"),
         str(paths.profile_use_object),
         str(compiler_runtime),
-        str(toolchain.zig_darwin_sdk / "libSystem.tbd"),
+        str(system_stub),
         "-o",
         str(paths.candidate_binary),
     )
@@ -794,7 +859,7 @@ def build_control(
     run_checked(
         zig_build_argv(toolchain, spec, paths, emit_ir=False),
         cwd=spec.repo_root,
-        env=os.environ.copy(),
+        env=zig_build_env(paths),
         timeout_s=900,
         log_path=paths.logs / "build-control.json",
     )
@@ -812,18 +877,73 @@ def emit_bitcode(
     run_checked(
         zig_build_argv(toolchain, spec, paths, emit_ir=True),
         cwd=spec.repo_root,
-        env=os.environ.copy(),
+        env=zig_build_env(paths),
         timeout_s=900,
         log_path=paths.logs / "emit-bitcode.json",
     )
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
-    with paths.bitcode.open("rb") as stream:
-        if stream.read(4) != b"BC\xc0\xde":
-            raise PgsoError(f"invalid LLVM bitcode header: {paths.bitcode}")
+    _require_bitcode_header(paths.bitcode)
+    # Every job derives instrumentation and profile use from this file, so
+    # the helper attributes are part of the recorded bitcode identity.
+    staged = paths.bitcode.with_name(paths.bitcode.name + ".staged")
+    run_checked(
+        ir_size_argv(toolchain, "outline-helpers", paths.bitcode, staged),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "outline-helpers.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(staged, "outlined-helper bitcode")
+    _require_bitcode_header(staged)
+    os.replace(staged, paths.bitcode)
     digest = sha256_file(paths.bitcode)
     if expected_sha256 is not None:
         validate_bitcode_hash(paths.bitcode, expected_sha256)
     return digest
+
+
+def _require_bitcode_header(path: pathlib.Path) -> None:
+    with path.open("rb") as stream:
+        if stream.read(4) not in BITCODE_MAGICS:
+            raise PgsoError(f"invalid LLVM bitcode header: {path}")
+
+
+def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None:
+    """Replace copies of mostly undefined constants with their defined stores."""
+    rewritten = paths.profile_use_bitcode.with_name(
+        paths.profile_use_bitcode.name + ".sparse"
+    )
+    run_checked(
+        ir_size_argv(
+            toolchain,
+            "sparse-constants",
+            paths.profile_use_bitcode,
+            rewritten,
+        ),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "sparse-constants.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(rewritten, "sparse-constant bitcode")
+    run_checked(
+        (
+            str(toolchain.opt),
+            *SPARSE_CLEANUP_FLAGS,
+            str(rewritten),
+            "-o",
+            str(paths.profile_use_bitcode),
+        ),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / "sparse-cleanup.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+    rewritten.unlink()
 
 
 def validate_bitcode_hash(path: pathlib.Path, expected_sha256: str) -> None:
@@ -1182,6 +1302,7 @@ def apply_profile(
     )
     if paths.selector != "fx":
         _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+        rewrite_sparse_constants(toolchain, paths)
         return paths.profile_use_bitcode
 
     _require_nonempty_file(
@@ -1233,6 +1354,7 @@ def apply_profile(
         require_empty_stderr=True,
     )
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+    rewrite_sparse_constants(toolchain, paths)
     outlined_symbols = _defined_external_symbols(
         toolchain,
         paths.profile_use_bitcode,
@@ -1308,6 +1430,13 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
     system_stub = toolchain.zig_darwin_sdk / "libSystem.tbd"
     _require_nonempty_file(system_stub, "pinned Zig system library stub")
     stub_hash = sha256_file(system_stub)
+    linked_stub = paths.candidate_binary.parent / "system-stub" / "libSystem.tbd"
+    linked_stub.parent.mkdir(parents=True, exist_ok=True)
+    linked_stub.write_text(
+        apple_ld_system_stub(system_stub.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
+    linked_stub_hash = sha256_file(linked_stub)
     order_path = paths.logs / "candidate-profile.order"
     run_checked(
         (str(toolchain.llvm_profdata), "order", str(paths.merged_profile), "-o", str(order_path)),
@@ -1340,7 +1469,7 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
         json.dumps(mapping, indent=2) + "\n", encoding="utf-8",
     )
     result = run_checked(
-        temporal_candidate_link_argv(toolchain, paths, runtime_object, contract),
+        temporal_candidate_link_argv(toolchain, paths, runtime_object, contract, linked_stub),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
@@ -1360,7 +1489,11 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
     )
     validate_macos_link_contract(linked_contract, contract)
     validate_archive_unchanged(runtime, runtime_hash)
-    if sha256_file(runtime_object) != runtime_object_hash or sha256_file(system_stub) != stub_hash:
+    if (
+        sha256_file(runtime_object) != runtime_object_hash
+        or sha256_file(system_stub) != stub_hash
+        or sha256_file(linked_stub) != linked_stub_hash
+    ):
         raise PgsoError("candidate runtime object or system stub changed during link")
     evidence = {
         "linker": "apple-ld",
@@ -1373,6 +1506,7 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
         "sysroot": str(toolchain.sdk),
         "system_stub": str(system_stub),
         "system_stub_sha256": stub_hash,
+        "linked_system_stub_sha256": linked_stub_hash,
         "runtime_archive_sha256": runtime_hash,
         "runtime_object_sha256": runtime_object_hash,
         "profile_sha256": sha256_file(paths.merged_profile),

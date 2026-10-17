@@ -1,4 +1,5 @@
 const std = @import("std");
+const observation = @import("observation.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const types = @import("../../shared/types.zig");
@@ -147,6 +148,7 @@ pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecution
 }
 
 pub const ToolExecutionRequest = struct {
+    observer: ?*observation.Observer = null,
     skill_locations: ?*const skill_contract.Locations = null,
     call_allocator: Allocator,
     result_allocator: Allocator,

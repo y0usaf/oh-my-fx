@@ -1,0 +1,51 @@
+[
+  {
+    "description": "The callback's state isn't compared with the live flow's",
+    "old": "           ok == flow[h] # 0 /\\ got[k] = flow[h]",
+    "new": "           ok == flow[h] # 0",
+    "invariant": "RedeemOnlyLiveState"
+  },
+  {
+    "description": "The loopback listener takes any request, an icon's too, as the browser's return",
+    "old": "Takes(kind) == IF Bridge THEN kind = \"form_ours\" ELSE kind = \"get\"",
+    "new": "Takes(kind) == IF Bridge THEN kind = \"form_ours\" ELSE kind \\in {\"get\", \"other\"}",
+    "invariant": "ListenerTakesOnlyItsOwn"
+  },
+  {
+    "description": "A bridged listener takes a form from any origin",
+    "config": "SignIn.stress.cfg",
+    "old": "Takes(kind) == IF Bridge THEN kind = \"form_ours\" ELSE kind = \"get\"",
+    "new": "Takes(kind) == IF Bridge THEN kind \\in {\"form_ours\", \"form_foreign\"} ELSE kind = \"get\"",
+    "invariant": "ListenerTakesOnlyItsOwn"
+  },
+  {
+    "description": "A destroyed host leaves its login listening",
+    "old": "          /\\ phase' = IF free THEN Gone(cur, phase) ELSE phase",
+    "new": "          /\\ phase' = phase",
+    "invariant": "NoListenerWithoutHost"
+  },
+  {
+    "description": "A second login doesn't end the first (startLogin without endLogin)",
+    "old": "       IN /\\ phase' = [(IF old # 0 THEN Ended(old) ELSE phase) EXCEPT ![k] = \"open\"]",
+    "new": "       IN /\\ phase' = [phase EXCEPT ![k] = \"open\"]",
+    "invariant": "OneSignInPerHost"
+  },
+  {
+    "description": "A login the browser never comes back to never expires",
+    "old": "    /\\ Open(k) /\\ alive[hostOf[k]] /\\ live[hostOf[k]] = k",
+    "new": "    /\\ phase[k] = \"redeeming\" /\\ alive[hostOf[k]] /\\ live[hostOf[k]] = k",
+    "property": "EveryLoginEnds"
+  },
+  {
+    "description": "a host's end closes its sign-in without a notice",
+    "old": "GoneIndicator(h) == IF SignsIn(h) THEN FALSE ELSE indicator",
+    "new": "GoneIndicator(h) == indicator",
+    "invariant": "IndicatorImpliesListener"
+  },
+  {
+    "description": "a new host starts a sign-in while an old one still signs in",
+    "old": "    /\\ \\A h \\in Hosts : alive[h] => h = cur\n",
+    "new": "",
+    "invariant": "OneSignInPerServer"
+  }
+]

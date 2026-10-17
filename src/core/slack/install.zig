@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const oauth = @import("../auth/oauth.zig");
 const io = @import("../shared/io.zig");
 const browser = @import("../auth/browser_callback.zig");
 const transport_mod = @import("../auth/oauth_transport.zig");
@@ -38,10 +39,10 @@ const Installation = struct {
 
 // The caller supplies an arena; the returned snapshot borrows its allocations.
 pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, opener: host.UrlOpener) !output.SlackSnapshot {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SlackInstallationUnsupported;
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SlackInstallationUnsupported;
     const origin = io.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
     if (!std.mem.eql(u8, origin, "https://fx.sh") and !test_origin(origin)) return error.InvalidSlackTestOrigin;
-    const home = io.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io.homeDir() orelse return error.HomeNotSet;
     var home_dir = io.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io.getIo(), home, .{ .iterate = true }) };
     defer home_dir.close();
     var root = try io.openOrCreateVerifiedPrivateDir(&home_dir, ".fx");
@@ -56,17 +57,17 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         if (!std.mem.eql(u8, value.bridge_origin, origin)) return error.SlackInstallationOriginMismatch;
     }
     if (action == .refresh and previous == null) return error.SlackInstallationMissing;
-    const config_url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install/config", .{origin});
+    const config_url = try alloc.print("{s}/api/slack/install/config", .{origin});
     const config = (try std.json.parseFromSlice(Config, alloc, try request(alloc, transport, .get, config_url, null, null), .{ .allocate = .alloc_always })).value;
     try validate_config(config);
-    const token_url = if (test_origin(origin)) try std.fmt.allocPrint(alloc, "{s}/api/oauth.v2.access", .{origin}) else "https://slack.com/api/oauth.v2.access";
-    const identity_url = if (test_origin(origin)) try std.fmt.allocPrint(alloc, "{s}/api/auth.test", .{origin}) else "https://slack.com/api/auth.test";
+    const token_url = if (test_origin(origin)) try alloc.print("{s}/api/oauth.v2.access", .{origin}) else "https://slack.com/api/oauth.v2.access";
+    const identity_url = if (test_origin(origin)) try alloc.print("{s}/api/auth.test", .{origin}) else "https://slack.com/api/auth.test";
     var form: std.Io.Writer.Allocating = .init(alloc);
     try append(&form.writer, "client_id", config.client_id, true);
-    var accepted: ?browser.Accepted(Callback) = null;
+    var accepted: ?browser.Accepted(oauth.FormCallback) = null;
     var saved = false;
     defer if (accepted) |*value| {
-        value.respond(if (saved) .ok else .failed) catch {};
+        respond_completion(value.stream, origin, saved) catch {};
         value.deinit();
     };
     if (action == .install) {
@@ -87,21 +88,26 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         try io.getIo().randomSecure(&entropy);
         var state_buf: [43]u8 = undefined;
         const state = std.base64.url_safe_no_pad.Encoder.encode(&state_buf, &entropy);
-        const start_url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install?state={s}&challenge={s}&port={d}", .{ origin, state, challenge, listener.socket.address.getPort() });
+        const start_url = try alloc.print("{s}/api/slack/install?state={s}&challenge={s}&port={d}", .{ origin, state, challenge, listener.socket.address.getPort() });
         try std.Io.File.stderr().writeStreamingAll(io.getIo(), "Authorize the workspace installation in your browser. Keep fx running.\n");
         if (io.getenv("FX_NO_OPEN_BROWSER") != null or !try opener.open(alloc, start_url)) {
-            try std.Io.File.stderr().writeStreamingAll(io.getIo(), try std.fmt.allocPrint(alloc, "Open on this computer: {s}\n", .{start_url}));
+            try std.Io.File.stderr().writeStreamingAll(io.getIo(), try alloc.print("Open on this computer: {s}\n", .{start_url}));
         }
-        var context = CallbackContext{ .state = state };
+        var context = oauth.FormCallbackContext{
+            .expected_state = state,
+            .invalid_error = error.InvalidSlackCallback,
+            .require_visible_ascii = true,
+            .max_value_bytes = 8192,
+        };
         var cancelled: std.atomic.Value(bool) = .init(false);
         while (accepted == null) {
             if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
-            accepted = try browser.await_form(Callback, parse_callback, alloc, &listener, &context, &cancelled, origin);
+            accepted = try browser.await_form(oauth.FormCallback, oauth.parse_form_callback, alloc, &listener, &context, &cancelled, null, origin);
         }
         if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
         if (accepted.?.callback.denied) return error.SlackAuthorizationDenied;
         try append(&form.writer, "redirect_uri", callback_url, false);
-        try append(&form.writer, "code", accepted.?.callback.code, false);
+        try append(&form.writer, "code", accepted.?.callback.code.?, false);
         try append(&form.writer, "code_verifier", verifier, false);
     } else {
         const current = previous.?;
@@ -114,7 +120,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
     const issued_at = io.milliTimestamp();
     const exchange = try request(alloc, transport, .post_form, token_url, form.written(), null);
     var record = try installation(alloc, exchange, config, origin, if (action == .refresh) previous else null, issued_at);
-    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{record.access_token});
+    const authorization = try alloc.print("Bearer {s}", .{record.access_token});
     const identity = try request(alloc, transport, .post_form, identity_url, "", authorization);
     try validate_identity(alloc, identity, &record, if (action == .refresh) previous else null);
     var serialized: std.Io.Writer.Allocating = .init(alloc);
@@ -122,6 +128,19 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
     try io.durableReplaceVerified(alloc, &dir, "installation.json", serialized.written());
     saved = true;
     return snapshot(action, record);
+}
+
+fn respond_completion(stream: std.Io.net.Stream, origin: []const u8, saved: bool) !void {
+    var buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io.getIo(), &buffer);
+    try writer.interface.print(
+        "HTTP/1.1 303 See Other\r\n" ++
+            "Location: {s}/api/slack/install/complete?result={s}\r\n" ++
+            "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n" ++
+            "Content-Length: 0\r\nConnection: close\r\n\r\n",
+        .{ origin, if (saved) "success" else "failed" },
+    );
+    try writer.interface.flush();
 }
 
 fn test_origin(value: []const u8) bool {
@@ -242,48 +261,6 @@ fn snapshot(action: Action, record: ?Installation) output.SlackSnapshot {
     return .{ .action = @tagName(action), .installed = record != null, .app_id = if (record) |r| r.app_id else null, .team_id = if (record) |r| r.team_id else null, .bot_user_id = if (record) |r| r.bot_user_id else null, .expires_at_ms = if (record) |r| r.expires_at_ms else null, .refresh_expires_at_ms = if (record) |r| r.refresh_expires_at_ms else null };
 }
 
-const Callback = struct { code: []const u8 = "", denied: bool = false };
-const CallbackContext = struct { state: []const u8, consumed: bool = false };
-fn parse_callback(raw: ?*anyopaque, alloc: Allocator, body: []const u8) browser.ParseResult(Callback) {
-    const context: *CallbackContext = @ptrCast(@alignCast(raw.?));
-    if (context.consumed) return .unrelated;
-    const result = callback(alloc, body, context.state) catch |err| return if (err == error.SlackStateMismatch) .unrelated else .{ .failed = err };
-    context.consumed = true;
-    return .{ .accepted = result };
-}
-fn callback(alloc: Allocator, body: []const u8, expected: []const u8) !Callback {
-    var state: ?[]const u8 = null;
-    var code: ?[]const u8 = null;
-    var denial: ?[]const u8 = null;
-    var fields = std.mem.splitScalar(u8, body, '&');
-    while (fields.next()) |field| {
-        const split = std.mem.findScalar(u8, field, '=') orelse return error.InvalidSlackCallback;
-        const name = try decode(alloc, field[0..split]);
-        const value = try decode(alloc, field[split + 1 ..]);
-        const target = if (std.mem.eql(u8, name, "state")) &state else if (std.mem.eql(u8, name, "code")) &code else if (std.mem.eql(u8, name, "error")) &denial else return error.InvalidSlackCallback;
-        if (target.* != null or value.len == 0) return error.InvalidSlackCallback;
-        target.* = value;
-    }
-    if (!std.mem.eql(u8, state orelse return error.SlackStateMismatch, expected)) return error.SlackStateMismatch;
-    if ((code == null) == (denial == null)) return error.InvalidSlackCallback;
-    if (code) |value| if (value.len > 2048) return error.InvalidSlackCallback;
-    return .{ .code = code orelse "", .denied = denial != null };
-}
-fn decode(alloc: Allocator, value: []const u8) ![]const u8 {
-    var result: std.Io.Writer.Allocating = .init(alloc);
-    var i: usize = 0;
-    while (i < value.len) : (i += 1) {
-        var byte = value[i];
-        if (byte == '%') {
-            if (i + 2 >= value.len) return error.InvalidSlackCallback;
-            byte = std.fmt.parseInt(u8, value[i + 1 ..][0..2], 16) catch return error.InvalidSlackCallback;
-            i += 2;
-        } else if (byte == '+') byte = ' ';
-        if (byte < 0x21 or byte > 0x7e) return error.InvalidSlackCallback;
-        try result.writer.writeByte(byte);
-    }
-    return result.toOwnedSlice();
-}
 fn append(writer: *std.Io.Writer, key: []const u8, value: []const u8, first: bool) !void {
     if (!first) try writer.writeByte('&');
     try writer.print("{s}=", .{key});
@@ -296,17 +273,60 @@ test "Slack callback consumes matching state once and rejects ambiguous fields" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var context = CallbackContext{ .state = "expected" };
-    try std.testing.expect(parse_callback(&context, alloc, "state=wrong&code=code") == .unrelated);
+    var context = oauth.FormCallbackContext{
+        .expected_state = "expected",
+        .invalid_error = error.InvalidSlackCallback,
+        .require_visible_ascii = true,
+        .max_value_bytes = 8192,
+    };
+    try std.testing.expect(oauth.parse_form_callback(&context, alloc, "state=wrong&code=code") == .unrelated);
     try std.testing.expect(!context.consumed);
-    const accepted = parse_callback(&context, alloc, "state=expected&code=code%2Bvalue");
-    try std.testing.expectEqualStrings("code+value", accepted.accepted.code);
-    try std.testing.expect(parse_callback(&context, alloc, "state=expected&code=code") == .unrelated);
-    try std.testing.expectError(error.InvalidSlackCallback, callback(alloc, "state=expected&state=expected&code=code", "expected"));
-    try std.testing.expectError(error.InvalidSlackCallback, callback(alloc, "state=expected&code=code&error=denied", "expected"));
-    try std.testing.expectError(error.SlackStateMismatch, callback(alloc, "code=code", "expected"));
-    try std.testing.expectError(error.InvalidSlackCallback, callback(alloc, "state=expected&code=%0A", "expected"));
-    try std.testing.expect((try callback(alloc, "state=expected&error=access_denied", "expected")).denied);
+    const accepted = oauth.parse_form_callback(&context, alloc, "state=expected&code=code%2Bvalue");
+    try std.testing.expectEqualStrings("code+value", accepted.accepted.code.?);
+    try std.testing.expect(oauth.parse_form_callback(&context, alloc, "state=expected&code=code") == .unrelated);
+    for ([_][]const u8{
+        "state=expected&state=expected&code=code",
+        "state=expected&code=code&error=denied",
+        "state=expected&code=%0A",
+    }) |body| {
+        var invalid_context = oauth.FormCallbackContext{
+            .expected_state = "expected",
+            .invalid_error = error.InvalidSlackCallback,
+            .require_visible_ascii = true,
+            .max_value_bytes = 8192,
+        };
+        const invalid = oauth.parse_form_callback(&invalid_context, alloc, body);
+        try std.testing.expect(invalid == .failed);
+        try std.testing.expectEqual(error.InvalidSlackCallback, invalid.failed);
+    }
+    var missing_state_context = oauth.FormCallbackContext{
+        .expected_state = "expected",
+        .invalid_error = error.InvalidSlackCallback,
+        .require_visible_ascii = true,
+        .max_value_bytes = 8192,
+    };
+    try std.testing.expect(oauth.parse_form_callback(&missing_state_context, alloc, "code=code") == .unrelated);
+    for ([_]struct { body: []const u8, expected: anyerror }{
+        .{ .body = "state=expected&code=%zz", .expected = error.InvalidCharacter },
+        .{ .body = "state=expected&code=%", .expected = error.InvalidSlackCallback },
+    }) |scenario| {
+        var malformed_context = oauth.FormCallbackContext{
+            .expected_state = "expected",
+            .invalid_error = error.InvalidSlackCallback,
+            .require_visible_ascii = true,
+            .max_value_bytes = 8192,
+        };
+        const malformed = oauth.parse_form_callback(&malformed_context, alloc, scenario.body);
+        try std.testing.expectEqual(scenario.expected, malformed.failed);
+    }
+    var denied_context = oauth.FormCallbackContext{
+        .expected_state = "expected",
+        .invalid_error = error.InvalidSlackCallback,
+        .require_visible_ascii = true,
+        .max_value_bytes = 8192,
+    };
+    const denied = oauth.parse_form_callback(&denied_context, alloc, "state=expected&error=access_denied");
+    try std.testing.expect(denied.accepted.denied);
     try std.testing.expect(valid_id("UBOT", "UW"));
     try std.testing.expect(valid_id("WBOT", "UW"));
     try std.testing.expect(!valid_id("BBOT", "UW"));

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
@@ -34,7 +35,6 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const result_store = @import("../session/result_store.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
-const session_usage = @import("../session/session_usage.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -143,7 +143,7 @@ test "prepared diff payload keeps compact elision and retains the complete appro
         var line: [32]u8 = undefined;
         try after.appendSlice(
             alloc,
-            try std.fmt.bufPrint(&line, "full-review-{d:0>3}\n", .{line_number}),
+            try std.mem.print(&line, "full-review-{d:0>3}\n", .{line_number}),
         );
     }
 
@@ -176,11 +176,11 @@ test "prepared diff payload keeps compact elision and retains the complete appro
     const payload = try preparedDiffPayload(alloc, enriched_handoff);
     defer diff_mod.freeDiffEntryPayload(alloc, payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload.preview, "⋯ +118 omitted") != null);
+    try std.testing.expect(std.mem.find(u8, payload.preview, "⋯ +118 omitted") != null);
     const full = payload.full orelse return error.TestExpectedFullDiff;
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "full-review-001") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "full-review-120") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "⋯ +118 omitted") == null);
+    try std.testing.expect(std.mem.find(u8, full.content, "full-review-001") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "full-review-120") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "⋯ +118 omitted") == null);
 }
 
 test "prepared diff payload keeps compact output when full formatting is unavailable" {
@@ -191,7 +191,7 @@ test "prepared diff payload keeps compact output when full formatting is unavail
         .lifecycle_id = .{ .turn_id = 40, .call_id = "full-format-fallback" },
     };
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 
@@ -203,7 +203,7 @@ test "prepared diff payload keeps compact output when full formatting is unavail
     defer diff_mod.freeDiffEntryPayload(std.testing.allocator, payload);
 
     try std.testing.expect(payload.full == null);
-    try std.testing.expect(std.mem.indexOf(u8, payload.preview, "after") != null);
+    try std.testing.expect(std.mem.find(u8, payload.preview, "after") != null);
 }
 
 test "full diff formatter renders unchanged review elisions" {
@@ -267,9 +267,9 @@ test "full diff formatter renders unchanged review elisions" {
     )) orelse
         return error.TestExpectedFullDiff;
     defer full.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "5 unchanged lines ⋯") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "old") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "new") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "5 unchanged lines ⋯") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "old") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "new") != null);
 }
 
 pub fn Bindings(comptime App: type) type {
@@ -343,6 +343,10 @@ pub fn Bindings(comptime App: type) type {
                         null
                 else
                     null,
+                .append_turn_piece = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
+                else
+                    null,
                 .propagate_grant = agentPropagateGrant,
                 .push_event = agentPushEvent,
                 .push_text = agentPushText,
@@ -371,28 +375,15 @@ pub fn Bindings(comptime App: type) type {
                 .record_tool_call_failed = agentRecordToolCallFailed,
                 .report_usage = agentReportUsage,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
-                .usage_allocator = app.alloc,
                 .diff_marker_styles = .{
                     .added = ui_render.diff_added_marker_style,
                     .removed = ui_render.diff_removed_marker_style,
                 },
             };
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                deps.usage = &app.session.usage;
-                if (comptime @hasField(App, "session_persistence") and
-                    @hasField(@TypeOf(app.session_persistence), "writable"))
-                {
-                    app.session.usage.configureCheckpointSink(
-                        if (app.session_persistence.writable != null)
-                            .{
-                                .context = @ptrCast(app),
-                                .allocator = app.alloc,
-                                .persist = agentPersistUsageCheckpoint,
-                            }
-                        else
-                            null,
-                    );
-                }
+            if (comptime @hasField(App, "session_persistence") and
+                @hasField(@TypeOf(app.session_persistence), "writable"))
+            {
+                deps.confirm_session_writer = agentConfirmSessionWriter;
             }
             if (comptime @hasDecl(App, "releaseAgentTerminalLease")) {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
@@ -705,7 +696,7 @@ pub fn Bindings(comptime App: type) type {
         pub fn onMcpProgress(ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
             const app: *App = @ptrCast(@alignCast(ctx));
             var label_buf: [512]u8 = undefined;
-            const label = std.fmt.bufPrint(
+            const label = std.mem.print(
                 &label_buf,
                 "{s}● {s}{s}",
                 .{ ui_render.bold_style, text, reset_style },
@@ -928,6 +919,19 @@ pub fn Bindings(comptime App: type) type {
 
         fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime runtime_profile.allows(App, .cooperative_agent)) {
+                const settings = app.worker.effectiveAgentTurnSettings();
+                if (settings.fast_mode or settings.ultrafast_mode) {
+                    if (app.worker.isCancelRequested()) return error.Cancelled;
+                    app.ensureModelCache();
+                    // A host abort can settle the fetch before queued input reaches the worker.
+                    app.cooperativeTransportPulse() catch |err| {
+                        debug_trace.logf("gateway", "model catalog transport pulse failed err={s}", .{@errorName(err)});
+                        return error.Cancelled;
+                    };
+                    if (app.worker.isCancelRequested()) return error.Cancelled;
+                }
+            }
             if (comptime @hasDecl(App, "resolveModelCapabilitiesForRequest")) {
                 return app.resolveModelCapabilitiesForRequest(model);
             }
@@ -1210,12 +1214,14 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).clearRecoveryCheckpoint(app);
         }
 
-        fn agentPersistUsageCheckpoint(
-            ctx: *anyopaque,
-            snapshot: session_usage.Snapshot,
-        ) !void {
+        fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).persistUsageCheckpoint(app, snapshot);
+            try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
+        }
+
+        fn agentConfirmSessionWriter(ctx: *anyopaque) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).confirmSessionWriter(app);
         }
 
         fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
@@ -1336,8 +1342,7 @@ pub fn Bindings(comptime App: type) type {
                 try gateway_error_format.formatHttpErrorMessage(std.heap.c_allocator, status, detail);
             defer std.heap.c_allocator.free(message);
             const label = if (auth_failure) |failure|
-                try std.fmt.allocPrint(
-                    std.heap.c_allocator,
+                try std.heap.c_allocator.print(
                     "⚠ {s} · {s}",
                     .{
                         message,
@@ -1352,7 +1357,7 @@ pub fn Bindings(comptime App: type) type {
                     },
                 )
             else
-                try std.fmt.allocPrint(std.heap.c_allocator, "⚠ {s}", .{message});
+                try std.heap.c_allocator.print("⚠ {s}", .{message});
             defer std.heap.c_allocator.free(label);
             try app_worker_runtime.Runtime(App).pushEvent(app, .{ .api_status_text = label });
         }
@@ -1362,8 +1367,7 @@ pub fn Bindings(comptime App: type) type {
             const question = switch (request.finish_reason) {
                 .content_filter => "Response blocked by content filter. What should fx do?",
                 else => if (request.replay_safe)
-                    try std.fmt.allocPrint(
-                        arena,
+                    try arena.print(
                         "Route failed after {d} attempt{s} for {s}. What should fx do?",
                         .{
                             request.semantic_attempts,
@@ -1510,9 +1514,9 @@ pub fn Bindings(comptime App: type) type {
                 provider_runtime.supported(App) and
                 @hasDecl(App, "modelCompletions"))
             {
-                // The Ctrl+P catalog owns the borrowed composer while a draft
+                // The Ctrl+P picker owns the borrowed composer while a draft
                 // is stashed; seeding the inline "/model " flow there would
-                // land in the menu's query box and be discarded on close.
+                // overwrite the catalog query or the effort and fast stages.
                 const InputRuntime = @TypeOf(app.input_runtime);
                 if (comptime @hasField(InputRuntime, "model_picker_draft")) {
                     if (app.input_runtime.model_picker_draft != null) return;
@@ -1858,7 +1862,7 @@ test "skill preparation uses the active turn tool result budget" {
         }
 
         fn observeBudget(ctx: dispatch.DispatchContext, _: []const u8) dispatch.DispatchError!skill_contract.CallPreparation {
-            return .{ .failure = .{ .model_output = try std.fmt.allocPrint(ctx.allocator, "{d}", .{ctx.max_tool_result_bytes}) } };
+            return .{ .failure = .{ .model_output = try ctx.allocator.print("{d}", .{ctx.max_tool_result_bytes}) } };
         }
     };
     var app: SkillApp = .{};
@@ -1997,7 +2001,7 @@ const FakeApp = struct {
 
     fn validateToolCall(self: *FakeApp, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
         _ = self;
-        return .{ .failure = try std.fmt.allocPrint(arena, "invalid {s}", .{call.name}) };
+        return .{ .failure = try arena.print("invalid {s}", .{call.name}) };
     }
 
     fn checkToolAvailability(self: *FakeApp, _: Allocator, _: ToolCall) !?[]const u8 {
@@ -2007,22 +2011,22 @@ const FakeApp = struct {
 
     fn describeToolActionWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "run {s}", .{call.name});
+        return arena.print("run {s}", .{call.name});
     }
 
     fn describeToolActionCompletedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "done {s}", .{call.name});
+        return arena.print("done {s}", .{call.name});
     }
 
     fn describeToolActionDeniedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "denied {s} {s}", .{ call.name, label });
+        return arena.print("denied {s} {s}", .{ call.name, label });
     }
 
     fn permissionTargetForCallWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "target:{s}", .{call.id});
+        return arena.print("target:{s}", .{call.id});
     }
 
     fn executeToolCallWithAdvertised(
@@ -2042,7 +2046,7 @@ const FakeApp = struct {
 
     fn formatToolExecutionErrorForAgent(self: *FakeApp, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "{s}:{s}", .{ tool_name, @errorName(err) });
+        return arena.print("{s}:{s}", .{ tool_name, @errorName(err) });
     }
 
     fn writeUserPromptCard(self: *FakeApp, prompt: types.UserTurn) !void {
@@ -2070,7 +2074,7 @@ const FakeApp = struct {
         self.command_output_count += 1;
     }
 
-    fn writeCommandOutputChunkForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, stream: command_output_content.Stream, text: []const u8, record: bool) !void {
+    pub fn writeCommandOutputChunkForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, stream: command_output_content.Stream, text: []const u8, record: bool) !void {
         storeLifecycleId(
             &self.last_command_output_lifecycle_turn_id,
             &self.last_command_output_lifecycle_call_id,
@@ -2083,7 +2087,7 @@ const FakeApp = struct {
         try self.flushCommandOutputSummaryForLifecycle(null, record);
     }
 
-    fn flushCommandOutputSummaryForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, record: bool) !void {
+    pub fn flushCommandOutputSummaryForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, record: bool) !void {
         _ = record;
         storeLifecycleId(
             &self.last_command_output_complete_lifecycle_turn_id,
@@ -2478,6 +2482,88 @@ test "agent deps use request-time model capability resolution when available" {
 
     try std.testing.expectEqual(@as(usize, 1), app.capability_request_count);
     try std.testing.expect(model_capabilities.reasoningEffortSupported(capabilities, types.ReasoningEffort.literal("future-tier")));
+}
+
+test "cooperative speed capability resolution uses active request settings and honors cancellation" {
+    const App = struct {
+        pub const host_profile = runtime_profile.wasm;
+        worker: worker_runtime.WorkerRuntime = .{},
+        warmups: usize = 0,
+        pulses: usize = 0,
+        resolutions: usize = 0,
+        eligible: bool = true,
+        cancel_on_pulse: bool = false,
+        fail_pulse: bool = false,
+
+        pub fn ensureModelCache(self: *@This()) void {
+            self.warmups += 1;
+        }
+
+        pub fn cooperativeTransportPulse(self: *@This()) error{PulseFailed}!void {
+            self.pulses += 1;
+            if (self.cancel_on_pulse) self.worker.requestCancel();
+            if (self.fail_pulse) return error.PulseFailed;
+        }
+
+        pub fn resolveModelCapabilitiesForRequest(self: *@This(), _: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            self.resolutions += 1;
+            return .{
+                .supports_fast_mode = self.eligible and self.warmups > 0,
+                .supports_ultrafast_mode = self.eligible and self.warmups > 0,
+            };
+        }
+    };
+    const Case = struct {
+        fast: bool = false,
+        configured: bool = false,
+        active: ?bool = null,
+        eligible: bool = true,
+        cancel_before: bool = false,
+        cancel_on_pulse: bool = false,
+        fail_pulse: bool = false,
+        warmups: usize = 0,
+        cancelled: bool = false,
+    };
+    for ([_]Case{
+        .{},
+        .{ .configured = true, .active = false },
+        .{ .active = true, .warmups = 1 },
+        .{ .configured = true, .warmups = 1, .eligible = false },
+        .{ .active = true, .cancel_before = true, .cancelled = true },
+        .{ .active = true, .cancel_on_pulse = true, .warmups = 1, .cancelled = true },
+        .{ .active = true, .fail_pulse = true, .warmups = 1, .cancelled = true },
+        .{ .fast = true },
+        .{ .fast = true, .configured = true, .active = false },
+        .{ .fast = true, .active = true, .warmups = 1 },
+        .{ .fast = true, .configured = true, .warmups = 1, .eligible = false },
+        .{ .fast = true, .active = true, .cancel_before = true, .cancelled = true },
+        .{ .fast = true, .active = true, .cancel_on_pulse = true, .warmups = 1, .cancelled = true },
+        .{ .fast = true, .active = true, .fail_pulse = true, .warmups = 1, .cancelled = true },
+    }) |case| {
+        var app: App = .{ .eligible = case.eligible, .cancel_on_pulse = case.cancel_on_pulse, .fail_pulse = case.fail_pulse };
+        defer app.worker.deinit(std.testing.allocator);
+        app.worker.agent_turn_settings.fast_mode = case.fast and case.configured;
+        app.worker.agent_turn_settings.ultrafast_mode = !case.fast and case.configured;
+        if (case.active) |active| app.worker.setActiveAgentTurnSettings(.{
+            .fast_mode = case.fast and active,
+            .ultrafast_mode = !case.fast and active,
+        });
+        if (case.cancel_before) app.worker.requestCancel();
+        const resolver = Bindings(App).modelCapabilityResolver(&app);
+        if (case.cancelled) {
+            try std.testing.expectError(error.Cancelled, resolver.resolve(std.testing.allocator, "openai/test"));
+            try std.testing.expectEqual(@as(usize, 0), app.resolutions);
+        } else {
+            const capabilities = try resolver.resolve(std.testing.allocator, "openai/test");
+            try std.testing.expectEqual(@as(usize, 1), app.resolutions);
+            try std.testing.expectEqual(case.eligible and case.warmups > 0, capabilities.supports_fast_mode);
+            if (!case.fast and case.configured and !case.eligible) {
+                try std.testing.expectError(error.UltrafastUnavailable, model_capabilities.resolveUltrafastProviderOptions(capabilities, .gateway, "openai/test", .auto, false, true));
+            }
+        }
+        try std.testing.expectEqual(case.warmups, app.warmups);
+        try std.testing.expectEqual(case.warmups, app.pulses);
+    }
 }
 
 test "agent deps record rejected tool calls in feedback diagnostics" {

@@ -585,105 +585,47 @@ fn requestResourceReadRound(
         },
     );
     defer outcome.deinit(alloc);
-    switch (outcome) {
-        .complete => |*complete| {
-            response.finishLegacy(self.transport.alloc, .completed);
-            const result = complete.*;
-            complete.contents = &.{};
-            return .{
-                .result = result,
-                .auth_identity = response.auth_identity,
-                .received_at_ms = received_at_ms,
-            };
-        },
-        .protocol_failure => |failure| {
-            if (round >= 8) return error.McpInputRequiredLimitExceeded;
-            if (try respondToLegacyUrlRequired(
-                self,
-                alloc,
-                server,
-                snapshot,
-                .{ .resources_read = uri },
-                failure.code,
-                failure.data_json,
-                options,
-                round,
-            )) |handled| {
-                if (handled.decision != .retry) {
-                    handled.responder.finish(alloc, handled.origin, .abandoned);
-                    return error.McpInputRequired;
-                }
-                const continued = requestResourceReadRound(
-                    self,
-                    alloc,
-                    server,
-                    snapshot,
-                    uri,
-                    operationDeadline(server),
-                    options,
-                    null,
-                    null,
-                    round + 1,
-                ) catch |err| {
-                    handled.responder.finish(alloc, handled.origin, .abandoned);
-                    return err;
+    var continuation = try prepareFeatureContinuation(
+        self,
+        alloc,
+        server,
+        snapshot,
+        .{ .resources_read = uri },
+        options,
+        round,
+        switch (outcome) {
+            .complete => |*complete| {
+                response.finishLegacy(self.transport.alloc, .completed);
+                const result = complete.*;
+                complete.contents = &.{};
+                return .{
+                    .result = result,
+                    .auth_identity = response.auth_identity,
+                    .received_at_ms = received_at_ms,
                 };
-                handled.responder.finish(alloc, handled.origin, .completed);
-                return continued;
-            }
-            try retainFeatureProtocolDiagnostic(alloc, options, failure);
-            return error.McpProtocolError;
+            },
+            .protocol_failure => |*failure| .{ .protocol_failure = failure },
+            .input_required => |*required| .{ .input_required = required },
         },
-        .input_required => |*required| {
-            if (round >= 8) return error.McpInputRequiredLimitExceeded;
-            const responder = options.input_responder orelse return error.McpInputRequired;
-            const requests_json = try mrtr.renderRequests(alloc, required.requests);
-            defer alloc.free(requests_json);
-            const compatibility = tool_mcp_runtime.InputRequired{
-                .input_requests_json = requests_json,
-                .request_state_json = required.request_state_json,
-            };
-            const interaction_deadline = operation_control.elicitationDeadline(io_mod.getIo());
-            const origin = tool_mcp_runtime.InputOrigin{
-                .wire = .modern_mcp,
-                .server_name = snapshot.server_name,
-                .operation = .{ .resources_read = uri },
-                .runtime_generation = self.transport.completions.runtime_generation,
-                .connection_generation = snapshot.connection_generation,
-                .client_generation = snapshot.connection_generation,
-                .catalog_generation = snapshot.catalog_generation,
-                .request_generation = round + 1,
-                .auth_generation = server.auth_generation.load(.acquire),
-                .deadline_ms = operation_control.timestampMillis(interaction_deadline),
-                .lifecycle_cancel_flag = server.cancellation(),
-            };
-            const responses = try responder.callback(
-                responder.context,
-                alloc,
-                origin,
-                compatibility,
-            );
-            defer alloc.free(responses);
-            try mrtr.validateResponses(alloc, required.requests, responses, .{});
-            const continued = requestResourceReadRound(
-                self,
-                alloc,
-                server,
-                snapshot,
-                uri,
-                operationDeadline(server),
-                options,
-                responses,
-                required.request_state_json,
-                round + 1,
-            ) catch |err| {
-                responder.finish(alloc, origin, .abandoned);
-                return err;
-            };
-            responder.finish(alloc, origin, .completed);
-            return continued;
-        },
-    }
+    );
+    defer continuation.deinit(alloc);
+    const continued = requestResourceReadRound(
+        self,
+        alloc,
+        server,
+        snapshot,
+        uri,
+        operationDeadline(server),
+        options,
+        continuation.input_responses_json,
+        continuation.request_state_json,
+        round + 1,
+    ) catch |err| {
+        continuation.finish(alloc, .abandoned);
+        return err;
+    };
+    continuation.finish(alloc, .completed);
+    return continued;
 }
 
 fn requestPromptGet(
@@ -741,55 +683,109 @@ fn requestPromptGetRound(
     defer response.deinit(self.transport.alloc);
     var outcome = try prompts_feature.parseGetOutcome(alloc, response.body, serverFeatureProtocol(server), .{});
     defer outcome.deinit(alloc);
-    switch (outcome) {
-        .complete => |*complete| {
-            response.finishLegacy(self.transport.alloc, .completed);
-            const result = complete.*;
-            complete.description = null;
-            complete.messages = &.{};
-            return result;
+    var continuation = try prepareFeatureContinuation(
+        self,
+        alloc,
+        server,
+        snapshot,
+        .{ .prompts_get = name },
+        options,
+        round,
+        switch (outcome) {
+            .complete => |*complete| {
+                response.finishLegacy(self.transport.alloc, .completed);
+                const result = complete.*;
+                complete.description = null;
+                complete.messages = &.{};
+                return result;
+            },
+            .protocol_failure => |*failure| .{ .protocol_failure = failure },
+            .input_required => |*required| .{ .input_required = required },
         },
+    );
+    defer continuation.deinit(alloc);
+    const continued = requestPromptGetRound(
+        self,
+        alloc,
+        server,
+        snapshot,
+        name,
+        arguments_json,
+        operationDeadline(server),
+        options,
+        continuation.input_responses_json,
+        continuation.request_state_json,
+        round + 1,
+    ) catch |err| {
+        continuation.finish(alloc, .abandoned);
+        return err;
+    };
+    continuation.finish(alloc, .completed);
+    return continued;
+}
+
+const FeatureContinuationRequest = union(enum) {
+    protocol_failure: *const resources_feature.ProtocolError,
+    input_required: *const mrtr.InputRequired,
+};
+
+const FeatureContinuation = struct {
+    completion: tool_mcp_runtime.InputCompletion,
+    input_responses_json: ?[]const u8 = null,
+    request_state_json: ?[]const u8 = null,
+
+    fn deinit(self: *FeatureContinuation, alloc: Allocator) void {
+        if (self.input_responses_json) |responses| alloc.free(responses);
+        self.* = undefined;
+    }
+
+    fn finish(
+        self: FeatureContinuation,
+        alloc: Allocator,
+        terminal: tool_mcp_runtime.ContinuationTerminal,
+    ) void {
+        self.completion.finish(alloc, terminal);
+    }
+};
+
+fn prepareFeatureContinuation(
+    self: Context,
+    alloc: Allocator,
+    server: *McpServer,
+    snapshot: *const FeatureIdentitySnapshot,
+    operation: elicitation.Operation,
+    options: FeatureCallOptions,
+    round: u8,
+    request: FeatureContinuationRequest,
+) !FeatureContinuation {
+    if (round >= 8) return error.McpInputRequiredLimitExceeded;
+
+    switch (request) {
         .protocol_failure => |failure| {
-            if (round >= 8) return error.McpInputRequiredLimitExceeded;
-            if (try respondToLegacyUrlRequired(
+            const handled = try respondToLegacyUrlRequired(
                 self,
                 alloc,
                 server,
                 snapshot,
-                .{ .prompts_get = name },
+                operation,
                 failure.code,
                 failure.data_json,
                 options,
                 round,
-            )) |handled| {
-                if (handled.decision != .retry) {
-                    handled.responder.finish(alloc, handled.origin, .abandoned);
-                    return error.McpInputRequired;
-                }
-                const continued = requestPromptGetRound(
-                    self,
-                    alloc,
-                    server,
-                    snapshot,
-                    name,
-                    arguments_json,
-                    operationDeadline(server),
-                    options,
-                    null,
-                    null,
-                    round + 1,
-                ) catch |err| {
-                    handled.responder.finish(alloc, handled.origin, .abandoned);
-                    return err;
-                };
-                handled.responder.finish(alloc, handled.origin, .completed);
-                return continued;
+            ) orelse {
+                try retainFeatureProtocolDiagnostic(alloc, options, failure.*);
+                return error.McpProtocolError;
+            };
+            if (handled.decision != .retry) {
+                handled.responder.finish(alloc, handled.origin, .abandoned);
+                return error.McpInputRequired;
             }
-            try retainFeatureProtocolDiagnostic(alloc, options, failure);
-            return error.McpProtocolError;
+            return .{ .completion = .{
+                .responder = handled.responder,
+                .origin = handled.origin,
+            } };
         },
-        .input_required => |*required| {
-            if (round >= 8) return error.McpInputRequiredLimitExceeded;
+        .input_required => |required| {
             const responder = options.input_responder orelse return error.McpInputRequired;
             const requests_json = try mrtr.renderRequests(alloc, required.requests);
             defer alloc.free(requests_json);
@@ -801,7 +797,7 @@ fn requestPromptGetRound(
             const origin = tool_mcp_runtime.InputOrigin{
                 .wire = .modern_mcp,
                 .server_name = snapshot.server_name,
-                .operation = .{ .prompts_get = name },
+                .operation = operation,
                 .runtime_generation = self.transport.completions.runtime_generation,
                 .connection_generation = snapshot.connection_generation,
                 .client_generation = snapshot.connection_generation,
@@ -817,26 +813,13 @@ fn requestPromptGetRound(
                 origin,
                 compatibility,
             );
-            defer alloc.free(responses);
+            errdefer alloc.free(responses);
             try mrtr.validateResponses(alloc, required.requests, responses, .{});
-            const continued = requestPromptGetRound(
-                self,
-                alloc,
-                server,
-                snapshot,
-                name,
-                arguments_json,
-                operationDeadline(server),
-                options,
-                responses,
-                required.request_state_json,
-                round + 1,
-            ) catch |err| {
-                responder.finish(alloc, origin, .abandoned);
-                return err;
+            return .{
+                .completion = .{ .responder = responder, .origin = origin },
+                .input_responses_json = responses,
+                .request_state_json = required.request_state_json,
             };
-            responder.finish(alloc, origin, .completed);
-            return continued;
         },
     }
 }

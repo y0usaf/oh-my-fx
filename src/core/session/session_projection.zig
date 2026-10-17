@@ -41,24 +41,6 @@ pub const Manifest = struct {
     }
 };
 
-pub const EventFileKind = enum(u8) {
-    regular = 1,
-    directory = 2,
-    symbolic_link = 3,
-    other = 255,
-};
-
-pub const EventFileStat = struct {
-    device: u64,
-    inode: u64,
-    kind: EventFileKind,
-    mode: u64,
-    link_count: u64,
-    size: u64,
-    mtime_ns: i128,
-    ctime_ns: i128,
-};
-
 pub const Checkpoint = struct {
     session_id: []u8,
     log_generation: session_event.Identifier,
@@ -242,37 +224,11 @@ pub fn decodeManifest(alloc: Allocator, bytes: []const u8) !Manifest {
     return manifest;
 }
 
-pub fn eventFileStatFingerprint(stat: EventFileStat, expected_size: u64) !Digest {
-    if (stat.kind != .regular or stat.link_count != 1 or stat.size != expected_size) {
-        return error.InvalidEventFileStat;
-    }
-
-    var encoded: [8 * 5 + 16 * 2 + 1]u8 = undefined;
-    var offset: usize = 0;
-    encoded[offset] = @intFromEnum(stat.kind);
-    offset += 1;
-    writeInt(&encoded, &offset, u64, stat.device);
-    writeInt(&encoded, &offset, u64, stat.inode);
-    writeInt(&encoded, &offset, u64, stat.mode);
-    writeInt(&encoded, &offset, u64, stat.link_count);
-    writeInt(&encoded, &offset, u64, stat.size);
-    writeInt(&encoded, &offset, i128, stat.mtime_ns);
-    writeInt(&encoded, &offset, i128, stat.ctime_ns);
-
-    var hasher = Sha256.init(.{});
-    hasher.update("fx:event-file-stat:v1\x00");
-    hasher.update(encoded[0..offset]);
-    return hasher.finalResult();
-}
-
-pub fn isManifestStale(manifest: Manifest, current: EventFileStat) bool {
-    const current_fingerprint = eventFileStatFingerprint(current, manifest.event_log_bytes) catch
-        return true;
-    return !std.mem.eql(
-        u8,
-        &manifest.event_log_stat_fingerprint,
-        &current_fingerprint,
-    );
+/// A projection is stale once the committed log's size differs from the bytes
+/// it summarizes. Copying or restoring a session changes the log's inode and
+/// ctime without adding events, so stat identity is not a staleness signal.
+pub fn isManifestStale(manifest: Manifest, event_log_size: u64) bool {
+    return event_log_size != manifest.event_log_bytes;
 }
 
 pub fn stateMatchesManifest(
@@ -306,7 +262,8 @@ fn durablePreferencesEqual(
     return std.mem.eql(u8, left.model, right.model) and
         left.provider.same_authority(right.provider) and
         left.effort.eql(right.effort) and
-        left.fast_mode == right.fast_mode;
+        left.fast_mode == right.fast_mode and
+        left.ultrafast_mode == right.ultrafast_mode;
 }
 
 pub fn encodeCheckpoint(alloc: Allocator, checkpoint: Checkpoint) ![]u8 {
@@ -478,9 +435,13 @@ fn writePreferences(
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
+    try writer.print(",\"fast_mode\":{s}", .{
         if (preferences.fast_mode) "true" else "false",
     });
+    if (preferences.ultrafast_mode) {
+        try writer.writeAll(",\"ultrafast_mode\":true");
+    }
+    try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(preferences.provider, .{}, writer);
     try writer.writeByte('}');
 }
@@ -587,17 +548,6 @@ fn writeJsonString(writer: *std.Io.Writer, bytes: []const u8) !void {
     try std.json.Stringify.value(bytes, .{}, writer);
 }
 
-fn writeInt(
-    destination: []u8,
-    offset: *usize,
-    comptime T: type,
-    value: T,
-) void {
-    const width = @sizeOf(T);
-    std.mem.writeInt(T, destination[offset.*..][0..width], value, .big);
-    offset.* += width;
-}
-
 test "manifest serialization is deterministic and capped" {
     const alloc = std.testing.allocator;
     const manifest = testManifest();
@@ -677,38 +627,6 @@ test "checkpoint decode semantic validation failure frees owned fields once" {
     @memcpy(invalid[pos..][0..replacement.len], replacement);
 
     try std.testing.expectError(error.InvalidCheckpoint, decodeCheckpoint(alloc, invalid));
-}
-
-test "event stat fingerprint detects same-size replacement and metadata-only change" {
-    const original = EventFileStat{
-        .device = 1,
-        .inode = 2,
-        .kind = .regular,
-        .mode = 0o100600,
-        .link_count = 1,
-        .size = 4096,
-        .mtime_ns = 10,
-        .ctime_ns = 20,
-    };
-    const original_hash = try eventFileStatFingerprint(original, 4096);
-
-    var replacement = original;
-    replacement.inode += 1;
-    const replacement_hash = try eventFileStatFingerprint(replacement, 4096);
-    try std.testing.expect(!std.mem.eql(u8, &original_hash, &replacement_hash));
-
-    var touched = original;
-    touched.ctime_ns += 1;
-    const touched_hash = try eventFileStatFingerprint(touched, 4096);
-    try std.testing.expect(!std.mem.eql(u8, &original_hash, &touched_hash));
-
-    var hard_linked = original;
-    hard_linked.link_count = 2;
-    try std.testing.expectError(error.InvalidEventFileStat, eventFileStatFingerprint(hard_linked, 4096));
-
-    var wrong_size = original;
-    wrong_size.size += 1;
-    try std.testing.expectError(error.InvalidEventFileStat, eventFileStatFingerprint(wrong_size, 4096));
 }
 
 test "checkpoint validation rejects stale corrupt and non-semantic boundaries" {
@@ -796,25 +714,11 @@ test "checkpoint validation rejects stale corrupt and non-semantic boundaries" {
     );
 }
 
-test "manifest stat comparison marks projections stale without changing canonical time" {
-    var manifest = testManifest();
-    const stat = EventFileStat{
-        .device = 1,
-        .inode = 2,
-        .kind = .regular,
-        .mode = 0o100600,
-        .link_count = 1,
-        .size = manifest.event_log_bytes,
-        .mtime_ns = 10,
-        .ctime_ns = 20,
-    };
-    manifest.event_log_stat_fingerprint = try eventFileStatFingerprint(stat, manifest.event_log_bytes);
-    try std.testing.expect(!isManifestStale(manifest, stat));
-
-    var touched = stat;
-    touched.mtime_ns += 1;
-    try std.testing.expect(isManifestStale(manifest, touched));
-    try std.testing.expectEqual(@as(i64, 200), manifest.updated_at_ms);
+test "manifest staleness follows the committed log size" {
+    const manifest = testManifest();
+    try std.testing.expect(!isManifestStale(manifest, manifest.event_log_bytes));
+    try std.testing.expect(isManifestStale(manifest, manifest.event_log_bytes + 1));
+    try std.testing.expect(isManifestStale(manifest, manifest.event_log_bytes - 1));
 }
 
 fn testManifest() Manifest {
@@ -832,7 +736,7 @@ fn testManifest() Manifest {
         .total_output_tokens = 20,
         .last_event_seq = 9,
         .event_log_bytes = 4096,
-        .event_log_stat_fingerprint = [_]u8{0x55} ** 32,
+        .event_log_stat_fingerprint = @as([32]u8, @splat(0x55)),
         .generation_base_seq = 1,
         .generation_base_bytes = 512,
         .checkpoint_seq = null,

@@ -155,6 +155,9 @@ fn postCommitResolutionError(
             .retired_skill_match_fuzzy => return error.InvalidSettingsFormat,
             .invalid_context_limits => return error.InvalidSettingsFormat,
             .invalid_additional_directories => return error.InvalidSettingsFormat,
+            .invalid_skill_symlink_authorities,
+            .invalid_ultrafast_mode_override,
+            => return error.InvalidSettingsFormat,
             .ignored_project_user_only_setting,
             .legacy_workspace_preferences,
             .manual_backup_available,
@@ -178,6 +181,7 @@ fn appendShadowedUserSources(
     try appendShadowedUserSource(writer, "permission_mode", patch.permission_mode != null, sources.permission_mode, &wrote_header);
     try appendShadowedUserSource(writer, "effort", patch.effort != null, sources.effort, &wrote_header);
     try appendShadowedUserSource(writer, "fast_mode", patch.fast_mode != null, sources.fast_mode, &wrote_header);
+    try appendShadowedUserSource(writer, "ultrafast_mode", patch.ultrafast_mode != null, sources.ultrafast_mode, &wrote_header);
     try appendShadowedUserSource(writer, "startup_scrollback", patch.startup_scrollback != null, sources.startup_scrollback, &wrote_header);
     try appendShadowedUserSource(writer, "prompt_history", patch.prompt_history_enabled != null, sources.prompt_history_enabled, &wrote_header);
     if (patch.statusline_item) |item| {
@@ -298,8 +302,9 @@ pub fn Commands(comptime App: type) type {
                 .permission_mode = app.permission_engine.mode,
                 .workspace_root = app.workspace_root,
                 .history_turns = app.session.historyLen(),
-                .session_permission_grants = app.permission_engine.grants.items.len,
+                .session_permission_grants = permissions.liveSessionGrantCount(app.permission_engine.grants.items),
                 .agent_step_limit = app.agent_step_limit,
+                .ultrafast_requested = app.worker.agent_turn_settings.ultrafast_mode,
             }).renderInteractiveBody(app.alloc);
             defer app.alloc.free(text);
             try app.writeDomainNotice(.{ .topic = "status", .tone = .neutral, .body = text }, true);
@@ -534,8 +539,7 @@ pub fn Commands(comptime App: type) type {
                 target.pattern,
                 .allow,
             ) catch |err| {
-                const notice_rule_write_fail = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice_rule_write_fail = try app.alloc.print(
                     "failed to add rule to settings (scope={s}, error={s})",
                     .{ @tagName(permission_scope), @errorName(err) },
                 );
@@ -575,8 +579,7 @@ pub fn Commands(comptime App: type) type {
                 target.category,
                 target.pattern,
             ) catch |err| {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "failed to remove rule from settings (scope={s}, error={s})",
                     .{ @tagName(permission_scope), @errorName(err) },
                 );
@@ -620,8 +623,7 @@ pub fn Commands(comptime App: type) type {
                 permissionWorkspaceRoot(app, permission_scope),
                 reset_scope,
             ) catch |err| {
-                const notice_reset_fail = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice_reset_fail = try app.alloc.print(
                     "failed to reset rules in settings (scope={s}, error={s})",
                     .{ @tagName(permission_scope), @errorName(err) },
                 );
@@ -641,8 +643,7 @@ pub fn Commands(comptime App: type) type {
             };
 
             var detailed = loadDetailedSettingsForNotice(app) catch |err| {
-                const msg = try std.fmt.allocPrint(
-                    app.alloc,
+                const msg = try app.alloc.print(
                     "reset {s}: removed {d} rule{s} (scope={s}); saved but effective source unknown and runtime reload failed ({s})",
                     .{
                         allowlistResetScopeLabel(reset_scope),
@@ -658,8 +659,7 @@ pub fn Commands(comptime App: type) type {
             };
             defer detailed.deinit(app.alloc);
             if (postCommitResolutionError(detailed)) |err| {
-                const msg = try std.fmt.allocPrint(
-                    app.alloc,
+                const msg = try app.alloc.print(
                     "reset {s}: removed {d} rule{s} (scope={s}); saved but effective source unknown and runtime reload failed ({s})",
                     .{
                         allowlistResetScopeLabel(reset_scope),
@@ -676,8 +676,7 @@ pub fn Commands(comptime App: type) type {
             replaceEffectivePermissionRules(app, &detailed);
 
             const shadow = permissionShadowLabel(detailed.permission_sources, permission_scope);
-            const msg = try std.fmt.allocPrint(
-                app.alloc,
+            const msg = try app.alloc.print(
                 "reset {s}: removed {d} rule{s} (scope={s}){s}{s}",
                 .{
                     allowlistResetScopeLabel(reset_scope),
@@ -694,6 +693,35 @@ pub fn Commands(comptime App: type) type {
 
         pub fn toggleFast(app: *App) !void {
             try toggleFastForModel(app, provider_runtime.model(app), true);
+        }
+
+        pub fn handleUltrafast(app: *App, rest: []const u8) !void {
+            const command = std.mem.trim(u8, rest, " \t");
+            if (command.len == 0 or std.ascii.eqlIgnoreCase(command, "status")) {
+                try writeUltrafastStatus(app);
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(command, "on")) {
+                try applyUltrafastMode(app, true, true, true);
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(command, "off")) {
+                try applyUltrafastMode(app, false, true, true);
+                return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .@"error",
+                .body = "usage: /ultrafast [on|off|status]",
+            }, true);
+        }
+
+        fn writeUltrafastStatus(app: *App) !void {
+            try app.writeDomainNotice(.{
+                .topic = "ultrafast",
+                .tone = .neutral,
+                .body = if (app.worker.agent_turn_settings.ultrafast_mode) "requested: on" else "requested: off",
+            }, true);
         }
 
         fn toggleFastForModel(app: *App, model: []const u8, announce: bool) !void {
@@ -718,14 +746,26 @@ pub fn Commands(comptime App: type) type {
 
         fn applyFastMode(app: *App, enabled: bool, announce: bool, persist: bool) !void {
             const previous = app.fast_mode;
+            const previous_ultrafast = app.worker.agent_turn_settings.ultrafast_mode;
             app.fast_mode = enabled;
+            if (enabled) {
+                app.worker.agent_turn_settings.ultrafast_mode = false;
+                if (comptime @hasField(App, "session_persistence")) {
+                    app.session_persistence.process_ultrafast_override = false;
+                }
+            }
             app.worker.syncQueuedPromptFastMode(app.fast_mode);
+            if (previous_ultrafast != app.worker.agent_turn_settings.ultrafast_mode) {
+                app.worker.syncQueuedPromptUltrafastMode(app.worker.agent_turn_settings.ultrafast_mode);
+            }
             debug_trace.logf(
                 "session",
-                "fast mode changed old={s} new={s} model={s} supports_fast={s}",
+                "fast mode changed old={s} new={s} ultrafast_old={s} ultrafast_new={s} model={s} supports_fast={s}",
                 .{
                     if (previous) "true" else "false",
                     if (app.fast_mode) "true" else "false",
+                    if (previous_ultrafast) "true" else "false",
+                    if (app.worker.agent_turn_settings.ultrafast_mode) "true" else "false",
                     provider_runtime.model(app),
                     if (model_capabilities.resolveForApp(App, app, provider_runtime.model(app)).supports_fast_mode) "true" else "false",
                 },
@@ -738,6 +778,7 @@ pub fn Commands(comptime App: type) type {
                         .provider = provider_runtime.provider(app),
                         .model = provider_runtime.model(app),
                         .fast_mode = app.fast_mode,
+                        .ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode,
                     },
                     "fast",
                     !announce,
@@ -747,6 +788,67 @@ pub fn Commands(comptime App: type) type {
             if (announce) {
                 const label = if (app.fast_mode) "on" else "off";
                 try app.writeDomainNotice(.{ .topic = "fast", .tone = .neutral, .body = label }, true);
+                if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
+            }
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn applyUltrafastMode(app: *App, enabled: bool, announce: bool, persist: bool) !void {
+            const capabilities = model_capabilities.resolveForApp(App, app, provider_runtime.model(app));
+            if (enabled and !capabilities.supports_ultrafast_mode) {
+                if (announce) {
+                    try app.writeDomainNotice(.{
+                        .topic = "ultrafast",
+                        .tone = .warning,
+                        .body = "Ultra mode is unavailable for this model and may increase cost.",
+                    }, true);
+                }
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+
+            const previous_ultrafast = app.worker.agent_turn_settings.ultrafast_mode;
+            const previous_fast = app.fast_mode;
+            app.worker.agent_turn_settings.ultrafast_mode = enabled;
+            if (comptime @hasField(App, "session_persistence")) {
+                app.session_persistence.process_ultrafast_override = enabled;
+            }
+            if (enabled) app.fast_mode = false;
+            app.worker.syncQueuedPromptUltrafastMode(app.worker.agent_turn_settings.ultrafast_mode);
+            if (previous_fast != app.fast_mode) app.worker.syncQueuedPromptFastMode(app.fast_mode);
+            debug_trace.logf(
+                "session",
+                "ultrafast mode changed old={s} new={s} fast_old={s} fast_new={s} model={s} supports_ultrafast={s}",
+                .{
+                    if (previous_ultrafast) "true" else "false",
+                    if (app.worker.agent_turn_settings.ultrafast_mode) "true" else "false",
+                    if (previous_fast) "true" else "false",
+                    if (app.fast_mode) "true" else "false",
+                    provider_runtime.model(app),
+                    if (capabilities.supports_ultrafast_mode) "true" else "false",
+                },
+            );
+
+            if (persist) {
+                try persistPreferenceTargets(
+                    app,
+                    .{
+                        .provider = provider_runtime.provider(app),
+                        .model = provider_runtime.model(app),
+                        .fast_mode = app.fast_mode,
+                        .ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode,
+                    },
+                    "ultrafast",
+                    !announce,
+                );
+            }
+
+            if (announce) {
+                try app.writeDomainNotice(.{
+                    .topic = "ultrafast",
+                    .tone = .neutral,
+                    .body = if (app.worker.agent_turn_settings.ultrafast_mode) "requested on" else "requested off",
+                }, true);
                 if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
             }
             app.shell.render_requests.request(.footer);
@@ -775,8 +877,14 @@ pub fn Commands(comptime App: type) type {
             try applyEffort(app, effort, false, true);
         }
 
-        pub fn selectModelFromPicker(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) !void {
-            try setResolvedModelRuntime(app, model, true);
+        pub fn selectModelFromPicker(
+            app: *App,
+            model: []const u8,
+            effort: types.ReasoningEffort,
+            fast_mode: bool,
+            ultrafast_mode: bool,
+        ) !void {
+            try setResolvedModelRuntime(app, model);
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.provider(app),
                 .model = model,
@@ -786,11 +894,17 @@ pub fn Commands(comptime App: type) type {
                 try applyEffort(app, effort, false, false);
                 patch.effort = effort;
             }
-            const selected_fast_mode = capabilities.supports_fast_mode and fast_mode;
+            const selected_ultrafast_mode = capabilities.supports_ultrafast_mode and ultrafast_mode;
+            const selected_fast_mode = capabilities.supports_fast_mode and fast_mode and !selected_ultrafast_mode;
             if (selected_fast_mode != app.fast_mode) {
                 try applyFastMode(app, selected_fast_mode, false, false);
             }
-            patch.fast_mode = selected_fast_mode;
+            if (selected_ultrafast_mode != app.worker.agent_turn_settings.ultrafast_mode) {
+                try applyUltrafastMode(app, selected_ultrafast_mode, false, false);
+            }
+            patch.fast_mode = app.fast_mode;
+            patch.ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode;
+            try announceModelSelection(app);
             try persistPreferenceTargets(app, patch, "model picker", false);
         }
 
@@ -827,8 +941,7 @@ pub fn Commands(comptime App: type) type {
             target: AllowlistTarget,
         ) !void {
             var detailed = loadDetailedSettingsForNotice(app) catch |err| {
-                const detail = try std.fmt.allocPrint(
-                    app.alloc,
+                const detail = try app.alloc.print(
                     "saved but effective source unknown and runtime reload failed ({s})",
                     .{@errorName(err)},
                 );
@@ -840,8 +953,7 @@ pub fn Commands(comptime App: type) type {
             };
             defer detailed.deinit(app.alloc);
             if (postCommitResolutionError(detailed)) |err| {
-                const detail = try std.fmt.allocPrint(
-                    app.alloc,
+                const detail = try app.alloc.print(
                     "saved but effective source unknown and runtime reload failed ({s})",
                     .{@errorName(err)},
                 );
@@ -855,7 +967,7 @@ pub fn Commands(comptime App: type) type {
 
             const shadow = permissionShadowLabel(detailed.permission_sources, permission_scope);
             const detail = if (shadow.len > 0)
-                try std.fmt.allocPrint(app.alloc, "user rules shadowed by {s}", .{shadow})
+                try app.alloc.print("user rules shadowed by {s}", .{shadow})
             else
                 try app.alloc.dupe(u8, "");
             defer app.alloc.free(detail);
@@ -927,7 +1039,7 @@ pub fn Commands(comptime App: type) type {
         fn writePermissionsStatus(app: *App) !void {
             const status = try app.permission_engine.formatPermissionsNoticeBody(app.alloc, app.workspace_root);
             defer app.alloc.free(status);
-            const notice = try std.fmt.allocPrint(app.alloc, "{s}\n{s}", .{ status, permissions_usage });
+            const notice = try app.alloc.print("{s}\n{s}", .{ status, permissions_usage });
             defer app.alloc.free(notice);
             try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = notice }, true);
         }
@@ -941,7 +1053,7 @@ pub fn Commands(comptime App: type) type {
             const settings = &detailed.settings;
 
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
-            const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
+            const msg = try app.alloc.print("model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
                 provider_runtime.model(app),
                 @tagName(detailed.sources.models.get(model_provider.NameKey.fromProvider(.gateway))),
                 permissions.permissionModeDisplayLabel(app.permission_engine.mode),
@@ -1015,7 +1127,7 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn writeSettingsLoadError(app: *App, err: anyerror) !void {
-            const msg = try std.fmt.allocPrint(app.alloc, "Failed to load settings: {s}", .{@errorName(err)});
+            const msg = try app.alloc.print("Failed to load settings: {s}", .{@errorName(err)});
             defer app.alloc.free(msg);
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .@"error", .body = msg }, true);
         }
@@ -1047,16 +1159,21 @@ pub fn Commands(comptime App: type) type {
 
         fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
             const model_changed = !std.mem.eql(u8, provider_runtime.model(app), resolved);
-            try setResolvedModelRuntime(app, resolved, announce);
+            try setResolvedModelRuntime(app, resolved);
             if (model_changed and app.fast_mode) {
                 try applyFastMode(app, false, false, false);
             }
+            if (model_changed and app.worker.agent_turn_settings.ultrafast_mode) {
+                try applyUltrafastMode(app, false, false, false);
+            }
+            if (announce) try announceModelSelection(app);
             try persistPreferenceTargets(
                 app,
                 .{
                     .provider = provider_runtime.provider(app),
                     .model = resolved,
                     .fast_mode = app.fast_mode,
+                    .ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode,
                 },
                 "model",
                 !announce,
@@ -1128,7 +1245,7 @@ pub fn Commands(comptime App: type) type {
             }
         }
 
-        fn setResolvedModelRuntime(app: *App, resolved: []const u8, announce: bool) !void {
+        fn setResolvedModelRuntime(app: *App, resolved: []const u8) !void {
             if (!std.mem.eql(u8, provider_runtime.model(app), resolved)) {
                 try provider_runtime.replaceModel(app, resolved);
             }
@@ -1136,18 +1253,22 @@ pub fn Commands(comptime App: type) type {
             try app.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
             if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(selected);
             app_session_runtime.Runtime(App).syncTerminalTitle(app);
+        }
 
-            if (announce) {
-                const active_response = if (comptime @hasField(App, "stream"))
-                    app.stream.active
-                else
-                    false;
-                const prefix: []const u8 = if (active_response) "Next turn will use " else "Switched to ";
-                const line = try std.fmt.allocPrint(app.alloc, "{s}{s}", .{ prefix, selected });
-                defer app.alloc.free(line);
-                try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
-                if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
-            }
+        fn announceModelSelection(app: *App) !void {
+            const selected = provider_runtime.model(app);
+            const active_response = if (comptime @hasField(App, "stream")) app.stream.active else false;
+            const prefix: []const u8 = if (active_response) "Next turn will use " else "Switched to ";
+            const speed: []const u8 = if (app.worker.agent_turn_settings.ultrafast_mode)
+                "ultrafast"
+            else if (app.fast_mode or model_capabilities.resolveForApp(App, app, selected).intrinsic_fast)
+                "fast"
+            else
+                "normal";
+            const line = try app.alloc.print("{s}{s} (effort: {s}, speed: {s})", .{ prefix, selected, app.effort.displayLabel(), speed });
+            defer app.alloc.free(line);
+            try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
+            if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
         }
 
         fn resolveModelQueryFromIds(alloc: std.mem.Allocator, ids: []const []u8, query: []const u8) !?[]u8 {
@@ -1575,6 +1696,11 @@ const FakeWorker = struct {
     synced_model_alloc: ?std.mem.Allocator = null,
     synced_fast_mode: ?bool = null,
     fast_sync_count: usize = 0,
+    agent_turn_settings: struct {
+        ultrafast_mode: bool = false,
+    } = .{},
+    synced_ultrafast_mode: ?bool = null,
+    ultrafast_sync_count: usize = 0,
     synced_effort: ?types.ReasoningEffort = null,
     effort_sync_count: usize = 0,
 
@@ -1606,6 +1732,11 @@ const FakeWorker = struct {
     fn syncQueuedPromptFastMode(self: *FakeWorker, enabled: bool) void {
         self.synced_fast_mode = enabled;
         self.fast_sync_count += 1;
+    }
+
+    fn syncQueuedPromptUltrafastMode(self: *FakeWorker, enabled: bool) void {
+        self.synced_ultrafast_mode = enabled;
+        self.ultrafast_sync_count += 1;
     }
 
     fn syncQueuedPromptEffort(self: *FakeWorker, effort: types.ReasoningEffort) void {
@@ -1678,6 +1809,7 @@ const FakeApp = struct {
     last_preference_provider: ?model_provider.ProviderId = null,
     last_preference_effort: ?types.ReasoningEffort = null,
     last_preference_fast_mode: ?bool = null,
+    last_preference_ultrafast_mode: ?bool = null,
     preference_settings_error: ?anyerror = null,
     preference_session_error: ?anyerror = null,
     preference_failure_cleanup: config_runtime.LegacyCleanup = .{},
@@ -1716,13 +1848,13 @@ const FakeApp = struct {
         self.semantic_write_count += 1;
         self.last_tone = notice.tone;
         const rendered = if (notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}\n", .{
+            try self.alloc.print("{s} {s}: {s}\n", .{
                 types.noticeGlyph(notice.tone),
                 notice.topic,
                 notice.body,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}\n", .{ types.noticeGlyph(notice.tone), notice.body });
+            try self.alloc.print("{s} {s}\n", .{ types.noticeGlyph(notice.tone), notice.body });
         defer self.alloc.free(rendered);
         try self.transcript.appendSlice(self.alloc, rendered);
     }
@@ -1804,7 +1936,7 @@ const FakeApp = struct {
         return makeStringList(self.alloc, self.fetch_ids);
     }
 
-    fn loadDetailedSettingsForNotice(self: *FakeApp) !config_runtime.DetailedSettings {
+    pub fn loadDetailedSettingsForNotice(self: *FakeApp) !config_runtime.DetailedSettings {
         self.post_commit_resolution_count += 1;
         if (self.post_commit_resolution_error) |err| return err;
         if (self.post_commit_resolution_diagnostic) |cause| {
@@ -1818,7 +1950,7 @@ const FakeApp = struct {
         return config_runtime.loadMergedSettingsDetailed(self.alloc, self.workspace_root);
     }
 
-    fn persistRuntimePreferences(
+    pub fn persistRuntimePreferences(
         self: *FakeApp,
         patch: app_session_runtime.SessionPreferencePatch,
     ) app_session_runtime.PreferenceCommitResult {
@@ -1831,6 +1963,7 @@ const FakeApp = struct {
         }
         self.last_preference_effort = patch.effort;
         self.last_preference_fast_mode = patch.fast_mode;
+        self.last_preference_ultrafast_mode = patch.ultrafast_mode;
         if (self.preference_settings_error == null) {
             const attempt = config_runtime.attemptUserPreferences(
                 self.alloc,
@@ -2658,6 +2791,17 @@ test "session_commands handleAllowlist recognizes tools from the active registry
     try std.testing.expect(parseAllowlistTarget(.{}, "tool memory") == null);
 }
 
+test "session_commands rejects invalid ultrafast payloads without changing the requested state" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleUltrafast(&app, "status on");
+
+    try std.testing.expect(!app.worker.agent_turn_settings.ultrafast_mode);
+    try expectTranscriptContains(&app, "usage: /ultrafast [on|off|status]");
+}
+
 test "session_commands toggleFast reports unsupported model and redraws footer" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
@@ -2739,7 +2883,7 @@ test "session_commands selectModelFromPicker skips effort changes for models wit
     defer app.deinit();
     app.effort = types.ReasoningEffort.literal("high");
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), true, false);
 
     try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
     try std.testing.expectEqualStrings("openai/gpt-4o", app.worker.synced_model.?);
@@ -2758,6 +2902,7 @@ test "session_commands model picker accepts the current selected model slice" {
         &app,
         app.selected_model.items,
         types.ReasoningEffort.literal("high"),
+        false,
         false,
     );
 
@@ -2779,7 +2924,7 @@ test "session_commands selectModelFromPicker persists portable Gateway reasoning
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("low")};
     app.setGatewayControls("provider/new-reasoning-model", &efforts, false);
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "provider/new-reasoning-model", types.ReasoningEffort.literal("low"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, "provider/new-reasoning-model", types.ReasoningEffort.literal("low"), true, false);
 
     try std.testing.expectEqualStrings("provider/new-reasoning-model", app.selected_model.items);
     try std.testing.expectEqualStrings("provider/new-reasoning-model", app.worker.synced_model.?);
@@ -2805,6 +2950,7 @@ test "session_commands model selection clears fast mode when the selected model 
         "zai/glm-5.3",
         types.ReasoningEffort.literal("max"),
         true,
+        false,
     );
 
     try std.testing.expectEqualStrings("zai/glm-5.3", app.selected_model.items);
@@ -2832,7 +2978,7 @@ test "session_commands selectModelFromPicker syncs queued fast mode and effort f
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
     app.setGatewayControls("anthropic/claude-opus-4.6", &efforts, true);
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true, false);
 
     try std.testing.expect(app.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
@@ -2849,12 +2995,37 @@ test "session_commands model picker follows mock catalog controls independent of
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
     app.setGatewayControls("provider/model", &efforts, true);
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "provider/model", types.ReasoningEffort.literal("future-tier"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, "provider/model", types.ReasoningEffort.literal("future-tier"), true, false);
 
     try std.testing.expect(app.fast_mode);
     try std.testing.expectEqualStrings("future-tier", app.effort.label());
     try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
     try std.testing.expectEqualStrings("future-tier", app.worker.synced_effort.?.label());
+}
+
+test "model switch notice reports the final chosen effort and Ultrafast speed" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-6-astra");
+    defer app.deinit();
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("xhigh")};
+    app.setGatewayControls("openai/gpt-6-astra", &efforts, true);
+    app.gateway_metadata.supports_ultrafast_mode = true;
+    try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-6-astra", types.ReasoningEffort.literal("xhigh"), false, true);
+    try expectTranscriptContains(&app, "Switched to openai/gpt-6-astra (effort: xhigh, speed: ultrafast)");
+    try std.testing.expect(std.mem.find(u8, app.text(), "effort: default") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.text(), "Switched to "));
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+}
+
+test "plain model switch notice does not report the previous model's speed" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
+    defer app.deinit();
+    app.worker.agent_turn_settings.ultrafast_mode = true;
+    app.fail_fetch = true;
+    try Commands(FakeApp).handleModel(&app, "openai/gpt-6-astra");
+    try expectTranscriptContains(&app, "Switched to openai/gpt-6-astra (effort: default, speed: normal)");
+    try std.testing.expect(!app.worker.agent_turn_settings.ultrafast_mode);
 }
 
 test "session_commands model picker emits one combined preference transaction" {
@@ -2874,6 +3045,7 @@ test "session_commands model picker emits one combined preference transaction" {
         "anthropic/claude-opus-4.7",
         types.ReasoningEffort.literal("high"),
         true,
+        false,
     );
 
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
@@ -2899,8 +3071,7 @@ test "session_commands user save notice uses one post-commit load after legacy c
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"model\":\"user/old\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
         .{workspace_root},
     );
@@ -2933,8 +3104,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
         .{workspace_root},
     );
@@ -3118,7 +3288,7 @@ test "session_commands model controls remain catalog validated and clear unsuppo
     app.fast_mode = true;
     app.worker.synced_fast_mode = true;
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), false);
+    try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), false, false);
 
     try std.testing.expect(!app.fast_mode);
     try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
@@ -3138,7 +3308,7 @@ test "session_commands model controls remain catalog validated and clear unsuppo
         .supports_fast_mode = true,
     };
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true, false);
 
     try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
     try std.testing.expectEqual(@as(usize, 2), app.worker.fast_sync_count);

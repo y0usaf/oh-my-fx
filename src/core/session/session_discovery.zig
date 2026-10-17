@@ -8,6 +8,7 @@ const session_child_store = @import("session_child_store.zig");
 const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
+const migration = @import("session_migration.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_replay = @import("session_replay.zig");
@@ -19,7 +20,7 @@ const types = @import("session_store_types.zig");
 
 const classifyAuthority = authority.classifyAuthority;
 const entryExistsRelative = authority.entryExistsRelative;
-const eventFileStat = authority.eventFileStat;
+const eventLogSize = authority.eventLogSize;
 const loadAuthorityMarkerOptional = authority.loadAuthorityMarkerOptional;
 const manifestSchemaVersion = authority.manifestSchemaVersion;
 const openSessionFile = authority.openSessionFile;
@@ -64,21 +65,6 @@ pub const ReadOnlyCandidate = struct {
 
     pub fn deinit(self: *ReadOnlyCandidate, alloc: Allocator) void {
         self.summary.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const WritableCandidate = struct {
-    id: []u8,
-    workspace_root: []u8,
-    updated_at_ms: i64,
-    storage: CandidateStorage,
-    projection_state: ProjectionState,
-    subagent_child: ?bool = null,
-
-    pub fn deinit(self: *WritableCandidate, alloc: Allocator) void {
-        alloc.free(self.id);
-        alloc.free(self.workspace_root);
         self.* = undefined;
     }
 };
@@ -212,7 +198,27 @@ pub fn inspectDoctorSession(
         );
         return;
     };
+    const stale_schema_v3 = candidate.storage == .schema_v3 and candidate.projection_state == .stale;
     candidate.deinit(alloc);
+    // A stale schema-v3 session resumes from its committed log, so a log that
+    // cannot be replayed leaves the session unreadable even though its
+    // manifest is valid; latest resume skips it for the same reason.
+    if (stale_schema_v3) {
+        if (migration.loadSchemaV3ReadOnly(alloc, session_dir, session_id)) |value| {
+            var replay = value;
+            replay.deinit(alloc);
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try appendDoctorDiagnostic(
+                diagnostics,
+                alloc,
+                session_id,
+                if (err == error.SessionPathUnsafe) .unsafe_path else .canonical_state_invalid,
+                null,
+            );
+            return;
+        }
+    }
     try inspectDoctorManagedChildren(
         ctx,
         alloc,
@@ -392,89 +398,10 @@ fn classifyConversationCandidate(
     };
 }
 
-/// Reads only the facts needed for writable latest selection. Caller owns the candidate.
-pub fn writable_conversation_candidate(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-    metadata: session_codec.SessionMetadata,
-    workspace_root: []const u8,
-) !WritableCandidate {
-    if (!std.mem.eql(u8, metadata.id, session_id)) return error.InvalidSessionFormat;
-    var updated_at_ms = metadata.updated_at_ms;
-    if (std.mem.eql(u8, metadata.workspace_root, workspace_root)) {
-        const path_stat = try session_dir.dir.statFile(io_mod.getIo(), "events.jsonl", .{ .follow_symlinks = false });
-        if (path_stat.kind != .file or path_stat.nlink != 1) return error.SessionPathUnsafe;
-        var file = try openSessionFile(session_dir, "events.jsonl", .read_only);
-        defer file.close(io_mod.getIo());
-        const stat = try file.stat(io_mod.getIo());
-        var offset: u64 = 0;
-        var buffer: [8192]u8 = undefined;
-        var reader = file.reader(io_mod.getIo(), &buffer);
-        while (offset < stat.size) {
-            const line = session_replay.readBufferedLine(alloc, &reader, stat.size, null) catch |err| switch (err) {
-                error.TruncatedEventFrame => break,
-                else => return err,
-            } orelse break;
-            defer alloc.free(line.bytes);
-            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
-            defer decoded.deinit();
-            switch (decoded.value.event) {
-                .turn_completed, .interrupted, .context_checkpoint => {
-                    updated_at_ms = @max(updated_at_ms, std.math.cast(
-                        i64,
-                        @divFloor(stat.mtime.nanoseconds, std.time.ns_per_ms),
-                    ) orelse std.math.maxInt(i64));
-                    break;
-                },
-                else => {},
-            }
-            offset = line.next_offset;
-        }
-    }
-    var candidate = try dupeWritableCandidate(alloc, metadata.id, metadata.workspace_root, updated_at_ms, .conversation, .current);
-    candidate.subagent_child = metadata.subagent_child;
-    return candidate;
-}
-
-/// Identifies a fenced candidate without recovering it. Caller owns the candidate.
-pub fn fenced_legacy_writable_candidate(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-    fallback_workspace: []const u8,
-) !WritableCandidate {
-    const name: []const u8 = if (try entryExistsRelative(session_dir, "session.legacy.json"))
-        "session.legacy.json"
-    else if (try entryExistsRelative(session_dir, "session.json"))
-        "session.json"
-    else
-        return error.SessionAuthorityBoundaryUnavailable;
-    const path_stat = try session_dir.dir.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false });
-    if (path_stat.kind != .file or path_stat.nlink != 1) return error.SessionPathUnsafe;
-    var file = try openSessionFile(session_dir, name, .read_only);
-    defer file.close(io_mod.getIo());
-    const stat = try file.stat(io_mod.getIo());
-    if (stat.size > automatic_legacy_max_bytes) return error.LegacySessionTooLarge;
-    var buffer: [16 * 1024]u8 = undefined;
-    var reader = file.readerStreaming(io_mod.getIo(), &buffer);
-    var summary = try readLegacySummary(alloc, &reader.interface, null);
-    defer summary.deinit(alloc);
-    if (!std.mem.eql(u8, summary.id, session_id)) return error.InvalidSessionFormat;
-    return dupeWritableCandidate(
-        alloc,
-        summary.id,
-        summary.workspace_root orelse fallback_workspace,
-        summary.updated_at_ms,
-        candidateStorageForLegacy(summary.schema_version),
-        .stale,
-    );
-}
-
 /// Builds a read-only candidate from a schema-v3 manifest, validating the
 /// authority marker, manifest identity, and projection freshness.
 /// Fails with `error.InvalidSessionFormat` / `error.UnsupportedSessionSchema` on mismatch.
-pub fn classifySchemaV3Candidate(
+fn classifySchemaV3Candidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
@@ -512,10 +439,10 @@ pub fn classifySchemaV3Candidate(
     {
         return error.InvalidSessionFormat;
     }
-    const current_stat = try eventFileStat(session_dir, "events.jsonl");
+    const event_log_size = try eventLogSize(session_dir, "events.jsonl");
     const projection_state: ProjectionState = if (session_projection.isManifestStale(
         manifest,
-        current_stat,
+        event_log_size,
     )) .stale else .current;
     try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
 
@@ -551,26 +478,163 @@ pub fn classifySchemaV3Candidate(
     };
 }
 
-/// Builds a read-only candidate from a legacy `session.json` snapshot via a
-/// streaming summary parse. Rejects directories carrying an authority fence.
-pub fn classifyLegacyCandidate(
+/// Listing's recovery of a schema-v3 session whose manifest is missing or
+/// cannot be read: its committed log is the authority, so the summary is
+/// replayed from it, as latest selection always did. Returns null when the
+/// session is not schema-v3, sits behind an interrupted upgrade (the route
+/// classification refuses it), or its log cannot be replayed either, leaving
+/// the caller to report the classification error.
+pub fn recoverSchemaV3Candidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
-) !ReadOnlyCandidate {
-    return classifyLegacyCandidateWithCancellation(alloc, session_dir, session_id, null);
+    cancelled: ?*const std.atomic.Value(bool),
+) !?ReadOnlyCandidate {
+    if (try session_log.hasConversationMetadata(alloc, session_dir)) return null;
+    const route = classifyAuthority(alloc, session_dir, session_id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (route != .schema_v3) return null;
+
+    var candidate: ReadOnlyCandidate = candidate: {
+        const id = try alloc.dupe(u8, session_id);
+        errdefer mem_utils.free(alloc, id);
+        var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
+        if (display.origin_workspace_root) |root| {
+            alloc.free(root);
+            display.origin_workspace_root = null;
+        }
+        break :candidate .{
+            .summary = .{
+                .id = id,
+                .title = display.title,
+                .preview = display.preview,
+                .display_metadata_present = display.present,
+                .created_at_ms = 0,
+                .updated_at_ms = 0,
+                .conversation_language = .default(),
+                .history_len = 0,
+            },
+            .storage = .schema_v3,
+            .projection_state = .stale,
+        };
+    };
+    errdefer candidate.deinit(alloc);
+    if (!try replayCommittedLog(alloc, session_dir, &candidate, cancelled)) {
+        candidate.deinit(alloc);
+        return null;
+    }
+    debug_trace.logf("session", "schema_v3 manifest unreadable id={s}; listed from the committed log", .{session_id});
+    return candidate;
 }
 
+/// Listing's summary of a stale schema-v3 projection: a stale manifest carries
+/// the wrong workspace and recency, so the summary is replaced by one replayed
+/// from the committed log, and the child identity comes from its first event.
+/// If the replay fails the stale summary stays listed: exact opens report the
+/// failure, and latest resume skips the session. Exact opens replay the log
+/// themselves, so only listing calls this.
+pub fn summarizeStaleProjection(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    candidate: *ReadOnlyCandidate,
+    cancelled: ?*const std.atomic.Value(bool),
+) !void {
+    if (candidate.storage != .schema_v3 or candidate.projection_state != .stale) return;
+    _ = try replayCommittedLog(alloc, session_dir, candidate, cancelled);
+}
+
+/// Replaces the log-derived fields of a schema-v3 candidate with a replay of
+/// its committed log and marks it replayed. Returns false, leaving the
+/// candidate unchanged, when the log cannot be replayed.
+fn replayCommittedLog(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    candidate: *ReadOnlyCandidate,
+    cancelled: ?*const std.atomic.Value(bool),
+) !bool {
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    var replay = migration.loadSchemaV3ReadOnly(alloc, session_dir, candidate.summary.id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "schema_v3 log replay failed id={s} err={s}", .{ candidate.summary.id, @errorName(err) });
+            return false;
+        },
+    };
+    defer replay.deinit(alloc);
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    const state = &replay.state;
+    const origin_workspace_root = try alloc.dupe(u8, state.origin_workspace_root);
+    errdefer alloc.free(origin_workspace_root);
+    const workspace_root = try alloc.dupe(u8, state.workspace_root);
+
+    const summary = &candidate.summary;
+    if (summary.origin_workspace_root) |root| alloc.free(root);
+    if (summary.workspace_root) |root| alloc.free(root);
+    summary.origin_workspace_root = origin_workspace_root;
+    summary.workspace_root = workspace_root;
+    summary.created_at_ms = state.created_at_ms;
+    summary.updated_at_ms = state.updated_at_ms;
+    summary.conversation_language = state.conversation_language;
+    summary.history_len = state.history.len;
+    candidate.projection_state = .replayed;
+    candidate.subagent_child = state.subagent_child;
+    return true;
+}
+
+/// Builds a read-only candidate from a legacy `session.json` snapshot via a
+/// streaming summary parse. Rejects directories carrying an authority fence.
 fn classifyLegacyCandidateWithCancellation(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
     cancelled: ?*const std.atomic.Value(bool),
 ) !ReadOnlyCandidate {
+    return classifyLegacySnapshot(alloc, session_dir, session_id, "session.json", .must_be_absent, cancelled);
+}
+
+/// Summarizes a legacy session whose upgrade was interrupted, from its stable
+/// snapshot, without recovering it. Listing uses this so the session stays
+/// reachable; resuming it runs the canonical recovery or reports the boundary.
+/// Caller owns the candidate.
+pub fn classifyFencedLegacyCandidate(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
+    if (!try entryExistsRelative(session_dir, "authority.pending.json")) {
+        return error.SessionAuthorityBoundaryUnavailable;
+    }
+    const name: []const u8 = if (try entryExistsRelative(session_dir, "session.legacy.json"))
+        "session.legacy.json"
+    else
+        "session.json";
+    return classifyLegacySnapshot(alloc, session_dir, session_id, name, .pending_allowed, cancelled);
+}
+
+fn classifyLegacySnapshot(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    name: []const u8,
+    fence: enum { must_be_absent, pending_allowed },
+    cancelled: ?*const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
     if (try entryExistsRelative(session_dir, "authority.json")) {
         return error.InvalidSessionFormat;
     }
-    var file = try openSessionFile(session_dir, "session.json", .read_only);
+    // Opening a FIFO or device for reading can block, so the helper checks
+    // the entry and opens it without blocking.
+    var file = io_mod.openExistingRegularFile(session_dir.dir, name, .read_only) catch |err| switch (err) {
+        error.DurablePathUnsafe => return error.SessionPathUnsafe,
+        else => return err,
+    };
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
@@ -582,12 +646,12 @@ fn classifyLegacyCandidateWithCancellation(
     if (!std.mem.eql(u8, legacy.id, session_id)) {
         return error.InvalidSessionFormat;
     }
-    try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
+    if (fence == .must_be_absent) try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
     const storage = candidateStorageForLegacy(legacy.schema_version);
     return .{
         .summary = legacy.intoSessionSummary(),
         .storage = storage,
-        .projection_state = .current,
+        .projection_state = if (fence == .must_be_absent) .current else .stale,
     };
 }
 
@@ -690,28 +754,6 @@ pub fn summaryFromState(
     };
 }
 
-/// Constructs a writable candidate, taking owned copies of the id and
-/// workspace root from caller-provided slices.
-pub fn dupeWritableCandidate(
-    alloc: Allocator,
-    id_source: []const u8,
-    workspace_source: []const u8,
-    updated_at_ms: i64,
-    storage: CandidateStorage,
-    projection_state: ProjectionState,
-) !WritableCandidate {
-    const id = try alloc.dupe(u8, id_source);
-    errdefer mem_utils.free(alloc, id);
-    const workspace_root = try alloc.dupe(u8, workspace_source);
-    return .{
-        .id = id,
-        .workspace_root = workspace_root,
-        .updated_at_ms = updated_at_ms,
-        .storage = storage,
-        .projection_state = projection_state,
-    };
-}
-
 fn candidateStorageForLegacy(
     schema: session_json.LegacySchemaVersion,
 ) CandidateStorage {
@@ -729,18 +771,6 @@ pub fn storageFormatForLegacy(
         .v1 => .legacy_v1,
         .v2 => .legacy_v2,
     };
-}
-
-/// Orders writable candidates: newer `updated_at_ms` wins, ties broken by
-/// descending id. Used to select the most recent writable session.
-pub fn writableCandidateNewer(
-    candidate: WritableCandidate,
-    current: WritableCandidate,
-) bool {
-    if (candidate.updated_at_ms != current.updated_at_ms) {
-        return candidate.updated_at_ms > current.updated_at_ms;
-    }
-    return std.mem.order(u8, candidate.id, current.id) == .gt;
 }
 
 /// Emits one structured discovery trace line. Pure logging; never fails.

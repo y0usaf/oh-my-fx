@@ -5,8 +5,9 @@ const io_mod = @import("io.zig");
 
 /// Long-lived HTTP client wrapper that keeps std's ConnectionPool alive
 /// across requests to one product origin. std already implements acquire,
-/// release, and thread safety; this wrapper owns the three product concerns
-/// std does not: client lifetime, launch warming, and idle staleness.
+/// release, and thread safety; this wrapper owns the product concerns std
+/// does not: client lifetime, launch warming, idle staleness, and a current
+/// certificate-validity clock.
 ///
 /// Ownership: created once per process by the provider runtime, borrowed by
 /// request paths. All methods are safe to call from concurrent request
@@ -15,6 +16,10 @@ const default_ttl_ms: i64 = 30_000;
 
 pub const HttpPool = struct {
     client: std.http.Client,
+    /// std checks server certificates against `client.now` and reads it
+    /// without a lock during TLS setup. Every connection setup on `client`
+    /// holds this shared; advancing the clock holds it exclusively.
+    setup_lock: std.Io.RwLock = .init,
     /// Pooled connections idle longer than this are closed instead of reused.
     /// std's pool has no liveness tracking; a gracefully-idle-closed
     /// connection fails only when the next request reads from it, which lands
@@ -89,12 +94,16 @@ pub const HttpPool = struct {
             };
         }
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = uri.getHost(&host_buf) catch return;
+        const host = std.Io.net.HostName.fromUri(uri, &host_buf) catch return;
         const port: u16 = uri.port orelse defaultPort(protocol);
         const started = io_mod.milliTimestamp();
-        const conn = self.client.connect(host, port, protocol) catch |err| {
-            debug_trace.logf("gateway", "pool_warm result=error err={s}", .{@errorName(err)});
-            return;
+        const conn = conn: {
+            self.setup_lock.lockSharedUncancelable(io);
+            defer self.setup_lock.unlockShared(io);
+            break :conn self.client.connect(host, port, protocol) catch |err| {
+                debug_trace.logf("gateway", "pool_warm result=error err={s}", .{@errorName(err)});
+                return;
+            };
         };
         self.client.connection_pool.release(conn, io);
         self.noteActivity();
@@ -148,6 +157,38 @@ pub const HttpPool = struct {
         return &self.client;
     }
 
+    /// Opens a request on the shared client with a current certificate
+    /// clock. The setup lock is held shared through connection setup; the
+    /// exclusive holder only stores a timestamp, so the wait is bounded.
+    pub fn openRequest(
+        self: *HttpPool,
+        method: std.http.Method,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+    ) std.http.Client.RequestError!std.http.Client.Request {
+        self.refreshTlsClock();
+        const io = self.client.io;
+        self.setup_lock.lockSharedUncancelable(io);
+        defer self.setup_lock.unlockShared(io);
+        return self.client.request(method, uri, options);
+    }
+
+    /// std sets `client.now` once, when the CA bundle first loads, so a
+    /// long-lived process would reject every certificate issued after that
+    /// moment as not yet valid. Skips while another connection setup is
+    /// reading the clock; the next open advances it instead.
+    fn refreshTlsClock(self: *HttpPool) void {
+        const client = &self.client;
+        const io = client.io;
+        if (!self.setup_lock.tryLock(io)) return;
+        defer self.setup_lock.unlock(io);
+        client.ca_bundle_lock.lockUncancelable(io);
+        defer client.ca_bundle_lock.unlock(io);
+        // Unloaded: std's request preamble sets the clock with the bundle.
+        if (client.now == null) return;
+        client.now = std.Io.Clock.real.now(io);
+    }
+
     fn drainIfStale(self: *HttpPool, url: []const u8) void {
         const last = self.last_activity_ms.load(.acquire);
         if (last == 0) return;
@@ -158,7 +199,7 @@ pub const HttpPool = struct {
         const uri = std.Uri.parse(url) catch return;
         const protocol = std.http.Client.Protocol.fromUri(uri) orelse return;
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = uri.getHost(&host_buf) catch return;
+        const host = std.Io.net.HostName.fromUri(uri, &host_buf) catch return;
         const port: u16 = uri.port orelse defaultPort(protocol);
         const criteria: std.http.Client.ConnectionPool.Criteria = .{
             .host = host,
@@ -166,7 +207,14 @@ pub const HttpPool = struct {
             .protocol = protocol,
         };
         var drained: usize = 0;
-        while (self.client.connection_pool.findConnection(io, criteria)) |conn| {
+        while (true) {
+            // A cancelled drain stops early and leaves the cancellation pending.
+            const conn = (self.client.connection_pool.findConnection(io, criteria) catch |err| switch (err) {
+                error.Canceled => {
+                    io.recancel();
+                    break;
+                },
+            }) orelse break;
             // findConnection moves the connection to the used list; unlink it
             // there before destroying, since destroy does not touch the lists.
             self.client.connection_pool.mutex.lockUncancelable(io);
@@ -218,12 +266,56 @@ test "warmAsync is a no-op in test builds" {
     try std.testing.expect(!pool.warm_started.load(.acquire));
 }
 
+test "TLS clock refresh leaves an unloaded clock for std to load" {
+    var pool = HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+    pool.refreshTlsClock();
+    try std.testing.expect(pool.client.now == null);
+}
+
+test "TLS clock refresh skips while a connection setup reads the clock" {
+    var pool = HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+    const io = pool.client.io;
+    // As though the bundle loaded when the process started, long ago.
+    const stale = std.Io.Timestamp.fromNanoseconds(1);
+    pool.client.now = stale;
+
+    pool.setup_lock.lockSharedUncancelable(io);
+    pool.refreshTlsClock();
+    try std.testing.expectEqual(stale.nanoseconds, pool.client.now.?.nanoseconds);
+    pool.setup_lock.unlockShared(io);
+
+    const before = std.Io.Clock.real.now(io);
+    pool.refreshTlsClock();
+    try std.testing.expect(pool.client.now.?.nanoseconds >= before.nanoseconds);
+}
+
+test "openRequest advances a stale clock before connection setup" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+
+    var pool = HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+    pool.client.now = std.Io.Timestamp.fromNanoseconds(1);
+    const before = std.Io.Clock.real.now(zio);
+
+    // The listen backlog completes the connect without any server accept.
+    var req = try pool.openRequest(.POST, try std.Uri.parse(url), .{});
+    defer req.deinit();
+    try std.testing.expect(pool.client.now.?.nanoseconds >= before.nanoseconds);
+}
+
 test "drain evicts a real parked connection past the TTL" {
     const zio = io_mod.getIo();
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try address.listen(zio, .{ .reuse_address = true });
     defer server.deinit(zio);
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(url);
 
     var pool = HttpPool.init(std.testing.allocator);

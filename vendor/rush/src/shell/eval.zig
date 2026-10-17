@@ -31,7 +31,7 @@ const job_control_signals = [_]u8{
 };
 
 fn validateAst(value: anytype) void {
-    if (zig_builtin.mode != .ReleaseFast and zig_builtin.mode != .ReleaseSmall) value.validate();
+    if (zig_builtin.mode != .fast and zig_builtin.mode != .small) value.validate();
 }
 
 pub fn evalProgram(comptime Host: type, shell: anytype, program: ast.Program) EvalError!result.EvalResult {
@@ -2268,7 +2268,7 @@ fn evalDotBuiltin(shell: anytype, args: []const []const u8) EvalError!result.Eva
 
 fn readDotScript(shell: anytype, path: []const u8) ![]const u8 {
     const allocator = shell.allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try shell.host.openZ(path_z, .{ .access = .read_only });
@@ -2630,13 +2630,13 @@ fn evalTerminalTest(shell: anytype, operand: []const u8) bool {
 
 fn fileStatus(shell: anytype, path: []const u8, follow_symlinks: bool) !?host_mod.FileStatus {
     if (path.len == 0) return null;
-    const path_z = try shell.scratchAllocator().dupeZ(u8, path);
+    const path_z = try shell.scratchAllocator().dupeSentinel(u8, path, 0);
     return shell.host.fileTestStatusZ(path_z, follow_symlinks);
 }
 
 fn fileAccess(shell: anytype, path: []const u8, access: host_mod.FileAccess) !bool {
     if (path.len == 0) return false;
-    const path_z = try shell.scratchAllocator().dupeZ(u8, path);
+    const path_z = try shell.scratchAllocator().dupeSentinel(u8, path, 0);
     return shell.host.fileAccessZ(path_z, access);
 }
 
@@ -2759,7 +2759,7 @@ fn evalEnvBuiltin(shell: anytype, args: []const []const u8, assignments: []const
     const path = if (std.mem.indexOfScalar(u8, command, '/') != null)
         command
     else
-        try shell.scratchAllocator().dupeZ(u8, command_path);
+        try shell.scratchAllocator().dupeSentinel(u8, command_path, 0);
     const request: host_mod.SpawnRequest = .{
         .path = path,
         .argv = argv,
@@ -4626,7 +4626,7 @@ fn applyRedirection(
 
     switch (redirection.op) {
         .input, .output, .append, .read_write, .clobber => {
-            const path = try shell.scratchAllocator().dupeZ(u8, try expandWord(shell, redirection.target));
+            const path = try shell.scratchAllocator().dupeSentinel(u8, try expandWord(shell, redirection.target), 0);
             const opened = try openRedirectionPath(shell, path, redirection.op);
             if (opened != target) {
                 defer shell.host.close(opened) catch {};
@@ -4667,7 +4667,7 @@ fn applyOutputAndErrorRedirection(
     };
     try frames.append(shell.scratchAllocator(), .{ .target = .stderr, .saved = stderr_saved });
 
-    const path = try shell.scratchAllocator().dupeZ(u8, try expandWord(shell, redirection.target));
+    const path = try shell.scratchAllocator().dupeSentinel(u8, try expandWord(shell, redirection.target), 0);
     const file_op: ast.RedirectionOperator = switch (redirection.op) {
         .output_and_error => .output,
         .append_and_error => .append,
@@ -8219,7 +8219,7 @@ fn searchExternalCommand(
     std.debug.assert(command.len != 0);
     const allocator = shell.scratchAllocator();
     if (std.mem.indexOfScalar(u8, command, '/') != null) {
-        const command_z = try allocator.dupeZ(u8, command);
+        const command_z = try allocator.dupeSentinel(u8, command, 0);
         if (shell.host.isExecutableZ(command_z)) {
             if (try pathIsDirectory(shell, command, .other)) return .not_executable;
             return .{ .executable = command_z };
@@ -8309,7 +8309,7 @@ fn makeShellFallbackArgv(
     const argv = try allocator.allocSentinel(?[*:0]const u8, args.len + 2, null);
     argv[0] = default_shell_path.ptr;
     argv[1] = path.ptr;
-    for (args, 0..) |arg, index| argv[index + 2] = (try allocator.dupeZ(u8, arg)).ptr;
+    for (args, 0..) |arg, index| argv[index + 2] = (try allocator.dupeSentinel(u8, arg, 0)).ptr;
     return argv;
 }
 
@@ -8476,13 +8476,13 @@ fn resolveCommandPathWithSearchPath(shell: anytype, command: [:0]const u8, searc
         if (shell.host.isExecutableZ(candidate)) return candidate;
     }
 
-    return allocator.dupeZ(u8, command);
+    return allocator.dupeSentinel(u8, command, 0);
 }
 
 fn findCommandPath(shell: anytype, command: []const u8, search_path: ?[]const u8) !?[]const u8 {
     const allocator = shell.scratchAllocator();
     if (std.mem.indexOfScalar(u8, command, '/') != null) {
-        const command_z = try allocator.dupeZ(u8, command);
+        const command_z = try allocator.dupeSentinel(u8, command, 0);
         return if (shell.host.isExecutableZ(command_z)) command else null;
     }
 

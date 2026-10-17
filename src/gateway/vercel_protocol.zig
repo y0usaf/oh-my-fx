@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -452,14 +453,21 @@ fn validatePendingToolReviewMessages(
 
 pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.ResolvedProviderOptions) !void {
     const routing = options.provider_order.len > 0;
-    const gateway_options = options.fast or options.prompt_caching or routing;
+    if (options.ultrafast and options.provider_strict and routing) {
+        var allows_openai = false;
+        for (options.provider_order) |provider| {
+            if (std.mem.eql(u8, provider, "openai")) allows_openai = true;
+        }
+        if (!allows_openai) return error.UltrafastProviderRestricted;
+    }
+    const gateway_options = options.fast or options.ultrafast or options.prompt_caching or routing;
     if (!gateway_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
     if (gateway_options) {
         try writer.writeAll("\"gateway\":{");
         var needs_comma = false;
-        if (options.fast) {
+        if (options.fast and !options.ultrafast) {
             try writer.writeAll("\"speed\":\"fast\"");
             needs_comma = true;
         }
@@ -468,7 +476,10 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
             try writer.writeAll("\"caching\":\"auto\"");
             needs_comma = true;
         }
-        if (routing) {
+        if (options.ultrafast) {
+            if (needs_comma) try writer.writeByte(',');
+            try writer.writeAll("\"only\":[\"openai\"]");
+        } else if (routing) {
             if (needs_comma) try writer.writeByte(',');
             try writer.writeAll(if (options.provider_strict) "\"only\":[" else "\"order\":[");
             for (options.provider_order, 0..) |slug, index| {
@@ -479,6 +490,9 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         }
         try writer.writeByte('}');
     }
+    if (options.ultrafast) {
+        try writer.writeAll(",\"openai\":{\"serviceTier\":\"ultrafast\"}");
+    }
     if (options.parallel_tool_calls) |parallel_tool_calls| {
         if (gateway_options) try writer.writeByte(',');
         try writer.writeAll("\"xai\":{\"parallelToolCalls\":");
@@ -486,6 +500,16 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         try writer.writeByte('}');
     }
     try writer.writeByte('}');
+}
+
+test "Ultrafast serializes only the OpenAI tier and strict OpenAI routing" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeProviderOptions(&out.writer, .{ .ultrafast = true, .fast = true, .prompt_caching = true });
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"openai\":{\"serviceTier\":\"ultrafast\"}") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"only\":[\"openai\"]") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"speed\"") == null);
+    try std.testing.expectError(error.UltrafastProviderRestricted, writeProviderOptions(&out.writer, .{ .ultrafast = true, .provider_strict = true, .provider_order = &.{"azure"} }));
 }
 
 pub fn validateToolMessageHistory(alloc: std.mem.Allocator, messages: []const ChatMessage) !void {
@@ -709,7 +733,7 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
         // ignored by several gateway provider routes, so only the text
         // acknowledgment stays here.
         try writer.writeAll(",\"output\":{\"type\":\"content\",\"value\":[");
-        const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{content}) else content;
+        const text = if (failed) try scratch_alloc.print("Tool error: {s}", .{content}) else content;
         defer if (failed) scratch_alloc.free(text);
         try writer.writeAll("{\"type\":\"text\",\"text\":");
         try std.json.Stringify.value(text, .{}, writer);
@@ -947,7 +971,8 @@ fn writeReplayContent(
             if (offset_value != .integer or length_value != .integer) return error.InvalidProviderState;
             const offset = std.math.cast(usize, offset_value.integer) orelse return error.InvalidProviderState;
             const length = std.math.cast(usize, length_value.integer) orelse return error.InvalidProviderState;
-            if (offset != text_end or offset > content.len or length > content.len - offset) return error.InvalidProviderState;
+            if (offset > content.len or length > content.len - offset) return error.InvalidProviderState;
+            if (offset != text_end and !separatesReplayText(content, text_end, offset)) return error.InvalidProviderState;
             text_end = offset + length;
             try writer.writeAll("{\"type\":\"text\",\"text\":");
             try std.json.Stringify.value(content[offset..text_end], .{}, writer);
@@ -977,6 +1002,12 @@ fn writeReplayContent(
         wrote_part = true;
     }
     try writer.writeByte(']');
+}
+
+/// Separator-joined messages replay as their own text, without the separator.
+fn separatesReplayText(content: []const u8, text_end: usize, offset: usize) bool {
+    return text_end > 0 and offset > text_end and
+        std.mem.eql(u8, content[text_end..offset], types.ProviderReplay.message_separator);
 }
 
 pub fn formatGatewayRequestShapeSummary(alloc: std.mem.Allocator, payload: []const u8) ![]u8 {
@@ -1291,7 +1322,7 @@ test "writeChatMessageJson serializes user text plus image file parts through co
     defer types.freeImageAttachmentSlice(alloc, images);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
     try image_attachments.captureImageSnapshot(alloc, &images[0], snapshot_dir);
 
@@ -1425,6 +1456,40 @@ test "Gateway request replays reasoning and call metadata without changing canon
     try std.testing.expectEqualStrings("read_file", parts[2].object.get("toolName").?.string);
     try std.testing.expectEqualStrings("file", parts[2].object.get("input").?.object.get("path").?.string);
     try std.testing.expectEqualStrings("signature", parts[2].object.get("providerOptions").?.object.get("vertex").?.object.get("thoughtSignature").?.string);
+}
+
+test "Gateway request replays separated messages as their own text" {
+    const alloc = std.testing.allocator;
+    const parts_json = "[{\"type\":\"text\",\"offset\":0,\"length\":9,\"providerOptions\":{\"openai\":{\"itemId\":\"A\",\"phase\":\"commentary\"}}}," ++
+        "{\"type\":\"text\",\"offset\":11,\"length\":5,\"providerOptions\":{\"openai\":{\"itemId\":\"B\",\"phase\":\"final_answer\"}}}]";
+    const messages = [_]ChatMessage{.{ .role = .assistant, .content = "Checking.\n\nDone.", .provider_replay = .{
+        .source = .{ .provider = .gateway, .model = "test" },
+        .parts_json = parts_json,
+    } }};
+    const body = try buildGatewayRequestBody(alloc, "[]", &messages);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const parts = parsed.value.object.get("prompt").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("Checking.", parts[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("commentary", parts[0].object.get("providerOptions").?.object.get("openai").?.object.get("phase").?.string);
+    try std.testing.expectEqualStrings("Done.", parts[1].object.get("text").?.string);
+    try std.testing.expectEqualStrings("final_answer", parts[1].object.get("providerOptions").?.object.get("openai").?.object.get("phase").?.string);
+
+    for ([_]struct { content: []const u8, parts_json: []const u8 }{
+        // Only the exact separator may sit between replayed spans.
+        .{ .content = "Checking.\nDone.", .parts_json = "[{\"type\":\"text\",\"offset\":0,\"length\":9},{\"type\":\"text\",\"offset\":10,\"length\":5}]" },
+        .{ .content = "Checking.xxDone.", .parts_json = "[{\"type\":\"text\",\"offset\":0,\"length\":9},{\"type\":\"text\",\"offset\":11,\"length\":5}]" },
+        // A separator never precedes the first message.
+        .{ .content = "\n\nDone.", .parts_json = "[{\"type\":\"text\",\"offset\":2,\"length\":5}]" },
+    }) |case| {
+        const invalid = [_]ChatMessage{.{ .role = .assistant, .content = case.content, .provider_replay = .{
+            .source = .{ .provider = .gateway, .model = "test" },
+            .parts_json = case.parts_json,
+        } }};
+        try std.testing.expectError(error.InvalidProviderState, buildGatewayRequestBody(alloc, "[]", &invalid));
+    }
 }
 
 test "Gateway automatic caching preserves transient context and grouped tool results" {
@@ -1989,7 +2054,7 @@ fn check_grouped_request_allocations(alloc: std.mem.Allocator) !void {
 }
 
 test "grouped tool result serialization releases failed allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_grouped_request_allocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_grouped_request_allocations, .{});
 }
 
 test "gateway request validation accepts paired assistant tool calls and results" {
@@ -2061,7 +2126,7 @@ test "gateway request validation preserves argument parser allocation failure" {
         .{ .role = .assistant, .tool_calls = calls[0..] },
         .{ .role = .tool, .content = "contents", .tool_call_id = "call_1", .tool_name = "read_file" },
     };
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
 
     try std.testing.expectError(error.OutOfMemory, validateToolMessageHistory(failing.allocator(), &messages));
 }
@@ -2208,7 +2273,7 @@ test "parseGatewayCompletion rejects duplicate-key legacy tool arguments" {
 }
 
 test "parseGatewayCompletion cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkParseGatewayCompletionAllocFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkParseGatewayCompletionAllocFailures, .{});
 }
 
 test "freeGatewayCompletion frees parsed completions under testing allocator" {

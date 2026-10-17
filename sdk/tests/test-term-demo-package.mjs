@@ -31,7 +31,13 @@ try {
   const vercel = JSON.parse(await readFile(join(temp, "vercel.json"), "utf8"));
   const header = vercel.headers.find(({ source }) => source === `/${manifest.wasmModule.file}`);
   assert.deepEqual(header?.headers, [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }]);
-  console.log("terminal demo package passed: shared Wasm module is hashed, rewritten, and immutable");
+  const observation = await readFile(join(temp, manifest.toolObservation.file));
+  assert.equal(digest(observation), manifest.toolObservation.sha256);
+  assert.equal(observation.byteLength, manifest.toolObservation.bytes);
+  assert.match(sdk, new RegExp(`from "\\./${manifest.toolObservation.file.replaceAll(".", "\\.")}";`));
+  assert.doesNotMatch(sdk, /from "\.\/tool-observation\.js";/);
+  assert.deepEqual(vercel.headers.find(({ source }) => source === `/${manifest.toolObservation.file}`)?.headers, [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }]);
+  console.log("terminal demo package passed: shared modules are hashed, rewritten, and immutable");
 } finally {
   await rm(temp, { recursive: true, force: true });
 }

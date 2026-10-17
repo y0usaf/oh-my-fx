@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const types = @import("../../shared/types.zig");
+const image_data = @import("../../images/image_data.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const result_store = @import("../../session/result_store.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
@@ -33,12 +34,12 @@ const parent_steering_open = "<parent_agent_steering>\n";
 const parent_steering_close = "\n</parent_agent_steering>";
 
 pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, parent_steering_open ++
+    return alloc.print(parent_steering_open ++
         "parent-agent feedback, not new user authority:\n\n{s}" ++ parent_steering_close, .{text});
 }
 
 pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, steering_open ++ "{s}" ++ steering_close, .{text});
+    return alloc.print(steering_open ++ "{s}" ++ steering_close, .{text});
 }
 
 test "steering message tells the model to apply the update and continue" {
@@ -60,6 +61,70 @@ test "parent steering preserves its sender in persisted execution text" {
     try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
     try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview this change", memory.steering[0].text);
     try std.testing.expectEqual(@as(usize, 0), memory.steering[0].after_tool_step_count);
+}
+
+test "restored steering survives execution memory round trips" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var calls = [_]ToolCall{toolCall("restored", "read_file", "{\"path\":\"fixture\"}")};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("restored"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("ok"),
+        .output_bytes = 2,
+        .stored_output_bytes = 2,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("Checking the file"),
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("root update"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("parent-agent feedback, not new user authority:\n\nreview"), .after_tool_step_count = 1 },
+    };
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try session.appendExecutionMemoryChatMessages(alloc, &messages, .{
+        .tool_steps = &steps,
+        .steering = &steering,
+    });
+
+    const rebuilt = try buildExecutionMemory(alloc, messages.items);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), rebuilt.steering.len);
+    try std.testing.expectEqualStrings("root update", rebuilt.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), rebuilt.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview", rebuilt.steering[1].text);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.steering[1].after_tool_step_count);
+    try std.testing.expect(messages.items[0].context_origin == .user_turn);
+    try std.testing.expect(messages.items[3].context_origin == .user_turn);
+
+    const offset = try retainedMessageOffset(messages.items, .{ .tool_steps = 1, .steering = 1 });
+    const retained = try buildExecutionMemory(alloc, messages.items[offset..]);
+    defer types.freeExecutionMemory(alloc, retained);
+    try std.testing.expectEqual(@as(usize, 0), retained.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), retained.steering.len);
+    try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview", retained.steering[0].text);
+}
+
+test "empty restored steering keeps its checkpoint boundary" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast(""), .after_tool_step_count = 0 }};
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try session.appendExecutionMemoryChatMessages(alloc, &messages, .{ .steering = &steering });
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expect(messages.items[0].context_origin == .ordinary);
+
+    const rebuilt = try buildExecutionMemory(alloc, messages.items);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.steering.len);
+    try std.testing.expectEqualStrings("", rebuilt.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), try retainedMessageOffset(messages.items, .{ .steering = 1 }));
 }
 
 pub fn persistedStatusForCurrentFxLocalResult(
@@ -122,10 +187,13 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
         }
         if (message.role != .user) continue;
         const content = message.content orelse continue;
-        const text = steeringText(content) orelse {
-            assistant_prefix = null;
-            continue;
-        };
+        const text = if (message.restored_steering)
+            content
+        else
+            steeringText(content) orelse {
+                assistant_prefix = null;
+                continue;
+            };
         const copy = try alloc.dupe(u8, text);
         const prefix_copy = if (assistant_prefix) |prefix|
             alloc.dupe(u8, prefix) catch |err| {
@@ -177,7 +245,9 @@ pub fn retainedMessageOffset(messages: []const ChatMessage, cut: CompactedExecut
             steps += 1;
             // Keep following continuation prompts, but not the completed reply.
             if (message.tool_calls.len == 0) prefix_start = index + 1;
-        } else if (message.role == .user and steeringText(message.content orelse "") != null) {
+        } else if (message.role == .user and message.content != null and
+            (message.restored_steering or steeringText(message.content.?) != null))
+        {
             if (steps == cut.tool_steps and steering == cut.steering) return prefix_start;
             steering += 1;
             prefix_start = index + 1;
@@ -221,6 +291,13 @@ test "retained standalone cut rebuilds exactly the selected execution suffix" {
     }
 }
 
+/// Steering the user typed during the turn, which a cancelled turn keeps.
+fn isSteering(message: ChatMessage) bool {
+    if (message.restored_steering) return true;
+    const content = message.content orelse return false;
+    return steeringText(content) != null;
+}
+
 fn steeringText(content: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, content, parent_steering_open) and std.mem.endsWith(u8, content, parent_steering_close)) {
         // Keep the sender label in persisted text and ordinary history replay.
@@ -230,6 +307,8 @@ fn steeringText(content: []const u8) ?[]const u8 {
     return content[steering_open.len .. content.len - steering_close.len];
 }
 
+/// Which steering and feedback a cancelled turn keeps is modeled in
+/// `tests/tla/session_manager/rollout/pr-1092/PR1092Steering.tla`.
 pub fn buildInterruptedExecutionMemory(
     alloc: Allocator,
     current_turn_messages: []const ChatMessage,
@@ -314,7 +393,7 @@ pub fn buildInterruptedExecutionMemory(
                 }
             }
             for (user_tail) |entry| {
-                if (!entry.permission_feedback) continue;
+                if (!entry.permission_feedback and !isSteering(entry)) continue;
                 if (entry.tool_call_id) |source_tool_call_id| {
                     if (execution_memory_helpers.findToolCallById(calls, source_tool_call_id) == null) {
                         continue;
@@ -426,6 +505,34 @@ test "interrupted execution memory retains marked feedback through mixed user ta
     try std.testing.expectEqualStrings("first command feedback marker", results[0].permission_feedback[0]);
     try std.testing.expectEqual(@as(usize, 1), results[1].permission_feedback.len);
     try std.testing.expectEqualStrings("second command feedback marker", results[1].permission_feedback[0]);
+}
+
+test "interrupted execution memory keeps steering typed right after a tool result" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{
+        .{ .id = "call_done", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"work\"}}" },
+        .{ .id = "call_active", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" },
+    };
+    const steering = try steeringMessage(alloc, "check the tests too");
+    defer alloc.free(steering);
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..1] },
+        .{ .role = .tool, .content = "child is still running", .tool_call_id = calls[0].id, .tool_name = calls[0].name, .tool_result_status = .success },
+        .{ .role = .user, .content = steering },
+        .{ .role = .user, .content = "custom hint", .permission_feedback = false },
+        .{ .role = .assistant, .content = "on it" },
+        .{ .role = .assistant, .tool_calls = calls[1..2] },
+    };
+
+    const memory = try buildInterruptedExecutionMemory(alloc, &messages, calls[1]);
+    defer types.freeExecutionMemory(alloc, memory);
+
+    // The cancelled turn keeps what the user typed, after the step it
+    // followed; an unmarked plain message still stays out.
+    try std.testing.expectEqual(@as(usize, 1), memory.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
+    try std.testing.expectEqualStrings("check the tests too", memory.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering[0].after_tool_step_count);
 }
 
 fn hasToolResultForCall(
@@ -564,6 +671,7 @@ pub fn prepareCapturedToolModelOutput(
     };
 }
 
+/// Retains the original tool images so later requests can project a safe view.
 pub fn retainToolImages(arena: Allocator, config: Config, call: ToolCall, prepared: *result_store.PreparedResult) !void {
     const memory = &prepared.memory;
     if (memory.tool_images.len == 0 or memory.tool_image_handle != null) return;
@@ -574,41 +682,213 @@ pub fn retainToolImages(arena: Allocator, config: Config, call: ToolCall, prepar
         return;
     };
     memory.tool_image_handle = handle;
-    const notice = try std.fmt.allocPrint(arena, "Saved images: {s}. Use read_tool_result with this handle to load them again.\n", .{handle});
+    const notice = try arena.print("Saved images: {s}. Use read_tool_result with this handle to load them again.\n", .{handle});
     const limit = config.max_tool_result_bytes -| notice.len;
     const keep = @import("../../config/context_limits.zig").utf8PrefixLength(prepared.model_output, limit);
     if (keep < prepared.model_output.len) memory.truncated = true;
     prepared.model_output = try std.mem.concat(arena, u8, &.{ notice, prepared.model_output[0..keep] });
 }
 
+fn needsImageMaterialization(messages: []const ChatMessage) bool {
+    for (messages) |message| {
+        const memory = message.tool_result_memory orelse continue;
+        if (memory.tool_images.len == 0 and memory.tool_image_handle != null) return true;
+    }
+    return false;
+}
+
+/// Loads stored tool images for a request without changing session history.
 pub fn materializeToolImages(arena: Allocator, config: Config, messages: []const ChatMessage) ![]const ChatMessage {
-    const needed = for (messages) |message| {
-        if (message.tool_result_memory) |memory| if (memory.tool_images.len == 0 and memory.tool_image_handle != null) break true;
-    } else false;
-    if (!needed) return messages;
+    if (!needsImageMaterialization(messages)) return messages;
     const materialized = try arena.dupe(ChatMessage, messages);
     for (materialized) |*message| {
         if (message.tool_result_memory) |*memory| {
-            if (memory.tool_images.len > 0) continue;
-            const handle = memory.tool_image_handle orelse continue;
-            if (config.session_child_capability) |capability| {
+            if (memory.tool_images.len == 0) {
+                const handle = memory.tool_image_handle orelse continue;
+                const capability = config.session_child_capability orelse {
+                    message.content = try prependImageNotice(arena, "[Stored tool image is unavailable in this session.]\n", message.content orelse "", config.max_tool_result_bytes);
+                    continue;
+                };
                 memory.tool_images = result_store.loadToolImages(arena, capability, handle) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    const notice = try std.fmt.allocPrint(arena, "[Stored tool image unavailable: {s}]\n", .{@errorName(err)});
+                    const notice = try arena.print("[Stored tool image unavailable: {s}]\n", .{@errorName(err)});
                     message.content = try prependImageNotice(arena, notice, message.content orelse "", config.max_tool_result_bytes);
                     continue;
                 };
-            } else {
-                message.content = try prependImageNotice(arena, "[Stored tool image is unavailable in this session.]\n", message.content orelse "", config.max_tool_result_bytes);
             }
         }
     }
     return materialized;
 }
 
+fn requestToolImageFits(image: types.ToolImage, max_dimension: u32) bool {
+    const dimensions = image_data.encodedImageDimensions(image.data) orelse return false;
+    return !dimensions.exceeds(max_dimension) and
+        image.data.len <= image_data.max_encoded_image_bytes and
+        image_data.supportedMediaType(image.mime_type);
+}
+
+/// Builds a safe request view without changing the tool images saved in history.
+pub fn withholdRequestToolImages(arena: Allocator, messages: []const ChatMessage, max_dimension: u32, text_limit: usize) ![]const ChatMessage {
+    var projected: ?[]ChatMessage = null;
+    for (messages, 0..) |message, index| {
+        const memory = message.tool_result_memory orelse continue;
+        const has_unsafe = for (memory.tool_images) |image| {
+            if (!requestToolImageFits(image, max_dimension)) break true;
+        } else false;
+        if (!has_unsafe) continue;
+        var kept: std.ArrayList(types.ToolImage) = try .initCapacity(arena, memory.tool_images.len);
+        var notice: std.Io.Writer.Allocating = .init(arena);
+        for (memory.tool_images) |image| {
+            if (requestToolImageFits(image, max_dimension)) {
+                kept.appendAssumeCapacity(image);
+                continue;
+            }
+            const dimensions = image_data.encodedImageDimensions(image.data);
+            if (dimensions) |size| {
+                try notice.writer.print("[Image not sent: {s} is {d}x{d} pixels; this request permits at most {d} per side and 5 MiB encoded per image. ", .{ image.mime_type, size.width, size.height, max_dimension });
+            } else if (image.source_ref != null and image.data.len == 0) {
+                try notice.writer.print("[Image not sent: only a host source reference was supplied; this request permits at most {d} per side and 5 MiB encoded per image. ", .{max_dimension});
+            } else {
+                try notice.writer.writeAll("[Image not sent: its dimensions could not be verified. ");
+            }
+            if (image.source_ref) |source_ref| {
+                try image_data.writeHostImageRecoveryNotice(&notice.writer, source_ref, max_dimension);
+            } else {
+                try notice.writer.writeAll("If this tool result names a local file, use an available image tool to save a smaller copy, then read_file the copy. If no tool or path is available, ask the user; ask before installing software.]\n");
+            }
+        }
+        if (kept.items.len == memory.tool_images.len) continue;
+        const output = projected orelse try arena.dupe(ChatMessage, messages);
+        projected = output;
+        output[index].tool_result_memory.?.tool_images = kept.items;
+        output[index].content = try prependImageNotice(arena, notice.written(), message.content orelse "", text_limit);
+    }
+    return projected orelse messages;
+}
+
 fn prependImageNotice(alloc: Allocator, notice: []const u8, content: []const u8, limit: usize) Allocator.Error![]u8 {
-    const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, limit -| notice.len);
-    return std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, limit)], content[0..keep] });
+    const utf8_prefix_length = @import("../../config/context_limits.zig").utf8PrefixLength;
+    const notice_keep = utf8_prefix_length(notice, limit);
+    const keep = utf8_prefix_length(content, limit -| notice.len);
+    return std.mem.concat(alloc, u8, &.{ notice[0..notice_keep], content[0..keep] });
+}
+
+fn testEncodedToolImage(arena: Allocator, bytes: []const u8, mime_type: []const u8) !types.ToolImage {
+    const encoded = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    return .{ .data = encoded, .mime_type = try arena.dupe(u8, mime_type) };
+}
+
+fn testPngHeaderToolImage(arena: Allocator, width: u32, height: u32) !types.ToolImage {
+    return testEncodedToolImage(arena, &image_data.testPngHeader(width, height), "image/png");
+}
+
+fn testJpegHeaderToolImage(arena: Allocator, width: u16, height: u16) !types.ToolImage {
+    return testEncodedToolImage(arena, &image_data.testJpeg(width, height), "image/jpeg");
+}
+
+fn testImageConfig(cancel: *std.atomic.Value(bool)) Config {
+    return .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
+        .cancel_flag = cancel,
+    };
+}
+
+test "request projection withholds unsafe tool images without changing history" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const images = [_]types.ToolImage{
+        try testPngHeaderToolImage(arena, 3420, 2224),
+        try testJpegHeaderToolImage(arena, 8001, 1),
+        try testPngHeaderToolImage(arena, 1, 1),
+    };
+    const messages = [_]ChatMessage{.{ .role = .tool, .content = "<path>frame.png</path>", .tool_result_memory = .{ .tool_images = &images } }};
+    const normal = try withholdRequestToolImages(arena, &messages, 8000, 4096);
+    try std.testing.expectEqual(@as(usize, 2), normal[0].tool_result_memory.?.tool_images.len);
+    const strict = try withholdRequestToolImages(arena, &messages, 2000, 4096);
+    try std.testing.expectEqual(@as(usize, 1), strict[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expect(std.mem.find(u8, strict[0].content.?, "<path>frame.png</path>") != null);
+    try std.testing.expectEqual(@as(usize, 3), messages[0].tool_result_memory.?.tool_images.len);
+}
+
+test "retaining tool results leaves original images in history" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const images = [_]types.ToolImage{try testPngHeaderToolImage(arena, 3420, 2224)};
+    var prepared = result_store.PreparedResult{ .model_output = "source <path>frame.png</path>", .memory = .{ .tool_images = &images } };
+    try retainToolImages(arena, testImageConfig(&cancel), toolCall("call_frame", "read_file", "{}"), &prepared);
+    try std.testing.expectEqual(@as(usize, 1), prepared.memory.tool_images.len);
+    try std.testing.expectEqualStrings(images[0].data, prepared.memory.tool_images[0].data);
+    try std.testing.expectEqualStrings("source <path>frame.png</path>", prepared.model_output);
+}
+
+test "request image notices remain bounded without mutating retained text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const images = [_]types.ToolImage{try testJpegHeaderToolImage(arena, 8001, 1)};
+    const content = try arena.alloc(u8, 2048);
+    @memset(content, 'x');
+    const messages = [_]ChatMessage{.{ .role = .tool, .content = content, .tool_result_memory = .{ .tool_images = &images } }};
+    const projected = try withholdRequestToolImages(arena, &messages, 8000, 512);
+    try std.testing.expect(projected[0].content.?.len <= 512);
+    try std.testing.expect(std.mem.startsWith(u8, projected[0].content.?, "[Image not sent:"));
+    try std.testing.expectEqual(@as(usize, 0), projected[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqual(@as(usize, 2048), messages[0].content.?.len);
+}
+
+test "request image notices preserve UTF-8 at every byte limit" {
+    const alloc = std.testing.allocator;
+    const content = "é界𐐀 tail";
+    for ([_][]const u8{ "", "ASCII ", "é", "界", "𐐀" }) |notice| {
+        const full = try std.mem.concat(alloc, u8, &.{ notice, content });
+        defer alloc.free(full);
+        for (0..full.len + 1) |limit| {
+            const output = try prependImageNotice(alloc, notice, content, limit);
+            defer alloc.free(output);
+            try std.testing.expect(output.len <= limit);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(output));
+            if (limit == full.len) try std.testing.expectEqualStrings(full, output);
+        }
+    }
+}
+
+test "request image notices keep clipped source references as JSON text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source_ref = text_utils.repeat("é", 256);
+    var image = try testPngHeaderToolImage(arena, 8001, 1);
+    image.source_ref = try arena.dupe(u8, source_ref);
+    const images = [_]types.ToolImage{ image, image };
+    const content = "original tool output";
+    const messages = [_]ChatMessage{.{ .role = .tool, .content = content, .tool_result_memory = .{ .tool_images = &images } }};
+    const projected = try withholdRequestToolImages(arena, &messages, 8000, 1079);
+    const output = projected[0].content.?;
+    try std.testing.expect(output.len <= 1079);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(output));
+    try std.testing.expect(std.mem.find(u8, output, source_ref) != null);
+    try std.testing.expectEqual(@as(usize, 0), projected[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqual(@as(usize, 2), messages[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqualStrings(content, messages[0].content.?);
+    for (messages[0].tool_result_memory.?.tool_images) |retained| {
+        try std.testing.expectEqualStrings(source_ref, retained.source_ref.?);
+        try std.testing.expectEqualStrings(image.data, retained.data);
+    }
+
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(output, .{}, &writer.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, writer.written(), .{});
+    try std.testing.expect(parsed.value == .string);
+    try std.testing.expectEqualStrings(output, parsed.value.string);
 }
 
 pub fn applyToolResultMemory(
@@ -908,8 +1188,7 @@ test "exact command sources delete replay and missing handles retain it" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(arena);
     try body.appendNTimes(arena, 'x', 80 * 1024);
-    const stored_source = try std.fmt.allocPrint(
-        arena,
+    const stored_source = try arena.print(
         "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
         .{body.items},
     );
@@ -967,8 +1246,7 @@ test "exact command sources delete replay and missing handles retain it" {
         );
         transformed_capture.appendAccepted(arena, .stdout, case.raw);
         transformed_capture.seal(arena);
-        const projected_source = try std.fmt.allocPrint(
-            arena,
+        const projected_source = try arena.print(
             "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
             .{case.projected},
         );
@@ -1149,8 +1427,7 @@ test "required terminal exec stores large output only as replay" {
     var cancel = std.atomic.Value(bool).init(false);
     const body = try arena.alloc(u8, result_store.large_result_threshold_bytes + 1024);
     @memset(body, 'x');
-    const raw_output = try std.fmt.allocPrint(
-        arena,
+    const raw_output = try arena.print(
         "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
         .{body},
     );
@@ -1203,7 +1480,7 @@ test "saved preparation stores complete output verbatim on cap loss" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cancel = std.atomic.Value(bool).init(false);
-    const raw = "MY_UNIT_TOKEN=abcdefgh" ** 47;
+    const raw = text_utils.repeat("MY_UNIT_TOKEN=abcdefgh", 47);
     try std.testing.expect(raw.len > tool_result_limits.min_configured_tool_result_bytes);
 
     const prepared = try prepareToolModelOutput(
@@ -1242,7 +1519,7 @@ test "no-save preparation preserves capped output verbatim without a result hand
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cancel = std.atomic.Value(bool).init(false);
-    const raw = "MY_UNIT_TOKEN=abcdefgh" ** 47;
+    const raw = text_utils.repeat("MY_UNIT_TOKEN=abcdefgh", 47);
 
     const prepared = try prepareToolModelOutput(
         arena,
@@ -1303,7 +1580,6 @@ test "saved read_tool_result preparation preserves exact secret-like output" {
 }
 
 test "retrieved output remains backed across the inline cap" {
-    const compaction = @import("context_compaction.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1343,21 +1619,14 @@ test "retrieved output remains backed across the inline cap" {
         try std.testing.expectEqual(@min(case.bytes, case.cap), prepared.model_output.len);
         try std.testing.expect(std.mem.startsWith(u8, prepared.model_output, head));
         try std.testing.expect(std.mem.find(u8, prepared.model_output, "[redacted]") == null);
-        var messages = [_]ChatMessage{.{ .role = .tool, .tool_call_id = "retrieval-cap", .tool_name = "read_tool_result", .content = prepared.model_output, .tool_result_memory = prepared.memory }};
         if (case.bytes > case.cap and storage != .unavailable) {
             const handle = prepared.memory.output_handle orelse return error.TestExpectedStoredRetrieval;
             try std.testing.expectEqual(case.bytes, prepared.memory.stored_output_bytes);
             const stored = try result_store.readForReplayManaged(arena, &capability, handle, case.bytes);
             try std.testing.expectEqualStrings(raw, stored);
-            try compaction.promoteMessageResults(arena, &messages, .{ .managed = &capability }, 0);
-            try std.testing.expectEqualStrings(handle, messages[0].tool_result_memory.?.output_handle.?);
         } else {
             try std.testing.expect(prepared.memory.output_handle == null);
-            if (case.bytes > case.cap) {
-                try std.testing.expectError(error.IncompleteCompactionResult, compaction.promoteMessageResults(arena, &messages, .unavailable, 0));
-            } else {
-                try std.testing.expectEqualStrings(raw, prepared.model_output);
-            }
+            if (case.bytes <= case.cap) try std.testing.expectEqualStrings(raw, prepared.model_output);
         }
     };
 }
@@ -1381,12 +1650,11 @@ test "retrieved output storage failure does not publish an unbacked result" {
         .cancel_flag = &cancel,
         .max_tool_result_bytes = 1024,
         .session_child_capability = &readonly,
-    }, toolCall("retrieval-store-error", "read_tool_result", "{}"), "x" ** 1025));
+    }, toolCall("retrieval-store-error", "read_tool_result", "{}"), text_utils.repeat("x", 1025)));
 }
 
 test "saved tool output preparation keeps builtins and dynamic tools compactable" {
     const builtins = @import("../../../builtins/tools.zig");
-    const compaction = @import("context_compaction.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1398,7 +1666,7 @@ test "saved tool output preparation keeps builtins and dynamic tools compactable
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const raw = "COMPLETE_TOOL_BODY\n" ++ "x" ** 8192;
+        const raw = "COMPLETE_TOOL_BODY\n" ++ text_utils.repeat("x", 8192);
         const prepared = try prepareToolModelOutput(arena, .{
             .system_prompt = "",
             .gateway_retry_count = 0,
@@ -1410,9 +1678,6 @@ test "saved tool output preparation keeps builtins and dynamic tools compactable
         }, toolCall("tool-preparation", name, "{}"), raw);
         const handle = prepared.memory.output_handle orelse return error.TestExpectedStoredOutput;
         try std.testing.expectEqual(raw.len, prepared.memory.stored_output_bytes);
-        var messages = [_]ChatMessage{.{ .role = .tool, .tool_call_id = "tool-preparation", .tool_name = name, .content = prepared.model_output, .tool_result_memory = prepared.memory }};
-        try compaction.promoteMessageResults(arena, &messages, .{ .legacy_dir = dir }, 0);
-        try std.testing.expectEqualStrings(handle, messages[0].tool_result_memory.?.output_handle.?);
         const stored = try result_store.readByRange(arena, dir, handle, 1, 16384);
         try std.testing.expect(std.mem.find(u8, stored, raw) != null);
     }

@@ -12,6 +12,10 @@ const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 
 const Allocator = std.mem.Allocator;
+const FormBody = oauth.FormBody;
+const isLoopbackHttpUrl = oauth.isLoopbackHttpUrl;
+const pkceChallengeAlloc = oauth.pkceChallengeAlloc;
+const randomUrlSafeSecret = oauth.randomUrlSafeSecret;
 
 const client_id = "b1a00492-073a-47ea-816f-4c329264a828";
 const token_url = "https://auth.x.ai/oauth2/token";
@@ -43,17 +47,7 @@ pub const Access = struct {
     }
 };
 
-const TokenSet = struct {
-    access_token: []u8,
-    refresh_token: []u8,
-    expires_in: i64,
-
-    fn deinit(self: *TokenSet, alloc: Allocator) void {
-        secret.zeroAndFree(alloc, self.access_token);
-        secret.zeroAndFree(alloc, self.refresh_token);
-        self.* = undefined;
-    }
-};
+const TokenSet = oauth.BrowserTokenSet;
 
 const BrowserLoginContext = struct {
     listener: std.Io.net.Server,
@@ -151,14 +145,14 @@ fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !
     const configured_issuer = try configuredEndpoint(alloc, e2e_issuer_url_env, issuer_url);
     defer alloc.free(configured_issuer);
     const configured_token_endpoint = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
-    errdefer alloc.free(configured_token_endpoint);
+    var token_endpoint_owned = true;
+    errdefer if (token_endpoint_owned) alloc.free(configured_token_endpoint);
 
     var listener = try bindBrowserCallback();
     var listener_owned = true;
     errdefer if (listener_owned) listener.deinit(io_mod.getIo());
     const callback_port = listener.socket.address.getPort();
-    const redirect_uri = try std.fmt.allocPrint(
-        alloc,
+    const redirect_uri = try alloc.print(
         "http://127.0.0.1:{d}/callback",
         .{callback_port},
     );
@@ -176,7 +170,20 @@ fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !
         code_challenge,
         state,
     );
-    errdefer alloc.free(authorization_url);
+    var authorization_url_owned = true;
+    errdefer if (authorization_url_owned) alloc.free(authorization_url);
+
+    var prepared = try login_flow.prepareBrowserLogin(alloc, .{
+        .issuer = configured_issuer,
+        .authorization_endpoint_suffix = "/oauth2/authorize",
+        .token_endpoint = configured_token_endpoint,
+        .verification_uri = authorization_url,
+        .client_id = client_id,
+        .expires_in = browser_login_timeout_seconds,
+    });
+    token_endpoint_owned = false;
+    authorization_url_owned = false;
+    errdefer prepared.deinit(alloc);
 
     const context = try alloc.create(BrowserLoginContext);
     errdefer alloc.destroy(context);
@@ -189,37 +196,8 @@ fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !
     };
     listener_owned = false;
 
-    const owned_issuer = try alloc.dupe(u8, configured_issuer);
-    errdefer alloc.free(owned_issuer);
-    const authorization_endpoint = try std.fmt.allocPrint(
-        alloc,
-        "{s}/oauth2/authorize",
-        .{std.mem.trimEnd(u8, configured_issuer, "/")},
-    );
-    errdefer alloc.free(authorization_endpoint);
-    const device_code = try alloc.dupe(u8, "");
-    errdefer secret.zeroAndFree(alloc, device_code);
-    const user_code = try alloc.dupe(u8, "");
-    errdefer alloc.free(user_code);
-    const owned_client_id = try alloc.dupe(u8, client_id);
-    errdefer alloc.free(owned_client_id);
-
     return .{
-        .prepared = .{
-            .metadata = .{
-                .issuer = owned_issuer,
-                .device_authorization_endpoint = authorization_endpoint,
-                .token_endpoint = configured_token_endpoint,
-            },
-            .device = .{
-                .device_code = device_code,
-                .user_code = user_code,
-                .verification_uri = authorization_url,
-                .expires_in = browser_login_timeout_seconds,
-                .interval = 1,
-            },
-            .client_id = owned_client_id,
-        },
+        .prepared = prepared,
         .context = context,
     };
 }
@@ -233,24 +211,6 @@ fn deinitBrowserLoginContext(raw: ?*anyopaque, alloc: Allocator) void {
 fn bindBrowserCallback() !std.Io.net.Server {
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     return address.listen(io_mod.getIo(), .{ .reuse_address = true });
-}
-
-fn randomUrlSafeSecret(alloc: Allocator) ![]u8 {
-    var entropy: [32]u8 = undefined;
-    try io_mod.getIo().randomSecure(&entropy);
-    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(entropy.len);
-    const encoded = try alloc.alloc(u8, encoded_len);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, &entropy);
-    return encoded;
-}
-
-fn pkceChallengeAlloc(alloc: Allocator, verifier: []const u8) ![]u8 {
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
-    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(digest.len);
-    const encoded = try alloc.alloc(u8, encoded_len);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, &digest);
-    return encoded;
 }
 
 fn pollBrowserToken(
@@ -298,23 +258,10 @@ fn pollBrowserToken(
     };
     errdefer token.deinit(alloc);
 
-    const scope = try alloc.dupe(u8, "");
-    errdefer if (scope.len > 0) alloc.free(scope);
-    const token_type = try alloc.dupe(u8, "Bearer");
-    errdefer alloc.free(token_type);
-    const access_token = token.access_token;
-    token.access_token = &.{};
-    const refresh_token = token.refresh_token;
-    token.refresh_token = &.{};
+    const result = try oauth.takeBrowserPollResult(alloc, &token);
     context.pending_callback = accepted;
     accepted = null;
-    return .{ .success = .{
-        .access_token = access_token,
-        .refresh_token = refresh_token,
-        .expires_in = token.expires_in,
-        .scope = scope,
-        .token_type = token_type,
-    } };
+    return result;
 }
 
 const BrowserCallbackParserContext = struct {
@@ -729,44 +676,17 @@ fn requestTokenAtWithBounds(
         deadline,
     );
     defer secret.zeroAndFree(alloc, bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidGrokOAuthResponse;
-    const object = parsed.value.object;
-    const access_token = try dupeRequiredString(alloc, object, "access_token");
-    errdefer secret.zeroAndFree(alloc, access_token);
-    const refresh_token = try dupeRequiredString(alloc, object, "refresh_token");
-    errdefer secret.zeroAndFree(alloc, refresh_token);
-    return .{
-        .access_token = access_token,
-        .refresh_token = refresh_token,
-        .expires_in = try requiredPositiveInteger(object, "expires_in"),
+    return oauth.parseBrowserTokenSet(alloc, bytes) catch |err| switch (err) {
+        error.InvalidOAuthResponse => return error.InvalidGrokOAuthResponse,
+        else => return err,
     };
 }
 
 fn configuredEndpoint(alloc: Allocator, env_name: []const u8, default_url: []const u8) ![]u8 {
-    const candidate = io_mod.getenv(env_name) orelse default_url;
-    if (io_mod.getenv(env_name) != null and !isLoopbackHttpUrl(candidate)) {
-        return error.InvalidE2EGrokEndpoint;
-    }
-    return alloc.dupe(u8, candidate);
-}
-
-fn isLoopbackHttpUrl(url: []const u8) bool {
-    const uri = std.Uri.parse(url) catch return false;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") or
-        uri.user != null or
-        uri.password != null or
-        uri.port == null)
-    {
-        return false;
-    }
-    const host_component = uri.host orelse return false;
-    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host_name = host_component.toRaw(&host_buf) catch return false;
-    return std.mem.eql(u8, host_name, "127.0.0.1") or
-        std.ascii.eqlIgnoreCase(host_name, "localhost") or
-        std.mem.eql(u8, host_name, "[::1]");
+    return oauth.configuredEndpoint(alloc, env_name, default_url) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidE2EGrokEndpoint,
+    };
 }
 
 fn requestAccepted(
@@ -786,7 +706,7 @@ fn fetchAccountId(
 ) ![]u8 {
     const endpoint_url = try configuredEndpoint(alloc, e2e_userinfo_url_env, userinfo_url);
     defer alloc.free(endpoint_url);
-    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    const authorization = try alloc.print("Bearer {s}", .{access_token});
     defer secret.zeroAndFree(alloc, authorization);
     var response = try transport.execute(alloc, .{
         .method = .get,
@@ -853,12 +773,6 @@ fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const
     return alloc.dupe(u8, value.string);
 }
 
-fn requiredPositiveInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
-    const value = object.get(key) orelse return error.InvalidGrokOAuthResponse;
-    if (value != .integer or value.integer <= 0) return error.InvalidGrokOAuthResponse;
-    return value.integer;
-}
-
 const BrowserCallback = struct {
     code: []u8,
 
@@ -917,63 +831,10 @@ fn parseBrowserCallbackTarget(
 }
 
 fn queryValueAlloc(alloc: Allocator, query: []const u8, key: []const u8) ![]u8 {
-    var pairs = std.mem.splitScalar(u8, query, '&');
-    while (pairs.next()) |pair| {
-        const equals = std.mem.findScalar(u8, pair, '=') orelse continue;
-        if (!std.mem.eql(u8, pair[0..equals], key)) continue;
-        return percentDecodeAlloc(alloc, pair[equals + 1 ..]);
-    }
-    return error.InvalidGrokOAuthCallback;
-}
-
-fn percentDecodeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    var out = try alloc.alloc(u8, value.len);
-    errdefer alloc.free(out);
-    var read_index: usize = 0;
-    var write_index: usize = 0;
-    while (read_index < value.len) {
-        if (value[read_index] == '%') {
-            if (read_index + 2 >= value.len) return error.InvalidGrokOAuthCallback;
-            const high = std.fmt.charToDigit(value[read_index + 1], 16) catch
-                return error.InvalidGrokOAuthCallback;
-            const low = std.fmt.charToDigit(value[read_index + 2], 16) catch
-                return error.InvalidGrokOAuthCallback;
-            out[write_index] = @as(u8, @intCast(high * 16 + low));
-            read_index += 3;
-        } else {
-            out[write_index] = if (value[read_index] == '+') ' ' else value[read_index];
-            read_index += 1;
-        }
-        write_index += 1;
-    }
-    if (write_index == 0) return error.InvalidGrokOAuthCallback;
-    return alloc.realloc(out, write_index);
-}
-
-const FormBody = struct {
-    first: bool = true,
-
-    fn append(self: *FormBody, writer: *std.Io.Writer, key: []const u8, value: []const u8) !void {
-        if (!self.first) try writer.writeByte('&');
-        self.first = false;
-        try percentEncode(writer, key);
-        try writer.writeByte('=');
-        try percentEncode(writer, value);
-    }
-};
-
-fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
-    const hex = "0123456789ABCDEF";
-    for (value) |byte| {
-        const safe = std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~';
-        if (safe) {
-            try writer.writeByte(byte);
-        } else {
-            try writer.writeByte('%');
-            try writer.writeByte(hex[byte >> 4]);
-            try writer.writeByte(hex[byte & 0x0f]);
-        }
-    }
+    return oauth.queryValueNonEmptyAlloc(alloc, query, key) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidGrokOAuthCallback,
+    };
 }
 
 fn writeStdout(text: []const u8) !void {

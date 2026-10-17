@@ -40,23 +40,22 @@ pub const TickCallbacks = struct {
 };
 
 pub const SgrState = struct {
-    const CodeForeground = enum {
-        none,
-        dark,
-        light,
-        themed,
-    };
+    /// The tracked foreground open. Theme-owned slots re-resolve at restore
+    /// time so live theme flips retint mid-stream; anything else restores
+    /// with its original bytes.
+    const Foreground = enum { none, inline_code, link, other };
 
     bold: bool = false,
     dim: bool = false,
     italic: bool = false,
     underline: bool = false,
     strike: bool = false,
-    code_fg: CodeForeground = .none,
-    link_fg: bool = false,
+    fg: Foreground = .none,
+    fg_buf: [24]u8 = undefined,
+    fg_len: u8 = 0,
 
     pub fn isActive(self: SgrState) bool {
-        return self.bold or self.dim or self.italic or self.underline or self.strike or self.code_fg != .none or self.link_fg;
+        return self.bold or self.dim or self.italic or self.underline or self.strike or self.fg != .none;
     }
 
     /// Update based on a complete ANSI sequence (including `\x1b[` prefix and
@@ -74,31 +73,62 @@ pub const SgrState = struct {
         }
 
         // Exact full-body match against the known single-parameter codes the
-        // markdown renderer emits. Recognized multi-parameter SGRs are
-        // matched whole (e.g. "38;5;245"); anything else is ignored.
+        // markdown renderer emits; multi-parameter SGRs (e.g. "1;38;5;245")
+        // count for every attribute and the color they carry.
         if (std.mem.eql(u8, body, "1")) self.bold = true else if (std.mem.eql(u8, body, "2")) self.dim = true else if (std.mem.eql(u8, body, "3")) self.italic = true else if (std.mem.eql(u8, body, "4")) self.underline = true else if (std.mem.eql(u8, body, "9")) self.strike = true else if (std.mem.eql(u8, body, "22")) {
             self.bold = false;
             self.dim = false;
         } else if (std.mem.eql(u8, body, "23")) self.italic = false else if (std.mem.eql(u8, body, "24")) self.underline = false else if (std.mem.eql(u8, body, "29")) self.strike = false else if (std.mem.eql(u8, body, "39")) {
-            self.code_fg = .none;
-            self.link_fg = false;
-        } else if (std.mem.eql(u8, body, "38;5;245")) self.code_fg = .dark else if (std.mem.eql(u8, body, "38;5;247")) self.code_fg = .light else if (std.mem.eql(u8, seq, shared_theme.current().inline_code_open)) {
-            // Theme-supplied inline-code opens track as the themed variant and
-            // re-emit whatever the active theme holds at restore time.
-            self.code_fg = .themed;
-        } else if (std.mem.eql(u8, seq, shared_theme.current().link_style)) {
-            // The themed link color tracks the same way, so a link that opens
-            // a row still carries its color after the row-start restore.
-            self.link_fg = true;
+            self.fg = .none;
+        } else {
+            // Multi-parameter SGRs (e.g. "1;38;5;245") apply each attribute
+            // they carry; color-spec parameters are not attributes.
+            if (std.mem.findScalar(u8, body, ';') != null) {
+                var params = std.mem.splitScalar(u8, body, ';');
+                while (params.next()) |param| {
+                    if (std.mem.eql(u8, param, "38") or std.mem.eql(u8, param, "48")) {
+                        // Skip the color space and value parameters so their
+                        // digits are not mistaken for attributes.
+                        if (params.next()) |space| {
+                            const skip: usize = if (std.mem.eql(u8, space, "2")) 3 else 1;
+                            for (0..skip) |_| _ = params.next();
+                        }
+                        continue;
+                    }
+                    if (std.mem.eql(u8, param, "1")) self.bold = true else if (std.mem.eql(u8, param, "2")) self.dim = true else if (std.mem.eql(u8, param, "3")) self.italic = true else if (std.mem.eql(u8, param, "4")) self.underline = true else if (std.mem.eql(u8, param, "9")) self.strike = true;
+                }
+            }
+            if (hasForegroundColor(body)) {
+                if (std.mem.eql(u8, seq, shared_theme.current().inline_code_open)) {
+                    self.fg = .inline_code;
+                } else if (std.mem.eql(u8, seq, shared_theme.current().link_style)) {
+                    self.fg = .link;
+                } else if (seq.len <= self.fg_buf.len) {
+                    @memcpy(self.fg_buf[0..seq.len], seq);
+                    self.fg_len = @intCast(seq.len);
+                    self.fg = .other;
+                }
+            }
         }
+    }
+
+    /// True when the SGR body sets a foreground color (a 38-prefixed extended
+    /// color or a basic 30-37/90-97), including combined forms like 1;38;5;245.
+    fn hasForegroundColor(body: []const u8) bool {
+        var it = std.mem.splitScalar(u8, body, ';');
+        while (it.next()) |param| {
+            if (std.mem.eql(u8, param, "38")) return true;
+            const value = std.fmt.parseInt(u8, param, 10) catch continue;
+            if ((value >= 30 and value <= 37) or (value >= 90 and value <= 97)) return true;
+        }
+        return false;
     }
 
     /// Serialize open codes for the currently-active attributes into `buf`.
     /// Returns the number of bytes written. The caller sizes `buf` for five
-    /// 4-byte attribute opens plus the active code-foreground open (the theme
-    /// builder bounds slot escapes); an oversized open is truncated by the
-    /// bounds check, degrading restore to pre-fix behavior rather than
-    /// corrupting the frame.
+    /// 4-byte attribute opens plus the active foreground open (bounded at 24
+    /// bytes); an oversized open is truncated by the bounds check, degrading
+    /// restore to pre-fix behavior rather than corrupting the frame.
     pub fn writeOpens(self: SgrState, buf: []u8) usize {
         var n: usize = 0;
         const append = struct {
@@ -114,13 +144,12 @@ pub const SgrState = struct {
         if (self.italic) append(buf, &n, "\x1b[3m");
         if (self.underline) append(buf, &n, "\x1b[4m");
         if (self.strike) append(buf, &n, "\x1b[9m");
-        switch (self.code_fg) {
+        switch (self.fg) {
             .none => {},
-            .dark => append(buf, &n, "\x1b[38;5;245m"),
-            .light => append(buf, &n, "\x1b[38;5;247m"),
-            .themed => append(buf, &n, shared_theme.current().inline_code_open),
+            .inline_code => append(buf, &n, shared_theme.current().inline_code_open),
+            .link => append(buf, &n, shared_theme.current().link_style),
+            .other => append(buf, &n, self.fg_buf[0..self.fg_len]),
         }
-        if (self.link_fg) append(buf, &n, shared_theme.current().link_style);
         return n;
     }
 };
@@ -169,8 +198,10 @@ pub const AssistantPacer = struct {
     pub fn pause(_: *AssistantPacer, _: i128) void {}
 
     pub fn rethemeInlineCode(self: *AssistantPacer, light: bool) void {
-        const from = if (light) "\x1b[38;5;245m" else "\x1b[38;5;247m";
-        const to = if (light) "\x1b[38;5;247m" else "\x1b[38;5;245m";
+        const from = shared_theme.builtin(!light).inline_code_open;
+        const to = shared_theme.builtin(light).inline_code_open;
+        // The rewrite is in place, so both builtin opens must be the same length.
+        comptime std.debug.assert(shared_theme.fx_dark.inline_code_open.len == shared_theme.fx_light.inline_code_open.len);
 
         var index: usize = 0;
         while (index + from.len <= self.pending.items.len) {
@@ -182,12 +213,8 @@ pub const AssistantPacer = struct {
             }
         }
 
-        switch (self.sgr.code_fg) {
-            // Themed opens re-emit from the active theme at restore time, so
-            // there is nothing to rewrite here.
-            .none, .themed => {},
-            .dark, .light => self.sgr.code_fg = if (light) .light else .dark,
-        }
+        // Theme-owned opens re-emit from the active theme at restore time, so
+        // there is nothing to rewrite in the tracker itself.
     }
 
     pub fn deferFinish(self: *AssistantPacer, alloc: Allocator, finished: FinishedPrompt) !bool {
@@ -391,7 +418,7 @@ pub const AssistantPacer = struct {
     fn consume(self: *AssistantPacer, byte_count: usize) void {
         const remaining = self.pending.items.len - byte_count;
         if (remaining > 0) {
-            std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[byte_count..]);
+            @memmove(self.pending.items[0..remaining], self.pending.items[byte_count..]);
         }
         self.pending.items.len = remaining;
     }
@@ -942,7 +969,7 @@ test "theme-supplied inline code color is restored across rendered blocks" {
     try pacer.enqueue(alloc, "\x1b[39m done");
     try pacer.tick(alloc, 1, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         cap.emitted.items,
         "code\x1b[0m\x1b[38;2;130;210;206m\x1b[39m done",
@@ -956,13 +983,13 @@ test "code style is restored across rendered blocks" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "\x1b[38;5;245mcode");
+    try pacer.enqueue(alloc, "\x1b[38;5;255mcode");
     try pacer.tick(alloc, 0, cap.callbacks());
     try pacer.enqueue(alloc, "\x1b[39m done");
     try pacer.tick(alloc, 1, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "code\x1b[0m\x1b[38;5;245m\x1b[39m done") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "code\x1b[0m\x1b[38;5;255m\x1b[39m done") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[39m") != null);
 }
 
 test "light code style is restored across rendered blocks" {
@@ -972,17 +999,17 @@ test "light code style is restored across rendered blocks" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "\x1b[38;5;247mcode");
+    try pacer.enqueue(alloc, "\x1b[38;5;235mcode");
     try pacer.tick(alloc, 0, cap.callbacks());
     try pacer.enqueue(alloc, "\x1b[39m done");
     try pacer.tick(alloc, 1, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         cap.emitted.items,
-        "code\x1b[0m\x1b[38;5;247m\x1b[39m done",
+        "code\x1b[0m\x1b[38;5;235m\x1b[39m done",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[39m") != null);
 }
 
 test "theme change retints active code before the next block" {
@@ -992,17 +1019,22 @@ test "theme change retints active code before the next block" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "\x1b[38;5;245mcode");
+    try pacer.enqueue(alloc, "\x1b[38;5;255mcode");
     try pacer.tick(alloc, 0, cap.callbacks());
     const emitted_before_theme_change = cap.emitted.items.len;
 
+    // Production flips the active theme first; the pacer's restore re-resolves
+    // theme-owned opens against it.
+    const previous = shared_theme.current();
+    defer shared_theme.activate(previous);
+    shared_theme.activate(shared_theme.fx_light);
     pacer.rethemeInlineCode(true);
     try pacer.enqueue(alloc, "\x1b[39m");
     try pacer.tick(alloc, 1, cap.callbacks());
 
     const after_theme_change = cap.emitted.items[emitted_before_theme_change..];
-    try std.testing.expect(std.mem.indexOf(u8, after_theme_change, "\x1b[0m\x1b[38;5;247m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_theme_change, "\x1b[38;5;245m") == null);
+    try std.testing.expect(std.mem.find(u8, after_theme_change, "\x1b[0m\x1b[38;5;235m") != null);
+    try std.testing.expect(std.mem.find(u8, after_theme_change, "\x1b[38;5;255m") == null);
 }
 
 test "theme change retints a queued inline code opener before it is emitted" {
@@ -1012,12 +1044,12 @@ test "theme change retints a queued inline code opener before it is emitted" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    try pacer.enqueue(alloc, "x\x1b[38;5;247mcode\x1b[39m");
+    try pacer.enqueue(alloc, "x\x1b[38;5;235mcode\x1b[39m");
     pacer.rethemeInlineCode(false);
     try pacer.tick(alloc, 0, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;245m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;247m") == null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[38;5;255m") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[38;5;235m") == null);
 }
 
 test "underline style is restored across rendered blocks" {
@@ -1032,7 +1064,7 @@ test "underline style is restored across rendered blocks" {
     try pacer.enqueue(alloc, "\x1b[24m");
     try pacer.tick(alloc, 1, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         cap.emitted.items,
         "Heading\x1b[0m\x1b[4m\x1b[24m",
@@ -1091,17 +1123,38 @@ test "link color is tracked and restored like the themed inline-code color" {
     var sgr: SgrState = .{};
     sgr.apply("\x1b[4m");
     sgr.apply(link_open);
-    try std.testing.expect(sgr.link_fg);
+    try std.testing.expect(sgr.fg == .link);
     try std.testing.expect(sgr.isActive());
 
     var opens: [96]u8 = undefined;
     const opens_len = sgr.writeOpens(&opens);
     const serialized = opens[0..opens_len];
-    try std.testing.expect(std.mem.indexOf(u8, serialized, "\x1b[4m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, serialized, link_open) != null);
+    try std.testing.expect(std.mem.find(u8, serialized, "\x1b[4m") != null);
+    try std.testing.expect(std.mem.find(u8, serialized, link_open) != null);
 
     sgr.apply("\x1b[39m");
-    try std.testing.expect(!sgr.link_fg);
+    try std.testing.expect(sgr.fg == .none);
     sgr.apply("\x1b[24m");
     try std.testing.expect(!sgr.isActive());
+}
+
+test "any foreground color restores after a row reset, not just known opens" {
+    var sgr: SgrState = .{};
+    sgr.apply("\x1b[38;5;204m");
+    try std.testing.expect(sgr.fg == .other);
+
+    var opens: [32]u8 = undefined;
+    const opens_len = sgr.writeOpens(&opens);
+    try std.testing.expectEqualStrings("\x1b[38;5;204m", opens[0..opens_len]);
+
+    // Combined forms carry the color with the attribute.
+    sgr.apply("\x1b[1;38;2;255;0;0m");
+    try std.testing.expect(sgr.fg == .other);
+    try std.testing.expect(sgr.bold);
+    const combined_len = sgr.writeOpens(&opens);
+    try std.testing.expectEqualStrings("\x1b[1m\x1b[1;38;2;255;0;0m", opens[0..combined_len]);
+
+    sgr.apply("\x1b[39m");
+    try std.testing.expect(sgr.fg == .none);
+    try std.testing.expect(sgr.bold);
 }

@@ -33,6 +33,9 @@ pub const CliModelCatalogResult = union(enum) {
     loaded: struct {
         /// Owned model id strings; the caller frees them with `collections.freeStringList`.
         ids: std.ArrayList([]u8),
+        /// Owned catalog entries behind `ids`, from a provider whose catalog carries model
+        /// metadata; empty otherwise. The caller frees them with `model_catalog.freeModelCatalog`.
+        entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
         provenance: model_catalog.Provenance,
     },
     failure: model_catalog.FailedOutcome,

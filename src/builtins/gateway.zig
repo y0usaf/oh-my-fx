@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const builtin = @import("builtin");
 
 pub const permission_reviewer = @import("gateway/permission_reviewer.zig");
@@ -16,18 +17,15 @@ const gateway_client = @import("../gateway/client.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
-const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
-const credential_authority = @import("../core/auth/credential_authority.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const vercel_model_policy = @import("../gateway/vercel_model_policy.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
 const shared_types = @import("../core/shared/types.zig");
-const session_usage = @import("../core/session/session_usage.zig");
 const web_search_contract = @import("../core/tooling/web_search_contract.zig");
 const web_search_policy = @import("../core/tooling/web_search_policy.zig");
 const web_search_provider = @import("../core/tooling/web_search_provider.zig");
@@ -42,7 +40,7 @@ const Request = web_search_contract.ProviderRequest;
 const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
 
-pub const default_model = "moonshotai/kimi-k3";
+pub const default_model = "spacexai/grok-4.7";
 pub const title_model = "openai/gpt-5.6-luna";
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
@@ -147,8 +145,6 @@ pub const oauth_transport_provider = oauth_transport.Provider{
     .execute_fn = executeOAuthRequest,
 };
 
-pub const generation_usage_provider = gateway_generation_usage.provider;
-
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
     .build_request_fn = buildAgentRequestForProvider,
@@ -165,7 +161,6 @@ pub const provider_bundle = provider_set.Bundle{
     .cli_model_catalog = cli_model_catalog_provider,
     .model_catalog = model_catalog_provider,
     .permission_reviewer = permission_reviewer.provider,
-    .deferred_usage = generation_usage_provider,
     .credits = credits_provider,
     .fx_search = default_web_search_provider,
 };
@@ -637,7 +632,7 @@ fn streamAgentCompletion(
     else
         vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
     if (result.status != .ok) return .{ .failed = .{
-        .kind = failureKind(result.status),
+        .kind = gatewayFailureKind(alloc, result.status, result.err_body),
         .detail = result.err_body,
         .diagnostics = .{
             .schema = diagnostics.schema,
@@ -648,41 +643,8 @@ fn streamAgentCompletion(
     } };
     return .{ .completed = .{
         .completion = result.completion,
-        .usage = gatewayUsageOutcome(request, result.completion),
         .ownership = .owned,
     } };
-}
-
-fn gatewayUsageOutcome(
-    request: agent_stream_provider_contract.ModelRequest,
-    completion: shared_types.ModelCompletion,
-) agent_stream_provider_contract.UsageOutcome {
-    const reference = gatewayUsageReference(request, completion) orelse
-        return .{ .unavailable = .possibly_billed };
-    return if (completion.billing != null)
-        .{ .exact = .gateway }
-    else
-        .{ .deferred = reference };
-}
-
-fn gatewayUsageReference(
-    request: agent_stream_provider_contract.ModelRequest,
-    completion: shared_types.ModelCompletion,
-) ?agent_stream_provider_contract.DeferredUsageReference {
-    const generation_id = completion.generation_id orelse return null;
-    const source = request.credential.credentialSource() orelse return null;
-    return .{
-        .provider = .gateway,
-        .generation_id = generation_id,
-        .scope = gateway_client.generationBaseUrl(),
-        .tenant = request.credential.tenant(),
-        .account_id = request.credential.accountId(),
-        .credential_source = source,
-        .credential_identity = credential_authority.derive(
-            source,
-            request.credential.accountId(),
-        ),
-    };
 }
 
 const EventBridge = struct {
@@ -706,6 +668,25 @@ const EventBridge = struct {
         sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
     }
 };
+
+/// Gateway reports the last provider it tried, so a provider's size rejection
+/// can arrive as a 400 from a later fallback. Classify it as too large.
+fn gatewayFailureKind(alloc: Allocator, status: std.http.Status, err_body: ?[]const u8) agent_stream_provider_contract.FailureKind {
+    const kind = failureKind(status);
+    if (kind != .invalid_request) return kind;
+    const body = err_body orelse return kind;
+    return if (vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind;
+}
+
+test "Gateway 400 with a provider 413 attempt is a size failure" {
+    const alloc = std.testing.allocator;
+    const fallback_body = "{\"providerMetadata\":{\"gateway\":{\"routing\":{\"modelAttempts\":[{\"providerAttempts\":[{\"statusCode\":413},{\"statusCode\":400}]}]}}}}";
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .bad_request, fallback_body));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, "AI_APICallError: Bad Request"));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, null));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .payload_too_large, null));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, fallback_body));
+}
 
 fn failureKind(status: std.http.Status) agent_stream_provider_contract.FailureKind {
     return switch (status) {
@@ -756,7 +737,7 @@ fn fetchCreditsWithFetch(
     defer if (team_path) |path| alloc.free(path);
     if (gateway_team) |team| {
         if (shared_types.validGatewayTeam(team)) {
-            team_path = std.fmt.allocPrint(alloc, "{s}?teamId={s}", .{ credits_path, team }) catch {
+            team_path = alloc.print("{s}?teamId={s}", .{ credits_path, team }) catch {
                 return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
             };
         } else {
@@ -966,8 +947,6 @@ fn executeWebSearchProvider(
         .model = inputs.worker_model,
         .retry_count = inputs.gateway_retry_count,
         .chat_url = inputs.gateway_chat_url,
-        .usage = inputs.usage,
-        .usage_allocator = inputs.usage_allocator,
     }, request, on_progress, progress_ctx);
 }
 
@@ -997,14 +976,17 @@ fn fetchCliModelCatalog(
     return switch (result) {
         .loaded => |loaded| project: {
             var catalog = loaded.catalog;
-            defer freeModelCatalog(alloc, &catalog);
-            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch return .{ .failure = .{
-                .access = loaded.provenance.access,
-                .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
-                .failure = .{ .category = .resource_exhausted },
-            } };
+            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch {
+                freeModelCatalog(alloc, &catalog);
+                break :project .{ .failure = .{
+                    .access = loaded.provenance.access,
+                    .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
+                    .failure = .{ .category = .resource_exhausted },
+                } };
+            };
             break :project .{ .loaded = .{
                 .ids = ids,
+                .entries = catalog,
                 .provenance = loaded.provenance,
             } };
         },
@@ -1044,8 +1026,6 @@ pub const GatewayWorkerConfig = struct {
     model: []const u8,
     retry_count: usize,
     chat_url: []const u8,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
     stream_ctx: *anyopaque = @ptrCast(&default_stream_ctx),
     stream_fn: StreamFn = streamGatewayWorker,
 };
@@ -1092,10 +1072,9 @@ pub fn executeGatewayWorker(
     const payload = try vercel_protocol.buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(alloc, tools_json, &messages, request.max_output_tokens);
     defer alloc.free(payload);
 
-    const usage_observation = try session_usage.InvocationObservation.begin(config.usage);
     var delivery = gateway_client.DeliveryCertainty.init();
     const provider_tool_name = try selectedToolName(request.backend);
-    var stream = config.stream_fn(
+    var stream = try config.stream_fn(
         config.stream_ctx,
         alloc,
         config.api_key orelse "",
@@ -1108,66 +1087,10 @@ pub fn executeGatewayWorker(
         deadline,
         &delivery,
         @constCast(request.cancel_flag),
-    ) catch |err| {
-        try usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled);
-        return err;
-    };
+    );
     defer stream.deinit(alloc);
-    const usage_outcome = gatewayWorkerUsageOutcome(config, stream.completion);
-    if (stream.status == .ok) {
-        try usage_observation.complete(
-            config.usage_allocator,
-            stream.completion,
-            usage_outcome,
-        );
-    } else {
-        try usage_observation.fail(.unbilled);
-    }
-    if (!builtin.is_test and stream.status == .ok and std.meta.activeTag(usage_outcome) == .deferred) {
-        if (config.usage) |ledger| {
-            if (config.api_key) |api_key| {
-                ledger.startDeferredReconciliation(
-                    config.usage_allocator,
-                    usage_outcome.deferred,
-                    api_key,
-                );
-            } else if (config.credential_source == .host_managed) {
-                ledger.startHostManagedDeferredReconciliation(
-                    config.usage_allocator,
-                    usage_outcome.deferred,
-                );
-            }
-        }
-    }
     if (stream.status != .ok) return error.GatewayRequestFailed;
     return normalizeGatewayCompletion(alloc, request, stream.completion, on_progress, progress_ctx);
-}
-
-fn gatewayWorkerUsageOutcome(
-    config: GatewayWorkerConfig,
-    completion: shared_types.ModelCompletion,
-) agent_stream_provider_contract.UsageOutcome {
-    const generation_id = completion.generation_id orelse
-        return .{ .unavailable = .possibly_billed };
-    const source = config.credential_source orelse .ai_gateway_api_key;
-    const reference = agent_stream_provider_contract.DeferredUsageReference{
-        .provider = .gateway,
-        .generation_id = generation_id,
-        .scope = gateway_client.generationBaseUrl(),
-        .tenant = config.team,
-        .credential_source = source,
-        .credential_identity = credential_authority.derive(
-            source,
-            null,
-        ),
-    };
-    return if (completion.billing != null)
-        .{ .exact = .gateway }
-    else
-        .{ .deferred = reference };
 }
 
 fn deadlineAfterMs(timeout_ms: u32) std.Io.Clock.Timestamp {
@@ -1273,16 +1196,14 @@ fn normalizeGatewayCompletion(
             break :blk false;
         },
         .reject_malformed_identity => |failure| blk: {
-            try content.append(alloc, .{ .error_text = try std.fmt.allocPrint(
-                alloc,
+            try content.append(alloc, .{ .error_text = try alloc.print(
                 "provider search tool identity is malformed ({s})",
                 .{@tagName(failure)},
             ) });
             break :blk false;
         },
         .reject_unstorable_identity => |failure| blk: {
-            const detail = try std.fmt.allocPrint(
-                alloc,
+            const detail = try alloc.print(
                 "provider search tool identity cannot be stored ({s}: {s})",
                 .{ @tagName(failure.field), @tagName(failure.reason) },
             );
@@ -1291,8 +1212,7 @@ fn normalizeGatewayCompletion(
             break :blk false;
         },
         .reject_malformed_provider_result => |failure| blk: {
-            try content.append(alloc, .{ .error_text = try std.fmt.allocPrint(
-                alloc,
+            try content.append(alloc, .{ .error_text = try alloc.print(
                 "provider search result identity is malformed ({s})",
                 .{@tagName(failure)},
             ) });
@@ -1329,7 +1249,7 @@ fn normalizeGatewayCompletion(
                     search_requests += 1;
                     map_result: {
                         const hits = parseSearchHits(alloc, provider_result, request.max_results) catch |err| {
-                            try content.append(alloc, .{ .error_text = try std.fmt.allocPrint(alloc, "provider search result decode failed: {s}", .{@errorName(err)}) });
+                            try content.append(alloc, .{ .error_text = try alloc.print("provider search result decode failed: {s}", .{@errorName(err)}) });
                             break :map_result;
                         };
                         errdefer deinitHits(alloc, hits);
@@ -1459,7 +1379,7 @@ fn writePerplexityDomains(alloc: Allocator, writer: *std.Io.Writer, domains: []c
     for (domains, 0..) |domain, index| {
         if (index > 0) try writer.writeByte(',');
         if (blocked) {
-            const prefixed = try std.fmt.allocPrint(alloc, "-{s}", .{domain});
+            const prefixed = try alloc.print("-{s}", .{domain});
             defer alloc.free(prefixed);
             try std.json.Stringify.value(prefixed, .{}, writer);
         } else {
@@ -1653,16 +1573,12 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
     const alloc = std.testing.allocator;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var fake = FakeStream{};
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
     var response = try executeGatewayWorker(alloc, .{
         .api_key = "key",
         .team = "team_123",
         .model = "provider/model",
         .retry_count = 1,
         .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
-        .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     }, .{
@@ -1686,9 +1602,6 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
     try std.testing.expect(fake.saw_output_bound);
     try std.testing.expect(fake.saw_required_tool_choice);
     try std.testing.expect(fake.saw_expected_provider_tool);
-    var usage_snapshot = try usage.snapshot(alloc);
-    defer usage_snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), usage_snapshot.pending.len);
     if (backend.eql(exa_search_backend_id)) {
         try std.testing.expect(fake.saw_exa);
         try std.testing.expect(!fake.saw_perplexity);
@@ -1740,8 +1653,7 @@ test "gateway worker returns one bounded error for malformed provider result ide
 
         try std.testing.expectEqual(@as(usize, 1), response.content.len);
         try std.testing.expect(response.content[0] == .error_text);
-        const expected = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const expected = try std.testing.allocator.print(
             "provider search result identity is malformed ({s})",
             .{@tagName(failure)},
         );
@@ -1752,11 +1664,11 @@ test "gateway worker returns one bounded error for malformed provider result ide
 }
 
 test "gateway worker rejects unstorable provider identities without returning search results" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectUnstorableProviderIdentity, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, expectUnstorableProviderIdentity, .{});
 }
 
 fn expectUnstorableProviderIdentity(alloc: Allocator) !void {
-    const oversized = [_]u8{'i'} ** 257;
+    const oversized: [257]u8 = @splat('i');
     var cancel_flag = std.atomic.Value(bool).init(false);
     var response = try normalizeGatewayCompletion(alloc, .{
         .backend = perplexity_search_backend_id,
@@ -1995,20 +1907,16 @@ const FakeStream = struct {
     }
 };
 
-test "pre-send web search failure stays unbilled" {
+test "a web search that fails before sending returns its error" {
     const alloc = std.testing.allocator;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var fake = FakeStream{ .fail_before_send = true };
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
 
     try std.testing.expectError(error.AccessDenied, executeGatewayWorker(alloc, .{
         .api_key = "key",
         .model = "provider/model",
         .retry_count = 1,
         .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
-        .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     }, .{
@@ -2016,28 +1924,18 @@ test "pre-send web search failure stays unbilled" {
         .query = "latest Zig release",
         .cancel_flag = &cancel_flag,
     }, null, null));
-
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
-    try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
 
-test "possibly sent web search failure marks billing incomplete" {
+test "a web search that fails after sending returns its error" {
     const alloc = std.testing.allocator;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var fake = FakeStream{ .fail_after_send = true };
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
 
     try std.testing.expectError(error.ConnectionResetByPeer, executeGatewayWorker(alloc, .{
         .api_key = "key",
         .model = "provider/model",
         .retry_count = 1,
         .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
-        .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     }, .{
@@ -2045,16 +1943,10 @@ test "possibly sent web search failure marks billing incomplete" {
         .query = "latest Zig release",
         .cancel_flag = &cancel_flag,
     }, null, null));
-
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
-    try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
 
 test "built-in gateway defaults preserve active provider policy" {
-    try std.testing.expectEqualStrings("moonshotai/kimi-k3", default_model);
+    try std.testing.expectEqualStrings("spacexai/grok-4.7", default_model);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v4/ai/language-model", default_chat_url);
     try std.testing.expectEqualStrings("/coding-agent/v1/models", models_path);
     try std.testing.expectEqual(@as(usize, 3), retry_count);
@@ -2489,7 +2381,13 @@ fn fetchModelCatalogResponse(
         gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url);
 }
 
-fn modelCatalogTeamPath(
+/// The catalog follows the same team contract as `/v1/credits`: it rejects an
+/// fx login unless the request names the team in a `teamId` query value, and
+/// the `x-vercel-ai-gateway-team` header does not satisfy it. Other
+/// credentials carry their team in that header. Every catalog transport builds
+/// its request from this function and `modelCatalogHeaderTeam` so they agree.
+/// Returns a caller-owned path, or null when `path` is used unchanged.
+pub fn modelCatalogTeamPath(
     alloc: Allocator,
     path: []const u8,
     access: credentials.CatalogAccess,
@@ -2497,12 +2395,43 @@ fn modelCatalogTeamPath(
     if (access.credentialSource() != .fx_login) return null;
     const team = access.teamContext() orelse return null;
     if (!shared_types.validGatewayTeam(team)) return null;
-    return try std.fmt.allocPrint(alloc, "{s}?teamId={s}", .{ path, team });
+    return try alloc.print("{s}?teamId={s}", .{ path, team });
 }
 
-fn modelCatalogHeaderTeam(access: credentials.CatalogAccess) ?[]const u8 {
+/// Returns the `x-vercel-ai-gateway-team` value for a catalog request, borrowed
+/// from `access`, or null for an fx login, whose team travels in the query.
+pub fn modelCatalogHeaderTeam(access: credentials.CatalogAccess) ?[]const u8 {
     if (access.credentialSource() == .fx_login) return null;
     return access.teamContext();
+}
+
+test "model catalog names an fx login team in the query and other teams in the header" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        access: credentials.CatalogAccess,
+        path: ?[]const u8,
+        header: ?[]const u8,
+    }{
+        .{ .access = credentials.catalogAccessForCredential(.fx_login, "login-token", "team_123"), .path = models_path ++ "?teamId=team_123", .header = null },
+        .{ .access = credentials.catalogAccessForCredential(.fx_login, "login-token", "team a/../b"), .path = null, .header = null },
+        .{ .access = credentials.catalogAccessForCredential(.fx_login, "login-token", null), .path = null, .header = null },
+        .{ .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "api-key", "team_123"), .path = null, .header = "team_123" },
+        .{ .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "api-key", null), .path = null, .header = null },
+    };
+    for (cases) |case| {
+        const path = try modelCatalogTeamPath(alloc, models_path, case.access);
+        defer if (path) |owned| alloc.free(owned);
+        if (case.path) |want| {
+            try std.testing.expectEqualStrings(want, path orelse return error.TestExpectedTeamPath);
+        } else {
+            try std.testing.expect(path == null);
+        }
+        if (case.header) |want| {
+            try std.testing.expectEqualStrings(want, modelCatalogHeaderTeam(case.access) orelse return error.TestExpectedHeaderTeam);
+        } else {
+            try std.testing.expect(modelCatalogHeaderTeam(case.access) == null);
+        }
+    }
 }
 
 fn catalogRequestFailure(err: anyerror) model_catalog.Failure {
@@ -2553,7 +2482,7 @@ fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]con
         break :blk default_model_catalog_base_url;
     } else default_model_catalog_base_url;
 
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, path });
+    return alloc.print("{s}{s}", .{ base_url, path });
 }
 
 var stable_models_test_environ: ?*std.process.Environ.Map = null;
@@ -2596,8 +2525,7 @@ const ModelsUrlTestEnv = struct {
 };
 
 fn installLoopbackModelsEnv(alloc: std.mem.Allocator, port: u16) !*ModelsUrlTestEnv {
-    const models_url = try std.fmt.allocPrint(
-        alloc,
+    const models_url = try alloc.print(
         "http://127.0.0.1:{d}/v1/models",
         .{port},
     );
@@ -2859,15 +2787,19 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     errdefer alloc.free(id);
     const owned_model_type = try alloc.dupe(u8, model_type);
     errdefer alloc.free(owned_model_type);
+    const name = try parseModelName(alloc, entry.object.get("name"));
+    errdefer if (name) |value| alloc.free(value);
 
     return .{
         .id = id,
+        .name = name,
         .model_type = owned_model_type,
         .released = released,
         .has_tool_use = has_tool_use,
         .has_reasoning = has_reasoning,
         .reasoning_efforts = reasoning_efforts,
         .supports_fast_mode = supports_fast_mode,
+        .supports_ultrafast_mode = supportsUltrafastMode(entry.object),
         .has_vision = has_vision,
         .has_file_input = has_file_input,
         .has_web_search = has_web_search,
@@ -2877,6 +2809,15 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
     };
+}
+
+/// The catalog's display name without surrounding whitespace; null when it is missing, not a string, or blank.
+fn parseModelName(alloc: std.mem.Allocator, value: ?std.json.Value) !?[]u8 {
+    const raw = value orelse return null;
+    if (raw != .string) return null;
+    const trimmed = std.mem.trim(u8, raw.string, &std.ascii.whitespace);
+    if (trimmed.len == 0) return null;
+    return try alloc.dupe(u8, trimmed);
 }
 
 fn parseReasoningEfforts(alloc: std.mem.Allocator, options: ?std.json.Value) !std.ArrayList(shared_types.ReasoningEffort) {
@@ -2923,6 +2864,65 @@ fn supportsFastMode(entry: std.json.ObjectMap) bool {
     const owned_by = entry.get("owned_by") orelse return false;
     if (owned_by != .string or !std.ascii.eqlIgnoreCase(owned_by.string, "openai")) return false;
     return hasObjectField(objectField(pricing, "service_tiers"), "priority");
+}
+
+fn supportsUltrafastMode(entry: std.json.ObjectMap) bool {
+    const owner = entry.get("owned_by") orelse return false;
+    if (owner != .string or !std.ascii.eqlIgnoreCase(owner.string, "openai")) return false;
+    const pricing = entry.get("pricing");
+    const tier = objectField(objectField(pricing, "service_tiers"), "ultrafast") orelse return false;
+    if (!positivePrice(objectField(tier, "input")) or !positivePrice(objectField(tier, "output"))) return false;
+    if (objectField(pricing, "input_cache_read") != null and !positivePrice(objectField(tier, "input_cache_read"))) return false;
+    return true;
+}
+
+fn positivePrice(value: ?std.json.Value) bool {
+    const actual = value orelse return false;
+    const price: f64 = switch (actual) {
+        .string => std.fmt.parseFloat(f64, actual.string) catch return false,
+        .float => actual.float,
+        .integer => @floatFromInt(actual.integer),
+        else => return false,
+    };
+    return std.math.isFinite(price) and price > 0;
+}
+
+test "Ultrafast catalog support requires OpenAI priced metadata rather than model names or tags" {
+    const json =
+        \\{"data":[
+        \\{"id":"openai/gpt-6-astra","type":"language","owned_by":"openai","pricing":{"input_cache_read":"0.000001","service_tiers":{"ultrafast":{"input":"0.00006","output":"0.0003","input_cache_read":"0.000006"}}}},
+        \\{"id":"openai/gpt-5.6-sol","type":"language","owned_by":"openai","tags":["ultrafast"],"pricing":{"service_tiers":{"priority":{"input":"0.1","output":"0.2"}}}},
+        \\{"id":"openai/incomplete","type":"language","owned_by":"openai","pricing":{"service_tiers":{"ultrafast":{"input":"0.1"}}}},
+        \\{"id":"provider/model","type":"language","owned_by":"provider","pricing":{"service_tiers":{"ultrafast":{"input":"0.1","output":"0.2"}}}}
+        \\]}
+    ;
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
+    for (catalog.items) |entry| {
+        try std.testing.expectEqual(std.mem.eql(u8, entry.id, "openai/gpt-6-astra"), entry.supports_ultrafast_mode);
+    }
+}
+
+test "Gateway catalog entries keep the trimmed display name" {
+    const json =
+        \\{"data":[
+        \\{"id":"openai/gpt-6-astra","name":"GPT-6 Astra ","type":"language"},
+        \\{"id":"provider/blank","name":"  ","type":"language"},
+        \\{"id":"provider/unnamed","type":"language"},
+        \\{"id":"provider/numeric","name":7,"type":"language"}
+        \\]}
+    ;
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
+    for (catalog.items) |entry| {
+        if (std.mem.eql(u8, entry.id, "openai/gpt-6-astra")) {
+            try std.testing.expectEqualStrings("GPT-6 Astra", entry.name.?);
+        } else {
+            try std.testing.expectEqual(@as(?[]u8, null), entry.name);
+        }
+    }
 }
 
 fn objectField(value: ?std.json.Value, key: []const u8) ?std.json.Value {

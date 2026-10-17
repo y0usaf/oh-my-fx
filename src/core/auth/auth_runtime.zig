@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const api_key_validator = @import("api_key_validator.zig");
 const auth_transition = @import("auth_transition.zig");
 const credentials = @import("credentials.zig");
@@ -152,7 +153,7 @@ pub const FailureSnapshot = struct {
             },
         });
         if (self.http_status) |status| {
-            try out.writer.print(" · HTTP {d}", .{@intFromEnum(status)});
+            try out.writer.print(" · HTTP {d}", .{@backingInt(status)});
         }
         return try out.toOwnedSlice();
     }
@@ -172,7 +173,7 @@ pub const FailureSnapshot = struct {
         try writer.writeAll(",\"reason\":");
         try std.json.Stringify.value(@tagName(self.reason), .{}, writer);
         if (self.http_status) |status| {
-            try writer.print(",\"http_status\":{d}", .{@intFromEnum(status)});
+            try writer.print(",\"http_status\":{d}", .{@backingInt(status)});
         }
         try writer.writeByte('}');
     }
@@ -196,7 +197,7 @@ fn stampNowMs() u32 {
 }
 
 fn noteRequestPathCredentialVerified(source: credentials.Source) void {
-    request_path_verified_source.store(@intFromEnum(source), .seq_cst);
+    request_path_verified_source.store(@backingInt(source), .seq_cst);
     request_path_verified_ms.store(stampNowMs(), .seq_cst);
 }
 
@@ -206,7 +207,7 @@ fn noteRequestPathCredentialVerified(source: credentials.Source) void {
 pub fn requestPathCredentialVerifiedRecently(source: credentials.Source) bool {
     const verified_ms = request_path_verified_ms.load(.seq_cst);
     if (verified_ms == 0) return false;
-    if (request_path_verified_source.load(.seq_cst) != @intFromEnum(source)) return false;
+    if (request_path_verified_source.load(.seq_cst) != @backingInt(source)) return false;
     return stampNowMs() -% verified_ms < request_path_verified_window_ms;
 }
 
@@ -412,8 +413,8 @@ pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
 pub fn preparationFailureText(alloc: Allocator, provider: model_provider.ProviderId, err: anyerror) ![]u8 {
     const label = provider_catalog.label(provider);
     const failure = classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
-    const normalized = preparationError(failure) orelse return std.fmt.allocPrint(alloc, "{s} requires a new sign-in.", .{label});
-    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ label, preparationFailureNotice(normalized).? });
+    const normalized = preparationError(failure) orelse return alloc.print("{s} requires a new sign-in.", .{label});
+    return alloc.print("{s}: {s}", .{ label, preparationFailureNotice(normalized).? });
 }
 
 test "credential preparation blocks an unavailable explicit source" {
@@ -855,6 +856,82 @@ const PromptCredentialRefreshTask = struct {
         if (self.expected_account_id) |account_id| alloc.free(account_id);
         self.expected_account_id = null;
         alloc.destroy(self);
+    }
+};
+
+/// The launch credential lookup an interactive session resolves after its
+/// first frame instead of before it.
+pub const StartupCredentialRequest = struct {
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+};
+
+pub const StartupCredentialOutcome = union(enum) {
+    /// The credential, when present, is owned by `std.heap.c_allocator`.
+    resolved: credentials.Resolution,
+    failed: anyerror,
+
+    pub fn deinit(self: *StartupCredentialOutcome) void {
+        switch (self.*) {
+            .resolved => |*resolution| if (resolution.credential) |*credential| {
+                credential.deinit(std.heap.c_allocator);
+                resolution.credential = null;
+            },
+            .failed => {},
+        }
+    }
+};
+
+/// Runs the launch credential resolution on a worker so the first frame does
+/// not wait for Keychain reads. Only the worker writes `outcome`; the main
+/// thread reads it after the release/acquire completion and join.
+const StartupCredentialTask = struct {
+    secret_store: host.SecretStore,
+    request: StartupCredentialRequest,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    outcome: StartupCredentialOutcome = .{ .resolved = .{} },
+
+    fn start(secret_store: host.SecretStore, request: StartupCredentialRequest) !*StartupCredentialTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(StartupCredentialTask);
+        errdefer alloc.destroy(task);
+        task.* = .{ .secret_store = secret_store, .request = request };
+        task.thread = try std.Thread.spawn(.{}, workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *StartupCredentialTask) void {
+        defer self.done.store(true, .release);
+        // Matches the blocking launch path: stored credentials only, no network.
+        const resolution = credentials.resolveForProvider(
+            std.heap.c_allocator,
+            oauth_transport.unavailable_provider,
+            self.secret_store,
+            .stored,
+            self.request.provider,
+            self.request.preferred,
+        ) catch |err| {
+            self.outcome = .{ .failed = err };
+            return;
+        };
+        self.outcome = .{ .resolved = resolution };
+    }
+
+    fn takeOutcome(self: *StartupCredentialTask) StartupCredentialOutcome {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        const outcome = self.outcome;
+        self.outcome = .{ .resolved = .{} };
+        std.heap.c_allocator.destroy(self);
+        return outcome;
+    }
+
+    /// Waits for the worker: a Keychain read cannot be interrupted, so this
+    /// joins the same way an abandoned prompt credential refresh does.
+    fn deinit(self: *StartupCredentialTask) void {
+        var outcome = self.takeOutcome();
+        outcome.deinit();
     }
 };
 
@@ -1629,6 +1706,10 @@ pub const GatewayCredential = struct {
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     source: credentials.Source,
+    /// The fx login account, when the credential carries one.
+    account: ?[]const u8 = null,
+    /// The fx login team's slug, for display.
+    team_slug: ?[]const u8 = null,
 };
 
 pub const ProviderCredentialSelection = union(enum) {
@@ -1677,6 +1758,9 @@ pub const Runtime = struct {
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
     provider_preparation: ?*ProviderPreparation = null,
+    startup_credential_task: ?*StartupCredentialTask = null,
+    /// The launch source inventory waits for the first frame.
+    startup_inventory_deferred: bool = false,
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -1719,7 +1803,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 31) {
+            if (@typeInfo(Self).@"struct".field_names.len != 33) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1755,9 +1839,13 @@ pub const Runtime = struct {
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
         storage.provider_preparation = null;
+        storage.startup_credential_task = null;
+        storage.startup_inventory_deferred = false;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
+        if (self.startup_credential_task) |task| task.deinit();
+        self.startup_credential_task = null;
         self.stopProviderPreparation();
         if (self.inventory_refresh_task) |task| task.deinit();
         self.inventory_refresh_task = null;
@@ -1794,6 +1882,8 @@ pub const Runtime = struct {
             .api_key = credential.token,
             .gateway_team = credential.gatewayTeam(),
             .source = credential.source,
+            .account = credential.account_id,
+            .team_slug = credential.team_slug,
         };
     }
 
@@ -2803,6 +2893,45 @@ pub const Runtime = struct {
         task.deinit();
     }
 
+    /// Starts resolving the launch credential on a worker. Returns false when
+    /// the worker cannot start; the caller then resolves the credential inline.
+    pub fn beginStartupCredentialLoad(self: *Self, request: StartupCredentialRequest) bool {
+        // Single-threaded builds have no worker; the caller resolves inline.
+        if (comptime builtin.single_threaded) return false;
+        std.debug.assert(self.startup_credential_task == null);
+        self.startup_credential_task = StartupCredentialTask.start(self.secret_store, request) catch |err| {
+            debug_trace.logf("auth", "startup credential worker unavailable err={s}", .{@errorName(err)});
+            return false;
+        };
+        return true;
+    }
+
+    /// Probing every source loads the Keychain framework, and the launch only
+    /// needs the inventory for onboarding, so an active credential lets the
+    /// probe wait until after the first frame.
+    pub fn deferStartupSourceInventory(self: *Self) void {
+        self.startup_inventory_deferred = true;
+    }
+
+    /// Returns true once when the deferred launch inventory is due.
+    pub fn takeDeferredStartupSourceInventory(self: *Self) bool {
+        const deferred = self.startup_inventory_deferred;
+        self.startup_inventory_deferred = false;
+        return deferred;
+    }
+
+    pub fn startupCredentialPending(self: *const Self) bool {
+        return self.startup_credential_task != null;
+    }
+
+    /// Returns the finished launch credential lookup once; null while it runs.
+    pub fn takeStartupCredentialLoad(self: *Self) ?StartupCredentialOutcome {
+        const task = self.startup_credential_task orelse return null;
+        if (!task.done.load(.acquire)) return null;
+        self.startup_credential_task = null;
+        return task.takeOutcome();
+    }
+
     pub fn refreshSelectedCredentialIfNeeded(
         self: *Self,
         alloc: Allocator,
@@ -3230,7 +3359,7 @@ fn expectApiKeyAllocationCleared(
 ) !void {
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
-    try std.testing.expect(std.mem.indexOf(u8, backing, sentinel) == null);
+    try std.testing.expect(std.mem.find(u8, backing, sentinel) == null);
 }
 
 test "auth runtime complete credential refresher ignores non-refreshable sources" {
@@ -4779,7 +4908,7 @@ test "api key stage zeroes its allocation on every exit path" {
     const sentinel = "FX_API_KEY_ZERO_SENTINEL";
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4791,7 +4920,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4820,7 +4949,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4849,7 +4978,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4878,7 +5007,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4907,7 +5036,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4935,7 +5064,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4947,7 +5076,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};

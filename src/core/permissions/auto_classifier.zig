@@ -1,11 +1,11 @@
 const std = @import("std");
+const observation = @import("../agent/runtime/observation.zig");
 const auto_classifier_context = @import("auto_classifier_context.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("permissions.zig");
-const session_usage = @import("../session/session_usage.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 
@@ -226,6 +226,7 @@ const ReviewView = enum {
 /// Borrowed view of the successful model turn. Every referenced slice must
 /// remain valid until `Reviewer.review` returns.
 pub const ReviewTurnContext = struct {
+    observer: ?*observation.Observer = null,
     model: []const u8,
     pending_assistant: types.ChatMessage,
     target_call_id: []const u8,
@@ -325,8 +326,6 @@ pub const ProviderInput = struct {
     /// FX_REVIEW_MODEL). Empty means the provider's compiled default.
     reviewer_model: []const u8 = "",
     cancel_flag: ?*std.atomic.Value(bool) = null,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: std.mem.Allocator = std.heap.c_allocator,
 };
 
 pub const ProviderFn = *const fn (
@@ -470,8 +469,7 @@ pub const Reviewer = struct {
         const context_message: []const u8 = switch (view) {
             .normal => "review_context_kind: normal\n",
             .contextual => blk: {
-                const message = std.fmt.allocPrint(
-                    alloc,
+                const message = alloc.print(
                     "review_context_kind: contextual\ntrusted_root_context:\n{s}",
                     .{trusted_root_context},
                 ) catch |err| return constructionFailure(err);
@@ -525,27 +523,41 @@ pub const Reviewer = struct {
                 "event=auto_review_send attempt={d} max_attempts=3 target_call_id={s}",
                 .{ attempt, review_turn.target_call_id },
             );
+            const observed = if (review_turn.observer) |observer| observer.beginModelWithSchemas(.{
+                .model = self.model,
+                .instructions = &instructions,
+                .messages = &messages,
+                .tool_choice = .required,
+                .provider_options = .{},
+            }, .permission_review, review_turn.target_call_id, tools_json) else null;
             var transport_outcome = transport.send(
                 alloc,
                 self.model,
                 payload,
                 send_deadline,
                 cancel_flag,
-            ) catch |err| switch (err) {
-                error.OutOfMemory, error.Cancelled => return err,
-                else => {
-                    if (!transport_retry_available) return .{ .invalid = .transport_call_failed };
-                    transport_retry_available = false;
-                    attempt += 1;
-                    send_deadline = reviewAttemptDeadline(self.timeout_ms);
-                    debug_trace.logf(
-                        "permission",
-                        "event=auto_review_transport_retry reason=call_failed target_call_id={s}",
-                        .{review_turn.target_call_id},
-                    );
-                    continue;
-                },
+            ) catch |err| failed: {
+                if (observed) |call| call.emit(.{ .model_end = .{ .id = call.id, .error_name = @errorName(err), .cancelled = err == error.Cancelled } });
+                break :failed switch (err) {
+                    error.OutOfMemory, error.Cancelled => return err,
+                    else => {
+                        if (!transport_retry_available) return .{ .invalid = .transport_call_failed };
+                        transport_retry_available = false;
+                        attempt += 1;
+                        send_deadline = reviewAttemptDeadline(self.timeout_ms);
+                        debug_trace.logf(
+                            "permission",
+                            "event=auto_review_transport_retry reason=call_failed target_call_id={s}",
+                            .{review_turn.target_call_id},
+                        );
+                        continue;
+                    },
+                };
             };
+            if (observed) |call| call.emit(.{ .model_end = switch (transport_outcome) {
+                .completion => |owned| .{ .id = call.id, .completion = owned.completion, .cancelled = cancel_flag.load(.seq_cst) },
+                else => .{ .id = call.id, .error_name = @tagName(transport_outcome), .cancelled = transport_outcome == .cancelled },
+            } });
             switch (transport_outcome) {
                 .cancelled => return error.Cancelled,
                 .timed_out, .transient_failure => {
@@ -1017,7 +1029,7 @@ test "shell input review requires receiver evidence and bounds untrusted screen 
         .session_id = "shell-owned",
         .launch_command = "python3 key-collector.py",
         .cwd = "/tmp/fixture",
-        .screen = "UNTRUSTED_PROMPT_BEGIN\x1b[31m" ++ ("x" ** 4096) ++ "UNTRUSTED_PROMPT_END",
+        .screen = "UNTRUSTED_PROMPT_BEGIN\x1b[31m" ++ text_utils.repeat("x", 4096) ++ "UNTRUSTED_PROMPT_END",
     };
     var present = try serializeEvidence(alloc, request, deadline, &cancel);
     defer present.deinit(alloc);
@@ -1275,7 +1287,7 @@ pub const function_schema: model_tool_schema.FunctionSchema = .{
 fn toolsJsonAlloc(alloc: std.mem.Allocator) ![]u8 {
     const schema_json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(alloc, function_schema);
     defer alloc.free(schema_json);
-    return std.fmt.allocPrint(alloc, "[{s}]", .{schema_json});
+    return alloc.print("[{s}]", .{schema_json});
 }
 
 test "automatic review model-facing tool contract stays byte exact" {
@@ -1606,10 +1618,10 @@ test "automatic review normalizes non-authoritative metadata" {
             .expected_rationale = "No rationale provided.",
         },
         .{
-            .arguments_json = "{\"decision\":\"clear\",\"rationale\":\"" ++ ("x" ** 239) ++ "éignored\"}",
+            .arguments_json = "{\"decision\":\"clear\",\"rationale\":\"" ++ text_utils.repeat("x", 239) ++ "éignored\"}",
             .expected_decision = .clear,
             .expected_risk = .low,
-            .expected_rationale = "x" ** 239,
+            .expected_rationale = text_utils.repeat("x", 239),
         },
     };
     for (cases) |case| {
@@ -1680,8 +1692,8 @@ test "prior tool result selection is entry bounded and keeps the newest window" 
     var contents: [20][16]u8 = undefined;
     var messages: [21]types.ChatMessage = undefined;
     for (messages[0..20], 0..) |*message, index| {
-        const call_id = try std.fmt.bufPrint(&call_ids[index], "call-{d}", .{index});
-        const content = try std.fmt.bufPrint(&contents[index], "result-{d}", .{index});
+        const call_id = try std.mem.print(&call_ids[index], "call-{d}", .{index});
+        const content = try std.mem.print(&contents[index], "result-{d}", .{index});
         message.* = .{
             .role = .tool,
             .content = content,
@@ -1727,8 +1739,8 @@ test "prior evidence excludes only host marked review feedback" {
 
 test "prior tool result evidence is byte bounded unmasked and terminal safe" {
     const entries = [_]PriorToolResultEntry{
-        .{ .tool_call_id = "first", .tool_name = "read_file", .content = "FIRST_RESULT " ++ ("a" ** 2000) },
-        .{ .tool_call_id = "last", .tool_name = "read_file", .content = "LAST_RESULT API_KEY=super-secret\x1b[31m" ++ ("z" ** 2000) },
+        .{ .tool_call_id = "first", .tool_name = "read_file", .content = "FIRST_RESULT " ++ text_utils.repeat("a", 2000) },
+        .{ .tool_call_id = "last", .tool_name = "read_file", .content = "LAST_RESULT API_KEY=super-secret\x1b[31m" ++ text_utils.repeat("z", 2000) },
     };
     var cancel_flag = std.atomic.Value(bool).init(false);
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -1822,7 +1834,7 @@ test "automatic review preserves the exact invalid completion cause" {
 
 test "review response uses the structured decision despite commentary" {
     for ([_][]const u8{ "clear", "caution" }) |decision| {
-        const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"decision\":\"{s}\"}}", .{decision});
+        const args = try std.testing.allocator.print("{{\"decision\":\"{s}\"}}", .{decision});
         defer std.testing.allocator.free(args);
         var result = try parseCompletion(std.testing.allocator, .{
             .content = "Additional text is not decision authority.",
@@ -1859,6 +1871,8 @@ test "review response retries malformed completion once on the same deadline" {
         }
     };
     var fixture = Fixture{};
+    var capture: @import("../agent/runtime/observation_testing.zig").Capture = .{ .expected_call = "pending" };
+    var observer = capture.observer();
     defer if (fixture.first_payload) |payload| std.testing.allocator.free(payload);
     var result = try Reviewer.withTransport(.{
         .context = &fixture,
@@ -1866,6 +1880,7 @@ test "review response retries malformed completion once on the same deadline" {
         .build_fn = buildTestReviewPayload,
     }, null, 1000).review(std.testing.allocator, .{
         .review_turn = .{
+            .observer = &observer,
             .model = "test/main",
             .target_call_id = "pending",
             .origin = .root,
@@ -1883,6 +1898,9 @@ test "review response retries malformed completion once on the same deadline" {
     try std.testing.expectEqual(std.meta.Tag(ParseOutcome).valid, std.meta.activeTag(result));
     try std.testing.expectEqual(Decision.clear, result.valid.decision);
     try std.testing.expectEqual(@as(usize, 2), fixture.sends);
+    try std.testing.expectEqual(@as(usize, 2), capture.count(.model_start));
+    try std.testing.expectEqual(capture.count(.model_start), capture.count(.model_end));
+    try std.testing.expect(!capture.invalid);
 }
 
 test "review response recovery is bounded and releases every completion" {
@@ -1952,11 +1970,15 @@ test "review response recovery is bounded and releases every completion" {
         };
         for (0..cycles) |_| {
             var fixture = Fixture{ .mode = mode };
+            var capture: @import("../agent/runtime/observation_testing.zig").Capture = .{ .expected_call = "pending" };
+            var observer = capture.observer();
+            var observed_request = request;
+            observed_request.review_turn.observer = &observer;
             const reviewer = Reviewer.withTransport(.{ .context = &fixture, .send_fn = Fixture.send, .build_fn = buildTestReviewPayload }, &fixture.cancel, if (mode == .expired) 20 else 1000);
             if (mode == .cancel_between or mode == .cancel_second) {
-                try std.testing.expectError(error.Cancelled, reviewer.review(std.testing.allocator, request));
+                try std.testing.expectError(error.Cancelled, reviewer.review(std.testing.allocator, observed_request));
             } else {
-                var outcome = try reviewer.review(std.testing.allocator, request);
+                var outcome = try reviewer.review(std.testing.allocator, observed_request);
                 defer outcome.deinit(std.testing.allocator);
                 switch (mode) {
                     .recover_clear, .transport_recover, .transport_then_invalid, .transport_throws => {
@@ -1989,6 +2011,9 @@ test "review response recovery is bounded and releases every completion" {
             };
             try std.testing.expectEqual(expected_sends, fixture.sends);
             try std.testing.expectEqual(expected_released, fixture.released);
+            try std.testing.expectEqual(fixture.sends, capture.count(.model_start));
+            try std.testing.expectEqual(capture.count(.model_start), capture.count(.model_end));
+            try std.testing.expect(!capture.invalid);
         }
     }
 }
@@ -2031,8 +2056,7 @@ test "automatic review sends exact unmasked secret-like action evidence" {
         .build_fn = buildTestReviewPayload,
     }, null, 1000);
     const command = "python3 -c 'import secrets; print(\"TOOL_DATA_TOKEN=\"+secrets.token_hex(12))'";
-    const arguments_json = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const arguments_json = try std.testing.allocator.print(
         "{{\"action\":\"run\",\"command\":{f}}}",
         .{std.json.fmt(command, .{})},
     );
@@ -2153,7 +2177,7 @@ test "automatic review sends symbolic secret references as complete evidence" {
 
 test "automatic review preserves prepared file lines within its evidence byte budget" {
     const alloc = std.testing.allocator;
-    const long_line = "x" ** 2048;
+    const long_line = text_utils.repeat("x", 2048);
     var content: std.Io.Writer.Allocating = .init(alloc);
     defer content.deinit();
     try content.writer.writeAll(long_line);
@@ -2503,7 +2527,7 @@ test "automatic review rejects oversized contextual root evidence without sendin
         .send_fn = FakeTransport.send,
         .build_fn = buildTestReviewPayload,
     }, null, 1000);
-    const oversized_root = "current_request: " ++ ("x" ** max_context_bytes) ++ "\n";
+    const oversized_root = "current_request: " ++ text_utils.repeat("x", max_context_bytes) ++ "\n";
     const outcome = try reviewer.review(std.testing.allocator, .{
         .review_turn = .{
             .model = "openai/gpt-5",
@@ -2574,7 +2598,7 @@ test "automatic review sends complete action evidence above sixteen kib" {
         .action = .{ .tool = .{
             .tool_name = "terminal",
             .arguments_json = "{\"action\":\"start\",\"command\":\"npm install\"}",
-            .schema_json = "{\"description\":\"" ++ ("s" ** (20 * 1024)) ++ "\"}",
+            .schema_json = "{\"description\":\"" ++ text_utils.repeat("s", 20 * 1024) ++ "\"}",
         } },
     });
     defer outcome.deinit(std.testing.allocator);
@@ -2622,7 +2646,7 @@ test "automatic review excludes assistant preamble and images" {
     };
 
     const long_preamble = "OPTIONAL_PREAMBLE_PREFIX" ++
-        ("p" ** max_review_packet_bytes) ++
+        text_utils.repeat("p", max_review_packet_bytes) ++
         "OPTIONAL_PREAMBLE_TAIL";
     var fake = FakeTransport{};
     const reviewer = Reviewer.withTransport(.{

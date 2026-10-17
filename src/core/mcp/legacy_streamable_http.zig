@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const legacy_sse = @import("legacy_sse.zig");
@@ -115,6 +116,19 @@ pub const Client = struct {
     auth_challenge: ?[]u8 = null,
 
     pub fn deinit(self: *Client) void {
+        self.retire();
+        self.terminateSession();
+        self.destroy();
+    }
+
+    /// Teardown for process exit and cancelled connections: skips the session
+    /// DELETE round trip. The server expires sessions its client abandons.
+    pub fn deinitWithoutSessionTermination(self: *Client) void {
+        self.retire();
+        self.destroy();
+    }
+
+    fn retire(self: *Client) void {
         self.lifecycle_mutex.lockUncancelable(io_mod.getIo());
         self.retiring = true;
         self.stopping.store(true, .release);
@@ -122,7 +136,9 @@ pub const Client = struct {
             self.lifecycle_cond.waitUncancelable(io_mod.getIo(), &self.lifecycle_mutex);
         }
         self.lifecycle_mutex.unlock(io_mod.getIo());
-        self.terminateSession();
+    }
+
+    fn destroy(self: *Client) void {
         if (self.session_id) |value| self.owner_allocator.free(value);
         if (self.auth_challenge) |value| self.owner_allocator.free(value);
         const alloc = self.owner_allocator;
@@ -620,7 +636,7 @@ fn readNotificationStream(
         }
         const chunk = reader.buffered();
         if (chunk.len == 0) continue;
-        const chunk_len = if (std.mem.indexOfAny(u8, chunk, "\r\n")) |index|
+        const chunk_len = if (std.mem.findAny(u8, chunk, "\r\n")) |index|
             index + 1
         else
             chunk.len;
@@ -889,7 +905,7 @@ fn appendHeaders(
 const MediaType = enum { json, sse };
 
 fn parseMediaType(value: []const u8) ?MediaType {
-    const separator = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+    const separator = std.mem.findScalar(u8, value, ';') orelse value.len;
     const media_type = std.mem.trim(u8, value[0..separator], " \t");
     if (std.ascii.eqlIgnoreCase(media_type, "application/json")) return .json;
     if (std.ascii.eqlIgnoreCase(media_type, "text/event-stream")) return .sse;
@@ -1024,7 +1040,7 @@ fn readSseStream(
         }
         const chunk = reader.buffered();
         if (chunk.len == 0) continue;
-        const chunk_len = if (std.mem.indexOfAny(u8, chunk, "\r\n")) |index|
+        const chunk_len = if (std.mem.findAny(u8, chunk, "\r\n")) |index|
             index + 1
         else
             chunk.len;
@@ -1399,7 +1415,7 @@ fn checkSseEventIdAllocationFailures(alloc: Allocator) !void {
 
 test "legacy Streamable HTTP replaces event IDs across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSseEventIdAllocationFailures,
         .{},
     );
@@ -1506,6 +1522,40 @@ test "deinit waits for an in-flight lease before it frees the session id" {
     try std.testing.expect(released.load(.acquire));
     try std.testing.expect(id_stayed_valid.load(.acquire));
     probe.join();
+}
+
+fn listenerHasPendingConnection(listener: *const std.Io.net.Server) !bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = listener.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    return try std.posix.poll(&fds, 0) > 0;
+}
+
+test "process-exit teardown skips the session DELETE that discard teardown sends" {
+    const os_tag = @import("builtin").target.os.tag;
+    if (os_tag == .windows or os_tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    const url = try alloc.print(
+        "http://127.0.0.1:{d}/mcp",
+        .{listener.socket.address.getPort()},
+    );
+    defer alloc.free(url);
+
+    const exiting = try testClientWithSession(alloc, "session-exit");
+    exiting.url = url;
+    exiting.deinitWithoutSessionTermination();
+    try std.testing.expect(!try listenerHasPendingConnection(&listener));
+
+    // Nothing accepts, so this DELETE connects and then waits out its bound.
+    const discarded = try testClientWithSession(alloc, "session-discard");
+    discarded.url = url;
+    discarded.deinit();
+    try std.testing.expect(try listenerHasPendingConnection(&listener));
 }
 
 test "a retired session refuses new leases and skips the delete on teardown" {

@@ -1,9 +1,9 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const diagnostics = @import("../workspace/diagnostics.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -15,16 +15,20 @@ const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    auto_compact_percent: u8 = compactor.default_percent,
     first_call_tool_choice: types.ToolChoice = .auto,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     /// Gateway provider routing for turns built from these settings. When set
     /// on WorkerRuntime.agent_turn_settings the slice is owned by the worker
@@ -574,6 +578,9 @@ pub const WorkerRuntime = struct {
     recovery_continuation_ready: bool = false,
     /// When true, queued work will not start.
     turn_start_held: bool = false,
+    /// Independent of a pending submission's turn-start hold; protects queued
+    /// work until a fresh-session scrollback handoff succeeds or is cancelled.
+    session_transition_held: bool = false,
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
@@ -647,7 +654,7 @@ pub const WorkerRuntime = struct {
     fn finishCompactionActivityLocked(self: *WorkerRuntime, turn_id: u64) void {
         const op = self.compaction_presentation.snapshot.operation orelse return;
         if (op.turn_id != turn_id or !op.active()) return;
-        diagnostics.traceCompactionLog(true, "unsettled operation at worker finish turn_id={d}", .{turn_id});
+        compactor.traceLog(true, "unsettled operation at worker finish turn_id={d}", .{turn_id});
         var feedback = compaction_activity.failure(
             if (self.isCancelRequested()) error.Cancelled else error.CompactionInterrupted,
             op.stage(),
@@ -1269,11 +1276,27 @@ pub const WorkerRuntime = struct {
         return messages;
     }
 
+    pub fn holdSessionTransition(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.session_transition_held = true;
+    }
+
+    pub fn releaseSessionTransitionHold(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.session_transition_held) return;
+        self.session_transition_held = false;
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
     /// Hold turn admission only when no turn is active or queued.
     pub fn tryHoldTurnStart(self: *WorkerRuntime) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.worker_processing or self.queuedWorkCountLocked() > 0 or self.turn_start_held) {
+        if (self.worker_processing or self.queuedWorkCountLocked() > 0 or
+            self.turn_start_held or self.session_transition_held)
+        {
             return false;
         }
         self.turn_start_held = true;
@@ -1372,7 +1395,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
-        while ((self.queued_prompts.items.len == 0 or self.turn_start_held) and
+        while ((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held) and
             !self.worker_stop_requested)
         {
             self.worker_processing = false;
@@ -1388,8 +1411,8 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         while (((self.queued_prompts.items.len == 0 and
-            self.queued_context_compaction == null) or self.turn_start_held) and
-            !self.worker_stop_requested)
+            self.queued_context_compaction == null) or self.turn_start_held or
+            self.session_transition_held) and !self.worker_stop_requested)
         {
             self.worker_processing = false;
             self.active_turn_id = 0;
@@ -1405,7 +1428,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.queued_prompts.items.len == 0 or
-            self.turn_start_held or
+            self.turn_start_held or self.session_transition_held or
             self.worker_stop_requested)
         {
             return null;
@@ -1418,7 +1441,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         if ((self.queued_prompts.items.len == 0 and
             self.queued_context_compaction == null) or self.turn_start_held or
-            self.worker_stop_requested)
+            self.session_transition_held or self.worker_stop_requested)
         {
             return null;
         }
@@ -1869,6 +1892,13 @@ pub const WorkerRuntime = struct {
         for (self.queued_prompts.items) |*prompt| prompt.agent_settings.fast_mode = enabled;
     }
 
+    pub fn syncQueuedPromptUltrafastMode(self: *WorkerRuntime, enabled: bool) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.agent_turn_settings.ultrafast_mode = enabled;
+        for (self.queued_prompts.items) |*prompt| prompt.agent_settings.ultrafast_mode = enabled;
+    }
+
     pub fn syncQueuedPromptEffort(self: *WorkerRuntime, effort: types.ReasoningEffort) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -2093,11 +2123,23 @@ pub const WorkerRuntime = struct {
         max_history_turns: usize,
         publication: ?HistoryPublication,
     ) !void {
-        errdefer |err| if (err == error.SessionPersistenceUncertain) {
-            if (self.active_prompt_snapshot_ownership) |ownership| {
-                _ = ownership.preserve();
+        self.propagateHistoryTurnToQueue(alloc, turn, max_history_turns, publication) catch |err| {
+            if (err == error.SessionPersistenceUncertain) {
+                if (self.active_prompt_snapshot_ownership) |ownership| {
+                    _ = ownership.preserve();
+                }
             }
+            return err;
         };
+    }
+
+    fn propagateHistoryTurnToQueue(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn: types.HistoryTurn,
+        max_history_turns: usize,
+        publication: ?HistoryPublication,
+    ) !void {
         if (self.queued_prompts.items.len == 0) {
             if (publication) |value| try value.commit();
             return;
@@ -2153,8 +2195,7 @@ pub const WorkerRuntime = struct {
                     types.SnapshotFileOwnership,
                     ownership_count,
                 );
-                std.mem.copyForwards(
-                    types.SnapshotFileOwnership,
+                @memmove(
                     ownerships[0..prompt.snapshot_file_ownerships.len],
                     prompt.snapshot_file_ownerships,
                 );
@@ -2816,7 +2857,7 @@ fn appendGrantToQueuedPrompt(alloc: std.mem.Allocator, prompt: *QueuedPrompt, to
     const current = prompt.grants;
     const next = try alloc.alloc(types.PermissionGrant, current.len + 1);
     errdefer alloc.free(next);
-    if (current.len > 0) std.mem.copyForwards(types.PermissionGrant, next[0..current.len], current);
+    if (current.len > 0) @memmove(next[0..current.len], current);
     next[current.len] = .{ .tool_name = tool_name_dup, .target_path = target_path_dup };
     alloc.free(current);
     prompt.grants = next;
@@ -2830,7 +2871,7 @@ fn appendHistoryTurnProjection(
 ) ![]types.HistoryTurn {
     _ = max_history_turns;
     const retained = if (turn == .compacted_summary and
-        std.mem.startsWith(u8, turn.compacted_summary.summary, types.context_handoff_open))
+        compactor.replacesPriorContext(turn.compacted_summary.summary))
         &.{}
     else
         current;
@@ -2918,7 +2959,7 @@ test "active prompt snapshot ownership discards every pre-transfer boundary" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var name_buffer: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "snapshot-{d}.bin", .{index});
+        const name = try std.mem.print(&name_buffer, "snapshot-{d}.bin", .{index});
         {
             var file = try tmp.dir.createFile(std.testing.io, name, .{});
             defer file.close(std.testing.io);
@@ -3396,7 +3437,7 @@ test "compaction preserves active snapshots only after persistence succeeds" {
 }
 
 test "failed queued prompt dequeue retains borrowed snapshot ownership" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     {
@@ -3523,7 +3564,7 @@ test "multi-queue history propagation is allocation-failure atomic" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_path = try std.fs.path.join(alloc, &.{ root, "snapshot.bin" });
+    const snapshot_path = try std.Io.Dir.path.join(alloc, &.{ root, "snapshot.bin" });
     defer alloc.free(snapshot_path);
 
     var fail_index: usize = 0;
@@ -3928,11 +3969,11 @@ test "finish ownership handoff preserves allocator and filesystem ownership" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_path = try std.fs.path.join(alloc, &.{ root, "snapshot.bin" });
+    const snapshot_path = try std.Io.Dir.path.join(alloc, &.{ root, "snapshot.bin" });
     defer alloc.free(snapshot_path);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkFinishOwnershipHandoffAllocation,
         .{snapshot_path},
     );
@@ -4381,7 +4422,7 @@ test "direct steering applies at the boundary without cancellation and seals bef
 }
 
 test "direct steering output allocation failure preserves feedback and cancellation discards it" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var receipt = SteeringReceipt{};
     var runtime = WorkerRuntime{};
     try std.testing.expect(runtime.beginDirectProcessing(41));
@@ -4399,7 +4440,7 @@ test "direct steering output allocation failure preserves feedback and cancellat
 }
 
 test "direct steering rejects inactive cancelled and full-allocation admission without taking ownership" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
     const prompt = try makePrompt(alloc, "feedback", "model");
@@ -4855,7 +4896,7 @@ test "failed steering admission does not cancel the active turn" {
     runtime.active_turn_id = 41;
 
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     const prompt = QueuedPrompt{
@@ -5016,7 +5057,7 @@ test "steer retraction requires an active processing turn" {
 }
 
 test "failed steer retraction preserves the queue" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(backing);
     runtime.worker_processing = true;
@@ -5092,7 +5133,7 @@ test "steering presentation survives queue to feedback transfer without duplicat
 }
 
 test "steering snapshot allocation failure preserves queue and feedback ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn run(alloc: std.mem.Allocator) !void {
             const backing = std.testing.allocator;
             var runtime = WorkerRuntime{};
@@ -5429,7 +5470,7 @@ fn checkStateSnapshotFailurePreservesPendingEvents(alloc: std.mem.Allocator) !vo
 
 test "state snapshot allocation failures preserve pending event ownership" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkStateSnapshotFailurePreservesPendingEvents,
         .{},
     );
@@ -6256,7 +6297,7 @@ test "submitted text only queues while a prompt is active" {
 }
 
 test "prompt take and grant append allocation failures preserve state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
@@ -6419,7 +6460,7 @@ fn checkToolLifecycleDupAllocationFailure(alloc: std.mem.Allocator) !void {
 
 test "typed lifecycle duplication frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkToolLifecycleDupAllocationFailure,
         .{},
     );
@@ -6697,7 +6738,7 @@ fn checkSemanticWorkerEventDuplicationAllocationFailure(alloc: std.mem.Allocator
 
 test "ordinary and error semantic worker events free partial duplication allocations" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticWorkerEventDuplicationAllocationFailure,
         .{},
     );
@@ -6756,7 +6797,7 @@ fn checkSemanticNoticeEnqueueAllocationFailure(alloc: std.mem.Allocator) !void {
 
 test "semantic notice enqueue frees partial topic body and queue allocations" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticNoticeEnqueueAllocationFailure,
         .{},
     );
@@ -7084,7 +7125,7 @@ test "approval cancellation leaves admitted steering available for the next turn
 }
 
 test "text enqueue allocation failure preserves active interactive state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
     runtime.worker_processing = true;
@@ -7273,7 +7314,7 @@ test "question request rolls back pending state when its boundary event cannot b
     const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
     const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
 
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     var probe_runtime = WorkerRuntime{};
     probe_runtime.worker_stop_requested = true;
     const probe_result = try probe_runtime.requestQuestionBatchAnswerBlocking(probe.allocator(), &entries);
@@ -7282,7 +7323,7 @@ test "question request rolls back pending state when its boundary event cannot b
     probe_runtime.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{
         .fail_index = marker_append_alloc_index,
     });
     var runtime = WorkerRuntime{};
@@ -7310,7 +7351,7 @@ test "discarding queued recovery releases metadata without deleting saved images
         .path = @constCast("/missing/source.png"),
         .media_type = @constCast("image/png"),
         .snapshot_path = path,
-        .snapshot_sha256 = @constCast("a" ** 64),
+        .snapshot_sha256 = @constCast(text_utils.repeat("a", 64)),
     }};
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
@@ -7335,4 +7376,20 @@ test "discarding queued recovery releases metadata without deleting saved images
     runtime.clearQueuedPrompts(alloc, &.{});
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
     try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
+}
+
+test "session transition hold keeps an existing queued prompt until released" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "test/model"));
+    runtime.holdSessionTransition();
+    try std.testing.expect(!runtime.tryHoldTurnStart());
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    runtime.releaseSessionTransitionHold();
+    const prompt = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, prompt);
+    try std.testing.expectEqualStrings("queued", prompt.prompt);
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
 }

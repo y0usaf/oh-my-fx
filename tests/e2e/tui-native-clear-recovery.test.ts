@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
-import { composerContains, FAKE_GATEWAY_MODEL, fakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { composerContains, FAKE_GATEWAY_MODEL, fakeGatewayFinalText, fakeShellRun, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const tmuxTest = test.skipIf(!tmuxAvailable());
 const PASTE_START = ["1b", "5b", "32", "30", "30", "7e"] as const;
@@ -76,6 +76,65 @@ tmuxTest("direct native-clear recovery resets the view and replays the held draf
   expect(history).not.toContain(old_marker);
   expect(history).toContain("𝒇x v");
   expect(readFileSync(stderr_path, "utf8")).toBe("");
+}, 30_000);
+
+tmuxTest("native-clear recovery after a tool call keeps fx running and the tool in full history", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fx-native-clear-tool-"));
+  temp_dirs.push(dir);
+  const trace_path = join(dir, "trace.log");
+  const stderr_path = join(dir, "stderr.log");
+  mkdirSync(join(dir, ".fx"), { recursive: true });
+  writeFileSync(join(dir, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
+  const gateway = startFakeGateway([
+    fakeShellRun("native_clear_tool", "echo TOOL_BEFORE_CLEAR"),
+    fakeGatewayFinalText("TOOL_TURN_DONE"),
+  ]);
+
+  session = await TmuxSession.create({
+    cwd: dir,
+    width: 100,
+    height: 30,
+    stderrPath: stderr_path,
+    env: {
+      HOME: dir,
+      AI_GATEWAY_API_KEY: "fake-native-clear-tool-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_THEME: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+      FX_AUTO_UPGRADE: "0",
+      FX_PERMISSION_MODE: "yolo",
+      TMUX: undefined,
+      FX_TRACE_LOG: trace_path,
+      FX_TRACE_SCOPES: "native_clear",
+    },
+  });
+  try {
+    await session.waitForComposer(10_000);
+    await session.sendLiteral("run the check");
+    await session.sendKeys("Enter");
+    await session.waitForText("TOOL_TURN_DONE", 10_000);
+
+    clearPaneTerminal(session);
+    await session.sendLiteral("abc");
+    await waitForTrace(trace_path, "native_clear_recovery_requested");
+    await session.waitForPane((pane) => composerContains(pane, "abc"), 10_000);
+
+    const history = await session.captureFullScrollback();
+    expect(history).not.toContain("TOOL_TURN_DONE");
+    expect(history).toContain("𝒇x v");
+
+    await session.sendKeys("C-o");
+    await session.waitForText("echo TOOL_BEFORE_CLEAR", 10_000);
+    await session.sendKeys("C-o");
+    await session.waitForPane((pane) => composerContains(pane, "abc"), 10_000);
+
+    expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderr_path, "utf8")).toBe("");
+  } finally {
+    gateway.stop();
+  }
 }, 30_000);
 
 tmuxTest("direct healthy screens retain an ordinary burst without resetting", async () => {

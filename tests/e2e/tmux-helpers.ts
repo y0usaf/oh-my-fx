@@ -36,6 +36,7 @@ const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_CHAT_URL",
   "FX_MAX_AGENT_STEPS",
   "FX_MODEL",
+  "FX_SESSIONS_V2",
 ] as const;
 
 export function canonicalSubagentIdForStore(childId: string): string {
@@ -327,10 +328,10 @@ export type FakeGatewayOptions = {
   classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
   titleResponses?: FakeGatewayResponse[];
-  generationResponse?: (
-    generationId: string,
-    request: Request,
-  ) => Response | Promise<Response>;
+  // Answers usage GETs (`/v1/report`, `/ai-gateway/usage-report`, ChatGPT's
+  // `/backend-api/wham/...`, Grok's `/billing` and `/settings`); see
+  // usage-fakes.ts. Null falls through to the routes below.
+  usage?: (url: URL, request: Request) => Response | null;
   // Response for the /v4/ai/evaluation-model endpoint (TypeSafe Jev through
   // the gateway). Defaults to a clear Jev decision.
   evaluationResponse?: FakeGatewayResponse;
@@ -373,7 +374,6 @@ function serveFakeGateway(
   const titleRequests: Array<{ body: string; headers: Headers }> = [];
   const titleResponses = [...(options.titleResponses ?? [])];
   const modelRequests: FakeGatewayModelRequest[] = [];
-  const generationRequests: string[] = [];
   const server = Bun.serve({
     port: 0,
     idleTimeout: 0,
@@ -392,13 +392,9 @@ function serveFakeGateway(
           }],
         });
       }
-      if (req.method === "GET" && new URL(req.url).pathname === "/v1/generation") {
-        const generationId = new URL(req.url).searchParams.get("id") ?? "";
-        generationRequests.push(generationId);
-        if (options.generationResponse) {
-          return options.generationResponse(generationId, req);
-        }
-        return new Response("not found", { status: 404 });
+      if (req.method === "GET" && options.usage) {
+        const answer = options.usage(new URL(req.url), req);
+        if (answer) return answer;
       }
       if (
         req.method === "POST" &&
@@ -456,7 +452,6 @@ function serveFakeGateway(
     classifierRequests,
     evaluationRequests,
     titleRequests,
-    generationRequests,
     modelRequests,
     requestCount() {
       return requests.length;
@@ -1414,7 +1409,8 @@ export class TmuxSession {
     rmSync(this.exitStatusPath, { force: true });
   }
 
-  private recordedExitStatus(): number | null {
+  /// The fx process's exit status once the pane has ended, or null.
+  recordedExitStatus(): number | null {
     try {
       const value = Number.parseInt(readFileSync(this.exitStatusPath, "utf8").trim(), 10);
       return Number.isSafeInteger(value) && value >= 0 && value <= 255 ? value : null;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const health = @import("health.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -27,6 +28,8 @@ pub const ServerSummary = struct {
     name: []u8,
     availability: Availability,
     tool_count: ?usize = null,
+    /// The server's tools are advertised every turn without a search.
+    always_loaded: bool = false,
 };
 
 pub const Snapshot = struct {
@@ -248,8 +251,7 @@ fn renderWithLimit(alloc: Allocator, snapshot: Snapshot, limit: usize) Allocator
     errdefer alloc.free(text);
     return .{
         .text = text,
-        .notice = try std.fmt.allocPrint(
-            alloc,
+        .notice = try alloc.print(
             "[context] omitted {d} MCP server{s} from the model catalog because the fixed {d}-byte budget was reached",
             .{ omitted_count, if (omitted_count == 1) "" else "s", limit },
         ),
@@ -268,14 +270,16 @@ fn renderEntry(alloc: Allocator, server: ServerSummary) Allocator.Error![]u8 {
     out.writer.print("\" state=\"{s}\"", .{@tagName(server.availability)}) catch return error.OutOfMemory;
     if (server.tool_count) |count| {
         out.writer.print(" tools=\"{d}\"", .{count}) catch return error.OutOfMemory;
+        if (server.always_loaded and server.availability == .ready and count > 0) {
+            out.writer.writeAll(" loaded=\"true\"") catch return error.OutOfMemory;
+        }
     }
     out.writer.writeAll(" />\n") catch return error.OutOfMemory;
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 fn truncationMarker(alloc: Allocator, omitted_count: usize) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "  <catalog_truncated omitted_count=\"{d}\" />\n",
         .{omitted_count},
     );
@@ -323,6 +327,7 @@ fn ownedSnapshot(
         name: []const u8,
         availability: Availability,
         tool_count: ?usize = null,
+        always_loaded: bool = false,
     },
 ) !Snapshot {
     const servers = try alloc.alloc(ServerSummary, inputs.len);
@@ -336,6 +341,7 @@ fn ownedSnapshot(
             .name = try alloc.dupe(u8, input.name),
             .availability = input.availability,
             .tool_count = input.tool_count,
+            .always_loaded = input.always_loaded,
         };
         initialized += 1;
     }
@@ -391,6 +397,23 @@ test "render exposes sorted server summaries without tool metadata" {
     try std.testing.expectEqual(@as(?[]u8, null), section.notice);
 }
 
+test "render marks ready always-loaded servers with visible tools" {
+    const alloc = std.testing.allocator;
+    var snapshot = try ownedSnapshot(alloc, &.{
+        .{ .name = "browser", .availability = .ready, .tool_count = 3, .always_loaded = true },
+        .{ .name = "empty", .availability = .ready, .tool_count = 0, .always_loaded = true },
+        .{ .name = "lazy", .availability = .ready, .tool_count = 1 },
+    });
+    defer snapshot.deinit(alloc);
+
+    var section = try render(alloc, snapshot);
+    defer section.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, section.text, "<server name=\"browser\" state=\"ready\" tools=\"3\" loaded=\"true\" />") != null);
+    try std.testing.expect(std.mem.find(u8, section.text, "<server name=\"empty\" state=\"ready\" tools=\"0\" />") != null);
+    try std.testing.expect(std.mem.find(u8, section.text, "<server name=\"lazy\" state=\"ready\" tools=\"1\" />") != null);
+}
+
 test "render encodes names and bounds omissions without revealing omitted aliases" {
     const alloc = std.testing.allocator;
     var snapshot = try ownedSnapshot(alloc, &.{
@@ -433,7 +456,7 @@ fn checkRenderAllocationFailures(alloc: Allocator) !void {
 
 test "render cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkRenderAllocationFailures,
         .{},
     );
@@ -491,7 +514,7 @@ test "renderChangeNotice bounds the transition list and encodes names" {
     var current: [10]ServerSummary = undefined;
     var names: [10][]u8 = undefined;
     for (0..10) |index| {
-        names[index] = try std.fmt.allocPrint(alloc, "server<{d}>", .{index});
+        names[index] = try alloc.print("server<{d}>", .{index});
     }
     defer for (names) |name| alloc.free(name);
     for (0..10) |index| {

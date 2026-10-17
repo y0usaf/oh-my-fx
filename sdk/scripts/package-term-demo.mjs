@@ -12,15 +12,17 @@ const browserPath = resolve(repoRoot, "sdk/browser.js");
 const sdkPath = resolve(repoRoot, "sdk/fx-sdk.js");
 const coreOutputPath = resolve(repoRoot, "sdk/core-output.js");
 const wasmModulePath = resolve(repoRoot, "sdk/wasm-module.js");
+const toolObservationPath = resolve(repoRoot, "sdk/tool-observation.js");
 const wasmPath = resolve(repoRoot, "zig-out/bin/fx-term.wasm");
 
-const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, wasmBytes] = await Promise.all([
+const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, wasmBytes, toolObservationBytes] = await Promise.all([
   readFile(htmlPath, "utf8"),
   readFile(browserPath),
   readFile(sdkPath),
   readFile(coreOutputPath),
   readFile(wasmModulePath),
   readFile(wasmPath),
+  readFile(toolObservationPath),
 ]);
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -29,9 +31,12 @@ const coreOutputHash = digest(coreOutputBytes);
 const coreOutputName = `core-output.${coreOutputHash}.js`;
 const wasmModuleHash = digest(wasmModuleBytes);
 const wasmModuleName = `wasm-module.${wasmModuleHash}.js`;
+const toolObservationHash = digest(toolObservationBytes);
+const toolObservationName = `tool-observation.${toolObservationHash}.js`;
 const sdkBytes = Buffer.from(sdkSource.toString()
   .replace('from "./core-output.js";', `from "./${coreOutputName}";`)
-  .replace('from "./wasm-module.js";', `from "./${wasmModuleName}";`));
+  .replace('from "./wasm-module.js";', `from "./${wasmModuleName}";`)
+  .replace('from "./tool-observation.js";', `from "./${toolObservationName}";`));
 const sdkHash = digest(sdkBytes);
 const wasmHash = digest(wasmBytes);
 const sdkName = `fx-sdk.${sdkHash}.js`;
@@ -88,6 +93,7 @@ const vercelConfig = {
       source: `/${wasmName}`,
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
+    { source: `/${toolObservationName}`, headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }] },
     {
       source: "/manifest.json",
       headers: [{ key: "Cache-Control", value: "no-store" }],
@@ -100,6 +106,7 @@ await Promise.all([
   writeFile(resolve(outputDir, sdkName), sdkBytes),
   writeFile(resolve(outputDir, coreOutputName), coreOutputBytes),
   writeFile(resolve(outputDir, wasmModuleName), wasmModuleBytes),
+  writeFile(resolve(outputDir, toolObservationName), toolObservationBytes),
   writeFile(resolve(outputDir, wasmName), wasmBytes),
   writeFile(resolve(outputDir, "vercel.json"), `${JSON.stringify(vercelConfig, null, 2)}\n`),
 ]);
@@ -110,6 +117,7 @@ const manifest = {
   sdk: { file: sdkName, sha256: sdkHash, bytes: sdkBytes.byteLength },
   coreOutput: { file: coreOutputName, sha256: coreOutputHash, bytes: coreOutputBytes.byteLength },
   wasmModule: { file: wasmModuleName, sha256: wasmModuleHash, bytes: wasmModuleBytes.byteLength },
+  toolObservation: { file: toolObservationName, sha256: toolObservationHash, bytes: toolObservationBytes.byteLength },
   wasm: { file: wasmName, sha256: wasmHash, integrity: integrity(wasmBytes), bytes: wasmBytes.byteLength },
 };
 await writeFile(resolve(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);

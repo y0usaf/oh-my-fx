@@ -75,7 +75,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: "0.16.0"
+          version: "0.17.0"
 
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
@@ -109,7 +109,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: "0.16.0"
+          version: "0.17.0"
 
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
@@ -154,6 +154,10 @@ jobs:
       actions: read
       contents: read
     uses: ./.github/workflows/pgso-macos-arm64.yml
+    with:
+      # Keep release evidence long enough to serve as the main control for
+      # manual PGSO comparisons.
+      evidence-retention-days: 90
 
   sign-macos-arm64:
     needs: [check-version, build-macos-arm64]

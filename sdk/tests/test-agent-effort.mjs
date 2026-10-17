@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, supportsJspi } from "../node.js";
+import { createFxEngine, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const backend = process.argv[2] || "native";
@@ -58,7 +58,7 @@ const baseOptions = {
     : { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }),
 };
 const createAgent = (gateway, overrides) =>
-  createFxAgent({ ...baseOptions, fetch: gateway.fetch, ...overrides });
+  createFxEngine({ ...baseOptions, fetch: gateway.fetch, ...overrides });
 
 async function runPrompt(agent) {
   const turn = agent.prompt("say ok");
@@ -69,7 +69,7 @@ async function runPrompt(agent) {
 // An advertised effort is validated at creation and applied to the turn request.
 {
   const gateway = mockGateway();
-  const agent = await createAgent(gateway, { model: "sdk/core-model", effort: "high" });
+  const agent = await createAgent(gateway, { model: { id: "sdk/core-model", effort: "high" } });
   assert.equal(gateway.state.catalogFetches, 1);
   const result = await runPrompt(agent);
   assert.equal(result.stopReason, "end_turn");
@@ -84,7 +84,9 @@ async function runPrompt(agent) {
   await assert.rejects(
     createAgent(gateway, { model: "sdk/core-model", effort: "max" }),
     (error) => {
-      assert.equal(error.code, "LIBFX_UNSUPPORTED_EFFORT");
+      assert.equal(error.code, "LIBFX_MODEL_UNSUPPORTED_EFFORT");
+      assert.equal(error.model, "sdk/core-model");
+      assert.equal(error.capability, "effort");
       assert.match(error.message, /"max"/);
       assert.match(error.message, /sdk\/core-model/);
       assert.match(error.message, /low, high/);
@@ -100,7 +102,9 @@ async function runPrompt(agent) {
   await assert.rejects(
     createAgent(gateway, { model: "sdk/plain-model", effort: "high" }),
     (error) => {
-      assert.equal(error.code, "LIBFX_UNSUPPORTED_EFFORT");
+      assert.equal(error.code, "LIBFX_MODEL_UNSUPPORTED_EFFORT");
+      assert.equal(error.model, "sdk/plain-model");
+      assert.equal(error.capability, "effort");
       assert.match(error.message, /unavailable for the active model/);
       return true;
     },
@@ -125,6 +129,29 @@ async function runPrompt(agent) {
   );
   assert.equal(gateway.state.catalogFetches, 0);
   assert.equal(gateway.state.chatBodies.length, 0);
+}
+
+// Model-object options must not silently override legacy top-level settings.
+{
+  const gateway = mockGateway();
+  for (const options of [
+    { model: { id: "sdk/core-model", effort: "high" }, effort: "low" },
+    { model: { id: "sdk/core-model", fast: true }, fast: false },
+  ]) {
+    await assert.rejects(createAgent(gateway, options), /model options cannot be mixed/);
+  }
+  await assert.rejects(createAgent(gateway, { model: { effort: "low" } }), /model.id/);
+  await assert.rejects(createAgent(gateway, { model: { id: "sdk/core-model", efffort: "high" } }), /unsupported model option: efffort/);
+  await assert.rejects(
+    createAgent(gateway, {
+      backend: "auto",
+      wasm: resolve(scriptDir, "missing-model-validation.wasm"),
+      model: { id: "sdk/core-model", effort: "high" },
+      effort: "low",
+    }),
+    (error) => error instanceof TypeError && /model options cannot be mixed/.test(error.message),
+  );
+  assert.equal(gateway.state.catalogFetches, 0);
 }
 
 // The model default needs no validation fetch and sends no reasoning field.

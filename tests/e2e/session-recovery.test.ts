@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
@@ -123,6 +123,7 @@ test("resume writes a replay cache and replays identically with it corrupt or mi
     fakeGatewayFinalText("CACHE_CONTINUED_TURN"),
     fakeGatewayFinalText("CACHE_CORRUPTED_TURN"),
     fakeGatewayFinalText("CACHE_REBUILT_TURN"),
+    fakeGatewayFinalText("CACHE_UPGRADED_TURN"),
   ]);
   try {
     const id = await createSavedSession(fixture, gateway);
@@ -163,6 +164,19 @@ test("resume writes a replay cache and replays identically with it corrupt or mi
     expect(gateway.requests[3]!.body).toContain("CACHE_CORRUPTED_TURN");
     expect(existsSync(cachePath)).toBe(true);
     expect(statSync(cachePath).size).toBeGreaterThan(baselineSize);
+
+    const versionOffset = Buffer.byteLength("fx-history-cache\x1a\n");
+    const outdatedCache = readFileSync(cachePath);
+    expect(outdatedCache.readBigUInt64LE(versionOffset)).toBe(3n);
+    outdatedCache.writeBigUInt64LE(2n, versionOffset);
+    writeFileSync(cachePath, outdatedCache, { mode: 0o600 });
+    const upgraded = await continueSession(fixture, gateway, id);
+    expect(upgraded.code).toBe(0);
+    expect(upgraded.stderr).toBe("");
+    expect(JSON.parse(upgraded.stdout).output).toBe("CACHE_UPGRADED_TURN");
+    expect(gateway.requests[4]!.body).toContain("CACHE_REBUILT_TURN");
+    expect(gateway.requests[4]!.body).toContain("CACHE_BASELINE_TURN");
+    expect(readFileSync(cachePath).readBigUInt64LE(versionOffset)).toBe(3n);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -194,7 +208,7 @@ test("latest resume preserves an unrelated pending authority directory", async (
   }
 }, TIMEOUT);
 
-test("resume keeps conversation history when accounting is damaged", async () => {
+test("resume ignores a damaged usage file left by an older fx", async () => {
   const fixture = createFixture("fx-accounting-resume-");
   const gateway = startFakeGateway([
     fakeGatewayFinalText("ACCOUNTING_HISTORY_RETAINED"),
@@ -212,7 +226,7 @@ test("resume keeps conversation history when accounting is damaged", async () =>
     expect(JSON.parse(resumed.stdout).session_id).toBe(id);
     expect(gateway.requests.at(-1)?.body).toContain("ACCOUNTING_HISTORY_RETAINED");
     expect(readFileSync(events).subarray(0, before.length).equals(before)).toBe(true);
-    expect(JSON.parse(readFileSync(join(dir, "usage-v2.json"), "utf8")).snapshot.billing).toBe("incomplete");
+    expect(readFileSync(join(dir, "usage-v2.json"), "utf8")).toBe("{broken accounting");
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -410,72 +424,7 @@ function expectLegacyRequest(request: { body: string; headers: Headers }) {
 }
 
 describe("session recovery", () => {
-  test("unsupported accounting snapshot versions refuse recovery without changing the source", async () => {
-    const fixture = createFixture("fx-session-future-usage-");
-    const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_ACCOUNTING_VERSION")]);
-    try {
-      const id = await createSavedSession(fixture, gateway);
-      const sessions = join(fixture.home, ".fx", "sessions");
-      const source = join(sessions, id);
-      const usagePath = join(source, "usage-v2.json");
-      const usage = JSON.parse(readFileSync(usagePath, "utf8"));
-      usage.snapshot.schema_version = 4;
-      writeFileSync(usagePath, JSON.stringify(usage), { mode: 0o600 });
-      const before = savedFileHashes(source);
-      const sessionNames = readdirSync(sessions).sort();
-      const result = await runFx(["session", "recover", id, "--json"], {
-        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
-      });
-      expect(result.code).toBe(1);
-      expect(result.stdout + result.stderr).toContain("UnsupportedUsageSidecar");
-      expect(savedFileHashes(source)).toEqual(before);
-      expect(readdirSync(sessions).sort()).toEqual(sessionNames);
-    } finally {
-      gateway.stop();
-      rmSync(fixture.root, { recursive: true, force: true });
-    }
-  }, TIMEOUT);
-
-  for (const damagedTail of [false, true]) {
-    test(`corrupt accounting recovers a source-preserving copy, damaged tail=${damagedTail}`, async () => {
-      const fixture = createFixture("fx-session-usage-copy-");
-      const gateway = startFakeGateway([
-        fakeGatewayFinalText("ACCOUNTING_RECOVERY_SAVED"),
-        fakeGatewayFinalText("ACCOUNTING_RECOVERY_CONTINUED"),
-      ]);
-      try {
-        const id = await createSavedSession(fixture, gateway);
-        const source = join(fixture.home, ".fx", "sessions", id);
-        const committed = readFileSync(join(source, "events.jsonl"));
-        writeFileSync(join(source, "usage-v2.json"), "{broken usage", { mode: 0o600 });
-        if (damagedTail) appendFileSync(join(source, "events.jsonl"), "{broken tail");
-        const before = savedFileHashes(source);
-        const result = await runFx(["session", "recover", id, "--json"], {
-          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
-        });
-        expect(result.code).toBe(0);
-        expect(result.stderr).toBe("");
-        const recovered = JSON.parse(result.stdout);
-        expect(recovered).toMatchObject({ status: "recovered", usage_incomplete: true, source_id: id });
-        expect(recovered.recovered_id).not.toBe(id);
-        expect(savedFileHashes(source)).toEqual(before);
-        const copy = join(fixture.home, ".fx", "sessions", recovered.recovered_id);
-        expect(readFileSync(join(copy, "events.jsonl"))).toEqual(committed);
-        expect(JSON.parse(readFileSync(join(copy, "usage-v2.json"), "utf8")).snapshot.billing).toBe("incomplete");
-        const continued = await continueSession(fixture, gateway, recovered.recovered_id);
-        expect(continued.code).toBe(0);
-        expect(continued.stderr).toBe("");
-        expect(gateway.requests.at(-1)!.body).toContain("ACCOUNTING_RECOVERY_SAVED");
-        expect(JSON.parse(readFileSync(join(copy, "usage-v2.json"), "utf8")).snapshot.billing).toBe("incomplete");
-        expect(savedFileHashes(source)).toEqual(before);
-      } finally {
-        gateway.stop();
-        rmSync(fixture.root, { recursive: true, force: true });
-      }
-    }, TIMEOUT);
-  }
-
-  test.skipIf(!tmuxAvailable())("legacy cache usage resumes through latest and exact session flows", async () => {
+  test.skipIf(!tmuxAvailable())("a legacy session with saved usage resumes through latest and exact session flows", async () => {
     const fixture = createFixture("fx-session-legacy-cache-");
     const gateway = startFakeGateway([
       fakeGatewayFinalText("HEALTHY_LATEST_USAGE"),
@@ -538,10 +487,6 @@ describe("session recovery", () => {
 
       await resume(["--resume", legacy.id], LEGACY_ANSWER, "legacy");
       expectLegacyArchive(legacy.source);
-      const usage = JSON.parse(readFileSync(join(legacy.source, "usage-v2.json"), "utf8"));
-      expect(usage.session_id).toBe(legacy.id);
-      expect(usage.snapshot.billing).toBe("legacy");
-      expect(usage.snapshot.models).toEqual([]);
       expect(gateway.requests).toHaveLength(1);
       const continued = await continueSession(fixture, gateway, legacy.id);
       expect(continued.code).toBe(0);
@@ -594,25 +539,18 @@ describe("session recovery", () => {
       writeFileSync(permissionPath, "", { mode: 0o600 });
       await expectRefused("PermissionStateTooLarge");
       writeFileSync(permissionPath, permissions, { mode: 0o600 });
-      const usagePath = join(source, "usage-v2.json");
-      rmSync(usagePath);
-      mkdirSync(usagePath, { mode: 0o700 });
-      await expectRefused("InvalidUsageSidecar");
-      expect(readdirSync(usagePath)).toEqual([]);
     } finally {
       gateway.stop();
       rmSync(fixture.root, { recursive: true, force: true });
     }
   }, TIMEOUT);
 
-  for (const { checkpointedTurn, missingUsage, fullCoverage, damagedUsage } of [
-    { checkpointedTurn: false, missingUsage: false, fullCoverage: false, damagedUsage: false },
-    { checkpointedTurn: true, missingUsage: false, fullCoverage: false, damagedUsage: false },
-    { checkpointedTurn: false, missingUsage: true, fullCoverage: false, damagedUsage: false },
-    { checkpointedTurn: false, missingUsage: false, fullCoverage: true, damagedUsage: false },
-    { checkpointedTurn: false, missingUsage: false, fullCoverage: false, damagedUsage: true },
+  for (const { checkpointedTurn, fullCoverage } of [
+    { checkpointedTurn: false, fullCoverage: false },
+    { checkpointedTurn: true, fullCoverage: false },
+    { checkpointedTurn: false, fullCoverage: true },
   ]) {
-    test(`current conversation recovery preserves exact checkpoints and artifacts with open=${checkpointedTurn} missing usage=${missingUsage} full coverage=${fullCoverage} damaged usage=${damagedUsage}`, async () => {
+    test(`current conversation recovery preserves exact checkpoints and artifacts with open=${checkpointedTurn} full coverage=${fullCoverage}`, async () => {
       const fixture = createFixture("fx-session-current-copy-");
       const responses = [
         fakeShellRun("saved-effect", "printf 'ONCE_RECOVERY_731\\n' >> effect.log; printf 'RESULT_RECOVERY_982\\n'"),
@@ -631,8 +569,6 @@ describe("session recovery", () => {
         const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
         metadata.title = "Recovered work keeps its chosen title";
         writeFileSync(metadataPath, JSON.stringify(metadata), { mode: 0o600 });
-        if (missingUsage) rmSync(join(source, "usage-v2.json"));
-        if (damagedUsage) writeFileSync(join(source, "usage-v2.json"), "{damaged usage", { mode: 0o600 });
         const records = readFileSync(eventPath, "utf8").trimEnd().split("\n").map(JSON.parse);
         if (fullCoverage) records[0].event.user.work_id = "covered-recovery-work";
         const stored = records.find((record) => record.event.tool_result).event.tool_result;
@@ -662,14 +598,6 @@ describe("session recovery", () => {
         expect(gateway.requests).toHaveLength(2);
         expect(savedFileHashes(source)).toEqual(before);
         const target = join(fixture.home, ".fx", "sessions", result.recovered_id);
-        if (damagedUsage || missingUsage) {
-          const usage = JSON.parse(readFileSync(join(target, "usage-v2.json"), "utf8")).snapshot;
-          expect(usage.billing).toBe("incomplete");
-          expect(usage.api_duration_complete).toBe(false);
-          expect(usage.wall_duration_complete).toBe(false);
-          expect(usage.code_complete).toBe(false);
-          expect(usage.incidents.length).toBeGreaterThan(0);
-        }
         expect(JSON.parse(readFileSync(join(target, "session.json"), "utf8")).title).toBe(metadata.title);
         const targetEvents = readFileSync(join(target, "events.jsonl"), "utf8");
         expect(targetEvents.startsWith(prefix)).toBe(true);
@@ -931,7 +859,7 @@ describe("session recovery", () => {
     }
   }, TIMEOUT);
 
-  test.skipIf(!tmuxAvailable())("latest resume reuses legacy ranking after opening the resume picker", async () => {
+  test.skipIf(!tmuxAvailable())("latest resume reuses the session index after opening the resume picker", async () => {
     const fixture = createFixture("fx-continue-ranking-cache-");
     const legacy = createLegacySession(fixture, 3);
     const gateway = startFakeGateway([fakeGatewayFinalText("LATEST_CACHE_HISTORY")]);
@@ -948,9 +876,11 @@ describe("session recovery", () => {
         });
         await tui.waitForComposer(TIMEOUT);
         await tui.waitForText("LATEST_CACHE_HISTORY", TIMEOUT);
-        expect(readFileSync(trace, "utf8")).toContain(iteration === 0
-          ? "legacy ranking cache reused=0 refreshed=1"
-          : "legacy ranking cache reused=1 refreshed=0");
+        // The first latest resume classifies every session; once the picker
+        // has saved the index, the untouched legacy row is reused unopened.
+        expect(readFileSync(trace, "utf8")).toMatch(iteration === 0
+          ? /session catalog cache reused=0 records=\d+/
+          : /session catalog cache reused=[1-9]\d* records=\d+/);
         if (iteration === 0) {
           await tui.sendText("/resume");
           await tui.waitForText(LEGACY_TITLE, TIMEOUT);
@@ -1042,6 +972,12 @@ describe("session recovery", () => {
           }
           await tui.waitForText(LEGACY_PARTIAL, TIMEOUT);
           await tui.waitForComposer(TIMEOUT);
+          if (blankSessionDir && expectedSessionIds.includes(basename(blankSessionDir))) {
+            // Switching away from the untouched startup session removes it.
+            expectedSessionIds.splice(expectedSessionIds.indexOf(basename(blankSessionDir)), 1);
+            await tui.waitForPane(() => !existsSync(blankSessionDir!), TIMEOUT);
+            expect(sessionEntries()).toEqual(expectedSessionIds);
+          }
           const scrollback = await tui.captureFullScrollbackEscapes();
           expect(scrollback).toContain(LEGACY_ANSWER);
           expect(scrollback.split(LEGACY_PARTIAL)).toHaveLength(2);
@@ -1066,7 +1002,7 @@ describe("session recovery", () => {
           expect(gateway.requests).toHaveLength(index);
           expect(gateway.classifierRequests).toHaveLength(0);
           expect(sessionEntries()).toEqual(expectedSessionIds);
-          if (blankSessionDir) expect(readFileSync(join(blankSessionDir, "events.jsonl"), "utf8")).toBe("");
+          if (blankSessionDir) expect(existsSync(blankSessionDir)).toBe(false);
           await tui.kill();
           tui = null;
         }
@@ -1233,7 +1169,9 @@ describe("session recovery", () => {
         expect(result.killSent).toBe(false);
         expect(result.code).toBe(1);
         expect(result.elapsedMs).toBeLessThan(5_000);
-        expect(result.stdout + result.stderr).toContain("SessionPathUnsafe");
+        // The unreadable session is skipped exactly as every listing skips it,
+        // and the error says unreadable sessions exist, as `fx session last` does.
+        expect(result.stdout + result.stderr).toContain("NoReadableSessions");
         expect(gateway.requests).toHaveLength(fenced ? 0 : 1);
         expect(gateway.classifierRequests).toHaveLength(0);
         expect(readdirSync(source, { recursive: true }).sort()).toEqual(namesBefore);
@@ -1245,7 +1183,9 @@ describe("session recovery", () => {
         for (const [path, digest] of Object.entries(before)) {
           expect(createHash("sha256").update(readFileSync(join(source, path))).digest("hex")).toBe(digest);
         }
-        expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([id]);
+        // Only the derived session index may appear beside the untouched session.
+        expect(readdirSync(join(fixture.home, ".fx", "sessions")).filter((name) => name !== ".resume-catalog"))
+          .toEqual([id]);
       } finally {
         gateway.stop();
         rmSync(fixture.root, { recursive: true, force: true });
@@ -1299,7 +1239,6 @@ describe("session recovery", () => {
         "permissions.json",
         "session.json",
         "session.lock",
-        "usage-v2.json",
       ]);
     } finally {
       gateway.stop();

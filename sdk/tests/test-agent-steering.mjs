@@ -4,7 +4,8 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, supportsJspi } from "../node.js";
+import { createFxEngine, supportsJspi } from "../node.js";
+import { testHooks } from "./hooks-fixture.mjs";
 
 const backend = process.argv[2] || "native";
 if (!new Set(["native", "wasm"]).has(backend)) throw new Error("usage: test-agent-steering.mjs [native|wasm]");
@@ -79,6 +80,7 @@ await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen
 const { port } = server.address();
 
 const options = (checkpoint) => ({
+  ...(testHooks ? { hooks: testHooks } : {}),
   backend,
   nativeAddon: addon,
   ...(wasm ? { wasm } : {}),
@@ -91,15 +93,14 @@ const options = (checkpoint) => ({
 
 let agent;
 try {
-  agent = await createFxAgent(options());
+  agent = await createFxEngine(options());
   const turn = agent.prompt("start work");
   const events = [];
-  let steered = false;
+  let steered = null;
   for await (const event of turn) {
     events.push(event);
     if (!steered && event.type === "text_delta" && event.delta === "before") {
-      steered = true;
-      await turn.steer([
+      steered = await turn.steer([
         { type: "text", text: "focus on" },
         { type: "text", text: "tests" },
       ]);
@@ -110,7 +111,8 @@ try {
     events.filter((event) => event.type === "text_delta" || event.type === "user_message"),
     [
       { type: "text_delta", delta: "before" },
-      { type: "user_message", text: "focus on\ntests" },
+      // The steer shows where it joined the turn, with its id.
+      { type: "user_message", text: "focus on\ntests", id: steered.id },
       { type: "text_delta", delta: "after" },
     ],
   );
@@ -118,7 +120,7 @@ try {
 
   const checkpoint = await agent.checkpoint();
   await agent.close();
-  agent = await createFxAgent(options(checkpoint));
+  agent = await createFxEngine(options(checkpoint));
   const restored = agent.prompt("continue saved work");
   let restoredText = "";
   for await (const event of restored) if (event.type === "text_delta") restoredText += event.delta;

@@ -157,7 +157,7 @@ pub const Operations = struct {
             },
         ) catch |err| {
             try lockRwUntil(self.catalog_mutex, deadline, cancel_flag);
-            server.setFailed(self.alloc, @errorName(err));
+            server.setFailed(self.alloc, connected.last_error orelse @errorName(err));
             self.catalog_mutex.unlock(io_mod.getIo());
             return err;
         };

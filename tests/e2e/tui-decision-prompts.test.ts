@@ -1240,6 +1240,42 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "approval reports program status until the turn is done and clears it on exit",
+    async () => {
+      const tapeRoot = process.env.FX_RECORD
+        ? null
+        : mkdtempSync(join(tmpdir(), "fx-program-status-"));
+      if (tapeRoot) roots.push(tapeRoot);
+      const tapePath = process.env.FX_RECORD ?? join(tapeRoot!, "approval.fxtape");
+      const ctx = await openApprovalPrompt("program status approval", {
+        FX_RECORD: tapePath,
+      });
+      await ctx.session.sendLiteralText("1");
+      await ctx.session.waitForText("program status approval handled", TIMEOUT);
+      await ctx.session.sendText("/quit");
+      expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
+
+      const stdout = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload))
+        .toString("latin1");
+      const reports = [...stdout.matchAll(/\x1b\]7501;([^\x1b]*)\x1b\\/g)]
+        .map((match) => match[1]!);
+      expect(reports.map((report) => report.replace(/:msg=.*$/, ""))).toEqual([
+        "state=idle:app=fx",
+        "state=working:app=fx",
+        "state=blocked:kind=permission:app=fx",
+        "state=working:app=fx",
+        "state=done:app=fx",
+        "state=clear",
+      ]);
+      const encodedMessage = reports[2]!.split(":msg=")[1] ?? "";
+      expect(Buffer.from(encodedMessage, "base64").toString("utf8"))
+        .toContain("touch generic-preview-accepted.txt");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "long command approval renders the complete command before a decision",
     async () => {
       const tapeRoot = process.env.FX_RECORD

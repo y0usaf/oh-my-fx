@@ -1,8 +1,8 @@
 const std = @import("std");
+const observation = @import("observation.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
-const session_usage = @import("../../session/session_usage.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
@@ -31,6 +31,19 @@ const ToolExecutionRequest = tool_contracts.ToolExecutionRequest;
 const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 const TransportPublicationOutcome = tool_contracts.TransportPublicationOutcome;
 pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
+
+/// The turn so far: the user's message and every piece completed since.
+/// Borrowed only for the call; a sink copies or serializes what it keeps.
+pub const TurnProgress = struct {
+    user: types.UserTurn,
+    execution: types.ExecutionMemory,
+    /// Tool calls the model issued that have no result yet, in their saved
+    /// form, so a crash while they run leaves them in the session (D28).
+    running_calls: []const types.ToolCall = &.{},
+    /// The text of the message that issued `running_calls`, so a crash also
+    /// leaves what fx already showed (D51).
+    running_assistant: ?[]const u8 = null,
+};
 
 /// Borrows checkpoint slices only for the call. A sink must synchronously copy
 /// or serialize anything it retains, including when a save fails.
@@ -188,6 +201,7 @@ pub const DiffMarkerStyles = struct {
 
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
+    observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     flush_assistant_stream_per_content_chunk: bool = false,
     render_assistant_text: bool = true,
@@ -216,6 +230,10 @@ pub const AgentRuntimeDeps = struct {
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
     snapshot_mcp_definition: ?*const fn (*anyopaque, Allocator, []const u8, types.McpToolBinding) anyerror!@import("../../tooling/tool_mcp_runtime.zig").DefinitionSnapshot = null,
+    /// Resolves a model call naming a live MCP tool that this step did not
+    /// advertise. A returned definition is advertised before admission, so
+    /// the call runs under the normal MCP validation and permission path.
+    resolve_unselected_mcp_tool: ?*const fn (ctx: *anyopaque, arena: Allocator, name: []const u8) anyerror!?@import("../../tooling/tool_mcp_runtime.zig").SelectedTool = null,
     prepare_skill_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) anyerror!skill_contract.CallPreparation = null,
     check_tool_availability: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
     request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) anyerror!command_admission.PermissionOutcome,
@@ -236,6 +254,13 @@ pub const AgentRuntimeDeps = struct {
     /// Call-scoped output for the exact error returned through compaction, never retained.
     compaction_failure: ?*?compaction_activity.ErrorProvenance = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,
+    /// Called at every model-request boundary with the turn so far, so each
+    /// completed piece is saved as it happens rather than at the turn's end.
+    append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
+    /// Confirms, without writing, that this process still owns the saved
+    /// session after a main-model completion and before its tool calls run.
+    /// Another process may have taken the session over.
+    confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
@@ -270,8 +295,6 @@ pub const AgentRuntimeDeps = struct {
     record_tool_call_failed: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
     report_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) void = null,
     report_inner_tool_usage: ?*const fn (ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void = null,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
     // Accent for the +N / -N counts in a committed file's status line.
     // Captured by value at construction; that is safe only while the marker
     // colors never change after startup (they are theme-independent).
@@ -280,6 +303,27 @@ pub const AgentRuntimeDeps = struct {
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);
         return self.push_system_notice(self.ctx, text);
+    }
+
+    pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
+        if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
+        var observed_request = request;
+        observed_request.observer = self.observer orelse request.observer;
+        const result = self.execute_tool_call(self.ctx, observed_request) catch |err| {
+            if (self.observer) |observer| observer.emit(.{ .tool_end = .{
+                .call = request.call,
+                .status = if (err == error.Cancelled) "cancelled" else "failure",
+                .error_name = @errorName(err),
+            } });
+            return err;
+        };
+        if (self.observer) |observer| observer.emit(.{ .tool_end = .{
+            .call = request.call,
+            .output = result.model_output,
+            .status = if (result.cancelled) "cancelled" else @tagName(result.status),
+            .usage = result.inner_usage,
+        } });
+        return result;
     }
 };
 

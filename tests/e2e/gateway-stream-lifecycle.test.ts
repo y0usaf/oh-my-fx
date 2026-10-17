@@ -15,7 +15,7 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
@@ -46,7 +46,7 @@ import {
 } from "./tmux-helpers";
 
 const MODEL = "openai/gpt-5.5";
-const DEFAULT_MODEL = "moonshotai/kimi-k3";
+const DEFAULT_MODEL = "spacexai/grok-4.7";
 const DELAY_MS = 32_500;
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
@@ -184,7 +184,11 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
       expect(tui.paneStatus().status).toBe(0);
       expect(readFileSync(join(root.root, "stderr.log"), "utf8")).toBe("");
-      const frames = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const events = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8");
+      const frames = events.trim().split("\n").map(line => JSON.parse(line));
+      // The saved turn keeps what the user typed while the child ran, whether
+      // the turn finished or was cancelled.
+      expect(events.split("STEERING_FIRST").length - 1).toBe(1);
       expect(frames.filter(frame => frame.event?.tool_result?.call_id === "steering-delegation")).toHaveLength(1);
       const trace = readFileSync(join(root.root, "trace.log"), "utf8");
       expect(trace).toContain("event=steering_wait_yielded ");
@@ -218,6 +222,22 @@ function compactionEventsPath(root: FixtureRoot): string {
 function checkpointCount(events: string): number {
   return events.split("\n").slice(0, -1)
     .filter((line) => JSON.parse(line).event?.context_checkpoint).length;
+}
+
+// Automatic compaction first asks right after the conversation, which keeps
+// the agent's instructions and tools so the provider can reuse its cache.
+const NOTES_AFTER_CONVERSATION = "Write the compaction notes for the turns of the conversation above";
+
+/// A compaction request after the conversation, the agent's own request
+/// with the notes request appended.
+function isNotesAfterConversation(body: string): boolean {
+  return body.includes(NOTES_AFTER_CONVERSATION);
+}
+
+/// Any compaction request: after the conversation, or the turns written out
+/// with no tools.
+function isSummaryRequest(body: string): boolean {
+  return isNotesAfterConversation(body) || JSON.parse(body).tools.length === 0;
 }
 
 async function compactAndWait(tui: TmuxSession, root: FixtureRoot, timeoutMs: number) {
@@ -798,20 +818,21 @@ async function waitForMcpServerReady(
     throw new Error(`Timed out waiting for MCP fixture startup: ${serverName}`);
   }
 
-  const hasServerState = (pane: string, state: "ready" | "failed") =>
-    pane.includes(`${serverName} [${state}]`) ||
+  const hasServerState = (pane: string, state: "Ready" | "Failed") =>
     pane.split("\n").some((line) =>
-      line.includes(`${serverName} `) && line.includes(` state=${state}`)
+      line.includes(`${serverName} `) && line.includes(state)
     );
   await session.sendText("/mcp list");
   const status = await session.waitForPane(
-    (pane) => hasServerState(pane, "ready") || hasServerState(pane, "failed"),
+    (pane) => hasServerState(pane, "Ready") || hasServerState(pane, "Failed"),
     timeoutMs,
   );
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
   if (!isProcessAlive(pid)) {
     throw new Error(`MCP fixture process ${pid} exited after startup.\n${status}`);
   }
-  if (hasServerState(status, "failed")) {
+  if (hasServerState(status, "Failed")) {
     throw new Error(`MCP server ${serverName} failed after startup.\n${status}`);
   }
 }
@@ -1149,7 +1170,7 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.",
+        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors, and quote words that begin with =.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -1258,7 +1279,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask keeps Kimi K3 as the default model with fast mode enabled", async () => {
+  test("ask uses Grok 4.7 as the default model", async () => {
     const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
@@ -1267,8 +1288,8 @@ describe("gateway stream lifecycle", () => {
         models: [{
           id: DEFAULT_MODEL,
           type: "language",
-          tags: ["tool-use"],
-          fast_options: [{ type: "toggle" }],
+          tags: ["reasoning", "tool-use", "implicit-caching", "vision"],
+          reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }],
         }],
       },
     );
@@ -1298,8 +1319,9 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("fast");
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
       expect(request).toMatchObject({
-        providerOptions: { gateway: { speed: "fast" } },
+        providerOptions: { gateway: { caching: "auto" } },
       });
     } finally {
       gateway.stop();
@@ -1313,21 +1335,13 @@ describe("gateway stream lifecycle", () => {
     const gateway = startDynamicFakeGateway(
       () => fakeGatewayFinalText("FLAG_OVERRIDES_COMPLETE"),
       {
-        models: [
-          {
-            id: DEFAULT_MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-          },
-          {
-            id: MODEL,
-            type: "language",
-            tags: ["tool-use", "reasoning"],
-            fast_options: [{ type: "toggle" }],
-            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
-          },
-        ],
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
       },
     );
 
@@ -1371,26 +1385,18 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask --model without --fast drops the compiled-default fast mode", async () => {
-    const root = createFixtureRoot("ask-model-override-drops-fast");
+  test("ask --model without --fast keeps fast mode off", async () => {
+    const root = createFixtureRoot("ask-model-override-no-fast");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
       () => fakeGatewayFinalText("MODEL_ONLY_COMPLETE"),
       {
-        models: [
-          {
-            id: DEFAULT_MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-          },
-          {
-            id: MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
-          },
-        ],
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use"],
+          fast_options: [{ type: "toggle" }],
+        }],
       },
     );
 
@@ -1435,8 +1441,8 @@ describe("gateway stream lifecycle", () => {
           {
             id: DEFAULT_MODEL,
             type: "language",
-            tags: ["tool-use"],
-            fast_options: [{ type: "toggle" }],
+            tags: ["reasoning", "tool-use", "implicit-caching", "vision"],
+            reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }],
           },
           {
             id: MODEL,
@@ -1494,8 +1500,9 @@ describe("gateway stream lifecycle", () => {
       );
       const restoredRequest = JSON.parse(gateway.requests[2]!.body);
       expect(restoredRequest).not.toHaveProperty("reasoning");
+      expect(restoredRequest).not.toHaveProperty("providerOptions.gateway.speed");
       expect(restoredRequest).toMatchObject({
-        providerOptions: { gateway: { speed: "fast" } },
+        providerOptions: { gateway: { caching: "auto" } },
       });
     } finally {
       gateway.stop();
@@ -1800,6 +1807,76 @@ describe("gateway stream lifecycle", () => {
       expect(result.stderr).not.toContain("symlinked rule file");
     } finally {
       gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("skill_symlink_authorities setting admits external skill links", async () => {
+    const root = createFixtureRoot("skill-symlink-authorities");
+    const tracePath = join(root.root, "trace.log");
+    const externalStore = join(root.root, "external-store");
+    const skillsRoot = join(root.home, ".agents", "skills");
+    mkdirSync(join(externalStore, "external-skill"), { recursive: true });
+    mkdirSync(skillsRoot, { recursive: true });
+    writeFileSync(
+      join(externalStore, "external-skill", "SKILL.md"),
+      "---\nname: external-skill\ndescription: skill outside every root\n---\n\nEXTERNAL_SKILL_SENTINEL\n",
+    );
+    symlinkSync(
+      join(externalStore, "external-skill"),
+      join(skillsRoot, "external-skill"),
+      "dir",
+    );
+    const settingsPath = join(root.home, ".fx", "settings.json");
+
+    const ask = async (settings: unknown) => {
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      const gateway = startGateway(() =>
+        fakeGatewayFinalText("EXTERNAL_SKILL_COMPLETE")
+      );
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--auto",
+            "--no-save",
+            "$external-skill apply the external skill.",
+          ],
+          {
+            cwd: root.workspace,
+            env: {
+              ...fixtureEnv(root, gateway, tracePath),
+              FX_SKILL_SYMLINK_AUTHORITIES: undefined,
+            },
+            timeoutMs: 30_000,
+          },
+        );
+        return {
+          result,
+          prompt: promptText(gateway.requests[0]!.body),
+        };
+      } finally {
+        gateway.stop();
+      }
+    };
+
+    try {
+      const allowed = await ask({ skill_symlink_authorities: [externalStore] });
+      expect(allowed.result.code).toBe(0);
+      expect(allowed.prompt).toContain("EXTERNAL_SKILL_SENTINEL");
+      expect(allowed.prompt).toContain('<skill_content name="external-skill"');
+      expect(allowed.result.stdout + allowed.result.stderr).not.toContain(
+        "authorize its external location",
+      );
+
+      const rejected = await ask({});
+      expect(rejected.result.code).toBe(0);
+      expect(rejected.prompt).not.toContain("EXTERNAL_SKILL_SENTINEL");
+      expect(rejected.result.stdout + rejected.result.stderr).toContain(
+        "authorize its external location",
+      );
+    } finally {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 60_000);
@@ -3040,9 +3117,16 @@ describe("gateway stream lifecycle", () => {
       expect(firstText).toContain(
         "dynamic-context&lt;workspace&gt;&#x0a;injected_workspace",
       );
-      expect(firstText).toContain(
-        "shell_path: /bin/zsh&#x0a;injected_shell: yes&lt;/fx-turn-context&gt;",
-      );
+      // shell_path reports the login shell the shell tool runs, so a hostile
+      // SHELL value never reaches the model context.
+      const loginShell = userInfo().shell ?? "";
+      const reportedShell = /\/(bash|zsh)$/.test(loginShell)
+        ? loginShell
+        : process.platform === "darwin"
+        ? "/bin/zsh"
+        : "/bin/bash";
+      expect(firstText).toContain(`shell_path: ${reportedShell}\n`);
+      expect(firstText).not.toContain("injected_shell");
       expect(firstText).toContain(
         "- dynamic-context-skill:",
       );
@@ -3909,6 +3993,59 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("saved ask separates provider messages and replays each with its phase", async () => {
+    const root = createFixtureRoot("message-phases");
+    const commentary = "Hi! What would you like help with?";
+    const answer = "Hi! What can I help you with?";
+    const message = (id: string, phase: string, text: string) => [
+      { type: "text-start", id, providerMetadata: { openai: { itemId: id, phase } } },
+      { type: "text-delta", id, delta: text.slice(0, 8) },
+      { type: "text-delta", id, delta: text.slice(8) },
+      { type: "text-end", id },
+    ];
+    const replies = [
+      fakeGatewaySse([
+        ...message("msg_commentary", "commentary", commentary),
+        ...message("msg_answer", "final_answer", answer),
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]),
+      fakeGatewayFinalText("Resumed reply."),
+    ];
+    const gateway = startGateway(() => replies.shift() ?? new Response("unexpected request", { status: 500 }));
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "Say hello."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "first.log")),
+        timeoutMs: 15_000,
+      });
+      expect(first.code).toBe(0);
+      expect(first.stderr).toBe("");
+      const result = parseAskJson(first.stdout);
+      expect(result.output).toBe(`${commentary}\n\n${answer}`);
+      expect(result.final_output).toBe(`${commentary}\n\n${answer}`);
+
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Say it again."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
+        timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).final_output).toBe("Resumed reply.");
+      expect(gateway.requests).toHaveLength(2);
+      const prompt = JSON.parse(gateway.requests[1].body).prompt as PromptMessage[];
+      const assistants = prompt.filter((entry) => entry.role === "assistant");
+      expect(assistants).toHaveLength(1);
+      expect(assistants[0].content).toEqual([
+        { type: "text", text: commentary, providerOptions: { openai: { itemId: "msg_commentary", phase: "commentary" } } },
+        { type: "text", text: answer, providerOptions: { openai: { itemId: "msg_answer", phase: "final_answer" } } },
+      ]);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("saved ask retries a clear response language mismatch without persisting it", async () => {
     const root = createFixtureRoot("response-language-retry");
     const firstTracePath = join(root.root, "first-trace.log");
@@ -4675,20 +4812,30 @@ describe("gateway stream lifecycle", () => {
     writeFileSync(clipboardStub, "#!/bin/sh\nexit 1\n");
     chmodSync(clipboardStub, 0o755);
     const marker = join(root.workspace, "executions.txt");
+    const invalidInput = '{"request":{"action":"run","command":"touch MUST_NOT_EXECUTE"';
     let step = 0;
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
           return fakeGatewaySse([
-            { type: "tool-call", toolCallId: "invalid_shell", toolName: "shell", input: '{"request":{"action":"run","command":"touch MUST_NOT_EXECUTE"' },
+            { type: "tool-call", toolCallId: "invalid_shell", toolName: "shell", input: invalidInput },
             { type: "tool-call", toolCallId: "valid_shell", toolName: "shell", input: { request: { action: "run", command: "printf 'once\\n' >> executions.txt", profile: "clean" } } },
             { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
           ]);
-        case 1:
-          expect(toolResultOutput(body, "invalid_shell")).toContain("Tool arguments were not valid JSON.");
+        case 1: {
+          const rejection = toolResultOutput(body, "invalid_shell");
+          expect(rejection).not.toContain("MUST_NOT_EXECUTE");
+          const error = JSON.parse(rejection).error;
+          expect(error.message).toContain("Tool arguments ended before the JSON was complete");
+          expect(error.details).toEqual({
+            failure: "truncated",
+            received_bytes: invalidInput.length,
+            error_offset: invalidInput.length,
+          });
           expect(shellResult(body, "valid_shell").exit_code).toBe(0);
           expect(readFileSync(marker, "utf8")).toBe("once\n");
           return fakeGatewayFinalText("REJECTION_RECOVERED");
+        }
         case 2:
           return fakeGatewayToolCall("later_shell", "shell", { request: { action: "run", command: "printf 'later\\n' >> executions.txt", profile: "clean" } });
         case 3:
@@ -5284,6 +5431,119 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
+    }
+  }, 30_000);
+
+  test("shell keeps a detached daemon across calls and stops same-session jobs", async () => {
+    const root = createFixtureRoot("shell-detached-daemon");
+    const tracePath = join(root.root, "trace.log");
+    const daemonPidPath = join(root.workspace, "daemon.pid");
+    const jobPidPath = join(root.workspace, "job.pid");
+    const startCallId = "shell_detached_daemon_start";
+    const probeCallId = "shell_detached_daemon_probe";
+    const startCommand = [
+      `sleep 30 >/dev/null 2>&1 & printf '%s' "$!" > ${JSON.stringify(jobPidPath)}`,
+      "python3 -c 'import os,sys,time",
+      "ready_r,ready_w=os.pipe()",
+      "if os.fork() == 0:",
+      " os.close(ready_r)",
+      " os.setsid()",
+      " if os.fork() > 0: os._exit(0)",
+      " null=os.open(\"/dev/null\",os.O_RDWR)",
+      " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)",
+      ` with open(${JSON.stringify(daemonPidPath)},\"w\") as f: f.write(str(os.getpid()))`,
+      " os.write(ready_w,b\"R\"); os.close(ready_w)",
+      " time.sleep(30)",
+      " os._exit(0)",
+      "os.close(ready_w)",
+      "if os.read(ready_r,1) != b\"R\": sys.exit(1)",
+      "print(\"DAEMON-STARTED\")'",
+    ].join("\n");
+    let step = 0;
+    let daemonPid: number | null = null;
+    let jobPid: number | null = null;
+    let started: ShellResult | null = null;
+    let probed: ShellResult | null = null;
+    let daemonAliveAfterStart = false;
+    let jobAliveAfterStart = true;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeShellRun(startCallId, startCommand, {
+            profile: "clean",
+            timeout_ms: 10_000,
+          });
+        case 1: {
+          try {
+            started = shellResult(body, startCallId);
+            daemonPid = Number.parseInt(readFileSync(daemonPidPath, "utf8"), 10);
+            jobPid = Number.parseInt(readFileSync(jobPidPath, "utf8"), 10);
+            daemonAliveAfterStart = isProcessAlive(daemonPid);
+            jobAliveAfterStart = isProcessAlive(jobPid);
+          } catch (error) {
+            gatewayObservationError = error;
+            return fakeGatewayFinalText("Detached daemon fixture failed.");
+          }
+          return fakeShellRun(
+            probeCallId,
+            `kill -0 ${daemonPid} && printf DAEMON-ALIVE`,
+            { profile: "clean" },
+          );
+        }
+        case 2:
+          try {
+            probed = shellResult(body, probeCallId);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("Detached daemon survived.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the detached daemon fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      if (gatewayObservationError) throw gatewayObservationError;
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Detached daemon survived.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(started).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        error: null,
+        output_delta: expect.stringContaining("DAEMON-STARTED"),
+      });
+      expect(Number.isSafeInteger(daemonPid) && daemonPid! > 0).toBe(true);
+      expect(Number.isSafeInteger(jobPid) && jobPid! > 0).toBe(true);
+      expect(daemonAliveAfterStart).toBe(true);
+      expect(jobAliveAfterStart).toBe(false);
+      expect(probed).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        output_delta: "DAEMON-ALIVE",
+      });
+      expect(isProcessAlive(daemonPid!)).toBe(true);
+    } finally {
+      for (const pid of [daemonPid, jobPid]) {
+        if (pid === null || !Number.isSafeInteger(pid) || pid <= 0) continue;
+        if (!isProcessAlive(pid)) continue;
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
 
@@ -5927,17 +6187,26 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let ordinary = 0;
     let summaries = 0;
     const gateway = startDynamicFakeGateway((body) => {
-      const request = JSON.parse(body);
-      if (request.tools.length === 0) {
+      if (isSummaryRequest(body)) {
         summaries++;
-        expect(body).not.toContain("LARGE_REASONING_");
-        expect(body).not.toContain("RECENT_REASONING_SIGNATURE");
+        if (isNotesAfterConversation(body)) {
+          // The agent's own request, reasoning included, as it was about to
+          // send it.
+          expect(summaries).toBe(1);
+          expect(body).toContain("LARGE_REASONING_5");
+        } else {
+          expect(body).not.toContain("LARGE_REASONING_");
+          expect(body).not.toContain("RECENT_REASONING_SIGNATURE");
+        }
         expect(body).toContain("REPLAY_RESULT_SENTINEL");
+        // The manual compaction folds the first one away, and these notes
+        // leave out its summary, so the summary is asked for once more.
+        if (summaries === 3) expect(body).toContain("Your notes left out the summary of the earlier compacted conversation.");
         return fakeGatewayFinalText("The prior reads completed. Preserve REPLAY_RESULT_SENTINEL and continue without repeating completed reads.");
       }
       ordinary++;
       if (ordinary === 6) {
-        expect(body).toContain("context_handoff");
+        expect(body).toContain("compacted_conversation");
         expect(body).toContain("REPLAY_RESULT_SENTINEL");
         expect(body).not.toContain("LARGE_REASONING_");
       }
@@ -5977,7 +6246,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       await tui.waitForText("RECENT_TURN_DONE", 15_000);
       await tui.waitForComposer(15_000);
       await compactAndWait(tui, root, 20_000);
-      expect(summaries).toBe(2);
+      expect(summaries).toBe(3);
       expect(readFileSync(tracePath, "utf8")).not.toContain("ContextCapacityExceeded");
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(15_000)).toBe(true);
@@ -5986,11 +6255,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const latest = await runFx(["session", "last", "--json"], { cwd: root.workspace, env });
       expect(latest.code).toBe(0);
       const id = JSON.parse(latest.stdout).id;
+      // Asked for only the summary, the reply without its heading is the
+      // summary of the folded compaction.
+      const compacted = await runFx(["session", "--id", id, "--json"], { cwd: root.workspace, env });
+      expect(compacted.code).toBe(0);
+      expect(JSON.parse(compacted.stdout).history.at(-1)?.summary).toContain("\"earlier\":\"The prior reads completed.");
       const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
       expect(resumed.code, resumed.stderr || resumed.stdout).toBe(0);
       expect(JSON.parse(resumed.stdout).final_output).toBe("COLD_REPLAY_DONE");
       expect(ordinary).toBe(9);
-      expect(summaries).toBe(2);
+      expect(summaries).toBe(3);
       expect(readFileSync(join(root.workspace, "sentinel.txt"), "utf8")).toBe("REPLAY_RESULT_SENTINEL\n");
     } finally {
       await tui?.kill();
@@ -6014,16 +6288,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         writeFileSync(join(root.workspace, "small.txt"), "small follow-up\n");
         let step = 0;
         let compactions = 0;
-        let snapshotHandle = "";
+        let sourceHandle = "";
         const gateway = startDynamicFakeGateway((body) => {
-          const request = JSON.parse(body);
-          if (request.tools.length === 0) {
-            expect(body).not.toContain(replaySignature);
+          if (isSummaryRequest(body)) {
+            // Only a request after the conversation carries its reasoning.
+            if (isNotesAfterConversation(body)) expect(body).toContain(replaySignature);
+            else expect(body).not.toContain(replaySignature);
             compactions++;
-            snapshotHandle = body.match(/result-read_tool_result-[a-f0-9-]+\.txt/)?.[0] ?? "";
-            expect(snapshotHandle).not.toBe("");
+            // The compacted command keeps the handle of its whole output.
+            expect(sourceHandle).not.toBe("");
+            expect(body).toContain(sourceHandle);
             if (compactions === 1) return fakeGatewayFinalText("");
-            return fakeGatewayFinalText(`The command ran once. Read ${snapshotHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
+            return fakeGatewayFinalText(`The command ran once. Read ${sourceHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
           }
           switch (step++) {
             case 0:
@@ -6034,6 +6310,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               const source = JSON.parse(toolResultOutput(body, "retrieval-source"));
               expect(source.exit_code).toBe(0);
               expect(source.full_output_handle).toBeString();
+              sourceHandle = source.full_output_handle;
               return fakeGatewayToolCall("retrieval-page", "read_tool_result", {
                 request: { handle: source.full_output_handle, query: "RETRIEVAL_MATCH" },
               });
@@ -6054,14 +6331,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               expect(body).toContain(replaySignature);
               if (trigger === "automatic") {
                 expect(compactions).toBe(2);
-                expect(body).toContain("context_handoff");
+                expect(body).toContain("compacted_conversation");
               }
               return fakeGatewayFinalText("RETRIEVAL_TURN_COMPLETE");
             case 4:
               expect(body).toContain(replaySignature);
-              expect(body).toContain(snapshotHandle);
+              expect(body).toContain(sourceHandle);
               return fakeGatewayToolCall("retrieval-tail", "read_tool_result", {
-                request: { handle: snapshotHandle, start_byte: 65300, byte_count: 1024 },
+                request: { handle: sourceHandle, start_byte: 65300, byte_count: 1024 },
               });
             case 5:
               expect(toolResultOutput(body, "retrieval-tail")).toContain(tail);
@@ -6083,9 +6360,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             await compactAndWait(tui, root, 20000);
           }
           expect(compactions).toBe(2);
-          const summaryRequests = gateway.requests.filter((entry) => JSON.parse(entry.body).tools.length === 0);
+          const summaryRequests = gateway.requests.filter((entry) => isSummaryRequest(entry.body));
           expect(summaryRequests).toHaveLength(2);
-          expect(summaryRequests[1]!.body).toBe(summaryRequests[0]!.body);
+          if (trigger === "automatic") {
+            // After the empty reply to the request after the conversation,
+            // the turns are written out instead.
+            expect(isNotesAfterConversation(summaryRequests[0]!.body)).toBe(true);
+            expect(JSON.parse(summaryRequests[1]!.body).tools).toHaveLength(0);
+          } else {
+            expect(summaryRequests[1]!.body).toBe(summaryRequests[0]!.body);
+          }
           await tui.sendText("/quit");
           expect(await tui.waitForSessionEnd(15000)).toBe(true);
           tui = null;
@@ -6094,18 +6378,24 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(latest.code).toBe(0);
           const sessionId = JSON.parse(latest.stdout).id;
           const sessionDir = join(root.home, ".fx", "sessions", sessionId);
-          const snapshot = readFileSync(join(sessionDir, "tool-results", snapshotHandle), "utf8");
+          const toolResults = join(sessionDir, "tool-results");
+          // The clipped page keeps its whole copy on disk.
+          const snapshotHandle = readdirSync(toolResults).find((name) => /^result-read_tool_result-[a-f0-9-]+\.txt$/.test(name)) ?? "";
+          expect(snapshotHandle).not.toBe("");
+          const snapshot = readFileSync(join(toolResults, snapshotHandle), "utf8");
           expect(Buffer.byteLength(snapshot)).toBeGreaterThan(65536);
           expect(snapshot).toContain(token);
           expect(snapshot).toContain(tail);
           expect(readFileSync(join(sessionDir, "events.jsonl"), "utf8")).toContain(snapshotHandle);
+          // The compacted command is saved as T1 with the handle of its whole output.
+          expect(readFileSync(join(toolResults, "compacted-T1.txt"), "utf8")).toContain(sourceHandle);
           const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           expect(resumed.stderr).toBe("Reading tool result\n");
           expect(JSON.parse(resumed.stdout).final_output).toBe("RETRIEVAL_RESTART_COMPLETE");
           expect(gateway.requests).toHaveLength(8);
           expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
-          expect(readFileSync(tracePath, "utf8")).not.toContain("IncompleteCompactionResult");
+          expect(readFileSync(tracePath, "utf8")).not.toContain("event=transaction_failed");
         } finally {
           await tui?.kill();
           gateway.stop();
@@ -6147,7 +6437,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "Continue the compacted session. Preserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.",
         ),
         fakeGatewayFinalText("compaction restart complete"),
-        fakeGatewayFinalText("Second compaction preserved the restored session."),
+        fakeGatewayFinalText("Turn 2\nIn between: Second compaction preserved the restored session.\n\nEarlier:\nThe user sent two sentinel prompts and restarted fx."),
       ];
       const gateway = startGateway(() =>
         responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -6245,9 +6535,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(compactRequest.toolChoice).toEqual({ type: "none" });
         expect(compactRequest.responseFormat).toBeUndefined();
         const compactSource = JSON.stringify(compactRequest.prompt);
-        expect(compactSource).toContain(callId);
-        expect(compactSource).not.toContain(inlineCallId);
-        expect(compactSource).toContain("Result handle:");
+        // The older turn's tool call is compacted as T1; the newest turn stays unchanged.
+        expect(compactSource).toContain("[Tool call T1: read_file]");
+        expect(compactSource).toContain("manual-compaction-large.txt");
+        expect(compactSource).not.toContain("manual-compaction-inline.txt");
+        expect(compactSource).toContain(bodySentinel);
         expect(gateway.requests[4].headers.get("ai-language-model-id")).toBe(MODEL);
 
         const resumed = await runFx(
@@ -6276,11 +6568,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           .filter((message) => message.role === "user")
           .map((message) => contentText(message.content));
         expect(userTexts.at(-1)).toBe("compaction restart probe");
-        expect(userTexts.some((text) => text.includes("context_handoff"))).toBe(
+        expect(userTexts.some((text) => text.includes("compacted_conversation"))).toBe(
           true,
         );
         const requestText = JSON.stringify(request);
-        expect(requestText).toContain("context_handoff");
+        expect(requestText).toContain("compacted_conversation");
         expect(requestText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(requestText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
         expect(requestText).not.toContain(bodySentinel);
@@ -6324,10 +6616,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForComposer(15_000);
         const resumedTranscript = await tui.captureFullScrollback();
         expect(resumedTranscript).toContain("compaction restart complete");
-        expect(resumedTranscript).not.toContain("context_handoff");
+        expect(resumedTranscript).not.toContain("compacted_conversation");
         expect(resumedTranscript).not.toContain("Recent conversation turns are preserved verbatim");
         await compactAndWait(tui, root, 15_000);
-        expect(await tui.captureFullScrollback()).not.toContain("context_handoff");
+        expect(await tui.captureFullScrollback()).not.toContain("compacted_conversation");
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(15_000);
         tui = null;
@@ -6339,11 +6631,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         };
         expect(secondCompactRequest.tools).toEqual([]);
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
-        expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
-        expect(secondCompactText).toContain("PREVIOUS_DERIVED_SUMMARY (not original user text)");
+        expect(secondCompactText).toContain("Write the compaction notes for the new turns above");
+        // The first compaction is shown whole so the model can summarize it,
+        // since it is saved as L1 and leaves what the agent sees.
+        expect(secondCompactText).toContain("[The earlier compacted conversation, to summarize; it is saved whole as L1]");
+        expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("Continue the compacted session.");
-        expect(secondCompactText).not.toContain("context_handoff");
+        expect(secondCompactText).toContain("\\nEarlier:\\nthree to five sentences");
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
         const afterSecondCompact = await runFx(
@@ -6357,6 +6652,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
         expect(secondSummary).toContain("Second compaction preserved the restored session.");
         expect(secondSummary).not.toContain("operation sequence");
+        expect(secondSummary).toContain("\"ledger_count\":1");
+        expect(secondSummary).toContain("The user sent two sentinel prompts and restarted fx.");
+        // The first compaction, its notes included, is saved whole as L1.
+        expect(secondSummary).not.toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        const firstLedger = readFileSync(join(root.home, ".fx", "sessions", sessionId, "tool-results", "compacted-L1.txt"), "utf8");
+        expect(firstLedger).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(firstLedger).toContain("Continue the compacted session.");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();
@@ -6382,10 +6684,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
             compactions++;
-            expect(body).toContain("Tool subagent (failure)");
+            // The cancelled call reaches the summarizer as it happened and is saved as T1.
+            expect(body).toContain("[Tool result T1: subagent]");
             expect(body).toContain("aborted by user");
-            diagnosticHandle = body.match(/result-subagent-[a-f0-9-]+\.txt/)?.[0] ?? "";
-            expect(diagnosticHandle).not.toBe("");
+            diagnosticHandle = "T1";
             return fakeGatewayFinalText(`The subagent was cancelled, not completed. Its diagnostic is ${diagnosticHandle}. Continue without repeating it.`);
           }
           switch (step++) {
@@ -6406,8 +6708,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               expect(compactions).toBe(trigger === "automatic" ? 1 : 0);
               return fakeGatewayFinalText("CANCEL_FOLLOWUP_COMPLETE");
             case 4:
-              expect(body).toContain("context_handoff");
-              expect(body).toContain(diagnosticHandle);
+              expect(body).toContain("compacted_conversation");
+              expect(body).toContain(`Its diagnostic is ${diagnosticHandle}.`);
+              expect(body).toContain("with read_tool_result");
               return fakeGatewayFinalText("CANCEL_RESTART_COMPLETE");
             default:
               return new Response("unexpected request", { status: 500 });
@@ -6451,7 +6754,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const saved = readFileSync(eventsPath, "utf8");
           expect(saved.startsWith(before)).toBe(true);
           expect(saved.match(/"context_checkpoint":/g)).toHaveLength(1);
-          expect(readFileSync(join(sessionDir, "tool-results", diagnosticHandle), "utf8")).toBe("aborted by user");
+          const savedTool = readFileSync(join(sessionDir, "tool-results", `compacted-${diagnosticHandle}.txt`), "utf8");
+          expect(savedTool.startsWith("T1 subagent: run Wait for further input without tools.\n")).toBe(true);
+          expect(savedTool).toContain("\nResult:\naborted by user\n");
           expect(await tui.captureFullScrollback()).not.toContain("IncompleteCompactionResult");
           await tui.sendText("/quit");
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
@@ -6487,7 +6792,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
       const held = heldFakeGatewayFinalText();
+      // The first turn reads a file, so compaction has work to summarize and
+      // asks the model; the summary is request 3.
+      writeFileSync(join(root.workspace, "manual-cancel-notes.txt"), "notes\n");
       const responses = [
+        fakeGatewayToolCall("manual-cancel-read", "read_file", { path: "manual-cancel-notes.txt" }),
         fakeGatewayFinalText("MANUAL_CANCEL_FIRST_READY"),
         fakeGatewayFinalText("MANUAL_CANCEL_SECOND_READY"),
         () => held.response,
@@ -6528,7 +6837,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(checkpointCount(originalHistory)).toBe(0);
         await tui.sendText("/compact");
         const requestDeadline = Date.now() + 15_000;
-        while (gateway.requests.length < 3) {
+        while (gateway.requests.length < 4) {
           if (Date.now() >= requestDeadline) throw new Error("compactor request did not start");
           await Bun.sleep(10);
         }
@@ -6539,16 +6848,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           await Bun.sleep(10);
         }
         await tui.waitForText(COMPACTION_ACTIVITY, Math.max(1, requestDeadline - Date.now()));
-        expect(gateway.requests).toHaveLength(3);
-        expect(JSON.parse(gateway.requests[2]!.body).tools).toEqual([]);
-        expect(JSON.parse(gateway.requests[2]!.body).toolChoice).toEqual({ type: "none" });
+        expect(gateway.requests).toHaveLength(4);
+        expect(JSON.parse(gateway.requests[3]!.body).tools).toEqual([]);
+        expect(JSON.parse(gateway.requests[3]!.body).toolChoice).toEqual({ type: "none" });
         expect(readFileSync(eventsPath, "utf8")).toBe(originalHistory);
         await tui.sendInterruptEscapePair(5_000);
         await tui.waitForPane(
           (pane) => pane.includes("Compaction cancelled. Try /compact again when ready.") && compactionIdle(pane),
           5_000,
         );
-        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests).toHaveLength(4);
         expect(readFileSync(eventsPath, "utf8")).toBe(originalHistory);
 
         const latest = await runFx(["session", "last", "--json"], {
@@ -6574,11 +6883,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           (pane) => pane.includes("MANUAL_CANCEL_RECOVERY_OK") && hasEmptyComposer(pane),
           15_000,
         );
-        expect(gateway.requests).toHaveLength(4);
-        const followUpRequest = gateway.requests[3]!.body;
+        expect(gateway.requests).toHaveLength(5);
+        const followUpRequest = gateway.requests[4]!.body;
         expect(followUpRequest).toContain("MANUAL_CANCEL_FIRST_READY");
         expect(followUpRequest).toContain("MANUAL_CANCEL_SECOND_READY");
-        expect(followUpRequest).not.toContain("context_handoff");
+        expect(followUpRequest).not.toContain("compacted_conversation");
         const beforeFailure = readFileSync(eventsPath, "utf8");
         expect(beforeFailure.startsWith(originalHistory)).toBe(true);
         expect(checkpointCount(beforeFailure)).toBe(0);
@@ -6591,8 +6900,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           (pane) => pane.includes("Compaction failed. Try /compact again.") && compactionIdle(pane),
           15_000,
         );
-        expect(gateway.requests).toHaveLength(6);
-        expect(gateway.requests[5]!.body).toBe(gateway.requests[4]!.body);
+        // An empty summary is retried once on the fallback model with the same prompt.
+        expect(gateway.requests).toHaveLength(7);
+        expect(JSON.parse(gateway.requests[6]!.body).prompt).toEqual(JSON.parse(gateway.requests[5]!.body).prompt);
+        expect(gateway.requests[5]!.headers.get("ai-language-model-id")).toBe(MODEL);
+        expect(gateway.requests[6]!.headers.get("ai-language-model-id")).toBe("anthropic/claude-sonnet-5");
         expect(readFileSync(eventsPath, "utf8")).toBe(beforeFailure);
         const afterFailure = await runFx(["session", "--id", sessionId, "--json"], {
           cwd: root.workspace, env: { HOME: root.home },
@@ -6704,8 +7016,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(compactionRequest).toContain(bodySentinel);
         expect(compactionRequest).toContain(tailSentinel);
         expect(compactionRequest).toContain("<skill_content");
-        expect(compactionRequest).toContain("Result handle:");
-        expect(postCompactionRequest).toContain("context_handoff");
+        expect(compactionRequest).toMatch(/\[Tool result T\d+: skill\]/);
+        expect(postCompactionRequest).toContain("compacted_conversation");
         expect(postCompactionRequest).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
@@ -7108,15 +7420,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const serializedError = JSON.stringify(output);
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      expect(serializedError).toContain("ContextCompactionUnavailable");
+      // The summary and its fallback are both rejected, so the turn fails
+      // without running the completed tool again.
+      expect(serializedError).toContain("ModelFailed");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
       expect(readFileSync(sideEffectPath, "utf8")).toBe("once\n");
-      expect(gateway.requestCount()).toBe(3);
-      const summaryRequest = JSON.parse(gateway.requests[2]!.body);
-      expect(summaryRequest.tools).toEqual([]);
-      expect(summaryRequest.toolChoice).toEqual({ type: "none" });
+      expect(gateway.requestCount()).toBe(4);
+      for (const index of [2, 3]) {
+        const summaryRequest = JSON.parse(gateway.requests[index]!.body);
+        expect(summaryRequest.tools).toEqual([]);
+        expect(summaryRequest.toolChoice).toEqual({ type: "none" });
+      }
+      expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe("anthropic/claude-sonnet-5");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -7431,6 +7748,54 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(request.body).not.toContain('"name":"task"');
       }
       await waitForProcessExit(pid);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("subagent starts when the parent has more than 256 MCP tools", async () => {
+    const root = createFixtureRoot("subagent-large-mcp-catalog");
+    const tracePath = join(root.root, "trace.log");
+    writeMcpFixture(root, { toolCount: 257 });
+    const childPrompt = "Summarize the large MCP catalog fixture.";
+    let parentResult = "";
+    let childRequested = false;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes('"toolCallId":"parent_subagent_large_1"')) {
+        parentResult = toolResultOutput(body, "parent_subagent_large_1");
+        return fakeGatewayFinalText("Parent observed child completion.");
+      }
+      if (body.includes(childPrompt)) {
+        expect(promptText(body)).toContain(
+          '<server name="fixture" state="ready" tools="257" />',
+        );
+        childRequested = true;
+        return fakeGatewayFinalText("Child with large MCP catalog complete.");
+      }
+      return fakeGatewayToolCall("parent_subagent_large_1", "subagent", {
+        request: { action: "run", task: childPrompt },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Delegate the large catalog summary."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(parentResult).not.toContain("AdmissionFailed");
+      expect(parentResult).toContain("Child with large MCP catalog complete.");
+      expect(childRequested).toBe(true);
+      expect(parseAskJson(result.stdout).tool_calls).toEqual([
+        { name: "subagent", status: "success" },
+      ]);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

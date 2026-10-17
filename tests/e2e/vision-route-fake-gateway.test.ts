@@ -20,6 +20,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { jpegHeader, paddedPng, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
@@ -1124,77 +1125,193 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask normalizes encoded-oversized native images on macOS and rejects elsewhere",
+    "fx ask withholds byte-oversized native images instead of normalizing or rejecting",
     async () => {
       const root = createIsolatedRoot();
       const oversizedPath = join(root.workspace, "encoded-oversized.png");
       copyFileSync(IMAGE_PATH, oversizedPath);
       truncateSync(oversizedPath, (5 * 1024 * 1024 * 3) / 4 + 1);
-      const notice = "Unable to prepare this image for upload. Use a smaller image.";
-      const gateway = startImageGateway(
-        process.platform === "darwin" ? [sseText("Normalized native image answer")] : [],
-      );
+      const gateway = startImageGateway([sseText("Byte-oversized native image answer")]);
       try {
-        if (process.platform === "darwin") {
-          const result = await runFx(
-            [
-              "ask",
-              "--json",
-              "--no-save",
-              "--no-color",
-              "--image",
-              oversizedPath,
-              "Describe the attached image.",
-            ],
-            {
-              cwd: root.workspace,
-              env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-              timeoutMs: TIMEOUT,
-            },
-          );
-
-          const json = parseFxJson(result);
-          expect(json.output).toContain("Normalized native image answer");
-          expect(json.tool_calls).toHaveLength(0);
-          expect(result.stderr).toBe("");
-          expect(gateway.chatRequests).toHaveLength(1);
-          const parts = nativeFileParts(gateway.chatRequests[0]!.body);
-          expect(parts).toHaveLength(1);
-          expect(parts[0]!.mediaType).toBe("image/jpeg");
-          expect(parts[0]!.data.data.length).toBeLessThanOrEqual(5 * 1024 * 1024);
-          return;
-        }
-
-        const textResult = await runFx(
-          ["ask", "--no-save", "--image", oversizedPath, "Describe the image."],
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            oversizedPath,
+            "Describe the attached image.",
+          ],
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
             timeoutMs: TIMEOUT,
           },
         );
-        expect(textResult.code).toBe(1);
-        expect(textResult.stdout).toBe("");
-        expect(textResult.stderr).toContain(notice);
 
-        const jsonResult = await runFx(
-          ["ask", "--json", "--no-save", "--image", oversizedPath, "Describe the image."],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const errorJson = parseFxErrorJson(jsonResult);
-        expect(errorJson.error).toBe("ImagePreparationFailed");
-        expect(jsonResult.stderr).toBe("");
-        expect(gateway.chatRequests).toHaveLength(0);
+        const json = parseFxJson(result);
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain("Byte-oversized native image answer");
+        expect(json.tool_calls).toHaveLength(0);
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain("This request permits at most 8000 per side and 5 MiB encoded per image.");
+        expect(body).toContain("The original is saved at ");
+        expect(body).toContain("then read_file the copy.");
+        expect(result.stderr).toBe("");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "fx ask sends single-request native PNG images byte-for-byte below the 8000-pixel limit",
+    async () => {
+      const root = createIsolatedRoot();
+      const widePath = join(root.workspace, "wide-screenshot.png");
+      const original = solidPng(3420, 2224);
+      writeFileSync(widePath, original);
+      const gateway = startImageGateway([sseText("Wide native image answer")]);
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            widePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.output).toContain("Wide native image answer");
+        expect(result.stderr).toBe("");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const parts = nativeFileParts(gateway.chatRequests[0]!.body);
+        expect(parts).toHaveLength(1);
+        expect(parts[0]!.mediaType).toBe("image/png");
+        expect(parts[0]!.data.data).toBe(original.toString("base64"));
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask withholds native JPEG images over the 8000-pixel limit with saved-path guidance",
+    async () => {
+      const root = createIsolatedRoot();
+      const photoPath = join(root.workspace, "photo.jpg");
+      writeFileSync(photoPath, jpegHeader(8001, 1));
+      const gateway = startImageGateway([sseText("Photo note answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--no-save", "--image", photoPath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(result).output).toContain("Photo note answer");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain(
+          "[Image #1 not sent: image/jpeg is 8001x1 pixels. This request permits at most 8000 per side and 5 MiB encoded per image. The original is saved at ",
+        );
+        expect(body).toContain(
+          "Use an available image tool to save a smaller copy to a new file ending in .jpg, then read_file the copy.",
+        );
+        expect(result.stderr).toBe("");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "tmux consumes /image when its pasted path becomes a prompt attachment",
+    async () => {
+      const root = createIsolatedRoot();
+      const photoPath = join(root.workspace, "photo.jpg");
+      writeFileSync(photoPath, jpegHeader(8001, 1));
+      const gateway = startImageGateway([
+        sseText("TUI oversized image recovery answer"),
+        sseText("TUI pasted slash image answer"),
+      ]);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      let session: TmuxSession | null = null;
+      try {
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            FX_AUTO_UPGRADE: "0",
+            NO_COLOR: "1",
+          },
+          stderrPath,
+          width: 140,
+          height: 50,
+        });
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        await session.sendLiteral("/image ");
+        await session.pasteText(photoPath);
+        const draft = await session.captureFullScrollback();
+        expect(draft).toContain("[Image 1]");
+        expect(draft).not.toContain("/image ");
+        await session.sendText(" Describe the attached image.");
+        await session.waitForText("TUI oversized image recovery answer", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        const scrollback = await session.captureFullScrollbackEscapes();
+        expect(scrollback).toContain("TUI oversized image recovery answer");
+        expect(scrollback).not.toContain("An attached image was not sent");
+        expect(scrollback).not.toContain("[Image #1 not sent");
+
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain(
+          "[Image #1 not sent: image/jpeg is 8001x1 pixels. This request permits at most 8000 per side and 5 MiB encoded per image. The original is saved at ",
+        );
+        expect(body).toContain("then read_file the copy.");
+
+        await session.pasteText(`/image ${photoPath}`);
+        const secondDraft = await session.captureFullScrollback();
+        expect(secondDraft).toContain("[Image 2]");
+        expect(secondDraft).not.toContain("/image ");
+        await session.sendText(" Describe the second image.");
+        await session.waitForText("TUI pasted slash image answer", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        expect(gateway.chatRequests).toHaveLength(2);
+        expect(nativeFileParts(gateway.chatRequests[1]!.body)).toHaveLength(0);
+        expect(gateway.chatRequests[1]!.body).toContain("then read_file the copy.");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        if (session) await session.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
   );
 
   test.each(["plain", "prose-replay", "mixed-replay"] as const)(
@@ -3245,3 +3362,140 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     rmSync(root.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 3);
+
+describe("request size budget", () => {
+  const SIZE_CAP_BYTES = 4_000_000;
+  const SIZE_IMAGE_COUNT = 6;
+  const SIZE_NOTICE = "not sent to keep the request under the provider's size limit";
+  const SIZE_PROMPT = "Read img01.png through img06.png one at a time with read_file.";
+  // Bodies AI Gateway returned on 2026-10-07 for a request over Claude's
+  // limit, reduced to the fields fx reads.
+  const gatewayFallbackBody = JSON.stringify({
+    error: { message: "Bad Request", type: "AI_APICallError", param: { statusCode: 400 } },
+    providerMetadata: {
+      gateway: {
+        routing: {
+          resolvedProvider: "anthropic",
+          modelAttempts: [
+            {
+              canonicalSlug: "anthropic/claude-haiku-4.5",
+              success: false,
+              providerAttempts: [
+                { provider: "anthropic", success: false, error: "Payload Too Large", statusCode: 413 },
+                { provider: "bedrock", success: false, error: "Input is too long.", statusCode: 400 },
+                { provider: "vertexAnthropic", success: false, error: "Bad Request", statusCode: 400 },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+  const payloadTooLargeBody = JSON.stringify({
+    error: { message: "Payload Too Large", type: "AI_APICallError", param: { statusCode: 413 } },
+  });
+
+  type SizeRequest = { body: string; images: string[]; tools: boolean; status: number };
+
+  function startSizeCappedGateway(rejection: { status: number; body: string }, images: Map<string, string>) {
+    const byData = new Map([...images].map(([name, data]) => [data, name]));
+    const requests: SizeRequest[] = [];
+    let issued = 0;
+    const server = Bun.serve({
+      port: 0,
+      maxRequestBodySize: 64 * 1024 * 1024,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/coding-agent/v1/models") {
+          return Response.json({ data: [{ id: GEMINI_MODEL, type: "language", tags: ["vision", "file-input", "tool-use"] }] });
+        }
+        if (req.method !== "POST") return new Response("not found", { status: 404 });
+        const body = await req.text();
+        if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+        const parsed = JSON.parse(body) as { tools?: unknown[] };
+        const tools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+        const carried = nativeFileParts(body).map((part) => byData.get(part.data.data) ?? "unknown");
+        const status = body.length > SIZE_CAP_BYTES ? rejection.status : 200;
+        requests.push({ body, images: carried, tools, status });
+        if (status !== 200) {
+          return new Response(rejection.body, { status, headers: { "content-type": "application/json" } });
+        }
+        if (!tools) return sseText("Summary: the user asked fx to read six images.");
+        if (issued < SIZE_IMAGE_COUNT) {
+          issued += 1;
+          return sseToolCall("read_file", { path: `img0${issued}.png` }, `call_img_${issued}`);
+        }
+        return sseText(`done: read ${SIZE_IMAGE_COUNT} images`);
+      },
+    });
+    return {
+      requests,
+      env: (root: ReturnType<typeof createIsolatedRoot>) => ({
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: "fake-size-budget-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: `http://127.0.0.1:${server.port}`,
+        FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
+        FX_MODEL: GEMINI_MODEL,
+      }),
+      stop() {
+        server.stop(true);
+      },
+    };
+  }
+
+  function writeSizeImages(workspace: string) {
+    const images = new Map<string, string>();
+    for (let index = 1; index <= SIZE_IMAGE_COUNT; index++) {
+      // About 1 MB of base64 each, distinct bytes per file.
+      const png = paddedPng(solidPng(64, 64), 750_000 + index);
+      writeFileSync(join(workspace, `img0${index}.png`), png);
+      images.set(`img0${index}.png`, png.toString("base64"));
+    }
+    return images;
+  }
+
+  for (const [label, rejection] of [
+    ["a Gateway 400 hiding a provider 413", { status: 400, body: gatewayFallbackBody }],
+    ["an HTTP 413", { status: 413, body: payloadTooLargeBody }],
+  ] as const) {
+    test(`${label} leaves out the oldest images instead of compacting`, async () => {
+      const root = createIsolatedRoot();
+      const images = writeSizeImages(root.workspace);
+      const gateway = startSizeCappedGateway(rejection, images);
+      try {
+        const result = await runFx(["ask", "--json", "--auto", "--no-color", SIZE_PROMPT], {
+          cwd: root.workspace,
+          env: gateway.env(root),
+          timeoutMs: TIMEOUT * 2,
+        });
+        const json = parseFxJson(result);
+        expect(json.output).toContain(`done: read ${SIZE_IMAGE_COUNT} images`);
+
+        const rejected = gateway.requests.filter((request) => request.status !== 200);
+        expect(rejected).toHaveLength(1);
+        // No summary request: the conversation was not compacted.
+        expect(gateway.requests.every((request) => request.tools)).toBe(true);
+
+        const rejectedIndex = gateway.requests.indexOf(rejected[0]!);
+        const learnedLimit = Math.floor(rejected[0]!.body.length / 4) * 3;
+        const after = gateway.requests.slice(rejectedIndex + 1);
+        expect(after.length).toBeGreaterThan(0);
+        for (const request of after) {
+          expect(request.body.length).toBeLessThanOrEqual(learnedLimit);
+          // Text history survives: the original prompt rides every request.
+          expect(request.body).toContain(SIZE_PROMPT);
+        }
+        // The retry drops the oldest images and keeps the newest.
+        expect(after[0]!.images).not.toContain("img01.png");
+        expect(after[0]!.images).toContain(rejected[0]!.images.at(-1));
+        expect(after[0]!.body).toContain(SIZE_NOTICE);
+        expect(after[0]!.body).toContain("read_tool_result with handle");
+        expect(after.at(-1)!.images).toContain("img06.png");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT * 3);
+  }
+});

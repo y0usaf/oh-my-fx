@@ -1377,6 +1377,68 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
 
   test(
+    "diff counts are monochrome until a theme is explicitly selected",
+    async () => {
+      for (const selection of ["default", "pinned", "named"] as const) {
+        const root = createIsolatedRoot();
+        const target = join(root.workspace, "marker.txt");
+        writeFileSync(target, "before\n");
+        if (selection === "named") {
+          mkdirSync(join(root.home, ".fx", "themes"), { recursive: true });
+          writeFileSync(join(root.home, ".fx", "themes", "marker-dark.json"), JSON.stringify({
+            name: "Marker Dark",
+            type: "dark",
+            colors: { diff_added_marker: "#30A46C", diff_removed_marker: "#E5484D" },
+          }));
+          writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({
+            sandbox: "none",
+            permission_mode: "ask",
+            permission: {},
+            theme: "marker-dark",
+          }));
+        }
+        const gateway = startFakeGateway([
+          toolCall(`${selection}_marker`, "edit_file", {
+            path: "marker.txt",
+            old_string: "before\n",
+            new_string: "after\n",
+          }),
+          finalText(`${selection} marker complete`),
+        ]);
+        const { session, stderrPath } = await launch(root, gateway, {}, {
+          FX_THEME: selection === "pinned" ? "dark" : undefined,
+          NO_COLOR: undefined,
+          COLORTERM: undefined,
+          TERM_PROGRAM: "Apple_Terminal",
+          COLORFGBG: "15;0",
+        });
+
+        await session.sendText("Edit the marker fixture.");
+        await waitForFileApproval(session, { required: ["marker.txt", "after"] });
+        await decide(session, 1);
+        await session.waitForText(`${selection} marker complete`, TIMEOUT);
+        expect(readFileSync(target, "utf8")).toBe("after\n");
+        const scrollback = await session.captureFullScrollbackEscapes();
+        const row = scrollback.split("\n").find((line) =>
+          line.includes("Edited marker.txt") && line.includes("+1") && line.includes("-1")
+        );
+        expect(row).toBeDefined();
+        if (selection === "default") {
+          expect(row).not.toContain("\x1b[38;5;71m");
+          expect(row).not.toContain("\x1b[38;5;167m");
+        } else {
+          expect(row).toContain("\x1b[38;5;71m+1");
+          expect(row).toContain("\x1b[38;5;167m-1");
+        }
+        expectCleanStderr(stderrPath);
+        await session.kill();
+        activeSession = null;
+      }
+    },
+    90_000,
+  );
+
+  test(
     "file session grant reuses the canonical target without a second prompt",
     async () => {
       const root = createIsolatedRoot();
@@ -1869,8 +1931,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(settled).not.toContain(APPLY_QUESTION);
       expect(existsSync(target)).toBe(false);
       expect(gateway.requests).toHaveLength(3);
-      expect(gateway.requests[1]!.body).toContain("Tool write_file (failure)");
-      expect(gateway.requests[2]!.body).toContain("context_handoff");
+      expect(gateway.requests[1]!.body).toContain("[Tool result T1: write_file]");
+      expect(gateway.requests[2]!.body).toContain("compacted_conversation");
       expectCleanStderr(stderrPath);
     },
     90_000,

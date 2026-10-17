@@ -338,13 +338,36 @@ pub const Operations = struct {
                     return error.Cancelled;
                 }
                 if (!outcome.connection_running and !outcome.request_started and !retried_unsent_call) {
-                    try self.recoverServerForToolCall(
+                    const failures_before = server.failureSerial();
+                    self.recoverServerForToolCall(
                         server,
                         snapshot,
                         outcome.generation,
                         operation_deadline.?,
                         options,
-                    );
+                    ) catch |recovery_err| {
+                        debug_trace.logf(
+                            "mcp",
+                            "stdio server recovery failed server={s} generation={d} err={s}",
+                            .{ server.config.name, outcome.generation, @errorName(recovery_err) },
+                        );
+                        if (recovery_err == error.Cancelled or
+                            recovery_err == error.McpAccessDenied or
+                            recovery_err == error.McpAuthorityChanged)
+                        {
+                            return recovery_err;
+                        }
+                        if (try restartFailedResult(
+                            arena,
+                            self.lifecycle.catalog_mutex,
+                            server,
+                            snapshot.prefixed_name,
+                            failures_before,
+                        )) |result| {
+                            return result;
+                        }
+                        return recovery_err;
+                    };
                     try lockRwSharedUntil(
                         &server.connection_lock,
                         operation_deadline.?,
@@ -569,6 +592,7 @@ pub const Operations = struct {
             responderCapabilities(options.input_responder),
         );
         defer alloc.free(request_body);
+        if (options.mcp_observation) |call| call.request(request_id);
 
         var tool_precommit = ToolPrecommit{
             .alloc = runtime.lifecycle.alloc,
@@ -653,6 +677,30 @@ pub const Operations = struct {
         return switch (status) {
             .success, .tool_failure => .completed,
             .protocol_failure, .input_required => .abandoned,
+        };
+    }
+
+    /// The reason a stopped server failed to start again, or null unless a
+    /// failure was recorded after the caller read `failures_before`.
+    fn restartFailedResult(
+        arena: Allocator,
+        catalog_mutex: *std.Io.RwLock,
+        server: *McpServer,
+        tool_name: []const u8,
+        failures_before: u64,
+    ) !?tool_mcp_runtime.CallResult {
+        // A successful recovery replaces last_error under the exclusive
+        // catalog lock without taking status_lock.
+        catalog_mutex.lockSharedUncancelable(io_mod.getIo());
+        defer catalog_mutex.unlockShared(io_mod.getIo());
+        server.status_lock.lockUncancelable(io_mod.getIo());
+        defer server.status_lock.unlock(io_mod.getIo());
+        if (server.failure_serial == failures_before) return null;
+        if (server.state.load(.acquire) != .failed) return null;
+        const failure = server.last_error orelse return null;
+        return .{
+            .model_output = try tool_result.restart_failed_result(arena, server.config.name, tool_name, failure),
+            .status = .protocol_failure,
         };
     }
 
@@ -746,6 +794,7 @@ pub const Operations = struct {
         };
         var transport_precommit = tool_precommit.transport();
         const request_id = try server.reserveRequestId();
+        if (options.mcp_observation) |call| call.request(request_id);
         if (server.legacy_http) |client| {
             if (!client.acquireUse()) return error.McpConnectionClosed;
             const client_version = client.version;
@@ -1106,6 +1155,7 @@ pub const Operations = struct {
 
         const client = server.legacy_sse orelse return error.McpConnectionClosed;
         const request_id = try server.reserveRequestId();
+        if (options.mcp_observation) |call| call.request(request_id);
         const request_body = try buildToolCallRequestForProtocol(
             alloc,
             request_id,
@@ -1175,3 +1225,24 @@ pub const Operations = struct {
         });
     }
 };
+
+test "a failed recovery reports only the failure it recorded" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var catalog_mutex: std.Io.RwLock = .init;
+    var server = McpServer{ .config = .{ .name = @constCast("fixture") } };
+    defer if (server.last_error) |value| alloc.free(value);
+
+    server.setFailed(alloc, "MCP server exited with code 1 before completing startup");
+    // A recovery that stopped before relaunching, such as on a lock
+    // timeout, must not report the older failure.
+    const before = server.failureSerial();
+    try std.testing.expect((try Operations.restartFailedResult(arena, &catalog_mutex, &server, "mcp_fixture_echo", before)) == null);
+
+    server.setFailed(alloc, "MCP server exited with code 5 before completing startup: relaunch blocked");
+    const result = (try Operations.restartFailedResult(arena, &catalog_mutex, &server, "mcp_fixture_echo", before)).?;
+    try std.testing.expect(result.status == .protocol_failure);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "exited with code 5 before completing startup: relaunch blocked") != null);
+}

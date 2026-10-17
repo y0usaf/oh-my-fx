@@ -56,7 +56,7 @@ pub fn await(
     cancel_flag: *std.atomic.Value(bool),
     allowed_cors_origin: ?[]const u8,
 ) !?Accepted(Callback) {
-    return await_request(Callback, parse, alloc, listener, parser_context, cancel_flag, allowed_cors_origin, null);
+    return await_request(Callback, parse, alloc, listener, parser_context, .{ .caller = cancel_flag }, allowed_cors_origin, null);
 }
 
 /// Accept a browser form POST from one exact HTTPS bridge origin.
@@ -66,11 +66,22 @@ pub fn await_form(
     alloc: Allocator,
     listener: *std.Io.net.Server,
     parser_context: ?*anyopaque,
-    cancel_flag: *std.atomic.Value(bool),
+    cancel_flag: ?*const std.atomic.Value(bool),
+    lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
     origin: []const u8,
 ) !?Accepted(Callback) {
-    return await_request(Callback, parse, alloc, listener, parser_context, cancel_flag, null, origin);
+    return await_request(Callback, parse, alloc, listener, parser_context, .{ .caller = cancel_flag, .runtime = lifecycle_cancel_flag }, null, origin);
 }
+
+const Cancellation = struct {
+    caller: ?*const std.atomic.Value(bool) = null,
+    runtime: ?*const std.atomic.Value(bool) = null,
+
+    fn cancelled(self: Cancellation) bool {
+        return (if (self.caller) |flag| flag.load(.acquire) else false) or
+            (if (self.runtime) |flag| flag.load(.acquire) else false);
+    }
+};
 
 fn await_request(
     comptime Callback: type,
@@ -78,7 +89,7 @@ fn await_request(
     alloc: Allocator,
     listener: *std.Io.net.Server,
     parser_context: ?*anyopaque,
-    cancel_flag: *std.atomic.Value(bool),
+    cancel_flag: Cancellation,
     allowed_cors_origin: ?[]const u8,
     form_origin: ?[]const u8,
 ) !?Accepted(Callback) {
@@ -157,16 +168,16 @@ const Request = struct {
 
 fn listenerReady(
     listener: *std.Io.net.Server,
-    cancel_flag: *std.atomic.Value(bool),
+    cancel_flag: Cancellation,
 ) !bool {
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (cancel_flag.cancelled()) return error.Cancelled;
     var fds = [_]std.posix.pollfd{.{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
     const ready = try std.posix.poll(&fds, poll_ms);
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (cancel_flag.cancelled()) return error.Cancelled;
     if (ready == 0) return false;
     if ((fds[0].revents & std.posix.POLL.IN) == 0) {
         return error.OAuthCallbackListenerFailed;
@@ -176,11 +187,11 @@ fn listenerReady(
 
 fn requestReadable(
     socket: std.posix.socket_t,
-    cancel_flag: *std.atomic.Value(bool),
+    cancel_flag: Cancellation,
     deadline_ms: i64,
 ) !bool {
     while (true) {
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (cancel_flag.cancelled()) return error.Cancelled;
         const remaining_ms = deadline_ms - io_mod.milliTimestamp();
         const wait_ms: i32 = if (remaining_ms <= 0)
             0
@@ -192,7 +203,7 @@ fn requestReadable(
             .revents = 0,
         }};
         const ready = try std.posix.poll(&fds, wait_ms);
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (cancel_flag.cancelled()) return error.Cancelled;
         if (ready != 0) return true;
         if (remaining_ms <= 0) return false;
     }
@@ -203,7 +214,7 @@ fn requestReadable(
 fn readRequest(
     alloc: Allocator,
     stream: std.Io.net.Stream,
-    cancel_flag: *std.atomic.Value(bool),
+    cancel_flag: Cancellation,
     allowed_cors_origin: ?[]const u8,
     form_origin: ?[]const u8,
     port: u16,
@@ -250,7 +261,7 @@ fn readRequest(
     const origin = requestHeaderValue(request_bytes[line_end + 2 .. request_len], "origin");
     if (form_origin) |required_origin| {
         var host_buf: [32]u8 = undefined;
-        const expected_host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{port});
+        const expected_host = try std.mem.print(&host_buf, "127.0.0.1:{d}", .{port});
         const headers = request_bytes[line_end + 2 .. request_len];
         const content_type = unique_header(headers, "content-type") orelse return error.InvalidOAuthCallbackRequest;
         const host_header = unique_header(headers, "host") orelse return error.InvalidOAuthCallbackRequest;

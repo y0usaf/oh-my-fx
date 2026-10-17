@@ -609,7 +609,7 @@ fn findHashPath(shell: anytype, utility: []const u8) !?[]const u8 {
 
     const allocator = shell.scratchAllocator();
     if (std.mem.indexOfScalar(u8, utility, '/') != null) {
-        const utility_z = try allocator.dupeZ(u8, utility);
+        const utility_z = try allocator.dupeSentinel(u8, utility, 0);
         return if (shell.host.isExecutableZ(utility_z)) utility else null;
     }
 

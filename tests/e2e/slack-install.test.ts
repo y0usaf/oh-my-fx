@@ -19,6 +19,13 @@ function fixture() {
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === '/api/slack/install/config') return Response.json({ client_id: '123.456', app_id: 'AFX', team_id: 'TVERCEL', scope: 'app_mentions:read', redirect_uri: 'https://fx.sh/api/slack/oauth/callback' });
+    if (path === '/api/slack/install/complete') {
+      expect(request.method).toBe('GET');
+      expect(await request.text()).toBe('');
+      expect(new URL(request.url).search).toBe('?result=success');
+      expect(JSON.parse(readFileSync(file, 'utf8')).access_token).toBe(access);
+      return new Response('Slack installation complete');
+    }
     const body = new URLSearchParams(await request.text());
     calls.push({ path, body });
     if (path === '/api/oauth.v2.access') {
@@ -64,7 +71,7 @@ function fixture() {
     challenge = url.searchParams.get('challenge')!;
     const target = `http://127.0.0.1:${url.searchParams.get('port')}/slack/oauth/callback`;
     const state = url.searchParams.get('state')!;
-    const post = (body: string, requestOrigin = origin) => fetch(target, { method: 'POST', headers: { origin: requestOrigin, 'content-type': 'application/x-www-form-urlencoded' }, body });
+    const post = (body: string, requestOrigin = origin) => fetch(target, { method: 'POST', redirect: 'manual', headers: { origin: requestOrigin, 'content-type': 'application/x-www-form-urlencoded' }, body });
     return { run, state, post, target };
   }
   async function install() {
@@ -72,17 +79,25 @@ function fixture() {
     const response = await started.post(new URLSearchParams({ state: started.state, code: 'test-authorization-code' }).toString());
     return { response, result: await started.run.result(), ...started };
   }
-  return { home, file, calls, spawn, start, install, get exchange() { return exchange; }, set exchange(value) { exchange = value; }, get identity() { return identity; }, set identity(value) { identity = value; } };
+  return { origin, home, file, calls, spawn, start, install, get exchange() { return exchange; }, set exchange(value) { exchange = value; }, get identity() { return identity; }, set identity(value) { identity = value; } };
 }
 
 test('installs through a real loopback POST, validates PKCE, and saves only bot credentials privately', async () => {
   const f = fixture();
   const { result, response } = await f.install();
   expect(result.code).toBe(0);
-  expect(response.status).toBe(200);
+  expect(response.status).toBe(303);
+  expect(response.headers.get('location')).toBe(`${f.origin}/api/slack/install/complete?result=success`);
+  expect(response.headers.get('cache-control')).toBe('no-store');
+  expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const page = await fetch(response.headers.get('location')!);
+    expect(page.status).toBe(200);
+    expect(await page.text()).toBe('Slack installation complete');
+  }
   expect(result.stderr).not.toContain('error');
   expect(JSON.parse(result.stdout)).toMatchObject({ installed: true, team_id: 'TVERCEL', bot_user_id: 'WBOT' });
-  expect(result.stdout + result.stderr + await response.text()).not.toMatch(/xoxb-test|xoxe-test|test-authorization-code/);
+  expect(result.stdout + result.stderr + JSON.stringify([...response.headers]) + await response.text()).not.toMatch(/xoxb-test|xoxe-test|test-authorization-code/);
   expect(statSync(f.file).mode & 0o777).toBe(0o600);
   expect(statSync(join(f.home, '.fx/slack')).mode & 0o777).toBe(0o700);
   const stored = readFileSync(f.file, 'utf8');
@@ -101,7 +116,7 @@ test('wrong origin and mismatched state cannot consume the waiting CLI transacti
   expect((await started.post(body, 'https://evil.example')).status).toBe(404);
   expect((await started.post('state=wrong&code=test-authorization-code')).status).toBe(404);
   expect(f.calls).toHaveLength(0);
-  expect((await started.post(body)).status).toBe(200);
+  expect((await started.post(body)).status).toBe(303);
   expect((await started.run.result()).code).toBe(0);
   await expect(started.post(body)).rejects.toThrow();
   expect(f.calls.filter((r) => r.path.endsWith('oauth.v2.access'))).toHaveLength(1);
@@ -111,7 +126,9 @@ test('denied consent and duplicate callback fields never exchange or save tokens
   for (const duplicate of [false, true]) {
     const f = fixture(), started = await f.start();
     const body = duplicate ? `state=${started.state}&state=${started.state}&code=test-authorization-code` : `state=${started.state}&error=access_denied`;
-    expect((await started.post(body)).status).toBe(400);
+    const response = await started.post(body);
+    expect(response.status).toBe(duplicate ? 400 : 303);
+    expect(response.headers.get('location')).toBe(duplicate ? null : `${f.origin}/api/slack/install/complete?result=failed`);
     expect((await started.run.result()).code).not.toBe(0);
     expect(f.calls).toHaveLength(0);
     expect(existsSync(f.file)).toBe(false);
@@ -121,7 +138,9 @@ test('denied consent and duplicate callback fields never exchange or save tokens
 test('wrong app workspace scope identity and failed exchange never save an installation', async () => {
   for (const override of [{ app_id: 'AWRONG' }, { team: { id: 'TWRONG' } }, { scope: '' }, { scope: 'app_mentions:read,chat:write' }, { bot_user_id: '' }, { token_type: 'user' }, { refresh_token: undefined }, { expires_in: -1 }, { ok: false }]) {
     const f = fixture(); f.exchange = { ...f.exchange, ...override };
-    const { result } = await f.install();
+    const { result, response } = await f.install();
+    expect(response.status).toBe(303);
+    expect(response.headers.get('location')).toBe(`${f.origin}/api/slack/install/complete?result=failed`);
     expect(result.code).not.toBe(0);
     expect(existsSync(f.file)).toBe(false);
     expect(result.stderr + result.stdout).not.toMatch(/xoxb-test|xoxe-test/);

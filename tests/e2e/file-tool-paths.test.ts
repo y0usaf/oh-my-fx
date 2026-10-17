@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
+import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
@@ -308,6 +309,7 @@ async function runTerminalToolScenario(args: {
   name: string;
   input: object;
   unsetHome?: boolean;
+  home?: string;
   expectedResultRequest: string[];
 }) {
   const gateway = startFakeGateway([
@@ -322,7 +324,7 @@ async function runTerminalToolScenario(args: {
         env: gatewayEnv(
           args.root,
           gateway,
-          args.unsetHome ? undefined : args.root.home,
+          args.unsetHome ? undefined : (args.home ?? args.root.home),
         ),
         timeoutMs: TIMEOUT,
       },
@@ -527,6 +529,142 @@ describe("filesystem path handling", () => {
   );
 
   test(
+    "read_file sends eligible originals and guides the model to reread an oversized copy",
+    async () => {
+      const root = createIsolatedRoot();
+      const frame = solidPng(3420, 2224);
+      const frameBase64 = frame.toString("base64");
+      const smallBase64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+      const oversizedBase64 = solidPng(8001, 1).toString("base64");
+      const gateway = startFakeGateway(
+        [
+          toolCall("read_frame", "read_file", { path: "frame.png" }),
+          (body) => {
+            const files = JSON.parse(body).prompt
+              .filter((message: { role?: string; content?: unknown }) =>
+                message.role === "user" && Array.isArray(message.content)
+              )
+              .flatMap((message: { content: Array<Record<string, unknown>> }) => message.content)
+              .filter((entry: Record<string, unknown>) => entry.type === "file");
+            expect(toolResultOutput(body, "read_frame")).toContain("image attached");
+            expect(files).toHaveLength(1);
+            expect((files[0].data as Record<string, unknown>).data).toBe(frameBase64);
+            return toolCall("read_oversized", "read_file", { path: "oversized.png" });
+          },
+          (body) => {
+            const files = JSON.parse(body).prompt
+              .filter((message: { role?: string; content?: unknown }) =>
+                message.role === "user" && Array.isArray(message.content)
+              )
+              .flatMap((message: { content: Array<Record<string, unknown>> }) => message.content)
+              .filter((entry: Record<string, unknown>) => entry.type === "file");
+            expect(toolResultOutput(body, "read_oversized")).toContain("<path>oversized.png</path>");
+            expect(toolResultOutput(body, "read_oversized")).toContain("exceeds 8000 pixels per side");
+            expect(toolResultOutput(body, "read_oversized")).toContain("save a smaller copy to a new file");
+            expect(files).toHaveLength(1);
+            expect(JSON.stringify(files)).not.toContain(oversizedBase64);
+            return toolCall("read_small", "read_file", { path: "small.png" });
+          },
+          (body) => {
+            const files = JSON.parse(body).prompt
+              .filter((message: { role?: string; content?: unknown }) =>
+                message.role === "user" && Array.isArray(message.content)
+              )
+              .flatMap((message: { content: Array<Record<string, unknown>> }) => message.content)
+              .filter((entry: Record<string, unknown>) => entry.type === "file");
+            const sent = files.map((entry: Record<string, unknown>) =>
+              (entry.data as Record<string, unknown>).data
+            );
+            expect(toolResultOutput(body, "read_small")).toContain("image attached");
+            expect(sent).toEqual(expect.arrayContaining([frameBase64, smallBase64]));
+            expect(sent).not.toContain(oversizedBase64);
+            return finalText("frames inspected");
+          },
+        ],
+        { modelTags: ["tool-use", "vision", "file-input"] },
+      );
+      try {
+        writeFileSync(join(root.workspace, "frame.png"), frame);
+        writeFileSync(join(root.workspace, "oversized.png"), Buffer.from(oversizedBase64, "base64"));
+        writeFileSync(join(root.workspace, "small.png"), Buffer.from(smallBase64, "base64"));
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Read the requested images, then stop."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const json = parseFxJson(result);
+        expect(json.tool_calls).toEqual([
+          { name: "read_file", status: "success" },
+          { name: "read_file", status: "success" },
+          { name: "read_file", status: "success" },
+        ]);
+        expect(gateway.requests).toHaveLength(4);
+        expect(gateway.remainingResponseCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "read_file withholds images over the strict request limit when more than 20 are requested",
+    async () => {
+      const root = createIsolatedRoot();
+      const frame = solidPng(3420, 2224);
+      const calls = Array.from({ length: 21 }, (_, index) => ({
+        type: "tool-call",
+        toolCallId: `read_frame_${index + 1}`,
+        toolName: "read_file",
+        input: { path: `frame-${index + 1}.png` },
+      }));
+      const gateway = startFakeGateway(
+        [
+          sse([
+            ...calls,
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]),
+          (body) => {
+            expect(occurrenceCount(body, "this request permits at most 2000 per side")).toBe(21);
+            expect(body).not.toContain('"type":"file"');
+            return finalText("frames withheld");
+          },
+        ],
+        { modelTags: ["tool-use", "vision", "file-input"] },
+      );
+      try {
+        for (let index = 0; index < calls.length; index++) {
+          writeFileSync(join(root.workspace, `frame-${index + 1}.png`), frame);
+        }
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Read every requested frame, then stop."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const json = parseFxJson(result);
+        expect(json.tool_calls).toHaveLength(21);
+        expect(json.tool_calls).toEqual(
+          Array.from({ length: 21 }, () => ({ name: "read_file", status: "success" })),
+        );
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.remainingResponseCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "corrupted stored tool image degrades to an explicit notice on resume",
     async () => {
       const root = createIsolatedRoot();
@@ -584,6 +722,73 @@ describe("filesystem path handling", () => {
         const body = secondGateway.requests[0].body;
         expect(body).toContain("Stored tool image unavailable");
         expect(body).not.toContain(pngBase64);
+      } finally {
+        secondGateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "resumed follow-up request extends the live request byte for byte",
+    async () => {
+      const root = createIsolatedRoot();
+      const lines = Array.from(
+        { length: 400 },
+        (_, index) => `PARITY_LINE_${String(index + 1).padStart(3, "0")}_${"x".repeat(24)}`,
+      );
+      writeFileSync(join(root.workspace, "parity.md"), `${lines.join("\n")}\n`);
+      const firstGateway = startFakeGateway([
+        toolCall("edit_parity_1", "edit_file", {
+          path: "parity.md",
+          old_string: "PARITY_LINE_200_",
+          new_string: "PARITY_EDITED_200_",
+        }),
+        finalText("parity edit done"),
+      ]);
+      let sessionId = "";
+      let liveBody = "";
+      try {
+        const first = await runFx(
+          ["ask", "--auto", "--json", "Edit parity.md once, then stop."],
+          { cwd: root.workspace, env: gatewayEnv(root, firstGateway, root.home), timeoutMs: TIMEOUT },
+        );
+        sessionId = parseFxJson(first).session_id;
+        expect(firstGateway.requests.length).toBe(2);
+        liveBody = firstGateway.requests[1].body;
+        expect(toolResultOutput(liveBody, "edit_parity_1")).not.toContain("Not executed");
+      } finally {
+        firstGateway.stop();
+      }
+      // The edit snapshots are large, so they live behind a handle and stay
+      // out of the log that resume reads.
+      const events = readFileSync(
+        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
+        "utf8",
+      );
+      expect(events).toMatch(/"content_handle":"diff-[0-9a-f]{16}-[0-9a-f]{16}\.json"/);
+      expect(events).not.toContain("PARITY_LINE_001_");
+
+      const secondGateway = startFakeGateway([finalText("parity follow-up done")]);
+      try {
+        const resumed = await runFx(
+          ["ask", "--auto", "--json", "--resume", sessionId, "What changed in parity.md?"],
+          { cwd: root.workspace, env: gatewayEnv(root, secondGateway, root.home), timeoutMs: TIMEOUT },
+        );
+        expect(resumed.code, resumed.stderr).toBe(0);
+        expect(secondGateway.requests.length).toBe(1);
+        const live = JSON.parse(liveBody) as { prompt: unknown[]; tools?: unknown };
+        const next = JSON.parse(secondGateway.requests[0].body) as { prompt: unknown[]; tools?: unknown };
+        // Provider prompt caching depends on the resumed request starting
+        // with exactly the bytes the live session last sent.
+        const livePrompt = live.prompt.map((message) => JSON.stringify(message));
+        const nextPrompt = next.prompt.map((message) => JSON.stringify(message));
+        expect(livePrompt.length).toBeGreaterThanOrEqual(3);
+        expect(livePrompt.join("")).toContain("edit_parity_1");
+        expect(nextPrompt.length).toBeGreaterThan(livePrompt.length);
+        expect(nextPrompt.slice(0, livePrompt.length)).toEqual(livePrompt);
+        expect(JSON.stringify(next.tools)).toBe(JSON.stringify(live.tools));
       } finally {
         secondGateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1385,6 +1590,38 @@ describe("filesystem path handling", () => {
   );
 
   test(
+    "grep_files searches a file larger than 200 KiB by path and by include",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        mkdirSync(join(root.workspace, "src"), { recursive: true });
+        // 3,000 lines of 100 bytes, then the match on line 3,001.
+        writeFileSync(
+          join(root.workspace, "src", "big.txt"),
+          `${"x".repeat(99)}\n`.repeat(3000) + "LARGE_FILE_NEEDLE\n",
+        );
+        const cases = [
+          { id: "grep_large_path_1", input: { pattern: "LARGE_FILE_NEEDLE", path: "src/big.txt" } },
+          { id: "grep_large_include_1", input: { pattern: "LARGE_FILE_NEEDLE", include: "src/*.txt" } },
+        ];
+        for (const scenario of cases) {
+          await runFirstCallToolScenario({
+            root,
+            id: scenario.id,
+            name: "grep_files",
+            input: scenario.input,
+            expectedResultRequest: [],
+            expectedResultOutput: ["big.txt:3001", "LARGE_FILE_NEEDLE"],
+          });
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "glob pattern cannot escape the separately approved search root",
     async () => {
       const root = createIsolatedRoot();
@@ -1508,6 +1745,31 @@ describe("filesystem path handling", () => {
         });
 
         expect(existsSync(literalWorkspacePath)).toBe(false);
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "relative HOME is treated like a missing HOME instead of aborting",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        await runTerminalToolScenario({
+          root,
+          id: "read_relative_home_1",
+          name: "read_file",
+          input: { path: "~/fx-path-fixture.txt" },
+          home: "relative/home",
+          expectedResultRequest: ["HomeNotSet"],
+        });
+
+        // Nothing resolves against the workspace: no tilde folder, and no
+        // profile written under the relative path.
+        expect(existsSync(join(root.workspace, "~"))).toBe(false);
+        expect(existsSync(join(root.workspace, "relative"))).toBe(false);
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }

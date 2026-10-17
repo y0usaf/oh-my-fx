@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const managed_execution = @import("../../execution/managed_execution.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
@@ -188,8 +189,7 @@ pub const ProvisionalToolStatuses = struct {
         call: ToolCall,
     ) !void {
         const call_id = self.visibleId(call) orelse return;
-        const summary = try std.fmt.allocPrint(
-            arena,
+        const summary = try arena.print(
             "{s} failed: {s}",
             .{ fallbackToolDisplay(hooks.tool_registry, call.name), if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments" },
         );
@@ -452,7 +452,7 @@ pub const ProvisionalToolStatuses = struct {
                 detail,
                 diff.max_encoded_label_bytes,
             );
-            const summary = try std.fmt.allocPrint(arena, "Cancelled {s}", .{encoded.bytes});
+            const summary = try arena.print("Cancelled {s}", .{encoded.bytes});
             try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .cancelled, .summary = summary },
@@ -497,8 +497,7 @@ pub const ProvisionalToolStatuses = struct {
                 detail,
                 diff.max_encoded_label_bytes,
             );
-            const summary = try std.fmt.allocPrint(
-                arena,
+            const summary = try arena.print(
                 "Connection interrupted before {s} ran",
                 .{encoded.bytes},
             );
@@ -728,9 +727,9 @@ fn formatProvisionalProgressLabel(
     label_value: ?[]const u8,
 ) ![]const u8 {
     if (label_value) |value| {
-        return std.fmt.bufPrint(buf, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ action_label, shared_theme.current().tool_stdout_style, value });
+        return std.mem.print(buf, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ action_label, shared_theme.current().tool_stdout_style, value });
     }
-    return std.fmt.bufPrint(buf, "● {s}\x1b[0m", .{action_label});
+    return std.mem.print(buf, "● {s}\x1b[0m", .{action_label});
 }
 
 pub fn fileMutationDisplayPath(
@@ -957,6 +956,53 @@ fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
     return std.mem.eql(u8, action, "wait");
 }
 
+pub fn publishSubagentCompletionPreview(
+    hooks: *const AgentRuntimeDeps,
+    arena: Allocator,
+    turn_id: u64,
+    call: ToolCall,
+    result: ToolExecutionResult,
+    advertised_dynamic_tool_names: []const []const u8,
+) !bool {
+    if (!std.mem.eql(u8, call.name, "subagent")) return false;
+    const base_line = if (try tooling_presentation.subagentStatusLine(
+        arena,
+        call,
+        result.model_output,
+    )) |line|
+        try arena.print("● {s}", .{line})
+    else switch (result.status) {
+        .success => try hooks.describe_tool_action_completed(
+            hooks.ctx,
+            arena,
+            call,
+            null,
+            advertised_dynamic_tool_names,
+        ),
+        .failure => try hooks.describe_tool_action_denied(
+            hooks.ctx,
+            arena,
+            call,
+            null,
+            try tooling_presentation.subagentFailureLabel(
+                arena,
+                call,
+                result.model_output,
+            ),
+            advertised_dynamic_tool_names,
+        ),
+    };
+    const line = if (result.subagent_completion) |status|
+        renderedSubagentSummary(hooks, arena, base_line, status)
+    else
+        base_line;
+    try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+        .id = .{ .turn_id = turn_id, .call_id = call.id },
+        .text = line,
+    } });
+    return true;
+}
+
 pub fn finishExecutedToolStatus(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -993,7 +1039,7 @@ pub fn finishExecutedToolStatus(
             advertised_dynamic_tool_names,
         );
         break :blk if (decision.detail) |detail|
-            try std.fmt.allocPrint(arena, "{s}: {s}", .{ base, detail })
+            try arena.print("{s}: {s}", .{ base, detail })
         else
             base;
     } else switch (result.status) {
@@ -1017,12 +1063,14 @@ pub fn finishExecutedToolStatus(
                 advertised_dynamic_tool_names,
             );
             if (std.mem.eql(u8, call.name, "shell")) {
+                if (try tool_result_errors.isTerminalEndedFailure(arena, safe_result)) {
+                    break :blk try arena.print("{s} · ended when fx exited", .{base});
+                }
                 if (try tool_result_errors.inspectTerminalActionFieldCorrection(
                     arena,
                     safe_result,
                 )) |correction| {
-                    break :blk try std.fmt.allocPrint(
-                        arena,
+                    break :blk try arena.print(
                         "{s} · {d} invalid field{s}",
                         .{
                             base,
@@ -1040,7 +1088,7 @@ pub fn finishExecutedToolStatus(
                 advertised_dynamic_tool_names,
             )) orelse break :blk base;
             if (detail.len == 0) break :blk base;
-            break :blk try std.fmt.allocPrint(arena, "{s}: {s}", .{ base, detail });
+            break :blk try arena.print("{s}: {s}", .{ base, detail });
         },
     };
     const summary_line = if (result.web_fetch_completion) |completion|
@@ -1155,11 +1203,11 @@ pub fn commandOutcomeDecision(
         else
             .{
                 .outcome = .failed,
-                .label = try std.fmt.allocPrint(arena, "Exited {d}", .{code}),
+                .label = try arena.print("Exited {d}", .{code}),
             },
         .signal => |signal| .{
             .outcome = .failed,
-            .label = try std.fmt.allocPrint(arena, "Signaled {d}", .{signal}),
+            .label = try arena.print("Signaled {d}", .{signal}),
         },
         .timed_out => .{ .outcome = .failed, .label = "Timed out" },
         .output_capture_failed => .{
@@ -1182,11 +1230,11 @@ pub fn terminalActionOutcomeDecision(
             .cancelled => .{ .outcome = .cancelled, .label = "Cancelled" },
             .exited => |code| .{
                 .outcome = if (code == 0) .completed else .failed,
-                .label = try std.fmt.allocPrint(arena, "Exited {d}", .{code}),
+                .label = try arena.print("Exited {d}", .{code}),
             },
             .signal => |signal| .{
                 .outcome = .failed,
-                .label = try std.fmt.allocPrint(arena, "Terminated by signal {d}", .{signal}),
+                .label = try arena.print("Terminated by signal {d}", .{signal}),
             },
         },
         .failed => |failed| if (failed == .cancelled)
@@ -1227,7 +1275,7 @@ fn failureStatusDetail(
                     std.mem.findScalar(u8, actionable, '\r') == null)
                 {
                     const masked = try text_utils.maskSecrets(arena, actionable);
-                    const encoded = try text_utils.encodeTerminalSafe(arena, masked, 256);
+                    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, 256);
                     return if (encoded.bytes.len == 0) detail else encoded.bytes;
                 }
             }
@@ -1235,7 +1283,7 @@ fn failureStatusDetail(
 
         if (safe_result.len == 0) return detail;
         const masked = try text_utils.maskSecrets(arena, safe_result);
-        const encoded = try text_utils.encodeTerminalSafe(arena, masked, 256);
+        const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, 256);
         return if (encoded.bytes.len == 0) detail else encoded.bytes;
     }
 
@@ -1246,7 +1294,7 @@ fn failureStatusDetail(
     }
     const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
     const masked_detail = try text_utils.maskSecrets(arena, detail);
-    const encoded = try text_utils.encodeTerminalSafe(arena, masked_detail, 256);
+    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
 }
 
@@ -1320,7 +1368,7 @@ fn commandArtifactHandle(
         .string => |value| value,
         else => return null,
     };
-    const handle = std.fs.path.basename(output_file);
+    const handle = std.Io.Dir.path.basename(output_file);
     if (!std.mem.startsWith(u8, handle, "fx-command-") or
         !std.mem.endsWith(u8, handle, ".log") or
         std.mem.endsWith(u8, handle, ".stdout.log") or
@@ -1375,12 +1423,11 @@ fn renderedSubagentSummary(
     var buf: [256]u8 = undefined;
     const status_line = renderer.render(&buf, status);
     if (status_line.len == 0) return base;
-    return std.fmt.allocPrint(arena, "{s}\n  {s}", .{ base, status_line }) catch base;
+    return arena.print("{s}\n  {s}", .{ base, status_line }) catch base;
 }
 
 fn formatWebSearchCompletion(arena: Allocator, base: []const u8, completion: types.WebSearchCompletion) ![]const u8 {
-    return std.fmt.allocPrint(
-        arena,
+    return arena.print(
         "{s} \x1b[38;5;245m| {d} search{s} | {d}ms\x1b[0m",
         .{ base, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
     );
@@ -1393,8 +1440,7 @@ fn formatWebFetchCompletion(arena: Allocator, base: []const u8, completion: type
         .stored => " | artifact stored",
         .unavailable => " | artifact unavailable",
     };
-    return std.fmt.allocPrint(
-        arena,
+    return arena.print(
         "{s} \x1b[38;5;245m| {s} | {d} bytes | HTTP {d} | {d}ms | {s}{s}\x1b[0m",
         .{ base, completion.url(), completion.bytes, completion.status, completion.duration_ms, cache, artifact },
     );
@@ -1414,11 +1460,11 @@ pub fn formatToolStatusWithStats(
     const add_style = if (markers.added.len != 0) markers.added else accent;
     const rem_style = if (markers.removed.len != 0) markers.removed else accent;
     if (additions > 0 and deletions > 0) {
-        return std.fmt.allocPrint(arena, "{s} {s}+{d}{s} {s}/{s} {s}-{d}{s}", .{ base, add_style, additions, reset, dim, reset, rem_style, deletions, reset });
+        return arena.print("{s} {s}+{d}{s} {s}/{s} {s}-{d}{s}", .{ base, add_style, additions, reset, dim, reset, rem_style, deletions, reset });
     } else if (additions > 0) {
-        return std.fmt.allocPrint(arena, "{s} {s}+{d}{s}", .{ base, add_style, additions, reset });
+        return arena.print("{s} {s}+{d}{s}", .{ base, add_style, additions, reset });
     } else if (deletions > 0) {
-        return std.fmt.allocPrint(arena, "{s} {s}-{d}{s}", .{ base, rem_style, deletions, reset });
+        return arena.print("{s} {s}-{d}{s}", .{ base, rem_style, deletions, reset });
     }
     return base;
 }
@@ -1487,10 +1533,10 @@ const ProvisionalStatusTestCapture = struct {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
     fn describeToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "started {s}", .{call.name});
+        return arena.print("started {s}", .{call.name});
     }
     fn describeDeniedToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
     fn noopPermissionTarget(_: *anyopaque, arena: Allocator, _: ToolCall, _: []const []const u8) ![]const u8 {
         return arena.dupe(u8, "");
@@ -1510,7 +1556,7 @@ const ProvisionalStatusTestCapture = struct {
     fn noopPushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
     fn noopPushHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
     fn noopFormatToolExecutionError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
+        return arena.print("{s}", .{@errorName(err)});
     }
 
     fn captureToolLifecycle(raw: *anyopaque, event: types.ToolLifecycleEvent) !void {
@@ -1833,7 +1879,7 @@ test "provisional skill labels fall back when encoded resource exceeds the progr
         const resource = try alloc.alloc(u8, len);
         defer alloc.free(resource);
         @memset(resource, 'a');
-        const json = try std.fmt.allocPrint(alloc, "{{\"resource\":\"{s}\"}}", .{resource});
+        const json = try alloc.print("{{\"resource\":\"{s}\"}}", .{resource});
         defer alloc.free(json);
         try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), "skill:opaque/location", json);
         const text = capture.events.items[1].progress.text;
@@ -2302,7 +2348,7 @@ fn checkProvisionalLifecycleAllocationFailures(alloc: Allocator) !void {
 
 test "provisional lifecycle cleans up every copied-id allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkProvisionalLifecycleAllocationFailures,
         .{},
     );
@@ -2358,6 +2404,40 @@ test "provider search completion keeps terminal result detail" {
     }
 }
 
+test "subagent completion preview updates progress without publishing a terminal" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const call = ToolCall{
+        .id = "child",
+        .name = "subagent",
+        .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}",
+    };
+
+    try std.testing.expect(try publishSubagentCompletionPreview(
+        &hooks,
+        arena,
+        3,
+        call,
+        .{ .model_output = "{\"ok\":true,\"pending\":true}" },
+        &.{},
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    switch (capture.events.items[0]) {
+        .progress => |progress| {
+            try std.testing.expectEqual(@as(u64, 3), progress.id.turn_id);
+            try std.testing.expectEqualStrings("child", progress.id.call_id);
+            try std.testing.expectEqualStrings("● Subagent still running · inspect auth", progress.text);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "subagent terminal summary preserves request row before child status" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2371,7 +2451,7 @@ test "subagent terminal summary preserves request row before child status" {
         .ctx = &renderer_context,
         .render_fn = struct {
             fn render(_: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
-                return std.fmt.bufPrint(buf, "{s} · {s} · {d}k", .{ status.model, status.effort.displayLabel(), status.input_tokens / 1000 }) catch "";
+                return std.mem.print(buf, "{s} · {s} · {d}k", .{ status.model, status.effort.displayLabel(), status.input_tokens / 1000 }) catch "";
             }
         }.render,
     };
@@ -2501,7 +2581,7 @@ test "permission target preflight failure reports the actionable reason" {
     );
 }
 
-test "dynamic MCP failure derives a bounded terminal-safe detail from the safe result" {
+test "dynamic MCP failure flattens a multi-line detail into a terminal-safe summary" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2510,7 +2590,7 @@ test "dynamic MCP failure derives a bounded terminal-safe detail from the safe r
     defer capture.deinit();
     const hooks = capture.hooks();
     const failure =
-        \\{"server":"plain","tool":"mcp_plain_getThreads","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"Invalid input: labels require at least one item\nretry rejected"}]}}
+        \\{"server":"plain","tool":"mcp_plain_getThreads","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"Invalid input:\u001b[31m labels require at least one item\nretry rejected\n"}]}}
     ;
     const advertised = [_][]const u8{"mcp_plain_getThreads"};
 
@@ -2535,7 +2615,48 @@ test "dynamic MCP failure derives a bounded terminal-safe detail from the safe r
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed mcp_plain_getThreads: Invalid input: labels require at least one item\\x0aretry rejected",
+        "Failed mcp_plain_getThreads: Invalid input:\\x1b[31m labels require at least one item retry rejected",
+        terminal.outcome.summary,
+    );
+    try std.testing.expect(std.mem.findScalar(u8, terminal.outcome.summary, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, terminal.outcome.summary, '\n') == null);
+}
+
+test "dynamic MCP failure flattens a pretty-printed JSON error body" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const failure =
+        \\{"server":"vercel","tool":"mcp_vercel_web_fetch_vercel_url","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"{\n  \"success\": false,\n  \"info\": \"Unable to create share\"\n}"}]}}
+    ;
+    const advertised = [_][]const u8{"mcp_vercel_web_fetch_vercel_url"};
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        7,
+        .{
+            .id = "vercel_failure",
+            .name = "mcp_vercel_web_fetch_vercel_url",
+            .arguments_json = "{}",
+        },
+        true,
+        null,
+        .{ .status = .failure, .model_output = failure },
+        failure,
+        .{ .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        null,
+        &advertised,
+    );
+
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+    try std.testing.expectEqualStrings(
+        "Failed mcp_vercel_web_fetch_vercel_url: { \"success\": false, \"info\": \"Unable to create share\" }",
         terminal.outcome.summary,
     );
 }
@@ -2557,7 +2678,7 @@ test "terminal path scope failure appends the exact status detail" {
             label: []const u8,
             _: []const []const u8,
         ) ![]const u8 {
-            return std.fmt.allocPrint(target, "{s} start", .{label});
+            return target.print("{s} start", .{label});
         }
     }.describe;
     const failure = "{\"failure\":{\"action\":\"start\",\"code\":\"path_outside_workspace\"}}";

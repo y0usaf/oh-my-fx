@@ -48,8 +48,8 @@ pub const Profile = struct {
     /// Diff patches paint line-wise (+/-, hunks, file headers) instead of
     /// running the tokenizer.
     diff_lines: bool = false,
-    keywords: []const []const u8 = &.{},
-    literals: []const []const u8 = &.{},
+    keywords: []const u8 = "",
+    literals: []const u8 = "",
     keyword_case: KeywordCase = .sensitive,
     detection: Detection = .none,
 };
@@ -58,13 +58,65 @@ const double_quote = &[_]u8{'"'};
 const double_single_quotes = &[_]u8{ '"', '\'' };
 const shell_quotes = &[_]u8{ '"', '\'', '`' };
 
+fn packedWordsLen(comptime words: anytype) usize {
+    @setEvalBranchQuota(10_000);
+    comptime var len: usize = 0;
+    inline for (words) |word| {
+        if (word.len > std.math.maxInt(u8)) @compileError("syntax word is too long");
+        len += @sizeOf(u32) + 1 + word.len;
+    }
+    return len;
+}
+
+/// This is only a lookup filter. Callers compare exact bytes after a match.
+pub fn packedWordHash(word: []const u8) u32 {
+    var hash: u32 = 2166136261;
+    for (word) |byte| hash = (hash ^ std.ascii.toLower(byte)) *% 16777619;
+    return hash;
+}
+
+fn packWords(comptime words: anytype) [packedWordsLen(words)]u8 {
+    @setEvalBranchQuota(100_000);
+    var result: [packedWordsLen(words)]u8 = undefined;
+    comptime var offset: usize = 0;
+    inline for (words) |word| {
+        std.mem.writeInt(u32, result[offset..][0..@sizeOf(u32)], packedWordHash(word), .little);
+        offset += @sizeOf(u32);
+        result[offset] = word.len;
+        offset += 1;
+        @memcpy(result[offset..][0..word.len], word);
+        offset += word.len;
+    }
+    return result;
+}
+
+test "packed syntax words retain exact hashes and boundaries" {
+    for (profiles) |profile| {
+        for ([_][]const u8{ profile.keywords, profile.literals }) |words| {
+            var offset: usize = 0;
+            while (offset < words.len) {
+                const hash = std.mem.readInt(u32, words[offset..][0..@sizeOf(u32)], .little);
+                offset += @sizeOf(u32);
+                const len = words[offset];
+                offset += 1;
+                const end = offset + len;
+                try std.testing.expect(end <= words.len);
+                try std.testing.expect(len > 0);
+                try std.testing.expectEqual(hash, packedWordHash(words[offset..end]));
+                offset = end;
+            }
+            try std.testing.expectEqual(words.len, offset);
+        }
+    }
+}
+
 const profiles = [_]Profile{
     .{
         .label = "zig",
         .aliases = &.{"zig"},
         .line_comments = &.{"//"},
         .quotes = double_quote,
-        .keywords = &.{ "const", "var", "fn", "pub", "return", "if", "else", "while", "for", "struct", "enum", "union", "try", "catch", "comptime", "defer", "errdefer", "async", "await", "anytype", "void" },
+        .keywords = &packWords(.{ "const", "var", "fn", "pub", "return", "if", "else", "while", "for", "struct", "enum", "union", "try", "catch", "comptime", "defer", "errdefer", "async", "await", "anytype", "void" }),
     },
     .{
         .label = "ts",
@@ -72,15 +124,15 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = shell_quotes,
-        .keywords = &.{ "const", "let", "var", "function", "class", "interface", "type", "export", "import", "from", "return", "if", "else", "for", "while", "async", "await", "new", "extends", "implements", "public", "private", "readonly" },
-        .literals = &.{ "true", "false", "null", "undefined" },
+        .keywords = &packWords(.{ "const", "let", "var", "function", "class", "interface", "type", "export", "import", "from", "return", "if", "else", "for", "while", "async", "await", "new", "extends", "implements", "public", "private", "readonly" }),
+        .literals = &packWords(.{ "true", "false", "null", "undefined" }),
         .detection = .typescript_assertion,
     },
     .{
         .label = "json",
         .aliases = &.{"json"},
         .quotes = double_quote,
-        .literals = &.{ "true", "false", "null" },
+        .literals = &packWords(.{ "true", "false", "null" }),
         .detection = .json,
     },
     .{
@@ -101,8 +153,8 @@ const profiles = [_]Profile{
         .aliases = &.{ "python", "py" },
         .line_comments = &.{"#"},
         .quotes = double_single_quotes,
-        .keywords = &.{ "def", "class", "return", "if", "elif", "else", "for", "while", "in", "import", "from", "as", "try", "except", "with", "lambda", "async", "await", "pass", "raise", "yield", "match", "case" },
-        .literals = &.{ "True", "False", "None" },
+        .keywords = &packWords(.{ "def", "class", "return", "if", "elif", "else", "for", "while", "in", "import", "from", "as", "try", "except", "with", "lambda", "async", "await", "pass", "raise", "yield", "match", "case" }),
+        .literals = &packWords(.{ "True", "False", "None" }),
         .detection = .python_header,
     },
     .{
@@ -110,14 +162,14 @@ const profiles = [_]Profile{
         .aliases = &.{ "yaml", "yml" },
         .line_comments = &.{"#"},
         .quotes = double_single_quotes,
-        .literals = &.{ "true", "false", "null", "yes", "no", "on", "off" },
+        .literals = &packWords(.{ "true", "false", "null", "yes", "no", "on", "off" }),
     },
     .{
         .label = "toml",
         .aliases = &.{"toml"},
         .line_comments = &.{"#"},
         .quotes = double_single_quotes,
-        .literals = &.{ "true", "false" },
+        .literals = &packWords(.{ "true", "false" }),
     },
     .{
         .label = "sql",
@@ -125,8 +177,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"--"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "select", "from", "where", "join", "left", "right", "inner", "outer", "on", "insert", "into", "values", "update", "set", "delete", "create", "alter", "drop", "table", "index", "group", "by", "order", "having", "limit", "as", "and", "or", "not", "distinct", "union" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "select", "from", "where", "join", "left", "right", "inner", "outer", "on", "insert", "into", "values", "update", "set", "delete", "create", "alter", "drop", "table", "index", "group", "by", "order", "having", "limit", "as", "and", "or", "not", "distinct", "union" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
         .keyword_case = .ascii_insensitive,
         .detection = .sql_select,
     },
@@ -135,7 +187,7 @@ const profiles = [_]Profile{
         .aliases = &.{ "dockerfile", "docker" },
         .line_comments = &.{"#"},
         .quotes = double_single_quotes,
-        .keywords = &.{ "from", "run", "cmd", "entrypoint", "copy", "add", "workdir", "env", "arg", "expose", "volume", "user", "label", "onbuild", "stopsignal", "healthcheck", "shell", "maintainer" },
+        .keywords = &packWords(.{ "from", "run", "cmd", "entrypoint", "copy", "add", "workdir", "env", "arg", "expose", "volume", "user", "label", "onbuild", "stopsignal", "healthcheck", "shell", "maintainer" }),
         .keyword_case = .ascii_insensitive,
         .detection = .dockerfile_from,
     },
@@ -145,8 +197,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "fn", "let", "mut", "pub", "struct", "enum", "impl", "trait", "use", "mod", "crate", "return", "if", "else", "match", "for", "while", "loop", "async", "await", "move", "where", "self", "super" },
-        .literals = &.{ "true", "false", "None", "Some" },
+        .keywords = &packWords(.{ "fn", "let", "mut", "pub", "struct", "enum", "impl", "trait", "use", "mod", "crate", "return", "if", "else", "match", "for", "while", "loop", "async", "await", "move", "where", "self", "super" }),
+        .literals = &packWords(.{ "true", "false", "None", "Some" }),
         .detection = .rust_function,
     },
     .{
@@ -155,8 +207,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = &[_]u8{ '"', '`' },
-        .keywords = &.{ "package", "import", "func", "var", "const", "type", "struct", "interface", "return", "if", "else", "for", "range", "switch", "case", "go", "defer", "select", "chan", "map" },
-        .literals = &.{ "true", "false", "nil" },
+        .keywords = &packWords(.{ "package", "import", "func", "var", "const", "type", "struct", "interface", "return", "if", "else", "for", "range", "switch", "case", "go", "defer", "select", "chan", "map" }),
+        .literals = &packWords(.{ "true", "false", "nil" }),
         .detection = .go_package,
     },
     .{
@@ -165,8 +217,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum", "extern", "float", "for", "goto", "if", "int", "long", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "volatile", "while" },
-        .literals = &.{ "true", "false", "NULL" },
+        .keywords = &packWords(.{ "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum", "extern", "float", "for", "goto", "if", "int", "long", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "volatile", "while" }),
+        .literals = &packWords(.{ "true", "false", "NULL" }),
     },
     .{
         .label = "cpp",
@@ -174,8 +226,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "auto", "bool", "class", "const", "constexpr", "decltype", "delete", "enum", "explicit", "friend", "inline", "namespace", "new", "nullptr", "private", "protected", "public", "template", "this", "typename", "using", "virtual", "void" },
-        .literals = &.{ "true", "false", "nullptr", "NULL" },
+        .keywords = &packWords(.{ "auto", "bool", "class", "const", "constexpr", "decltype", "delete", "enum", "explicit", "friend", "inline", "namespace", "new", "nullptr", "private", "protected", "public", "template", "this", "typename", "using", "virtual", "void" }),
+        .literals = &packWords(.{ "true", "false", "nullptr", "NULL" }),
     },
     .{
         .label = "csharp",
@@ -183,8 +235,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "class", "namespace", "using", "public", "private", "protected", "internal", "static", "void", "string", "int", "var", "new", "return", "if", "else", "for", "foreach", "while", "async", "await", "interface", "record", "get", "set" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "class", "namespace", "using", "public", "private", "protected", "internal", "static", "void", "string", "int", "var", "new", "return", "if", "else", "for", "foreach", "while", "async", "await", "interface", "record", "get", "set" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
     },
     .{
         .label = "java",
@@ -192,8 +244,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "class", "interface", "package", "import", "public", "private", "protected", "static", "final", "void", "new", "return", "if", "else", "for", "while", "try", "catch", "throws", "extends", "implements", "record", "var" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "class", "interface", "package", "import", "public", "private", "protected", "static", "final", "void", "new", "return", "if", "else", "for", "while", "try", "catch", "throws", "extends", "implements", "record", "var" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
     },
     .{
         .label = "kotlin",
@@ -201,8 +253,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "fun", "val", "var", "class", "object", "interface", "package", "import", "public", "private", "return", "if", "else", "when", "for", "while", "try", "catch", "data", "sealed", "suspend" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "fun", "val", "var", "class", "object", "interface", "package", "import", "public", "private", "return", "if", "else", "when", "for", "while", "try", "catch", "data", "sealed", "suspend" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
     },
     .{
         .label = "php",
@@ -210,16 +262,16 @@ const profiles = [_]Profile{
         .line_comments = &.{ "//", "#" },
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "function", "class", "public", "private", "protected", "namespace", "use", "return", "if", "else", "foreach", "for", "while", "try", "catch", "new", "static", "const", "echo", "yield" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "function", "class", "public", "private", "protected", "namespace", "use", "return", "if", "else", "foreach", "for", "while", "try", "catch", "new", "static", "const", "echo", "yield" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
     },
     .{
         .label = "ruby",
         .aliases = &.{ "ruby", "rb" },
         .line_comments = &.{"#"},
         .quotes = double_single_quotes,
-        .keywords = &.{ "def", "class", "module", "end", "return", "if", "elsif", "else", "unless", "case", "when", "do", "while", "for", "in", "begin", "rescue", "require", "attr_reader" },
-        .literals = &.{ "true", "false", "nil" },
+        .keywords = &packWords(.{ "def", "class", "module", "end", "return", "if", "elsif", "else", "unless", "case", "when", "do", "while", "for", "in", "begin", "rescue", "require", "attr_reader" }),
+        .literals = &packWords(.{ "true", "false", "nil" }),
     },
     .{
         .label = "swift",
@@ -227,8 +279,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "func", "let", "var", "class", "struct", "enum", "protocol", "extension", "import", "public", "private", "return", "if", "else", "guard", "for", "while", "switch", "case", "async", "await", "throws", "try" },
-        .literals = &.{ "true", "false", "nil" },
+        .keywords = &packWords(.{ "func", "let", "var", "class", "struct", "enum", "protocol", "extension", "import", "public", "private", "return", "if", "else", "guard", "for", "while", "switch", "case", "async", "await", "throws", "try" }),
+        .literals = &packWords(.{ "true", "false", "nil" }),
     },
     .{
         .label = "powershell",
@@ -236,8 +288,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"#"},
         .block_comment = .{ .start = "<#", .end = "#>" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "function", "param", "if", "else", "elseif", "foreach", "for", "while", "switch", "return", "throw", "try", "catch", "finally", "begin", "process", "end", "filter", "class", "enum" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "function", "param", "if", "else", "elseif", "foreach", "for", "while", "switch", "return", "throw", "try", "catch", "finally", "begin", "process", "end", "filter", "class", "enum" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
         .keyword_case = .ascii_insensitive,
     },
     .{
@@ -246,29 +298,29 @@ const profiles = [_]Profile{
         .line_comments = &.{"--"},
         .block_comment = .{ .start = "--[[", .end = "]]" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while" },
-        .literals = &.{ "true", "false", "nil" },
+        .keywords = &packWords(.{ "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while" }),
+        .literals = &packWords(.{ "true", "false", "nil" }),
     },
     .{
         .label = "html",
         .aliases = &.{ "html", "htm", "vue", "svelte" },
         .block_comment = .{ .start = "<!--", .end = "-->" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "html", "head", "body", "main", "header", "footer", "section", "article", "div", "span", "a", "p", "script", "style", "link", "meta", "title", "button", "input", "form", "img", "ul", "li" },
+        .keywords = &packWords(.{ "html", "head", "body", "main", "header", "footer", "section", "article", "div", "span", "a", "p", "script", "style", "link", "meta", "title", "button", "input", "form", "img", "ul", "li" }),
     },
     .{
         .label = "xml",
         .aliases = &.{"xml"},
         .block_comment = .{ .start = "<!--", .end = "-->" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "xml", "version", "encoding", "DOCTYPE", "CDATA" },
+        .keywords = &packWords(.{ "xml", "version", "encoding", "DOCTYPE", "CDATA" }),
     },
     .{
         .label = "css",
         .aliases = &.{"css"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "color", "background", "display", "position", "margin", "padding", "border", "font", "width", "height", "flex", "grid", "align", "justify", "transition", "transform", "animation", "media" },
+        .keywords = &packWords(.{ "color", "background", "display", "position", "margin", "padding", "border", "font", "width", "height", "flex", "grid", "align", "justify", "transition", "transform", "animation", "media" }),
     },
     .{
         .label = "hcl",
@@ -276,8 +328,8 @@ const profiles = [_]Profile{
         .line_comments = &.{ "#", "//" },
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "resource", "module", "variable", "output", "provider", "terraform", "locals", "data", "dynamic", "for_each", "count" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "resource", "module", "variable", "output", "provider", "terraform", "locals", "data", "dynamic", "for_each", "count" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
     },
     .{
         .label = "make",
@@ -300,8 +352,8 @@ const profiles = [_]Profile{
         .aliases = &.{ "graphql", "gql" },
         .line_comments = &.{"#"},
         .quotes = double_quote,
-        .keywords = &.{ "query", "mutation", "subscription", "fragment", "on", "type", "input", "interface", "enum", "union", "scalar", "schema", "extend", "implements", "directive" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "query", "mutation", "subscription", "fragment", "on", "type", "input", "interface", "enum", "union", "scalar", "schema", "extend", "implements", "directive" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
     },
     .{
         .label = "dart",
@@ -309,8 +361,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "const", "final", "var", "class", "extends", "with", "implements", "mixin", "enum", "if", "else", "for", "while", "return", "async", "await", "new", "static", "import", "export", "void" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "const", "final", "var", "class", "extends", "with", "implements", "mixin", "enum", "if", "else", "for", "while", "return", "async", "await", "new", "static", "import", "export", "void" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
     },
     .{
         .label = "scala",
@@ -318,16 +370,16 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_quote,
-        .keywords = &.{ "val", "var", "def", "class", "object", "trait", "extends", "with", "package", "import", "if", "else", "for", "while", "yield", "match", "case", "return", "new", "type", "given", "override" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "val", "var", "def", "class", "object", "trait", "extends", "with", "package", "import", "if", "else", "for", "while", "yield", "match", "case", "return", "new", "type", "given", "override" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
     },
     .{
         .label = "elixir",
         .aliases = &.{ "elixir", "ex", "exs" },
         .line_comments = &.{"#"},
         .quotes = double_quote,
-        .keywords = &.{ "def", "defmodule", "defp", "defmacro", "defguard", "do", "end", "fn", "if", "else", "unless", "case", "cond", "when", "with", "for", "try", "rescue", "after", "alias", "import", "require", "use" },
-        .literals = &.{ "true", "false", "nil" },
+        .keywords = &packWords(.{ "def", "defmodule", "defp", "defmacro", "defguard", "do", "end", "fn", "if", "else", "unless", "case", "cond", "when", "with", "for", "try", "rescue", "after", "alias", "import", "require", "use" }),
+        .literals = &packWords(.{ "true", "false", "nil" }),
     },
     .{
         .label = "haskell",
@@ -335,8 +387,8 @@ const profiles = [_]Profile{
         .line_comments = &.{"--"},
         .block_comment = .{ .start = "{-", .end = "-}" },
         .quotes = double_quote,
-        .keywords = &.{ "module", "where", "import", "data", "type", "newtype", "class", "instance", "deriving", "if", "then", "else", "case", "of", "do", "let", "in", "infix", "infixl", "infixr" },
-        .literals = &.{ "True", "False" },
+        .keywords = &packWords(.{ "module", "where", "import", "data", "type", "newtype", "class", "instance", "deriving", "if", "then", "else", "case", "of", "do", "let", "in", "infix", "infixl", "infixr" }),
+        .literals = &packWords(.{ "True", "False" }),
     },
     .{
         .label = "perl",
@@ -344,16 +396,16 @@ const profiles = [_]Profile{
         .line_comments = &.{"#"},
         .quotes = shell_quotes,
         .dollar_vars = true,
-        .keywords = &.{ "my", "our", "sub", "use", "package", "if", "else", "elsif", "unless", "while", "for", "foreach", "return", "local", "state", "say", "print", "die", "warn", "eval", "do", "require" },
-        .literals = &.{"undef"},
+        .keywords = &packWords(.{ "my", "our", "sub", "use", "package", "if", "else", "elsif", "unless", "while", "for", "foreach", "return", "local", "state", "say", "print", "die", "warn", "eval", "do", "require" }),
+        .literals = &packWords(.{"undef"}),
     },
     .{
         .label = "r",
         .aliases = &.{"r"},
         .line_comments = &.{"#"},
         .quotes = double_single_quotes,
-        .keywords = &.{ "function", "if", "else", "for", "while", "repeat", "break", "next", "return", "in", "library", "require" },
-        .literals = &.{ "TRUE", "FALSE", "NULL", "NA" },
+        .keywords = &packWords(.{ "function", "if", "else", "for", "while", "repeat", "break", "next", "return", "in", "library", "require" }),
+        .literals = &packWords(.{ "TRUE", "FALSE", "NULL", "NA" }),
     },
     .{
         .label = "groovy",
@@ -361,14 +413,14 @@ const profiles = [_]Profile{
         .line_comments = &.{"//"},
         .block_comment = .{ .start = "/*", .end = "*/" },
         .quotes = double_single_quotes,
-        .keywords = &.{ "def", "class", "interface", "enum", "if", "else", "for", "while", "return", "new", "try", "catch", "finally", "throw", "package", "import", "extends", "implements", "static", "final", "void" },
-        .literals = &.{ "true", "false", "null" },
+        .keywords = &packWords(.{ "def", "class", "interface", "enum", "if", "else", "for", "while", "return", "new", "try", "catch", "finally", "throw", "package", "import", "extends", "implements", "static", "final", "void" }),
+        .literals = &packWords(.{ "true", "false", "null" }),
     },
     .{
         .label = "nginx",
         .aliases = &.{"nginx"},
         .line_comments = &.{"#"},
-        .keywords = &.{ "server", "location", "listen", "root", "proxy_pass", "set", "return", "rewrite", "if", "error_page", "access_log", "include", "upstream", "worker_processes", "events", "http" },
+        .keywords = &packWords(.{ "server", "location", "listen", "root", "proxy_pass", "set", "return", "rewrite", "if", "error_page", "access_log", "include", "upstream", "worker_processes", "events", "http" }),
     },
     .{
         // Inline code spans color as strings; prose numbers stay plain.
@@ -426,12 +478,12 @@ fn matchesDetection(alloc: Allocator, detection: Detection, source: []const u8) 
 fn matchesDiffPatch(source: []const u8) bool {
     const line = firstNonblankLine(source);
     if (std.mem.startsWith(u8, line, "diff --git ") or std.mem.startsWith(u8, line, "@@ ")) return true;
-    return std.mem.startsWith(u8, line, "--- ") and std.mem.indexOf(u8, source, "\n+++ ") != null;
+    return std.mem.startsWith(u8, line, "--- ") and std.mem.find(u8, source, "\n+++ ") != null;
 }
 
 fn matchesTypeScriptAssertion(source: []const u8) bool {
     var start: usize = 0;
-    while (std.mem.indexOfPos(u8, source, start, "} as ")) |assertion_start| {
+    while (std.mem.findPos(u8, source, start, "} as ")) |assertion_start| {
         const type_start = assertion_start + "} as ".len;
         if (type_start < source.len and std.ascii.isUpper(source[type_start])) return true;
         start = type_start;
@@ -450,7 +502,7 @@ fn isValidJson(alloc: Allocator, source: []const u8) bool {
 fn matchesShellShebang(source: []const u8) bool {
     const line = firstNonblankLine(source);
     return std.mem.startsWith(u8, line, "#!") and
-        (std.mem.indexOf(u8, line, "bash") != null or std.mem.indexOf(u8, line, "zsh") != null or std.mem.indexOf(u8, line, "/sh") != null);
+        (std.mem.find(u8, line, "bash") != null or std.mem.find(u8, line, "zsh") != null or std.mem.find(u8, line, "/sh") != null);
 }
 
 fn matchesPythonHeader(source: []const u8) bool {
@@ -466,7 +518,7 @@ fn matchesSqlSelect(source: []const u8) bool {
 fn matchesRustFunction(source: []const u8) bool {
     const line = firstNonblankLine(source);
     if (!std.mem.startsWith(u8, line, "fn ") and !std.mem.startsWith(u8, line, "pub fn ")) return false;
-    return std.mem.indexOf(u8, source, "let ") != null or std.mem.indexOf(u8, source, "println!") != null or std.mem.indexOf(u8, line, "->") != null;
+    return std.mem.find(u8, source, "let ") != null or std.mem.find(u8, source, "println!") != null or std.mem.find(u8, line, "->") != null;
 }
 
 fn firstNonblankLine(source: []const u8) []const u8 {
@@ -481,7 +533,7 @@ fn firstNonblankLine(source: []const u8) []const u8 {
 fn containsLineStart(source: []const u8, prefix: []const u8) bool {
     if (std.mem.startsWith(u8, source, prefix)) return true;
     var start: usize = 0;
-    while (std.mem.indexOfPos(u8, source, start, "\n")) |newline| {
+    while (std.mem.findPos(u8, source, start, "\n")) |newline| {
         const line_start = newline + 1;
         if (std.mem.startsWith(u8, source[line_start..], prefix)) return true;
         start = line_start;

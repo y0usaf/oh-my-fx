@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
@@ -136,7 +137,7 @@ noinline fn migrateLegacyLockedInto(
         alloc,
         writable,
         state,
-        @intFromEnum(schema),
+        @backingInt(schema),
         primary_stat.size,
         null,
     );
@@ -174,7 +175,7 @@ pub fn loadSchemaV3ReadOnly(
     var events = try openSessionFile(session_dir, "events.jsonl", .read_only);
     defer events.close(io_mod.getIo());
     const generation = try session_replay.readFirstGeneration(alloc, events);
-    const watermark_name = try std.fmt.allocPrint(alloc, "commit.{s}.json", .{
+    const watermark_name = try alloc.print("commit.{s}.json", .{
         std.fmt.bytesToHex(generation, .lower),
     });
     defer alloc.free(watermark_name);
@@ -222,9 +223,6 @@ pub fn loadSchemaV3ReadOnly(
     {
         return error.InvalidSessionFormat;
     }
-    if (replayed.state.usage) |usage| if (usage.billing == .legacy) {
-        @import("../shared/debug_trace.zig").logf("session", "legacy usage unavailable session_id={s} source_schema=3", .{session_id});
-    };
     if (try replayed.state.archive_legacy_recovery(alloc)) {
         @import("../shared/debug_trace.zig").logf("session", "legacy recovery archived session_id={s} reason=unverifiable_route_authority", .{session_id});
     }
@@ -274,7 +272,7 @@ fn repairLegacyImages(
 ) !void {
     const session_dir = try paths.sessionDirPath(alloc, ctx.sessions_dir, session_id);
     defer alloc.free(session_dir);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ session_dir, "images" });
     defer alloc.free(snapshot_dir);
     _ = try session.repair_legacy_images_transactionally(
         alloc,
@@ -356,6 +354,7 @@ fn loadMigrationPreferences(
         ),
         .effort = detailed.settings.effort orelse .auto,
         .fast_mode = detailed.settings.fast_mode orelse false,
+        .ultrafast_mode = detailed.settings.ultrafast_mode orelse false,
     };
 }
 
@@ -365,11 +364,11 @@ test "schema v3 import archives legacy recovery with allocation failure cleanup"
     defer tmp.cleanup();
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{}) };
     defer dir.close();
-    const generation = [_]u8{1} ** 16;
+    const generation: [16]u8 = @splat(1);
     const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
-        .event_id = [_]u8{1} ** 16,
+        .event_id = @as([16]u8, @splat(1)),
         .timestamp_ms = 10,
         .event = .{ .session_started = .{
             .id = @constCast("legacy-recovery"),
@@ -385,10 +384,10 @@ test "schema v3 import archives legacy recovery with allocation failure cleanup"
     const events = try std.mem.concat(alloc, u8, &.{ started, recovery });
     defer alloc.free(events);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "events.jsonl", .data = events });
-    const watermark = try std.fmt.allocPrint(alloc, "{{\"schema_version\":1,\"session_id\":\"legacy-recovery\",\"log_generation\":\"01010101010101010101010101010101\",\"through_seq\":2,\"through_event_id\":\"02020202020202020202020202020202\",\"through_event_log_bytes\":{d}}}", .{events.len});
+    const watermark = try alloc.print("{{\"schema_version\":1,\"session_id\":\"legacy-recovery\",\"log_generation\":\"01010101010101010101010101010101\",\"through_seq\":2,\"through_event_id\":\"02020202020202020202020202020202\",\"through_event_log_bytes\":{d}}}", .{events.len});
     defer alloc.free(watermark);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "commit.01010101010101010101010101010101.json", .data = watermark });
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, source: *io_mod.VerifiedDir) !void {
             var imported = try loadSchemaV3ReadOnly(a, source, "legacy-recovery");
             defer imported.deinit(a);
@@ -411,17 +410,13 @@ test "schema v3 import follows the committed watermark beyond a stale manifest" 
     try store.canonical_root.sessions.?.dir.createDir(std.testing.io, id, .fromMode(0o700));
     var dir = io_mod.VerifiedDir{ .dir = try store.canonical_root.sessions.?.dir.openDir(std.testing.io, id, .{}) };
     defer dir.close();
-    const generation = [_]u8{1} ** 16;
-    const event_id = [_]u8{2} ** 16;
+    const generation: [16]u8 = @splat(1);
+    const event_id: [16]u8 = @splat(2);
     const language = try session.ConversationLanguage.fromSlice("en");
-    var usage = @import("session_usage.zig").Usage.initFresh();
-    defer usage.deinit(alloc);
-    var usage_snapshot = try usage.snapshot(alloc);
-    defer usage_snapshot.deinit(alloc);
     const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
-        .event_id = [_]u8{1} ** 16,
+        .event_id = @as([16]u8, @splat(1)),
         .timestamp_ms = 10,
         .event = .{ .session_started = .{
             .id = @constCast(id),
@@ -430,7 +425,6 @@ test "schema v3 import follows the committed watermark beyond a stale manifest" 
             .workspace_root = @constCast("/workspace"),
             .conversation_language = language,
             .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
-            .usage = usage_snapshot,
         } },
     });
     defer alloc.free(started);
@@ -455,7 +449,7 @@ test "schema v3 import follows the committed watermark beyond a stale manifest" 
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "events.jsonl", .data = events });
     const manifest = try session_projection.encodeManifest(alloc, .{
         .id = @constCast(id),
-        .authority_id = [_]u8{3} ** 16,
+        .authority_id = @as([16]u8, @splat(3)),
         .log_generation = generation,
         .created_at_ms = 10,
         .updated_at_ms = 10,
@@ -467,7 +461,7 @@ test "schema v3 import follows the committed watermark beyond a stale manifest" 
         .total_output_tokens = 0,
         .last_event_seq = 1,
         .event_log_bytes = started.len,
-        .event_log_stat_fingerprint = [_]u8{0} ** 32,
+        .event_log_stat_fingerprint = @as([32]u8, @splat(0)),
         .generation_base_seq = 1,
         .generation_base_bytes = started.len,
         .checkpoint_seq = null,
@@ -477,8 +471,7 @@ test "schema v3 import follows the committed watermark beyond a stale manifest" 
     defer alloc.free(manifest);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "session.json", .data = manifest });
     const watermark_name = "commit.01010101010101010101010101010101.json";
-    const watermark = try std.fmt.allocPrint(
-        alloc,
+    const watermark = try alloc.print(
         "{{\"schema_version\":1,\"session_id\":\"{s}\",\"log_generation\":\"{s}\",\"through_seq\":2,\"through_event_id\":\"{s}\",\"through_event_log_bytes\":{d}}}\n",
         .{ id, std.fmt.bytesToHex(generation, .lower), std.fmt.bytesToHex(event_id, .lower), started.len + committed.len },
     );

@@ -223,7 +223,7 @@ describe("version-scoped legacy MCP remote transports", () => {
     }, 30_000);
   }
 
-  test.skipIf(!tmuxAvailable())(
+  test(
     "legacy list-change health reports an installed listener and lazy feature counts truthfully",
     async () => {
       streamable = startLegacyStreamableHttpFixture("2025-11-25", {
@@ -235,22 +235,19 @@ describe("version-scoped legacy MCP remote transports", () => {
       gateway = startFakeGateway([fakeGatewayFinalText("unused")], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        width: 160,
-        height: 34,
-        env: fixtureEnv(root, gateway),
-      });
 
-      await tui.waitForComposer(15_000);
-      await tui.sendText("/mcp list");
-      const pane = await tui.waitForText("MCP health (1 server)", 10_000);
-      expect(pane).toContain("protocol=2025-11-25");
-      expect(pane).toContain(
+      const result = await runFx(["mcp", "list", "--connect"], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain("protocol=2025-11-25");
+      expect(result.stdout).toContain(
         "tools=1 resources=unknown templates=unknown prompts=unknown",
       );
-      expect(pane).toContain("subscription=active");
+      expect(result.stdout).toContain("subscription=active");
       expect(gateway.requests).toHaveLength(0);
     },
     30_000,
@@ -1107,7 +1104,7 @@ describe("version-scoped legacy MCP remote transports", () => {
 
   for (const version of VERSIONS) {
     test.skipIf(!tmuxAvailable())(
-      `TUI cancellation sends ${version} cancellation headers and cleans up`,
+      `TUI cancellation sends ${version} cancellation headers and quits without a session DELETE`,
       async () => {
         streamable = startLegacyStreamableHttpFixture(version, {
           mode: "stall_call",
@@ -1172,7 +1169,9 @@ describe("version-scoped legacy MCP remote transports", () => {
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(10_000);
         tui = null;
-        expect(streamable.deleteCalls).toBe(1);
+        // Exit leaves the session for the server to expire rather than
+        // holding the prompt for a DELETE round trip.
+        expect(streamable.deleteCalls).toBe(0);
       },
       40_000,
     );

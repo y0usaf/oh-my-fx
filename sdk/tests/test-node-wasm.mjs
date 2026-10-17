@@ -13,6 +13,7 @@ const termScripts = [
   "test-term-features.mjs",
   "test-term-history.mjs",
   "test-term-workspace.mjs",
+  "test-term-agents-md.mjs",
 ];
 const commands = [
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-wasm-jspi-tier-up.mjs", import.meta.url))]],
@@ -20,6 +21,7 @@ const commands = [
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-core-output-pressure.mjs", import.meta.url)), "wasm"]],
   [process.execPath, [fileURLToPath(new URL("test-wasm-memory.mjs", import.meta.url))]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-bootstrap.mjs", import.meta.url)), "wasm"]],
+  [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-step-limit.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-effort.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-fast.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-images.mjs", import.meta.url)), "wasm"]],
@@ -31,6 +33,9 @@ const commands = [
   [process.execPath, ["--experimental-wasm-jspi", "--expose-gc", fileURLToPath(new URL("test-wasm-module-cache.mjs", import.meta.url))]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-request-context.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-transport-retry.mjs", import.meta.url)), "wasm"]],
+  [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-codex.mjs", import.meta.url)), "wasm"]],
+  [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-grok.mjs", import.meta.url)), "wasm"]],
+  [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-custom.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-core.mjs", import.meta.url))]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-core-cancel.mjs", import.meta.url))]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-core-home-unavailable.mjs", import.meta.url))]],

@@ -1406,7 +1406,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 34", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 37", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
@@ -1823,10 +1823,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "full-window output limit is omitted from the agent request",
+    "full-window output limit is bounded in the agent request",
     async () => {
       const model = "meta/muse-spark-1.2-contributor";
-      const finalText = "Full-window output limit omitted.";
+      const finalText = "Full-window output limit bounded.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-full-window-output-limit-",
         [fakeGatewayFinalText(finalText)],
@@ -1853,9 +1853,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.modelRequests).toHaveLength(1);
       expect(queuedGateway.requests).toHaveLength(1);
-      expect(JSON.parse(queuedGateway.requests[0]!.body)).not.toHaveProperty(
-        "maxOutputTokens",
-      );
+      expect(JSON.parse(queuedGateway.requests[0]!.body).maxOutputTokens).toBe(32_768);
       expect(session!.isAlive()).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -2622,9 +2620,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           },
         });
         await session.waitForComposer(TIMEOUT);
-        // A pending recovery checkpoint continues automatically on resume; no
-        // slash command exists for it anymore.
-        await session.waitForText(/continues\s+automatically/, TIMEOUT);
+        // The kill left the owner marker behind, so resume reports the
+        // unclean exit and waits instead of restarting the turn on its own.
+        await session.waitForText(/quit unexpectedly/, TIMEOUT);
+        await Bun.sleep(1_000);
+        expect(resumed.started).toBe(false);
+        expect(queuedGateway.requests).toHaveLength(2);
+        await session.sendText("continue");
         await waitForCondition(() => resumed.started, "admitted resumed response");
         await session.waitForText("Thinking", TIMEOUT);
         expect(queuedGateway.requests).toHaveLength(3);
@@ -2796,8 +2798,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         },
       });
       await session.waitForComposer(TIMEOUT);
-      // The pending recovery checkpoint continues automatically on resume.
-      await session.waitForText(/continues\s+automatically/, TIMEOUT);
+      // The unclean-exit gate asks before the recovering turn retries.
+      await session.waitForText(/quit unexpectedly/, TIMEOUT);
+      expect(queuedGateway.requests).toHaveLength(1);
+      await session.sendText("continue");
       await session.waitForText(finalText, TIMEOUT);
 
       expect(queuedGateway.requests).toHaveLength(2);
@@ -3420,6 +3424,170 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         framesRoot,
         submittedPrompt,
       );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "idle pasted prompt taller than the viewport keeps every line in scrollback",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-tall-idle-submit-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const promptLines = [
+        "TALL_PROMPT_HEAD_SENTINEL",
+        ...Array.from(
+          { length: 78 },
+          (_, index) => `tall prompt body ${String(index + 1).padStart(2, "0")}`,
+        ),
+        "TALL_PROMPT_TAIL_SENTINEL",
+      ];
+      const hold: HoldState = { started: false, cancelled: false };
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const heldGateway = startFakeGateway([() => heldGatewayResponse(hold)]);
+      gateway = heldGateway;
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        width: 96,
+        height: 28,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-tall-idle-submit-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          // A recording notice would add transcript rows above the prompt.
+          FX_DEBUG_RECORD: undefined,
+          FX_RECORD: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.pasteText(promptLines.join("\n"));
+      await session.sendKeys("Enter");
+      await waitForCondition(
+        () => heldGateway.requests.length === 1 && hold.started,
+        "held tall idle prompt stream",
+      );
+      await session.waitForText("Thinking", TIMEOUT);
+      // The preview already shows the tail, so wait for the head too.
+      const scrollback = await waitForScrollback(
+        session,
+        (value) => value.includes(promptLines[0]!) && value.includes(promptLines.at(-1)!),
+        "tall idle prompt head and tail",
+        10_000,
+      );
+      const rows = scrollback.split("\n").map((row) => row.trimEnd());
+      let previous = rows.findIndex((row) => row.includes("Run /help for commands"));
+      expect(previous).toBeGreaterThanOrEqual(0);
+      for (const line of promptLines) {
+        const matches = rows.flatMap((row, index) => (row.endsWith(line) ? [index] : []));
+        expect({ line, matches: matches.length }).toEqual({ line, matches: 1 });
+        expect(matches[0]).toBeGreaterThan(previous);
+        previous = matches[0];
+      }
+
+      await session.sendKeys("C-c");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      expect(hold.cancelled).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "steering taller than the viewport keeps earlier rows in scrollback",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-tall-steering-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const firstPrompt = "TALL_STEERING_FIRST_PROMPT";
+      const steeringLines = [
+        "TALL_STEERING_HEAD_SENTINEL",
+        ...Array.from(
+          { length: 78 },
+          (_, index) => `tall steering body ${String(index + 1).padStart(2, "0")}`,
+        ),
+        "TALL_STEERING_TAIL_SENTINEL",
+      ];
+      const hold: HoldState = { started: false, cancelled: false };
+      const continued: HoldState = { started: false, cancelled: false };
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const heldGateway = startFakeGateway([
+        () => heldGatewayResponse(hold),
+        () => heldGatewayResponse(continued),
+      ]);
+      gateway = heldGateway;
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        width: 96,
+        height: 28,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-tall-steering-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DEBUG_RECORD: undefined,
+          FX_RECORD: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(firstPrompt);
+      await waitForCondition(
+        () => heldGateway.requests.length === 1 && hold.started,
+        "held turn before tall steering",
+      );
+      await session.waitForText("Thinking", TIMEOUT);
+      await session.pasteText(steeringLines.join("\n"));
+      await session.sendKeys("Enter");
+      await waitForCondition(
+        () => heldGateway.requests.length === 2 && continued.started,
+        "held continuation after tall steering",
+      );
+      // The preview already shows the tail, so wait for the head too.
+      const scrollback = await waitForScrollback(
+        session,
+        (value) => value.includes(steeringLines[0]!) && value.includes(steeringLines.at(-1)!),
+        "tall steering head and tail",
+        10_000,
+      );
+      const rows = scrollback.split("\n").map((row) => row.trimEnd());
+      let previous = rows.findIndex((row) => row.includes("Run /help for commands"));
+      expect(previous).toBeGreaterThanOrEqual(0);
+      for (const line of [firstPrompt, ...steeringLines]) {
+        const matches = rows.flatMap((row, index) => (row.endsWith(line) ? [index] : []));
+        expect({ line, matches: matches.length }).toEqual({ line, matches: 1 });
+        expect(matches[0]).toBeGreaterThan(previous);
+        previous = matches[0];
+      }
+
+      await session.sendKeys("C-c");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      expect(continued.cancelled).toBe(true);
+      expect(heldGateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
@@ -5019,6 +5187,67 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "separate provider messages render as separate paragraphs",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-message-phases-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const commentary = "COMMENTARY_MESSAGE_SENTINEL";
+      const answer = "FINAL_ANSWER_SENTINEL";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+      const message = (id: string, phase: string, text: string) => [
+        { type: "text-start", id, providerMetadata: { openai: { itemId: id, phase } } },
+        { type: "text-delta", id, delta: text },
+        { type: "text-end", id },
+      ];
+
+      const phase_gateway = startFakeGateway([
+        fakeGatewaySse([
+          ...message("msg_commentary", "commentary", commentary),
+          ...message("msg_answer", "final_answer", answer),
+          { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+        ]),
+      ]);
+      gateway = phase_gateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 64,
+        height: 16,
+        minimumHistoryLines: 200,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-message-phases-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: phase_gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: phase_gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: phase_gateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Say hello.");
+      await session.waitForText(answer, TIMEOUT);
+      await Bun.sleep(250);
+      const scrollback = await session.captureFullScrollback();
+      const lines = scrollback.split("\n").map((line) => line.trim());
+      const commentary_index = lines.indexOf(commentary);
+      expect(commentary_index).toBeGreaterThanOrEqual(0);
+      expect(lines[commentary_index + 1]).toBe("");
+      expect(lines[commentary_index + 2]).toBe(answer);
+      expect(scrollback).not.toContain(commentary + answer);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "launch-row release preserves complete history during a large table append",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-launch-history-")));
@@ -5523,7 +5752,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_E2E_GATEWAY_CHAT_URL: unsupportedGateway.chatUrl,
         FX_MODEL: MODEL,
         FX_TRACE_LOG: tracePath,
-        FX_TRACE_SCOPES: "tool",
+        FX_TRACE_SCOPES: "tool,core",
       };
       session = await TmuxSession.create({
         cwd: workspace,
@@ -5584,6 +5813,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(trace).toContain(
         `event=execution_start turn_id=1 step_id=1 call_id=${supportedCallId} name=shell`,
       );
+      // The startup-file snapshot must capture while fx owns the terminal;
+      // a capture that shares the terminal stops on job control.
+      expect(trace).toContain("shell snapshot ready");
       expect(existsSync(tapePath)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -5711,6 +5943,120 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       } finally {
         hold.release?.();
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
+    "parallel sibling subagent rows terminalize independently",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-parallel-subagent-rows-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const rootPrompt = "PARALLEL_SUBAGENT_ROW_FIXTURE";
+      const firstTask = "Check first sibling";
+      const secondTask = "Check second sibling";
+      let releaseFirst!: (response: Response) => void;
+      let releaseSecond!: (response: Response) => void;
+      const heldFirst = new Promise<Response>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const heldSecond = new Promise<Response>((resolve) => {
+        releaseSecond = resolve;
+      });
+      const started = new Set<string>();
+      let parentContinuations = 0;
+      const rowGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as {
+          prompt: Array<{ role: string; content: unknown }>;
+        };
+        const userText = contentText(request.prompt.findLast((message) => message.role === "user")?.content);
+        if (userText.includes(firstTask) && !userText.includes(rootPrompt)) {
+          started.add("first");
+          return heldFirst;
+        }
+        if (userText.includes(secondTask) && !userText.includes(rootPrompt)) {
+          started.add("second");
+          return heldSecond;
+        }
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        );
+        const firstResult = parts.find((part) =>
+          part.type === "tool-result" && part.toolCallId === "parallel_row_first",
+        );
+        const secondResult = parts.find((part) =>
+          part.type === "tool-result" && part.toolCallId === "parallel_row_second",
+        );
+        if (firstResult && secondResult) {
+          parentContinuations += 1;
+          return fakeGatewayFinalText("PARALLEL_SUBAGENT_ROWS_FINISHED");
+        }
+        return fakeGatewaySse([
+          {
+            type: "tool-call",
+            toolCallId: "parallel_row_first",
+            toolName: "subagent",
+            input: { request: { action: "run", task: firstTask } },
+          },
+          {
+            type: "tool-call",
+            toolCallId: "parallel_row_second",
+            toolName: "subagent",
+            input: { request: { action: "run", task: secondTask } },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]);
+      }, { classifierDecision: "clear" });
+      gateway = rowGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-parallel-subagent-row-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: rowGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText(rootPrompt);
+        await waitForCondition(() => started.size === 2, "both sibling subagents started");
+        await session.waitForText(`Subagent working · ${firstTask}`, TIMEOUT);
+        await session.waitForText(`Subagent working · ${secondTask}`, TIMEOUT);
+
+        releaseFirst(fakeGatewayFinalText("PARALLEL_FIRST_DONE"));
+        await session.waitForText(`Subagent finished · ${firstTask}`, TIMEOUT);
+        const partial = await session.captureFullScrollback();
+        expect(partial).toContain(`Subagent working · ${secondTask}`);
+        expect(partial).not.toContain(`Subagent finished · ${secondTask}`);
+        expect(parentContinuations).toBe(0);
+
+        releaseSecond(fakeGatewayFinalText("PARALLEL_SECOND_DONE"));
+        await session.waitForText("PARALLEL_SUBAGENT_ROWS_FINISHED", TIMEOUT);
+        const completed = await session.captureFullScrollback();
+        expect(countOccurrences(completed, `Subagent finished · ${firstTask}`)).toBe(1);
+        expect(countOccurrences(completed, `Subagent finished · ${secondTask}`)).toBe(1);
+        expect(parentContinuations).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      } finally {
+        releaseFirst(fakeGatewayFinalText("PARALLEL_FIRST_DONE"));
+        releaseSecond(fakeGatewayFinalText("PARALLEL_SECOND_DONE"));
       }
     },
     TIMEOUT * 3,

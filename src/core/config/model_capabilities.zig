@@ -1,9 +1,11 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
+const model_provider = @import("model_provider.zig");
 
 pub const ResolvedProviderOptions = struct {
     reasoning: ?types.ReasoningEffort = null,
     fast: bool = false,
+    ultrafast: bool = false,
     parallel_tool_calls: ?bool = null,
     prompt_caching: bool = false,
     /// Borrowed gateway provider slugs in preference order. Empty leaves
@@ -41,6 +43,7 @@ pub const GatewayMetadata = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
     supports_tool_use: bool = false,
     supports_vision: bool = false,
     supports_file_input: bool = false,
@@ -55,6 +58,7 @@ pub const Capabilities = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
     intrinsic_fast: bool = false,
     supports_tool_use: bool = false,
     supports_vision: bool = false,
@@ -89,6 +93,7 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
         capabilities.supports_reasoning = metadata.supports_reasoning or metadata.reasoning_efforts.len > 0;
         capabilities.reasoning_efforts = metadata.reasoning_efforts;
         capabilities.supports_fast_mode = metadata.supports_fast_mode;
+        capabilities.supports_ultrafast_mode = metadata.supports_ultrafast_mode;
         capabilities.supports_tool_use = metadata.supports_tool_use;
         capabilities.supports_vision = metadata.supports_vision;
         capabilities.supports_file_input = metadata.supports_file_input;
@@ -121,6 +126,37 @@ pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilit
         generic;
     capabilities.intrinsic_fast = capabilities.intrinsic_fast or generic.intrinsic_fast;
     return capabilities;
+}
+
+// A catalog output limit that fills the whole context window cannot bound a real request, and
+// omitting the limit lets some providers stop replies at a few thousand tokens.
+const full_window_output_tokens: u32 = 32_768;
+const full_window_output_divisor: u32 = 8;
+
+/// Output tokens to request and reserve for one model call, or null to leave the limit unset.
+pub fn requestOutputTokens(capabilities: Capabilities) ?u32 {
+    const advertised = capabilities.max_output_tokens orelse return null;
+    const window = capabilities.context_window orelse return advertised;
+    if (advertised < window) return advertised;
+    return @min(full_window_output_tokens, window / full_window_output_divisor);
+}
+
+test "request output limit bounds full-window catalog limits" {
+    const cases = [_]struct {
+        capabilities: Capabilities,
+        expected: ?u32,
+    }{
+        .{ .capabilities = .{}, .expected = null },
+        .{ .capabilities = .{ .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 256_000 }, .expected = null },
+        .{ .capabilities = .{ .context_window = 256_000, .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 1_000_000 }, .expected = 32_768 },
+        .{ .capabilities = .{ .context_window = 131_072, .max_output_tokens = 131_072 }, .expected = 16_384 },
+        .{ .capabilities = .{ .context_window = 128_000, .max_output_tokens = 256_000 }, .expected = 16_000 },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, requestOutputTokens(case.capabilities));
+    }
 }
 
 pub fn reasoningEffortSupported(capabilities: Capabilities, effort: types.ReasoningEffort) bool {
@@ -166,6 +202,37 @@ pub fn resolveProviderOptionsForCapabilities(
     }
     resolved.fast = fast_mode and capabilities.supports_fast_mode;
     return resolved;
+}
+
+/// Ultrafast is an explicit, catalog-verified OpenAI Gateway opt-in. Unlike Fast,
+/// unsupported or unknown capabilities must not silently downgrade before sending.
+pub fn resolveUltrafastProviderOptions(
+    capabilities: Capabilities,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    effort: types.ReasoningEffort,
+    fast_mode: bool,
+    ultrafast_mode: bool,
+) error{UltrafastUnavailable}!ResolvedProviderOptions {
+    var options = resolveProviderOptionsForCapabilities(capabilities, effort, fast_mode);
+    if (!ultrafast_mode) return options;
+    if (provider != .gateway or !std.mem.startsWith(u8, model, "openai/") or !capabilities.supports_ultrafast_mode) {
+        return error.UltrafastUnavailable;
+    }
+    options.fast = false;
+    options.ultrafast = true;
+    return options;
+}
+
+test "Ultrafast requires explicit opt-in and verified OpenAI Gateway capability" {
+    const caps = Capabilities{ .supports_fast_mode = true, .supports_ultrafast_mode = true };
+    const normal = try resolveUltrafastProviderOptions(caps, .gateway, "openai/gpt-6-astra", .auto, true, false);
+    try std.testing.expect(normal.fast and !normal.ultrafast);
+    const ultra = try resolveUltrafastProviderOptions(caps, .gateway, "openai/gpt-6-astra", .auto, true, true);
+    try std.testing.expect(ultra.ultrafast and !ultra.fast);
+    try std.testing.expectError(error.UltrafastUnavailable, resolveUltrafastProviderOptions(.{}, .gateway, "openai/gpt-6-astra", .auto, false, true));
+    try std.testing.expectError(error.UltrafastUnavailable, resolveUltrafastProviderOptions(caps, .codex, "openai/gpt-6-astra", .auto, false, true));
+    try std.testing.expectError(error.UltrafastUnavailable, resolveUltrafastProviderOptions(caps, .gateway, "anthropic/model", .auto, false, true));
 }
 
 test "capabilities infer intrinsic fast identity but not controls from model IDs" {

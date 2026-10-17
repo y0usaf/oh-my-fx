@@ -29,7 +29,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
@@ -39,6 +39,8 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "--effort <level>", .description = "Override the reasoning effort for this request" },
             .{ .flag = "--fast", .description = "Enable Fast mode for this request when the model supports it" },
             .{ .flag = "--no-fast", .description = "Disable Fast mode for this request" },
+            .{ .flag = "--ultrafast", .description = "Request Ultra mode for this request when the model supports it" },
+            .{ .flag = "--no-ultrafast", .description = "Disable Ultra mode for this request" },
             .{ .flag = "--provider-order <a,b,...>", .description = "Prefer these gateway providers in order for this request" },
             .{ .flag = "--provider-strict", .description = "Restrict this request to only the providers in --provider-order" },
             .{ .flag = "--no-provider-strict", .description = "Clear the provider restriction for this request" },
@@ -48,6 +50,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "--quiet", .description = "Suppress assistant output" },
             .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
             .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume and --resume-id" },
+            .{ .flag = "--sessions-v2", .description = "Use the experimental v2 session store, also set by FX_SESSIONS_V2=1; its sessions resume only with it" },
             .{ .flag = "--no-color", .description = "Render TTY output without colors or hyperlinks" },
             .{ .flag = "--resume <last|id>", .description = "Continue the last session or a session by id" },
             .{ .flag = "--resume-id <id>", .description = "Continue a session by exact id" },
@@ -66,10 +69,12 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .acp,
         .token = "acp",
-        .usage = "acp [--model <id>] [--log-file <path>]",
+        .usage = "acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
         .summary = "Start an ACP server over stdio",
         .options = &.{
             .{ .flag = "--model <id>", .description = "Override the default model" },
+            .{ .flag = "--ultrafast", .description = "Request Ultra mode when the model supports it" },
+            .{ .flag = "--no-ultrafast", .description = "Disable Ultra mode" },
             .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
         },
     },
@@ -144,6 +149,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Manage MCP servers without opening the interactive shell",
         .details = &.{
             "Commands:",
+            "  fx mcp add slack                   Configure Slack and open authorization",
             "  fx mcp add NAME COMMAND [ARGS...]",
             "  fx mcp add --transport http NAME URL",
             "  fx " ++ command_specs.mcp_auth_usage,
@@ -202,12 +208,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .sessions,
         .token = "sessions",
-        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json]",
+        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions convert [--json]",
         .summary = "List saved sessions for the current workspace",
         .options = &.{
             .{ .flag = "--all", .description = "List saved sessions across every workspace in this profile" },
             .{ .flag = "--limit <1-100>", .description = "Set the maximum sessions returned per page" },
             .{ .flag = "--cursor <cursor>", .description = "Continue from a prior sessions result" },
+            .{ .flag = "convert", .description = "Convert every session saved in the previous format" },
             json_option,
         },
     },
@@ -236,15 +243,16 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .usage,
         .token = "usage",
-        .usage = "usage [--period <24h|7d|30d>] [--json]",
-        .summary = "Show local fx token usage and spend",
+        .usage = "usage [--period <today|7d|month>] [--json]",
+        .summary = "Show your provider's usage and spend",
         .options = &.{
-            .{ .flag = "--period <24h|7d|30d>", .description = "Select a rolling window (default: 30d)" },
+            .{ .flag = "--period <today|7d|month>", .description = "Select the period, in UTC days (default: month)" },
             json_option,
         },
         .details = &.{
-            "Reports only usage recorded by fx on this machine.",
-            "This command reads local state and does not query account-wide Gateway reports.",
+            "With AI Gateway, reads its usage reports: with fx login, your spend on the team and your budget; with an API key, that key's spend.",
+            "With Codex, reads your ChatGPT plan's limits and activity; with Grok, your plan's allowance and credits.",
+            "Finished days are cached under ~/.fx and fetched at most once a day.",
         },
     },
     .{
@@ -319,7 +327,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .credits, .usage = "credits|balance", .summary = "Show Vercel AI Gateway credits" },
     } },
     .{ .entries = &.{
-        .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]", .summary = "Show locally recorded token usage and spend" },
+        .{ .kind = .usage, .usage = "usage [--period <today|7d|month>]", .summary = "Show your provider's usage and spend" },
     } },
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
@@ -364,6 +372,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Turn Fast mode on or off for an interactive session",
     },
     .{
+        .usage = "--ultrafast, --no-ultrafast",
+        .description = "Request Ultra mode on or off for an interactive session",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the remembered workspace session",
     },
@@ -382,6 +394,10 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--resume-<id>",
         .description = "Resume a session by exact ID",
+    },
+    .{
+        .usage = "--sessions-v2",
+        .description = "Use the experimental v2 session store, also set by FX_SESSIONS_V2=1",
     },
     .{
         .usage = "-h, --help",
@@ -453,11 +469,12 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
 
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
+    .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .help_entry = "/provider (/setup)", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
-    .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },
+    .{ .kind = .usage, .command = "/usage", .aliases = &.{}, .help_entry = "/usage", .completion_description = "show your provider's usage and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
@@ -476,9 +493,11 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast", .completion_description = "toggle Fast mode when supported", .presentation_category = .model },
+    .{ .kind = .ultrafast, .command = "/ultrafast", .help_entry = "/ultrafast [on|off|status]", .completion_description = "request Ultra mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
+    .{ .kind = .shell, .command = "/shell", .help_entry = "/shell reload", .completion_description = "reload shell startup files for commands", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
@@ -539,6 +558,7 @@ test "built-in slash commands register exact active order" {
         "/reset",
         "/resume",
         "/rename",
+        "/fork",
         "/login",
         "/logout",
         "/provider",
@@ -562,9 +582,11 @@ test "built-in slash commands register exact active order" {
         "/credits",
         "/paste",
         "/fast",
+        "/ultrafast",
         "/statusline",
         "/sound",
         "/workspace",
+        "/shell",
         "/version",
         "/quit",
     };

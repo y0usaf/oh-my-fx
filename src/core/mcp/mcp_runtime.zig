@@ -7,6 +7,7 @@ const catalog_refresh = @import("catalog_refresh.zig");
 const tool_search = @import("tool_search.zig");
 const server_views = @import("server_views.zig");
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const atomic_value = @import("atomic_value.zig");
 const server_connection = @import("server_connection.zig");
 const builtin = @import("builtin");
@@ -120,6 +121,7 @@ pub const PreviewNativeWorkspaceAuthorityFn = *const fn (
 
 const connection_control = @import("connection_control.zig");
 const operation_authority = @import("operation_authority.zig");
+const message_carrier_mod = @import("message_carrier.zig");
 const startupDeadline = connection_control.startupDeadline;
 
 const LegacyUrlWaiter = legacy_url_completion.Waiter;
@@ -216,6 +218,36 @@ const ServerAccessPrecommit = operation_authority.SendGuard;
 
 const OperationAccessGuard = operation_authority.Guard;
 
+const max_tool_display_title_bytes: usize = 200;
+
+/// Returns the owned MCP `title`, falling back to `annotations.title`, or null
+/// when neither is usable display text.
+fn toolDisplayTitle(alloc: Allocator, tool: McpTool) Allocator.Error!?[]u8 {
+    if (tool.title) |title| {
+        if (usableDisplayTitle(title)) |value| return try alloc.dupe(u8, value);
+    }
+    const annotations = tool.annotations_json orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, annotations, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const title = parsed.value.object.get("title") orelse return null;
+    if (title != .string) return null;
+    const value = usableDisplayTitle(title.string) orelse return null;
+    return try alloc.dupe(u8, value);
+}
+
+/// Returns the displayable part of a server-provided tool title, or null when
+/// it has none.
+pub fn usableDisplayTitle(title: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, title, " \t\r\n");
+    if (trimmed.len == 0 or !std.unicode.utf8ValidateSlice(trimmed)) return null;
+    for (trimmed) |byte| if (byte < 0x20 or byte == 0x7f) return null;
+    return text_utils.utf8PrefixByBytes(trimmed, max_tool_display_title_bytes);
+}
+
 const authorizeLiveAccess = operation_authority.authorizeLiveAccess;
 const resolveLiveAuthority = operation_authority.resolveLiveAuthority;
 
@@ -231,6 +263,13 @@ const healthFailureForState = server_views.healthFailureForState;
 
 const DetachedTransport = server_connection.DetachedTransport;
 pub const McpServer = server_connection.Server;
+
+/// Process exit: SIGKILLs every stdio MCP child in the process at once and
+/// refuses later launches. Returns false when only a full teardown reaches
+/// every child; see `stdio_dispatcher.killAllForProcessExit`.
+pub fn killAllStdioChildrenForProcessExit() bool {
+    return stdio_dispatcher.killAllForProcessExit();
+}
 
 pub const McpRuntime = struct {
     alloc: Allocator,
@@ -249,9 +288,14 @@ pub const McpRuntime = struct {
     retiring: std.atomic.Value(bool) = .init(false),
     tool_registry: tool_dispatch.Registry = .{},
     legacy_elicitation_capabilities: elicitation.Capabilities = .{},
+    message_carrier: ?message_carrier_mod.Carrier = null,
     discovery_state: std.atomic.Value(DiscoveryState) = .init(.idle),
     discovery_cancel_requested: std.atomic.Value(bool) = .init(false),
     discovery_thread: ?std.Thread = null,
+    /// Set when the process is about to exit, so a reload still reconciling
+    /// this runtime tears removed servers down without grace or session
+    /// DELETEs.
+    process_exiting: std.atomic.Value(bool) = .init(false),
 
     fn legacyInputs(self: *McpRuntime) legacy_elicitation_runtime.Coordination {
         return .{ .catalog_mutex = &self.catalog_mutex, .completions = &self.completions };
@@ -300,14 +344,23 @@ pub const McpRuntime = struct {
     }
 
     pub fn deinit(self: *McpRuntime) void {
+        self.deinitWithMode(.immediate);
+    }
+
+    /// Kills stdio children without grace and skips remote session DELETEs;
+    /// only for teardown immediately followed by process exit.
+    pub fn deinitForProcessExit(self: *McpRuntime) void {
+        self.deinitWithMode(.process_exit);
+    }
+
+    fn deinitWithMode(self: *McpRuntime, shutdown_mode: ServerShutdownMode) void {
         self.discovery_cancel_requested.store(true, .seq_cst);
         if (self.discovery_thread) |thread| {
             self.discovery_thread = null;
             thread.join();
         }
-        // Process-exit path: kill stdio children immediately rather than
-        // waiting out per-server grace windows.
-        for (self.servers.items) |server| self.destroyServer(server, .immediate);
+        // A discarded runtime never waits out per-server grace windows.
+        for (self.servers.items) |server| self.destroyServer(server, shutdown_mode);
         self.servers.deinit(self.alloc);
         for (self.workspace_diagnostics.items) |*diagnostic| {
             diagnostic.deinit(self.alloc);
@@ -317,7 +370,15 @@ pub const McpRuntime = struct {
         self.tool_aliases.deinit();
     }
 
-    const ServerShutdownMode = enum { graceful, immediate };
+    const ServerShutdownMode = enum { graceful, immediate, process_exit };
+
+    pub fn prepareForProcessExit(self: *McpRuntime) void {
+        self.process_exiting.store(true, .release);
+    }
+
+    fn retiredServerShutdownMode(self: *const McpRuntime) ServerShutdownMode {
+        return if (self.process_exiting.load(.acquire)) .process_exit else .graceful;
+    }
 
     fn destroyServer(self: *McpRuntime, server: *McpServer, shutdown_mode: ServerShutdownMode) void {
         server.lifetime.retire();
@@ -337,6 +398,7 @@ pub const McpRuntime = struct {
         switch (shutdown_mode) {
             .graceful => detached.deinitGracefully(self.alloc),
             .immediate => detached.deinitImmediate(self.alloc),
+            .process_exit => detached.deinitForProcessExit(self.alloc),
         }
         server.deinit(self.alloc);
         server.connection_lock.unlock(io_mod.getIo());
@@ -346,6 +408,45 @@ pub const McpRuntime = struct {
 
     pub fn legacyUrlCompletionRecorded(self: *McpRuntime, origin: tool_mcp_runtime.InputOrigin, id: []const u8) bool {
         return self.completions.legacyUrlCompletionRecorded(origin, id);
+    }
+
+    /// Installs the host channel for servers with `acp_server_id`. Must be
+    /// set before those servers are added.
+    pub fn setMessageCarrier(self: *McpRuntime, carrier: ?message_carrier_mod.Carrier) void {
+        self.message_carrier = carrier;
+    }
+
+    /// True when a configured server waits for `connectHostChannelServers`.
+    pub fn hasPendingHostChannelServers(self: *McpRuntime) bool {
+        self.server_mutex.lockSharedUncancelable(io_mod.getIo());
+        defer self.server_mutex.unlockShared(io_mod.getIo());
+        for (self.servers.items) |server| {
+            if (hostChannelPending(server)) return true;
+        }
+        return false;
+    }
+
+    /// A host-channel server is pending until it has connected or failed; a
+    /// cancelled attempt leaves it disconnected and eligible for the next turn.
+    fn hostChannelPending(server: *const McpServer) bool {
+        if (server.config.acp_server_id == null or !server.config.enabled) return false;
+        return server.startup_state.load(.acquire) != .complete or
+            server.state.load(.acquire) == .disconnected;
+    }
+
+    /// Connects servers served over the host's own connection. The host calls
+    /// this off the thread that reads that connection, because every
+    /// discovery request waits for a reply that thread must deliver.
+    pub fn connectHostChannelServers(self: *McpRuntime, tool_registry: tool_dispatch.Registry, cancel: *std.atomic.Value(bool)) !void {
+        const server_handles = try self.acquireServers();
+        defer self.releaseServers(server_handles);
+        if (self.retiring.load(.acquire)) return error.McpRuntimeRetired;
+        for (server_handles) |server| {
+            if (!hostChannelPending(server)) continue;
+            _ = server.startup_state.cmpxchgStrong(.complete, .idle, .acq_rel, .acquire);
+        }
+        self.connectAllControlled(tool_registry, cancel, null, .acp_host_channel);
+        for (server_handles) |server| try self.waitForServerStartup(server, cancel);
     }
 
     pub fn setLegacyUrlCompletionSink(
@@ -626,14 +727,7 @@ pub const McpRuntime = struct {
             }
             break :accepted sink.accept(sink.context, origin, acp_id);
         };
-        return switch (accepted) {
-            .missing => null,
-            .awaiting_completion => .awaiting_completion,
-            .completed => |id| completed: {
-                sink.publish(sink.context, id);
-                break :completed .completed;
-            },
-        };
+        return sink.settleAccept(accepted);
     }
 
     pub fn addServer(
@@ -666,6 +760,7 @@ pub const McpRuntime = struct {
         server.owner_alloc = self.alloc;
         server.session_generation = self.generation;
         server.elicitation_capabilities = self.legacy_elicitation_capabilities;
+        server.message_carrier = self.message_carrier;
         server.completion_state = &self.completions;
         server.legacy_notifications = .{ .context = self, .callback = handleLegacyCompletionNotification };
     }
@@ -770,7 +865,7 @@ pub const McpRuntime = struct {
                         .failed => .failed,
                     }, serverAuthenticationState(server), server.config.name, server.last_error);
                     defer if (failure) |message| self.alloc.free(message);
-                    return try std.fmt.allocPrint(self.alloc, "Required MCP server '{s}' failed to start: {s}", .{ safe_name, failure orelse "Check the trusted profile configuration and retry." });
+                    return try self.alloc.print("Required MCP server '{s}' failed to start: {s}", .{ safe_name, failure orelse "Check the trusted profile configuration and retry." });
                 }
             }
         }
@@ -808,7 +903,7 @@ pub const McpRuntime = struct {
         self.releaseServers(current);
         current_retained = false;
         for (previous.items) |server| {
-            if (std.mem.findScalar(*McpServer, self.servers.items, server) == null) self.destroyServer(server, .graceful);
+            if (std.mem.findScalar(*McpServer, self.servers.items, server) == null) self.destroyServer(server, self.retiredServerShutdownMode());
         }
         previous.deinit(self.alloc);
         return null;
@@ -854,7 +949,7 @@ pub const McpRuntime = struct {
         }
         self.server_mutex.unlock(io_mod.getIo());
         self.catalog_mutex.unlock(io_mod.getIo());
-        for (retired.items) |server| self.destroyServer(server, .graceful);
+        for (retired.items) |server| self.destroyServer(server, self.retiredServerShutdownMode());
     }
 
     pub fn workspaceAuthorityReducedAgainstConfigs(
@@ -1123,6 +1218,16 @@ pub const McpRuntime = struct {
         return .{ .servers = servers };
     }
 
+    /// True when the named server is down with a recorded failure, which a
+    /// tool search naming it reports to the model.
+    pub fn hasRecordedFailure(self: *McpRuntime, name: []const u8) bool {
+        const server = self.acquireServer(name) orelse return false;
+        defer server.lifetime.release(io_mod.getIo());
+        server.status_lock.lockUncancelable(io_mod.getIo());
+        defer server.status_lock.unlock(io_mod.getIo());
+        return server.state.load(.acquire) == .failed and server.last_error != null;
+    }
+
     pub fn requiredStartupFailure(
         self: *McpRuntime,
         alloc: Allocator,
@@ -1133,8 +1238,7 @@ pub const McpRuntime = struct {
         if (health.startupDecision(snapshot.servers) != .blocked) return null;
         for (snapshot.servers) |server| {
             if (!server.required or server.connection == .ready) continue;
-            const message = try std.fmt.allocPrint(
-                alloc,
+            const message = try alloc.print(
                 "Required MCP server '{s}' failed to start: {s}",
                 .{
                     server.configured_name,
@@ -1298,7 +1402,11 @@ pub const McpRuntime = struct {
         defer server.connection_lock.unlock(io_mod.getIo());
         const names = &self.tool_aliases;
         connectServerCancellable(self, server, names, cancel, null) catch |err| {
-            server.setFailed(self.alloc, @errorName(err));
+            if (server.last_error == null) {
+                server.setFailed(self.alloc, @errorName(err));
+            } else {
+                server.state.store(.failed, .release);
+            }
             return err;
         };
     }
@@ -1381,7 +1489,7 @@ pub const McpRuntime = struct {
         var index_count: usize = 0;
         self.catalog_mutex.lockUncancelable(io_mod.getIo());
         for (server_handles) |server| {
-            switch (startup_admission.decide(server.config.enabled, server.config.required, server.config.workspace_admission, phase)) {
+            switch (startup_admission.decideServer(&server.config, phase)) {
                 .connect => if (server.startup_state.cmpxchgStrong(.idle, .loading, .acq_rel, .acquire) == null) {
                     jobs[index_count] = server;
                     index_count += 1;
@@ -1628,6 +1736,38 @@ pub const McpRuntime = struct {
         return null;
     }
 
+    pub const ToolIdentity = struct {
+        server: []u8,
+        /// The tool's name on its server, before fx exposes it to the model.
+        tool: []u8,
+        /// The server's display title, when it declares one.
+        title: ?[]u8 = null,
+
+        pub fn deinit(self: ToolIdentity, alloc: Allocator) void {
+            alloc.free(self.server);
+            alloc.free(self.tool);
+            if (self.title) |title| alloc.free(title);
+        }
+    };
+
+    /// Resolves an exposed MCP tool name to its server and original tool from
+    /// the published catalog, never by parsing the exposed name. Returns null
+    /// for names that are not published MCP tools. The caller owns the result.
+    pub fn toolIdentity(self: *McpRuntime, alloc: Allocator, name: []const u8) !?ToolIdentity {
+        self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
+        defer self.catalog_mutex.unlockShared(io_mod.getIo());
+        const match = self.lookupCallableTool(name) orelse return null;
+        const server_name = try alloc.dupe(u8, match.server.config.name);
+        errdefer alloc.free(server_name);
+        const tool_name = try alloc.dupe(u8, match.tool.original_name);
+        errdefer alloc.free(tool_name);
+        return .{
+            .server = server_name,
+            .tool = tool_name,
+            .title = try toolDisplayTitle(alloc, match.tool),
+        };
+    }
+
     fn lookupCallableTool(self: *McpRuntime, name: []const u8) ?struct { server: *McpServer, tool: McpTool } {
         for (self.servers.items) |server| {
             if (!server.isPublished() or (server.state.load(.acquire) != .ready and server.state.load(.acquire) != .failed)) continue;
@@ -1765,6 +1905,46 @@ pub const McpRuntime = struct {
             }
         }
         return names.toOwnedSlice(alloc);
+    }
+
+    pub const AlwaysLoadedTools = selected_schema.AlwaysLoadedTools;
+
+    /// Projects every ready tool of servers configured as always loaded,
+    /// sharing one `mcp_selected_schema_bytes` budget in catalog order. Does
+    /// not connect or refresh a server. Tools past the budget stay reachable
+    /// through capability search. The caller owns the result.
+    pub fn snapshotAlwaysLoadedTools(
+        self: *McpRuntime,
+        alloc: Allocator,
+        permission_rules: types.PermissionRuleSet,
+        limits: context_limits.Values,
+        access: tool_mcp_runtime.Access,
+    ) !AlwaysLoadedTools {
+        var loaded: selected_schema.AlwaysLoaded = .init(limits);
+        errdefer loaded.deinit(alloc);
+        if (self.retiring.load(.acquire)) return loaded.finish(alloc);
+        var guard = OperationAccessGuard.init(self.alloc, access, self.generation) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return loaded.finish(alloc),
+        };
+        defer guard.deinit();
+
+        {
+            self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
+            defer self.catalog_mutex.unlockShared(io_mod.getIo());
+            for (self.servers.items) |server| {
+                if (!server.config.always_loaded) continue;
+                if (!server.isPublished() or server.state.load(.acquire) != .ready) continue;
+                if (!tool_catalog.serverCatalogAvailable(server)) continue;
+                if (server.tool_subscription) |subscription| if (subscription.hasInvalidation()) continue;
+                for (server.tool_catalog.tools.items) |tool| {
+                    if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
+                    if (!guard.allows(.{ .tool = tool.prefixed_name })) continue;
+                    try loaded.add(alloc, tool, server.instructions, self.bindingForTool(server, tool), limits);
+                }
+            }
+        }
+        return loaded.finish(alloc);
     }
 
     pub fn snapshotAccessView(
@@ -2078,7 +2258,7 @@ pub const McpRuntime = struct {
             if (self.lookupCallableTool(name) == null) break :result @as(tool_mcp_runtime.ValidationResult, .not_available);
             tools_feature.validateArguments(arena, arguments_json, .{}) catch |err| {
                 break :result @as(tool_mcp_runtime.ValidationResult, .{
-                    .invalid = try std.fmt.allocPrint(arena, "Invalid arguments for MCP tool {s}: {s}", .{ name, @errorName(err) }),
+                    .invalid = try arena.print("Invalid arguments for MCP tool {s}: {s}", .{ name, @errorName(err) }),
                 });
             };
             break :result @as(tool_mcp_runtime.ValidationResult, .{ .valid = self.generation });
@@ -2141,16 +2321,24 @@ pub const McpRuntime = struct {
 
         try tools_feature.validateArguments(arena, arguments_json, .{});
 
-        return try self.toolOperations().callToolFromSnapshot(
+        var observed = if (options.observer) |observer| observer.beginMcp(.{ .call_id = options.call_id, .server = snapshot.server_name, .tool = snapshot.original_name, .transport = @tagName(match.server.config.transport) }) else null;
+        var observed_options = options;
+        observed_options.mcp_observation = if (observed) |*call| call else null;
+        const result = self.toolOperations().callToolFromSnapshot(
             arena,
             match.server,
             &snapshot,
             arguments_json,
             max_tool_result_bytes,
-            options,
+            observed_options,
             0,
             null,
-        );
+        ) catch |err| {
+            if (observed) |call| call.end(if (err == error.Cancelled) .cancelled else .failure, @errorName(err));
+            return err;
+        };
+        if (observed) |call| call.end(result.status.observed(), null);
+        return result;
     }
 
     fn serverForSnapshotLocked(
@@ -2523,6 +2711,36 @@ const renderPromptGetForModel = feature_result.renderPromptGetForModel;
 const renderCompletionForModel = feature_result.renderCompletionForModel;
 
 const currentAuthPartition = server_auth.currentAuthPartition;
+
+test "tool display title prefers the MCP title and falls back to annotations" {
+    const alloc = std.testing.allocator;
+    var title = "Evaluate JavaScript".*;
+    var annotations = "{\"title\":\"Annotated title\"}".*;
+    var control_title = "bad\x1btitle".*;
+    const base: McpTool = .{
+        .original_name = "browser_eval",
+        .prefixed_name = @constCast("mcp_mini_browser_eval"),
+        .description = @constCast(""),
+        .input_schema_json = @constCast("{}"),
+        .tags = &.{},
+    };
+
+    var with_title = base;
+    with_title.title = &title;
+    with_title.annotations_json = &annotations;
+    const primary = (try toolDisplayTitle(alloc, with_title)).?;
+    defer alloc.free(primary);
+    try std.testing.expectEqualStrings("Evaluate JavaScript", primary);
+
+    var annotated = base;
+    annotated.title = &control_title;
+    annotated.annotations_json = &annotations;
+    const fallback = (try toolDisplayTitle(alloc, annotated)).?;
+    defer alloc.free(fallback);
+    try std.testing.expectEqualStrings("Annotated title", fallback);
+
+    try std.testing.expect((try toolDisplayTitle(alloc, base)) == null);
+}
 
 test "operation deadline includes waiting for the connection lease" {
     const io = std.testing.io;
@@ -2923,7 +3141,7 @@ test "per-server recovery serialization observes the operation deadline" {
 }
 
 test "guarded stdio subscription startup releases catalog locks before transport commit" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const child = try std.process.spawn(std.testing.io, .{
         .argv = &.{ "sh", "-c", "while IFS= read -r request; do :; done" },
@@ -3020,7 +3238,7 @@ test "guarded stdio subscription startup releases catalog locks before transport
 }
 
 test "runtime shutdown releases catalog locks before subscription cancellation write" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
@@ -3279,21 +3497,20 @@ fn connectServerCancellable(
     cancel_requested: *std.atomic.Value(bool),
     timeout_override: ?std.Io.Duration,
 ) !void {
-    const deadline = startupDeadline(
-        std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
-        server.config.startup_timeout_ms,
-        timeout_override,
-    );
+    // Fix the span from the same instant as the deadline so later work,
+    // such as loading stored credentials, cannot shave it.
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const control = (connection_control.Control{
+        .deadline = startupDeadline(now, server.config.startup_timeout_ms, timeout_override),
+        .cancel_flag = cancel_requested,
+        .lifecycle_cancel_flag = server.cancellation(),
+    }).withStartupSpan(now, server.config.startup_timeout_ms);
     return server_transport.start(
         runtime.alloc,
         runtime.tool_registry,
         server,
         used_tool_names,
-        .{
-            .deadline = deadline,
-            .cancel_flag = cancel_requested,
-            .lifecycle_cancel_flag = server.cancellation(),
-        },
+        control,
     ) catch |err| switch (err) {
         error.McpRequestTimedOut => error.McpConnectionTimedOut,
         else => err,
@@ -3842,7 +4059,7 @@ test "legacy URL completions require an established unique candidate before repl
     var id_buffer: [64]u8 = undefined;
     var candidate_index: usize = runtime.completions.legacy_url_completion_candidates.items.len;
     while (candidate_index < max_legacy_url_completion_candidates) : (candidate_index += 1) {
-        const id = try std.fmt.bufPrint(&id_buffer, "candidate-{d}", .{candidate_index});
+        const id = try std.mem.print(&id_buffer, "candidate-{d}", .{candidate_index});
         const candidate_ids = [_][]const u8{id};
         try runtime.registerLegacyUrlCompletionCandidates(
             source,
@@ -3853,7 +4070,7 @@ test "legacy URL completions require an established unique candidate before repl
     }
     var unknown_index: usize = 0;
     while (unknown_index <= max_early_legacy_url_completions_per_window) : (unknown_index += 1) {
-        const id = try std.fmt.bufPrint(&id_buffer, "unknown-{d}", .{unknown_index});
+        const id = try std.mem.print(&id_buffer, "unknown-{d}", .{unknown_index});
         var frame = std.Io.Writer.Allocating.init(alloc);
         defer frame.deinit();
         try frame.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":");
@@ -3915,7 +4132,7 @@ test "legacy URL provisional completions cannot cross concurrent operation windo
     var provisional_buffer: [64]u8 = undefined;
     var provisional_index: usize = 1;
     while (provisional_index < max_early_legacy_url_completions_per_window) : (provisional_index += 1) {
-        const id = try std.fmt.bufPrint(&provisional_buffer, "first-window-{d}", .{provisional_index});
+        const id = try std.mem.print(&provisional_buffer, "first-window-{d}", .{provisional_index});
         var frame = std.Io.Writer.Allocating.init(alloc);
         defer frame.deinit();
         try frame.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":");
@@ -4713,7 +4930,7 @@ test "direct legacy terminal retains only completed tool outcomes" {
 }
 
 test "legacy URL waiter publication is allocator-safe and retirement wakes it" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var failed_runtime = McpRuntime.init(failing.allocator());
     defer failed_runtime.deinit();
     const ids = [_][]const u8{"one"};
@@ -4752,7 +4969,7 @@ test "legacy URL waiter publication is allocator-safe and retirement wakes it" {
 }
 
 test "runtime retirement cancels a committed stdio tool call before waiting for its lease" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const shell_server =
@@ -5226,8 +5443,7 @@ test "legacy initialize advertises elicitation only for negotiated supported mod
 
 test "modern request builders share required request metadata" {
     const alloc = std.testing.allocator;
-    const metadata = try std.fmt.allocPrint(
-        alloc,
+    const metadata = try alloc.print(
         "\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"{s}\",\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"fx\",\"version\":\"{s}\"}},\"io.modelcontextprotocol/clientCapabilities\":{{}}}}",
         .{ modern_protocol_version, build_options.app_version },
     );
@@ -5235,8 +5451,7 @@ test "modern request builders share required request metadata" {
 
     const discover = try buildDiscoverRequest(alloc, 0);
     defer alloc.free(discover);
-    const expected_discover = try std.fmt.allocPrint(
-        alloc,
+    const expected_discover = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\",\"params\":{{{s}}}}}",
         .{metadata},
     );
@@ -5245,8 +5460,7 @@ test "modern request builders share required request metadata" {
 
     const list = try buildToolsListRequest(alloc, 1, .modern, null);
     defer alloc.free(list);
-    const expected_list = try std.fmt.allocPrint(
-        alloc,
+    const expected_list = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{{s}}}}}",
         .{metadata},
     );
@@ -5255,8 +5469,7 @@ test "modern request builders share required request metadata" {
 
     const call = try buildToolCallRequestForProtocol(alloc, 2, "echo", "{\"text\":\"hi\"}", .modern, null, null, .{});
     defer alloc.free(call);
-    const expected_call = try std.fmt.allocPrint(
-        alloc,
+    const expected_call = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{{s},\"name\":\"echo\",\"arguments\":{{\"text\":\"hi\"}}}}}}",
         .{metadata},
     );
@@ -5413,11 +5626,11 @@ fn expectResourceText(result: ResourceReadResult, expected: []const u8) !void {
 
 fn expectTestProcessExited(pid: std.posix.pid_t) !void {
     for (0..200) |_| {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
             else => {},
         };
-        if (builtin.os.tag == .linux and testProcessIsZombie(pid)) return;
+        if (builtin.target.os.tag == .linux and testProcessIsZombie(pid)) return;
         io_mod.sleep(10 * std.time.ns_per_ms);
     }
     return error.TestProcessStillRunning;
@@ -5425,7 +5638,7 @@ fn expectTestProcessExited(pid: std.posix.pid_t) !void {
 
 fn testProcessIsZombie(pid: std.posix.pid_t) bool {
     var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/status", .{pid}) catch return false;
+    const path = std.mem.print(&path_buf, "/proc/{d}/status", .{pid}) catch return false;
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return false;
     defer file.close(io_mod.getIo());
 
@@ -5479,6 +5692,35 @@ test "server_transport.connectServer completes NDJSON handshake against a real s
 
     server.disconnect();
     try expectTestProcessExited(grandchild_pid);
+}
+
+test "server_transport.connectServer keeps the restart when discovery stalled before the legacy launch exited" {
+    const alloc = std.testing.allocator;
+    // Ignores the modern discovery probe, then exits on the legacy initialize.
+    const shell_server =
+        \\IFS= read -r line
+        \\case "$line" in
+        \\  *'"method":"server/discover"'*) exec sleep 30 ;;
+        \\esac
+        \\printf 'npm error code E401\n' >&2
+        \\exit 3
+    ;
+    var config = try shellMcpConfigForTest(alloc, "stalled", shell_server);
+    config.startup_timeout_ms = 400;
+    var server = McpServer{ .config = config };
+    defer server.deinit(alloc);
+    var used = tool_names.Registry.init(alloc);
+    defer used.deinit();
+
+    // Not every launch ended on its own, so this is not the no-restart error.
+    try std.testing.expectError(
+        error.McpInitFailed,
+        server_transport.connectServer(alloc, &server, .{}, &used, .{}),
+    );
+    try std.testing.expectEqualStrings(
+        "MCP server exited with code 3 before completing startup: npm error code E401",
+        server.last_error.?,
+    );
 }
 
 test "server_transport.connectServer discovers and calls a modern NDJSON tool" {
@@ -5911,7 +6153,7 @@ test "resource read cache publication OOM releases fetched contents" {
         .name = @constCast("owned"),
     }};
     var server = resourceReadPublicationServerForTest(&descriptors);
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var runtime = McpRuntime.init(failing.allocator());
     defer runtime.deinit();
     const snapshot = resourceReadPublicationSnapshotForTest(&server);
@@ -5984,7 +6226,7 @@ test "resource read publication cancellation and deadline release fetched conten
 
 test "cached resource read finalization releases every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkResourceReadFinishAllocationFailures,
         .{true},
     );
@@ -5992,7 +6234,7 @@ test "cached resource read finalization releases every allocation failure" {
 
 test "uncached resource read finalization releases every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkResourceReadFinishAllocationFailures,
         .{false},
     );
@@ -6023,8 +6265,8 @@ fn checkResourceSnapshotWithTemplatesAllocationFailures(alloc: Allocator) !void 
 }
 
 test "resource template matching bounds catalog work and releases the catalog lock" {
-    const malicious_template = "memory://{value}" ++ ("a" ** 2047) ++ "b";
-    const requested_uri = "memory://" ++ ("a" ** 4096);
+    const malicious_template = "memory://{value}" ++ text_utils.repeat("a", 2047) ++ "b";
+    const requested_uri = "memory://" ++ text_utils.repeat("a", 4096);
     var templates = [_]resources_feature.Template{.{
         .uri_template = @constCast(malicious_template),
         .name = @constCast("bounded"),
@@ -6097,7 +6339,7 @@ test "resource template matching propagates operation control and releases the c
 
 test "resource template snapshot allocation failures propagate and clean up" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkResourceSnapshotWithTemplatesAllocationFailures,
         .{},
     );
@@ -6512,6 +6754,8 @@ test "caller cancellation interrupts blocked candidate connection" {
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
     try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[0].state.load(.acquire));
     try std.testing.expect(runtime.servers.items[0].last_error == null);
+    // Cancellation is not a startup failure and never spends a restart.
+    try std.testing.expectEqual(@as(u8, 0), runtime.servers.items[0].restart_attempts);
 }
 
 test "MCP health terminal-encodes external identity and omits secret-bearing configuration" {
@@ -6538,7 +6782,7 @@ test "MCP health terminal-encodes external identity and omits secret-bearing con
 
 test "MCP health snapshot cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkHealthSnapshotAllocationFailures,
         .{},
     );
@@ -6646,7 +6890,7 @@ fn checkModelCatalogSnapshotAllocationFailures(alloc: Allocator) !void {
 
 test "model catalog snapshot cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkModelCatalogSnapshotAllocationFailures,
         .{},
     );
@@ -6894,7 +7138,11 @@ test "McpRuntime continues discovery after one server times out" {
 
     try std.testing.expect(!runtime.isDiscovering());
     try std.testing.expectEqual(ServerState.failed, runtime.servers.items[0].state.load(.acquire));
-    try std.testing.expectEqualStrings("McpConnectionTimedOut", runtime.servers.items[0].last_error.?);
+    // The private override, not startup_timeout_ms, set this limit.
+    try std.testing.expectEqualStrings(
+        "MCP server did not complete startup within 2000 ms",
+        runtime.servers.items[0].last_error.?,
+    );
     try std.testing.expectEqual(ServerState.ready, runtime.servers.items[1].state.load(.acquire));
     try std.testing.expect(runtime.hasTool("mcp_ready_echo"));
 }
@@ -6924,16 +7172,16 @@ test "tool name allocation sanitizes truncates and deconflicts" {
     defer alloc.free(space_collision);
     try std.testing.expectEqualStrings("mcp_a_b_c_2", space_collision);
 
-    const long_server = [_]u8{'s'} ** 70;
+    const long_server: [70]u8 = @splat('s');
     const long_first = try used.name(alloc, .{}, long_server[0..], "tool");
     defer alloc.free(long_first);
     try std.testing.expectEqual(@as(usize, 64), long_first.len);
-    try std.testing.expectEqualStrings("mcp_" ++ ("s" ** 60), long_first);
+    try std.testing.expectEqualStrings("mcp_" ++ text_utils.repeat("s", 60), long_first);
 
     const long_second = try used.name(alloc, .{}, long_server[0..], "other");
     defer alloc.free(long_second);
     try std.testing.expectEqual(@as(usize, 64), long_second.len);
-    try std.testing.expectEqualStrings("mcp_" ++ ("s" ** 58) ++ "_2", long_second);
+    try std.testing.expectEqualStrings("mcp_" ++ text_utils.repeat("s", 58) ++ "_2", long_second);
 }
 
 test "MCP tool name allocation reserves registered tool names" {
@@ -6961,7 +7209,7 @@ test "MCP tool name allocation leaves non-conflicting dynamic names unchanged" {
 }
 
 test "tool name allocation collision path cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocateToolNameCollisionAllocFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAllocateToolNameCollisionAllocFailures, .{});
 }
 
 fn checkToolSnapshotBuildAllocationFailures(alloc: Allocator) !void {
@@ -7001,7 +7249,7 @@ fn checkCursorReplacementAllocationFailures(alloc: Allocator) !void {
 
 test "cursor replacement preserves the previous owner on allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCursorReplacementAllocationFailures,
         .{},
     );
@@ -7028,7 +7276,7 @@ fn checkServerDiagnosticSnapshotAllocationFailures(alloc: Allocator) !void {
 
 test "server diagnostic snapshots release every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkServerDiagnosticSnapshotAllocationFailures,
         .{},
     );
@@ -7036,7 +7284,7 @@ test "server diagnostic snapshots release every allocation failure" {
 
 test "whole tool snapshot construction releases every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkToolSnapshotBuildAllocationFailures,
         .{},
     );
@@ -7178,10 +7426,10 @@ test "MCP search bounds untrusted description and schema fields" {
         &used,
     );
 
-    const description = "zearly123 " ++ ("x" ** mcp_tool_description_search_bytes) ++ " zlate987";
+    const description = "zearly123 " ++ text_utils.repeat("x", mcp_tool_description_search_bytes) ++ " zlate987";
     const schema =
         "{\"type\":\"object\",\"properties\":{\"zearly456\":{\"type\":\"string\"},\"padding\":{\"description\":\"" ++
-        ("x" ** mcp_tool_schema_search_bytes) ++
+        text_utils.repeat("x", mcp_tool_schema_search_bytes) ++
         "zlate654\"}}}";
     const tool = &runtime.servers.items[0].tool_catalog.tools.items[0];
     alloc.free(tool.description);
@@ -7209,7 +7457,7 @@ test "MCP search bounds untrusted description and schema fields" {
 }
 
 test "MCP search releases request-scoped ranking allocations" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = McpRuntime.init(alloc);
     defer runtime.deinit();
 
@@ -7823,7 +8071,7 @@ test "MCP access snapshot admits feature-only servers independently of tools" {
 
 test "MCP access snapshot releases every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAccessSnapshotAllocationFailures,
         .{},
     );
@@ -8004,6 +8252,13 @@ test "scoped MCP authentication rendering excludes denied servers" {
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "denied") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "DENIED_SECRET_ENV") != null);
+
+    // A scoped caller cannot learn why a denied server is down either.
+    runtime.servers.items[1].setFailed(alloc, "MCP server exited with code 1 before completing startup");
+    try std.testing.expect(try renderServerFailure(alloc, runtime.servers.items, &scoped, "denied") == null);
+    const failure = (try renderServerFailure(alloc, runtime.servers.items, &root, "denied")).?;
+    defer alloc.free(failure);
+    try std.testing.expect(std.mem.find(u8, failure, "exited with code 1 before completing startup") != null);
 }
 
 test "MCP server instructions are captured from initialize and exposed only when present" {
@@ -8061,7 +8316,7 @@ test "MCP exact selection returns one executable schema by prefixed name" {
 
     try runtime.addServer(.{ .name = try alloc.dupe(u8, "fs"), .command = try alloc.dupe(u8, "cmd") });
     runtime.servers.items[0].state.store(.ready, .release);
-    runtime.servers.items[0].instructions = try alloc.dupe(u8, ("i" ** 1500) ++ "instruction tail");
+    runtime.servers.items[0].instructions = try alloc.dupe(u8, text_utils.repeat("i", 1500) ++ "instruction tail");
 
     var used = tool_names.Registry.init(alloc);
     defer used.deinit();
@@ -8455,11 +8710,12 @@ fn checkConfigurationReloadAllocationFailures(alloc: Allocator) !void {
 }
 
 test "configuration reload cleans up every allocation failure without opening a transport" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkConfigurationReloadAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkConfigurationReloadAllocationFailures, .{});
 }
 
 const boundedEncodedScalar = tool_search.boundedEncodedScalar;
 const renderAuthenticationRequired = tool_search.renderAuthenticationRequired;
+const renderServerFailure = tool_search.renderServerFailure;
 
 const digestResources = feature_catalog_runtime.digestResources;
 

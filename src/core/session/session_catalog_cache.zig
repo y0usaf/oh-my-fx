@@ -1,50 +1,49 @@
+//! The session index: the single derived owner of "which saved sessions exist
+//! and how they summarize". Every listing surface (the resume picker,
+//! `fx sessions`, `fx session last`, ACP listing, and latest-session resume)
+//! reads it through `listActionableCatalog`, so no listing surface scans
+//! session directories on its own.
+//!
+//! Rows are bound to stat fingerprints of each session's classification
+//! inputs. A matching fingerprint reuses the row without opening the session;
+//! a mismatch reclassifies that one directory through canonical discovery.
+//! The file is disposable: a missing, corrupt, or older-version index is
+//! rebuilt from the session directories, which remain the only authority.
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const child_state = @import("../subagent/child_state.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
+const session_discovery = @import("session_discovery.zig");
 const session_layout = @import("session_layout.zig");
 const session_store = @import("session_store.zig");
 const summary_codec = @import("session_summary_codec.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-// Disposable v4 proofs bind replay and the legacy route gates to one stat window.
-const magic = "fx-resume-catalog-v4\n";
+// v6 stores the disposable row payload in a bounded binary encoding. Every
+// older format remains a cache miss and is rebuilt from canonical sessions.
+const magic = "fx-resume-catalog-v6\n";
 const file_name = ".resume-catalog";
-pub const max_bytes = 64 * 1024 * 1024;
-pub const max_records = 100_000;
+const max_bytes = 64 * 1024 * 1024;
+const max_records = 100_000;
 const Fingerprint = [Sha256.digest_length]u8;
-const Generation = @import("session_event.zig").Identifier;
 
-pub const Entry = struct {
+const Entry = struct {
     fingerprint: ?Fingerprint,
-    value: union(enum) { visible: session_store.SessionSummary, excluded: []u8, legacy_ranking: LegacyRanking },
-
-    /// Caller owns both strings; this is ranking evidence, never picker visibility.
-    pub const LegacyRanking = struct {
-        id: []u8,
-        workspace_root: []u8,
-        updated_at_ms: i64,
-        generation: Generation,
-
-        pub fn clone(alloc: Allocator, id_value: []const u8, workspace_root: []const u8, updated_at_ms: i64, generation: Generation) !LegacyRanking {
-            const owned_id = try alloc.dupe(u8, id_value);
-            errdefer alloc.free(owned_id);
-            return .{ .id = owned_id, .workspace_root = try alloc.dupe(u8, workspace_root), .updated_at_ms = updated_at_ms, .generation = generation };
-        }
-
-        fn deinit(self: *LegacyRanking, alloc: Allocator) void {
-            alloc.free(self.id);
-            alloc.free(self.workspace_root);
-        }
-    };
+    value: union(enum) { visible: session_store.SessionSummary, excluded: []u8 },
+    /// A stale schema-v3 projection whose committed log failed to replay in
+    /// this listing: listed from its manifest. The failure may be transient,
+    /// so the row is never cached and every listing checks it again.
+    unreplayable: bool = false,
 
     fn id(self: Entry) []const u8 {
         return switch (self.value) {
             .visible => |summary| summary.id,
             .excluded => |name| name,
-            .legacy_ranking => |ranking| ranking.id,
         };
     }
 
@@ -52,7 +51,6 @@ pub const Entry = struct {
         switch (self.value) {
             .visible => |*summary| summary.deinit(alloc),
             .excluded => |name| alloc.free(name),
-            .legacy_ranking => |*ranking| ranking.deinit(alloc),
         }
         self.* = undefined;
     }
@@ -87,6 +85,28 @@ const Summary = struct {
         };
     }
 
+    /// The row contract `load` enforces. Discovery can report a summary
+    /// outside it, such as a legacy session whose clock stepped back, and one
+    /// such row would make `load` reject the whole file, so the catalog lists
+    /// that session without caching it.
+    fn persistable(self: Summary) bool {
+        if (self.created_at_ms < 0 or self.updated_at_ms < self.created_at_ms) return false;
+        if (!std.unicode.utf8ValidateSlice(self.language)) return false;
+        _ = session.ConversationLanguage.fromSlice(self.language) catch return false;
+        if (std.math.cast(usize, self.history_len) == null) return false;
+        for ([_]?[]const u8{ self.workspace_root, self.origin_workspace_root, self.title, self.preview }) |optional| {
+            if (optional) |value| if (!std.unicode.utf8ValidateSlice(value)) return false;
+        }
+        if (self.title) |title| {
+            if (title.len > session_codec.max_session_title_bytes) return false;
+        }
+        for ([_]?[]const u8{ self.workspace_root, self.origin_workspace_root }) |root| {
+            const path = root orelse continue;
+            if (!std.Io.Dir.path.isAbsolute(path) or path.len > std.Io.Dir.max_path_bytes) return false;
+        }
+        return true;
+    }
+
     fn clone(self: Summary, alloc: Allocator, id: []const u8) !session_store.SessionSummary {
         return summary_codec.cloneSessionSummary(alloc, .{
             .id = @constCast(id),
@@ -107,40 +127,34 @@ const Summary = struct {
 
 const Row = struct {
     id: []const u8,
-    fingerprint: []const u8,
+    fingerprint: Fingerprint,
     value: union(enum) {
         visible: Summary,
         excluded: void,
-        legacy_ranking: struct { workspace_root: []const u8, updated_at_ms: i64, generation: Generation },
     },
 };
 
 /// Owns parsed cache bytes. Reused entries are separately owned by the caller.
 pub const Loaded = struct {
     bytes: ?[]u8 = null,
-    parsed: ?std.json.Parsed([]Row) = null,
+    parsed: ?[]Row = null,
     index: std.StringHashMapUnmanaged(usize) = .empty,
-    picker_count: usize = 0,
 
     pub fn deinit(self: *Loaded, alloc: Allocator) void {
         self.index.deinit(alloc);
-        if (self.parsed) |*parsed| parsed.deinit();
+        if (self.parsed) |rows| alloc.free(rows);
         if (self.bytes) |bytes| alloc.free(bytes);
         self.* = .{};
     }
 
-    pub fn count(self: *const Loaded) usize {
-        return self.picker_count;
+    fn count(self: *const Loaded) usize {
+        return self.index.count();
     }
-    pub fn rankingCount(self: *const Loaded) usize {
-        return self.index.count() - self.picker_count;
-    }
-    pub fn present(self: *const Loaded) bool {
+    fn present(self: *const Loaded) bool {
         return self.parsed != null;
     }
     pub fn contains(self: *const Loaded, id: []const u8) bool {
-        const position = self.index.get(id) orelse return false;
-        return self.parsed.?.value[position].value != .legacy_ranking;
+        return self.index.contains(id);
     }
 
     pub fn load(alloc: Allocator, dir: ?io_mod.VerifiedDir, cancelled: ?*const std.atomic.Value(bool)) !Loaded {
@@ -156,7 +170,9 @@ pub const Loaded = struct {
     }
 
     fn loadChecked(alloc: Allocator, dir: std.Io.Dir, cancelled: ?*const std.atomic.Value(bool)) !Loaded {
-        var file = try dir.openFile(io_mod.getIo(), file_name, .{ .follow_symlinks = false, .allow_directory = false, .resolve_beneath = true });
+        // Opening a FIFO or device for reading can block, so the helper checks
+        // the entry and opens it without blocking before any read.
+        var file = try io_mod.openExistingRegularFile(dir, file_name, .read_only);
         defer file.close(io_mod.getIo());
         const stat = try file.stat(io_mod.getIo());
         if (stat.kind != .file or stat.nlink > 1 or (stat.permissions.toMode() & 0o077) != 0 or stat.size > max_bytes) return error.InvalidCatalogCache;
@@ -170,56 +186,29 @@ pub const Loaded = struct {
             if (read != end - offset) return error.InvalidCatalogCache;
             offset = end;
         }
-        if (bytes.len < magic.len + Sha256.digest_length or !std.mem.startsWith(u8, bytes, magic)) return error.InvalidCatalogCache;
+        if (bytes.len < magic.len + Sha256.digest_length + @sizeOf(u32) or !std.mem.startsWith(u8, bytes, magic)) return error.InvalidCatalogCache;
         const payload = bytes[magic.len + Sha256.digest_length ..];
         var digest: Fingerprint = undefined;
         Sha256.hash(payload, &digest, .{});
         if (!std.mem.eql(u8, &digest, bytes[magic.len..][0..Sha256.digest_length])) return error.InvalidCatalogCache;
-        const parsed = try std.json.parseFromSlice([]Row, alloc, payload, .{ .allocate = .alloc_if_needed, .ignore_unknown_fields = false, .max_value_len = max_bytes });
-        errdefer parsed.deinit();
-        if (parsed.value.len > max_records) return error.InvalidCatalogCache;
+        const rows = try decodeRows(alloc, payload, cancelled);
+        errdefer alloc.free(rows);
         var index: std.StringHashMapUnmanaged(usize) = .empty;
         errdefer index.deinit(alloc);
-        try index.ensureTotalCapacity(alloc, @intCast(parsed.value.len));
-        var picker_count: usize = 0;
-        for (parsed.value, 0..) |row, i| {
+        try index.ensureTotalCapacity(alloc, @intCast(rows.len));
+        for (rows, 0..) |row, i| {
             if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
-            try session_layout.validateSessionId(row.id);
-            if (row.fingerprint.len != 64) return error.InvalidCatalogCache;
-            var fingerprint_bytes: Fingerprint = undefined;
-            _ = std.fmt.hexToBytes(&fingerprint_bytes, row.fingerprint) catch return error.InvalidCatalogCache;
-            if (row.value != .legacy_ranking) picker_count += 1;
-            if (row.value == .legacy_ranking) {
-                const ranking = row.value.legacy_ranking;
-                try @import("session_store_paths.zig").validateWorkspaceRoot(ranking.workspace_root);
-                if (ranking.updated_at_ms < 0) return error.InvalidCatalogCache;
-            }
-            if (row.value == .visible) {
-                const summary = row.value.visible;
-                if (summary.created_at_ms < 0 or summary.updated_at_ms < summary.created_at_ms) return error.InvalidCatalogCache;
-                if (summary.history_len == 0 and !summary.has_checkpoint) return error.InvalidCatalogCache;
-                _ = try session.ConversationLanguage.fromSlice(summary.language);
-                _ = std.math.cast(usize, summary.history_len) orelse return error.InvalidCatalogCache;
-                if (summary.title) |title| {
-                    if (title.len > session_codec.max_session_title_bytes or !std.unicode.utf8ValidateSlice(title)) return error.InvalidCatalogCache;
-                }
-                for ([_]?[]const u8{ summary.workspace_root, summary.origin_workspace_root }) |root| {
-                    if (root) |path| {
-                        if (!std.fs.path.isAbsolute(path) or path.len > std.Io.Dir.max_path_bytes) return error.InvalidCatalogCache;
-                    }
-                }
-            }
             const entry = index.getOrPutAssumeCapacity(row.id);
             if (entry.found_existing) return error.InvalidCatalogCache;
             entry.value_ptr.* = i;
         }
-        return .{ .bytes = bytes, .parsed = parsed, .index = index, .picker_count = picker_count };
+        return .{ .bytes = bytes, .parsed = rows, .index = index };
     }
 
-    pub fn reuse(self: *const Loaded, alloc: Allocator, id: []const u8, fingerprint_value: Fingerprint) !?Entry {
+    fn reuse(self: *const Loaded, alloc: Allocator, id: []const u8, fingerprint_value: Fingerprint) !?Entry {
         const position = self.index.get(id) orelse return null;
-        const row = self.parsed.?.value[position];
-        if (row.value == .legacy_ranking or !matches(row, fingerprint_value)) return null;
+        const row = self.parsed.?[position];
+        if (!matches(row, fingerprint_value)) return null;
         return try cloneRow(alloc, row, fingerprint_value);
     }
 
@@ -233,11 +222,11 @@ pub const Loaded = struct {
             for (summaries.items) |*summary| summary.deinit(alloc);
             summaries.deinit(alloc);
         }
-        const parsed = self.parsed orelse return summaries;
-        for (parsed.value) |row| {
+        const rows = self.parsed orelse return summaries;
+        for (rows) |row| {
             const summary = switch (row.value) {
                 .visible => |*value| value,
-                .excluded, .legacy_ranking => continue,
+                .excluded => continue,
             };
             if (active_id) |active| if (std.mem.eql(u8, active, row.id)) continue;
             var cloned = try summary.clone(alloc, row.id);
@@ -247,33 +236,14 @@ pub const Loaded = struct {
         return summaries;
     }
 
-    /// Generation from a successful replay observation, not a caller-selected source.
-    pub fn rankingGeneration(self: *const Loaded, id: []const u8) ?Generation {
-        const position = self.index.get(id) orelse return null;
-        return switch (self.parsed.?.value[position].value) {
-            .legacy_ranking => |ranking| ranking.generation,
-            .visible, .excluded => null,
-        };
-    }
-
-    /// Returns an independently owned ranking observation, never a picker row.
-    pub fn reuseRanking(self: *const Loaded, alloc: Allocator, id: []const u8, fingerprint_value: Fingerprint) !?Entry {
-        const position = self.index.get(id) orelse return null;
-        const row = self.parsed.?.value[position];
-        if (row.value != .legacy_ranking or !matches(row, fingerprint_value)) return null;
-        return try cloneRow(alloc, row, fingerprint_value);
-    }
-
     fn matches(row: Row, value: Fingerprint) bool {
-        const hex = std.fmt.bytesToHex(value, .lower);
-        return std.mem.eql(u8, row.fingerprint, &hex);
+        return std.mem.eql(u8, &row.fingerprint, &value);
     }
 
     fn cloneRow(alloc: Allocator, row: Row, value: Fingerprint) !Entry {
         return .{ .fingerprint = value, .value = switch (row.value) {
             .visible => |summary| .{ .visible = try summary.clone(alloc, row.id) },
             .excluded => .{ .excluded = try alloc.dupe(u8, row.id) },
-            .legacy_ranking => |ranking| .{ .legacy_ranking = try Entry.LegacyRanking.clone(alloc, row.id, ranking.workspace_root, ranking.updated_at_ms, ranking.generation) },
         } };
     }
 };
@@ -291,18 +261,9 @@ pub const Writer = struct {
         self.dir.close();
     }
 
-    pub fn save(self: *Writer, alloc: Allocator, entries: []const Entry, cancelled: *const std.atomic.Value(bool)) !void {
-        return self.saveKind(alloc, entries, .picker, cancelled);
-    }
-
-    /// Replaces complete-scan ranking observations, preserving valid picker rows.
-    pub fn saveRanking(self: *Writer, alloc: Allocator, entries: []const Entry, cancelled: *const std.atomic.Value(bool)) !void {
-        return self.saveKind(alloc, entries, .ranking, cancelled);
-    }
-
-    const Purpose = enum { picker, ranking };
-
-    fn saveKind(self: *Writer, alloc: Allocator, entries: []const Entry, purpose: Purpose, cancelled: *const std.atomic.Value(bool)) !void {
+    /// Publishes every fingerprinted entry, then keeps any earlier row this
+    /// scan did not observe only while its session still matches that row.
+    fn save(self: *Writer, alloc: Allocator, entries: []const Entry, cancelled: *const std.atomic.Value(bool)) !void {
         if (cancelled.load(.acquire)) return error.Cancelled;
         if (entries.len > max_records) return error.CatalogCacheTooLarge;
         var previous = try Loaded.load(alloc, self.dir, cancelled);
@@ -311,31 +272,24 @@ pub const Writer = struct {
         defer replaced.deinit(alloc);
         var payload: std.Io.Writer.Allocating = .init(alloc);
         defer payload.deinit();
-        payload.writer.writeByte('[') catch return error.OutOfMemory;
+        writeInt(&payload.writer, u32, 0) catch return error.OutOfMemory;
         var written: usize = 0;
         for (entries) |*entry| {
             if (cancelled.load(.acquire)) return error.Cancelled;
             const value = entry.fingerprint orelse continue;
-            if ((entry.value == .legacy_ranking) != (purpose == .ranking)) return error.InvalidCatalogCache;
             try replaced.put(alloc, entry.id(), {});
-            const hex = std.fmt.bytesToHex(value, .lower);
-            try writeRow(&payload, &written, .{ .id = entry.id(), .fingerprint = &hex, .value = switch (entry.value) {
+            try writeRow(&payload, &written, .{ .id = entry.id(), .fingerprint = value, .value = switch (entry.value) {
                 .visible => |*summary| .{ .visible = Summary.from(summary) },
                 .excluded => .excluded,
-                .legacy_ranking => |ranking| .{ .legacy_ranking = .{ .workspace_root = ranking.workspace_root, .updated_at_ms = ranking.updated_at_ms, .generation = ranking.generation } },
             } });
         }
-        if (previous.parsed) |parsed| for (parsed.value) |row| {
+        if (previous.parsed) |rows| for (rows) |row| {
             if (cancelled.load(.acquire)) return error.Cancelled;
-            if ((row.value == .legacy_ranking) == (purpose == .ranking) or replaced.contains(row.id)) continue;
-            // Legacy picker observations have no fingerprint and must not erase ranking rows.
-            const current = (if (row.value == .legacy_ranking)
-                rankingFingerprint(self.dir.dir, row.id, row.value.legacy_ranking.generation)
-            else
-                fingerprint(self.dir.dir, row.id)) catch null;
+            if (replaced.contains(row.id)) continue;
+            const current = fingerprint(self.dir.dir, row.id) catch null;
             if (current) |stamp| if (Loaded.matches(row, stamp)) try writeRow(&payload, &written, row);
         };
-        payload.writer.writeByte(']') catch return error.OutOfMemory;
+        std.mem.writeInt(u32, payload.written()[0..@sizeOf(u32)], @intCast(written), .little);
         if (cancelled.load(.acquire)) return error.Cancelled;
         var digest: Fingerprint = undefined;
         Sha256.hash(payload.written(), &digest, .{});
@@ -350,11 +304,131 @@ pub const Writer = struct {
 
 fn writeRow(payload: *std.Io.Writer.Allocating, written: *usize, row: Row) !void {
     if (written.* == max_records) return error.CatalogCacheTooLarge;
-    if (written.* != 0) payload.writer.writeByte(',') catch return error.OutOfMemory;
-    // This writer is memory-only: WriteFailed means allocation exhaustion.
-    std.json.Stringify.value(row, .{}, &payload.writer) catch return error.OutOfMemory;
+    writeString(&payload.writer, row.id) catch return error.OutOfMemory;
+    payload.writer.writeAll(&row.fingerprint) catch return error.OutOfMemory;
+    switch (row.value) {
+        .excluded => payload.writer.writeByte(0) catch return error.OutOfMemory,
+        .visible => |summary| {
+            payload.writer.writeByte(1) catch return error.OutOfMemory;
+            var flags: u8 = 0;
+            if (summary.display_metadata_present) flags |= 1 << 0;
+            if (summary.has_checkpoint) flags |= 1 << 1;
+            if (summary.has_managed_children) flags |= 1 << 2;
+            payload.writer.writeByte(flags) catch return error.OutOfMemory;
+            writeInt(&payload.writer, i64, summary.created_at_ms) catch return error.OutOfMemory;
+            writeInt(&payload.writer, i64, summary.updated_at_ms) catch return error.OutOfMemory;
+            writeInt(&payload.writer, u64, summary.history_len) catch return error.OutOfMemory;
+            writeOptionalString(&payload.writer, summary.workspace_root) catch return error.OutOfMemory;
+            writeOptionalString(&payload.writer, summary.origin_workspace_root) catch return error.OutOfMemory;
+            writeOptionalString(&payload.writer, summary.title) catch return error.OutOfMemory;
+            writeOptionalString(&payload.writer, summary.preview) catch return error.OutOfMemory;
+            writeString(&payload.writer, summary.language) catch return error.OutOfMemory;
+        },
+    }
     written.* += 1;
-    if (payload.written().len > max_bytes - magic.len - Sha256.digest_length - 1) return error.CatalogCacheTooLarge;
+    if (payload.written().len > max_bytes - magic.len - Sha256.digest_length) return error.CatalogCacheTooLarge;
+}
+
+fn decodeRows(
+    alloc: Allocator,
+    payload: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) ![]Row {
+    var cursor = ByteCursor{ .bytes = payload };
+    const count = try cursor.readInt(u32);
+    if (count > max_records) return error.InvalidCatalogCache;
+    const rows = try alloc.alloc(Row, count);
+    errdefer alloc.free(rows);
+    for (rows) |*row| {
+        if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
+        const id = try cursor.readString();
+        session_layout.validateSessionId(id) catch return error.InvalidCatalogCache;
+        const raw_fingerprint = try cursor.take(@sizeOf(Fingerprint));
+        const fingerprint_value: Fingerprint = raw_fingerprint[0..@sizeOf(Fingerprint)].*;
+        const value: @FieldType(Row, "value") = switch (try cursor.readByte()) {
+            0 => .excluded,
+            1 => visible: {
+                const flags = try cursor.readByte();
+                if (flags & ~@as(u8, 0b111) != 0) return error.InvalidCatalogCache;
+                const summary = Summary{
+                    .display_metadata_present = flags & (1 << 0) != 0,
+                    .has_checkpoint = flags & (1 << 1) != 0,
+                    .has_managed_children = flags & (1 << 2) != 0,
+                    .created_at_ms = try cursor.readInt(i64),
+                    .updated_at_ms = try cursor.readInt(i64),
+                    .history_len = try cursor.readInt(u64),
+                    .workspace_root = try cursor.readOptionalString(),
+                    .origin_workspace_root = try cursor.readOptionalString(),
+                    .title = try cursor.readOptionalString(),
+                    .preview = try cursor.readOptionalString(),
+                    .language = try cursor.readString(),
+                };
+                if (!summary.persistable()) return error.InvalidCatalogCache;
+                break :visible .{ .visible = summary };
+            },
+            else => return error.InvalidCatalogCache,
+        };
+        row.* = .{ .id = id, .fingerprint = fingerprint_value, .value = value };
+    }
+    if (!cursor.done()) return error.InvalidCatalogCache;
+    return rows;
+}
+
+const ByteCursor = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+
+    fn take(self: *ByteCursor, len: usize) ![]const u8 {
+        const end = std.math.add(usize, self.offset, len) catch
+            return error.InvalidCatalogCache;
+        if (end > self.bytes.len) return error.InvalidCatalogCache;
+        const result = self.bytes[self.offset..end];
+        self.offset = end;
+        return result;
+    }
+
+    fn readByte(self: *ByteCursor) !u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn readInt(self: *ByteCursor, comptime T: type) !T {
+        const raw = try self.take(@sizeOf(T));
+        return std.mem.readInt(T, raw[0..@sizeOf(T)], .little);
+    }
+
+    fn readString(self: *ByteCursor) ![]const u8 {
+        return self.take(try self.readInt(u32));
+    }
+
+    fn readOptionalString(self: *ByteCursor) !?[]const u8 {
+        const len = try self.readInt(u32);
+        if (len == std.math.maxInt(u32)) return null;
+        return @as(?[]const u8, try self.take(len));
+    }
+
+    fn done(self: ByteCursor) bool {
+        return self.offset == self.bytes.len;
+    }
+};
+
+fn writeInt(writer: *std.Io.Writer, comptime T: type, value: T) !void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .little);
+    try writer.writeAll(&bytes);
+}
+
+fn writeString(writer: *std.Io.Writer, value: []const u8) !void {
+    const len = std.math.cast(u32, value.len) orelse return error.CatalogCacheTooLarge;
+    try writeInt(writer, u32, len);
+    try writer.writeAll(value);
+}
+
+fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+    if (value) |bytes| {
+        try writeString(writer, bytes);
+    } else {
+        try writeInt(writer, u32, std.math.maxInt(u32));
+    }
 }
 
 /// Reports whether a persisted catalog exists, without parsing it. Callers use
@@ -366,44 +440,34 @@ pub fn catalogFileExists(sessions: ?io_mod.VerifiedDir) bool {
 }
 
 /// Stats are freshness evidence only. Cache misses still use canonical discovery and admission.
-pub fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
+fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     try session_layout.validateSessionId(id);
     const before = (try statOptional(dir, id)) orelse return null;
     if (before.kind != .directory) return null;
     var digest = Sha256.init(.{});
     addStat(&digest, before);
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const session_path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, "session.json" });
-    const session_stat = (try statOptional(dir, session_path)) orelse return null;
-    if (session_stat.kind != .file or session_stat.nlink != 1) return null;
-    addStat(&digest, session_stat);
-    // Legacy sessions carry no event log, so absence is part of the proof:
-    // a later appearance of events.jsonl must invalidate a cached row.
-    const events_path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, "events.jsonl" });
-    if (try statOptional(dir, events_path)) |stat| {
-        if (stat.kind != .file or stat.nlink != 1) return null;
-        digest.update(&.{1});
-        addStat(&digest, stat);
-    } else digest.update(&.{0});
-    // schema_v3 and legacy classification also observe the authority marker,
-    // the authority fence, and the display sidecar. Their presence, absence, or
-    // replacement must invalidate a cached row, so bind them into the digest.
-    for ([_][]const u8{ "authority.json", "authority.pending.json", "display.json" }) |name| {
-        const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, name });
+    // Classification observes each of these files, and its result depends on
+    // whether each is present: a legacy session carries no event log, and a
+    // schema_v3 session whose manifest is lost is listed from its log. Their
+    // presence, absence, or replacement must invalidate a cached row, so bind
+    // them into the digest.
+    for ([_][]const u8{ "session.json", "events.jsonl", "authority.json", "authority.pending.json", "display.json" }) |name| {
+        const path = try std.mem.print(&path_buffer, "{s}/{s}", .{ id, name });
         if (try statOptional(dir, path)) |stat| {
             if (stat.kind != .file or stat.nlink != 1) return null;
             digest.update(&.{1});
             addStat(&digest, stat);
         } else digest.update(&.{0});
     }
-    const child_path = try std.fmt.bufPrint(&path_buffer, "{s}/subagent", .{id});
+    const child_path = try std.mem.print(&path_buffer, "{s}/subagent", .{id});
     const child = try statOptional(dir, child_path);
     if (child) |stat| {
         if (stat.kind != .directory) return null;
         digest.update(&.{1});
         addStat(&digest, stat);
         for ([_][]const u8{ "owner.json", "control.json" }) |name| {
-            const path = try std.fmt.bufPrint(&path_buffer, "{s}/subagent/{s}", .{ id, name });
+            const path = try std.mem.print(&path_buffer, "{s}/subagent/{s}", .{ id, name });
             if (try statOptional(dir, path)) |marker| {
                 if (marker.kind != .file or marker.nlink != 1) return null;
                 digest.update(&.{1});
@@ -416,94 +480,6 @@ pub fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     var value: Fingerprint = undefined;
     digest.final(&value);
     return value;
-}
-
-const watermark_name_len = "commit.".len + 32 + ".json".len;
-
-/// Observes only the active-generation watermark used by the v3 importer, plus
-/// fixed source inputs. Superseded watermarks never govern that committed prefix.
-pub fn rankingFingerprint(root: std.Io.Dir, id: []const u8, generation: Generation) !?Fingerprint {
-    try session_layout.validateSessionId(id);
-    var dir = try root.openDir(io_mod.getIo(), id, .{ .follow_symlinks = false });
-    defer dir.close(io_mod.getIo());
-    return rankingFingerprintForOpenSession(root, id, dir, generation);
-}
-
-/// Binds the observation to the same directory handle used by canonical replay.
-/// Replacement of that directory disables publication of the old handle's result.
-pub fn rankingFingerprintForOpenSession(root: std.Io.Dir, id: []const u8, session_dir: std.Io.Dir, generation: Generation) !?Fingerprint {
-    try session_layout.validateSessionId(id);
-    const before = (try statOptional(root, id)) orelse return null;
-    if (before.kind != .directory) return null;
-    var dir = try session_dir.openDir(io_mod.getIo(), ".", .{ .follow_symlinks = false });
-    defer dir.close(io_mod.getIo());
-    if (!sameStat(before, try dir.stat(io_mod.getIo()))) return null;
-    var hash = Sha256.init(.{});
-    addStat(&hash, before);
-    try addDevice(&hash, dir, ".");
-    for ([_][]const u8{ "session.json", "events.jsonl", "authority.json", "authority.pending.json", "commit.pending.json", "session.legacy.json", "checkpoint.json" }) |name| {
-        if (!try addRankingFile(&hash, dir, name)) return null;
-    }
-    var watermark_buffer: [watermark_name_len]u8 = undefined;
-    const watermark = try std.fmt.bufPrint(&watermark_buffer, "commit.{s}.json", .{std.fmt.bytesToHex(generation, .lower)});
-    if (!try addRankingFile(&hash, dir, watermark)) return null;
-    if (try statOptional(dir, "subagent")) |child_stat| {
-        if (child_stat.kind != .directory) return null;
-        hash.update(&.{1});
-        addStat(&hash, child_stat);
-        try addDevice(&hash, dir, "subagent");
-        var child = try dir.openDir(io_mod.getIo(), "subagent", .{ .follow_symlinks = false });
-        defer child.close(io_mod.getIo());
-        if (!sameStat(child_stat, try child.stat(io_mod.getIo()))) return null;
-        for ([_][]const u8{ "owner.json", "control.json" }) |name| if (!try addRankingFile(&hash, child, name)) return null;
-        if (!sameStat(child_stat, (try statOptional(dir, "subagent")) orelse return null)) return null;
-    } else hash.update(&.{0});
-    if (!sameStat(before, try dir.stat(io_mod.getIo())) or !sameStat(before, (try statOptional(root, id)) orelse return null)) return null;
-    var result: Fingerprint = undefined;
-    hash.final(&result);
-    return result;
-}
-
-fn addRankingFile(hash: *Sha256, dir: std.Io.Dir, name: []const u8) !bool {
-    hash.update(name);
-    hash.update(&.{0});
-    if (try statOptional(dir, name)) |stat| {
-        if (stat.kind != .file or stat.nlink != 1) return false;
-        hash.update(&.{1});
-        addStat(hash, stat);
-        try addDevice(hash, dir, name);
-    } else hash.update(&.{0});
-    return true;
-}
-
-// std.Io.File.Stat omits device identity. Match the authority reader's native
-// no-follow observation; unsupported targets cannot produce ranking cache hits.
-fn addDevice(hash: *Sha256, dir: std.Io.Dir, name: []const u8) !void {
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&buffer, "{s}", .{name});
-    const device: u64 = switch (@import("builtin").os.tag) {
-        .linux => blk: {
-            const linux = std.os.linux;
-            var stat: linux.Statx = std.mem.zeroes(linux.Statx);
-            while (true) switch (linux.errno(linux.statx(dir.handle, path, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &stat))) {
-                .SUCCESS => break :blk (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
-                .INTR => continue,
-                else => return error.RankingFingerprintUnavailable,
-            };
-        },
-        .macos => blk: {
-            var stat: std.c.Stat = undefined;
-            while (true) switch (std.c.errno(std.c.fstatat(dir.handle, path, &stat, std.c.AT.SYMLINK_NOFOLLOW))) {
-                .SUCCESS => break :blk @intCast(stat.dev),
-                .INTR => continue,
-                else => return error.RankingFingerprintUnavailable,
-            };
-        },
-        else => return error.RankingFingerprintUnavailable,
-    };
-    var bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &bytes, device, .little);
-    hash.update(&bytes);
 }
 
 fn statOptional(dir: std.Io.Dir, path: []const u8) !?std.Io.File.Stat {
@@ -519,12 +495,565 @@ fn sameStat(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
 }
 
 fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
-    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @intFromEnum(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
+    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @backingInt(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
     var bytes: [16]u8 = undefined;
     for (values) |value| {
         std.mem.writeInt(u128, &bytes, value, .little);
         hash.update(&bytes);
     }
+}
+
+/// Every listable session in newest-first order, plus the number of session
+/// directories that could not be classified during this refresh.
+pub const ActionableSessionCatalog = struct {
+    summaries: std.ArrayList(session_store.SessionSummary) = .empty,
+    skipped_invalid: usize = 0,
+    /// Owned ids of listed sessions whose stale schema-v3 log failed to replay
+    /// in this listing. Such rows are never cached, so every listing observes
+    /// them afresh.
+    unreplayable_ids: std.ArrayList([]u8) = .empty,
+    /// Owned ids of the sessions counted in `skipped_invalid`, which v2's
+    /// listing still shows until they are converted or refused (D59).
+    invalid_ids: std.ArrayList([]u8) = .empty,
+
+    pub fn deinit(self: *ActionableSessionCatalog, alloc: Allocator) void {
+        for (self.summaries.items) |*summary| summary.deinit(alloc);
+        self.summaries.deinit(alloc);
+        for (self.unreplayable_ids.items) |id| alloc.free(id);
+        self.unreplayable_ids.deinit(alloc);
+        for (self.invalid_ids.items) |id| alloc.free(id);
+        self.invalid_ids.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn isUnreplayable(self: *const ActionableSessionCatalog, id: []const u8) bool {
+        for (self.unreplayable_ids.items) |value| {
+            if (std.mem.eql(u8, value, id)) return true;
+        }
+        return false;
+    }
+};
+
+const CatalogRead = struct {
+    store: session_store.Store,
+    candidates: session_store.CandidateIterator,
+    iterator_mutex: std.Io.Mutex = .init,
+    active_id: ?[]const u8,
+    cancelled: *std.atomic.Value(bool),
+    cache: *const Loaded,
+    changed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    reused: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    skipped_invalid: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn nextId(self: *CatalogRead, alloc: Allocator) !?[]u8 {
+        self.iterator_mutex.lockUncancelable(io_mod.getIo());
+        defer self.iterator_mutex.unlock(io_mod.getIo());
+        return self.candidates.nextId(alloc, self.cancelled);
+    }
+};
+
+const CatalogWorker = struct {
+    read: *CatalogRead,
+    alloc: Allocator,
+    entries: std.ArrayList(Entry) = .empty,
+    /// Owned ids this worker counted in `skipped_invalid`.
+    invalid: std.ArrayList([]u8) = .empty,
+    failure: ?anyerror = null,
+
+    fn run(self: *CatalogWorker) void {
+        self.readAll() catch |err| {
+            self.failure = err;
+            self.read.cancelled.store(true, .release);
+        };
+    }
+
+    fn readAll(self: *CatalogWorker) !void {
+        const dir = self.read.store.canonical_root.sessions orelse return;
+        while (try self.read.nextId(self.alloc)) |id| {
+            defer self.alloc.free(id);
+            const before = fingerprint(dir.dir, id) catch null;
+            if (before) |stamp| {
+                if (try self.read.cache.reuse(self.alloc, id, stamp)) |value| {
+                    var entry = value;
+                    errdefer entry.deinit(self.alloc);
+                    try self.entries.append(self.alloc, entry);
+                    _ = self.read.reused.fetchAdd(1, .monotonic);
+                    continue;
+                }
+            }
+            var fenced = false;
+            var candidate = self.read.store.readOnlyCandidate(self.alloc, id, self.read.cancelled) catch |err| switch (err) {
+                error.OutOfMemory, error.Cancelled => return err,
+                else => fallback: {
+                    // A legacy upgrade interrupted mid-rename stays listed from
+                    // its stable snapshot, so resuming it can run recovery.
+                    if (self.read.store.readOnlyFencedLegacyCandidate(self.alloc, id, self.read.cancelled)) |value| {
+                        fenced = true;
+                        break :fallback value;
+                    } else |fallback_err| switch (fallback_err) {
+                        error.OutOfMemory, error.Cancelled => return fallback_err,
+                        else => {},
+                    }
+                    session_discovery.logDiscoveryError(.read_only_list, id, null, null, err);
+                    _ = self.read.skipped_invalid.fetchAdd(1, .monotonic);
+                    try self.invalid.ensureUnusedCapacity(self.alloc, 1);
+                    self.invalid.appendAssumeCapacity(try self.alloc.dupe(u8, id));
+                    continue;
+                },
+            };
+            var owned = true;
+            defer if (owned) candidate.deinit(self.alloc);
+            const is_active = if (self.read.active_id) |active| std.mem.eql(u8, id, active) else false;
+            if (is_active and !candidate.summary.hasResumableContent()) continue;
+            if (self.read.cancelled.load(.acquire)) return error.Cancelled;
+            // The fingerprint binds every classification input, so each settled
+            // row is cacheable, a replayed schema_v3 projection included: the
+            // commit watermark and checkpoint the replay also reads are
+            // replaced by rename, which changes the session directory stat the
+            // fingerprint binds. A row read around an interrupted upgrade
+            // describes a transition, and a failed replay can be transient,
+            // so neither is ever reused. Empty sessions stay listed; the
+            // picker alone hides rows without resumable content.
+            var cacheable = !fenced and candidate.projection_state != .stale;
+            const managed = child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                // An unverifiable marker or first event stays listed, as
+                // `fx sessions` always did; exact resume still refuses a real
+                // child. The row is not cached, so the check runs again.
+                else => blk: {
+                    cacheable = false;
+                    break :blk false;
+                },
+            };
+            if (!managed and !Summary.from(&candidate.summary).persistable()) {
+                debug_trace.logf("core", "session catalog cache left id={s} uncached: summary outside the row contract", .{id});
+                cacheable = false;
+            }
+            const after = if (cacheable) fingerprint(dir.dir, id) catch null else null;
+            const stable = if (before) |a| if (after) |z| std.mem.eql(u8, &a, &z) else false else false;
+            var entry = Entry{
+                .fingerprint = if (stable) after else null,
+                .value = if (managed) .{ .excluded = try self.alloc.dupe(u8, id) } else .{ .visible = candidate.summary },
+                .unreplayable = !fenced and candidate.storage == .schema_v3 and candidate.projection_state == .stale,
+            };
+            if (!managed) owned = false;
+            errdefer entry.deinit(self.alloc);
+            try self.entries.append(self.alloc, entry);
+            if (stable or self.read.cache.contains(id)) self.read.changed.store(true, .release);
+        }
+    }
+};
+
+/// Refreshes the session index and returns every listable session, newest
+/// first. `active_id` is omitted from the result. Rows whose fingerprints still
+/// match are reused without opening their sessions; the rest are reclassified
+/// by canonical discovery. When `cache_writer` is set, a changed index is
+/// persisted for the next caller. Caller owns the returned catalog.
+pub fn listActionableCatalog(
+    store: session_store.Store,
+    alloc: Allocator,
+    active_id: ?[]const u8,
+    cancelled: ?*std.atomic.Value(bool),
+    cache_writer: ?*Writer,
+) !ActionableSessionCatalog {
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    var local_stop = std.atomic.Value(bool).init(false);
+    const stop_requested = cancelled orelse &local_stop;
+    var cached = try Loaded.load(std.heap.c_allocator, store.canonical_root.sessions, stop_requested);
+    defer cached.deinit(std.heap.c_allocator);
+    var read = CatalogRead{ .store = store, .candidates = store.readOnlyCandidates(), .active_id = active_id, .cancelled = stop_requested, .cache = &cached };
+    read.changed.store(!cached.present(), .monotonic);
+    // Worker storage is independent of the caller's allocator and ends after the merge.
+    const worker_alloc = std.heap.c_allocator;
+    var workers: [4]CatalogWorker = undefined;
+    for (&workers) |*worker| worker.* = .{ .read = &read, .alloc = worker_alloc };
+    defer for (&workers) |*worker| {
+        for (worker.entries.items) |*entry| entry.deinit(worker_alloc);
+        worker.entries.deinit(worker_alloc);
+        for (worker.invalid.items) |id| worker_alloc.free(id);
+        worker.invalid.deinit(worker_alloc);
+    };
+    var threads: [workers.len - 1]?std.Thread = @splat(null);
+    errdefer {
+        stop_requested.store(true, .release);
+        for (&threads) |*handle| {
+            if (handle.*) |thread| thread.join();
+            handle.* = null;
+        }
+    }
+    for (&threads, workers[1..]) |*handle, *worker| {
+        handle.* = try std.Thread.spawn(.{}, CatalogWorker.run, .{worker});
+    }
+    workers[0].run();
+    for (&threads) |*handle| {
+        handle.*.?.join();
+        handle.* = null;
+    }
+    for (workers) |worker| {
+        if (worker.failure) |err| {
+            if (err != error.Cancelled) return err;
+        }
+    }
+    if (stop_requested.load(.acquire)) return error.Cancelled;
+    var entries: std.ArrayList(Entry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(worker_alloc);
+        entries.deinit(worker_alloc);
+    }
+    for (&workers) |*worker| {
+        try entries.appendSlice(worker_alloc, worker.entries.items);
+        worker.entries.items.len = 0;
+    }
+    var catalog: ActionableSessionCatalog = .{ .skipped_invalid = read.skipped_invalid.load(.monotonic) };
+    errdefer catalog.deinit(alloc);
+    for (workers) |worker| for (worker.invalid.items) |id| {
+        if (active_id) |active| if (std.mem.eql(u8, active, id)) continue;
+        try catalog.invalid_ids.ensureUnusedCapacity(alloc, 1);
+        catalog.invalid_ids.appendAssumeCapacity(try alloc.dupe(u8, id));
+    };
+    var cacheable: usize = 0;
+    for (entries.items) |entry| {
+        if (stop_requested.load(.acquire)) return error.Cancelled;
+        if (entry.fingerprint != null) cacheable += 1;
+        switch (entry.value) {
+            .visible => |summary| {
+                if (active_id) |active| if (std.mem.eql(u8, active, summary.id)) continue;
+                if (entry.unreplayable) {
+                    const unreplayable_id = try alloc.dupe(u8, summary.id);
+                    errdefer alloc.free(unreplayable_id);
+                    try catalog.unreplayable_ids.append(alloc, unreplayable_id);
+                }
+                var copy = try summary_codec.cloneSessionSummary(alloc, summary);
+                errdefer copy.deinit(alloc);
+                try catalog.summaries.append(alloc, copy);
+            },
+            .excluded => {},
+        }
+    }
+    if (cache_writer) |writer| {
+        if (read.changed.load(.acquire) or cacheable != cached.count()) {
+            writer.save(alloc, entries.items, stop_requested) catch |err| {
+                if (stop_requested.load(.acquire)) return error.Cancelled;
+                debug_trace.logf("core", "session catalog cache not saved err={s}", .{@errorName(err)});
+            };
+        }
+    }
+    debug_trace.logf("core", "session catalog cache reused={d} records={d} skipped_invalid={d}", .{ read.reused.load(.monotonic), cacheable, catalog.skipped_invalid });
+    summary_codec.sortSummariesNewestFirst(catalog.summaries.items);
+    return catalog;
+}
+
+test "actionable catalog preserves discovery and child visibility" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    const history = [_]session.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved request") },
+        .assistant = @constCast("saved response"),
+    } }};
+    for ([_][]const u8{ "public", "private-bit", "private-marker", "empty" }, 0..) |id, index| {
+        const durable = session_codec.DurableSessionState{
+            .id = @constCast(id),
+            .origin_workspace_root = workspace,
+            .workspace_root = workspace,
+            .created_at_ms = 1,
+            .updated_at_ms = @intCast(index + 1),
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .history = if (std.mem.eql(u8, id, "empty")) &.{} else @constCast(&history),
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+            .subagent_child = std.mem.eql(u8, id, "private-bit"),
+        };
+        var writable = try store.startWritableSession(alloc, durable);
+        writable.deinit(alloc);
+    }
+    const children = child_state.Store{ .backend = .{ .v1 = &store }, .parent_id = "public" };
+    try children.markChildSession(alloc, "private-marker");
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, null);
+    defer catalog.deinit(alloc);
+    // Children stay private; an empty session is listed, and only the picker
+    // hides rows without resumable content.
+    try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
+    for (catalog.summaries.items) |summary| {
+        try std.testing.expect(std.mem.eql(u8, summary.id, "public") or std.mem.eql(u8, summary.id, "empty"));
+    }
+    var reference = try store.list(alloc);
+    defer summary_codec.freeSummaries(alloc, &reference);
+    var visible: usize = 0;
+    for (reference.items) |summary| {
+        if (std.mem.eql(u8, summary.id, "private-bit") or std.mem.eql(u8, summary.id, "private-marker")) continue;
+        try std.testing.expectEqualStrings(summary.id, catalog.summaries.items[visible].id);
+        try std.testing.expectEqual(summary.history_len, catalog.summaries.items[visible].history_len);
+        try std.testing.expectEqual(summary.updated_at_ms, catalog.summaries.items[visible].updated_at_ms);
+        visible += 1;
+    }
+    try std.testing.expectEqual(catalog.summaries.items.len, visible);
+    stopped.store(true, .release);
+    try std.testing.expectError(error.Cancelled, listActionableCatalog(store, alloc, null, &stopped, null));
+    const AllocationCheck = struct {
+        fn run(failing_alloc: Allocator, source: session_store.Store) !void {
+            var result = try listActionableCatalog(source, failing_alloc, null, null, null);
+            defer result.deinit(failing_alloc);
+            try std.testing.expectEqual(@as(usize, 2), result.summaries.items.len);
+        }
+
+        fn candidate(failing_alloc: Allocator, source: session_store.Store) !void {
+            var result = try source.readOnlyCandidate(failing_alloc, "public", null);
+            defer result.deinit(failing_alloc);
+            try std.testing.expectEqualStrings("public", result.summary.id);
+            try std.testing.expectEqual(@as(?bool, false), result.subagent_child);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, AllocationCheck.run, .{store});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, AllocationCheck.candidate, .{store});
+
+    stopped.store(false, .release);
+    var empty_cache: Loaded = .{};
+    var failed_read = CatalogRead{ .store = store, .candidates = store.readOnlyCandidates(), .active_id = null, .cancelled = &stopped, .cache = &empty_cache };
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var failed_worker = CatalogWorker{ .read = &failed_read, .alloc = failing.allocator() };
+    defer failed_worker.entries.deinit(failing.allocator());
+    failed_worker.run();
+    try std.testing.expectEqual(error.OutOfMemory, failed_worker.failure.?);
+    try std.testing.expect(stopped.load(.acquire));
+    try std.testing.expectError(error.Cancelled, store.readOnlyCandidate(alloc, "public", &stopped));
+
+    stopped.store(false, .release);
+    var writer = (try Writer.init(store)).?;
+    defer writer.deinit();
+    var built = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer built.deinit(alloc);
+    var reused = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer reused.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reused.summaries.items.len);
+    try std.testing.expectEqualStrings(built.summaries.items[0].id, reused.summaries.items[0].id);
+    {
+        var changed = try store.resumeForWrite(alloc, "public");
+        defer changed.deinit(alloc);
+        _ = try changed.renameConversation(alloc, "Changed title");
+    }
+    var renamed = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer renamed.deinit(alloc);
+    try std.testing.expectEqualStrings("Changed title", renamed.summaries.items[0].title.?);
+    try io_mod.durableReplaceVerified(alloc, &writer.dir, ".resume-catalog", "truncated cache");
+    var repaired = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer repaired.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), repaired.summaries.items.len);
+    try std.testing.expectEqualStrings("Changed title", repaired.summaries.items[0].title.?);
+    const new_owner = child_state.Store{ .backend = .{ .v1 = &store }, .parent_id = "parent" };
+    try new_owner.markChildSession(alloc, "public");
+    var hidden = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer hidden.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), hidden.summaries.items.len);
+    try std.testing.expectEqualStrings("empty", hidden.summaries.items[0].id);
+    var removed = try store.resumeForWrite(alloc, "empty");
+    try std.testing.expectEqual(.discarded, store.deleteCommittedSession(alloc, &removed));
+    var reconciled = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer reconciled.deinit(alloc);
+    var saved = try Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.present());
+    try std.testing.expect(!saved.contains("empty"));
+    try std.testing.expectEqual(@as(usize, 0), reconciled.summaries.items.len);
+    var read_only = try session_store.Store.initReadOnlyFromHome(alloc, home, workspace);
+    defer read_only.deinit(alloc);
+    try std.testing.expect((try Writer.init(read_only)) == null);
+}
+
+test "actionable catalog lists and caches legacy sessions without event logs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx/sessions/legacy-old");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    // Oldest persisted format: a schema v2 snapshot with no event log.
+    const manifest = try alloc.print("{{\"schema_version\":2,\"id\":\"legacy-old\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
+    defer alloc.free(manifest);
+    var file = try tmp.dir.createFile(std.testing.io, "home/.fx/sessions/legacy-old/session.json", .{});
+    try file.writeStreamingAll(std.testing.io, manifest);
+    file.close(std.testing.io);
+
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var writer = (try Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer catalog.deinit(alloc);
+    // Legacy sessions stay resumable, so every listing shows them, and the row
+    // lands in the cache so later scans reuse it instead of reparsing.
+    try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
+    try std.testing.expectEqualStrings("legacy-old", catalog.summaries.items[0].id);
+    var saved = try Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.present());
+    try std.testing.expect(saved.contains("legacy-old"));
+    var again = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), again.summaries.items.len);
+}
+
+test "a summary outside the row contract stays listed without disabling the index" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    // A legacy snapshot whose clock stepped back records an update before its
+    // creation, which the index row contract rejects.
+    const Snapshot = struct { id: []const u8, created_at_ms: i64, updated_at_ms: i64 };
+    for ([_]Snapshot{
+        .{ .id = "legacy-ok", .created_at_ms = 1, .updated_at_ms = 2 },
+        .{ .id = "clock-skewed", .created_at_ms = 2000, .updated_at_ms = 1000 },
+    }) |snapshot| {
+        const dir_path = try alloc.print("home/.fx/sessions/{s}", .{snapshot.id});
+        defer alloc.free(dir_path);
+        try tmp.dir.createDirPath(std.testing.io, dir_path);
+        const path = try alloc.print("{s}/session.json", .{dir_path});
+        defer alloc.free(path);
+        const manifest = try alloc.print("{{\"schema_version\":2,\"id\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{ snapshot.id, snapshot.created_at_ms, snapshot.updated_at_ms, workspace });
+        defer alloc.free(manifest);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = manifest });
+    }
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var writer = (try Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer catalog.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), catalog.summaries.items.len);
+    {
+        var saved = try Loaded.load(alloc, writer.dir, null);
+        defer saved.deinit(alloc);
+        try std.testing.expect(saved.present());
+        try std.testing.expect(saved.contains("legacy-ok"));
+        try std.testing.expect(!saved.contains("clock-skewed"));
+    }
+    // The next listing reuses the saved row and leaves the index untouched.
+    const index_path = "home/.fx/sessions/.resume-catalog";
+    const before = try tmp.dir.statFile(std.testing.io, index_path, .{});
+    var again = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), again.summaries.items.len);
+    const after = try tmp.dir.statFile(std.testing.io, index_path, .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+}
+
+test "actionable catalog lists an interrupted legacy upgrade without caching it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx/sessions/fenced");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const snapshot = try alloc.print("{{\"schema_version\":2,\"id\":\"fenced\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
+    defer alloc.free(snapshot);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/session.legacy.json", .data = snapshot });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/authority.pending.json", .data = "pending" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/fenced/session.json", .data = "interrupted replacement" });
+
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var writer = (try Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer catalog.deinit(alloc);
+    // The stable snapshot keeps the session listed so resuming it can finish
+    // the upgrade, but the row describes a transition and is never reused.
+    try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
+    try std.testing.expectEqualStrings("fenced", catalog.summaries.items[0].id);
+    var saved = try Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.present());
+    try std.testing.expect(!saved.contains("fenced"));
+}
+
+test "actionable catalog lists an unverifiable child marker without caching it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, .{
+        .id = @constCast("unverified"),
+        .origin_workspace_root = workspace,
+        .workspace_root = workspace,
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+    });
+    writable.deinit(alloc);
+    try tmp.dir.createDir(std.testing.io, "home/.fx/sessions/unverified/subagent", .fromMode(0o700));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/unverified/subagent/control.json", .data = "not a control record", .flags = .{ .permissions = .fromMode(0o600) } });
+
+    var writer = (try Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer catalog.deinit(alloc);
+    // A damaged marker cannot prove the session is a child, so it stays
+    // listed; the row is not cached so the next listing checks it again.
+    try std.testing.expectEqual(@as(usize, 1), catalog.summaries.items.len);
+    try std.testing.expectEqualStrings("unverified", catalog.summaries.items[0].id);
+    var saved = try Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.present());
+    try std.testing.expect(!saved.contains("unverified"));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "catalog cache ignores a FIFO without blocking" {
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ root, file_name }, 0);
+    if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+    // Reading a FIFO waits for a writer that never comes; the index is ignored.
+    var loaded = try Loaded.load(alloc, dir, null);
+    defer loaded.deinit(alloc);
+    try std.testing.expect(!loaded.present());
 }
 
 test "catalog cache round trips owned rows and ignores incomplete observations" {
@@ -588,174 +1117,25 @@ test "catalog cache corruption and duplicate identifiers require rebuilding" {
     try std.testing.expect(!corrupt.present());
 }
 
-fn rankingTestSource(dir: std.Io.Dir, id: []const u8) !void {
-    try dir.createDir(io_mod.getIo(), id, .fromMode(0o700));
-    var child = try dir.openDir(io_mod.getIo(), id, .{});
-    defer child.close(io_mod.getIo());
-    for ([_][]const u8{ "session.json", "events.jsonl", "authority.json", "commit.11111111111111111111111111111111.json" }) |name| {
-        var file = try child.createFile(io_mod.getIo(), name, .{ .permissions = .fromMode(0o600) });
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "{}\n");
-    }
-}
-
-test "catalog ranking rows roundtrip isolate kinds and survive picker publication" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try rankingTestSource(tmp.dir, "legacy");
-    try rankingTestSource(tmp.dir, "picker");
-    var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) } };
-    defer writer.deinit();
-    const stamp = (try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))).?;
-    const ranking = Entry{ .fingerprint = stamp, .value = .{ .legacy_ranking = .{ .id = @constCast("legacy"), .workspace_root = @constCast("/workspace"), .updated_at_ms = 20, .generation = @splat(0x11) } } };
-    const picker = Entry{ .fingerprint = try fingerprint(tmp.dir, "picker"), .value = .{ .excluded = @constCast("picker") } };
-    const legacy_picker = Entry{ .fingerprint = null, .value = .{ .excluded = @constCast("legacy") } };
-    var stop = std.atomic.Value(bool).init(false);
-    try writer.saveRanking(alloc, &.{ranking}, &stop);
-    try writer.save(alloc, &.{ picker, legacy_picker }, &stop);
-    try writer.saveRanking(alloc, &.{ranking}, &stop);
-    var loaded = try Loaded.load(alloc, writer.dir, null);
-    defer loaded.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), loaded.count());
-    try std.testing.expectEqual(@as(usize, 1), loaded.rankingCount());
-    try std.testing.expect(!loaded.contains("legacy"));
-    try std.testing.expect(loaded.contains("picker"));
-    try std.testing.expect((try loaded.reuse(alloc, "legacy", stamp)) == null);
-    try std.testing.expect((try loaded.reuseRanking(alloc, "picker", picker.fingerprint.?)) == null);
-    try std.testing.expect((try loaded.reuseRanking(alloc, "legacy", @splat(0))) == null);
-    var reused = (try loaded.reuseRanking(alloc, "legacy", stamp)).?;
-    defer reused.deinit(alloc);
-    try std.testing.expectEqualStrings("legacy", reused.value.legacy_ranking.id);
-    try std.testing.expectEqualStrings("/workspace", reused.value.legacy_ranking.workspace_root);
-    try std.testing.expectEqual(@as(i64, 20), reused.value.legacy_ranking.updated_at_ms);
-
-    // A newly migrated, cacheable picker row supersedes its old ranking row.
-    const migrated = Entry{ .fingerprint = try fingerprint(tmp.dir, "legacy"), .value = .{ .excluded = @constCast("legacy") } };
-    try writer.save(alloc, &.{ picker, migrated }, &stop);
-    var replaced = try Loaded.load(alloc, writer.dir, null);
-    defer replaced.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), replaced.count());
-    try std.testing.expectEqual(@as(usize, 0), replaced.rankingCount());
-}
-
-test "catalog ranking fingerprint detects in-place authority and active watermark inputs" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try rankingTestSource(tmp.dir, "legacy");
-    var dir = try tmp.dir.openDir(std.testing.io, "legacy", .{});
-    defer dir.close(std.testing.io);
-    for ([_][]const u8{ "authority.pending.json", "commit.pending.json", "session.legacy.json", "checkpoint.json" }) |name| {
-        var file = try dir.createFile(std.testing.io, name, .{});
-        file.close(std.testing.io);
-    }
-    for ([_][]const u8{ "session.json", "events.jsonl", "authority.json", "authority.pending.json", "commit.pending.json", "session.legacy.json", "checkpoint.json", "commit.11111111111111111111111111111111.json" }) |name| {
-        const before = (try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))).?;
-        const parent = try dir.stat(std.testing.io);
-        var file = try dir.openFile(std.testing.io, name, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        io_mod.sleep(2 * std.time.ns_per_ms);
-        try file.writePositionalAll(std.testing.io, "bad", 0);
-        try std.testing.expect(sameStat(parent, try dir.stat(std.testing.io)));
-        try std.testing.expect(!std.mem.eql(u8, &before, &(try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))).?));
-    }
-    const before = (try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))).?;
-    try dir.deleteFile(std.testing.io, "authority.pending.json");
-    try std.testing.expect(!std.mem.eql(u8, &before, &(try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))).?));
-    var unknown = try dir.createFile(std.testing.io, "commit.unknown.json", .{});
-    defer unknown.close(std.testing.io);
-    const with_obsolete = (try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))).?;
-    try unknown.writeStreamingAll(std.testing.io, "not an active watermark");
-    try std.testing.expectEqual(with_obsolete, (try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))).?);
-}
-
-test "catalog ranking fingerprint rejects active symlinks and replaced directories" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try rankingTestSource(tmp.dir, "legacy");
-    var original = try tmp.dir.openDir(std.testing.io, "legacy", .{});
-    defer original.close(std.testing.io);
-    try tmp.dir.rename("legacy", tmp.dir, "old", std.testing.io);
-    try rankingTestSource(tmp.dir, "legacy");
-    try std.testing.expect((try rankingFingerprintForOpenSession(tmp.dir, "legacy", original, @splat(0x11))) == null);
-    var dir = try tmp.dir.openDir(std.testing.io, "legacy", .{});
-    defer dir.close(std.testing.io);
-    try dir.symLink(std.testing.io, "events.jsonl", "authority.pending.json", .{});
-    try std.testing.expect((try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))) == null);
-    try dir.deleteFile(std.testing.io, "authority.pending.json");
-    try dir.deleteFile(std.testing.io, "commit.11111111111111111111111111111111.json");
-    try dir.symLink(std.testing.io, "events.jsonl", "commit.11111111111111111111111111111111.json", .{});
-    try std.testing.expect((try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))) == null);
-}
-
-test "catalog ranking cache tolerates thousands of obsolete watermarks and binds generation" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try rankingTestSource(tmp.dir, "legacy");
-    var dir = try tmp.dir.openDir(std.testing.io, "legacy", .{});
-    defer dir.close(std.testing.io);
-    var name_buffer: [watermark_name_len]u8 = undefined;
-    for (0..1536) |index| {
-        const name = try std.fmt.bufPrint(&name_buffer, "commit.{x:0>32}.json", .{index});
-        var file = try dir.createFile(std.testing.io, name, .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "obsolete invalid JSON");
-    }
-    const generation: Generation = @splat(0x11);
-    const stamp = (try rankingFingerprint(tmp.dir, "legacy", generation)).?;
-    var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) } };
-    defer writer.deinit();
-    const ranking = Entry{ .fingerprint = stamp, .value = .{ .legacy_ranking = .{ .id = @constCast("legacy"), .workspace_root = @constCast("/workspace"), .updated_at_ms = 20, .generation = generation } } };
-    var stop = std.atomic.Value(bool).init(false);
-    try writer.saveRanking(alloc, &.{ranking}, &stop);
-    try writer.save(alloc, &.{}, &stop);
-    var loaded = try Loaded.load(alloc, writer.dir, null);
-    defer loaded.deinit(alloc);
-    try std.testing.expectEqual(generation, loaded.rankingGeneration("legacy").?);
-    var reused = (try loaded.reuseRanking(alloc, "legacy", (try rankingFingerprint(tmp.dir, "legacy", generation)).?)).?;
-    defer reused.deinit(alloc);
-    try std.testing.expectEqual(generation, reused.value.legacy_ranking.generation);
-    const other = (try rankingFingerprint(tmp.dir, "legacy", @splat(0x22))).?;
-    try std.testing.expect((try loaded.reuseRanking(alloc, "legacy", other)) == null);
-    var events = try dir.openFile(std.testing.io, "events.jsonl", .{ .mode = .read_write });
-    defer events.close(std.testing.io);
-    try events.writePositionalAll(std.testing.io, "new generation", 0);
-    const changed = (try rankingFingerprint(tmp.dir, "legacy", generation)).?;
-    try std.testing.expect((try loaded.reuseRanking(alloc, "legacy", changed)) == null);
-}
-
-test "catalog ranking invalid rows versions cancellation and bounds are misses" {
+test "catalog older versions cancellation and bounds are misses" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) } };
     defer writer.deinit();
     var stop = std.atomic.Value(bool).init(false);
-    const invalid = [_]Entry{
-        .{ .fingerprint = @splat(1), .value = .{ .legacy_ranking = .{ .id = @constCast("relative"), .workspace_root = @constCast("relative"), .updated_at_ms = 20, .generation = @splat(0x11) } } },
-        .{ .fingerprint = @splat(1), .value = .{ .legacy_ranking = .{ .id = @constCast("negative"), .workspace_root = @constCast("/workspace"), .updated_at_ms = -1, .generation = @splat(0x11) } } },
-    };
-    for (invalid) |row| {
-        try writer.saveRanking(alloc, &.{row}, &stop);
-        var loaded = try Loaded.load(alloc, writer.dir, null);
-        defer loaded.deinit(alloc);
-        try std.testing.expect(!loaded.present());
-    }
-    const valid = Entry{ .fingerprint = @splat(1), .value = .{ .legacy_ranking = .{ .id = @constCast("valid"), .workspace_root = @constCast("/workspace"), .updated_at_ms = 20, .generation = @splat(0x11) } } };
-    try writer.saveRanking(alloc, &.{ valid, valid }, &stop);
-    var duplicate = try Loaded.load(alloc, writer.dir, null);
-    defer duplicate.deinit(alloc);
-    try std.testing.expect(!duplicate.present());
-    try writer.saveRanking(alloc, &.{valid}, &stop);
+    const valid = Entry{ .fingerprint = @splat(1), .value = .{ .excluded = @constCast("valid") } };
+    try writer.save(alloc, &.{valid}, &stop);
     stop.store(true, .release);
-    try std.testing.expectError(error.Cancelled, writer.saveRanking(alloc, &.{}, &stop));
+    try std.testing.expectError(error.Cancelled, writer.save(alloc, &.{}, &stop));
     var retained = try Loaded.load(alloc, writer.dir, null);
     defer retained.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), retained.rankingCount());
+    try std.testing.expectEqual(@as(usize, 1), retained.count());
     var file = try writer.dir.dir.openFile(std.testing.io, file_name, .{ .mode = .read_write });
     defer file.close(std.testing.io);
-    for ([_][]const u8{ "1", "2", "3" }) |version| {
+    // Every earlier format, including v4 files that still carry legacy
+    // ranking rows, is ignored and rebuilt rather than partially trusted.
+    for ([_][]const u8{ "1", "2", "3", "4", "5" }) |version| {
         try file.writePositionalAll(std.testing.io, version, "fx-resume-catalog-v".len);
         var old_version = try Loaded.load(alloc, writer.dir, null);
         defer old_version.deinit(alloc);
@@ -764,53 +1144,27 @@ test "catalog ranking invalid rows versions cancellation and bounds are misses" 
     var payload: std.Io.Writer.Allocating = .init(alloc);
     defer payload.deinit();
     var written: usize = max_records;
-    try std.testing.expectError(error.CatalogCacheTooLarge, writeRow(&payload, &written, .{ .id = "id", .fingerprint = "", .value = .excluded }));
+    try std.testing.expectError(error.CatalogCacheTooLarge, writeRow(&payload, &written, .{ .id = "id", .fingerprint = @splat(0), .value = .excluded }));
 }
 
-test "catalog ranking missing or malformed generation requires rebuilding" {
+test "catalog rows reject a v5 JSON payload relabelled v6" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
     defer dir.close();
-    const prefix = "[{\"id\":\"legacy\",\"fingerprint\":\"" ++ "1" ** 64 ++ "\",\"value\":{\"legacy_ranking\":{\"workspace_root\":\"/workspace\",\"updated_at_ms\":20";
-    for ([_][]const u8{ prefix ++ "}}}]", prefix ++ ",\"generation\":[1]}}}]", prefix ++ ",\"generation\":null}}}]" }) |payload| {
-        var digest: Fingerprint = undefined;
-        Sha256.hash(payload, &digest, .{});
-        var bytes: std.Io.Writer.Allocating = .init(alloc);
-        defer bytes.deinit();
-        try bytes.writer.writeAll(magic);
-        try bytes.writer.writeAll(&digest);
-        try bytes.writer.writeAll(payload);
-        try io_mod.durableReplaceVerified(alloc, &dir, file_name, bytes.written());
-        var loaded = try Loaded.load(alloc, dir, null);
-        defer loaded.deinit(alloc);
-        try std.testing.expect(!loaded.present());
-    }
-}
-
-test "catalog ranking allocation failures clean owned rows and merged publication" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try rankingTestSource(tmp.dir, "legacy");
-    var writer = Writer{ .dir = .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) } };
-    defer writer.deinit();
-    const stamp = (try rankingFingerprint(tmp.dir, "legacy", @splat(0x11))).?;
-    const ranking = Entry{ .fingerprint = stamp, .value = .{ .legacy_ranking = .{ .id = @constCast("legacy"), .workspace_root = @constCast("/workspace"), .updated_at_ms = 20, .generation = @splat(0x11) } } };
-    var stop = std.atomic.Value(bool).init(false);
-    try writer.saveRanking(alloc, &.{ranking}, &stop);
-    try std.testing.checkAllAllocationFailures(alloc, struct {
-        fn check(a: Allocator, output: *Writer, fingerprint_value: Fingerprint) !void {
-            var loaded = try Loaded.load(a, output.dir, null);
-            defer loaded.deinit(a);
-            var reused = (try loaded.reuseRanking(a, "legacy", fingerprint_value)).?;
-            defer reused.deinit(a);
-            var cancelled = std.atomic.Value(bool).init(false);
-            try output.saveRanking(a, &.{reused}, &cancelled);
-            try output.save(a, &.{}, &cancelled);
-        }
-    }.check, .{ &writer, stamp });
+    const payload = "[{\"id\":\"legacy\",\"fingerprint\":\"" ++ text_utils.repeat("1", 64) ++ "\",\"value\":{\"legacy_ranking\":{\"workspace_root\":\"/workspace\",\"updated_at_ms\":20}}}]";
+    var digest: Fingerprint = undefined;
+    Sha256.hash(payload, &digest, .{});
+    var bytes: std.Io.Writer.Allocating = .init(alloc);
+    defer bytes.deinit();
+    try bytes.writer.writeAll(magic);
+    try bytes.writer.writeAll(&digest);
+    try bytes.writer.writeAll(payload);
+    try io_mod.durableReplaceVerified(alloc, &dir, file_name, bytes.written());
+    var loaded = try Loaded.load(alloc, dir, null);
+    defer loaded.deinit(alloc);
+    try std.testing.expect(!loaded.present());
 }
 
 test "catalog fingerprint binds authority fence display sidecar and missing event log" {
@@ -837,7 +1191,7 @@ test "catalog fingerprint binds authority fence display sidecar and missing even
     // invalidate the observation even when session.json and events.jsonl are
     // untouched.
     for ([_][]const u8{ "authority.json", "authority.pending.json", "display.json" }) |name| {
-        const path = try std.fmt.allocPrint(std.testing.allocator, "session/{s}", .{name});
+        const path = try std.testing.allocator.print("session/{s}", .{name});
         defer std.testing.allocator.free(path);
         const absent = (try fingerprint(tmp.dir, "session")).?;
         var file = try tmp.dir.createFile(std.testing.io, path, .{});

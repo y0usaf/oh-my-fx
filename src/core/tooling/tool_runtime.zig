@@ -1,4 +1,6 @@
 const std = @import("std");
+const observation = @import("../agent/runtime/observation.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
@@ -46,6 +48,7 @@ const tool_dispatch = @import("tool_dispatch.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
@@ -110,6 +113,7 @@ test {
 }
 
 pub const Context = struct {
+    observer: ?*observation.Observer = null,
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
     ignored_list_entries: []const []const u8,
@@ -119,6 +123,8 @@ pub const Context = struct {
     max_read_file_line_len: usize,
     max_command_output_bytes: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    /// Passed to subagent turns. See `Config.auto_compact_percent`.
+    auto_compact_percent: u8 = compactor.default_percent,
     api_key: []const u8,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     gateway_team: ?[]const u8 = null,
@@ -145,6 +151,7 @@ pub const Context = struct {
     gateway_models_path: []const u8 = "/v1/models",
     agent_step_limit: usize,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     /// Borrowed gateway provider routing inherited by subagent turns. Never
     /// applied to tool-internal provider requests (vision, web search), which
@@ -235,6 +242,7 @@ pub const Context = struct {
 
     /// Projects only the borrowed capabilities consumed by admission.
     pub fn admissionInput(self: Context) tool_admission.Input {
+        const observer = self.observer orelse if (self.permission_review_turn) |review| review.observer else null;
         var input: tool_admission.Input = .{
             .workspace_root = self.workspace_root,
             .access_scope = self.access_scope,
@@ -260,6 +268,11 @@ pub const Context = struct {
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
         }
+        if (input.permission_prompter) |*prompter| {
+            prompter.observer = observer orelse prompter.observer;
+            prompter.cancel_flag = self.cancel_flag orelse prompter.cancel_flag;
+        }
+        if (input.permission_review_turn) |*review| review.observer = observer;
         return input;
     }
 
@@ -311,8 +324,6 @@ pub const Context = struct {
             .endpoint = self.gateway_chat_url,
             .reviewer_model = self.reviewer_model,
             .cancel_flag = self.cancel_flag,
-            .usage = &self.session.usage,
-            .usage_allocator = self.session_allocator,
         });
     }
 };
@@ -386,6 +397,7 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
+    execution_ctx.observer = request.observer orelse ctx.observer;
     execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
@@ -429,7 +441,7 @@ pub fn executeToolCallAuthorized(
         spec.take_file_mutation_input_fn != null
     else
         false;
-    const result = (if (comptime builtin.os.tag == .wasi)
+    const result = (if (comptime builtin.target.os.tag == .wasi)
         executeWorkspaceToolCallInner(
             execution_ctx,
             request.result_allocator,
@@ -599,6 +611,7 @@ pub fn executeHostToolCallAuthorized(
     if (spec.executor_kind != .host) return error.InvalidToolArguments;
 
     var execution_ctx = ctx;
+    execution_ctx.observer = request.observer orelse ctx.observer;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
     }
@@ -609,16 +622,12 @@ pub fn executeHostToolCallAuthorized(
         request.call,
     );
     dispatch_ctx.execution_authority = request.authority;
-    var status_detail: ?[]u8 = null;
     const dispatched = try tool_dispatch.dispatchAuthorizedToolCall(
         dispatch_ctx,
         execution_ctx.tool_registry,
         request.call,
-        &status_detail,
     );
-    var result = toolExecutionResultFromDispatch(dispatched, .{});
-    result.status_detail = status_detail;
-    return result;
+    return toolExecutionResultFromDispatch(dispatched, .{});
 }
 
 fn rebindMcpAuthorityGeneration(
@@ -716,13 +725,13 @@ fn executeWorkspaceToolCallInner(
         }
     }
     const spec = registeredToolSpec(ctx, call.name) orelse
-        return semanticFailure(try std.fmt.allocPrint(arena, "Unsupported tool: {s}", .{call.name}));
+        return semanticFailure(try arena.print("Unsupported tool: {s}", .{call.name}));
     if (ctx.tool_registry.tools.len != 1 or
         !std.mem.eql(u8, spec.name, "shell") or
         spec.executor_kind != .run_command or
         spec.runtime_provider != .run_command)
     {
-        return semanticFailure(try std.fmt.allocPrint(arena, "Unsupported tool: {s}", .{call.name}));
+        return semanticFailure(try arena.print("Unsupported tool: {s}", .{call.name}));
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
@@ -739,7 +748,6 @@ fn executeWorkspaceToolCallInner(
         dispatch_ctx,
         ctx.tool_registry,
         call,
-        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
@@ -748,7 +756,6 @@ fn executeWorkspaceToolCallInner(
     var execution = command_backend.completion orelse
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     return execution;
 }
 
@@ -775,7 +782,7 @@ fn resolveToolDispatchPrelude(
             try tool_mcp_runtime.notSelectedOutput(arena, call.name),
         ) },
         .unsupported => .{ .completed = semanticFailure(
-            try std.fmt.allocPrint(arena, "Unsupported tool: {s}", .{call.name}),
+            try arena.print("Unsupported tool: {s}", .{call.name}),
         ) },
     };
 }
@@ -791,13 +798,13 @@ fn emitMcpProgress(raw_context: *anyopaque, progress: tool_mcp_runtime.Progress)
     const text = if (progress.message) |message|
         text_utils.clippedLabel(&clipped_buf, message, clipped_buf.len)
     else if (progress.total) |total|
-        std.fmt.bufPrint(
+        std.mem.print(
             &generated_buf,
             "MCP progress {d:.2}/{d:.2}",
             .{ progress.progress, total },
         ) catch "MCP progress"
     else
-        std.fmt.bufPrint(
+        std.mem.print(
             &generated_buf,
             "MCP progress {d:.2}",
             .{progress.progress},
@@ -852,6 +859,8 @@ fn executeRegisteredTool(
     dispatch_ctx.result_commit_sink = &result_commit_token;
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
+        .observer = ctx.observer,
+        .call_id = call.id,
         .expected_runtime_generation = ctx.expected_mcp_runtime_generation,
         .expected_binding = ctx.expected_mcp_binding,
         .cancel_flag = dispatch_ctx.cancel_flag,
@@ -892,7 +901,6 @@ fn executeRegisteredTool(
         dispatch_ctx,
         registry,
         call,
-        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
@@ -915,7 +923,6 @@ fn executeRegisteredTool(
     else
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     if (mcp_call_status == .input_required or
         (execution.status == .failure and
             tool_mcp_feature_dispatch.isInputRequiredFailure(execution.model_output)))
@@ -977,7 +984,6 @@ fn executeRunCommandBackend(
 
 const DispatchMetadata = struct {
     model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
-    status_detail: ?[]u8 = null,
     inner_usage: ?types.ToolUsage = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
@@ -1009,7 +1015,6 @@ fn toolExecutionResultFromDispatch(
         .success => .{
             .model_content_kind = metadata.model_content_kind,
             .model_output = result.body,
-            .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
@@ -1020,7 +1025,6 @@ fn toolExecutionResultFromDispatch(
         .failure => .{
             .status = .failure,
             .model_output = result.body,
-            .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
@@ -1035,6 +1039,34 @@ pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, k
     const runtime = ctx.mcp_ctx orelse return .unavailable;
     const snapshot = ctx.mcp_snapshot_tool orelse return .unavailable;
     return snapshot(runtime, arena, name, known, ctx.permission_rules, ctx.context_limits, ctx.mcp_access);
+}
+
+/// Resolves the exact exposed name of a live MCP tool the model called
+/// without selecting it. Returns null for unknown, denied, inaccessible, or
+/// oversized definitions. The result is allocated in `arena`.
+pub fn resolveUnselectedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const runtime_context = ctx.mcp_ctx orelse return null;
+    const schema_fn = ctx.mcp_tool_schema orelse return null;
+    const projection = (schema_fn(
+        runtime_context,
+        arena,
+        name,
+        ctx.permission_rules,
+        ctx.context_limits,
+        ctx.mcp_access,
+        runtimeCancelFlag(ctx),
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => return null,
+    }) orelse return null;
+    return switch (projection) {
+        .selected => |payload| .{
+            .name = name,
+            .schema_json = payload.model_output,
+            .mcp_binding = payload.mcp_binding,
+        },
+        .rejected => null,
+    };
 }
 
 fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolExecutionResult {
@@ -1134,6 +1166,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         ctx.web_search_runtime_ready and ctx.web_search_backend != null;
     return .{
         .allocator = arena,
+        .observer = ctx.observer,
         .permission_mode = ctx.permission_mode,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.access_scope,
@@ -1309,6 +1342,8 @@ fn executeVisionRequest(
     authority: command_admission.ToolExecutionAuthority,
 ) !ToolExecutionResult {
     const config: vision_executor.Config = .{
+        .observer = state.runtime.observer,
+        .parent_call_id = if (state.runtime.output_chunk_lifecycle_id) |id| id.call_id else null,
         .stream_provider = state.runtime.agent_stream_provider,
         .api_key = state.runtime.api_key,
         .credential_source = state.runtime.credential_source,
@@ -1316,8 +1351,6 @@ fn executeVisionRequest(
         .session_id = state.runtime.lifecycle_scope.session_id,
         .retry_count = state.runtime.gateway_retry_count,
         .cancel_flag = state.runtime.cancel_flag,
-        .usage = &state.runtime.session.usage,
-        .usage_allocator = state.runtime.session_allocator,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
     };
@@ -1534,7 +1567,7 @@ fn toolRunCommand(
     const command_ctx = command_admission.CommandContext{
         .command = command,
         .resolved_cwd = cwd,
-        .target_os = builtin.os.tag,
+        .target_os = builtin.target.os.tag,
         .environment = request.environment,
     };
     const timeout = try effectiveCommandTimeout(
@@ -1551,7 +1584,7 @@ fn toolRunCommand(
         if (ctx.command_replay_capture) |capture| capture.policy() else null,
     );
 
-    if (comptime builtin.os.tag == .wasi or builtin.is_test) {
+    if (comptime builtin.target.os.tag == .wasi or builtin.is_test) {
         if (ctx.workspace_executor) |executor| {
             return executeWorkspaceRunCommand(
                 arena,
@@ -1563,7 +1596,7 @@ fn toolRunCommand(
             );
         }
     }
-    if (comptime builtin.os.tag == .wasi) return error.WorkspaceUnavailable;
+    if (comptime builtin.target.os.tag == .wasi) return error.WorkspaceUnavailable;
 
     try execution_router.validateConfigContext(.{
         .max_command_output_bytes = ctx.max_command_output_bytes,
@@ -2068,7 +2101,7 @@ const SubagentProgressBridge = struct {
         if (status_line.len == 0) return;
         const first_line = (tool_presentation.formatSubagentPlainAction(self.alloc, self.call, .active) catch return) orelse return;
         defer self.alloc.free(first_line);
-        const row = std.fmt.allocPrint(self.alloc, "● {s}\n  {s}", .{ first_line, status_line }) catch return;
+        const row = self.alloc.print("● {s}\n  {s}", .{ first_line, status_line }) catch return;
         defer self.alloc.free(row);
         self.progress_fn(self.progress_ctx, self.lifecycle_id, row);
     }
@@ -2079,7 +2112,7 @@ test "subagent progress publishes a complete two-line lifecycle row" {
         text: ?[]u8 = null,
 
         fn render(_: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
-            return std.fmt.bufPrint(buf, "{s} · {s} · {s} · {d}k", .{ status.model, status.effort.displayLabel(), status.session_title orelse "missing", status.input_tokens / 1000 }) catch "";
+            return std.mem.print(buf, "{s} · {s} · {s} · {d}k", .{ status.model, status.effort.displayLabel(), status.session_title orelse "missing", status.input_tokens / 1000 }) catch "";
         }
 
         fn publish(raw: *anyopaque, _: types.ToolLifecycleId, text: []const u8) void {
@@ -2155,6 +2188,7 @@ fn executeSubagentProvider(
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
     const output = host.executeManaged(arena, request, .{
+        .observer = ctx.observer,
         .caller_id = caller_id,
         .invocation_id = invocation_id,
         .parent_permission_mode = ctx.permission_mode,
@@ -2166,6 +2200,7 @@ fn executeSubagentProvider(
             .model = ctx.model,
             .effort = ctx.effort,
             .fast_mode = ctx.fast_mode,
+            .ultrafast_mode = ctx.ultrafast_mode,
             .conversation_language = ctx.session.languageSnapshot(),
         },
         .max_result_bytes = ctx.max_tool_result_bytes,
@@ -2318,7 +2353,6 @@ const test_captured_shell = blk: {
     tool.call = callTestCapturedShell;
     tool.captured_command_fn = null;
     tool.process_local_fn = null;
-    tool.authorized_result_mapper = null;
     tool.reads_only_fn = testCapturedShellFalse;
     tool.irreversible_fn = testCapturedShellFalse;
     break :blk tool;
@@ -2424,6 +2458,7 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
 }
 
 const TestRuntime = struct {
+    observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     worker: WorkerRuntime = .{},
@@ -2499,6 +2534,7 @@ const TestRuntime = struct {
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
             .agent_stream_provider = self.agent_stream_provider,
+            .observer = self.observer,
             .gateway_team = self.gateway_team,
             .provider = self.provider,
             .provider_capabilities = self.provider_capabilities,
@@ -2866,7 +2902,7 @@ fn expectToolErrorDetailInt(json: []const u8, field: []const u8, expected: i64) 
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| {
+    if (std.Io.Dir.path.dirname(path)) |parent| {
         try dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try dir.createFile(std.testing.io, path, .{ .truncate = true });
@@ -2875,7 +2911,7 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
 }
 
 fn writeLargeTestFile(dir: std.Io.Dir, path: []const u8, prefix: []const u8, fill_len: usize) !void {
-    if (std.fs.path.dirname(path)) |parent| {
+    if (std.Io.Dir.path.dirname(path)) |parent| {
         try dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try dir.createFile(std.testing.io, path, .{ .truncate = true });
@@ -3081,7 +3117,7 @@ test "removed tool names are not callable" {
             .arguments_json = "{\"query\":\"review runtime\"}",
         });
         try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-        const expected = try std.fmt.allocPrint(arena, "Unsupported tool: {s}", .{name});
+        const expected = try arena.print("Unsupported tool: {s}", .{name});
         try std.testing.expectEqualStrings(expected, result.model_output);
     }
 }
@@ -3968,12 +4004,11 @@ test "local file mutations bypass review while external mutations use exact revi
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const targets = [_][]const u8{
-        try std.fs.path.join(arena, &.{ workspace, "approved-local.txt" }),
-        try std.fs.path.join(arena, &.{ external, "approved-external.txt" }),
+        try std.Io.Dir.path.join(arena, &.{ workspace, "approved-local.txt" }),
+        try std.Io.Dir.path.join(arena, &.{ external, "approved-external.txt" }),
     };
     for (targets, 0..) |target, index| {
-        const args = try std.fmt.allocPrint(
-            arena,
+        const args = try arena.print(
             "{{\"path\":\"{s}\",\"content\":\"alpha\\nbeta\\n\"}}",
             .{target},
         );
@@ -4018,14 +4053,13 @@ test "main file mutation producer rejects wildcard-bearing grant roots before pr
     for ([_]u8{ '*', '?' }) |wildcard| {
         for ([_]Scope{ .workspace, .external }) |scope| {
             const prefix = if (scope == .workspace) "workspace" else "external";
-            const dir_name = try std.fmt.allocPrint(
-                arena,
+            const dir_name = try arena.print(
                 "{s}{c}literal",
                 .{ prefix, wildcard },
             );
             try tmp.dir.createDirPath(io_mod.getIo(), dir_name);
             const literal_root = try io_mod.dirRealpathAlloc(arena, tmp.dir, dir_name);
-            const edit_path = try std.fs.path.join(arena, &.{ dir_name, "edit.txt" });
+            const edit_path = try std.Io.Dir.path.join(arena, &.{ dir_name, "edit.txt" });
             {
                 var file = try tmp.dir.createFile(
                     io_mod.getIo(),
@@ -4038,7 +4072,7 @@ test "main file mutation producer rejects wildcard-bearing grant roots before pr
 
             for ([_]file_mutation_contract.Kind{ .write, .edit }) |kind| {
                 const basename = if (kind == .write) "write.txt" else "edit.txt";
-                const target_path = try std.fs.path.join(
+                const target_path = try std.Io.Dir.path.join(
                     arena,
                     &.{ literal_root, basename },
                 );
@@ -4118,19 +4152,19 @@ test "main file mutation prompts project producer-backed workspace and external 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const workspace_write = try std.fs.path.join(
+    const workspace_write = try std.Io.Dir.path.join(
         arena,
         &.{ workspace, "write.txt" },
     );
-    const workspace_edit = try std.fs.path.join(
+    const workspace_edit = try std.Io.Dir.path.join(
         arena,
         &.{ workspace, "edit.txt" },
     );
-    const external_write = try std.fs.path.join(
+    const external_write = try std.Io.Dir.path.join(
         arena,
         &.{ external, "write.txt" },
     );
-    const external_edit = try std.fs.path.join(
+    const external_edit = try std.Io.Dir.path.join(
         arena,
         &.{ external, "edit.txt" },
     );
@@ -4150,13 +4184,11 @@ test "main file mutation prompts project producer-backed workspace and external 
         std.Io.Dir.max_path_bytes,
         max_edit_path.len,
     );
-    const workspace_pattern = try std.fmt.allocPrint(
-        arena,
+    const workspace_pattern = try arena.print(
         "{s}/**",
         .{workspace},
     );
-    const external_pattern = try std.fmt.allocPrint(
-        arena,
+    const external_pattern = try arena.print(
         "{s}/**",
         .{external},
     );
@@ -4367,12 +4399,11 @@ test "file mutation lifecycle decodes each call at most once" {
         .pattern = @constCast("**"),
         .action = .deny,
     }};
-    const prompted_target = try std.fs.path.join(
+    const prompted_target = try std.Io.Dir.path.join(
         call_arena,
         &.{ external, "prompted.txt" },
     );
-    const prompted_args = try std.fmt.allocPrint(
-        call_arena,
+    const prompted_args = try call_arena.print(
         "{{\"path\":\"{s}\",\"content\":\"prompted\"}}",
         .{prompted_target},
     );
@@ -4538,12 +4569,11 @@ test "file mutation preflight separates edit approval from equality disclosure" 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const private_target = try std.fs.path.join(
+    const private_target = try std.Io.Dir.path.join(
         arena,
         &.{ external, "private.txt" },
     );
-    const private_pattern = try std.fmt.allocPrint(
-        arena,
+    const private_pattern = try arena.print(
         "{s}/**",
         .{external},
     );
@@ -4559,13 +4589,11 @@ test "file mutation preflight separates edit approval from equality disclosure" 
             .action = .allow,
         },
     };
-    const private_noop_args = try std.fmt.allocPrint(
-        arena,
+    const private_noop_args = try arena.print(
         "{{\"path\":\"{s}\",\"content\":\"private\\n\"}}",
         .{private_target},
     );
-    const private_changed_args = try std.fmt.allocPrint(
-        arena,
+    const private_changed_args = try arena.print(
         "{{\"path\":\"{s}\",\"content\":\"changed\\n\"}}",
         .{private_target},
     );
@@ -4658,7 +4686,7 @@ test "disabled automatic reviewer returns a recoverable denial without a human p
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const target = try std.fs.path.join(arena, &.{ external, "created.txt" });
+    const target = try std.Io.Dir.path.join(arena, &.{ external, "created.txt" });
     {
         var existing = try tmp.dir.createFile(
             io_mod.getIo(),
@@ -4668,7 +4696,7 @@ test "disabled automatic reviewer returns a recoverable denial without a human p
         defer existing.close(io_mod.getIo());
         try existing.writeStreamingAll(io_mod.getIo(), "before");
     }
-    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"hello\"}}", .{target});
+    const args = try arena.print("{{\"path\":\"{s}\",\"content\":\"hello\"}}", .{target});
 
     const outcome = try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "external-write",
@@ -4788,7 +4816,7 @@ test "executeToolCall rejects overlong glob pattern with failure status" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const args = try std.fmt.allocPrint(arena, "{{\"pattern\":\"{s}\"}}", .{pattern});
+    const args = try arena.print("{{\"pattern\":\"{s}\"}}", .{pattern});
 
     const result = try executeToolCall(rt.context(), arena, .{
         .id = "glob",
@@ -4797,7 +4825,7 @@ test "executeToolCall rejects overlong glob pattern with failure status" {
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    const expected = try std.fmt.allocPrint(arena, "glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
+    const expected = try arena.print("glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
     try std.testing.expectEqualStrings(expected, result.model_output);
 }
 
@@ -4809,7 +4837,7 @@ test "executeToolCall glob_files finds match beyond former traversal cap" {
     var i: usize = 0;
     while (i < 2050) : (i += 1) {
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "workspace/many/file-{d:0>4}.txt", .{i});
+        const name = try std.mem.print(&name_buf, "workspace/many/file-{d:0>4}.txt", .{i});
         try writeTestFile(tmp.dir, name, "not here\n");
     }
     try writeTestFile(tmp.dir, "workspace/zzzz/target.zig", "target\n");
@@ -4873,7 +4901,7 @@ test "executeToolCall traces non-text grep skips in normal runtime" {
     try writeTestFile(tmp.dir, "workspace/binaryish/blob.bin", "binary\x00needle\x01\n");
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4900,14 +4928,14 @@ test "executeToolCall traces non-text grep skips in normal runtime" {
     try expectContains(trace, "binaryish/blob.bin");
 }
 
-test "executeToolCall traces oversized grep skips in normal runtime" {
+test "executeToolCall searches large files in normal runtime" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeLargeTestFile(tmp.dir, "workspace/oversized/huge.txt", "needle hidden\n", 260 * 1024);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4925,13 +4953,13 @@ test "executeToolCall traces oversized grep skips in normal runtime" {
         .arguments_json = "{\"pattern\":\"needle\",\"path\":\"oversized\"}",
     });
 
+    // A 260 KiB file, its second line one long run, is searched in full.
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expectEqualStrings("[grep] no matches for needle\n", result.model_output);
+    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - oversized/huge.txt:1: needle hidden\n", result.model_output);
 
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
-    try expectContains(trace, "grep_files skipped oversized file path=");
-    try expectContains(trace, "oversized/huge.txt");
+    try std.testing.expect(std.mem.find(u8, trace, "grep_files skipped") == null);
 }
 
 test "executeToolCall returns failure status for missing grep path" {
@@ -5092,7 +5120,7 @@ test "command replay policy is decided once from typed execution context" {
 }
 
 test "terminal exec request timeout reaches execution without an ambient timeout" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var rt = TestRuntime{};
@@ -5115,7 +5143,7 @@ test "terminal exec request timeout reaches execution without an ambient timeout
 }
 
 test "saved noninteractive terminal exec captures replay by capability" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5207,8 +5235,7 @@ test "registered read_tool_result restores an omitted stored-result suffix" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const arguments_json = try std.fmt.allocPrint(
-        arena,
+    const arguments_json = try arena.print(
         "{{\"handle\":\"{s}\",\"query\":\"suffix needle\"}}",
         .{suffixless_handle},
     );
@@ -5225,7 +5252,7 @@ test "registered read_tool_result restores an omitted stored-result suffix" {
 }
 
 test "no-save terminal exec publishes one readable ephemeral replay" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
     const read_tool_result = @import("../../tools/session/read_tool_result.zig");
@@ -5284,8 +5311,7 @@ test "no-save terminal exec publishes one readable ephemeral replay" {
         .unavailable => return error.TestExpectedReplay,
     };
     try std.testing.expect(std.mem.find(u8, prepared.model_output, descriptor.handle) != null);
-    const read_arguments = try std.fmt.allocPrint(
-        arena,
+    const read_arguments = try arena.print(
         "{{\"handle\":\"{s}\",\"start_byte\":1,\"byte_count\":4096}}",
         .{descriptor.handle},
     );
@@ -5319,7 +5345,7 @@ test "no-save terminal exec publishes one readable ephemeral replay" {
 }
 
 test "required replay spill failure returns recoverable capture failure" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var store = command_replay_store.EphemeralStore.initForTesting(
@@ -5350,7 +5376,7 @@ test "required replay spill failure returns recoverable capture failure" {
 }
 
 test "run_command timeout returns model-visible failure" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5559,7 +5585,7 @@ test "run_command timeout returns model-visible failure" {
 
 test "interactive command replay capture allocation fails open" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     const init = try initCommandReplayCapture(
@@ -5640,7 +5666,7 @@ test "required replay finalizer overrides every recoverable command result" {
 }
 
 test "run_command post-spawn cancellation returns structured evidence in every mode" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5664,9 +5690,8 @@ test "run_command post-spawn cancellation returns structured evidence in every m
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const interactive_marker = try std.fs.path.join(arena, &.{ workspace, "interactive-ready" });
-    const interactive_command = try std.fmt.allocPrint(
-        arena,
+    const interactive_marker = try std.Io.Dir.path.join(arena, &.{ workspace, "interactive-ready" });
+    const interactive_command = try arena.print(
         "trap 'exit 0' TERM; printf ready > '{s}'; printf 'RUNTIME-READY\\n'; while :; do :; done",
         .{interactive_marker},
     );
@@ -5696,9 +5721,8 @@ test "run_command post-spawn cancellation returns structured evidence in every m
 
     cancel.store(false, .seq_cst);
     rt.interactive = false;
-    const headless_marker = try std.fs.path.join(arena, &.{ workspace, "headless-ready" });
-    const headless_command = try std.fmt.allocPrint(
-        arena,
+    const headless_marker = try std.Io.Dir.path.join(arena, &.{ workspace, "headless-ready" });
+    const headless_command = try arena.print(
         "trap 'exit 0' TERM; printf ready > '{s}'; printf 'HEADLESS-READY\\n'; while :; do :; done",
         .{headless_marker},
     );
@@ -5765,7 +5789,7 @@ test "run_command post-spawn cancellation returns structured evidence in every m
 }
 
 test "run_command success exposes structured foreground metadata" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var rt = TestRuntime{
         .permission_mode = .auto,
@@ -5936,7 +5960,7 @@ test "browser run_command maps host cancellation and deadline without signal or 
 }
 
 test "run_command preserves result when presentation callback fails" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const FailOutput = struct {
         calls: usize = 0,
@@ -5973,7 +5997,7 @@ test "run_command preserves result when presentation callback fails" {
 }
 
 test "run_command returns model output and structured metadata" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var rt = TestRuntime{
         .permission_mode = .auto,
@@ -6004,7 +6028,7 @@ test "run_command returns model output and structured metadata" {
 }
 
 test "run_command nonzero exit returns structured masked failure" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var rt = TestRuntime{
         .permission_mode = .auto,
@@ -6043,7 +6067,7 @@ test "run_command nonzero exit returns structured masked failure" {
 }
 
 test "run_command huge output exposes truncation and artifact paths without stdout body" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6367,7 +6391,7 @@ const McpFixture = struct {
     }
 
     fn search(_: *anyopaque, arena: Allocator, request: capability_retrieval.Request, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
-        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{request.query.raw}) };
+        return .{ .model_output = try arena.print("{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{request.query.raw}) };
     }
 
     fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
@@ -6695,7 +6719,7 @@ test "install_skill explicit tool installs local skill source" {
 
     var rt = TestRuntime{ .workspace_root = repo_root, .skills_dir = skills_dir };
     defer rt.deinit(alloc);
-    const args_json = try std.fmt.allocPrint(alloc, "{{\"source\":\"{s}\",\"skill\":\"workflow\"}}", .{repo_root});
+    const args_json = try alloc.print("{{\"source\":\"{s}\",\"skill\":\"workflow\"}}", .{repo_root});
     defer alloc.free(args_json);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -6707,7 +6731,7 @@ test "install_skill explicit tool installs local skill source" {
     try expectNotContains(result.model_output, "BODY SENTINEL");
     try std.testing.expect(std.mem.find(u8, result.model_output, "workflow\"<injected>") == null);
 
-    const installed = try std.fs.path.join(alloc, &.{ skills_dir, "workflow", "SKILL.md" });
+    const installed = try std.Io.Dir.path.join(alloc, &.{ skills_dir, "workflow", "SKILL.md" });
     defer alloc.free(installed);
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), installed, .{});
     defer file.close(io_mod.getIo());
@@ -6732,7 +6756,7 @@ test "skill tool preserves resource and discovery notices separately" {
         defer file.close(io_mod.getIo());
         try file.writeStreamingAll(
             io_mod.getIo(),
-            "---\nname: workflow\ndescription: workflow helper\n---\n\nuse the workflow skill\n" ++ ("bounded instruction line\n" ** 8),
+            "---\nname: workflow\ndescription: workflow helper\n---\n\nuse the workflow skill\n" ++ text_utils.repeat("bounded instruction line\n", 8),
         );
     }
     {
@@ -6834,7 +6858,7 @@ test "skill tool loads the exact advertised duplicate and rejects ambiguous or u
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const exact_managed_args = try std.fmt.allocPrint(arena, "{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{managed_skill});
+    const exact_managed_args = try arena.print("{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{managed_skill});
     const exact = try executeToolCall(rt.context(), arena, .{ .id = "exact", .name = "skill", .arguments_json = exact_managed_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, exact.status);
     try expectContains(exact.model_output, "MANAGED BODY B");
@@ -6853,13 +6877,13 @@ test "skill tool loads the exact advertised duplicate and rejects ambiguous or u
     try expectContains(ambiguous.model_output, workspace_skill);
     try expectContains(ambiguous.model_output, managed_skill);
 
-    const outside_args = try std.fmt.allocPrint(arena, "{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{outside_skill});
+    const outside_args = try arena.print("{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{outside_skill});
     const outside = try executeToolCall(rt.context(), arena, .{ .id = "outside", .name = "skill", .arguments_json = outside_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, outside.status);
     try expectNotContains(outside.model_output, "OUTSIDE BODY SENTINEL");
     try expectNotContains(outside.model_output, "outside-only.txt");
 
-    const mismatch_args = try std.fmt.allocPrint(arena, "{{\"name\":\"other\",\"location\":\"{s}\"}}", .{managed_skill});
+    const mismatch_args = try arena.print("{{\"name\":\"other\",\"location\":\"{s}\"}}", .{managed_skill});
     const mismatch = try executeToolCall(rt.context(), arena, .{ .id = "mismatch", .name = "skill", .arguments_json = mismatch_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, mismatch.status);
     try expectContains(mismatch.model_output, "does not match");
@@ -7013,8 +7037,7 @@ const VisionGatewayFixture = struct {
         try request.admission.admit();
         request.delivery.markPossiblySent();
         if (response.status != .ok) return .{ .failed = .{ .kind = .provider_error } };
-        const credential_source = request.credential.credentialSource() orelse
-            return error.MissingCredentialSource;
+        if (request.credential.credentialSource() == null) return error.MissingCredentialSource;
         return .{ .completed = .{
             .completion = .{
                 .content = response.content,
@@ -7022,17 +7045,6 @@ const VisionGatewayFixture = struct {
                 .finish_reason = .stop,
                 .usage = response.usage,
             },
-            .usage = .{ .deferred = .{
-                .provider = .gateway,
-                .generation_id = response.generation_id orelse "gen_test",
-                .scope = "https://ai-gateway.vercel.sh",
-                .tenant = request.credential.tenant(),
-                .credential_source = credential_source,
-                .credential_identity = credential_authority.derive(
-                    credential_source,
-                    request.credential.accountId(),
-                ),
-            } },
         } };
     }
 };
@@ -7048,10 +7060,10 @@ fn makeVisionCatalog(
     errdefer for (catalog[0..initialized]) |image| types.freeImageAttachment(alloc, image);
     const root = try io_mod.dirRealpathAlloc(alloc, dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
     for (catalog, 0..) |*image, index| {
-        const name = try std.fmt.allocPrint(alloc, "vision-{d}.png", .{index + 1});
+        const name = try alloc.print("vision-{d}.png", .{index + 1});
         defer alloc.free(name);
         try dir.writeFile(io_mod.getIo(), .{ .sub_path = name, .data = "\x89PNG\r\n\x1a\nimage bytes" });
         const path = try io_mod.dirRealpathAlloc(alloc, dir, name);
@@ -7220,7 +7232,7 @@ test "Codex vision calls fail before provider access" {
 
 fn visionRequestAllocationCount(args_json: []const u8) !usize {
     var probe = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .resize_fail_index = 0 },
     );
     const alloc = probe.allocator();
@@ -7232,7 +7244,7 @@ fn visionRequestAllocationCount(args_json: []const u8) !usize {
 
 fn visionProviderParseAllocationCount(provider_json: []const u8) !usize {
     var probe = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .resize_fail_index = 0 },
     );
     const alloc = probe.allocator();
@@ -7251,7 +7263,7 @@ fn visionAllocationIndexAtGateway(
     args_json: []const u8,
     provider_json: []const u8,
 ) !usize {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var probe = std.testing.FailingAllocator.init(
         base,
         .{ .resize_fail_index = 0 },
@@ -7369,7 +7381,7 @@ fn expectVisionOutOfMemoryAt(
     args_json: []const u8,
     provider_json: []const u8,
 ) !void {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var failing = OneShotFailingAllocator.init(base, fail_index);
     const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
     var fixture = VisionGatewayFixture{ .alloc = base, .responses = &responses };
@@ -7474,7 +7486,7 @@ test "vision parsed record transfer allocation failure releases the parsed owner
     );
 }
 
-test "vision authorized catalog retains historical access outside budgeted model history" {
+test "vision authorized catalog retains historical access outside compacted model history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7486,6 +7498,11 @@ test "vision authorized catalog retains historical access outside budgeted model
             .user = .{ .text = @constCast("historical turn"), .images = source_images },
             .assistant = @constCast("historical answer"),
         } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("historical turn inspected an image"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("newer turn without images") },
             .assistant = @constCast("newer answer"),
@@ -7493,17 +7510,19 @@ test "vision authorized catalog retains historical access outside budgeted model
     };
     const catalog = try session_runtime.collect_image_catalog(alloc, &history, &.{});
     defer types.freeImageAttachmentSlice(alloc, catalog);
-    var budget_arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer budget_arena_state.deinit();
-    var budgeted_messages: std.ArrayList(ChatMessage) = .empty;
-    try session_runtime.appendHistoryChatMessagesBudgeted(
-        budget_arena_state.allocator(),
-        &budgeted_messages,
+    var context_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer context_arena_state.deinit();
+    var context_messages: std.ArrayList(ChatMessage) = .empty;
+    try session_runtime.appendActiveContextHistoryChatMessages(
+        context_arena_state.allocator(),
+        &context_messages,
         &history,
-        .{ .max_tokens = 1 },
+        1,
     );
-    for (budgeted_messages.items) |message| {
+    try std.testing.expect(context_messages.items.len > 0);
+    for (context_messages.items) |message| {
         try std.testing.expectEqual(@as(usize, 0), message.images.len);
+        if (message.content) |content| try std.testing.expect(std.mem.find(u8, content, "historical answer") == null);
     }
 
     const provider_json = try visionProviderSuccess(alloc, &.{41});
@@ -7559,7 +7578,10 @@ test "vision runtime resolves historical authorized images and batches twenty as
     };
     var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &responses };
     defer fixture.deinit();
+    var capture: @import("../agent/runtime/observation_testing.zig").Capture = .{};
+    var observer = capture.observer();
     var rt = TestRuntime{
+        .observer = &observer,
         .agent_stream_provider = fixture.provider(),
         .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
         .api_key = "gateway-key",
@@ -7581,6 +7603,9 @@ test "vision runtime resolves historical authorized images and batches twenty as
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     try std.testing.expectEqual(@as(usize, 3), fixture.call_count);
+    try std.testing.expectEqual(@as(usize, 3), capture.count(.model_start));
+    try std.testing.expectEqual(capture.count(.model_start), capture.count(.model_end));
+    try std.testing.expectEqual(@as(usize, 3), capture.purposes[@backingInt(observation.ModelPurpose.vision)]);
     try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, fixture.payloads.items[0], "\"type\":\"file\""));
     try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, fixture.payloads.items[1], "\"type\":\"file\""));
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, fixture.payloads.items[2], "\"type\":\"file\""));
@@ -7595,16 +7620,13 @@ test "vision runtime resolves historical authorized images and batches twenty as
     }
     var previous_offset: usize = 0;
     for (requested) |image_id| {
-        const needle = try std.fmt.allocPrint(alloc, "\"image_id\":{d}", .{image_id});
+        const needle = try alloc.print("\"image_id\":{d}", .{image_id});
         defer alloc.free(needle);
         const relative = std.mem.findPos(u8, result.model_output, previous_offset, needle) orelse return error.TestExpectedEqual;
         previous_offset = relative + needle.len;
     }
     try std.testing.expectEqual(@as(u64, 18), result.inner_usage.?.input_tokens);
     try std.testing.expectEqual(@as(u64, 23), result.inner_usage.?.output_tokens);
-    var usage_snapshot = try rt.session.usage.snapshot(alloc);
-    defer usage_snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), usage_snapshot.pending.len);
 }
 
 test "vision runtime rejects unauthorized ids before filesystem or provider access" {
@@ -7880,7 +7902,7 @@ test "vision runtime honors configured provider bounds without a hidden twenty K
     defer tmp.cleanup();
     const catalog = try makeVisionCatalog(alloc, tmp.dir, 1);
     defer types.freeImageAttachmentSlice(alloc, catalog);
-    const evidence = "x" ** 3500;
+    const evidence = text_utils.repeat("x", 3500);
     var large_out: std.Io.Writer.Allocating = .init(alloc);
     defer large_out.deinit();
     try large_out.writer.writeAll("{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"large\",\"visible_text\":[");

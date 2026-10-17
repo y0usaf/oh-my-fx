@@ -39,7 +39,6 @@ TRAINING_E2E_TESTS = (
     "mcp-stdio.test.ts",
     "mcp-auth.test.ts",
     "session-recovery.test.ts",
-    "terminal-host.test.ts",
     "tui-startup.test.ts",
     "permission-errors.test.ts",
     "tui-resize.test.ts",
@@ -56,15 +55,18 @@ TRAINING_E2E_TESTS = (
 VERIFICATION_E2E_TESTS = (
     "slack-install.test.ts",
     "auto-mode-reliability.test.ts",
+    "sessions-v2.test.ts",
     "review-model-override.test.ts",
     "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
+    "mcp-verbs.test.ts",
     "tui-auth-source-selection.test.ts",
     "tui-compaction-activity.test.ts",
     "compaction-policy.test.ts",
     "tui-composer-edit-contracts.test.ts",
-    "tui-cost.test.ts",
+    "tui-usage.test.ts",
     "tui-decision-prompts.test.ts",
+    "poisoned-repository.test.ts",
     "tui-file-picker.test.ts",
     "tui-input-line-delete.test.ts",
     "tui-input-navigation.test.ts",
@@ -73,6 +75,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-slash-commands.test.ts",
     "tui-slash-extra.test.ts",
     "tui-slash-menu.test.ts",
+    "ultrafast-fake-gateway.test.ts",
     "web-fetch-permission-progress.test.ts",
     "web-search-permission-progress.test.ts",
     "yolo-permission-mode.test.ts",
@@ -370,8 +373,8 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(57, len(corpus.candidate_scenarios))
+        self.assertEqual(35, len(corpus.scenarios))
+        self.assertEqual(61, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

@@ -107,7 +107,7 @@ pub fn formatLocalTime(_: RealHost, allocator: std.mem.Allocator, timestamp: i64
     if (local_result == null) return error.Unexpected;
     if (format.len == 0) return allocator.dupe(u8, "");
 
-    const format_z = try allocator.dupeZ(u8, format);
+    const format_z = try allocator.dupeSentinel(u8, format, 0);
     defer allocator.free(format_z);
     const minimum_len = std.math.add(usize, format.len, 1) catch return error.OutOfMemory;
     if (minimum_len > local_time_max_buffer_len) return error.Unexpected;
@@ -1176,7 +1176,7 @@ fn linuxListDir(allocator: std.mem.Allocator, path: []const u8) ListDirError!hos
 
 fn linuxGetDents(fd: i32, buffer: []u8) ListDirError!usize {
     while (true) {
-        const rc = std.os.linux.getdents64(fd, buffer.ptr, buffer.len);
+        const rc = std.os.linux.getdents64(fd, buffer.ptr, @intCast(buffer.len));
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => return rc,
             .INTR => continue,
@@ -1357,7 +1357,7 @@ fn linuxWait(pid: host.Pid) WaitError!host.WaitStatus {
     const linux = std.os.linux;
     var status: u32 = 0;
     while (true) {
-        const wait_rc = linux.waitpid(pid, &status, 0);
+        const wait_rc = linux.waitpid(pid, @ptrCast(&status), 0);
         switch (linux.errno(wait_rc)) {
             .SUCCESS => return decodeWaitStatus(status),
             .INTR => continue,
@@ -1370,7 +1370,7 @@ fn linuxWaitNonBlocking(pid: host.Pid) WaitError!?host.WaitStatus {
     const linux = std.os.linux;
     var status: u32 = 0;
     while (true) {
-        const wait_rc = linux.waitpid(pid, &status, linux.W.NOHANG | linux.W.UNTRACED);
+        const wait_rc = linux.waitpid(pid, @ptrCast(&status), linux.W.NOHANG | linux.W.UNTRACED);
         switch (linux.errno(wait_rc)) {
             .SUCCESS => return if (wait_rc == 0) null else decodeWaitStatus(status),
             .INTR => continue,
@@ -1383,7 +1383,7 @@ fn linuxWaitJobEvent(pid: host.Pid) WaitError!host.WaitStatus {
     const linux = std.os.linux;
     var status: u32 = 0;
     while (true) {
-        const wait_rc = linux.waitpid(pid, &status, linux.W.UNTRACED);
+        const wait_rc = linux.waitpid(pid, @ptrCast(&status), linux.W.UNTRACED);
         switch (linux.errno(wait_rc)) {
             .SUCCESS => return decodeWaitStatus(status),
             .INTR => continue,
@@ -1396,7 +1396,7 @@ fn linuxWaitJobEventInterruptible(pid: host.Pid) WaitError!host.WaitStatus {
     const linux = std.os.linux;
     var status: u32 = 0;
     while (true) {
-        const wait_rc = linux.waitpid(pid, &status, linux.W.UNTRACED);
+        const wait_rc = linux.waitpid(pid, @ptrCast(&status), linux.W.UNTRACED);
         switch (linux.errno(wait_rc)) {
             .SUCCESS => return decodeWaitStatus(status),
             .INTR => if (peekPendingSignal()) |signal| return .{ .signaled = signal } else continue,
@@ -1409,7 +1409,7 @@ fn linuxWaitInterruptible(pid: host.Pid) WaitError!host.WaitStatus {
     const linux = std.os.linux;
     var status: u32 = 0;
     while (true) {
-        const wait_rc = linux.waitpid(pid, &status, 0);
+        const wait_rc = linux.waitpid(pid, @ptrCast(&status), 0);
         switch (linux.errno(wait_rc)) {
             .SUCCESS => return decodeWaitStatus(status),
             .INTR => if (peekPendingSignal()) |signal| return .{ .signaled = signal } else continue,

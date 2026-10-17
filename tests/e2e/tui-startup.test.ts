@@ -11,7 +11,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  hasEmptyComposer,
+  startDynamicFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
@@ -40,7 +47,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 34", 5_000);
+      const pane = await session.waitForText("Commands 37", 5_000);
       expect(pane).toContain("[All]");
       expect(pane).toContain("tab category");
       expect(pane).toContain("enter open");
@@ -199,10 +206,11 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 30,
         });
 
-        await session.waitForPane(
+        const initial = await session.waitForPane(
           (pane) => pane.includes("status-root") && pane.includes("initial-branch"),
           10_000,
         );
+        expect(initial).not.toContain("⚡︎");
 
         writeFileSync(headPath, "ref: refs/heads/refreshed-branch\n");
         await session.resizeWindow(101, 30);
@@ -217,7 +225,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
 
         await session.resizeWindow(50, 30);
         const narrow = await session.waitForPane(
-          (pane) => pane.includes("s-root") && pane.includes("detached:"),
+          (pane) => pane.includes("s-root") && pane.includes("detached"),
           5_000,
         );
         expect(narrow).not.toContain("initial-branch");
@@ -296,6 +304,239 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "/new preserves the visible transcript in terminal scrollback",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-scrollback-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+      const banner = `𝒇x v${version} · Run /help for commands`;
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_RECORD: tapePath,
+            FX_RECORD_INPUT: "1",
+            FX_DEBUG_RECORD_SILENT_BANNER: "1",
+          },
+          stderrPath,
+          width: 80,
+          height: 18,
+        });
+        await session.waitForComposer(10_000);
+        for (let i = 0; i < 8; i++) {
+          await session.sendText("/status");
+          await session.waitForComposer(5_000);
+        }
+        const before = await session.captureFullScrollback();
+        const lastStatus = before.slice(before.lastIndexOf("* status:"));
+        expect(lastStatus).toContain("agent_step_limit=0");
+
+        await session.sendText("/new");
+        await session.waitForPane(
+          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          5_000,
+        );
+        const after = await session.captureFullScrollback();
+        const priorStatus = after.slice(after.lastIndexOf("* status:"), after.lastIndexOf(banner)).trimEnd();
+        expect(priorStatus).toBe(lastStatus.split("\n┃")[0]?.trimEnd());
+        expect(priorStatus).not.toContain("Commands 1");
+        expect(priorStatus).not.toContain("run /login ·");
+        expect(await session.capturePane()).not.toContain("model=");
+        const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
+        expect(replay.frame_count).toBeGreaterThan(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/new keeps a completed reply in scrollback and starts the next prompt fresh",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-reply-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIXTURE_REPLY_OK"));
+      const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+      const banner = `𝒇x v${version} · Run /help for commands`;
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            AI_GATEWAY_API_KEY: "new-fixture-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          stderrPath,
+          width: 100,
+          height: 24,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("first fixture prompt");
+        await session.waitForText("FIXTURE_REPLY_OK", 10_000);
+        await session.sendText("/new");
+        await session.waitForPane((pane) => pane.includes(banner) && hasEmptyComposer(pane), 10_000);
+        const history = await session.captureFullScrollback();
+        expect(history.lastIndexOf("FIXTURE_REPLY_OK")).toBeLessThan(history.lastIndexOf(banner));
+        expect(history).toContain("FIXTURE_REPLY_OK");
+
+        await session.sendText("second fixture prompt");
+        await session.waitForText("FIXTURE_REPLY_OK", 10_000);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1].body).toContain("second fixture prompt");
+        expect(gateway.requests[1].body).not.toContain("first fixture prompt");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/new waits for a resize before moving the old transcript into scrollback",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-resize-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "resize.fxtape");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+      const banner = `𝒇x v${version} · Run /help for commands`;
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_RECORD: tapePath,
+            FX_RECORD_INPUT: "1",
+            FX_DEBUG_RECORD_SILENT_BANNER: "1",
+          },
+          stderrPath,
+          width: 80,
+          height: 18,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("/status");
+        await session.waitForPane((pane) => pane.includes("agent_step_limit=0"), 5_000);
+        const before = await session.captureFullScrollback();
+        const expectedStatus = before.slice(before.lastIndexOf("* status:")).split("\n┃")[0]?.trimEnd();
+        expect(expectedStatus).toContain("agent_step_limit=0");
+        session.sendLiteralImmediate("/new");
+        await session.resizeWindow(78, 18, 0);
+        await Bun.sleep(40);
+        session.sendKeysImmediate(["Enter"]);
+
+        await session.waitForPane(
+          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          10_000,
+        );
+        const history = await session.captureFullScrollback();
+        const oldStatus = history.slice(history.lastIndexOf("* status:"), history.lastIndexOf(banner));
+        let lastIndex = -1;
+        for (const field of ["* status:", "permission_mode=auto", "workspace=", "history_turns=0", "session_permission_grants=0", "agent_step_limit=0"]) {
+          const index = oldStatus.indexOf(field);
+          expect(index).toBeGreaterThan(lastIndex);
+          lastIndex = index;
+        }
+        expect(oldStatus.replace(/\s+/g, "")).toBe(expectedStatus?.replace(/\s+/g, ""));
+        expect(oldStatus).not.toContain("Commands 1");
+        expect(oldStatus).not.toContain("run /login ·");
+        expect(session.isAlive()).toBe(true);
+        await session.sendText("/status");
+        await session.waitForPane((pane) => pane.includes("agent_step_limit=0") && hasEmptyComposer(pane), 5_000);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
+        expect(replay.frame_count).toBeGreaterThan(0);
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/quit exits after a fresh-session handoff times out at an invalid terminal size",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-invalid-size-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_TRACE_LOG: tracePath },
+          stderrPath,
+          width: 80,
+          height: 18,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("/status");
+        await session.waitForText("agent_step_limit=0", 5_000);
+        session.sendLiteralImmediate("/new");
+        await session.resizeWindow(78, 3, 0);
+        session.sendKeysImmediate(["Enter"]);
+
+        let trace = "";
+        for (let attempt = 0; attempt < 100; attempt++) {
+          trace = readFileSync(tracePath, "utf8");
+          if (trace.includes("live_session_transition_deferred")) break;
+          await Bun.sleep(25);
+        }
+        expect(trace).toContain("live_session_transition_deferred");
+        session.sendLiteralImmediate("/quit");
+        session.sendKeysImmediate(["Enter"]);
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        expect(readFileSync(tracePath, "utf8")).toContain("live_session_transition_cancelled reason=resize_timeout");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
@@ -351,9 +592,14 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         expect(summary).toContain("Connecting");
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
+        const beforeListMenu = await session.captureFullScrollback();
         await session.sendText("/mcp list");
-        const status = await session.waitForText("state=connecting", 5_000);
-        expect(status).toContain("pending source=profile scope=profile policy=optional");
+        const listMenu = await session.waitForText("[Servers]", 5_000);
+        expect(listMenu).toContain("pending");
+        expect(listMenu).toContain("Connecting");
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
+        expect(await session.captureFullScrollback()).toBe(beforeListMenu);
 
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(5_000)).toBe(true);
