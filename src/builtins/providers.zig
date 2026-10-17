@@ -7,22 +7,29 @@ const xai_grok = @import("../gateway/xai_grok.zig");
 const xai_grok_models = @import("../gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_reviewer.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
+const chat_completions = @import("../gateway/chat_completions.zig");
+const configured_provider = @import("../core/config/configured_provider.zig");
+
+fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Definition) provider_set.Bundle {
+    return chat_completions.bundle(definition);
+}
 
 pub const native = provider_set.Set{
+    .configured_fn = configuredBundle,
     .gateway = gateway.provider_bundle,
     .codex = .{
-        .compaction_model = "gpt-5.6-luna",
         .presentation = provider_catalog.find(.codex),
         .auth_strategy = .chatgpt,
+        .title_model = openai_codex_models.title_model,
         .agent_stream = openai_codex.agent_stream_provider,
         .cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .model_catalog = openai_codex_models.model_catalog_provider,
         .permission_reviewer = openai_codex_permission_reviewer.provider,
     },
     .grok = .{
-        .compaction_model = "grok-4.5",
         .presentation = provider_catalog.find(.grok),
         .auth_strategy = .grok,
+        .title_model = xai_grok_models.title_model,
         .agent_stream = xai_grok.agent_stream_provider,
         .cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
         .model_catalog = xai_grok_models.model_catalog_provider,

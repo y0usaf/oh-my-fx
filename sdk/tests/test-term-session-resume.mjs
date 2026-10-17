@@ -100,7 +100,7 @@ async function start(args = []) {
     sessionStore,
   });
   await waitFor(
-    () => capture.text().includes(args.length ? "Session resumed" : "Run /help for commands"),
+    () => capture.text().includes(args.length ? "session resumed" : "Run /help for commands"),
     "fx-term startup",
     () => `output=${JSON.stringify(capture.text().slice(-1000))}`,
   );

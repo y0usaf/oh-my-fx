@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const edit_contract = @import("../input/editor_state.zig");
 const io_mod = @import("../shared/io.zig");
@@ -64,11 +65,14 @@ pub const OwnedQuestionOption = struct {
 
 pub const OwnedQuestionEntry = struct {
     question: []const u8,
+    submission: @FieldType(types.QuestionBatchEntry, "submission") = .none,
+    submission_buffer: ?[]u8 = null,
     options: std.ArrayList(OwnedQuestionOption) = .empty,
     choice_index: u8 = 0,
     confirmed_choice_index: ?u8 = null,
     /// Either borrowed from an option label or a slice into
-    /// `confirmed_freeform_buffer.items`. Non-null once confirmed.
+    /// `confirmed_freeform_buffer.items`, or encoded in `submission_buffer`.
+    /// Non-null once confirmed.
     answer: ?[]const u8 = null,
     freeform_buffer: std.ArrayList(u8) = .empty,
     confirmed_freeform_buffer: std.ArrayList(u8) = .empty,
@@ -76,6 +80,7 @@ pub const OwnedQuestionEntry = struct {
     freeform_preferred_column: ?usize = null,
 
     pub fn deinit(self: *OwnedQuestionEntry, alloc: Allocator) void {
+        if (self.submission_buffer) |buffer| alloc.free(buffer);
         alloc.free(self.question);
         for (self.options.items) |opt| {
             alloc.free(opt.label);
@@ -213,6 +218,11 @@ pub const QuestionPrompt = struct {
         self.discard(alloc, "prompt_replaced");
         try self.entries.ensureTotalCapacity(alloc, entries.len);
         for (entries) |incoming| {
+            const has_freeform = switch (incoming.submission) {
+                .none => append_freeform,
+                .input => true,
+                .choice => false,
+            };
             const q_copy = try alloc.dupe(u8, incoming.question);
             errdefer alloc.free(q_copy);
 
@@ -225,7 +235,7 @@ pub const QuestionPrompt = struct {
                 opts.deinit(alloc);
             }
 
-            try opts.ensureTotalCapacity(alloc, incoming.options.len + @intFromBool(append_freeform));
+            try opts.ensureTotalCapacity(alloc, incoming.options.len + @intFromBool(has_freeform));
             for (incoming.options) |opt| {
                 const label_copy = try alloc.dupe(u8, opt.label);
                 errdefer alloc.free(label_copy);
@@ -239,8 +249,8 @@ pub const QuestionPrompt = struct {
                 });
             }
 
-            if (append_freeform) {
-                const freeform_label_copy = try alloc.dupe(u8, freeform_option_label);
+            if (has_freeform) {
+                const freeform_label_copy = try alloc.dupe(u8, if (incoming.submission == .input) "Submit value" else freeform_option_label);
                 opts.appendAssumeCapacity(.{
                     .label = freeform_label_copy,
                     .description = null,
@@ -251,6 +261,8 @@ pub const QuestionPrompt = struct {
             self.entries.appendAssumeCapacity(.{
                 .question = q_copy,
                 .options = opts,
+                .submission = incoming.submission,
+                .choice_index = if (incoming.submission == .input) @intCast(incoming.options.len) else 0,
             });
         }
         self.active = true;
@@ -259,8 +271,14 @@ pub const QuestionPrompt = struct {
     fn matches(self: QuestionPrompt, entries: []const types.QuestionBatchEntry, append_freeform: bool) bool {
         if (self.entries.items.len != entries.len) return false;
         for (self.entries.items, entries) |owned, incoming| {
+            if (owned.submission != incoming.submission) return false;
+            const has_freeform = switch (incoming.submission) {
+                .none => append_freeform,
+                .input => true,
+                .choice => false,
+            };
             if (!std.mem.eql(u8, owned.question, incoming.question)) return false;
-            const expected_len = incoming.options.len + @intFromBool(append_freeform);
+            const expected_len = incoming.options.len + @intFromBool(has_freeform);
             if (owned.options.items.len != expected_len) return false;
             for (incoming.options, 0..) |n, i| {
                 const o = owned.options.items[i];
@@ -269,7 +287,7 @@ pub const QuestionPrompt = struct {
                 const nd: []const u8 = n.description orelse "";
                 if (!std.mem.eql(u8, od, nd)) return false;
             }
-            if (append_freeform) {
+            if (has_freeform) {
                 const slot = owned.options.items[owned.options.items.len - 1];
                 if (!slot.is_freeform_slot) return false;
             }
@@ -580,7 +598,7 @@ pub const QuestionPrompt = struct {
         if (entry.freeform_cursor == 0) return;
         const start = text_boundaries.previousCharacterStart(entry.freeform_buffer.items, entry.freeform_cursor);
         const count = entry.freeform_cursor - start;
-        std.mem.copyForwards(u8, entry.freeform_buffer.items[start..], entry.freeform_buffer.items[entry.freeform_cursor..]);
+        @memmove(entry.freeform_buffer.items[start .. entry.freeform_buffer.items.len - count], entry.freeform_buffer.items[entry.freeform_cursor..]);
         entry.freeform_buffer.items.len -= count;
         entry.freeform_cursor = start;
     }
@@ -609,6 +627,17 @@ pub const QuestionPrompt = struct {
         if (entry.options.items.len == 0) return .none;
         const idx: usize = @min(entry.choice_index, entry.options.items.len - 1);
         const opt = entry.options.items[idx];
+        const encoded = if (entry.submission != .none) blk: {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            if (opt.is_freeform_slot) {
+                std.json.Stringify.value(.{ .value = entry.freeform_buffer.items }, .{}, &out.writer) catch return error.OutOfMemory;
+            } else {
+                std.json.Stringify.value(.{ .option = idx }, .{}, &out.writer) catch return error.OutOfMemory;
+            }
+            break :blk try out.toOwnedSlice();
+        } else null;
+        errdefer if (encoded) |buffer| alloc.free(buffer);
         if (opt.is_freeform_slot) {
             try entry.confirmed_freeform_buffer.ensureTotalCapacity(alloc, entry.freeform_buffer.items.len);
             entry.confirmed_freeform_buffer.clearRetainingCapacity();
@@ -616,6 +645,11 @@ pub const QuestionPrompt = struct {
             entry.answer = entry.confirmed_freeform_buffer.items;
         } else {
             entry.answer = opt.label;
+        }
+        if (encoded) |buffer| {
+            if (entry.submission_buffer) |previous| alloc.free(previous);
+            entry.submission_buffer = buffer;
+            entry.answer = buffer;
         }
         entry.freeform_preferred_column = null;
         entry.confirmed_choice_index = entry.choice_index;
@@ -782,7 +816,7 @@ fn checkQuestionPromptSyncAllocationFailures(alloc: Allocator) !void {
 
 test "question prompt frees partial owned-entry allocations" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkQuestionPromptSyncAllocationFailures,
         .{},
     );
@@ -795,7 +829,7 @@ test "question prompt freeform allocation failure preserves prompt state" {
     prompt.moveChoice(-1);
 
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -816,7 +850,7 @@ test "question prompt submission allocation failure preserves the draft" {
     prompt.applyFreeformCursorMove(1, 7);
 
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -1506,7 +1540,7 @@ test "question prompt traces discarded drafts with their reason" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "question-draft.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "question-draft.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1538,7 +1572,7 @@ test "question prompt traces drafts that differ from accepted submissions" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "question-draft-accepted.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "question-draft-accepted.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1619,4 +1653,45 @@ test "question prompt traces drafts that differ from accepted submissions" {
         trace,
         "question draft discarded reason=accepted_submission_changed entry=0 bytes=0",
     ) != null);
+}
+
+test "compact submission keeps input distinct from actions and choice prompts closed" {
+    const alloc = std.testing.allocator;
+    var prompt: QuestionPrompt = .{};
+    defer prompt.deinit(alloc);
+    const actions = [_]types.QuestionOption{ .{ .label = "Decline" }, .{ .label = "Cancel" } };
+    const entry = types.QuestionBatchEntry{ .question = "Enter submits", .options = &actions, .submission = .input };
+    try prompt.syncFrom(alloc, &.{entry});
+    try std.testing.expect(prompt.isFreeformSelected());
+    for ("Decline") |byte| _ = try prompt.apply(alloc, .{ .insert_ascii = byte });
+    // Refresh must preserve the draft and its submission contract.
+    try prompt.syncFrom(alloc, &.{entry});
+    try std.testing.expectEqual(.all_decided, try prompt.apply(alloc, .submit));
+    try std.testing.expectEqualStrings("{\"value\":\"Decline\"}", prompt.entries.items[0].answer.?);
+    prompt.resetAfterSubmission(alloc);
+    try prompt.syncFrom(alloc, &.{entry});
+    prompt.moveChoice(1);
+    try std.testing.expectEqual(.all_decided, try prompt.apply(alloc, .submit));
+    try std.testing.expectEqualStrings("{\"option\":0}", prompt.entries.items[0].answer.?);
+    prompt.resetAfterSubmission(alloc);
+    try prompt.syncFrom(alloc, &.{.{ .question = "Choose", .options = &actions, .submission = .choice }});
+    try std.testing.expectEqual(@as(usize, 2), prompt.entries.items[0].options.items.len);
+    try std.testing.expect(!prompt.isFreeformSelected());
+    try std.testing.expectEqual(.all_decided, try prompt.apply(alloc, .submit));
+    try std.testing.expectEqualStrings("{\"option\":0}", prompt.entries.items[0].answer.?);
+}
+
+test "compact submission allocation failure preserves the unanswered input" {
+    const alloc = testing_allocator.no_resize;
+    var prompt: QuestionPrompt = .{};
+    defer prompt.deinit(alloc);
+    try prompt.syncFrom(alloc, &.{.{ .question = "Input", .options = &.{}, .submission = .input }});
+    _ = try prompt.apply(alloc, .{ .insert_ascii = 'x' });
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, prompt.apply(failing.allocator(), .submit));
+    try std.testing.expect(prompt.entries.items[0].answer == null);
+    try std.testing.expect(prompt.entries.items[0].confirmed_choice_index == null);
+    try std.testing.expectEqualStrings("x", prompt.entries.items[0].freeform_buffer.items);
+    try std.testing.expectEqual(.all_decided, try prompt.apply(alloc, .submit));
+    try std.testing.expectEqualStrings("{\"value\":\"x\"}", prompt.entries.items[0].answer.?);
 }

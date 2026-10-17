@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
 
@@ -58,6 +59,11 @@ pub const Message = struct {
 pub const RpcError = struct {
     code: i64,
     message: []const u8,
+    data: ?struct {
+        code: []const u8,
+        model: []const u8,
+        capability: []const u8,
+    } = null,
 };
 
 pub fn parseMessage(alloc: Allocator, line: []const u8) !Message {
@@ -172,6 +178,15 @@ pub const Writer = struct {
                     try w.print("{d}", .{response.err.code});
                     try w.writeAll(",\"message\":");
                     try writeJsonStr(response.err.message, w);
+                    if (response.err.data) |data| {
+                        try w.writeAll(",\"data\":{\"code\":");
+                        try writeJsonStr(data.code, w);
+                        try w.writeAll(",\"model\":");
+                        try writeJsonStr(data.model, w);
+                        try w.writeAll(",\"capability\":");
+                        try writeJsonStr(data.capability, w);
+                        try w.writeByte('}');
+                    }
                     try w.writeAll("}}\n");
                 },
                 .notification => |notification| {
@@ -256,7 +271,7 @@ pub const Writer = struct {
         }
     }
 
-    fn writeId(w: *std.Io.Writer, id: ?RequestId) !void {
+    pub fn writeId(w: *std.Io.Writer, id: ?RequestId) !void {
         if (id) |rid| {
             switch (rid) {
                 .integer => |n| try w.print("{d}", .{n}),
@@ -454,7 +469,7 @@ test "Reader propagates allocation failure without publishing a partial frame" {
     };
     var reader = Reader.initForTesting(&source, ChunkedTestSource.read);
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -554,6 +569,27 @@ test "Writer Frame formats protocol lines" {
             .err = .{ .code = ErrorCode.invalid_params, .message = "bad \"params\"" },
         } }).write(&out.writer);
         try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"error\":{\"code\":-32602,\"message\":\"bad \\\"params\\\"\"}}\n", out.writer.buffered());
+    }
+
+    {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try (Writer.Frame{ .error_response = .{
+            .id = .{ .integer = 7 },
+            .err = .{
+                .code = ErrorCode.invalid_params,
+                .message = "Unsupported fast mode",
+                .data = .{
+                    .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+                    .model = "provider/quoted\"model",
+                    .capability = "fast",
+                },
+            },
+        } }).write(&out.writer);
+        try std.testing.expectEqualStrings(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32602,\"message\":\"Unsupported fast mode\",\"data\":{\"code\":\"LIBFX_MODEL_UNSUPPORTED_FAST\",\"model\":\"provider/quoted\\\"model\",\"capability\":\"fast\"}}}\n",
+            out.writer.buffered(),
+        );
     }
 
     {

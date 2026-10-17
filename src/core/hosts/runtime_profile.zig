@@ -13,8 +13,8 @@ pub const Profile = struct {
     clipboard: bool,
     url_opening: bool,
     web_search: bool,
-    generation_usage: bool,
     tools: bool,
+    js_host_clipboard: bool,
     js_host_config: bool,
     js_host_prompt_history: bool,
     js_host_sessions: bool,
@@ -43,8 +43,8 @@ pub const native = Profile{
     .clipboard = true,
     .url_opening = true,
     .web_search = true,
-    .generation_usage = true,
     .tools = true,
+    .js_host_clipboard = false,
     .js_host_config = false,
     .js_host_prompt_history = false,
     .js_host_sessions = false,
@@ -66,8 +66,8 @@ pub const wasm = Profile{
     .clipboard = false,
     .url_opening = false,
     .web_search = false,
-    .generation_usage = false,
     .tools = false,
+    .js_host_clipboard = true,
     .js_host_config = true,
     .js_host_prompt_history = true,
     .js_host_sessions = true,
@@ -89,6 +89,7 @@ test "host profile capabilities are selected by field" {
     try std.testing.expect(!allows(App, .durable_sessions));
     try std.testing.expect(allows(App, .js_host_config));
     try std.testing.expect(allows(App, .js_host_sessions));
+    try std.testing.expect(allows(App, .js_host_clipboard));
 }
 
 test "native and wasm profiles select distinct auth host effects" {

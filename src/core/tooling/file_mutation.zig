@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
@@ -41,7 +42,6 @@ pub const CreatedParentResidue = struct {
     component_index: usize,
     path_end: usize,
     permission_target_index: usize,
-    created_identity: file_mutation_contract.FileIdentity,
     observed_identity: ?file_mutation_contract.FileIdentity,
     reason: ParentCleanupResidueReason,
 };
@@ -1174,7 +1174,6 @@ fn createdParentResidue(
         .component_index = created.component_index,
         .path_end = created.path_end,
         .permission_target_index = created.permission_target_index,
-        .created_identity = created.identity,
         .observed_identity = observed_identity,
         .reason = reason,
     };
@@ -1443,11 +1442,10 @@ fn derivePostimage(
             };
             const occurrence_count = countOccurrences(before, edit.old_string);
             if (occurrence_count == 0) {
-                break :blk .{ .semantic_failure = "edit_file failed: old_string not found in file" };
+                break :blk .{ .semantic_failure = "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit." };
             }
             if (occurrence_count > 1) {
-                break :blk .{ .semantic_failure = try std.fmt.allocPrint(
-                    alloc,
+                break :blk .{ .semantic_failure = try alloc.print(
                     "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
                     .{occurrence_count},
                 ) };
@@ -1800,7 +1798,7 @@ test "prepare derives a missing write without creating the target" {
 }
 
 test "prepare shows the canonical external target when a symlink redirects outside the workspace" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1816,7 +1814,7 @@ test "prepare shows the canonical external target when a symlink redirects outsi
     };
 
     const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
-    const misleading_path = try std.fs.path.join(arena, &.{ workspace, "link/new.txt" });
+    const misleading_path = try std.Io.Dir.path.join(arena, &.{ workspace, "link/new.txt" });
     const call: types.ToolCall = .{
         .id = "write-symlink-redirect",
         .name = "write_file",
@@ -1844,7 +1842,7 @@ test "prepare retains full review separately from the bounded approval preview" 
         var line: [32]u8 = undefined;
         try content.appendSlice(
             std.testing.allocator,
-            try std.fmt.bufPrint(&line, "line {d}\n", .{line_number}),
+            try std.mem.print(&line, "line {d}\n", .{line_number}),
         );
     }
 
@@ -1955,7 +1953,7 @@ test "prepare preserves exact edit semantic failures" {
     };
     const missing_policy = try evaluatePolicy(arena, root, missing_call);
     try std.testing.expectEqualStrings(
-        "edit_file failed: old_string not found in file",
+        "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit.",
         try expectSemanticFailure(arena, missing_call, missing_policy),
     );
 
@@ -1970,6 +1968,35 @@ test "prepare preserves exact edit semantic failures" {
         "edit_file failed: old_string is not unique (found 2 occurrences), provide more context",
         try expectSemanticFailure(arena, duplicate_call, duplicate_policy),
     );
+}
+
+test "zero-occurrence edit failure explains recovery and leaves the file untouched" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The field is already gone, so a repeated removal must fail with
+    // guidance rather than a bare mismatch.
+    try createFile(&tmp, "strategy.ts", "export interface RacePlan {\n  laps: number;\n}\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const arguments = try editArgumentsJson(arena, "strategy.ts", "  trajectory?: Trajectory;\n}", "}");
+    const call: types.ToolCall = .{
+        .id = "edit-already-applied",
+        .name = "edit_file",
+        .arguments_json = arguments,
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+
+    const failure = try expectSemanticFailure(arena, call, policy);
+    try std.testing.expect(std.mem.find(u8, failure, "old_string not found in file") != null);
+    try std.testing.expect(std.mem.find(u8, failure, "Re-read the file") != null);
+    try std.testing.expect(std.mem.find(u8, failure, "if the change is already applied, do not retry") != null);
+
+    var file = try tmp.dir.openFile(std.testing.io, "strategy.ts", .{});
+    defer file.close(std.testing.io);
+    const unchanged = try io_mod.readFileToEnd(arena, &file, 4096);
+    try std.testing.expectEqualStrings("export interface RacePlan {\n  laps: number;\n}\n", unchanged);
 }
 
 test "prepare emits explicit empty and no-change notices" {
@@ -2147,7 +2174,7 @@ test "prepare rejects call target and authority identity mismatches" {
 }
 
 test "prepare rejects an intermediate-directory retarget" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2360,7 +2387,7 @@ test "apply installs reviewed bytes beneath an authorized external anchor" {
         tmp.dir,
         "external",
     );
-    const target_path = try std.fs.path.join(
+    const target_path = try std.Io.Dir.path.join(
         call_alloc,
         &.{ external, "nested/new.txt" },
     );
@@ -2412,11 +2439,11 @@ test "apply rejects binding mismatches before allocation or filesystem access" {
     const prepared = try prepareForApply(owner_alloc, root, call);
 
     var failing_call = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var failing_result = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     const call_alloc = failing_call.allocator();
@@ -2506,7 +2533,7 @@ test "apply allocation failure before rename leaves target unchanged" {
     };
     const prepared = try prepareForApply(call_alloc, root, call);
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 3 },
     );
     var test_state = StageTestState{};
@@ -3248,7 +3275,7 @@ test "apply returns deepest-first bounded residue when created parents are not e
 }
 
 test "apply preserves the existing destination mode" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

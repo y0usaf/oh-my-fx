@@ -194,14 +194,14 @@ fn fetchConvertedOutcome(ctx: tool_dispatch.DispatchContext, url: []const u8, tr
 
     return switch (result) {
         .success => |success| blk: {
-            recordTargetHttpDiagnostic(transport_started_at_ms, @intFromEnum(success.status), success.body.len, "");
+            recordTargetHttpDiagnostic(transport_started_at_ms, @backingInt(success.status), success.body.len, "");
             const success_display_url = try text_utils.redactUrlForDisplay(ctx.allocator, success.final_url);
             defer ctx.allocator.free(success_display_url);
             emitProgress(ctx, .{ .converting = success_display_url });
             break :blk .{ .success = try convertSuccess(ctx.allocator, success) };
         },
         .failure => |failure| blk: {
-            recordTargetHttpDiagnostic(transport_started_at_ms, if (failure.status) |status| @intFromEnum(status) else 0, failure.body.len, "");
+            recordTargetHttpDiagnostic(transport_started_at_ms, if (failure.status) |status| @backingInt(status) else 0, failure.body.len, "");
             break :blk .{ .failure = try fetchResultFailure(ctx.allocator, url, failure) };
         },
         .cross_host_redirect => |cross_host_url| blk: {
@@ -286,7 +286,7 @@ fn nonSuccessFailure(alloc: Allocator, url: []const u8, failure: http_fetch.Fail
     const details = [_]tool_result_errors.Detail{
         .{ .name = "field", .value = .{ .string = "url" } },
         .{ .name = "url", .value = .{ .string = display_url } },
-        .{ .name = "status", .value = .{ .unsigned = @intFromEnum(failure.status.?) } },
+        .{ .name = "status", .value = .{ .unsigned = @backingInt(failure.status.?) } },
         .{ .name = "body_preview", .value = .{ .string = safe_preview } },
         .{ .name = "body_truncated", .value = .{ .boolean = failure.body.len > preview_len } },
     };
@@ -304,7 +304,7 @@ fn unexpectedEncodingFailure(alloc: Allocator, url: []const u8, failure: http_fe
     const details = [_]tool_result_errors.Detail{
         .{ .name = "field", .value = .{ .string = "url" } },
         .{ .name = "url", .value = .{ .string = display_url } },
-        .{ .name = "status", .value = .{ .unsigned = @intFromEnum(failure.status.?) } },
+        .{ .name = "status", .value = .{ .unsigned = @backingInt(failure.status.?) } },
         .{ .name = "content_encoding", .value = .{ .string = failure.content_encoding.? } },
     };
     return try tool_result_errors.toolExecutionFailureJson(alloc, .{
@@ -415,7 +415,7 @@ fn writeOutputMetadata(alloc: Allocator, writer: *std.Io.Writer, success: Output
         "<url>{s}</url>\n<status>{d}</status>\n<mime_type>{s}</mime_type>\n<content_kind>{s}</content_kind>\n<cache_hit>{s}</cache_hit>\n",
         .{
             display_url,
-            @intFromEnum(success.status),
+            @backingInt(success.status),
             success.mime_type,
             @tagName(success.content_kind),
             if (success.cache_hit) "true" else "false",
@@ -443,7 +443,7 @@ fn reportCompletion(ctx: tool_dispatch.DispatchContext, success: OutputView, sta
     defer ctx.allocator.free(display_url);
     var completion = types.WebFetchCompletion{
         .bytes = webFetchOutputBytes(success),
-        .status = @intFromEnum(success.status),
+        .status = @backingInt(success.status),
         .duration_ms = @intCast(clampI64MsToU32(io_mod.milliTimestamp() - started_at_ms)),
         .cache_hit = success.cache_hit,
         .artifact_state = webFetchArtifactState(success),
@@ -696,6 +696,7 @@ test "web_fetch returns bounded untrusted content" {
     defer result.deinit(alloc);
 
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -721,6 +722,7 @@ test "web_fetch returns converted HTML directly without an extraction worker" {
     var result = try callWithRuntimeAndTransport(.{ .allocator = alloc }, stackInput(&input), &runtime, transport.transport());
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |value| value,
         .failure => return error.TestExpectedEqual,
     };
@@ -745,6 +747,7 @@ test "web_fetch returns markdown directly" {
     defer result.deinit(alloc);
 
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -786,6 +789,7 @@ test "web_fetch binary artifact metadata omits raw bytes from tool output and se
     var result = try callUrlWithRuntimeArtifacts(alloc, &runtime, "https://example.com/file.pdf", &transport, &store, null);
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -818,6 +822,7 @@ test "web_fetch artifact quota fails before cache insertion" {
     var result = try callUrlWithRuntimeArtifacts(alloc, &runtime, "https://example.com/file.pdf", &transport, &store, null);
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => return error.TestExpectedEqual,
         .failure => |body| body,
     };
@@ -841,6 +846,7 @@ test "web_fetch binary artifact write completes before cache insertion" {
     var result = try callUrlWithRuntimeArtifacts(alloc, &runtime, "https://example.com/file.pdf", &transport, &store, null);
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -904,6 +910,7 @@ test "web_fetch storeless route returns metadata without durable path" {
     var result = try callUrlWithRuntimeArtifacts(alloc, &runtime, "https://example.com/file.pdf", &transport, null, null);
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -929,6 +936,7 @@ test "web_fetch durable binary output never contains raw artifact bytes" {
     var result = try callUrlWithRuntimeArtifacts(alloc, &runtime, "https://example.com/file.pdf", &transport, &store, null);
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -946,6 +954,7 @@ test "web_fetch storeless binary response creates no transient artifact" {
     var result = try callUrlWithRuntimeArtifacts(alloc, &runtime, "https://example.com/file.pdf", &transport, null, null);
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -975,6 +984,7 @@ test "web_fetch authorized cache hit skips dns and target http" {
     defer result.deinit(alloc);
 
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -1145,6 +1155,7 @@ test "web_fetch keeps signed urls for transport and redacts presentation metadat
     }, stackInput(&input), &runtime, transport.transport());
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |value| value,
         .failure => return error.TestExpectedEqual,
     };
@@ -1164,6 +1175,7 @@ test "web_fetch failure details redact signed urls" {
     var result = try callUrl(alloc, "https://example.com/docs?token=secret-value", &transport);
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |value| value,
         .success => return error.TestExpectedEqual,
     };
@@ -1233,6 +1245,7 @@ test "web_fetch converts html responses before returning and caching" {
     var first = try callUrlWithRuntime(alloc, &runtime, "https://example.com/docs", &transport);
     defer first.deinit(alloc);
     const first_body = switch (first) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -1245,6 +1258,7 @@ test "web_fetch converts html responses before returning and caching" {
     var second = try callUrlWithRuntime(alloc, &runtime, "https://example.com/docs", &transport);
     defer second.deinit(alloc);
     const second_body = switch (second) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| body,
         .failure => return error.TestExpectedEqual,
     };
@@ -1284,6 +1298,7 @@ test "web_fetch blocks unsafe redirect before fetching redirected target" {
     defer result.deinit(alloc);
 
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => return error.TestExpectedEqual,
         .failure => |body| body,
     };
@@ -1302,6 +1317,7 @@ test "web_fetch returns structured failures for non success encoding and cross h
         var result = try callUrl(alloc, "https://example.com/missing", &transport);
         defer result.deinit(alloc);
         const body = switch (result) {
+            .rich => return error.TestUnexpectedRichResult,
             .success => return error.TestExpectedEqual,
             .failure => |body| body,
         };
@@ -1316,6 +1332,7 @@ test "web_fetch returns structured failures for non success encoding and cross h
         var result = try callUrl(alloc, "https://example.com/compressed", &transport);
         defer result.deinit(alloc);
         const body = switch (result) {
+            .rich => return error.TestUnexpectedRichResult,
             .success => return error.TestExpectedEqual,
             .failure => |body| body,
         };
@@ -1330,6 +1347,7 @@ test "web_fetch returns structured failures for non success encoding and cross h
         var result = try callUrl(alloc, "https://example.com/redirect", &transport);
         defer result.deinit(alloc);
         const body = switch (result) {
+            .rich => return error.TestUnexpectedRichResult,
             .success => return error.TestExpectedEqual,
             .failure => |body| body,
         };
@@ -1349,6 +1367,7 @@ test "web_fetch converts network failures to structured tool failure" {
     defer result.deinit(alloc);
 
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => return error.TestExpectedEqual,
         .failure => |body| body,
     };
@@ -1374,6 +1393,7 @@ test "web_fetch transport failures preserve root causes and network protocol gui
         var result = try callUrl(alloc, "https://example.com/docs", &transport);
         defer result.deinit(alloc);
         const body = switch (result) {
+            .rich => return error.TestUnexpectedRichResult,
             .success => return error.TestExpectedEqual,
             .failure => |value| value,
         };
@@ -1399,6 +1419,7 @@ test "web_fetch transport failure redacts signed urls without changing schema" {
     );
     defer result.deinit(alloc);
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => return error.TestExpectedEqual,
         .failure => |value| value,
     };

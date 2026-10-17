@@ -68,16 +68,17 @@ pub fn callSelect(
         ctx.mcp_permission_rules,
         ctx.context_limits,
         ctx.mcp_access,
+        ctx.cancel_flag,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.Cancelled) return error.Cancelled;
         return .{ .failure = try tool_result_errors.formatToolExecutionErrorJson(
             ctx.allocator,
             "mcp_select_tool",
             err,
         ) };
     }) orelse {
-        return .{ .failure = try std.fmt.allocPrint(
-            ctx.allocator,
+        return .{ .failure = try ctx.allocator.print(
             "Dynamic MCP tool not found or not allowed: {s}",
             .{input.name},
         ) };
@@ -94,7 +95,7 @@ pub fn callSelect(
             defer ctx.allocator.free(payload.model_output);
             defer if (payload.notice) |notice| ctx.allocator.free(notice);
             if (payload.notice) |notice| try tool_dispatch.reportContextNotice(ctx, notice);
-            try tool_dispatch.reportSelectedDynamicTool(ctx, input.name, payload.model_output);
+            try tool_dispatch.reportSelectedDynamicTool(ctx, input.name, payload.model_output, payload.mcp_binding);
         },
     }
     var success: std.Io.Writer.Allocating = .init(ctx.allocator);

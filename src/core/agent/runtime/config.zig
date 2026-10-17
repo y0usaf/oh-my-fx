@@ -1,9 +1,11 @@
 const std = @import("std");
+const skill_invocation = @import("../../skills/skill_invocation.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
 const session_child_store = @import("../../session/session_child_store.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
 const context_limits = @import("../../config/context_limits.zig");
+const compactor = @import("../../compactor/compactor.zig");
 const workspace_access = @import("../../workspace/workspace_access.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
 const provider_set = @import("../../gateway/provider_set.zig");
@@ -22,8 +24,9 @@ pub const Config = struct {
 
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
-    skills_prompt_section: []const u8 = "",
-    explicit_skills_prompt_section: []const u8 = "",
+    host_instructions: []const u8 = "",
+    skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
+    skill_bindings: []const skill_invocation.ExplicitBinding = &.{},
     gateway_retry_count: usize,
     max_provider_attempts: usize = model_response_recovery.default_max_provider_attempts,
     /// Interactive hosts may request a durable "try later" pause separately
@@ -34,17 +37,28 @@ pub const Config = struct {
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     initial_dynamic_tools: []const stream_provider.DynamicFunctionTool = &.{},
     provider_capabilities: provider_set.Bundle.Capabilities = .{
+        .gateway_prompt_caching = true,
         .fx_search = true,
         .vision_fallback = true,
     },
     custom_tool_guidance: []const u8 = "",
     agent_step_limit: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    /// Share of the model's usable input at which automatic compaction starts.
+    auto_compact_percent: u8 = compactor.default_percent,
     step_limit_notice: []const u8 = default_step_limit_notice,
     cancel_flag: *std.atomic.Value(bool),
     review_enabled: bool = false,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: ReasoningEffort = .auto,
+    /// Borrowed gateway provider slugs in preference order; empty leaves
+    /// routing to the gateway. Backing memory is owned by the caller and must
+    /// outlive every request built from this config.
+    provider_order: []const []const u8 = &.{},
+    /// Sends `provider_order` as the gateway's hard `only` restriction instead
+    /// of its `order` preference.
+    provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
@@ -59,6 +73,7 @@ pub const Config = struct {
     /// persistent child. Internal assistant-authored delegations leave this
     /// false.
     current_prompt_is_root_authority: bool = false,
+    enforce_response_language: bool = true,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,

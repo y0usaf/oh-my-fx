@@ -11,7 +11,6 @@ const builtin_gateway = @import("../../../../builtins/gateway.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
-const session_usage = @import("../../../session/session_usage.zig");
 const model_provider = @import("../../../config/model_provider.zig");
 const command_replay_store = @import("../../../session/command_replay_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
@@ -179,7 +178,7 @@ fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthori
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
-            .target_os = builtin.os.tag,
+            .target_os = builtin.target.os.tag,
         },
         .source = .interactive_once,
     } } };
@@ -199,6 +198,7 @@ pub const FakeCompletion = struct {
     chunks: []const []const u8 = &.{},
     reasoning_chunks: []const []const u8 = &.{},
     content: ?[]const u8 = null,
+    provider_state_json: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     streamed_tool_starts: []const ToolCall = &.{},
     provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null,
@@ -208,14 +208,34 @@ pub const FakeCompletion = struct {
     omit_finish: bool = false,
     usage: types.Usage = .{},
     generation_id: ?[]const u8 = null,
-    billing: ?types.ProviderBilling = null,
-    exact_usage_provider: ?model_provider.ProviderId = null,
     delivery_ambiguous: bool = false,
     pause_before_output: bool = false,
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
 };
+
+/// Fails a model request whose prompt ends on an assistant message, and one the
+/// runtime had to continue unless the test expects that repair.
+pub fn expectReplyablePromptTail(alloc: Allocator, payload: []const u8, allow_continuation: bool) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const prompt = parsed.value.object.get("prompt") orelse return;
+    if (prompt != .array or prompt.array.items.len == 0) return;
+    const tail = prompt.array.items[prompt.array.items.len - 1];
+    if (tail != .object) return;
+    const role = tail.object.get("role") orelse return;
+    if (role != .string) return;
+    if (std.mem.eql(u8, role.string, "assistant")) return error.TestAssistantPrefillRequest;
+    if (allow_continuation or !std.mem.eql(u8, role.string, "user")) return;
+    const content = tail.object.get("content") orelse return;
+    if (content != .array or content.array.items.len != 1 or content.array.items[0] != .object) return;
+    const text = content.array.items[0].object.get("text") orelse return;
+    if (text == .string and std.mem.eql(u8, text.string, runtime_orchestrator.assistant_tail_continuation_prompt)) {
+        return error.TestAssistantTailContinued;
+    }
+}
 
 pub const FakeGateway = struct {
     alloc: Allocator,
@@ -227,6 +247,10 @@ pub const FakeGateway = struct {
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
+    /// A continued tail means history projection ended on an assistant
+    /// message. Only tests of that repair may accept it.
+    allow_assistant_tail_continuation: bool = false,
 
     pub fn init(alloc: Allocator, completions: []const FakeCompletion) FakeGateway {
         return .{ .alloc = alloc, .completions = completions };
@@ -257,9 +281,11 @@ pub const FakeGateway = struct {
         alloc: Allocator,
         request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
+        if (self.observe_request) |observe| try observe(request);
         const payload = request.prepared_request_body orelse
             try builtin_gateway.buildAgentRequest(alloc, request.data());
         defer if (request.prepared_request_body == null) alloc.free(payload);
+        try expectReplyablePromptTail(alloc, payload, self.allow_assistant_tail_continuation);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
         try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret() orelse ""));
@@ -335,6 +361,7 @@ pub const FakeGateway = struct {
         return .{ .completed = .{
             .completion = .{
                 .content = completion.content,
+                .provider_state_json = completion.provider_state_json,
                 .tool_calls = completion.tool_calls,
                 .provider_result_identity_failure = completion.provider_result_identity_failure,
                 .provider_failure_cause = completion.provider_failure_cause,
@@ -346,12 +373,7 @@ pub const FakeGateway = struct {
                     completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
                 .usage = completion.usage,
                 .generation_id = completion.generation_id,
-                .billing = completion.billing,
             },
-            .usage = if (completion.exact_usage_provider) |provider_id|
-                .{ .exact = provider_id }
-            else
-                .{ .unavailable = .possibly_billed },
         } };
     }
 
@@ -499,6 +521,7 @@ pub const FakeAgentRuntimeDeps = struct {
     executed_names: std.ArrayList([]u8) = .empty,
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
+    failed_names: std.ArrayList([]u8) = .empty,
     inner_usage_names: std.ArrayList([]u8) = .empty,
     inner_usages: std.ArrayList(types.ToolUsage) = .empty,
     validated_names: std.ArrayList([]u8) = .empty,
@@ -534,6 +557,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_waiting: ?*std.atomic.Value(bool) = null,
     permission_release: ?*std.atomic.Value(bool) = null,
     tool_execution_override: ?ToolExecutionOverride = null,
+    catalog_unavailable: bool = false,
     permission_failure_names: []const []const u8 = &.{},
     permission_index: usize = 0,
     exec_plans: []const FakeExecPlan = &.{},
@@ -569,6 +593,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_grant_count: usize = 0,
     command_complete_count: usize = 0,
     route_recovery_clear_count: usize = 0,
+    full_detail_records: std.ArrayList(types.SemanticNotice) = .empty,
     finish_event_count: usize = 0,
     finish_event_attempt_count: usize = 0,
     finish_event_error: ?anyerror = null,
@@ -581,6 +606,7 @@ pub const FakeAgentRuntimeDeps = struct {
     terminal_lease_cleanup_errors: []const ?anyerror = &.{},
     terminal_lease_cleanup_index: usize = 0,
     finish_assistant_text: ?[]u8 = null,
+    finish_presentation_text: ?[]u8 = null,
     finish_summary: ?types.TurnSummary = null,
     finish_projection: ?types.FinishedPromptProjection = null,
     finish_terminal_outcome: ?types.TurnPresentationOutcome = null,
@@ -590,6 +616,7 @@ pub const FakeAgentRuntimeDeps = struct {
     background_history_log_path: ?[]u8 = null,
     background_event_log_path: ?[]u8 = null,
     history_turns: std.ArrayList(HistoryTurn) = .empty,
+    compaction_prefixes: std.ArrayList(?HistoryTurn) = .empty,
     interrupted_history_count: usize = 0,
     interrupted_event_count: usize = 0,
     interrupted_tool_name: ?[]u8 = null,
@@ -612,7 +639,6 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_execute_delay_ms: u64 = 0,
     ordinary_cancel_on_execute_name: ?[]const u8 = null,
     session_context: ?*session_runtime.SessionRuntime = null,
-    usage: ?*session_usage.Usage = null,
     validation_not_registered_names: []const []const u8 = &.{},
     validation_failure_names: []const []const u8 = &.{},
     validation_results: []const ?[]const u8 = &.{},
@@ -639,14 +665,10 @@ pub const FakeAgentRuntimeDeps = struct {
     last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
     default_model_capabilities: model_capabilities.Capabilities = .{
         .image_input_support = .non_native,
-        .prompt_caching = true,
         .context_window = 1_000_000,
     },
     capability_overrides: []const ModelCapabilityOverride = &.{},
     available_capability_overrides: []const ModelCapabilityOverride = &.{},
-    compaction_route: provider_set.CompactionRouteDecision = .{
-        .ready = .{ .provider = .gateway, .model = "openai/gpt-5.6-luna" },
-    },
     capability_queries: std.ArrayList([]u8) = .empty,
     cancel_on_capability_resolution: ?*std.atomic.Value(bool) = null,
     cancel_after_capability_resolution: ?*std.atomic.Value(bool) = null,
@@ -658,12 +680,17 @@ pub const FakeAgentRuntimeDeps = struct {
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
+    /// Returned by every session writer check; null confirms the writer.
+    session_writer_error: ?anyerror = null,
+    session_writer_checks: usize = 0,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
     recovery_checkpoint_error: ?anyerror = null,
     recovery_checkpoint_error_at: ?usize = null,
     recovery_checkpoint_calls: usize = 0,
+    recovery_checkpoint_clears: usize = 0,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
+    pause_on_auto_retry_attempt: ?usize = null,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
@@ -684,6 +711,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.system_notices);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
+        for (self.full_detail_records.items) |notice| types.freeSemanticNotice(self.alloc, notice);
+        self.full_detail_records.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
@@ -698,6 +727,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.executed_names);
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
+        freeStringList(self.alloc, &self.failed_names);
         freeStringList(self.alloc, &self.inner_usage_names);
         self.inner_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.validated_names);
@@ -717,12 +747,15 @@ pub const FakeAgentRuntimeDeps = struct {
         freeGrantList(self.alloc, &self.last_frozen_file_grants);
         self.execute_timeout_started_ms.deinit(self.alloc);
         if (self.finish_assistant_text) |value| self.alloc.free(value);
+        if (self.finish_presentation_text) |value| self.alloc.free(value);
         freeStringList(self.alloc, &self.terminal_lease_cleanup_ids);
         if (self.history_assistant_text) |value| self.alloc.free(value);
         if (self.background_history_log_path) |value| self.alloc.free(value);
         if (self.background_event_log_path) |value| self.alloc.free(value);
         for (self.history_turns.items) |turn| types.freeHistoryTurn(self.alloc, turn);
         self.history_turns.deinit(self.alloc);
+        for (self.compaction_prefixes.items) |prefix| if (prefix) |turn| types.freeHistoryTurn(self.alloc, turn);
+        self.compaction_prefixes.deinit(self.alloc);
         if (self.interrupted_tool_name) |value| self.alloc.free(value);
         if (self.http_detail) |value| self.alloc.free(value);
         if (self.diff_preview) |value| self.alloc.free(value);
@@ -743,7 +776,6 @@ pub const FakeAgentRuntimeDeps = struct {
         return .{
             .ctx = self,
             .agent_stream_provider = self.agent_stream_provider,
-            .compaction_route = self.compaction_route,
             .tool_registry = self.tool_registry,
             .live_tool_authority = self.live_tool_authority,
             .tool_activity_recorder = self.tool_activity_recorder,
@@ -770,9 +802,12 @@ pub const FakeAgentRuntimeDeps = struct {
             .execute_tool_call = execute,
             .publish_committed_file_handoff = publishCommittedFileHandoff,
             .propagate_history_turn = propagateHistory,
+            .commit_context_compaction = .{ .commit = commitCompaction },
             .recovery_checkpoint = if (self.enable_recovery_checkpoint) .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             } else null,
+            .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
             .push_text = pushText,
@@ -788,6 +823,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
+            .model_catalog_unavailable = catalogUnavailable,
             .take_steering_boundary = if (self.steering_messages.len > 0 or
                 self.immediate_steering_messages.len > 0)
                 takeSteeringBoundary
@@ -795,10 +831,20 @@ pub const FakeAgentRuntimeDeps = struct {
                 null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
+            .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
-            .usage = self.usage,
-            .usage_allocator = self.alloc,
         };
+    }
+
+    fn confirmSessionWriter(raw: *anyopaque) anyerror!void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.session_writer_checks += 1;
+        if (self.session_writer_error) |err| return err;
+    }
+
+    fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recovery_checkpoint_clears += 1;
     }
 
     fn setRecoveryCheckpoint(
@@ -828,6 +874,11 @@ pub const FakeAgentRuntimeDeps = struct {
     fn snapshotRootPermissionMode(raw: *anyopaque) PermissionMode {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         return self.root_permission_mode.?;
+    }
+
+    fn catalogUnavailable(raw: *anyopaque) bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.catalog_unavailable;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
@@ -881,7 +932,7 @@ pub const FakeAgentRuntimeDeps = struct {
     ) !worker_runtime.SteeringBoundaryResult {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const source = switch (kind) {
-            .model => blk: {
+            .model, .finalizing => blk: {
                 self.steering_take_count += 1;
                 if (self.steering_take_count != self.steering_take_at) return .none;
                 break :blk self.steering_messages;
@@ -937,15 +988,15 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (self.static_context_text) |text| {
+        if (project_context orelse self.static_context_text) |text| {
             try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         }
     }
 
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
-        try self.log.append(self.alloc, try std.fmt.allocPrint(self.alloc, fmt, args));
+        try self.log.append(self.alloc, try self.alloc.print(fmt, args));
     }
 
     fn prepareParentTurnContext(raw: *anyopaque, arena: Allocator) !?runtime_deps.PreparedParentTurnContext {
@@ -964,7 +1015,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 @as(u64, @intCast(self.parent_turn_prepare_count)),
             .delivery_id = try arena.dupe(u8, "delivery"),
             .start_offset = 0,
-            .end_offset = 0,
             .total_bytes = 0,
         };
         return .{
@@ -1026,7 +1076,7 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         for (self.validation_failure_names) |name| {
             if (std.mem.eql(u8, name, call.name)) {
-                return .{ .failure = try std.fmt.allocPrint(arena, "{s} arguments failed registered-tool validation", .{call.name}) };
+                return .{ .failure = try arena.print("{s} arguments failed registered-tool validation", .{call.name}) };
             }
         }
         const mcp_runtime_generation = if (self.validation_mcp_tool_name) |name|
@@ -1077,6 +1127,7 @@ pub const FakeAgentRuntimeDeps = struct {
         live_authority: ?runtime_tool_contracts.LiveToolAuthority,
         revalidation: ?runtime_tool_contracts.LivePermissionRevalidation,
         advertised_dynamic_tool_names: []const []const u8,
+        _: ?[]const u8,
     ) !command_admission.PermissionOutcome {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         if (self.permission_request_override) |override| {
@@ -1346,20 +1397,20 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "start {s} {s}", .{ call.name, target })
+            arena.print("start {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "start {s}", .{call.name});
+            arena.print("start {s}", .{call.name});
     }
 
     fn describeCompleted(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "done {s} {s}", .{ call.name, target })
+            arena.print("done {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "done {s}", .{call.name});
+            arena.print("done {s}", .{call.name});
     }
 
     fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
 
     fn permissionTarget(raw: *anyopaque, arena: Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
@@ -1573,6 +1624,21 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.record("rejected:{s}", .{call.name});
     }
 
+    fn recordFailed(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.failed_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        try self.record("failed:{s}", .{call.name});
+    }
+
+    fn commitCompaction(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, active_prefix: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const owned = if (active_prefix) |prefix| try types.dupeHistoryTurn(self.alloc, .{ .assistant = prefix }) else null;
+        errdefer if (owned) |turn| types.freeHistoryTurn(self.alloc, turn);
+        try self.compaction_prefixes.ensureUnusedCapacity(self.alloc, 1);
+        try propagateHistory(raw, .{ .compacted_summary = summary });
+        self.compaction_prefixes.appendAssumeCapacity(owned);
+    }
+
     fn propagateHistory(raw: *anyopaque, turn: HistoryTurn) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.history_propagation_count += 1;
@@ -1611,6 +1677,12 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         switch (event) {
+            .full_detail_record => |notice| {
+                const owned = try types.dupeSemanticNotice(self.alloc, notice);
+                errdefer types.freeSemanticNotice(self.alloc, owned);
+                try self.full_detail_records.append(self.alloc, owned);
+                try self.record("full_detail_record:{s}:{s}", .{ notice.topic, notice.body });
+            },
             .clear_route_recovery_status => {
                 self.route_recovery_clear_count += 1;
                 try self.record("event:clear_route_recovery_status", .{});
@@ -1622,6 +1694,11 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.finish_summary = finished.summary;
                 self.finish_projection = finished.terminal_projection;
                 self.finish_terminal_outcome = finished.terminal_outcome;
+                if (self.finish_presentation_text) |value| self.alloc.free(value);
+                self.finish_presentation_text = null;
+                if (finished.presentation_text) |value| {
+                    self.finish_presentation_text = try self.alloc.dupe(u8, value);
+                }
                 switch (finished.turn) {
                     .assistant => |entry| {
                         if (self.finish_assistant_text) |value| self.alloc.free(value);
@@ -1658,11 +1735,13 @@ pub const FakeAgentRuntimeDeps = struct {
     fn pushText(raw: *anyopaque, emission: runtime_deps.TextEmission) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const text = switch (emission) {
+            .assistant_started => return,
             .assistant_source => |text| {
                 try self.assistant_sources.append(self.alloc, try self.alloc.dupe(u8, text));
                 return;
             },
             .assistant_rendered => |text| text,
+            .assistant_restarted => |text| text,
             .operational => |text| text,
         };
         try self.texts.append(self.alloc, try self.alloc.dupe(u8, text));
@@ -1746,7 +1825,9 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         if (self.pause_on_auto_retry_status and
             status.kind == .auto_retry and
-            status.retry_deadline != null)
+            status.retry_deadline != null and
+            (self.pause_on_auto_retry_attempt == null or
+                self.pause_on_auto_retry_attempt.? == status.failed_attempt))
         {
             if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
         }
@@ -1774,7 +1855,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     fn formatError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+        return arena.print("Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
 
@@ -2061,7 +2142,7 @@ pub fn expectBodyContainsInOrder(gateway: *const FakeGateway, index: usize, need
     const body = gateway.request_bodies.items[index];
     var cursor: usize = 0;
     for (needles) |needle| {
-        const found = std.mem.indexOfPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
+        const found = std.mem.findPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
         cursor = found + needle.len;
     }
 }
@@ -2128,7 +2209,7 @@ pub fn countText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) usize {
 pub fn countNeedle(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |found| {
+    while (std.mem.findPos(u8, haystack, pos, needle)) |found| {
         count += 1;
         pos = found + needle.len;
     }

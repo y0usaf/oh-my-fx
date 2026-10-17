@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const activity_status = @import("../core/output/activity_status.zig");
 const paint_plan = @import("render_engine/paint_plan.zig");
 
@@ -107,6 +108,13 @@ pub const RenderRequestState = struct {
     animation_candidate_in_flight: bool = false,
     next_animation_generation: u64 = 1,
     consecutive_input_pending_aborts: u8 = 0,
+    observed_compaction_revision: u64 = 0,
+
+    pub fn observeCompactionRevision(self: *RenderRequestState, revision: u64) void {
+        if (self.observed_compaction_revision == revision) return;
+        self.observed_compaction_revision = revision;
+        self.request(.footer);
+    }
 
     pub fn request(self: *RenderRequestState, reason: Reason) void {
         self.pending_reasons.insert(reason);
@@ -359,6 +367,19 @@ fn reasonsAffectApproval(reasons: ReasonSet) bool {
     return relevant.count() > 0;
 }
 
+test "compaction revisions request footer repaint without restarting animation" {
+    var state: RenderRequestState = .{};
+    state.observeCompactionRevision(1);
+    try std.testing.expect(state.hasReason(.footer));
+    state.clearReason(.footer);
+    state.observeCompactionRevision(1);
+    try std.testing.expect(!state.hasPending());
+    state.animation_next_deadline_ms = 100;
+    state.observeCompactionRevision(2);
+    try std.testing.expect(state.hasReason(.footer));
+    try std.testing.expectEqual(@as(i64, 100), state.animation_next_deadline_ms);
+}
+
 test "render request state exposes the transaction operations" {
     try std.testing.expect(@hasDecl(RenderRequestState, "request"));
     try std.testing.expect(@hasDecl(RenderRequestState, "requestInvalidation"));
@@ -467,7 +488,7 @@ test "unfinished frame attempt restores captured work after preparation allocati
         .bottom = 4,
     });
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 

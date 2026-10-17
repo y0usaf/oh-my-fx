@@ -1,4 +1,7 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
+const file_picker_path = @import("file_picker_path.zig");
+const file_completion_state = @import("file_completion_state.zig");
 const editor_state = @import("editor_state.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -43,7 +46,7 @@ const InlinePickerSuppression = union(enum) {
     }
 };
 
-pub const model_picker_fast_options = [_][]const u8{ "normal", "fast" };
+pub const model_picker_speed_options = [_][]const u8{ "normal", "fast", "ultrafast" };
 
 /// `/login` and `/setup` are aliases of `/provider`: all open the same
 /// columnar picker. Typed text keeps whichever spelling the user wrote;
@@ -53,12 +56,6 @@ pub const provider_prefix = "/provider ";
 pub const login_prefix = "/login ";
 const setup_prefix = "/setup ";
 pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix, setup_prefix };
-
-pub fn providerPickerPrefix(input: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimStart(u8, input, " \t\r\n");
-    const len = providerPickerPrefixLen(trimmed) orelse return null;
-    return trimmed[0..len];
-}
 
 pub const ModelPickerQuery = struct {
     stage: ModelPickerStage,
@@ -75,16 +72,7 @@ pub const ProviderPickerQuery = struct {
     token_start: usize,
 };
 
-pub const FilePickerQuery = struct {
-    /// Bytes between `@` and the cursor, without the leading `@`.
-    query: []const u8,
-    /// Byte offset of the `@` in the composer text.
-    at_offset: usize,
-    /// Byte offset where `query` begins.
-    token_start: usize,
-    /// The query begins with `@"` and stays open across spaces.
-    quoted: bool = false,
-};
+pub const FilePickerQuery = file_picker_path.Query;
 
 pub const InlineSkillQuery = struct {
     /// Bytes between `$` and the cursor, without the leading `$`.
@@ -98,6 +86,48 @@ pub const InlineSkillQuery = struct {
 pub const InlineSlashQuery = struct {
     /// Slash command prefix through the cursor, including the leading `/`.
     prefix: []const u8,
+};
+
+/// Paces the frame for a keystroke that started a folder listing. Most folders
+/// list well within one event-loop tick, so that frame waits for the rows and
+/// the keystroke paints together with them instead of over an empty
+/// "indexing files..." list. Times are monotonic milliseconds. Modeled in
+/// `tests/tla/indexer/ListingWait.tla`.
+const FileListingWait = struct {
+    const hold_ms: i64 = 8;
+
+    started_ms: ?i64 = null,
+    // The previous listing outlasted the wait, so the next keystroke paints at
+    // once instead of paying the wait again on a slow folder.
+    last_outlasted_hold: bool = false,
+
+    /// Returns true while the next frame should wait for an in-flight listing.
+    /// Keystrokes during one listing share its wait.
+    pub fn hold(self: *FileListingWait, listing_in_flight: bool, now_ms: i64) bool {
+        if (!listing_in_flight) {
+            if (self.started_ms) |started| self.last_outlasted_hold = !withinHold(started, now_ms);
+            self.started_ms = null;
+            return false;
+        }
+        if (self.started_ms == null) self.started_ms = now_ms;
+        return self.active(now_ms);
+    }
+
+    pub fn active(self: FileListingWait, now_ms: i64) bool {
+        return !self.last_outlasted_hold and self.measuring(now_ms);
+    }
+
+    /// True during the first tick of every listing, waited for or not, so a
+    /// listing that finishes in time is seen at once and waiting turns back on.
+    pub fn measuring(self: FileListingWait, now_ms: i64) bool {
+        const started = self.started_ms orelse return false;
+        return withinHold(started, now_ms);
+    }
+
+    fn withinHold(started_ms: i64, now_ms: i64) bool {
+        // A clock that steps backwards ends the wait instead of extending it.
+        return now_ms >= started_ms and now_ms - started_ms < hold_ms;
+    }
 };
 
 /// Owns layout-independent composer picker state. Call `deinit` with the
@@ -126,18 +156,37 @@ pub const State = struct {
     team_column_window_start: usize = 0,
     key_source_column_index: usize = 0,
     key_source_column_window_start: usize = 0,
+    file_completion: file_completion_state.State = .{},
+    // The ordinal is meaningful only within file_completion's presented rows.
     file_completion_index: usize = 0,
     file_completion_window_start: usize = 0,
     file_picker_episode_seen: bool = false,
+    file_listing_wait: FileListingWait = .{},
+
+    pub fn initInto(self: *State) void {
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "file_completion")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
+        }
+        self.file_completion.initInto();
+    }
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        self.file_completion.deinit(alloc);
         self.model_picker_pending_model.deinit(alloc);
         self.provider_picker_pending_provider.deinit(alloc);
         self.provider_picker_pending_method.deinit(alloc);
-        self.* = .{};
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+            // The child's owner already restored its defaults.
+            if (comptime std.mem.eql(u8, field_name, "file_completion")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
+        }
     }
 
     pub fn resetInlinePickerEpisode(self: *State) void {
+        self.file_completion.invalidate();
         self.slash_completion_index = 0;
         self.slash_completion_window_start = 0;
         self.inline_picker_suppression = null;
@@ -151,6 +200,7 @@ pub const State = struct {
     }
 
     pub fn dismissInlinePicker(self: *State, kind: InlinePickerKind) void {
+        if (kind == .file) self.file_completion.invalidate();
         self.inline_picker_suppression = .{ .dismissed_until_trigger_change = kind };
     }
 
@@ -221,6 +271,8 @@ pub const State = struct {
     fn rawFilePickerQuery(self: *const State, editor: *const editor_state.State) ?FilePickerQuery {
         if (self.rawModelPickerQuery(editor) != null) return null;
         if (self.rawProviderPickerQuery(editor) != null) return null;
+        const command_text = std.mem.trimStart(u8, editor.input.items, " \t\r\n");
+        if (tokenMatchesAt(command_text, 0, "/mcp")) return null;
         return findFilePickerQuery(editor.input.items, editor.cursor);
     }
 
@@ -397,6 +449,7 @@ pub const State = struct {
         model: []const u8,
         effort_index: usize,
         fast_mode: bool,
+        ultrafast_mode: bool,
         stage: ModelPickerStage,
     ) Allocator.Error!void {
         const stable_model = try alloc.dupe(u8, model);
@@ -408,7 +461,7 @@ pub const State = struct {
         self.model_picker_stage = stage;
         self.model_picker_effort_index = effort_index;
         self.model_picker_effort_window_start = 0;
-        self.model_picker_fast_index = if (fast_mode) 1 else 0;
+        self.model_picker_fast_index = if (ultrafast_mode) 2 else if (fast_mode) 1 else 0;
         self.model_picker_fast_window_start = 0;
     }
 
@@ -432,8 +485,12 @@ pub const State = struct {
         return self.model_picker_effort_index;
     }
 
+    pub fn selectedModelPickerSpeed(self: *const State) []const u8 {
+        return model_picker_speed_options[self.model_picker_fast_index % model_picker_speed_options.len];
+    }
+
     pub fn selectedModelPickerFast(self: *const State) bool {
-        return self.model_picker_fast_index % model_picker_fast_options.len == 1;
+        return std.mem.eql(u8, self.selectedModelPickerSpeed(), "fast");
     }
 };
 
@@ -507,49 +564,7 @@ fn leadingWhitespaceLen(bytes: []const u8) usize {
 }
 
 fn findFilePickerQuery(items: []const u8, cursor: usize) ?FilePickerQuery {
-    if (cursor > items.len) return null;
-
-    var index = cursor;
-    while (index > 0) {
-        const byte = items[index - 1];
-        if (byte == '@') {
-            const at_offset = index - 1;
-            if (at_offset > 0 and !isFilePickerStartBoundary(items[at_offset - 1])) {
-                index -= 1;
-                continue;
-            }
-            const quoted = index < cursor and items[index] == '"';
-            const token_start = index + @intFromBool(quoted);
-            return .{
-                .query = items[token_start..cursor],
-                .at_offset = at_offset,
-                .token_start = token_start,
-                .quoted = quoted,
-            };
-        }
-        if (isFilePickerTerminator(byte)) break;
-        index -= 1;
-    }
-
-    index = cursor;
-    while (index > 1) {
-        const byte = items[index - 1];
-        if (byte == '\t' or byte == '\n' or byte == '\r') return null;
-        if (byte == '"') {
-            const at_offset = index - 2;
-            if (items[at_offset] != '@') return null;
-            if (at_offset > 0 and !isFilePickerStartBoundary(items[at_offset - 1])) return null;
-            return .{
-                .query = items[index..cursor],
-                .at_offset = at_offset,
-                .token_start = index,
-                .quoted = true,
-            };
-        }
-        index -= 1;
-    }
-
-    return null;
+    return file_picker_path.query_at(items, cursor);
 }
 
 fn findInlineSkillQuery(items: []const u8, cursor: usize) ?InlineSkillQuery {
@@ -561,6 +576,7 @@ fn findInlineSkillQuery(items: []const u8, cursor: usize) ?InlineSkillQuery {
         if (isFilePickerTerminator(byte)) return null;
         index -= 1;
         if (byte != '$') continue;
+        if (file_picker_path.contains_position(items, index)) return null;
         return .{
             .query = items[index + 1 .. cursor],
             .dollar_offset = index,
@@ -581,14 +597,6 @@ fn findInlineSlashQuery(items: []const u8, cursor: usize) ?InlineSlashQuery {
     if (std.mem.trim(u8, items[0..token_start], " \t\r\n").len == 0) return null;
 
     return .{ .prefix = items[token_start..cursor] };
-}
-
-fn isFilePickerStartBoundary(byte: u8) bool {
-    if (isFilePickerTerminator(byte)) return true;
-    return switch (byte) {
-        '(', '[', '{', '<', '\'', '"', '`' => true,
-        else => false,
-    };
 }
 
 fn modelPickerTokenStart(trimmed: []const u8, model: []const u8, stage: ModelPickerStage) ?usize {
@@ -652,6 +660,35 @@ fn skipPickerSpaces(bytes: []const u8, start: usize) usize {
     var index = start;
     while (index < bytes.len and (bytes[index] == ' ' or bytes[index] == '\t')) : (index += 1) {}
     return index;
+}
+
+test "picker deinit releases owned text and restores declared defaults" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.model_picker_pending_model.appendSlice(alloc, "model");
+    try state.provider_picker_pending_provider.appendSlice(alloc, "provider");
+    try state.provider_picker_pending_method.appendSlice(alloc, "method");
+    state.model_picker_stage = .fast;
+    state.provider_picker_stage = .api_key;
+    state.slash_completion_index = 7;
+    state.inline_picker_suppression = .history_slash_recall_until_edit;
+    state.file_completion.active = true;
+    state.file_completion.episode = 51;
+    state.deinit(alloc);
+    const state_info = @typeInfo(State).@"struct";
+    inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+        if (comptime std.mem.eql(u8, field_name, "file_completion")) {
+            const child_info = @typeInfo(file_completion_state.State).@"struct";
+            inline for (child_info.field_names, child_info.field_types, child_info.field_attrs) |child_name, child_type, child_attrs| {
+                if (comptime std.mem.eql(u8, child_name, "raw_query") or std.mem.eql(u8, child_name, "lookup_query")) continue;
+                try std.testing.expectEqualDeep(child_attrs.defaultValue(child_type).?, @field(state.file_completion, child_name));
+            }
+        } else {
+            try std.testing.expectEqualDeep(field_attrs.defaultValue(field_type).?, @field(state, field_name));
+        }
+    }
+    state.deinit(alloc);
 }
 
 test "picker state resolves model file skill and slash queries" {
@@ -724,6 +761,60 @@ test "model picker query takes precedence over file syntax" {
     try std.testing.expectEqual(@as(?FilePickerQuery, null), state.activeFilePickerQuery(&editor));
 }
 
+test "MCP arguments stay literal while ordinary file queries remain eligible" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const literal_inputs = [_][]const u8{
+        "/mcp add memory npx -y @modelcontextprotocol/server-memory@2026.8.31",
+        " \t/mcp\tadd memory npx @scope/package",
+        "\n/mcp add memory npx @scope/package",
+    };
+    for (literal_inputs) |input| {
+        try editor.setText(alloc, input);
+        try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
+        try std.testing.expect(state.inlinePickerTriggerKind(&editor) != .file);
+        _ = editor.setCursor(input.len - 1);
+        try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
+    }
+
+    const file_inputs = [_][]const u8{
+        "read @src/main.zig",
+        "/mcpx @src/main.zig",
+        "explain /mcp @src/main.zig",
+        "/review @src/main.zig",
+    };
+    for (file_inputs) |input| {
+        try editor.setText(alloc, input);
+        try std.testing.expectEqualStrings("src/main.zig", state.activeFilePickerQuery(&editor).?.query);
+        try std.testing.expectEqual(InlinePickerKind.file, state.inlinePickerTriggerKind(&editor).?);
+    }
+}
+
+test "MCP argument edits and history do not retain file picker ownership" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try editor.setText(alloc, "read @scope/package");
+    state.dismissInlinePicker(.file);
+    try editor.setText(alloc, "/mcp add memory npx @scope/package");
+    state.reconcileInlinePickerAfterEdit(&editor);
+    try std.testing.expect(!state.isInlinePickerSuppressed(.file));
+    state.resetInlinePickerForHistoryRecall(&editor);
+    try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
+    try std.testing.expect(state.inlinePickerTriggerKind(&editor) != .file);
+
+    try editor.setText(alloc, "read @scope/package");
+    state.reconcileInlinePickerAfterEdit(&editor);
+    try std.testing.expectEqualStrings("scope/package", state.activeFilePickerQuery(&editor).?.query);
+}
+
 test "picker dismissal lasts for one trigger episode" {
     const alloc = std.testing.allocator;
     var editor: editor_state.State = .{};
@@ -788,22 +879,24 @@ test "model picker flow accepts aliased pending model input" {
     var state: State = .{};
     defer state.deinit(alloc);
 
-    try state.beginModelPickerFlow(alloc, "openai/gpt-5", 2, false, .effort);
+    try state.beginModelPickerFlow(alloc, "openai/gpt-5", 2, false, false, .effort);
     const aliased_model = state.model_picker_pending_model.items;
-    try state.beginModelPickerFlow(alloc, aliased_model, 3, true, .fast);
+    try state.beginModelPickerFlow(alloc, aliased_model, 3, true, false, .fast);
 
     try std.testing.expectEqual(ModelPickerStage.fast, state.model_picker_stage);
     try std.testing.expectEqualStrings("openai/gpt-5", state.model_picker_pending_model.items);
     try std.testing.expectEqual(@as(usize, 3), state.selectedModelPickerEffortIndex());
-    try std.testing.expect(state.selectedModelPickerFast());
+    try std.testing.expectEqualStrings("fast", state.selectedModelPickerSpeed());
+    try state.beginModelPickerFlow(alloc, aliased_model, 3, false, true, .fast);
+    try std.testing.expectEqualStrings("ultrafast", state.selectedModelPickerSpeed());
 }
 
 test "model picker flow preserves state when allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var state: State = .{};
     defer state.deinit(alloc);
 
-    try state.beginModelPickerFlow(alloc, "old", 2, false, .effort);
+    try state.beginModelPickerFlow(alloc, "old", 2, false, false, .effort);
 
     var failing = std.testing.FailingAllocator.init(alloc, .{
         .fail_index = 1,
@@ -818,6 +911,7 @@ test "model picker flow preserves state when allocation fails" {
             &large_model,
             5,
             true,
+            false,
             .fast,
         ),
     );
@@ -964,4 +1058,31 @@ test "committed tokens only match at word boundaries" {
 
     state.reconcileInlinePickerAfterEdit(&editor);
     try std.testing.expectEqual(ProviderPickerStage.provider, state.provider_picker_stage);
+}
+
+test "folder listing wait spans one tick and is skipped after a slow listing" {
+    var wait: FileListingWait = .{};
+    try std.testing.expect(!wait.hold(false, 100));
+    // Keystrokes during one listing share the first keystroke's wait.
+    try std.testing.expect(wait.hold(true, 100));
+    try std.testing.expect(wait.hold(true, 100 + FileListingWait.hold_ms - 1));
+    try std.testing.expect(wait.active(100 + FileListingWait.hold_ms - 1));
+    // A listing that outlasts the wait paints at once from then on.
+    try std.testing.expect(!wait.hold(true, 100 + FileListingWait.hold_ms));
+    try std.testing.expect(!wait.hold(true, 140));
+    try std.testing.expect(!wait.active(140));
+    try std.testing.expect(!wait.hold(false, 141));
+    // The folder was slow, so the next keystroke does not wait for it, but
+    // the listing is still watched for its first tick.
+    try std.testing.expect(!wait.hold(true, 200));
+    try std.testing.expect(!wait.active(200));
+    try std.testing.expect(wait.measuring(200 + FileListingWait.hold_ms - 1));
+    try std.testing.expect(!wait.measuring(200 + FileListingWait.hold_ms));
+    // A listing that finishes within the wait turns waiting back on.
+    try std.testing.expect(!wait.hold(false, 202));
+    try std.testing.expect(wait.hold(true, 300));
+    try std.testing.expect(!wait.hold(false, 301));
+    try std.testing.expect(wait.hold(true, 400));
+    // A clock that steps backwards ends the wait.
+    try std.testing.expect(!wait.hold(true, 350));
 }

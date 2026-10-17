@@ -15,7 +15,23 @@ ditto_bin="${FX_SIGNING_DITTO_BIN:-/usr/bin/ditto}"
 xcrun_bin="${FX_SIGNING_XCRUN_BIN:-/usr/bin/xcrun}"
 jq_bin="${FX_SIGNING_JQ_BIN:-/usr/bin/jq}"
 
-binary_path="${1:?usage: sign-and-notarize-macos.sh <binary-path>}"
+binary_path="${1:?usage: sign-and-notarize-macos.sh <binary-path> [4096|16384]}"
+signing_page_size="${2-4096}"
+if [[ $# -gt 2 || ( "${signing_page_size}" != 4096 && "${signing_page_size}" != 16384 ) ]]; then
+    echo "Signature page size must be 4096 or 16384" >&2
+    exit 1
+fi
+if ! binary_archs="$("${xcrun_bin}" lipo -archs "${binary_path}")"; then
+    echo "Apple signing failed during architecture inspection" >&2
+    exit 1
+fi
+if [[ $# -eq 1 && "${binary_archs}" == arm64 ]]; then
+    signing_page_size=16384
+fi
+if [[ "${signing_page_size}" == 16384 && "${binary_archs}" != arm64 ]]; then
+    echo "16 KiB signature pages require a thin arm64 binary" >&2
+    exit 1
+fi
 for required_name in \
     APPLE_DEVELOPER_ID_P12_BASE64 \
     APPLE_DEVELOPER_ID_P12_PASSWORD \
@@ -95,6 +111,7 @@ if ! "${codesign_bin}" \
     --identifier "${signing_identifier}" \
     --options runtime \
     --timestamp \
+    --pagesize "${signing_page_size}" \
     "${binary_path}"; then
     fail_stage "code signing"
 fi

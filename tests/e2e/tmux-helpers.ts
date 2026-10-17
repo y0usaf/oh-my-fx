@@ -7,10 +7,11 @@
  * Requires: tmux installed and available in PATH.
  */
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
+import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
 
@@ -35,6 +36,7 @@ const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_CHAT_URL",
   "FX_MAX_AGENT_STEPS",
   "FX_MODEL",
+  "FX_SESSIONS_V2",
 ] as const;
 
 export function canonicalSubagentIdForStore(childId: string): string {
@@ -178,15 +180,6 @@ export function fakeGatewayPermissionDecision(
     decision,
     rationale,
   });
-}
-
-export function classifierEvidenceFromRequest(body: string): string {
-  const parsed = JSON.parse(body) as any;
-  const instruction = parsed.prompt.at(-1);
-  if (instruction?.role !== "system" || typeof instruction.content !== "string") {
-    throw new Error("classifier instruction missing");
-  }
-  return instruction.content;
 }
 
 export function fakeGatewaySerializedToolCall(
@@ -334,11 +327,41 @@ export type FakeGatewayOptions = {
       | Promise<FakeGatewayModel[] | Response>);
   classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
-  generationResponse?: (
-    generationId: string,
-    request: Request,
-  ) => Response | Promise<Response>;
+  titleResponses?: FakeGatewayResponse[];
+  // Answers usage GETs (`/v1/report`, `/ai-gateway/usage-report`, ChatGPT's
+  // `/backend-api/wham/...`, Grok's `/billing` and `/settings`); see
+  // usage-fakes.ts. Null falls through to the routes below.
+  usage?: (url: URL, request: Request) => Response | null;
+  // Response for the /v4/ai/evaluation-model endpoint (TypeSafe Jev through
+  // the gateway). Defaults to a clear Jev decision.
+  evaluationResponse?: FakeGatewayResponse;
 };
+
+// Session title generation calls carry this instruction regardless of the
+// provider protocol. Fake servers route them to their own channel so they
+// never consume queued completion responses; the default is a finish-only
+// stream so the call completes without text deltas (which would pollute
+// SSE trace assertions) and without a usable title, leaving the locally
+// derived title in place for tests that do not opt in.
+export const TITLE_GENERATION_MARKER = "Generate a short title";
+
+export function fakeGatewayTitleDefault() {
+  return fakeGatewaySse([{
+    type: "finish",
+    finishReason: { unified: "stop", raw: "stop" },
+    usage: { inputTokens: { total: 2 }, outputTokens: { total: 0 } },
+  }]);
+}
+
+// Finish-only Responses-protocol stream for title generation side calls at
+// Codex/Grok fake servers: completes without text deltas and without usable
+// title content, leaving the locally derived session title in place.
+export function fakeResponsesTitleDefault() {
+  return new Response(
+    'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":0}}}\n\n',
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
 
 function serveFakeGateway(
   nextCompletion: (body: string) => Response | Promise<Response>,
@@ -346,9 +369,11 @@ function serveFakeGateway(
 ) {
   const requests: Array<{ body: string; headers: Headers }> = [];
   const classifierRequests: Array<{ body: string; headers: Headers }> = [];
+  const evaluationRequests: Array<{ body: string; headers: Headers }> = [];
   const classifierResponses = [...(options.classifierResponses ?? [])];
+  const titleRequests: Array<{ body: string; headers: Headers }> = [];
+  const titleResponses = [...(options.titleResponses ?? [])];
   const modelRequests: FakeGatewayModelRequest[] = [];
-  const generationRequests: string[] = [];
   const server = Bun.serve({
     port: 0,
     idleTimeout: 0,
@@ -367,13 +392,39 @@ function serveFakeGateway(
           }],
         });
       }
-      if (req.method === "GET" && new URL(req.url).pathname === "/v1/generation") {
-        const generationId = new URL(req.url).searchParams.get("id") ?? "";
-        generationRequests.push(generationId);
-        if (options.generationResponse) {
-          return options.generationResponse(generationId, req);
-        }
-        return new Response("not found", { status: 404 });
+      if (req.method === "GET" && options.usage) {
+        const answer = options.usage(new URL(req.url), req);
+        if (answer) return answer;
+      }
+      if (
+        req.method === "POST" &&
+        new URL(req.url).pathname === "/v4/ai/evaluation-model"
+      ) {
+        evaluationRequests.push({
+          body: await req.text(),
+          headers: new Headers(req.headers),
+        });
+        // Mirrors the real AI Gateway evaluation-model envelope: camelCase
+        // usage and confidence under providerMetadata.typesafe.
+        const evaluationResponse = options.evaluationResponse ??
+          Response.json({
+            answers: {
+              decision: {
+                type: "choice",
+                choice: "clear",
+                probabilities: { clear: 0.99, caution: 0.01 },
+              },
+            },
+            rounding: { probabilityDecimals: 2, scoreDecimals: 2 },
+            usage: { inputTokens: 100, outputTokens: 10 },
+            warnings: [],
+            providerMetadata: {
+              typesafe: { confidence: { decision: 0.97 } },
+            },
+          });
+        return typeof evaluationResponse === "function"
+          ? await evaluationResponse(evaluationRequests[evaluationRequests.length - 1].body)
+          : evaluationResponse;
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
@@ -384,16 +435,23 @@ function serveFakeGateway(
         if (next) return typeof next === "function" ? await next(body) : next;
         return fakeGatewayPermissionDecision(options.classifierDecision ?? "clear");
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) {
+        titleRequests.push({ body, headers });
+        const next = titleResponses.shift();
+        if (next) return typeof next === "function" ? await next(body) : next;
+        return fakeGatewayTitleDefault();
+      }
       requests.push({ body, headers });
       return nextCompletion(body);
     },
   });
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
-    generationRequests,
+    evaluationRequests,
+    titleRequests,
     modelRequests,
     requestCount() {
       return requests.length;
@@ -428,6 +486,65 @@ export function startDynamicFakeGateway(
   return serveFakeGateway(response, options);
 }
 
+// Serves a fake update channel whose "new" artifact is a wrapper script that
+// logs its argv to argvLogPath and execs the real FX_BIN, so upgrade relaunch
+// tests can drive the handoff without shipping a second binary.
+export function startUpgradeServer(
+  root: string,
+  argvLogPath: string,
+  options: {
+    revision?: string;
+  } = {},
+): { baseUrl: string; stop: () => void } {
+  const artifactDir = join(root, "release-artifact");
+  const wrapperPath = join(artifactDir, "fx");
+  const archivePath = join(root, "fx.tar.gz");
+  mkdirSync(artifactDir);
+  const script = `#!/bin/sh
+{
+  printf '%s' "$0"
+  for arg in "$@"; do
+    printf '\\t%s' "$arg"
+  done
+  printf '\\n'
+} >> ${shellQuote(argvLogPath)}
+exec ${shellQuote(FX_BIN)} "$@"
+`;
+  writeFileSync(wrapperPath, script);
+  chmodSync(wrapperPath, 0o755);
+  const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "fx"]);
+  if (tar.exitCode !== 0) throw new Error(tar.stderr.toString());
+
+  const archive = readFileSync(archivePath);
+  const checksum = createHash("sha256").update(archive).digest("hex");
+  const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
+  const revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
+  const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
+  const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/latest.txt") return new Response("v9.9.9\n");
+      if (path === "/dev.json") {
+        return Response.json({ version: "9.9.9", commit: revision });
+      }
+      if (path === stableArchiveRoute || path === devArchiveRoute) {
+        return new Response(archive);
+      }
+      if (path === `${stableArchiveRoute}.sha256` || path === `${devArchiveRoute}.sha256`) {
+        return new Response(`${checksum}\n`);
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  return {
+    baseUrl: `http://127.0.0.1:${server.port}`,
+    stop: () => server.stop(true),
+  };
+}
+
 export class TmuxSession {
   readonly name: string;
   private readonly socketName?: string;
@@ -456,7 +573,7 @@ export class TmuxSession {
     const {
       cmd = FX_BIN,
       cwd = REPO_ROOT,
-      env = {},
+      env: requestedEnv = {},
       width = 120,
       height = 40,
       stderrPath,
@@ -466,6 +583,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
+    const env = providerVersionTestEnv(requestedEnv);
 
     if (
       minimumHistoryLines !== undefined &&
@@ -728,6 +846,26 @@ export class TmuxSession {
       stdio: "pipe",
     });
     await sleep(100);
+  }
+
+  // Interrupt active work: the first Escape arms the interrupt gesture, and a
+  // confirming press within the one-second window cancels. The confirm press
+  // is retried once when a runner stall let the arm expire between presses
+  // (the hint reappearing means the second press re-armed instead of firing).
+  async sendInterruptEscapePair(hintTimeoutMs = 15_000): Promise<void> {
+    await this.sendKeys("Escape");
+    await this.waitForText("esc again to interrupt", hintTimeoutMs);
+    await sleep(150);
+    await this.sendKeys("Escape");
+    await sleep(250);
+    const pane = await this.capturePane();
+    if (
+      pane.includes("esc again to interrupt") ||
+      pane.includes("esc esc interrupt") ||
+      pane.includes("esc esc to interrupt")
+    ) {
+      await this.sendKeys("Escape");
+    }
   }
 
   sendKeysImmediate(keys: readonly string[]): void {
@@ -1271,7 +1409,8 @@ export class TmuxSession {
     rmSync(this.exitStatusPath, { force: true });
   }
 
-  private recordedExitStatus(): number | null {
+  /// The fx process's exit status once the pane has ended, or null.
+  recordedExitStatus(): number | null {
     try {
       const value = Number.parseInt(readFileSync(this.exitStatusPath, "utf8").trim(), 10);
       return Number.isSafeInteger(value) && value >= 0 && value <= 255 ? value : null;

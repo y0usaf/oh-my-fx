@@ -5,6 +5,7 @@ const entity_spans = @import("../../core/shared/entity_spans.zig");
 const types = @import("../../core/shared/types.zig");
 const paste_blocks = @import("../../core/input/pasted_blocks.zig");
 const registered_entities = @import("../../core/input/registered_entities.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 pub const Direction = enum { up, down };
 pub const BreakKind = enum { hard_newline, soft_wrap, input_end };
@@ -70,9 +71,7 @@ pub const Row = struct {
     raw_start: usize,
     raw_end: usize,
     break_kind: BreakKind,
-    prefix_cell_width: usize,
     content_width: usize,
-    first_cursor_offset: usize,
     last_cursor_offset: usize,
 };
 
@@ -140,7 +139,6 @@ pub const Iterator = struct {
     }
 
     fn finishRow(self: *Iterator, break_kind: BreakKind, raw_end: usize) Event {
-        const prefix = inputPrefix(self.row_index);
         const last_cursor_offset = switch (break_kind) {
             .soft_wrap => if (self.last_cursor_offset == raw_end) self.previous_cursor_offset else self.last_cursor_offset,
             .hard_newline, .input_end => raw_end,
@@ -150,9 +148,7 @@ pub const Iterator = struct {
             .raw_start = self.row_start,
             .raw_end = raw_end,
             .break_kind = break_kind,
-            .prefix_cell_width = prefix.cell_width,
             .content_width = self.content_column,
-            .first_cursor_offset = self.row_start,
             .last_cursor_offset = last_cursor_offset,
         };
 
@@ -786,7 +782,7 @@ test "visual layout targets registered paste placeholders only at boundaries" {
     const input = "x\n[Pasted text #7, 1 line]";
     const blocks = [_]paste_blocks.PastedBlock{.{
         .id = 7,
-        .text = @constCast("P" ** 1001),
+        .text = @constCast(text_utils.repeat("P", 1001)),
         .line_count = 1,
         .span = .{
             .raw_start = "x\n".len,
@@ -1321,8 +1317,8 @@ test "visual layout word wrap keeps trailing space on the previous row" {
 }
 
 test "visual layout handles direct-limit and longer restored input without allocation" {
-    const direct = "x" ** 4096;
-    const longer = "y" ** 5000;
+    const direct = text_utils.repeat("x", 4096);
+    const longer = text_utils.repeat("y", 5000);
     const direct_summary = summarize(testSource(direct, direct.len, 80), null);
     const longer_summary = summarize(testSource(longer, longer.len, 80), null);
     try std.testing.expect(direct_summary.total_rows > 1);

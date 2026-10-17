@@ -59,7 +59,7 @@ const Worker = struct {
     fn acceptProgress(raw: *anyopaque, progress: @import("mcp_test_exports").Progress) void {
         const self: *Worker = @ptrCast(@alignCast(raw));
         var expected_buf: [64]u8 = undefined;
-        const expected = std.fmt.bufPrint(
+        const expected = std.mem.print(
             &expected_buf,
             "progress:{s}",
             .{self.owner},
@@ -319,7 +319,7 @@ pub fn main(init: std.process.Init) !void {
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .inherit,
-        .pgid = if (@import("builtin").os.tag == .windows) null else 0,
+        .pgid = if (@import("builtin").target.os.tag == .windows) null else 0,
     });
     const child_id = child.id.?;
     const dispatcher = try mcp.StdioDispatcher.create(
@@ -431,14 +431,14 @@ fn runRuntimeScopedHttpAuth(
         .operation_timeout_ms = 10_000,
     });
     runtime.connectAll(.{});
-    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state != .ready) {
+    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state.load(.acquire) != .ready) {
         if (runtime.servers.items.len == 1) {
             var stderr_buf: [1024]u8 = undefined;
             var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
             try stderr.interface.print(
                 "scoped auth connect failed state={s} error={s}\n",
                 .{
-                    @tagName(runtime.servers.items[0].state),
+                    @tagName(runtime.servers.items[0].state.load(.acquire)),
                     runtime.servers.items[0].last_error orelse "none",
                 },
             );
@@ -446,7 +446,7 @@ fn runRuntimeScopedHttpAuth(
         }
         return error.ScopedAuthServerDidNotConnect;
     }
-    const server = &runtime.servers.items[0];
+    const server = runtime.servers.items[0];
     if (expired) {
         server.auth_lock.lockUncancelable(io);
         if (server.auth_credentials) |*credentials| {
@@ -550,12 +550,12 @@ fn runRuntimeLegacyRefreshLocks(
     });
     runtime.connectAll(.{});
     if (runtime.servers.items.len != 1 or
-        runtime.servers.items[0].state != .ready or
+        runtime.servers.items[0].state.load(.acquire) != .ready or
         runtime.servers.items[0].legacy_http == null)
     {
         return error.LegacyRefreshServerDidNotConnect;
     }
-    const server = &runtime.servers.items[0];
+    const server = runtime.servers.items[0];
     server.auth_lock.lockUncancelable(io);
     if (server.auth_credentials) |*credentials| {
         credentials.expires_at_ms = 0;
@@ -644,12 +644,12 @@ fn runRuntimeLogoutRefreshRace(
         });
         runtime.connectAll(.{});
         if (runtime.servers.items.len != 1 or
-            runtime.servers.items[0].state != .ready or
+            runtime.servers.items[0].state.load(.acquire) != .ready or
             runtime.servers.items[0].legacy_http == null)
         {
             return error.LogoutRefreshServerDidNotConnect;
         }
-        const server = &runtime.servers.items[0];
+        const server = runtime.servers.items[0];
         server.auth_lock.lockUncancelable(io);
         if (server.auth_credentials) |*credentials| {
             credentials.expires_at_ms = 0;
@@ -798,7 +798,7 @@ fn runRuntimeInteractiveAuthLocks(
     var runtime = mcp.McpRuntime.init(alloc);
     defer runtime.deinit();
     try addInteractiveAuthServer(&runtime, alloc, server_url);
-    const server = &runtime.servers.items[0];
+    const server = runtime.servers.items[0];
     var opener = InteractiveAuthOpener{
         .io = io,
         .started_path = auth_started_path,
@@ -847,7 +847,7 @@ fn runRuntimeInteractiveAuthRetirement(
     var runtime = mcp.McpRuntime.init(alloc);
     defer runtime.deinit();
     try addInteractiveAuthServer(&runtime, alloc, server_url);
-    const server = &runtime.servers.items[0];
+    const server = runtime.servers.items[0];
     var opener = InteractiveAuthOpener{
         .io = io,
         .started_path = auth_started_path,
@@ -898,15 +898,15 @@ fn runRuntimeScopedRecovery(
     {
         return error.InvalidScopedRecoveryChildMode;
     }
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "mcp-crashed" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-crashed" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
-    const unused_ready = try std.fs.path.join(alloc, &.{ root, "unused-ready" });
+    const unused_ready = try std.Io.Dir.path.join(alloc, &.{ root, "unused-ready" });
     defer alloc.free(unused_ready);
-    const unused_release = try std.fs.path.join(alloc, &.{ root, "unused-release" });
+    const unused_release = try std.Io.Dir.path.join(alloc, &.{ root, "unused-release" });
     defer alloc.free(unused_release);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -931,10 +931,10 @@ fn runRuntimeScopedRecovery(
         1,
     );
     runtime.connectAll(.{});
-    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state != .ready) {
+    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state.load(.acquire) != .ready) {
         return error.ScopedRecoveryServerDidNotConnect;
     }
-    const owner_id = try std.fmt.allocPrint(alloc, "{s}-child", .{child_mode});
+    const owner_id = try alloc.print("{s}-child", .{child_mode});
     defer alloc.free(owner_id);
     var captured = try runtime.snapshotAccessView(
         alloc,
@@ -1072,15 +1072,15 @@ fn runRuntimeMrtrGuards(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "mrtr-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "mrtr-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
-    const unused_ready = try std.fs.path.join(alloc, &.{ root, "unused-ready" });
+    const unused_ready = try std.Io.Dir.path.join(alloc, &.{ root, "unused-ready" });
     defer alloc.free(unused_ready);
-    const unused_release = try std.fs.path.join(alloc, &.{ root, "unused-release" });
+    const unused_release = try std.Io.Dir.path.join(alloc, &.{ root, "unused-release" });
     defer alloc.free(unused_release);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1105,7 +1105,7 @@ fn runRuntimeMrtrGuards(
         0,
     );
     runtime.connectAll(.{});
-    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state != .ready) {
+    if (runtime.servers.items.len != 1 or runtime.servers.items[0].state.load(.acquire) != .ready) {
         return error.MrtrGuardServerDidNotConnect;
     }
 
@@ -1176,7 +1176,7 @@ fn countWireMethod(
         .limited(1024 * 1024),
     );
     defer alloc.free(contents);
-    const needle = try std.fmt.allocPrint(alloc, "\"method\":\"{s}\"", .{method});
+    const needle = try alloc.print("\"method\":\"{s}\"", .{method});
     defer alloc.free(needle);
     return std.mem.count(u8, contents, needle);
 }
@@ -1188,16 +1188,16 @@ fn runRuntimeRecovery(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "blocked-write-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "blocked-write-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
 
     const config_args = try alloc.alloc([]const u8, 1);
     config_args[0] = try alloc.dupe(u8, fixture_path);
-    const config_env = try alloc.alloc(mcp.McpEnvVar, 4);
+    const config_env = try alloc.alloc(mcp.McpEnvVar, 5);
     config_env[0] = .{
         .key = try alloc.dupe(u8, "FX_MCP_MODE"),
         .value = try alloc.dupe(u8, "block_operation_write_once"),
@@ -1213,6 +1213,11 @@ fn runRuntimeRecovery(
     config_env[3] = .{
         .key = try alloc.dupe(u8, "FX_MCP_PID_PATH"),
         .value = try alloc.dupe(u8, pid_path),
+    };
+
+    config_env[4] = .{
+        .key = try alloc.dupe(u8, "FX_MCP_PROTOCOL_VERSION"),
+        .value = try alloc.dupe(u8, "2026-07-28"),
     };
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1265,11 +1270,11 @@ fn runRuntimeRecoveryBudget(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "recovery-budget-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-budget-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1346,15 +1351,15 @@ fn runRuntimeStaleRecovery(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "stale-recovery-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "stale-recovery-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
-    const ready_path = try std.fs.path.join(alloc, &.{ root, "recovery-ready" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-ready" });
     defer alloc.free(ready_path);
-    const release_path = try std.fs.path.join(alloc, &.{ root, "recovery-release" });
+    const release_path = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-release" });
     defer alloc.free(release_path);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1488,11 +1493,11 @@ fn runRuntimeCatalogControl(
     root: []const u8,
     control: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "catalog-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "catalog-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
 
     const cancel_control = std.mem.eql(u8, control, "cancel");
@@ -1582,13 +1587,13 @@ fn runRuntimeRecoveryControl(
     root: []const u8,
     control: []const u8,
 ) !void {
-    const marker_path = try std.fs.path.join(alloc, &.{ root, "blocked-write-marker" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ root, "blocked-write-marker" });
     defer alloc.free(marker_path);
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const pid_path = try std.fs.path.join(alloc, &.{ root, "mcp.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp.pid" });
     defer alloc.free(pid_path);
-    const ready_path = try std.fs.path.join(alloc, &.{ root, "recovery-ready" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-ready" });
     defer alloc.free(ready_path);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1614,7 +1619,7 @@ fn runRuntimeRecoveryControl(
         1,
     );
     runtime.connectAll(.{});
-    if (runtime.servers.items[0].state != .ready) {
+    if (runtime.servers.items[0].state.load(.acquire) != .ready) {
         return error.RuntimeRecoveryControlServerDidNotConnect;
     }
     runtime.servers.items[0].config.startup_timeout_ms = if (std.mem.eql(u8, control, "cancel"))
@@ -1655,12 +1660,22 @@ fn runRuntimeRecoveryControl(
     call_joined = true;
     defer if (call.response) |response| alloc.free(response);
 
-    const expected_error: anyerror = if (std.mem.eql(u8, control, "cancel"))
-        error.Cancelled
-    else
-        error.McpRequestTimedOut;
-    if (call.err == null or call.err.? != expected_error) {
-        return error.WrongRecoveryControlError;
+    if (std.mem.eql(u8, control, "cancel")) {
+        if (call.err == null or call.err.? != error.Cancelled) {
+            return error.WrongRecoveryControlError;
+        }
+    } else {
+        // The call reports why the stopped server could not be restarted.
+        const response = call.response orelse return error.WrongRecoveryControlError;
+        if (std.mem.find(u8, response, "server_restart_failed") == null or
+            std.mem.find(u8, response, "did not complete startup within 500 ms (startup_timeout_ms)") == null)
+        {
+            var stderr_buf: [1024]u8 = undefined;
+            var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
+            try stderr.interface.print("unexpected recovery result: {s}\n", .{response});
+            try stderr.interface.flush();
+            return error.WrongRecoveryControlResult;
+        }
     }
     const control_elapsed_ms = if (control_started_ms) |started_ms|
         milliTimestamp(io) - started_ms
@@ -1688,19 +1703,19 @@ fn runRuntimeRecoveryCollision(
     fixture_path: []const u8,
     root: []const u8,
 ) !void {
-    const wire_log_path = try std.fs.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
+    const wire_log_path = try std.Io.Dir.path.join(alloc, &.{ root, "mcp-wire.jsonl" });
     defer alloc.free(wire_log_path);
-    const first_marker = try std.fs.path.join(alloc, &.{ root, "first-marker" });
+    const first_marker = try std.Io.Dir.path.join(alloc, &.{ root, "first-marker" });
     defer alloc.free(first_marker);
-    const second_marker = try std.fs.path.join(alloc, &.{ root, "second-marker" });
+    const second_marker = try std.Io.Dir.path.join(alloc, &.{ root, "second-marker" });
     defer alloc.free(second_marker);
-    const first_pid = try std.fs.path.join(alloc, &.{ root, "first.pid" });
+    const first_pid = try std.Io.Dir.path.join(alloc, &.{ root, "first.pid" });
     defer alloc.free(first_pid);
-    const second_pid = try std.fs.path.join(alloc, &.{ root, "second.pid" });
+    const second_pid = try std.Io.Dir.path.join(alloc, &.{ root, "second.pid" });
     defer alloc.free(second_pid);
-    const recovery_ready = try std.fs.path.join(alloc, &.{ root, "recovery-ready" });
+    const recovery_ready = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-ready" });
     defer alloc.free(recovery_ready);
-    const recovery_release = try std.fs.path.join(alloc, &.{ root, "recovery-release" });
+    const recovery_release = try std.Io.Dir.path.join(alloc, &.{ root, "recovery-release" });
     defer alloc.free(recovery_release);
 
     var runtime = mcp.McpRuntime.init(alloc);
@@ -1760,8 +1775,12 @@ fn runRuntimeRecoveryCollision(
     };
     const first_thread = try std.Thread.spawn(.{}, RuntimeCall.run, .{&first_call});
     const second_thread = try std.Thread.spawn(.{}, RuntimeCall.run, .{&second_call});
-    try waitForReadyCount(io, alloc, recovery_ready, 1, 2_000);
-    sleep(io, 250 * std.time.ns_per_ms);
+    waitForReadyCount(io, alloc, recovery_ready, 2, 2_000) catch |err| {
+        try createSignalFile(io, recovery_release);
+        first_thread.join();
+        second_thread.join();
+        return err;
+    };
     const ready_before_release = try readyCount(io, alloc, recovery_ready);
     try createSignalFile(io, recovery_release);
     first_thread.join();
@@ -1771,7 +1790,7 @@ fn runRuntimeRecoveryCollision(
     if (first_call.err == null or second_call.err == null) {
         return error.MissingRecoveryTriggerError;
     }
-    if (ready_before_release != 1) return error.RecoveryWasNotSerialized;
+    if (ready_before_release != 2) return error.UnrelatedRecoveryWasBlocked;
     const ready_after_release = try readyCount(io, alloc, recovery_ready);
     if (ready_after_release != 2) return error.MissingSecondRecovery;
 
@@ -1835,8 +1854,9 @@ fn addRecoveryTestServer(
 ) !void {
     const config_args = try alloc.alloc([]const u8, 1);
     config_args[0] = try alloc.dupe(u8, fixture_path);
-    const config_env = try alloc.alloc(mcp.McpEnvVar, 9);
+    const config_env = try alloc.alloc(mcp.McpEnvVar, 10);
     const entries = [_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "FX_MCP_PROTOCOL_VERSION", .value = "2026-07-28" },
         .{ .key = "FX_MCP_MODE", .value = mode },
         .{ .key = "FX_MCP_CRASH_MARKER", .value = marker_path },
         .{ .key = "FX_MCP_WIRE_LOG", .value = wire_log_path },
@@ -2014,7 +2034,7 @@ fn runBlockedWrite(
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .inherit,
-        .pgid = if (@import("builtin").os.tag == .windows) null else 0,
+        .pgid = if (@import("builtin").target.os.tag == .windows) null else 0,
     });
     const child_id = child.id.?;
     const dispatcher = try mcp.StdioDispatcher.create(
@@ -2040,7 +2060,7 @@ fn runBlockedWrite(
     }
     const exceeded_deadline = !blocked.done.load(.acquire);
     if (exceeded_deadline) {
-        if (@import("builtin").os.tag == .windows) {
+        if (@import("builtin").target.os.tag == .windows) {
             return error.SkipZigTest;
         }
         std.posix.kill(-child_id, .KILL) catch |err| switch (err) {
@@ -2082,7 +2102,7 @@ fn validateWorker(alloc: Allocator, worker: *const Worker) !void {
     const response = worker.response orelse return error.MissingResponse;
     defer alloc.free(response);
     var expected_buf: [64]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
         "\"owner\":\"{s}\"",
         .{worker.owner},

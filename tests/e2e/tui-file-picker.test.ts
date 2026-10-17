@@ -5,10 +5,12 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,6 +19,7 @@ import { FX_BIN, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  heldFakeGatewayFinalText,
   isComposerLine,
   startFakeGateway,
   TmuxSession,
@@ -125,6 +128,16 @@ function processRssKb(pid: number): number {
     throw new Error(`invalid RSS for pid ${pid}: ${JSON.stringify(output)}`);
   }
   return rss;
+}
+
+// The @ menu rows: the lines between the two rules below the composer.
+function pickerRows(grid: string[]): string[] {
+  const composer = grid.findIndex(isComposerLine);
+  const rules = grid.flatMap((line, index) =>
+    index > composer && /^─+$/.test(line.trim()) ? [index] : []
+  );
+  if (composer < 0 || rules.length < 2) return [];
+  return grid.slice(rules[0]! + 1, rules[1]!).map((line) => line.trim()).filter(Boolean);
 }
 
 function composerTextFromPane(pane: string): string {
@@ -358,7 +371,7 @@ function expectFileDiscoveryOffMainThread(trace: string): void {
   );
   const discoveryThreads = traceThreadIds(
     trace,
-    /workspace file discovery process spawning thread=(\d+)/g,
+    /file index root (?:scanned|reused) root=\d+ .*thread=(\d+)/g,
   );
   const mainThreads = new Set(callerThreads);
 
@@ -426,6 +439,187 @@ async function replayTape(current: Fixture): Promise<void> {
 }
 
 describe("@ file picker", () => {
+  tmuxTest(
+    "Tab opens a folder that lists itself first, and Enter selects a folder",
+    async () => {
+      const current = createFixture("fx-file-picker-folder-");
+      mkdirSync(join(current.workspace, "notes", "drafts"), { recursive: true });
+      writeFileSync(join(current.workspace, "notes", "todo.md"), "todo");
+      writeFileSync(join(current.workspace, "notes", "drafts", "idea.md"), "idea");
+      const active = await startMockFx(current, [], 1000);
+
+      await active.sendLiteral("Review @notes");
+      await active.waitForText("notes/", TIMEOUT);
+      await active.sendKeys("Tab");
+      await active.waitForText("notes/todo.md", TIMEOUT);
+      expect(await composerPlainText(active)).toBe("Review @notes/");
+      expect(pickerRows(await active.capturePaneGrid())).toEqual(["notes/", "notes/drafts/", "notes/todo.md"]);
+
+      // Enter on the first row selects the opened folder itself.
+      await active.sendKeys("Enter");
+      await active.sendLiteral("please");
+      await active.waitForPane((pane) => composerTextFromPane(pane) === "Review @notes/ please", TIMEOUT);
+      expect(pickerRows(await active.capturePaneGrid())).toEqual([]);
+
+      // Enter on a listed child folder selects that folder.
+      await clearComposer(active);
+      await active.sendLiteral("@notes/");
+      await active.waitForText("notes/drafts/", TIMEOUT);
+      await active.sendKeys("Down");
+      await active.sendKeys("Enter");
+      await active.sendLiteral("x");
+      await active.waitForPane((pane) => composerTextFromPane(pane) === "@notes/drafts/ x", TIMEOUT);
+      expect(gateway?.requests ?? []).toHaveLength(0);
+      expectCleanRuntime(current, active);
+      await clearComposer(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
+    "shows ten rows when the terminal has room and scrolls the rows it shows",
+    async () => {
+      const current = createFixture("fx-file-picker-rows-");
+      const names = Array.from({ length: 30 }, (_, i) => `item-${String(i).padStart(2, "0")}.txt`);
+      for (const name of names) writeFileSync(join(current.workspace, name), "x");
+      gateway = startFakeGateway([]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: current.workspace, env: mockFxEnvironment(current, gateway),
+        isolated: true, width: 112, height: 40, stderrPath: current.stderrPath,
+      });
+      const active = session;
+      await active.waitForComposer(TIMEOUT);
+      await active.sendLiteral("@item-");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(0, 10).join("|"), TIMEOUT);
+
+      // A short terminal keeps six rows, and navigation scrolls those six:
+      // moving back up leaves the window in place until the selection passes
+      // its top row.
+      await active.resizeWindow(112, 16);
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(0, 6).join("|"), TIMEOUT);
+      for (let i = 0; i < 7; i++) await active.sendKeys("Down");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(2, 8).join("|"), TIMEOUT);
+      for (let i = 0; i < 6; i++) await active.sendKeys("Up");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(1, 7).join("|"), TIMEOUT);
+      await active.sendKeys("Tab");
+      await active.waitForPane((pane) => composerTextFromPane(pane) === "@item-01.txt", TIMEOUT);
+      expect(gateway.requests).toHaveLength(0);
+      expectCleanRuntime(current, active);
+      await clearComposer(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
+    "paints a folder's rows with the keystroke instead of a loading frame",
+    async () => {
+      const current = createFixture("fx-file-picker-folder-frame-");
+      mkdirSync(join(current.workspace, "tree", "inner"), { recursive: true });
+      writeFileSync(join(current.workspace, "tree", "top.txt"), "top");
+      writeFileSync(join(current.workspace, "tree", "inner", "leaf-a.txt"), "a");
+      writeFileSync(join(current.workspace, "tree", "inner", "leaf-b.txt"), "b");
+      const active = await startMockFx(current, [], 1000);
+
+      await active.sendLiteral("@./tree/");
+      await active.waitForText("./tree/top.txt", TIMEOUT);
+      await active.sendKeys("Down");
+      await active.sendKeys("Tab");
+      await active.waitForText("./tree/inner/leaf-a.txt", TIMEOUT);
+      await active.sendLiteral("leaf-b");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === "./tree/inner/leaf-b.txt", TIMEOUT);
+      expectCleanRuntime(current, active);
+      await clearComposer(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+
+      // Every frame fx wrote, interleaved with the keystrokes that caused them.
+      const framesDir = join(current.root, "frames");
+      const replay = await runFx(["replay", current.tapePath, "--frames-dir", framesDir], {
+        cwd: current.workspace, env: { HOME: current.home }, timeoutMs: TIMEOUT,
+      });
+      expect(replay.code).toBe(0);
+      const frames = readdirSync(join(framesDir, "frames"))
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => JSON.parse(readFileSync(join(framesDir, "frames", name), "utf8")) as {
+          index: number;
+          elapsed_ms: number;
+          kind: string;
+        })
+        .sort((a, b) => a.index - b.index);
+      let lastInputMs = Number.NEGATIVE_INFINITY;
+      let folderRowsPainted = false;
+      for (const frame of frames) {
+        if (frame.kind === "stdin") {
+          lastInputMs = frame.elapsed_ms;
+          continue;
+        }
+        if (frame.kind !== "stdout") continue;
+        // Grid files frame each terminal row as |row|.
+        const grid = readFileSync(
+          join(framesDir, "frames", `${String(frame.index).padStart(4, "0")}.grid.txt`),
+          "utf8",
+        ).split("\n").map((line) => line.replace(/^\|(.*)\|$/, "$1"));
+        if (!composerTextFromPane(grid.join("\n")).startsWith("@./tree/")) continue;
+        if (pickerRows(grid).includes("./tree/inner/leaf-a.txt")) folderRowsPainted = true;
+        // A folder that lists within one 8 ms tick paints together with its
+        // keystroke. A loading frame is allowed only once that wait has run
+        // out; 7 allows for millisecond rounding between the tape and the wait.
+        if (grid.some((line) => line.includes("indexing files..."))) {
+          expect(frame.elapsed_ms - lastInputMs).toBeGreaterThanOrEqual(7);
+        }
+      }
+      expect(folderRowsPainted).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
+    "opens and selects a file while a turn is in flight",
+    async () => {
+      const current = createFixture("fx-file-picker-in-flight-");
+      initGit(current.workspace);
+      writeFileSync(join(current.workspace, "in-flight-context.txt"), "context");
+      git(current.workspace, "add", "in-flight-context.txt");
+      const held = heldFakeGatewayFinalText();
+
+      try {
+        const active = await startMockFx(current, [held.response], 1_000);
+        await active.sendText("Keep this turn active.");
+        await waitForGatewayRequestCount(1);
+
+        await active.sendLiteral("@in-flight");
+        await active.waitForPane(
+          (pane) => pane.includes("in-flight-context.txt"),
+          5_000,
+        );
+        await active.sendKeys("Enter");
+        await active.waitForPane(
+          (pane) => composerTextFromPane(pane).includes("@in-flight-context.txt"),
+          5_000,
+        );
+
+        expect(gateway?.requests).toHaveLength(1);
+        held.release("IN_FLIGHT_FILE_PICKER_COMPLETE");
+        await active.waitForText("IN_FLIGHT_FILE_PICKER_COMPLETE", TIMEOUT);
+        expectCleanRuntime(current, active);
+        await clearComposer(active);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        held.dispose();
+      }
+    },
+    TIMEOUT,
+  );
+
   tmuxTest(
     "keeps the completed result visible through rapid large-index refreshes",
     async () => {
@@ -638,7 +832,14 @@ describe("@ file picker", () => {
         }
       })();
 
+      // A refresh of an unchanged tree reuses the saved listing in a few
+      // milliseconds. Touching the git index, as `git add` would, makes each
+      // refresh rescan every file without changing the result, so frames can
+      // observe a replacement in flight.
+      const gitIndexPath = join(current.workspace, ".git", "index");
       const injectCycle = () => {
+        const now = new Date();
+        utimesSync(gitIndexPath, now, now);
         active.sendKeysImmediate(["Escape", "C-u"]);
         active.sendLiteralImmediate(`${LIFECYCLE_QUERY.slice(0, -1)}`);
         active.sendLiteralImmediate(LIFECYCLE_QUERY.slice(-1));
@@ -797,8 +998,15 @@ describe("@ file picker", () => {
       for (const snapshot of activeQueryFrames) {
         expect(snapshot.pane).not.toContain("indexing files...");
       }
+      // A replacement finishes in tens of milliseconds, close to one frame
+      // capture, so a frame inside it is luck. What must hold is that
+      // replacements began while the query was on screen and every frame
+      // around them kept the completed result.
       expect(
-        activeQueryFrames.some((snapshot) => replacementIncomplete(snapshot.trace)),
+        activeQueryFrames.some((snapshot) =>
+          traceGenerationNumbers(snapshot.trace, "file index generation started")
+            .some((generation) => generation >= firstReplacementGeneration)
+        ),
       ).toBe(true);
 
       let acceptedFilePrompt = "";
@@ -927,7 +1135,7 @@ describe("@ file picker", () => {
 
       const finalTrace = await waitForFileText(
         current.tracePath,
-        "file index shutdown complete",
+        "file index shutdown requested",
       );
       const replacementStart = finalTrace.indexOf(
         `file index generation started generation=${replacementGeneration}`,
@@ -942,7 +1150,6 @@ describe("@ file picker", () => {
       expect(replacementReady).toBeGreaterThan(replacementStart);
       expect(replacementAdopted).toBeGreaterThan(replacementReady);
       expect(finalTrace).toContain("file index refresh coalesced");
-      expect(finalTrace).toContain("file index shutdown requested");
       expectFileDiscoveryOffMainThread(finalTrace);
 
       if (artifactDir) {
@@ -1508,16 +1715,21 @@ describe("@ file picker", () => {
       await active.sendLiteral("@flip-file");
       await active.waitForText("flip-file.txt", TIMEOUT);
       await waitForFileText(current.tracePath, stableFileAdoption);
+      const fileDraft = await composerPlainText(active);
       rmSync(join(current.workspace, "flip-file.txt"));
       mkdirSync(join(current.workspace, "flip-file.txt"));
-      await clearComposer(active);
-      await active.waitForComposer(TIMEOUT);
+      await active.sendKeys("Enter");
+      await active.waitForText("Selection unavailable", TIMEOUT);
+      expect(await composerPlainText(active)).toBe(fileDraft);
       const refreshedFileAdoption = nextFileIndexAdoption(current.tracePath);
-      await active.sendLiteral("@flip-file");
+      await active.sendKeys("Tab");
       await waitForFileText(current.tracePath, refreshedFileAdoption);
       await active.waitForText("flip-file.txt/", TIMEOUT);
-      const refreshedFileTraceOffset = readFileSync(current.tracePath, "utf8").length;
       await active.sendKeys("Enter");
+      await active.waitForText("Selection unavailable", TIMEOUT);
+      expect(await composerPlainText(active)).toBe(fileDraft);
+      const refreshedFileTraceOffset = readFileSync(current.tracePath, "utf8").length;
+      await active.sendKeys("Down Enter");
       await waitForFileSlice(current.tracePath, refreshedFileTraceOffset, [
         "file picker Enter consumed selected=true",
       ]);
@@ -1530,18 +1742,21 @@ describe("@ file picker", () => {
       await active.sendLiteral("@flip-dir");
       await active.waitForText("flip-dir/", TIMEOUT);
       await waitForFileText(current.tracePath, stableDirectoryAdoption);
+      const directoryDraft = await composerPlainText(active);
       rmSync(join(current.workspace, "flip-dir"), { recursive: true, force: true });
       writeFileSync(join(current.workspace, "flip-dir"), "now a file");
-      await clearComposer(active);
-      await active.waitForComposer(TIMEOUT);
+      await active.sendKeys("Enter");
+      await active.waitForText("Selection unavailable", TIMEOUT);
+      expect(await composerPlainText(active)).toBe(directoryDraft);
       const refreshedDirectoryAdoption = nextFileIndexAdoption(current.tracePath);
-      await active.sendLiteral("@flip-dir");
+      await active.sendKeys("Tab");
       await waitForFileText(current.tracePath, refreshedDirectoryAdoption);
+      await active.waitForText("Selection unavailable", TIMEOUT);
       const refreshedDirectoryTraceOffset = readFileSync(
         current.tracePath,
         "utf8",
       ).length;
-      await active.sendKeys("Enter");
+      await active.sendKeys("Down Enter");
       await waitForFileSlice(current.tracePath, refreshedDirectoryTraceOffset, [
         "file picker Enter consumed selected=true",
       ]);
@@ -1550,6 +1765,293 @@ describe("@ file picker", () => {
       expect(gateway?.requests).toHaveLength(1);
       expectCleanRuntime(current, active);
       await replayTape(current);
+    },
+    120_000,
+  );
+
+  tmuxTest(
+    "consumes loading Tab and Enter without duplicate directory jobs or delayed submit",
+    async () => {
+      const current = createFixture("fx-file-picker-directory-job-");
+      initGit(current.workspace);
+      mkdirSync(join(current.workspace, "first"));
+      mkdirSync(join(current.workspace, "second"));
+      writeFileSync(join(current.workspace, "first", "alpha.txt"), "first");
+      writeFileSync(join(current.workspace, "second", "beta.txt"), "second");
+      gateway = startFakeGateway([]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: current.workspace, env: mockFxEnvironment(current, gateway),
+        isolated: true, width: 112, height: 32, stderrPath: current.stderrPath,
+      });
+      const active = session;
+      await active.waitForComposer(TIMEOUT);
+      // One input batch arrives before any directory rowset can be presented.
+      active.sendLiteralImmediate("@./first/\t\t\r");
+      await active.waitForText("./first/alpha.txt", TIMEOUT);
+      expect(await composerPlainText(active)).toBe("@./first/");
+      expect(gateway.requests).toHaveLength(0);
+      const starts = () => readFileSync(current.tracePath, "utf8").split("directory completion started request=").length - 1;
+      expect(starts()).toBe(1);
+      await active.resizeWindow(100, 30);
+      await active.waitForText("./first/alpha.txt", TIMEOUT);
+      await active.sendKeys("Down Up");
+      expect(starts()).toBe(1);
+      expect(gateway.requests).toHaveLength(0);
+      await clearComposer(active);
+      active.sendLiteralImmediate("@./second/\r");
+      await active.waitForText("./second/beta.txt", TIMEOUT);
+      expect(await composerPlainText(active)).toBe("@./second/");
+      expect(starts()).toBe(2);
+      expect(gateway.requests).toHaveLength(0);
+      // The first row is the opened folder itself; its file follows.
+      await active.sendKeys("Down Tab");
+      expect(await composerPlainText(active)).toBe("@./second/beta.txt");
+      await clearComposer(active);
+      const scrollback = await active.captureFullScrollbackEscapes();
+      expect(scrollback).not.toContain("./first/alpha.txt");
+      expect(scrollback).not.toContain("./second/beta.txt");
+      expectCleanRuntime(current, active);
+      await active.sendText("/quit");
+      await active.waitForSessionEnd(TIMEOUT);
+      expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+      const replay = await runFx(["replay", current.tapePath, "--frames"], {
+        cwd: current.workspace, env: { HOME: current.home }, timeoutMs: TIMEOUT,
+      });
+      expect(replay.code).toBe(0);
+      expect(replay.stderr).toBe("");
+      expect(replay.stdout).toContain("./first/alpha.txt");
+      expect(replay.stdout).toContain("./second/beta.txt");
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
+    "keeps presented file identity without rescanning on navigation and repaint",
+    async () => {
+      const current = createFixture("fx-file-picker-presented-");
+      initGit(current.workspace);
+      writeFileSync(join(current.workspace, "b.txt"), "b");
+      writeFileSync(join(current.workspace, "c.txt"), "c");
+      git(current.workspace, "add", "b.txt", "c.txt");
+      gateway = startFakeGateway([fakeGatewayFinalText("PRESENTED_PICKER_OK")]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: current.workspace, env: mockFxEnvironment(current, gateway),
+        isolated: true, width: 112, height: 32, stderrPath: current.stderrPath,
+      });
+      const active = session;
+      await active.waitForComposer(TIMEOUT);
+      await active.sendLiteral("@./");
+      await active.waitForText("./c.txt", TIMEOUT);
+      // .git is also listed by explicit completion. Select c from the end.
+      await active.sendKeys("Up");
+      const prepared = () => readFileSync(current.tracePath, "utf8").split("file picker prepared revision=").length - 1;
+      const before = prepared();
+      await active.resizeWindow(100, 30);
+      await active.waitForText("./c.txt", TIMEOUT);
+      await active.sendKeys("Up Down");
+      expect(prepared()).toBe(before);
+      writeFileSync(join(current.workspace, "a.txt"), "a");
+      await active.sendKeys("Tab");
+      expect(await composerPlainText(active)).toBe("@./c.txt");
+      expect(prepared()).toBe(before);
+      expect(gateway?.requests).toHaveLength(0);
+
+      mkdirSync(join(current.workspace, "retry"));
+      writeFileSync(join(current.workspace, "retry", "b.txt"), "b");
+      writeFileSync(join(current.workspace, "retry", "c.txt"), "c");
+      await clearComposer(active);
+      await active.sendLiteral("@./retry/");
+      await active.waitForText("./retry/c.txt", TIMEOUT);
+      await active.sendKeys("Up");
+      unlinkSync(join(current.workspace, "retry", "c.txt"));
+      await active.sendKeys("Enter");
+      await active.waitForText("Selection unavailable", TIMEOUT);
+      const retryOffset = readFileSync(current.tracePath, "utf8").length;
+      await active.sendKeys("Tab");
+      await waitForFileSlice(current.tracePath, retryOffset, ["file picker prepared revision="]);
+      await active.waitForPane(pane => pane.includes("./retry/b.txt") && !pane.includes("./retry/c.txt"), TIMEOUT);
+      await active.sendKeys("Enter");
+      await active.waitForText("Selection unavailable", TIMEOUT);
+      expect(await composerPlainText(active)).toBe("@./retry/");
+      expect(gateway?.requests).toHaveLength(0);
+      // The rows are now the folder and b.txt; move from the stale slot to b.txt.
+      await active.sendKeys("Down Down Enter");
+      expect(await composerPlainText(active)).toBe("@./retry/b.txt");
+
+      await clearComposer(active);
+      await active.sendLiteral("@./missing/");
+      await active.waitForText("Directory unavailable.", TIMEOUT);
+      await active.sendKeys("Enter");
+      expect(await composerPlainText(active)).toBe("@./missing/");
+      expect(gateway?.requests).toHaveLength(0);
+      mkdirSync(join(current.workspace, "missing"));
+      writeFileSync(join(current.workspace, "missing", "recovered.txt"), "recovered");
+      await active.sendKeys("Tab");
+      await active.waitForText("./missing/recovered.txt", TIMEOUT);
+      expect(await composerPlainText(active)).toBe("@./missing/");
+      // The recovered folder lists itself first; its file follows.
+      await active.sendKeys("Down Tab");
+      expect(await composerPlainText(active)).toBe("@./missing/recovered.txt");
+      await active.sendLiteral(" Reply with the words PRESENTED, PICKER, and OK joined by underscores.");
+      await active.sendKeys("Enter");
+      await active.waitForText("PRESENTED_PICKER_OK", TIMEOUT);
+      await active.waitForStableComposer(TIMEOUT);
+      expect(gateway?.requests).toHaveLength(1);
+      expect(gateway!.requests[0]!.body).toContain("@./missing/recovered.txt Reply with the words PRESENTED, PICKER, and OK joined by underscores.");
+      const scrollback = await active.captureFullScrollbackEscapes();
+      expect(scrollback).toContain("PRESENTED_PICKER_OK");
+      expectCleanRuntime(current, active);
+      await active.sendText("/quit");
+      await active.waitForSessionEnd(TIMEOUT);
+      expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+      const replay = await runFx(["replay", current.tapePath, "--frames"], {
+        cwd: current.workspace, env: { HOME: current.home }, timeoutMs: TIMEOUT,
+      });
+      expect(replay.code).toBe(0);
+      expect(replay.stderr).toBe("");
+      expect(replay.stdout).toContain("Directory unavailable.");
+      expect(replay.stdout).toContain("@./c.txt");
+    },
+    120_000,
+  );
+
+  tmuxTest(
+    "fuzzy home basenames match suffixes and subsequences without scanning descendants",
+    async () => {
+      const current = createFixture("fx-file-picker-fuzzy-home-");
+      initGit(current.workspace);
+      mkdirSync(join(current.home, "Desktop"));
+      mkdirSync(join(current.home, "other"));
+      writeFileSync(join(current.home, "Desktop", "note.txt"), "DO_NOT_ATTACH_DESKTOP_CONTENT");
+      writeFileSync(join(current.home, "other", "ktop.txt"), "not an immediate child");
+      gateway = startFakeGateway([fakeGatewayFinalText("FUZZY_HOME_OK")]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: current.workspace, env: mockFxEnvironment(current, gateway),
+        isolated: true, width: 112, height: 32, stderrPath: current.stderrPath,
+      });
+      const active = session;
+      await active.waitForComposer(TIMEOUT);
+      for (const query of ["@~/ktop", "@~/dsktp"]) {
+        await clearComposer(active);
+        await active.sendLiteral(query);
+        await active.waitForText("~/Desktop/", TIMEOUT);
+        expect(await active.capturePane()).not.toContain("ktop.txt");
+        await active.sendKeys("Tab");
+        expect(await composerPlainText(active)).toBe("@~/Desktop/");
+        expect(gateway.requests).toHaveLength(0);
+      }
+      await active.sendLiteral("ote");
+      await active.waitForText("~/Desktop/note.txt", TIMEOUT);
+      await active.sendKeys("Tab");
+      expect(await composerPlainText(active)).toBe("@~/Desktop/note.txt");
+      await active.sendLiteral(" Reply briefly.");
+      await active.sendKeys("Enter");
+      await active.waitForText("FUZZY_HOME_OK", TIMEOUT);
+      await active.waitForStableComposer(TIMEOUT);
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.body).toContain("@~/Desktop/note.txt Reply briefly.");
+      expect(gateway.requests[0]!.body).not.toContain("DO_NOT_ATTACH_DESKTOP_CONTENT");
+      expectCleanRuntime(current, active);
+      await active.sendText("/quit");
+      await active.waitForSessionEnd(TIMEOUT);
+      expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+      await replayTape(current);
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
+    "browses bare directory shortcuts from startup through submission and exit",
+    async () => {
+      const current = createFixture("fx-file-picker-shortcuts-");
+      initGit(current.workspace);
+      writeFileSync(join(current.home, "home-target.txt"), "DO_NOT_ATTACH_HOME_CONTENT");
+      writeFileSync(join(current.workspace, "local-target.txt"), "local");
+      writeFileSync(join(current.workspace, ".gitignore"), "ignored/\n");
+      writeFileSync(join(current.root, "parent-target.txt"), "parent");
+      git(current.workspace, "add", "local-target.txt", ".gitignore");
+      gateway = startFakeGateway([fakeGatewayFinalText("SHORTCUT_FLOW_OK")]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: current.workspace,
+        env: mockFxEnvironment(current, gateway),
+        isolated: true,
+        width: 112,
+        height: 32,
+        stderrPath: current.stderrPath,
+      });
+      const active = session;
+      await active.waitForComposer(TIMEOUT);
+
+      for (const [shortcut, label] of [
+        ["~", "~/home-target.txt"],
+        [".", "./local-target.txt"],
+        ["..", "../parent-target.txt"],
+      ] as const) {
+        await clearComposer(active);
+        await active.sendLiteral(`@${shortcut}`);
+        await active.waitForText(label, TIMEOUT);
+        expect(await composerPlainText(active)).toBe(`@${shortcut}`);
+        await active.sendLiteral("/");
+        await active.waitForText(label, TIMEOUT);
+        await active.sendKeys("BSpace");
+        await active.waitForPane((pane) =>
+          composerTextFromPane(pane) === `@${shortcut}` && pane.includes(label), TIMEOUT);
+        await active.sendKeys("Escape");
+        await active.waitForPane((pane) => !pane.includes(label), TIMEOUT);
+      }
+
+      await clearComposer(active);
+      await active.sendLiteral("@.gitig");
+      await active.waitForText(".gitignore", TIMEOUT);
+      await active.sendKeys("Tab");
+      expect(await composerPlainText(active)).toBe("@.gitignore");
+      await clearComposer(active);
+      await active.sendLiteral("@lcltrgt");
+      await active.waitForText("local-target.txt", TIMEOUT);
+      await active.sendKeys("Enter");
+      expect(await composerPlainText(active)).toBe("@local-target.txt");
+
+      await clearComposer(active);
+      await active.sendLiteral("@~");
+      await active.waitForText("~/home-target.txt", TIMEOUT);
+      // Rows: the home folder itself, ~/.fx/, then ~/home-target.txt.
+      await active.sendKeys("Down Down Enter");
+      expect(await composerPlainText(active)).toBe("@~/home-target.txt");
+      expect(gateway?.requests).toHaveLength(0);
+      await active.sendLiteral(" Reply with the words SHORTCUT, FLOW, and OK joined by underscores.");
+      await active.sendKeys("Enter");
+      await active.waitForText("SHORTCUT_FLOW_OK", TIMEOUT);
+      await active.waitForStableComposer(TIMEOUT);
+      expect(gateway?.requests).toHaveLength(1);
+      const request = JSON.parse(gateway!.requests[0]!.body);
+      expect(request.prompt.at(-1)).toEqual({
+        role: "user",
+        content: [{ type: "text", text: "@~/home-target.txt Reply with the words SHORTCUT, FLOW, and OK joined by underscores." }],
+      });
+      expect(gateway!.requests[0]!.body).not.toContain("DO_NOT_ATTACH_HOME_CONTENT");
+      const scrollback = await active.captureFullScrollbackEscapes();
+      expect(scrollback).toContain("SHORTCUT_FLOW_OK");
+      expect(scrollback).not.toContain("no matching files");
+      expectCleanRuntime(current, active);
+      await active.sendText("/quit");
+      await active.waitForSessionEnd(TIMEOUT);
+      expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+
+      const replay = await runFx(["replay", current.tapePath, "--frames"], {
+        cwd: current.workspace,
+        env: { HOME: current.home },
+        timeoutMs: TIMEOUT,
+      });
+      expect(replay.code).toBe(0);
+      expect(replay.stderr).toBe("");
+      for (const text of ["~/home-target.txt", "./local-target.txt", "../parent-target.txt", "SHORTCUT_FLOW_OK"]) {
+        expect(replay.stdout).toContain(text);
+      }
     },
     120_000,
   );
@@ -1588,6 +2090,9 @@ describe("@ file picker", () => {
       await active.waitForText("empty-workspace/", TIMEOUT);
       await active.sendKeys("Tab");
       expect(await composerPlainText(active)).toBe("@empty-workspace/");
+      // An opened empty folder still lists itself, so it can be selected.
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === "empty-workspace/", TIMEOUT);
+      await active.sendLiteral("zzz");
       await active.waitForText("no matching files", TIMEOUT);
       await active.sendKeys("Escape");
       await active.waitForPane((pane) => !pane.includes("no matching files"), TIMEOUT);
@@ -1610,11 +2115,11 @@ describe("@ file picker", () => {
       await active.sendLiteral("@./scoped/@t");
       await active.waitForText("./scoped/@types/", TIMEOUT);
       await active.sendKeys("Tab");
-      expect(await composerPlainText(active)).toBe("@./scoped/@types/");
+      expect(await composerPlainText(active)).toBe('@"./scoped/@types/');
       await active.sendLiteral("index");
       await active.waitForText("./scoped/@types/index.d.ts", TIMEOUT);
       await active.sendKeys("Tab");
-      expect(await composerPlainText(active)).toBe("@./scoped/@types/index.d.ts");
+      expect(await composerPlainText(active)).toBe('@"./scoped/@types/index.d.ts"');
 
       await clearComposer(active);
       await active.sendLiteral("@../parent");
@@ -1838,7 +2343,7 @@ describe("@ file picker", () => {
   );
 
   liveTmuxTest(
-    "browses a home path and submits through the live Gateway",
+    "browses a bare home shortcut through the live Gateway and exits cleanly",
     async () => {
       const current = createFixture("fx-file-picker-live-");
       initGit(current.workspace);
@@ -1859,16 +2364,20 @@ describe("@ file picker", () => {
           FX_MODEL: process.env.FX_FILE_PICKER_LIVE_MODEL ?? "anthropic/claude-sonnet-4.6",
           FX_TRACE_LOG: current.tracePath,
           FX_TRACE_SCOPES: "input,prompt,gateway",
+          FX_RECORD: current.tapePath,
         },
+        isolated: true,
         width: 112,
         height: 32,
         stderrPath: current.stderrPath,
         startupWaitMs: 1000,
       });
       await session.waitForComposer(TIMEOUT);
-      await session.sendLiteral('@"~/live');
-      await session.waitForText("live space/", TIMEOUT);
-      await session.sendKeys("Tab");
+      await session.sendLiteral('@"~');
+      await session.waitForText("~/live space/", TIMEOUT);
+      expect(await composerPlainText(session)).toBe('@"~');
+      await session.sendKeys("Down Tab");
+      expect(await composerPlainText(session)).toBe('@"~/live space/');
       await session.sendLiteral("live-context");
       await session.waitForText("live-context.txt", TIMEOUT);
       await session.sendKeys("Enter");
@@ -1877,7 +2386,22 @@ describe("@ file picker", () => {
       );
       await session.sendKeys("Enter");
       await session.waitForText("LIVE_PICKER_OK", 180_000);
+      await session.waitForStableComposer(TIMEOUT);
+      expect(await session.captureFullScrollback()).toContain("LIVE_PICKER_OK");
       expectCleanRuntime(current, session);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+      const replay = await runFx(["replay", current.tapePath, "--frames"], {
+        cwd: current.workspace,
+        env: { HOME: current.home },
+        timeoutMs: TIMEOUT,
+      });
+      expect(replay.code).toBe(0);
+      expect(replay.stderr).toBe("");
+      expect(replay.stdout).toContain("~/live space/");
+      expect(replay.stdout).toContain("LIVE_PICKER_OK");
     },
     180_000,
   );

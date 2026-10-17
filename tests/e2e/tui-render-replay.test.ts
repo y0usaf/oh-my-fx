@@ -329,14 +329,14 @@ describe("tui: render record/replay", () => {
         { length: 33 },
         (_, index) => `captured input line ${index + 1}: ${"x".repeat(32)}`,
       ).join("\n");
-      const authNotice = "● Auth: fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
+      const authNotice = "auth: fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
       const launched = await launch({ recordInput: true });
       session = launched.session;
 
       await session.pasteText(pasted);
       await session.waitForText("[Pasted text #1, 33 lines]", 5_000);
       await session.sendKeys("Enter");
-      await session.waitForText("● Auth: fx needs access", 5_000);
+      await session.waitForText("auth: fx needs access", 5_000);
       expect((await session.captureFullScrollback()).replace(/\s+/g, " ")).toContain(authNotice);
 
       const stdin = readTapeFrames(launched.tapePath)
@@ -469,7 +469,7 @@ describe("tui: render record/replay", () => {
       expect(statSync(launched.tapePath).mode & 0o077).toBe(0);
 
       await session.sendKeys("C-o");
-      await session.waitForText("Full detail · ctrl o close", 5_000);
+      await session.waitForText("full detail · ctrl+o close", 5_000);
       await session.waitForText("visual terminal capture:", 5_000);
       await session.sendKeys("C-o");
       await session.waitForComposer(5_000);

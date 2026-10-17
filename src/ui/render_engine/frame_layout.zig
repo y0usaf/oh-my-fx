@@ -58,7 +58,6 @@ pub const TranscriptFlowPreview = struct {
     replaceable_row: u16 = 1,
     tail_kind: ?transcript_blocks.TranscriptBlockKind = null,
     replaceable_active: bool = false,
-    welcome_split_active: bool = false,
     split_prefix_lines: usize = 0,
     split_suffix_start_line: usize = 0,
 };
@@ -234,7 +233,6 @@ pub const FrameLayout = struct {
             .footer_clean_allowed = options.invalidation.isEmpty(),
             .synchronized_update = options.synchronized_update,
             .cursor_target = options.cursor_target,
-            .footer_reservation_source = .none,
             .bottom_reserved_rows = 0,
             .preserve_scrollback = options.preserve_scrollback,
             .reset_terminal = options.reset_terminal,
@@ -473,7 +471,7 @@ fn layoutId(layout: FrameLayout) u64 {
     hashRect(&hasher, layout.blank_area);
     hashRect(&hasher, layout.footer_gap_area);
     hashU16(&hasher, layout.solved_frame_height);
-    hashU16(&hasher, @intFromEnum(layout.placement_policy));
+    hashU16(&hasher, @backingInt(layout.placement_policy));
     const value = hasher.final();
     return if (value == 0) 1 else value;
 }

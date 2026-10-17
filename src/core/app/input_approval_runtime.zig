@@ -9,7 +9,6 @@ const approval_screen = @import("../../ui/approval_screen.zig");
 const approval_ui = @import("../../ui/footer/approval_ui.zig");
 const types = @import("../shared/types.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -18,13 +17,13 @@ const session = @import("../session/session.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const render_request = @import("../../ui/render_request.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const ToolPermissionDecision = types.ToolPermissionDecision;
 
 pub fn ApprovalRuntime(comptime App: type) type {
     return struct {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
-        const queue_rt = input_queue_runtime.Runtime(App);
 
         fn requestActiveSurfaceFrame(app: *App) void {
             app_render_runtime.Runtime(App).requestActiveSurfaceFrame(app, .modal);
@@ -424,9 +423,6 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 debug_trace.logf("input", "cancel approval operation queued={d}", .{app.worker.queuedPromptCount()});
                 interrupt.traceInterruptRequested(app, "input_approval");
             }
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                _ = queue_rt.pauseAndOpenAfterModalCancel(app);
-            }
             app.worker.cancelApprovalTurn();
 
             clearApprovalPrompt(app, "cancelled");
@@ -494,7 +490,7 @@ test "approval wheel keeps scrolling a committed command review after review syn
     defer app.deinit();
     const request: permission_request.PermissionRequest = .{
         .id = 42,
-        .label = "shell.run " ++ ("x" ** 2_400),
+        .label = "shell.run " ++ text_utils.repeat("x", 2_400),
     };
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, request));
     try std.testing.expect(try approval_screen.needsScreen(

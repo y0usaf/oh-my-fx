@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const pathing = @import("pathing.zig");
 
@@ -83,7 +84,7 @@ pub const AccessScope = struct {
         mode: @import("../shared/types.zig").ResolveMode,
     ) ![]const u8 {
         const trimmed = std.mem.trim(u8, input_path, " \t\r\n");
-        if (!std.fs.path.isAbsolute(trimmed) and !std.mem.startsWith(u8, trimmed, "~")) {
+        if (!std.Io.Dir.path.isAbsolute(trimmed) and !std.mem.startsWith(u8, trimmed, "~")) {
             return pathing.resolveWorkspacePath(arena, self.primary_directory, input_path, mode);
         }
         const resolved = switch (mode) {
@@ -509,16 +510,16 @@ pub const WorkspaceAccess = struct {
 };
 
 fn resolveAbsoluteInput(alloc: Allocator, primary_directory: []const u8, input_path: []const u8) Error![]u8 {
-    if (input_path.len == 0 or input_path.len > std.fs.max_path_bytes or
+    if (input_path.len == 0 or input_path.len > std.Io.Dir.max_path_bytes or
         !std.unicode.utf8ValidateSlice(input_path) or
         std.mem.findScalar(u8, input_path, 0) != null)
     {
         return error.InvalidPath;
     }
-    return if (std.fs.path.isAbsolute(input_path))
-        std.fs.path.resolve(alloc, &.{input_path})
+    return if (std.Io.Dir.path.isAbsolute(input_path))
+        std.Io.Dir.path.resolveAlloc(alloc, &.{input_path})
     else
-        std.fs.path.resolve(alloc, &.{ primary_directory, input_path });
+        std.Io.Dir.path.resolveAlloc(alloc, &.{ primary_directory, input_path });
 }
 
 const SavedResolution = struct {
@@ -567,22 +568,29 @@ fn canonicalExistingDirectory(
     primary_directory: []const u8,
     input_path: []const u8,
 ) Error![]u8 {
-    if (input_path.len == 0 or input_path.len > std.fs.max_path_bytes or
+    if (input_path.len == 0 or input_path.len > std.Io.Dir.max_path_bytes or
         !std.unicode.utf8ValidateSlice(input_path) or
         std.mem.findScalar(u8, input_path, 0) != null)
     {
         return error.InvalidPath;
     }
 
-    const absolute = if (std.fs.path.isAbsolute(input_path))
+    const absolute = if (std.Io.Dir.path.isAbsolute(input_path))
         try alloc.dupe(u8, input_path)
     else
-        try std.fs.path.resolve(alloc, &.{ primary_directory, input_path });
+        try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary_directory, input_path });
     defer alloc.free(absolute);
 
     const canonical = io_mod.realpathAlloc(alloc, absolute) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.FileNotFound => return error.PathNotFound,
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.SymLinkLoop,
+        error.NameTooLong,
+        error.InputOutput,
+        => return error.PathNotFound,
+        error.NotDir => return error.NotDirectory,
         else => return error.InvalidPath,
     };
     errdefer alloc.free(canonical);
@@ -618,8 +626,8 @@ fn resolveObservedDirectory(
 }
 
 fn validateStoredPath(path: []const u8) Error!void {
-    if (path.len == 0 or path.len > std.fs.max_path_bytes or
-        !std.fs.path.isAbsolute(path) or
+    if (path.len == 0 or path.len > std.Io.Dir.max_path_bytes or
+        !std.Io.Dir.path.isAbsolute(path) or
         !std.unicode.utf8ValidateSlice(path) or
         std.mem.findScalar(u8, path, 0) != null)
     {
@@ -812,7 +820,7 @@ test "workspace access retains missing saved directories as inactive" {
 
     const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
     defer alloc.free(primary);
-    const missing = try std.fs.path.resolve(alloc, &.{ primary, "../missing" });
+    const missing = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../missing" });
     defer alloc.free(missing);
 
     var access = try WorkspaceAccess.init(alloc, primary, &.{missing}, &.{}, false);
@@ -858,6 +866,40 @@ test "workspace access refreshes availability after a saved directory disappears
     try std.testing.expect((try access.stageAvailabilityRefresh(alloc, primary)) == null);
 }
 
+test "workspace access deactivates an observed root when its ancestor becomes unusable" {
+    for ([_]bool{ false, true }) |loop| {
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(std.testing.io, "primary");
+        try tmp.dir.createDirPath(std.testing.io, "parent/shared");
+        const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
+        defer alloc.free(primary);
+        const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "parent/shared");
+        defer alloc.free(shared);
+        var access = try WorkspaceAccess.init(alloc, primary, &.{shared}, &.{}, false);
+        defer access.deinit(alloc);
+        try tmp.dir.rename("parent", tmp.dir, "held", std.testing.io);
+        if (loop) {
+            try tmp.dir.symLink(std.testing.io, "parent", "parent", .{ .is_directory = true });
+        } else {
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent", .data = "not a directory" });
+        }
+        var unavailable = (try access.stageAvailabilityRefresh(alloc, primary)) orelse return error.TestExpectedRefresh;
+        access.deinit(alloc);
+        access = unavailable;
+        unavailable = .{};
+        try std.testing.expect(!access.entries[0].available);
+        try std.testing.expect(!access.scope(primary).contains(shared));
+        try tmp.dir.deleteFile(std.testing.io, "parent");
+        try tmp.dir.rename("held", tmp.dir, "parent", std.testing.io);
+        var restored = (try access.stageAvailabilityRefresh(alloc, primary)) orelse return error.TestExpectedRefresh;
+        defer restored.deinit(alloc);
+        try std.testing.expect(restored.entries[0].available);
+        try std.testing.expect(restored.scope(primary).contains(shared));
+    }
+}
+
 test "workspace access canonicalizes a saved directory restored through a symlinked ancestor" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -870,7 +912,7 @@ test "workspace access canonicalizes a saved directory restored through a symlin
     defer alloc.free(primary);
     const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "real-parent/shared");
     defer alloc.free(shared);
-    const source = try std.fs.path.resolve(alloc, &.{ primary, "../parent-link/shared" });
+    const source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../parent-link/shared" });
     defer alloc.free(source);
 
     var access = try WorkspaceAccess.init(alloc, primary, &.{source}, &.{}, false);
@@ -907,9 +949,9 @@ test "workspace access rejects an availability refresh that splits past capacity
 
     const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
     defer alloc.free(primary);
-    const source_a = try std.fs.path.resolve(alloc, &.{ primary, "../link-a/shared" });
+    const source_a = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../link-a/shared" });
     defer alloc.free(source_a);
-    const source_b = try std.fs.path.resolve(alloc, &.{ primary, "../link-b/shared" });
+    const source_b = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../link-b/shared" });
     defer alloc.free(source_b);
 
     var existing: [max_additional_directories - 1][]u8 = undefined;
@@ -919,7 +961,7 @@ test "workspace access rejects an availability refresh that splits past capacity
     saved[0] = source_a;
     saved[1] = source_b;
     for (&existing, 0..) |*path, index| {
-        const name = try std.fmt.allocPrint(alloc, "existing-{d}", .{index});
+        const name = try alloc.print("existing-{d}", .{index});
         defer alloc.free(name);
         try tmp.dir.createDir(std.testing.io, name, .default_dir);
         path.* = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
@@ -954,14 +996,13 @@ test "workspace access normalizes equivalent missing saved directory identities"
 
     const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
     defer alloc.free(primary);
-    const missing = try std.fs.path.resolve(alloc, &.{ primary, "../missing" });
+    const missing = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../missing" });
     defer alloc.free(missing);
-    const dot_alias = try std.fmt.allocPrint(alloc, "{s}{c}.", .{ missing, std.fs.path.sep });
+    const dot_alias = try alloc.print("{s}{c}.", .{ missing, std.Io.Dir.path.sep });
     defer alloc.free(dot_alias);
-    const parent_alias = try std.fmt.allocPrint(
-        alloc,
+    const parent_alias = try alloc.print(
         "{s}{c}child{c}..",
-        .{ missing, std.fs.path.sep, std.fs.path.sep },
+        .{ missing, std.Io.Dir.path.sep, std.Io.Dir.path.sep },
     );
     defer alloc.free(parent_alias);
 
@@ -997,7 +1038,7 @@ test "workspace access preserves observed source identity across retarget and la
     defer alloc.free(primary);
     const first = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "first");
     defer alloc.free(first);
-    const source = try std.fs.path.resolve(alloc, &.{ primary, "../saved-link" });
+    const source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../saved-link" });
     defer alloc.free(source);
 
     var access = try WorkspaceAccess.init(alloc, primary, &.{source}, &.{}, false);
@@ -1034,7 +1075,7 @@ test "workspace access removes a disappeared saved source by its spelling" {
 
     const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
     defer alloc.free(primary);
-    const source = try std.fs.path.resolve(alloc, &.{ primary, "../saved-link" });
+    const source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../saved-link" });
     defer alloc.free(source);
 
     var access = try WorkspaceAccess.init(alloc, primary, &.{source}, &.{}, false);
@@ -1061,9 +1102,9 @@ test "workspace access resolves unavailable identities through existing ancestor
     defer alloc.free(primary);
     const real_parent = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "real-parent");
     defer alloc.free(real_parent);
-    const real_missing = try std.fs.path.join(alloc, &.{ real_parent, "missing" });
+    const real_missing = try std.Io.Dir.path.join(alloc, &.{ real_parent, "missing" });
     defer alloc.free(real_missing);
-    const linked_missing = try std.fs.path.resolve(alloc, &.{ primary, "../parent-link/missing" });
+    const linked_missing = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../parent-link/missing" });
     defer alloc.free(linked_missing);
 
     var access = try WorkspaceAccess.init(
@@ -1122,7 +1163,7 @@ test "workspace access rejects the primary root and capacity overflow" {
     var initialized: usize = 0;
     defer for (paths[0..initialized]) |path| alloc.free(path);
     for (&paths, 0..) |*path, index| {
-        const name = try std.fmt.allocPrint(alloc, "root-{d}", .{index});
+        const name = try alloc.print("root-{d}", .{index});
         defer alloc.free(name);
         try tmp.dir.createDir(std.testing.io, name, .default_dir);
         path.* = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
@@ -1224,7 +1265,7 @@ test "workspace access rejects removal of an unknown missing directory" {
     defer alloc.free(primary);
     const saved = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "saved");
     defer alloc.free(saved);
-    const unknown = try std.fs.path.resolve(alloc, &.{ primary, "../unknown" });
+    const unknown = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../unknown" });
     defer alloc.free(unknown);
 
     var access = try WorkspaceAccess.init(alloc, primary, &.{saved}, &.{}, false);
@@ -1268,7 +1309,7 @@ test "workspace access removes an unavailable saved directory with a trailing se
     defer alloc.free(primary);
     const saved = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "saved");
     defer alloc.free(saved);
-    const input_path = try std.fmt.allocPrint(alloc, "{s}{c}", .{ saved, std.fs.path.sep });
+    const input_path = try alloc.print("{s}{c}", .{ saved, std.Io.Dir.path.sep });
     defer alloc.free(input_path);
 
     var access = try WorkspaceAccess.init(alloc, primary, &.{saved}, &.{}, false);
@@ -1291,7 +1332,7 @@ test "workspace access removes an unavailable saved directory with a dot segment
     defer alloc.free(primary);
     const saved = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "saved");
     defer alloc.free(saved);
-    const input_path = try std.fmt.allocPrint(alloc, "{s}{c}.", .{ saved, std.fs.path.sep });
+    const input_path = try alloc.print("{s}{c}.", .{ saved, std.Io.Dir.path.sep });
     defer alloc.free(input_path);
 
     var access = try WorkspaceAccess.init(alloc, primary, &.{saved}, &.{}, false);
@@ -1314,10 +1355,9 @@ test "workspace access removes an unavailable saved directory with a parent segm
     defer alloc.free(primary);
     const saved = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "saved");
     defer alloc.free(saved);
-    const input_path = try std.fmt.allocPrint(
-        alloc,
+    const input_path = try alloc.print(
         "{s}{c}missing{c}..",
-        .{ saved, std.fs.path.sep, std.fs.path.sep },
+        .{ saved, std.Io.Dir.path.sep, std.Io.Dir.path.sep },
     );
     defer alloc.free(input_path);
 
@@ -1396,7 +1436,7 @@ test "workspace access reports when a staged replacement removes command line au
 }
 
 test "workspace access releases partial state across allocation failures" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);

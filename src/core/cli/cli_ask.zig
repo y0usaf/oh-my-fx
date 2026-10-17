@@ -1,9 +1,12 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
+const shared_theme = @import("../shared/theme.zig");
+const ui_render = @import("../../ui/render.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -24,10 +27,15 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
+const http_pool = @import("../shared/http_pool.zig");
+const gateway_client = @import("../../gateway/client.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
+const session_title_generation = @import("../session/session_title_generation.zig");
+const compactor = @import("../compactor/compactor.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -36,6 +44,7 @@ const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_host = @import("../mcp_host/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -47,9 +56,9 @@ const permissions = @import("../permissions/permissions.zig");
 const session_runtime = @import("../session/session.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
-const session_usage = @import("../session/session_usage.zig");
-const usage_report = @import("../session/usage_report.zig");
 const session_store = @import("../session/session_store.zig");
+const session_adapter = @import("../session/session_adapter.zig");
+const session_child_store = @import("../session/session_child_store.zig");
 const legacy_background_migration = @import("../session/legacy_background_migration.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -59,6 +68,8 @@ const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const subagent_child_state = @import("../subagent/child_state.zig");
+const subagent_model_contract = @import("../subagent/model_contract.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../../builtins/gateway.zig")
@@ -77,10 +88,10 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
-const skill_invocation = @import("../skills/skill_invocation.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const ask_presentation = @import("../../ui/ask_presentation.zig");
 const url_opener = @import("../hosts/url_opener.zig");
@@ -105,7 +116,7 @@ const ShellAction = enum {
     stop,
 };
 
-const supports_headless_interrupt = switch (std_builtin.os.tag) {
+const supports_headless_interrupt = switch (std_builtin.target.os.tag) {
     .windows, .wasi, .freestanding => false,
     else => true,
 };
@@ -127,7 +138,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
     fn handle(signal: std.posix.SIG) callconv(.c) void {
         _ = requested_signal.cmpxchgStrong(
             0,
-            @intCast(@intFromEnum(signal)),
+            @intCast(@backingInt(signal)),
             .seq_cst,
             .seq_cst,
         );
@@ -135,7 +146,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
     }
 
     fn exitCode() u8 {
-        return switch (@as(std.posix.SIG, @enumFromInt(requested_signal.load(.seq_cst)))) {
+        return switch (@as(std.posix.SIG, @fromBackingInt(@intCast(requested_signal.load(.seq_cst))))) {
             std.posix.SIG.TERM => headless_termination_exit_code,
             else => headless_interrupt_exit_code,
         };
@@ -181,7 +192,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
                 if (test_after_restore) |hook| hook();
             }
             if (redeliver and cancel_requested.load(.seq_cst)) {
-                const signal: std.posix.SIG = @enumFromInt(requested_signal.load(.seq_cst));
+                const signal: std.posix.SIG = @fromBackingInt(@intCast(requested_signal.load(.seq_cst)));
                 _ = std.c.raise(signal);
             }
             coordinator_active = false;
@@ -244,9 +255,12 @@ pub const Config = struct {
     max_history_turns: usize,
     mode_registry: mode_registry.Registry,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    /// `fx --sessions-v2 ask`; resolved with FX_SESSIONS_V2 by the adapter.
+    sessions_v2: bool = false,
 };
 
 fn runAskChild(
@@ -264,7 +278,6 @@ fn runAskChild(
         .{
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
-            .mcp_runtime = ctx.mcp,
             .subagent_available = true,
         },
     ) catch return error.OutOfMemory;
@@ -275,8 +288,7 @@ fn runAskChild(
         .provider_set = ctx.cfg.provider_set,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
-        .skills_prompt_section = ctx.subagent_skills_prompt,
-        .explicit_skills_prompt_section = ctx.subagent_explicit_skills_prompt,
+        .skill_catalog = .{ .skills = ctx.loaded_skills.skills, .diagnostics = ctx.loaded_skills.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
@@ -291,20 +303,30 @@ pub const PromptRunResult = struct {
     exit_code: u8,
     assistant_output: []u8,
     final_output: []u8 = &.{},
+    /// Owned raw text of the completed final response as saved to history,
+    /// with its Markdown intact; empty when absent. Unlike `final_output`, it
+    /// never includes display-only text.
+    final_source: []u8 = &.{},
     interrupted: bool = false,
     model: []u8 = &.{},
     session_id: []u8 = &.{},
     tool_calls: []ToolCallRecord = &.{},
     step_count: usize = 0,
+    /// Owned slug of the provider that served the last gateway request;
+    /// empty when the provider did not report routing metadata.
+    resolved_provider: []u8 = &.{},
     error_code: ?[]const u8 = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
     recovery_durable: bool = false,
+    usage: types.Usage = .{},
 
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
         alloc.free(self.assistant_output);
         if (self.final_output.len > 0) alloc.free(self.final_output);
+        if (self.final_source.len > 0) alloc.free(self.final_source);
         if (self.model.len > 0) alloc.free(self.model);
+        if (self.resolved_provider.len > 0) alloc.free(self.resolved_provider);
         if (self.session_id.len > 0) alloc.free(self.session_id);
         freeToolCallRecords(alloc, self.tool_calls);
     }
@@ -331,6 +353,12 @@ const AskOptions = struct {
     prompt: []u8,
     resume_target: ?ResumeTarget = null,
     permission_override: ?PermissionMode = null,
+    model_override: ?[]u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
+    fast_override: ?bool = null,
+    ultrafast_override: ?bool = null,
+    provider_order_override: ?[][]const u8 = null,
+    provider_strict_override: ?bool = null,
     image_paths: std.ArrayList([]u8) = .empty,
     images: std.ArrayList(ImageAttachment) = .empty,
     system_prompt_override: ?[]u8 = null,
@@ -342,6 +370,8 @@ const AskOptions = struct {
     no_save: bool = false,
     no_color: bool = false,
     continue_recovery: bool = false,
+    /// `fx ask --sessions-v2`: keep this run's session in the v2 store.
+    sessions_v2: bool = false,
 
     fn deinit(self: *AskOptions, alloc: Allocator) void {
         alloc.free(self.prompt);
@@ -350,6 +380,11 @@ const AskOptions = struct {
         for (self.images.items) |image| types.freeImageAttachment(alloc, image);
         self.images.deinit(alloc);
         if (self.system_prompt_override) |s| alloc.free(s);
+        if (self.model_override) |m| alloc.free(m);
+        if (self.provider_order_override) |order| {
+            for (order) |slug| alloc.free(@constCast(slug));
+            if (order.len > 0) alloc.free(order);
+        }
     }
 };
 
@@ -400,8 +435,9 @@ const PermissionApprovalPromptResult = enum {
 const NotifyAttentionFn = *const fn (?*anyopaque) void;
 const PermissionApprovalPromptFn = *const fn (?*anyopaque, ?*anyopaque, WriteFn, []const u8, ?*anyopaque, NotifyAttentionFn) anyerror!PermissionApprovalPromptResult;
 const IsTtyFn = *const fn (?*anyopaque) bool;
-const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
-const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
+/// The final `?[]const u8` is the run's --model, which stands in for a provider without a saved model.
+const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, ?[]const u8) anyerror!app_lifecycle.StartupState;
+const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode, ?[]const u8) anyerror!app_lifecycle.StartupState;
 const InitializeSessionStoresFn = *const fn (*AskContext) anyerror!void;
 const LoadSkillsFn = *const fn (
     Allocator,
@@ -424,18 +460,18 @@ const RunDeps = struct {
     stdout_is_tty: IsTtyFn = realStdoutIsTty,
     stderr_is_tty: IsTtyFn = realStderrIsTty,
     load_startup_state: LoadStartupStateFn = loadStartupStateDefault,
-    load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
+    load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateForRun,
     initialize_session_stores: InitializeSessionStoresFn = initializeSessionStoresDefault,
     load_skills: LoadSkillsFn = app_runtime_setup.loadSkills,
     context_registry: context_contract.Registry,
     tool_set: tool_set_contract.ToolSet,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     process_queued_prompt: ProcessQueuedPromptFn = processQueuedPromptDefault,
     persist_yolo_acknowledgment: PersistYoloAcknowledgmentFn = persistYoloAcknowledgmentDefault,
     discard_pristine_session_ctx: ?*anyopaque = null,
     discard_pristine_session: DiscardPristineSessionFn = discardPristineSessionDefault,
     install_headless_interrupt: bool = false,
-    start_subagent_background_recovery: bool = true,
     stdin_source: StdinSource = .real,
 };
 
@@ -464,6 +500,12 @@ const RunOptions = struct {
     resume_target: ?ResumeTarget = null,
     color_enabled: bool = true,
     continue_recovery: bool = false,
+    model_override: ?[]const u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
+    fast_override: ?bool = null,
+    ultrafast_override: ?bool = null,
+    provider_order_override: ?[]const []const u8 = null,
+    provider_strict_override: ?bool = null,
     deps: RunDeps,
 };
 
@@ -540,11 +582,26 @@ const AskContext = struct {
     provider: model_provider.ProviderId = .gateway,
     model_catalog_access: credentials.CatalogAccess = .{ .public_only = .no_credential },
     model: []const u8 = "",
+    /// Resolved review-model override borrowed from the startup state for the
+    /// duration of the run. Empty keeps the reviewer's compiled default.
+    reviewer_model: []const u8 = "",
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
+    auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
+    /// Profile preference used only when creating a new durable session.
+    /// Process and CLI overrides remain per-run and never rewrite this value.
+    persisted_ultrafast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    /// Borrowed gateway provider routing for this run; startup state owns the
+    /// backing memory.
+    provider_order: []const []const u8 = &.{},
+    provider_strict: bool = false,
+    /// Owned slug of the provider that served the latest gateway request this
+    /// run, reported by the gateway's routing metadata.
+    resolved_provider: ?[]u8 = null,
     first_call_tool_choice: types.ToolChoice = .auto,
     permission_mode: PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
@@ -557,10 +614,16 @@ const AskContext = struct {
     managed_executions: managed_execution.Runtime,
     ephemeral_command_replay: command_replay_store.EphemeralStore,
     subagent_host: ?*subagent_tool_host.Runtime = null,
-    subagent_skills_prompt: []u8 = &.{},
-    subagent_explicit_skills_prompt: []u8 = &.{},
+    loaded_skills: app_runtime_setup.LoadedSkills = .{},
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
+    /// Sessions v2: set instead of `store` and `writable`, never both.
+    v2_store: ?session_adapter.Store = null,
+    v2: ?*session_adapter.Session = null,
+    /// The v2 parent's children (D22), borrowed by `subagent_host`.
+    v2_children: ?*subagent_child_state.V2Children = null,
+    /// A resumed v2 session's preferences; `model` borrows from here.
+    v2_preferences: ?session_codec.DurableSessionPreferences = null,
     session_write_mutex: std.Io.Mutex = .init,
     requested_resume: ?ResumeTarget = null,
     seed_model: []const u8 = "",
@@ -570,6 +633,8 @@ const AskContext = struct {
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     context_enabled: bool = true,
     mcp: ?*mcp_runtime.McpRuntime = null,
+    /// MCP-v2's host when FX_MCP_ENGINE=v2 selects it; `mcp` then stays null.
+    mcp_host: ?*mcp_host.Host = null,
     mcp_elicitation_capabilities: @import("../mcp/elicitation.zig").Capabilities = .{},
     failed: bool = false,
     typed_error_code: ?[]const u8 = null,
@@ -581,11 +646,14 @@ const AskContext = struct {
     deferred_tool_progress: std.ArrayList([]u8) = .empty,
     pending_tool_progress_mutex: std.Io.Mutex = .init,
     raw_boundary_pending: bool = false,
+    response_output_start: usize = 0,
+    response_restart_pending: bool = false,
     raw_trailing_newlines: u8 = 0,
     raw_has_output: bool = false,
     command_output_line_open: bool = false,
     assistant_output: std.ArrayList(u8) = .empty,
     final_output: std.ArrayList(u8) = .empty,
+    final_source: std.ArrayList(u8) = .empty,
     tool_call_records: std.ArrayList(ToolCallRecord) = .empty,
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
@@ -600,7 +668,6 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
-    retain_external_root_user_turn: bool = false,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -612,10 +679,7 @@ const AskContext = struct {
             .model = cfg.default_model,
             .seed_model = cfg.default_model,
             .mode_id = cfg.mode_registry.default_mode_id,
-            .session = session_runtime.SessionRuntime.initWithProviders(
-                cfg.max_history_turns,
-                cfg.provider_set.deferredUsageProviders(),
-            ),
+            .session = session_runtime.SessionRuntime.init(cfg.max_history_turns),
             .web_search_runtime = web_search_runtime.Runtime.init(.{
                 .provider = cfg.provider_set.gateway.fx_search.?,
             }),
@@ -708,29 +772,20 @@ const AskContext = struct {
     }
 
     fn deinit(self: *AskContext) void {
+        // Terminals end with this process. Ending them first also releases
+        // any subagent still waiting on one.
+        self.terminal_client.closeOwnedTerminals();
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
+        if (self.v2_children) |children| {
+            children.deinit();
+            self.alloc.destroy(children);
+        }
+        self.v2_children = null;
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
-        self.session.usage.finishReconciliationBeforeShutdown();
-        self.session.usage.finishProfilePublicationsBeforeShutdown();
-        self.session.usage.configurePublicationSink(null);
-        self.session.usage.configureCheckpointSink(null);
-        if (self.writable) |*writable| {
-            if (writable.needsFinalStateReplacement(
-                self.session.usage.isDirty(),
-            )) {
-                commitAskStateReplacement(self, writable, false) catch |err| {
-                    debug_trace.logf(
-                        "session",
-                        "failed to flush ask session usage err={s}",
-                        .{@errorName(err)},
-                    );
-                };
-            }
-        }
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
@@ -739,6 +794,12 @@ const AskContext = struct {
         if (self.writable) |*writable| writable.deinit(self.alloc);
         self.writable = null;
         if (self.store) |*store| store.deinit(self.alloc);
+        if (self.v2) |v2| v2.close();
+        self.v2 = null;
+        if (self.v2_store) |*store| store.deinit(self.alloc);
+        self.v2_store = null;
+        if (self.v2_preferences) |*preferences| preferences.deinit(self.alloc);
+        self.v2_preferences = null;
         self.ephemeral_command_replay.deinit();
         self.permission_rules.deinit(self.alloc);
         self.session.deinit(self.alloc);
@@ -749,12 +810,15 @@ const AskContext = struct {
             m.deinit();
             self.alloc.destroy(m);
         }
+        // `fx ask` exits next, so nothing waits for its servers.
+        if (self.mcp_host != null) mcp_host.signalServersForExit();
         if (self.image_snapshot_temp_dir) |path| {
             image_attachments.cleanupSnapshotDir(path);
             self.alloc.free(path);
         }
         self.assistant_output.deinit(self.alloc);
         self.final_output.deinit(self.alloc);
+        self.final_source.deinit(self.alloc);
         for (self.pending_tool_progress.items) |progress| progress.deinit(self.alloc);
         self.pending_tool_progress.deinit(self.alloc);
         for (self.deferred_tool_progress.items) |progress| self.alloc.free(progress);
@@ -763,8 +827,8 @@ const AskContext = struct {
             freeToolCallRecord(self.alloc, record);
         }
         self.tool_call_records.deinit(self.alloc);
-        if (self.subagent_skills_prompt.len > 0) self.alloc.free(self.subagent_skills_prompt);
-        if (self.subagent_explicit_skills_prompt.len > 0) self.alloc.free(self.subagent_explicit_skills_prompt);
+        if (self.resolved_provider) |provider| self.alloc.free(provider);
+        self.loaded_skills.deinit(self.alloc);
     }
 
     fn lifecycleContext(self: *AskContext) agent_runtime.LifecycleContext {
@@ -773,7 +837,7 @@ const AskContext = struct {
             .scope = .{
                 .kind = .ask,
                 .workspace_root = self.workspace_root,
-                .session_id = if (self.writable) |*writable| writable.active_id else null,
+                .session_id = self.activeSessionId(),
             },
             .outcome_allocator = self.alloc,
         };
@@ -800,9 +864,26 @@ const AskContext = struct {
         return false;
     }
 
+    /// The saved session's id, from whichever backend holds it.
+    fn activeSessionId(self: *const AskContext) ?[]const u8 {
+        if (self.v2) |v2| return v2.id();
+        return if (self.writable) |*writable| writable.active_id else null;
+    }
+
+    /// The saved session's side-file capability, if any.
+    fn sessionChildCapability(self: *AskContext) ?*session_child_store.SessionChildCapability {
+        if (self.v2) |v2| return v2.childCapability() catch |err| {
+            debug_trace.logf("session", "event=sessions_v2_side_files_unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
+            return null;
+        };
+        return if (self.writable) |*writable| writable.childCapability() catch null else null;
+    }
+
     fn imageSnapshotStorageDir(self: *AskContext) ![]u8 {
-        const sessions_dir = if (self.store) |*store| store.sessions_dir else null;
-        const session_id = if (self.writable) |*writable| writable.active_id else null;
+        // A v2 session captures into the process's temporary folder, then
+        // keeps the bytes inside the turn (D44).
+        const sessions_dir = if (self.v2 != null) null else if (self.store) |*store| store.sessions_dir else null;
+        const session_id = if (self.v2 != null) null else self.activeSessionId();
         return session_store.imageSnapshotStorageDir(
             self.alloc,
             sessions_dir,
@@ -820,6 +901,7 @@ const AskContext = struct {
             snapshot_dir,
             .{ .cancel_flag = self.cancelFlag() },
         );
+        if (self.v2 != null) try image_attachments.inlineCapturedSnapshot(self.alloc, attachment);
     }
 
     fn captureImageAttachments(self: *AskContext, attachments: []ImageAttachment) !void {
@@ -831,9 +913,29 @@ const AskContext = struct {
             snapshot_dir,
             .{ .cancel_flag = self.cancelFlag() },
         );
+        if (self.v2 != null) try image_attachments.inlineCapturedSnapshots(self.alloc, attachments);
+    }
+
+    /// Record whether restored history references shell execution handles this
+    /// process does not own. Registry membership, not the resume itself,
+    /// decides staleness (see session_runtime.detectStaleShellHandles).
+    fn updateStaleShellHandles(self: *AskContext, history: []const session_runtime.HistoryTurn) void {
+        self.session.has_stale_shell_handles = session_runtime.detectStaleShellHandles(
+            self.alloc,
+            history,
+            &self.managed_executions,
+        ) catch |err| blk: {
+            debug_trace.logf(
+                "session",
+                "event=stale_shell_handle_scan outcome=skipped err={s}",
+                .{@errorName(err)},
+            );
+            break :blk false;
+        };
     }
 
     fn initializeSessionStores(self: *AskContext) !void {
+        if (session_adapter.enabled(self.cfg.sessions_v2)) return self.initializeV2Session();
         var store = session_store.Store.init(self.alloc, self.workspace_root) catch |err| {
             if (err == error.OutOfMemory or self.requested_resume != null) return err;
             debug_trace.logf(
@@ -854,6 +956,7 @@ const AskContext = struct {
             .model = @constCast(self.seed_model),
             .effort = self.effort,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.persisted_ultrafast_mode,
         };
         var writable = if (self.requested_resume) |target|
             try subagent_resume_admission.resumeForExternalPrompt(
@@ -876,20 +979,10 @@ const AskContext = struct {
                 self.alloc,
                 writable.state.conversation_language,
                 writable.state.history,
-                writable.state.context_history_start,
                 writable.state.permission_state,
             );
-            if (writable.state.usage) |usage| {
-                try self.session.usage.restore(
-                    self.alloc,
-                    usage,
-                    writable.state.created_at_ms,
-                );
-            } else {
-                self.session.usage.restoreLegacyWallDuration(
-                    writable.state.created_at_ms,
-                );
-            }
+            updateStaleShellHandles(self, writable.state.history);
+            writable.releaseHydrationHistory(self.alloc);
         }
 
         const session_dir = try session_store.sessionDirPath(
@@ -911,25 +1004,23 @@ const AskContext = struct {
             self.model = preferences.model;
             self.effort = preferences.effort;
             self.fast_mode = preferences.fast_mode;
+            self.ultrafast_mode = preferences.ultrafast_mode;
         }
-        self.subagent_host = try subagent_tool_host.Runtime.create(
+        self.subagent_host = subagent_tool_host.Runtime.create(
             self.alloc,
             &self.store.?,
             self.writable.?.active_id,
             .{ .context = self, .resolve_fn = resolveAskSubagentAuthority },
             .{ .context = self, .run_fn = runAskChild },
-        );
-        if (self.deps.start_subagent_background_recovery) {
-            self.subagent_host.?.requestBackgroundRecovery(
-                io_mod.milliTimestamp(),
-            ) catch |err| {
-                debug_trace.logf(
-                    "subagent",
-                    "ask background recovery unavailable root_id={s} outcome={s}",
-                    .{ self.subagent_host.?.root_id, @errorName(err) },
-                );
-            };
-        }
+        ) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf(
+                "subagent",
+                "ask subagent host unavailable root_id={s} err={s}",
+                .{ self.writable.?.active_id, @errorName(err) },
+            );
+            break :blk null;
+        };
         const capability = try self.writable.?.childCapability();
         if (legacy_background_migration.migrate(
             self.alloc,
@@ -958,6 +1049,100 @@ const AskContext = struct {
         }
     }
 
+    /// Sessions v2: the same run, saved through the adapter. v1's store is
+    /// never opened in this process.
+    fn initializeV2Session(self: *AskContext) !void {
+        self.v2_store = session_adapter.Store.openFromEnv(self.alloc) catch |err| {
+            if (err == error.OutOfMemory or self.requested_resume != null) return err;
+            debug_trace.logf("session", "event=ask_session_store_unavailable backend=v2 error={s}", .{@errorName(err)});
+            try self.writeStderr("fx ask: warning: session persistence unavailable; error=");
+            try self.writeStderr(@errorName(err));
+            try self.writeStderr("; continuing without saving\n");
+            return;
+        };
+        errdefer {
+            self.v2_store.?.deinit(self.alloc);
+            self.v2_store = null;
+        }
+        const store = &self.v2_store.?;
+        const seed_preferences = session_codec.DurableSessionPreferences{
+            .provider = self.provider,
+            .model = @constCast(self.seed_model),
+            .effort = self.effort,
+            .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.persisted_ultrafast_mode,
+        };
+        // Converting a v1 session can be slow; stderr says why (D61).
+        store.notice = .{ .context = self, .emit = conversionNotice };
+        const v2 = if (self.requested_resume) |target|
+            session_adapter.Session.resumeSession(self.alloc, store, switch (target) {
+                .last => .last,
+                .id => |id| .{ .id = id },
+            }, self.workspace_root, .ask) catch |err| {
+                if (store.conversionProblem()) |problem| {
+                    self.writeStderr("fx ask: the session can't be converted: ") catch {};
+                    self.writeLine(problem) catch {};
+                }
+                return err;
+            }
+        else blk: {
+            var permission_state = try self.session.snapshotPermissionState(self.alloc);
+            defer permission_state.deinit(self.alloc);
+            break :blk try session_adapter.Session.create(self.alloc, store, self.workspace_root, .ask, .{
+                .preferences = seed_preferences,
+                .language = self.session.languageSnapshot(),
+                .permission_state = permission_state,
+            });
+        };
+        errdefer v2.close();
+
+        if (self.requested_resume != null) {
+            var restored = try v2.restore(self.alloc);
+            defer restored.deinit(self.alloc);
+            try self.session.restoreWithPermissionState(
+                self.alloc,
+                restored.language,
+                restored.history,
+                restored.permission_state orelse .{},
+            );
+            updateStaleShellHandles(self, restored.history);
+            if (restored.preferences) |preferences| {
+                self.v2_preferences = preferences;
+                restored.preferences = null;
+                self.provider = preferences.provider;
+                self.model = preferences.model;
+                self.effort = preferences.effort;
+                self.fast_mode = preferences.fast_mode;
+                self.ultrafast_mode = preferences.ultrafast_mode;
+            }
+        }
+        self.session.configureWebFetchArtifactBlobs(self.alloc, try v2.childCapability(), v2.id());
+        self.v2 = v2;
+        try self.startV2SubagentHost(v2);
+    }
+
+    /// Subagents on v2 keep their state in the parent's log (D22). A host
+    /// that cannot start leaves them off and says why in the trace, as v1.
+    fn startV2SubagentHost(self: *AskContext, v2: *session_adapter.Session) !void {
+        const children = try self.alloc.create(subagent_child_state.V2Children);
+        errdefer self.alloc.destroy(children);
+        children.* = subagent_child_state.V2Children.init(self.alloc, v2, self.workspace_root);
+        errdefer children.deinit();
+        self.subagent_host = subagent_tool_host.Runtime.createV2(
+            self.alloc,
+            children,
+            .{ .context = self, .resolve_fn = resolveAskSubagentAuthority },
+            .{ .context = self, .run_fn = runAskChild },
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("subagent", "ask subagent host unavailable root_id={s} err={s}", .{ v2.id(), @errorName(err) });
+            children.deinit();
+            self.alloc.destroy(children);
+            return;
+        };
+        self.v2_children = children;
+    }
+
     fn toolContext(self: *AskContext) tool_runtime.Context {
         const provider_capabilities = self.cfg.provider_set.select(self.provider).capabilities;
         if (provider_capabilities.fx_search) {
@@ -968,8 +1153,6 @@ const AskContext = struct {
                 .worker_model = self.model,
                 .gateway_retry_count = self.cfg.gateway_retry_count,
                 .gateway_chat_url = self.cfg.gateway_chat_url,
-                .usage = &self.session.usage,
-                .usage_allocator = self.alloc,
             });
         }
         var tc: tool_runtime.Context = .{
@@ -982,12 +1165,9 @@ const AskContext = struct {
             .max_read_file_line_len = self.cfg.max_read_file_line_len,
             .max_command_output_bytes = self.cfg.max_command_output_bytes,
             .max_tool_result_bytes = self.max_tool_result_bytes,
+            .auto_compact_percent = self.auto_compact_percent,
             .api_key = self.api_key,
             .agent_stream_provider = self.agentStreamProvider(),
-            .compaction_route = self.cfg.provider_set.compactionRoute(
-                self.provider,
-                self.credential_source,
-            ),
             .gateway_team = self.gateway_team,
             .credential_source = self.credential_source,
             .account_id = self.account_id,
@@ -996,19 +1176,23 @@ const AskContext = struct {
             .oauth_transport = self.cfg.gateway_provider.oauth_transport,
             .secret_store = self.cfg.secret_store,
             .model = self.model,
+            .reviewer_model = self.reviewer_model,
             .gateway_retry_count = self.cfg.gateway_retry_count,
             .gateway_chat_url = self.cfg.gateway_chat_url,
             .gateway_models_path = self.cfg.gateway_models_path,
             .agent_step_limit = self.agent_step_limit,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.ultrafast_mode,
             .effort = self.effort,
+            .provider_order = if (self.provider == .gateway) self.provider_order else &.{},
+            .provider_strict = self.provider == .gateway and self.provider_strict,
             .first_call_tool_choice = self.first_call_tool_choice,
             .permission_mode = self.permission_mode,
             .permission_grants = &.{},
             .permission_rules = self.permission_rules,
             .tool_registry = self.toolRegistry(),
             .subagent_host = self.subagent_host,
-            .subagent_caller_id = if (self.writable) |*writable| writable.active_id else null,
+            .subagent_caller_id = self.activeSessionId(),
             .auto_classifier = self.admissionAutoClassifier(),
             .worker = &self.worker,
             .cancel_flag = self.cancelFlag(),
@@ -1022,10 +1206,7 @@ const AskContext = struct {
             .on_output_chunk = onCommandOutputChunk,
             .mcp_progress_ctx = @ptrCast(self),
             .on_mcp_progress = onMcpProgress,
-            .session_child_capability = if (self.writable) |*writable|
-                writable.childCapability() catch null
-            else
-                null,
+            .session_child_capability = self.sessionChildCapability(),
             .ephemeral_command_replay = self.managed_executions.replayStore(),
             .terminal_client = &self.terminal_client,
             .managed_executions = &self.managed_executions,
@@ -1043,26 +1224,34 @@ const AskContext = struct {
                 .ctx = @ptrCast(self),
                 .resolve_fn = resolveModelCapabilities,
             },
+            .model_override_resolver = .{
+                .context = @ptrCast(self),
+                .resolve_fn = resolveModelOverride,
+            },
             .interactive = false,
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
         };
-        if (self.mcp != null) {
+        if (self.mcp_host) |h| {
+            h.catalog.wire(&tc);
+        } else if (self.mcp != null) {
             tc.mcp_ctx = @ptrCast(self);
             tc.mcp_has_tool = mcpHasTool;
             tc.mcp_validate_tool = mcpValidateTool;
             tc.mcp_call_tool = mcpCallTool;
             tc.mcp_search_tools = mcpSearchTools;
             tc.mcp_tool_schema = mcpToolSchemaJson;
+            tc.mcp_snapshot_tool = mcpSnapshotTool;
             tc.mcp_call_feature = mcpCallFeature;
-            if (self.mcp_elicitation_capabilities.any()) {
-                tc.mcp_input_responder = .{
-                    .context = @ptrCast(self),
-                    .capabilities = self.mcp_elicitation_capabilities,
-                    .legacy_url_manual_completion = true,
-                    .callback = respondToAskMcpInput,
-                };
-            }
+        }
+        // Either engine: on a terminal, a server's question is put to the user.
+        if ((self.mcp_host != null or self.mcp != null) and self.mcp_elicitation_capabilities.any()) {
+            tc.mcp_input_responder = .{
+                .context = @ptrCast(self),
+                .capabilities = self.mcp_elicitation_capabilities,
+                .legacy_url_manual_completion = true,
+                .callback = respondToAskMcpInput,
+            };
         }
         return tc;
     }
@@ -1086,9 +1275,8 @@ const AskContext = struct {
             .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.cfg.gateway_chat_url,
+            .reviewer_model = self.reviewer_model,
             .cancel_flag = self.cancelFlag(),
-            .usage = &self.session.usage,
-            .usage_allocator = self.alloc,
         });
     }
 
@@ -1102,6 +1290,13 @@ const AskContext = struct {
 
     fn writeStderr(self: *AskContext, text: []const u8) !void {
         try self.deps.write_stderr(self.deps.stderr_ctx, text);
+    }
+
+    /// The store's notice that converting a v1 session is slow (D61).
+    fn conversionNotice(context: ?*anyopaque, text: []const u8) void {
+        const self: *AskContext = @ptrCast(@alignCast(context.?));
+        self.writeStderr("fx ask: ") catch return;
+        self.writeLine(text) catch {};
     }
 
     fn writeLine(self: *AskContext, text: []const u8) !void {
@@ -1150,10 +1345,11 @@ fn freshAskState(
 
 pub fn run(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !u8 {
     return runWithDeps(alloc, args, cfg, .{
-        .load_startup_state = app_lifecycle.loadStartupState,
+        .load_startup_state = loadStartupStateDefault,
         .context_registry = context_registry,
         .tool_set = tool_set,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_host = cfg.load_mcp_host,
         .install_headless_interrupt = true,
     });
 }
@@ -1191,6 +1387,8 @@ fn writeAskUsage(deps: RunDeps, usage: []const u8) !void {
 }
 
 fn askErrorNotice(err: anyerror) ?[]const u8 {
+    if (auth_runtime.preparationFailureNotice(err)) |notice| return notice;
+    if (config_runtime.modelNotSelectedMessage(err)) |message| return message;
     return switch (err) {
         error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
         error.ModelImageCapabilityUnavailable => image_attachments.model_image_capability_unavailable_notice,
@@ -1283,6 +1481,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     if (options.system_prompt_override) |sp| {
         effective_cfg.prompt_policy.system_prompt = sp;
     }
+    effective_cfg.sessions_v2 = cfg.sessions_v2 or options.sessions_v2;
 
     const output_mode = selectOutputMode(
         options.quiet,
@@ -1299,6 +1498,12 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .resume_target = options.resume_target,
         .color_enabled = !options.no_color,
         .continue_recovery = options.continue_recovery,
+        .model_override = options.model_override,
+        .effort_override = options.effort_override,
+        .fast_override = options.fast_override,
+        .ultrafast_override = options.ultrafast_override,
+        .provider_order_override = options.provider_order_override,
+        .provider_strict_override = options.provider_strict_override,
         .deps = deps,
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
@@ -1361,7 +1566,7 @@ fn preflightAskImages(
                 else => @errorName(err),
             };
             if (options.json_output) {
-                const detail = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @errorName(err), image_path });
+                const detail = try alloc.print("{s}: {s}", .{ @errorName(err), image_path });
                 defer alloc.free(detail);
                 const json = try renderErrorJsonResult(alloc, detail);
                 defer alloc.free(json);
@@ -1390,6 +1595,7 @@ pub fn runPrompt(alloc: Allocator, prompt: []const u8, auto_permission: bool, cf
             .context_registry = context_registry,
             .tool_set = tool_set,
             .load_mcp_runtime = cfg.load_mcp_runtime,
+            .load_mcp_host = cfg.load_mcp_host,
         },
     });
     defer result.deinit(alloc);
@@ -1404,6 +1610,7 @@ pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, auto_permission: b
             .context_registry = context_registry,
             .tool_set = tool_set,
             .load_mcp_runtime = cfg.load_mcp_runtime,
+            .load_mcp_host = cfg.load_mcp_host,
         },
     });
 }
@@ -1412,13 +1619,12 @@ fn missingCredentialResult(
     alloc: Allocator,
     options: RunOptions,
     provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
 ) !PromptRunResult {
-    const message = if (provider == .codex)
-        credentials.missing_chatgpt_credential_message
-    else if (provider == .grok)
-        credentials.missing_grok_credential_message
-    else
-        credentials.missing_credential_message;
+    const status = auth_runtime.StatusSnapshot{
+        .required_source = auth_runtime.requestedSource(provider, preferred),
+    };
+    const message = status.missingHelp(.cli).?;
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
@@ -1429,7 +1635,8 @@ fn missingCredentialResult(
     };
 }
 
-fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, cfg: Config, options: RunOptions) !PromptRunResult {
+fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, initial_cfg: Config, options: RunOptions) !PromptRunResult {
+    var cfg = initial_cfg;
     var owned_prompt = try alloc.dupe(u8, prompt);
     defer alloc.free(owned_prompt);
 
@@ -1442,6 +1649,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.default_model,
             cfg.default_agent_step_limit,
             cfg.auth_mode,
+            options.model_override,
         )
     else
         try options.deps.load_startup_state(
@@ -1450,8 +1658,29 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.secret_store,
             cfg.default_model,
             cfg.default_agent_step_limit,
+            options.model_override,
         );
     defer startup.deinit(alloc);
+    applyAskThemeChoice(startup.theme);
+    cfg.provider_set.definitions = startup.configured_providers.definitions;
+    // Bind gateway chat traffic to a per-process connection pool and warm one
+    // connection in the background while the rest of startup continues.
+    var gateway_pool: ?*http_pool.HttpPool = null;
+    defer if (gateway_pool) |pool| {
+        if (pool.deinit() == .destroyed) alloc.destroy(pool);
+    };
+    if (io_mod.getenv("FX_BENCH") == null and startup.provider == .gateway) {
+        if (alloc.create(http_pool.HttpPool)) |pool| {
+            pool.* = http_pool.HttpPool.init(alloc);
+            gateway_pool = pool;
+            if (cfg.provider_set.gateway.agent_stream) |stream| {
+                var stamped = stream;
+                stamped.context = pool;
+                cfg.provider_set.gateway.agent_stream = stamped;
+            }
+            pool.warmAsync(gateway_client.resolveChatUrlForWarmup(cfg.gateway_chat_url));
+        } else |_| {}
+    }
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
@@ -1487,17 +1716,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (cfg.auth_mode == .local and
         !options.continue_recovery and options.resume_target == null and startup.credential == null)
     {
-        return missingCredentialResult(alloc, options, startup.provider);
+        if (startup.credential_load_failure) |failure| {
+            if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
+        }
+        return missingCredentialResult(alloc, options, startup.provider, startup.credential_source_preference);
     }
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
-    if (options.save_session) {
-        _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
-        ctx.session.attachProfileUsagePublisher(alloc);
-    }
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
     try ctx.checkCancellation();
     var presenter: ?ask_presentation.Runtime = null;
@@ -1518,12 +1746,18 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.requested_resume = options.resume_target;
     ctx.agent_step_limit = startup.agent_step_limit;
     ctx.max_tool_result_bytes = startup.max_tool_result_bytes;
+    ctx.auto_compact_percent = startup.auto_compact_percent;
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
     ctx.fast_mode = startup.fast_mode;
+    ctx.persisted_ultrafast_mode = startup.configured_ultrafast_mode;
+    ctx.ultrafast_mode = startup.ultrafast_mode;
+    ctx.provider_order = startup.provider_order;
+    ctx.provider_strict = startup.provider_strict;
     ctx.effort = toCoreReasoningEffort(startup.effort);
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
     ctx.permission_mode = permission_mode;
+    ctx.reviewer_model = startup.review_model;
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;
@@ -1543,13 +1777,54 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
         try options.deps.initialize_session_stores(&ctx);
         try ctx.checkCancellation();
+        if (config_runtime.providerEnvOverride() != null) {
+            ctx.provider = startup.provider;
+            ctx.model = startup.selected_model;
+        }
         if (startup.model_source == .process_override) {
             ctx.model = startup.selected_model;
         } else if (ctx.requested_resume != null) {
             owned_resumed_model = try alloc.dupe(u8, ctx.model);
             ctx.model = owned_resumed_model.?;
         }
+        // Environment precedence survives resume without rewriting the saved
+        // profile preference. CLI flags below remain the final per-run layer.
+        if (startup.ultrafast_process_override) |ultrafast| ctx.ultrafast_mode = ultrafast;
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
+    }
+
+    // Ask flags are per-run overrides: they win over startup and resumed
+    // session preferences but are never persisted into session preferences.
+    if (options.model_override) |model| {
+        ctx.model = model;
+    }
+    if (options.effort_override) |effort| {
+        ctx.effort = effort;
+    }
+    if (options.fast_override) |fast| {
+        ctx.fast_mode = fast;
+        if (fast) ctx.ultrafast_mode = false;
+    } else if (options.model_override != null and ctx.requested_resume == null and
+        startup.fast_mode_source == .compiled_default)
+    {
+        // Default fast mode applies to the compiled default model only; an
+        // explicit model override drops it unless --fast restores it.
+        ctx.fast_mode = false;
+    }
+    if (options.ultrafast_override) |ultrafast| {
+        ctx.ultrafast_mode = ultrafast;
+        if (ultrafast) ctx.fast_mode = false;
+    } else if (options.model_override != null and ctx.requested_resume == null and
+        startup.ultrafast_mode_source == .compiled_default)
+    {
+        // Ultra mode must never follow an explicit model override by default.
+        ctx.ultrafast_mode = false;
+    }
+    if (options.provider_order_override) |order| {
+        ctx.provider_order = order;
+    }
+    if (options.provider_strict_override) |strict| {
+        ctx.provider_strict = strict;
     }
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
@@ -1562,6 +1837,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         alloc.free(owned_prompt);
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
+    } else if (ctx.writable) |*writable| {
+        if (writable.conversation_writer.turn_open) {
+            const checkpoint = writable.state.recovery_checkpoint orelse
+                return error.InvalidRecoveryCheckpoint;
+            const prompt_snapshot_committed = ctx.prompt_snapshot_committed;
+            defer ctx.prompt_snapshot_committed = prompt_snapshot_committed;
+            try propagateHistoryTurn(&ctx, checkpoint.interruptedTurn());
+        }
     }
 
     var routed_credential: ?credentials.Credential = null;
@@ -1572,17 +1855,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.credential_source = .host_managed;
         ctx.account_id = null;
         ctx.model_catalog_access = .host_managed;
-        if (comptime @import("builtin").os.tag != .wasi) {
-            if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
-                ctx.session.usage.replaceHostManagedReconciliationAuthority(
-                    ctx.alloc,
-                    ctx.provider,
-                );
-            }
-        }
     } else {
         const startup_matches_final_model = if (startup.credential) |credential|
-            model_provider.authorizesCredential(ctx.provider, credential.source)
+            startup.provider.same_authority(ctx.provider) and model_provider.authorizesCredential(ctx.provider, credential.source)
         else
             false;
         const startup_credential_is_final = startup_matches_final_model and
@@ -1590,15 +1865,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         const credential: *const credentials.Credential = if (startup_credential_is_final)
             &startup.credential.?
         else routed: {
+            const preferred_source = if (ctx.provider == .gateway) startup.credential_source_preference else null;
             routed_credential = try auth_runtime.prepareCredential(
                 alloc,
                 cfg.gateway_provider.oauth_transport,
                 cfg.secret_store,
                 ctx.provider,
-                if (ctx.provider == .gateway) startup.credential_source_preference else null,
+                preferred_source,
             );
             if (routed_credential == null) {
-                return missingCredentialResult(alloc, options, ctx.provider);
+                return missingCredentialResult(alloc, options, ctx.provider, preferred_source);
             }
             break :routed &routed_credential.?;
         };
@@ -1612,17 +1888,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             credential.gatewayTeam(),
             credential.accountId(),
         );
-        if (comptime @import("builtin").os.tag != .wasi) {
-            if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
-                ctx.session.usage.replaceProviderReconciliationCredential(
-                    alloc,
-                    ctx.provider,
-                    credential.source,
-                    credential.accountId(),
-                    credential.token,
-                );
-            }
-        }
     }
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
@@ -1637,10 +1902,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             options.images,
     );
     defer types.freeImageAttachmentSlice(alloc, current_images);
-    defer if (options.save_session and !ctx.prompt_snapshot_committed) {
+    defer if (recovery_checkpoint == null and options.save_session and !ctx.prompt_snapshot_committed) {
         image_attachments.deleteUnreferencedImageSnapshots(current_images, restored_image_catalog);
     };
-    if (current_images.len > 0) {
+    if (recovery_checkpoint == null and current_images.len > 0) {
         try ctx.checkCancellation();
         _ = std.math.add(
             usize,
@@ -1652,16 +1917,19 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
     }
 
-    const authorized_image_catalog = try ctx.session.snapshotImageCatalog(alloc, current_images);
+    const authorized_image_catalog = if (recovery_checkpoint) |checkpoint|
+        try session_runtime.merge_image_catalog_history_turn(alloc, restored_image_catalog, checkpoint.interruptedTurn())
+    else
+        try ctx.session.snapshotImageCatalog(alloc, current_images);
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     try ctx.checkCancellation();
-    var loaded_skills = try options.deps.load_skills(
+    ctx.loaded_skills = try options.deps.load_skills(
         alloc,
         startup.workspace_root,
         cfg.skill_root_policy,
     );
-    defer loaded_skills.deinit(alloc);
+    const loaded_skills = &ctx.loaded_skills;
     try ctx.checkCancellation();
     skill_runtime.traceDiagnostics("ask_startup", loaded_skills.diagnostics);
     ctx.skills_dir = loaded_skills.dir;
@@ -1710,8 +1978,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         if (options.output_mode.isTerminal()) {
             mcp.connectAllCancellable(ctx.toolRegistry(), ctx.cancelFlag());
         } else {
-            mcp.connectRequiredForAsk(ctx.toolRegistry());
+            mcp.connectRequiredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
         }
+    }
+    if (options.deps.load_mcp_host) |load_host| {
+        ctx.mcp_host = try load_host(alloc, startup.workspace_root, ctx.toolRegistry(), .{ .questions = ctx.mcp_elicitation_capabilities });
+        if (ctx.mcp_host) |h| try reportUnapprovedMcpServers(&ctx, h);
     }
     try ctx.checkCancellation();
     if (ctx.mcp) |mcp| {
@@ -1726,39 +1998,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             return failPromptRunResult(error.McpRequiredServerUnavailable);
         }
     }
-    const session_child_capability = if (ctx.writable) |*writable|
-        writable.childCapability() catch null
-    else
-        null;
+    const session_child_capability = ctx.sessionChildCapability();
     var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
-        .mcp_runtime = ctx.mcp,
         .subagent_available = ctx.subagent_host != null,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
-    const skills_view = skill_runtime.Runtime{
-        .items = loaded_skills.skills,
-        .diagnostics = loaded_skills.diagnostics,
-    };
-    var bounded_skills = try skills_view.buildRoutedSystemPromptSection(alloc, owned_prompt, ctx.context_limits);
-    defer bounded_skills.deinit(alloc);
-    if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    const skills_section = bounded_skills.text;
-    var explicit_skills = try skill_invocation.buildExplicitPromptSection(
-        alloc,
-        .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
-        owned_prompt,
-        &.{},
-        ctx.context_limits,
-    );
-    defer explicit_skills.deinit(alloc);
-    if (explicit_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    if (explicit_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    ctx.subagent_skills_prompt = try alloc.dupe(u8, skills_section);
-    ctx.subagent_explicit_skills_prompt = try alloc.dupe(u8, explicit_skills.text);
     const context_history = try ctx.session.snapshotHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);
     const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
@@ -1785,7 +2032,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,
-        .context_history_start = ctx.session.contextHistoryStart(),
         .unversioned_history_count = ctx.session.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = &.{},
@@ -1798,17 +2044,22 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     const deps = agentRuntimeDeps(&ctx);
     const semantic_presentation = if (ctx.presenter) |value| value.semanticSink() else null;
     try ctx.checkCancellation();
+    const title_task = maybeStartAskTitleTask(
+        &ctx,
+        startup.session_title_generation,
+        owned_prompt,
+        recovery_checkpoint == null and options.save_session and ctx.requested_resume == null,
+    );
+    defer if (title_task) |task| completeAskTitleTask(&ctx, task);
     const current_prompt_is_root_authority = if (ctx.writable) |writable|
         writable.external_prompt_origin == .persistent_child and
             recovery_checkpoint == null
     else
         false;
-    ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
-        .skills_prompt_section = skills_section,
-        .explicit_skills_prompt_section = explicit_skills.text,
+        .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
@@ -1817,9 +2068,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
+        .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
         .fast_mode = ctx.fast_mode,
+        .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
+        .provider_order = if (ctx.provider == .gateway) ctx.provider_order else &.{},
+        .provider_strict = ctx.provider == .gateway and ctx.provider_strict,
         .first_call_tool_choice = ctx.first_call_tool_choice,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
@@ -1853,6 +2108,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 .interrupted = ctx.processInterruptRequested(),
                 .tool_calls = tool_calls,
                 .error_code = "NonInteractivePermissionRequired",
+                .usage = ctx.session.agent.turn_usage,
             };
         },
         else => {
@@ -1871,7 +2127,92 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     return result;
 }
 
+/// Starts background title generation for a fresh saved session. The task runs
+/// concurrently with the first turn and is applied by `completeAskTitleTask`
+/// on every exit path. The locally derived title remains when generation is
+/// skipped or unavailable.
+fn maybeStartAskTitleTask(
+    ctx: *AskContext,
+    setting_enabled: bool,
+    prompt: []const u8,
+    fresh_session: bool,
+) ?*session_title_generation.Task {
+    // Unit tests share the real provider bundles; never spawn network side
+    // calls from a test process. Wiring is covered by e2e mock servers.
+    if (comptime @import("builtin").is_test) return null;
+    if (comptime @import("builtin").target.os.tag == .wasi) return null;
+    if (!setting_enabled or !fresh_session) return null;
+    if (ctx.session.agent.history.items.len != 0) return null;
+    const session_id = ctx.activeSessionId() orelse return null;
+    const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    const title_model = bundle.title_model orelse return null;
+    const agent_stream = bundle.agent_stream orelse return null;
+    const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
+    if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
+    const task = session_title_generation.Task.create(.{
+        .session_id = session_id,
+        .model = title_model,
+        .prompt_excerpt = excerpt,
+        .api_key = if (ctx.api_key.len > 0) ctx.api_key else null,
+        .gateway_team = ctx.gateway_team,
+        .account_id = ctx.account_id,
+        .credential_source = ctx.credential_source,
+        .stream_provider = agent_stream,
+    }) catch return null;
+    task.spawn() catch |err| {
+        debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
+        task.destroy();
+        return null;
+    };
+    return task;
+}
+
+/// Joins the bounded title task and installs the generated title unless the
+/// session already carries a user-set title.
+fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
+    defer task.destroy();
+    task.join();
+    const title = task.takeTitle() orelse return;
+    defer std.heap.c_allocator.free(title);
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    if (ctx.v2) |v2| {
+        if (!std.mem.eql(u8, v2.id(), task.session_id)) {
+            debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
+            return;
+        }
+        const installed = v2.installGeneratedTitle(ctx.session.agent.history.items, title) catch |err| {
+            debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+            return;
+        };
+        if (installed) debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+        return;
+    }
+    const writable = if (ctx.writable) |*value| value else return;
+    if (!std.mem.eql(u8, writable.active_id, task.session_id)) {
+        debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
+        return;
+    }
+    const installed = session_title_generation.installGeneratedTitle(ctx.alloc, writable, ctx.session.agent.history.items, title) catch |err| {
+        debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+        return;
+    };
+    if (installed) {
+        debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+    }
+}
+
+/// Reports a pending shell snapshot fallback once, on stderr.
+fn writeShellSnapshotNotice(ctx: *AskContext) void {
+    var buffer: [shell_snapshot.max_notice_bytes]u8 = undefined;
+    const notice = shell_snapshot.processOwner().takeUiNotice(&buffer) orelse return;
+    ctx.writeStderr("fx ask: warning: ") catch return;
+    ctx.writeStderr(notice) catch return;
+    ctx.writeStderr("\n") catch return;
+}
+
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
+    writeShellSnapshotNotice(ctx);
     const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
     errdefer alloc.free(assistant_output);
     const final_output: []u8 = if (ctx.final_output.items.len > 0)
@@ -1879,10 +2220,23 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     else
         @constCast(&.{});
     errdefer if (final_output.len > 0) alloc.free(final_output);
+    const final_source: []u8 = if (ctx.final_source.items.len > 0)
+        try alloc.dupe(u8, ctx.final_source.items)
+    else
+        @constCast(&.{});
+    errdefer if (final_source.len > 0) alloc.free(final_source);
     const model = try alloc.dupe(u8, ctx.model);
     errdefer alloc.free(model);
+    const resolved_provider: []u8 = if (ctx.resolved_provider) |provider|
+        try alloc.dupe(u8, provider)
+    else
+        @constCast(&.{});
+    errdefer if (resolved_provider.len > 0) alloc.free(resolved_provider);
     const session_id = if (ctx.writable) |writable|
         try alloc.dupe(u8, writable.active_id)
+    else if (ctx.v2) |v2|
+        // A v2 session exists once its first turn is written.
+        try alloc.dupe(u8, if (v2.saved()) v2.id() else "")
     else
         try alloc.dupe(u8, "");
     errdefer if (session_id.len > 0) alloc.free(session_id);
@@ -1893,15 +2247,19 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .exit_code = if (ctx.failed) 1 else 0,
         .assistant_output = assistant_output,
         .final_output = final_output,
+        .final_source = final_source,
         .interrupted = ctx.processInterruptRequested(),
         .model = model,
+        .resolved_provider = resolved_provider,
         .session_id = session_id,
         .tool_calls = tool_calls,
         .step_count = ctx.step_count,
         .error_code = ctx.typed_error_code,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
+        // Sessions v2 keeps no recovery checkpoint yet.
         .recovery_durable = ctx.writable != null,
+        .usage = ctx.session.agent.turn_usage,
     };
 }
 
@@ -1934,8 +2292,6 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
             ctx.alloc,
             .{ .recovery_checkpoint_cleared = .{} },
             io_mod.milliTimestamp(),
-            .retry_expected_tail,
-            .{},
         ) catch |err| {
             debug_trace.logf(
                 "ask",
@@ -1963,23 +2319,11 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
 }
 
 fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
-    ctx.session.usage.configureCheckpointSink(
-        if (ctx.writable != null)
-            .{
-                .context = @ptrCast(ctx),
-                .allocator = ctx.alloc,
-                .persist = persistUsageCheckpoint,
-            }
-        else
-            null,
-    );
     return .{
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = ctx.agentStreamProvider(),
-        .compaction_route = ctx.cfg.provider_set.compactionRoute(
-            ctx.provider,
-            ctx.credential_source,
-        ),
+        .confirm_session_writer = confirmSessionWriter,
+        .render_assistant_text = ctx.output_mode.isTerminal(),
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
@@ -1988,6 +2332,8 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
+        .snapshot_mcp_definition = snapshotMcpDefinition,
+        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -1999,12 +2345,15 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCallAuthorized,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (ctx.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             }
         else
             null,
+        .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
         .push_text = pushText,
@@ -2018,12 +2367,17 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
+        .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
+        .record_tool_call_failed = recordToolCallFailed,
         .report_usage = reportUsage,
-        .usage = &ctx.session.usage,
-        .usage_allocator = ctx.alloc,
     };
+}
+
+fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return ctx.capability_resolver.state == .failed;
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
@@ -2039,6 +2393,10 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+        return null;
+    }
     var refreshed = (try auth_runtime.refreshCredentialForAccount(
         ctx.cfg.gateway_provider.oauth_transport,
         ctx.alloc,
@@ -2090,47 +2448,15 @@ fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
-fn persistUsageCheckpoint(
-    raw_ctx: *anyopaque,
-    snapshot: session_usage.Snapshot,
-) !void {
+/// Fails when this process no longer owns the saved session, without
+/// writing. Sessions v2 hold the session's lock, and an unsaved session has
+/// no writer to lose.
+fn confirmSessionWriter(raw_ctx: *anyopaque) anyerror!void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
-    const writable = if (ctx.writable) |*value|
-        value
-    else
-        return error.SessionPersistenceUnavailable;
-    const store = ctx.store orelse return error.SessionPersistenceUnavailable;
-    const recovery_checkpoint = try store.prepareUsageRecoveryCheckpoint(
-        ctx.alloc,
-        writable,
-        snapshot,
-    );
-    if (writable.degradedTail() != null) {
-        var current = try currentAskState(
-            ctx,
-            writable,
-            recovery_checkpoint.timestamp_ms,
-        );
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
-    }
-    _ = try writable.appendEvent(
-        ctx.alloc,
-        .{ .usage_checkpointed = .{ .usage = snapshot } },
-        recovery_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{ .checkpoint_interval = 0 },
-    );
-    try store.finishUsageRecoveryCheckpoint(
-        writable.active_id,
-        recovery_checkpoint,
-    );
+    if (ctx.v2 != null) return;
+    if (ctx.writable) |*writable| try writable.confirmWriter();
 }
 
 /// Overwrite session totals with the latest completion usage (same semantics as
@@ -2170,6 +2496,33 @@ fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capa
     );
 }
 
+/// Subagent model overrides resolve against the same catalog the capability
+/// path uses. The resolve loads the catalog on first use; only cancellation
+/// or an unavailable catalog falls back to raw passthrough.
+fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
+    const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    const catalog_provider = bundle.model_catalog orelse return .no_catalog;
+    _ = ctx.capability_resolver.resolve(
+        ctx.alloc,
+        catalog_provider,
+        .{
+            .access = ctx.model_catalog_access,
+            .endpoint = ctx.cfg.gateway_models_path,
+            .cancel_flag = ctx.cancelFlag(),
+        },
+        raw_model,
+        bundle.fallbackModelCapabilities(raw_model),
+    ) catch return .no_catalog;
+    const entries = ctx.capability_resolver.catalogEntries() orelse return .no_catalog;
+    var ids = try model_catalog.projectModelIds(alloc, entries);
+    defer {
+        for (ids.items) |id| alloc.free(id);
+        ids.deinit(alloc);
+    }
+    return subagent_model_contract.matchCatalogModel(alloc, ids.items, raw_model);
+}
+
 fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
     std.debug.assert(turn_id != 0);
     _ = disposition;
@@ -2177,6 +2530,7 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     if (outcome == .failed or outcome == .paused) {
         ctx.failed = true;
     }
+    if (outcome == .completed) discard_restarted_json_preview(ctx);
 }
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -2186,16 +2540,18 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
-        .tracker = null,
+        .stale_shell_handles = ctx.session.has_stale_shell_handles,
     }, arena, messages);
 }
 
-fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultStatic(.{
-        .project_context = ctx.modelVisibleProjectContext(),
+        .project_context = project_context orelse ctx.modelVisibleProjectContext(),
     }, arena, messages);
-    var snapshot = if (ctx.mcp) |mcp|
+    var snapshot = if (ctx.mcp_host) |h|
+        try h.catalog.modelSnapshot(arena)
+    else if (ctx.mcp) |mcp|
         try mcp.snapshotModelCatalog(arena, ctx.permission_rules, true)
     else
         try mcp_model_catalog.Snapshot.empty(arena);
@@ -2205,6 +2561,11 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
         try messages.append(arena, .{ .role = .system, .content = section.text });
     }
     if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
+}
+
+fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.snapshotMcpDefinition(ctx.toolContext(), arena, name, known);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -2218,6 +2579,11 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
+}
+
+fn prepareSkillCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.prepareSkillCall(ctx.toolContext(), arena, call, locations);
 }
 
 fn cliAdmissionContext(
@@ -2278,9 +2644,10 @@ fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: Too
     );
 }
 
-fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
+fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
+    var tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
+    tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     return finishCliPermissionOutcome(
         ctx,
         tool_ctx,
@@ -2489,12 +2856,14 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
         ctx.toolRegistry(),
         ctx.workspace_root,
         &ctx.terminal_client,
+        &ctx.managed_executions,
         call,
     );
 }
 
 fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (try tool_presentation.formatSubagentPlainAction(arena, call, .completed)) |line| return line;
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
@@ -2506,6 +2875,7 @@ fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: Tool
 
 fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (try tool_presentation.formatSubagentPlainAction(arena, call, .{ .stopped = label })) |line| return line;
     const action = try tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
@@ -2513,7 +2883,7 @@ fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCal
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
-    return std.fmt.allocPrint(arena, "{s}: {s}", .{ label, action });
+    return arena.print("{s}: {s}", .{ label, action });
 }
 
 fn lifecycleDynamicMcpToolAvailable(ctx: *AskContext, name: []const u8, advertised_dynamic_tool_names: []const []const u8) bool {
@@ -2522,6 +2892,7 @@ fn lifecycleDynamicMcpToolAvailable(ctx: *AskContext, name: []const u8, advertis
 }
 
 fn lifecycleDynamicMcpAvailability(ctx: *AskContext) tool_mcp_runtime.RuntimeCapabilities {
+    if (ctx.mcp_host) |h| return h.catalog.runtimeCapabilities();
     if (ctx.mcp == null) return .{};
     return .{ .context = @ptrCast(ctx), .has_tool = mcpHasTool };
 }
@@ -2633,6 +3004,29 @@ fn recordToolCallRejected(
         },
         .rejected,
         "rejected",
+    );
+}
+
+fn recordToolCallFailed(
+    raw_ctx: *anyopaque,
+    _: Allocator,
+    call: ToolCall,
+    model_output: []const u8,
+    command_result_json: ?[]const u8,
+) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.output_mode.capturesJson()) return;
+    appendToolCallRecordBestEffort(
+        ctx,
+        call,
+        "error",
+        .{
+            .status = .failure,
+            .model_output = model_output,
+            .command_result_json = command_result_json,
+        },
+        .tool_failed,
+        "tool_failed",
     );
 }
 
@@ -2863,49 +3257,69 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    try ctx.session.appendHistoryEntry(ctx.alloc, turn);
+    var prepared = try ctx.session.prepareHistoryEntry(ctx.alloc, turn);
+    var prepared_owned = true;
+    defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
-    const writable = if (ctx.writable) |*value| value else return;
-    try subagent_resume_admission.retainExternalRootUserTurn(
-        ctx.store,
-        ctx.alloc,
-        writable,
-        turn,
-        ctx.retain_external_root_user_turn,
-    );
-
-    if (writable.degradedTail() != null) {
-        const now_ms = io_mod.milliTimestamp();
-        var current = try currentAskState(ctx, writable, now_ms);
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
+    if (ctx.v2) |v2| {
+        try v2.prepareTurn(&prepared);
+        v2.commitTurn(prepared, ctx.session.languageSnapshot()) catch |err| {
+            // A failed write may still have reached the log: keep its images.
+            if (session_adapter.writeMayHaveLanded(err)) ctx.prompt_snapshot_committed = true;
+            return err;
+        };
+        ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+        prepared_owned = false;
+        ctx.prompt_snapshot_committed = true;
+        return;
     }
-
+    const writable = if (ctx.writable) |*value| value else {
+        ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+        prepared_owned = false;
+        return;
+    };
+    try writable.prepareHistoryTurnForCommit(ctx.alloc, &prepared);
     _ = writable.appendEvent(
         ctx.alloc,
         .{ .history_turn_committed = .{
             .conversation_language = ctx.session.languageSnapshot(),
             .total_input_tokens = writable.state.total_input_tokens,
             .total_output_tokens = writable.state.total_output_tokens,
-            .turn = turn,
+            .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-        .retry_expected_tail,
-        .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            try commitAskStateReplacement(ctx, writable, true);
-            ctx.prompt_snapshot_committed = true;
-            return;
-        },
-        else => return err,
+    ) catch |err| {
+        if (err == error.SessionPersistenceUncertain) ctx.prompt_snapshot_committed = true;
+        return err;
     };
+    ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+    prepared_owned = false;
     ctx.prompt_snapshot_committed = true;
+}
+
+fn commitContextCompaction(
+    raw_ctx: *anyopaque,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+    retained_from: ?types.ContextHistoryCut,
+) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(ctx.session.agent.history.items) });
+    errdefer types.freeHistoryTurnSlice(ctx.alloc, prepared);
+    if (ctx.v2) |v2| {
+        try v2.commitCompaction(summary, active_prefix != null, retained_from);
+        if (active_prefix != null) ctx.prompt_snapshot_committed = true;
+    } else if (ctx.writable) |*writable| {
+        _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
+            if (err == error.SessionPersistenceUncertain and active_prefix != null) ctx.prompt_snapshot_committed = true;
+            return err;
+        };
+        if (active_prefix != null) ctx.prompt_snapshot_committed = true;
+    }
+    ctx.session.commitCompactedHistory(ctx.alloc, prepared);
 }
 
 fn setRecoveryCheckpoint(
@@ -2913,77 +3327,52 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    writeRecoveryCheckpoint(ctx, checkpoint) catch |err| {
+        if (err == error.SessionPersistenceUncertain) ctx.prompt_snapshot_committed = true;
+        return err;
+    };
+}
+
+fn writeRecoveryCheckpoint(ctx: *AskContext, checkpoint: session_codec.RecoveryCheckpoint) !void {
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
     const now_ms = io_mod.milliTimestamp();
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         ctx.alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
-        .retry_expected_tail,
-        .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            var current = try currentAskState(ctx, writable, now_ms);
-            defer current.deinit(ctx.alloc);
-            if (current.recovery_checkpoint) |*old| old.deinit(ctx.alloc);
-            current.recovery_checkpoint = try checkpoint.dupe(ctx.alloc);
-            _ = try writable.commitStateReplacement(
-                ctx.alloc,
-                current,
-                .compaction,
-                .retry_expected_tail,
-                .{},
-            );
-        },
-        else => return err,
-    };
-}
-
-fn currentAskState(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-    now_ms: i64,
-) !session_codec.DurableSessionState {
-    var state = try writable.state.dupe(ctx.alloc);
-    errdefer state.deinit(ctx.alloc);
-    const history = try ctx.session.snapshotHistory(ctx.alloc);
-    types.freeHistoryTurnSlice(ctx.alloc, state.history);
-    state.history = history;
-    const permission_state = try ctx.session.snapshotPermissionState(ctx.alloc);
-    state.permission_state.deinit(ctx.alloc);
-    state.permission_state = permission_state;
-    state.conversation_language = ctx.session.languageSnapshot();
-    state.updated_at_ms = now_ms;
-    const usage = try ctx.session.usage.snapshot(ctx.alloc);
-    if (state.usage) |*old| old.deinit(ctx.alloc);
-    state.usage = usage;
-    return state;
-}
-
-fn commitAskStateReplacement(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-    clear_recovery_checkpoint: bool,
-) !void {
-    const now_ms = io_mod.milliTimestamp();
-    var state = try currentAskState(ctx, writable, now_ms);
-    defer state.deinit(ctx.alloc);
-    if (clear_recovery_checkpoint) {
-        if (state.recovery_checkpoint) |*checkpoint| checkpoint.deinit(ctx.alloc);
-        state.recovery_checkpoint = null;
-    }
-    _ = try writable.commitStateReplacement(
-        ctx.alloc,
-        state,
-        .compaction,
-        .retry_expected_tail,
-        .{},
     );
-    if (state.usage) |usage| {
-        ctx.session.usage.markClean(usage);
-    }
+    ctx.prompt_snapshot_committed = true;
+}
+
+/// Sessions v2: each completed piece is saved before the next request.
+/// A failed stream is traced and left to the commit, which writes every
+/// piece the stream missed or reports the failure itself.
+fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return;
+    v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
+        return;
+    };
+    // The log now refers to this prompt's images.
+    ctx.prompt_snapshot_committed = true;
+}
+
+fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    if (writable.state.recovery_checkpoint == null) return;
+    _ = try writable.appendEvent(
+        ctx.alloc,
+        .{ .recovery_checkpoint_cleared = .{} },
+        io_mod.milliTimestamp(),
+    );
 }
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
@@ -2993,13 +3382,22 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
     defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
     switch (event) {
         .clear_route_recovery_status => ctx.last_recovery_status = null,
+        .provider_resolved => |slug| {
+            if (ctx.resolved_provider) |old| ctx.alloc.free(old);
+            ctx.resolved_provider = try ctx.alloc.dupe(u8, slug);
+        },
         .finish_prompt => |finished| {
             ctx.final_output.clearRetainingCapacity();
+            ctx.final_source.clearRetainingCapacity();
             if (finished.terminal_outcome == .completed) switch (finished.turn) {
-                .assistant => |turn| try ctx.final_output.appendSlice(
-                    ctx.alloc,
-                    turn.assistant,
-                ),
+                .assistant => |turn| {
+                    const presentation = @import("../agent/runtime/assistant_stream.zig");
+                    const text = finished.presentation_text orelse turn.assistant;
+                    const normalized = try presentation.normalizeAssistantTextForDisplay(ctx.alloc, text);
+                    defer ctx.alloc.free(normalized);
+                    try ctx.final_output.appendSlice(ctx.alloc, presentation.textForCompletedPresentation(text, normalized));
+                    try ctx.final_source.appendSlice(ctx.alloc, turn.assistant);
+                },
                 .compacted_summary, .interrupted => {},
             };
         },
@@ -3010,6 +3408,19 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     switch (emission) {
+        .assistant_started => {
+            discard_restarted_json_preview(ctx);
+            ctx.response_output_start = ctx.assistant_output.items.len;
+        },
+        .assistant_restarted => |text| switch (ctx.output_mode) {
+            .raw => try writeRawAssistantBytes(ctx, text),
+            .json => {
+                ctx.response_restart_pending = true;
+                try ctx.writeStderr(text);
+            },
+            .quiet => try ctx.writeStderr(text),
+            .terminal, .terminal_no_color => try ctx.presenter.?.pushText(text),
+        },
         .assistant_source => |text| switch (ctx.output_mode) {
             .raw, .json => try pushRawAssistantText(ctx, text),
             .quiet, .terminal, .terminal_no_color => {},
@@ -3023,6 +3434,21 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
             .quiet, .json, .raw => try ctx.writeStderr(text),
         },
     }
+}
+
+fn discard_restarted_json_preview(ctx: *AskContext) void {
+    if (!ctx.response_restart_pending) return;
+    debug_trace.logf("agent", "discarding interrupted JSON preview bytes={d}", .{ctx.assistant_output.items.len - ctx.response_output_start});
+    ctx.assistant_output.shrinkRetainingCapacity(ctx.response_output_start);
+    ctx.response_restart_pending = false;
+    ctx.raw_has_output = ctx.assistant_output.items.len > 0;
+    ctx.raw_boundary_pending = ctx.raw_has_output;
+    ctx.raw_trailing_newlines = if (std.mem.endsWith(u8, ctx.assistant_output.items, "\n\n"))
+        2
+    else if (std.mem.endsWith(u8, ctx.assistant_output.items, "\n"))
+        1
+    else
+        0;
 }
 
 fn pushRawAssistantText(ctx: *AskContext, text: []const u8) !void {
@@ -3075,8 +3501,13 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             try publishPendingToolProgress(ctx, progress.id.call_id, progress.text);
         },
         .turn_finished => if (!ctx.output_mode.isTerminal()) clearPendingToolProgress(ctx),
-        .terminal => |value| if (!ctx.output_mode.isTerminal()) {
-            try settlePendingToolProgress(ctx, value.id.call_id, value.outcome);
+        .terminal => |value| {
+            if (!ctx.output_mode.isTerminal()) {
+                try settlePendingToolProgress(ctx, value.id.call_id, value.outcome);
+            }
+            // Report a fallback right after the command it affected; a later
+            // recapture in the same run would otherwise clear it unseen.
+            writeShellSnapshotNotice(ctx);
         },
     }
 }
@@ -3246,7 +3677,7 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
         (ctx.output_mode == .quiet and !terminal)) return;
     var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try pushSystemNotice(raw_ctx, status.label(&label_buf));
-    if (terminal and ctx.writable == null) {
+    if (terminal and ctx.writable == null and ctx.v2 == null) {
         try pushSystemNotice(
             raw_ctx,
             "This run was started with --no-save, so its recovery context cannot be resumed after exit.",
@@ -3307,33 +3738,42 @@ fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text:
     };
 }
 
+/// The same warning v1 gives for project servers still waiting for approval.
+fn reportUnapprovedMcpServers(ctx: *AskContext, h: *mcp_host.Host) !void {
+    var listed = false;
+    for (h.runtime.servers()) |s| {
+        if (s.held != .waiting_for_approval) continue;
+        try ctx.writeStderr(if (listed) ", " else "fx ask: skipped unapproved project MCP servers: ");
+        try ctx.writeStderr(s.name);
+        listed = true;
+    }
+    if (listed) try ctx.writeStderr(". Approve with fx mcp approve <name> before retrying.\n");
+}
+
 fn activateAskMcp(ctx: *AskContext) anyerror!*mcp_runtime.McpRuntime {
     const runtime = ctx.mcp orelse return error.McpRuntimeUnavailable;
-    try runtime.connectDeferredForAsk(ctx.toolRegistry());
+    try runtime.connectDeferredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
     return runtime;
 }
 
 fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activateAskMcp(ctx) catch return false;
+    const mcp = ctx.mcp orelse return false;
+    mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, ctx.cancelFlag()) catch return false;
     return mcp.hasToolWithAccess(name, access);
 }
 
 fn mcpValidateTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
     const self: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = activateAskMcp(self) catch |err| {
-        if (err == error.McpRuntimeUnavailable) return .not_available;
-        return err;
-    };
+    const runtime = self.mcp orelse return .not_available;
+    try runtime.connectDeferredToolForAsk(self.toolRegistry(), name, access, self.cancelFlag());
     return runtime.validateToolArgumentsByNameWithAccess(arena, name, arguments_json, access);
 }
 
 fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activateAskMcp(ctx) catch |err| {
-        if (err == error.McpRuntimeUnavailable) return null;
-        return err;
-    };
+    const mcp = ctx.mcp orelse return null;
+    try mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, options.access, options.cancel_flag orelse ctx.cancelFlag());
     return mcp.callToolByNameWithOptions(
         arena,
         name,
@@ -3343,16 +3783,40 @@ fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, argument
     );
 }
 
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = try activateAskMcp(ctx);
-    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access);
+    const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
+    if (request.server) |server_name| {
+        mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag()) catch |err| switch (err) {
+            error.McpAuthenticationRequired => {}, // Search renders the observed challenge with named login guidance.
+            error.Cancelled, error.OutOfMemory, error.McpAccessDenied, error.McpAuthorityChanged => return err,
+            else => {
+                if (!mcp.hasRecordedFailure(server_name)) return err;
+                // Search reports the recorded reason instead of the error name.
+                debug_trace.logf(
+                    "mcp",
+                    "deferred ask connection failed server={s} err={s}; search reports the recorded failure",
+                    .{ server_name, @errorName(err) },
+                );
+            },
+        };
+    } else {
+        try mcp.connectDeferredForAsk(ctx.toolRegistry(), cancel_flag orelse ctx.cancelFlag());
+    }
+    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
 }
 
-fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = try activateAskMcp(ctx);
-    return runtime.toolSchemaJsonByNameWithAccess(arena, name, permission_rules, limits, access);
+    const runtime = ctx.mcp orelse return .unavailable;
+    return runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
+}
+
+fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const runtime = ctx.mcp orelse return null;
+    try runtime.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, cancel_flag orelse ctx.cancelFlag());
+    return runtime.toolSchemaJsonByNameWithAccess(arena, name, permission_rules, limits, access, cancel_flag);
 }
 
 fn mcpCallFeature(
@@ -3362,8 +3826,9 @@ fn mcpCallFeature(
     options: tool_mcp_runtime.FeatureCallOptions,
 ) anyerror!tool_mcp_runtime.FeatureResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = try activateAskMcp(ctx);
+    const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
     if (!options.access.allowsFeatureServer(mcp.generation, request.server_name)) return error.McpServerNotFound;
+    try mcp.connectDeferredServerForAsk(ctx.toolRegistry(), request.server_name, options.access, .features, options.cancel_flag orelse ctx.cancelFlag());
     return mcp.callFeatureForModel(arena, request, options);
 }
 
@@ -3403,7 +3868,7 @@ fn askTerminalMcpQuestion(
         try ctx.writeStderr("\n");
         for (entry.options, 0..) |option, index| {
             var number_buffer: [32]u8 = undefined;
-            const prefix = try std.fmt.bufPrint(&number_buffer, "  {d}. ", .{index + 1});
+            const prefix = try std.mem.print(&number_buffer, "  {d}. ", .{index + 1});
             try ctx.writeStderr(prefix);
             try ctx.writeStderr(option.label);
             if (option.description) |description| {
@@ -3548,14 +4013,21 @@ fn resolveAskSubagentAuthority(
     root_id: []const u8,
 ) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
     const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
-    const writable = if (ctx.writable) |*value| value else return error.HostAuthorityUnavailable;
-    if (!std.mem.eql(u8, writable.active_id, root_id)) {
+    const active_id = if (ctx.writable) |*value|
+        value.active_id
+    else if (ctx.v2) |v2|
+        v2.id()
+    else
+        return error.HostAuthorityUnavailable;
+    if (!std.mem.eql(u8, active_id, root_id)) {
         return error.HostAuthorityUnavailable;
     }
     if (ctx.mcp != null) {
         _ = activateAskMcp(ctx) catch return error.HostAuthorityUnavailable;
     }
-    const integrations = if (ctx.mcp) |mcp|
+    const integrations = if (ctx.mcp_host) |h|
+        h.catalog.snapshotToolNames(alloc, ctx.permission_rules)
+    else if (ctx.mcp) |mcp|
         mcp.snapshotToolNames(alloc, ctx.permission_rules)
     else
         alloc.alloc([]u8, 0);
@@ -3564,7 +4036,9 @@ fn resolveAskSubagentAuthority(
         for (owned_integrations) |name| alloc.free(name);
         alloc.free(owned_integrations);
     }
-    var mcp_view = if (ctx.mcp) |mcp|
+    var mcp_view = if (ctx.mcp_host) |h|
+        try h.catalog.snapshotAccessView(alloc, root_id, root_id, ctx.permission_rules, false)
+    else if (ctx.mcp) |mcp|
         try mcp.snapshotAccessView(
             alloc,
             root_id,
@@ -3600,6 +4074,20 @@ fn resolveAskSubagentAuthority(
     );
 }
 
+/// Parses one `--provider-order` value for `fx ask`, replacing any earlier
+/// occurrence. The returned slice is owned by `alloc`.
+fn parseAskProviderOrder(alloc: Allocator, raw: []const u8, previous: ?[][]const u8) ![][]const u8 {
+    const parsed: [][]const u8 = switch (config_runtime.parseProviderOrderList(alloc, raw)) {
+        .ok => |maybe| maybe orelse return error.InvalidAskArgs,
+        .invalid => return error.InvalidAskArgs,
+    };
+    if (previous) |old| {
+        for (old) |slug| alloc.free(@constCast(slug));
+        if (old.len > 0) alloc.free(old);
+    }
+    return parsed;
+}
+
 fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: StdinSource) !AskOptions {
     var opts: AskOptions = .{ .prompt = &.{} };
     errdefer opts.deinit(alloc);
@@ -3618,9 +4106,45 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--auto")) {
             if (opts.permission_override != null) return error.InvalidAskArgs;
             opts.permission_override = .auto;
-        } else if (std.mem.eql(u8, arg, "--yolo")) {
+        } else if (std.mem.eql(u8, arg, "--full-access") or std.mem.eql(u8, arg, "--yolo")) {
             if (opts.permission_override != null) return error.InvalidAskArgs;
             opts.permission_override = .yolo;
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            const model = std.mem.trim(u8, args[i], " \t\r\n");
+            if (model.len == 0) return error.InvalidAskArgs;
+            const owned_model = try alloc.dupe(u8, model);
+            if (opts.model_override) |old| alloc.free(old);
+            opts.model_override = owned_model;
+        } else if (std.mem.eql(u8, arg, "--effort")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            opts.effort_override = types.ReasoningEffort.parse(args[i]) orelse
+                return error.InvalidAskArgs;
+        } else if (std.mem.eql(u8, arg, "--fast") or std.mem.eql(u8, arg, "--no-fast")) {
+            const enabled = std.mem.eql(u8, arg, "--fast");
+            if (opts.fast_override != null and opts.fast_override.? != enabled)
+                return error.InvalidAskArgs;
+            opts.fast_override = enabled;
+            if (enabled) opts.ultrafast_override = false;
+        } else if (std.mem.eql(u8, arg, "--ultrafast") or std.mem.eql(u8, arg, "--no-ultrafast")) {
+            const enabled = std.mem.eql(u8, arg, "--ultrafast");
+            if (opts.ultrafast_override != null and opts.ultrafast_override.? != enabled)
+                return error.InvalidAskArgs;
+            opts.ultrafast_override = enabled;
+            if (enabled) opts.fast_override = false;
+        } else if (std.mem.eql(u8, arg, "--provider-order")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            opts.provider_order_override = try parseAskProviderOrder(alloc, args[i], opts.provider_order_override);
+        } else if (std.mem.startsWith(u8, arg, "--provider-order=")) {
+            opts.provider_order_override = try parseAskProviderOrder(alloc, arg["--provider-order=".len..], opts.provider_order_override);
+        } else if (std.mem.eql(u8, arg, "--provider-strict") or std.mem.eql(u8, arg, "--no-provider-strict")) {
+            const strict = std.mem.eql(u8, arg, "--provider-strict");
+            if (opts.provider_strict_override != null and opts.provider_strict_override.? != strict)
+                return error.InvalidAskArgs;
+            opts.provider_strict_override = strict;
         } else if (std.mem.eql(u8, arg, "--resume") or std.mem.eql(u8, arg, "--resume-id")) {
             if (opts.resume_target != null) return error.InvalidAskArgs;
             const exact_id = std.mem.eql(u8, arg, "--resume-id");
@@ -3655,6 +4179,8 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "--no-save")) {
             opts.no_save = true;
+        } else if (std.mem.eql(u8, arg, "--sessions-v2")) {
+            opts.sessions_v2 = true;
         } else if (std.mem.eql(u8, arg, "--no-color")) {
             opts.no_color = true;
         } else if (std.mem.eql(u8, arg, "--continue-recovery")) {
@@ -3703,7 +4229,7 @@ fn emitHeadlessYoloWarning(alloc: Allocator, options: RunOptions) !void {
             var message: std.Io.Writer.Allocating = .init(alloc);
             defer message.deinit();
             try message.writer.print(
-                "fx ask: failed to save YOLO acknowledgment: {s}\n",
+                "fx ask: failed to save full access acknowledgment: {s}\n",
                 .{@errorName(failure.err)},
             );
             try options.deps.write_stderr(options.deps.stderr_ctx, message.written());
@@ -3810,6 +4336,12 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     try out.writer.print(",\"exit_code\":{d}", .{result.exit_code});
     try out.writer.writeAll(",\"model\":");
     try std.json.Stringify.value(result.model, .{}, &out.writer);
+    try out.writer.writeAll(",\"resolved_provider\":");
+    if (result.resolved_provider.len > 0) {
+        try std.json.Stringify.value(result.resolved_provider, .{}, &out.writer);
+    } else {
+        try out.writer.writeAll("null");
+    }
     try out.writer.writeAll(",\"session_id\":");
     try std.json.Stringify.value(result.session_id, .{}, &out.writer);
     try out.writer.print(",\"steps\":{d}", .{result.step_count});
@@ -3859,7 +4391,11 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         }
         try out.writer.writeAll("}");
     }
-    try out.writer.writeAll("]");
+    try out.writer.writeAll("],\"usage\":");
+    try std.json.Stringify.value(.{
+        .input_tokens = result.usage.input_tokens,
+        .output_tokens = result.usage.output_tokens,
+    }, .{}, &out.writer);
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);
@@ -3872,7 +4408,12 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         try out.writer.writeAll(",\"recovery\":{\"state\":");
         try std.json.Stringify.value(
-            if (recovery.kind == .terminal_provider_error) "paused" else if (recovery.isRecovered()) "recovered" else "active",
+            if (recovery.kind == .terminal_provider_error)
+                // A genuine lifecycle pause (action == .paused) is resumable; a
+                // terminal stop (no action) is not. JSON consumers need the
+                // distinction.
+                if (recovery.action == .paused) "paused" else "failed"
+            else if (recovery.isRecovered()) "recovered" else "active",
             .{},
             &out.writer,
         );
@@ -3904,13 +4445,11 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
 }
 
 fn renderErrorJsonResult(alloc: Allocator, err_name: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-
-    try out.writer.writeAll("{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":");
-    try std.json.Stringify.value(err_name, .{}, &out.writer);
-    try out.writer.writeAll("}\n");
-    return try out.toOwnedSlice();
+    return renderFinalJsonResult(alloc, .{
+        .exit_code = 1,
+        .assistant_output = &.{},
+        .error_code = err_name,
+    });
 }
 
 fn toCoreReasoningEffort(effort: types.ReasoningEffort) types.ReasoningEffort {
@@ -3929,19 +4468,41 @@ fn takeCorePermissionRules(_: Allocator, startup: *app_lifecycle.StartupState) !
     return startup.takePermissionRules();
 }
 
+/// Theme selection mirrors the interactive bootstrap: FX_THEME wins over the
+/// settings "theme" key. light/dark pin the builtin variant immediately; a
+/// named theme records its source so the presentation layer can resolve it
+/// once terminal detection picks the variant.
+fn applyAskThemeChoice(settings_theme: ?[]const u8) void {
+    var configured: ?[]const u8 = settings_theme;
+    if (io_mod.getenv("FX_THEME")) |value| {
+        if (value.len > 0) configured = value;
+    }
+    const choice = if (configured) |value| shared_theme.classifyValue(value) else null;
+    if (choice) |selected| switch (selected) {
+        .pin_light, .pin_dark => {
+            shared_theme.setSource(null, true);
+            ui_render.initTheme(selected == .pin_light, null);
+        },
+        .custom => |name| shared_theme.setSource(name, false),
+    };
+}
+
 fn loadStartupStateDefault(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
+    model_override: ?[]const u8,
 ) !app_lifecycle.StartupState {
-    return app_lifecycle.loadStartupState(
+    return app_lifecycle.loadStartupStateForRun(
         alloc,
         transport,
         secret_store,
         default_model,
         default_agent_step_limit,
+        .local,
+        model_override,
     );
 }
 
@@ -4118,7 +4679,7 @@ fn testModelPromptOverlay(model: []const u8) ?[]const u8 {
 
 fn testConfig() Config {
     return .{
-        .command_usage = "ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
+        .command_usage = "ask [--auto|--full-access] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
         .default_model = "model",
         .default_agent_step_limit = 4,
         .gateway_retry_count = 1,
@@ -4145,7 +4706,7 @@ fn testConfig() Config {
     };
 }
 
-fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
@@ -4154,7 +4715,7 @@ fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     return state;
 }
 
-fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
@@ -4167,14 +4728,14 @@ fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     return state;
 }
 
-fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     state.yolo_acknowledged = true;
     return state;
 }
 
-fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     errdefer state.deinit(alloc);
     state.config_diagnostics = try alloc.alloc(config_runtime.ConfigDiagnostic, 1);
     state.config_diagnostics[0] = .{
@@ -4184,8 +4745,8 @@ fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.
     return state;
 }
 
-fn testPresentKeySavedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testPresentKeySavedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     errdefer state.deinit(alloc);
     state.configured_model = try alloc.dupe(u8, default_model);
     return state;
@@ -4242,6 +4803,10 @@ fn testProcessQueuedPromptPartialThenReadFailed(_: *agent_runtime.Agent, deps: *
 }
 
 fn testProcessQueuedPromptRepeatsSkillDiagnostic(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+    try std.testing.expectEqual(@as(usize, 1), cfg.skill_catalog.skills.len);
+    try std.testing.expectEqualStrings("visible", cfg.skill_catalog.skills[0].name);
+    try std.testing.expectEqual(@as(usize, 1), cfg.skill_catalog.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.context_limits.skill_catalog_bytes.effectiveBytes());
     const diagnostics = [_]skill_runtime.SkillDiagnostic{.{
         .path = "/tmp/bad-skill/SKILL.md",
         .source = .workspace_shared,
@@ -4251,6 +4816,7 @@ fn testProcessQueuedPromptRepeatsSkillDiagnostic(agent: *agent_runtime.Agent, de
     var notice: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer notice.deinit();
     try skill_runtime.writeDiagnosticSummary(std.testing.allocator, &notice.writer, &diagnostics);
+    try deps.push_context_notice.?(deps.ctx, notice.written());
     try deps.push_context_notice.?(deps.ctx, notice.written());
     try testProcessQueuedPrompt(agent, deps, semantic_presentation, lifecycle, cfg, job);
 }
@@ -4403,9 +4969,9 @@ var test_initialize_session_store_calls: usize = 0;
 var test_image_preflight_startup_calls: usize = 0;
 var test_image_preflight_process_calls: usize = 0;
 
-fn testCountImagePreflightStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+fn testCountImagePreflightStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
     test_image_preflight_startup_calls += 1;
-    return testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+    return testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
 }
 
 fn testCountImagePreflightProcess(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
@@ -4509,8 +5075,8 @@ fn testLoadTruncatedSkillsWithDiagnostic(
     };
 }
 
-fn testPresentKeyTruncatedSkillCatalogStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testPresentKeyNoContextStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testPresentKeyTruncatedSkillCatalogStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testPresentKeyNoContextStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     state.context_limits.skill_catalog_bytes = .{
         .value = .{ .bytes = 0 },
         .source = .command_line,
@@ -4653,7 +5219,7 @@ const TestContextRegistryFixture = struct {
         defer messages.deinit(arena);
 
         const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-        try append_static(deps.ctx, arena, &messages);
+        try append_static(deps.ctx, arena, null, &messages);
         try deps.append_runtime_context(deps.ctx, arena, &messages);
         try std.testing.expectEqual(
             ctx.permission_mode,
@@ -4683,8 +5249,8 @@ const test_cli_context_registry = context_contract.Registry{ .default_provider =
     .append_transient_fn = TestContextRegistryFixture.appendTransient,
 } };
 
-fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     state.context_enabled = false;
     return state;
 }
@@ -4733,49 +5299,6 @@ fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []co
     return rules;
 }
 
-fn testPermissionRuleSetPair(
-    alloc: Allocator,
-    permission: []const u8,
-    first_pattern: []const u8,
-    first_action: types.PermissionAction,
-    second_pattern: []const u8,
-    second_action: types.PermissionAction,
-) !types.PermissionRuleSet {
-    const entries = [_]struct {
-        pattern: []const u8,
-        action: types.PermissionAction,
-    }{
-        .{ .pattern = first_pattern, .action = first_action },
-        .{ .pattern = second_pattern, .action = second_action },
-    };
-    var rules: types.PermissionRuleSet = .{
-        .rules = try alloc.alloc(types.PermissionRule, entries.len),
-    };
-    errdefer alloc.free(rules.rules);
-    var initialized: usize = 0;
-    errdefer {
-        for (rules.rules[0..initialized]) |rule| {
-            alloc.free(rule.permission);
-            alloc.free(rule.pattern);
-        }
-    }
-
-    for (entries, 0..) |entry, index| {
-        const owned_permission = try alloc.dupe(u8, permission);
-        const owned_pattern = alloc.dupe(u8, entry.pattern) catch |err| {
-            alloc.free(owned_permission);
-            return err;
-        };
-        rules.rules[index] = .{
-            .permission = owned_permission,
-            .pattern = owned_pattern,
-            .action = entry.action,
-        };
-        initialized += 1;
-    }
-    return rules;
-}
-
 test "CLI lifecycle action preserves dynamic MCP availability boundaries" {
     const Fixture = struct {
         calls: usize = 0,
@@ -4812,6 +5335,7 @@ test "CLI lifecycle dynamic MCP capability preserves its callback context" {
     var mcp = mcp_runtime.McpRuntime.init(std.testing.allocator);
     defer mcp.deinit();
     ctx.mcp = &mcp;
+    ctx.mcp_host = null;
 
     const capability = lifecycleDynamicMcpAvailability(&ctx);
 
@@ -4909,7 +5433,7 @@ test "Ask MCP adapters revalidate scoped authority before catalog access" {
     provider.calls = 0;
     try std.testing.expectError(
         error.McpAuthorityChanged,
-        mcpToolSchemaJson(@ptrCast(&ctx), alloc, "mcp_fixture_echo", .{}, .{}, access),
+        mcpToolSchemaJson(@ptrCast(&ctx), alloc, "mcp_fixture_echo", .{}, .{}, access, null),
     );
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
 }
@@ -4984,7 +5508,7 @@ test "CLI prompt projection configures web search then blocks native execution" 
     defer messages.deinit(arena);
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-    try append_static(deps.ctx, arena, &messages);
+    try append_static(deps.ctx, arena, null, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.api_key);
@@ -5169,23 +5693,123 @@ test "parse options preserves active ask flags and operands" {
     try std.testing.expectEqualStrings("hello world", options.prompt);
 }
 
-test "parse options accepts yolo and rejects permission flag conflicts" {
-    var yolo = try parseOptionsWithStdin(
-        std.testing.allocator,
-        &.{ "--yolo", "hello" },
-        .tty,
-    );
-    defer yolo.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(?PermissionMode, .yolo), yolo.permission_override);
+test "parse options accepts full access aliases and rejects permission flag conflicts" {
+    const alloc = std.testing.allocator;
+    const aliases = [_][:0]const u8{ "--full-access", "--yolo" };
+    for (aliases) |alias| {
+        var options = try parseOptionsWithStdin(alloc, &.{ alias, "hello" }, .tty);
+        defer options.deinit(alloc);
+        try std.testing.expectEqual(@as(?PermissionMode, .yolo), options.permission_override);
+        try std.testing.expectEqualStrings("hello", options.prompt);
+    }
 
-    try std.testing.expectError(
-        error.InvalidAskArgs,
-        parseOptionsWithStdin(
-            std.testing.allocator,
-            &.{ "--auto", "--yolo", "hello" },
-            .tty,
-        ),
-    );
+    const permission_flags = [_][:0]const u8{ "--auto", "--full-access", "--yolo" };
+    for (permission_flags) |first| {
+        for (permission_flags) |second| {
+            try std.testing.expectError(
+                error.InvalidAskArgs,
+                parseOptionsWithStdin(alloc, &.{ first, second, "hello" }, .tty),
+            );
+        }
+    }
+}
+
+test "parse options preserves full access aliases after the delimiter as prompt text" {
+    const alloc = std.testing.allocator;
+    var literal = try parseOptionsWithStdin(alloc, &.{ "--", "--full-access", "--yolo", "--auto" }, .tty);
+    defer literal.deinit(alloc);
+    try std.testing.expectEqual(@as(?PermissionMode, null), literal.permission_override);
+    try std.testing.expectEqualStrings("--full-access --yolo --auto", literal.prompt);
+
+    const cases = [_]struct {
+        flag: [:0]const u8,
+        mode: PermissionMode,
+    }{
+        .{ .flag = "--auto", .mode = .auto },
+        .{ .flag = "--full-access", .mode = .yolo },
+        .{ .flag = "--yolo", .mode = .yolo },
+    };
+    for (cases) |case| {
+        var options = try parseOptionsWithStdin(alloc, &.{ case.flag, "--", "--full-access", "--yolo", "--auto" }, .tty);
+        defer options.deinit(alloc);
+        try std.testing.expectEqual(@as(?PermissionMode, case.mode), options.permission_override);
+        try std.testing.expectEqualStrings("--full-access --yolo --auto", options.prompt);
+    }
+}
+
+test "parse options preserves model effort and fast overrides" {
+    const alloc = std.testing.allocator;
+    var options = try parseOptionsWithStdin(alloc, &.{
+        "--model",
+        "provider/override-model",
+        "--effort",
+        "high",
+        "--fast",
+        "hello",
+    }, .tty);
+    defer options.deinit(alloc);
+
+    try std.testing.expectEqualStrings("provider/override-model", options.model_override.?);
+    try std.testing.expect(options.effort_override.?.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expectEqual(@as(?bool, true), options.fast_override);
+    try std.testing.expectEqualStrings("hello", options.prompt);
+
+    var off = try parseOptionsWithStdin(alloc, &.{ "--no-fast", "hello" }, .tty);
+    defer off.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, false), off.fast_override);
+
+    var defaulted = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
+    defer defaulted.deinit(alloc);
+    try std.testing.expectEqual(@as(?[]u8, null), defaulted.model_override);
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), defaulted.effort_override);
+    try std.testing.expectEqual(@as(?bool, null), defaulted.fast_override);
+
+    var last_model = try parseOptionsWithStdin(alloc, &.{ "--model", "first/model", "--model", "second/model", "hello" }, .tty);
+    defer last_model.deinit(alloc);
+    try std.testing.expectEqualStrings("second/model", last_model.model_override.?);
+}
+
+test "parse options accepts provider routing flags and rejects malformed values" {
+    const alloc = std.testing.allocator;
+
+    var options = try parseOptionsWithStdin(alloc, &.{ "--provider-order", "azure,anthropic", "--provider-strict", "hello" }, .tty);
+    defer options.deinit(alloc);
+    const order = options.provider_order_override.?;
+    try std.testing.expectEqual(@as(usize, 2), order.len);
+    try std.testing.expectEqualStrings("azure", order[0]);
+    try std.testing.expectEqualStrings("anthropic", order[1]);
+    try std.testing.expectEqual(@as(?bool, true), options.provider_strict_override);
+    try std.testing.expectEqualStrings("hello", options.prompt);
+
+    var equals_form = try parseOptionsWithStdin(alloc, &.{ "--provider-order=bedrock", "--no-provider-strict", "hello" }, .tty);
+    defer equals_form.deinit(alloc);
+    try std.testing.expectEqualStrings("bedrock", equals_form.provider_order_override.?[0]);
+    try std.testing.expectEqual(@as(?bool, false), equals_form.provider_strict_override);
+
+    var defaulted = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
+    defer defaulted.deinit(alloc);
+    try std.testing.expectEqual(@as(?[][]const u8, null), defaulted.provider_order_override);
+    try std.testing.expectEqual(@as(?bool, null), defaulted.provider_strict_override);
+
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"--provider-order"}, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--provider-order=Bad Slug", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--provider-strict", "--no-provider-strict", "hello" }, .tty));
+}
+
+test "parse options rejects invalid model effort and fast flag forms" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"--model"}, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--model", "  ", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"--effort"}, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--effort", "not an effort", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--fast", "--no-fast", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--no-fast", "--fast", "hello" }, .tty));
+
+    var literal = try parseOptionsWithStdin(alloc, &.{ "--", "--model", "--fast" }, .tty);
+    defer literal.deinit(alloc);
+    try std.testing.expectEqual(@as(?[]u8, null), literal.model_override);
+    try std.testing.expectEqual(@as(?bool, null), literal.fast_override);
+    try std.testing.expectEqualStrings("--model --fast", literal.prompt);
 }
 
 test "headless yolo warning reaches stderr before acknowledgment persistence" {
@@ -5347,9 +5971,9 @@ test "runWithDeps reports a missing image before startup after cleaning prior at
     }
     const valid_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "valid.png");
     defer alloc.free(valid_path);
-    const valid_path_z = try alloc.dupeZ(u8, valid_path);
+    const valid_path_z = try alloc.dupeSentinel(u8, valid_path, 0);
     defer alloc.free(valid_path_z);
-    const missing_path_z = try alloc.dupeZ(u8, "/tmp/fx-ask-missing-image.png");
+    const missing_path_z = try alloc.dupeSentinel(u8, "/tmp/fx-ask-missing-image.png", 0);
     defer alloc.free(missing_path_z);
 
     var stdout_capture: TestCapture = .{};
@@ -5387,7 +6011,7 @@ test "runWithDeps reports unsupported images in JSON before startup" {
     }
     const invalid_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "not-image.txt");
     defer alloc.free(invalid_path);
-    const invalid_path_z = try alloc.dupeZ(u8, invalid_path);
+    const invalid_path_z = try alloc.dupeSentinel(u8, invalid_path, 0);
     defer alloc.free(invalid_path_z);
 
     var stdout_capture: TestCapture = .{};
@@ -5426,7 +6050,7 @@ test "runWithDeps assigns image ids and owns the authorized catalog before proce
     }
     const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "valid.png");
     defer alloc.free(image_path);
-    const image_path_z = try alloc.dupeZ(u8, image_path);
+    const image_path_z = try alloc.dupeSentinel(u8, image_path, 0);
     defer alloc.free(image_path_z);
 
     var stdout_capture: TestCapture = .{};
@@ -5455,7 +6079,7 @@ test "runWithDeps assigns image ids and owns the authorized catalog before proce
     );
     try std.testing.expectError(
         error.FileNotFound,
-        std.Io.Dir.openDirAbsolute(std.testing.io, std.fs.path.dirname(snapshot_path).?, .{}),
+        std.Io.Dir.openDirAbsolute(std.testing.io, std.Io.Dir.path.dirname(snapshot_path).?, .{}),
     );
 }
 
@@ -5537,7 +6161,7 @@ test "stdin prompt resource limit accepts exact bytes and rejects one over witho
 
 test "stdin prompt reader propagates allocation failure" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var reader = std.Io.Reader.fixed("prompt");
@@ -5552,14 +6176,14 @@ test "stdin prompt errors keep exact structured names" {
     const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded");
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptResourceLimitExceeded\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
         overflow,
     );
 
     const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed");
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
         read_failure,
     );
 }
@@ -5576,7 +6200,7 @@ test "image preparation failure has stable text and JSON contracts" {
     const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed));
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
         json,
     );
 }
@@ -5594,7 +6218,7 @@ test "unresolved image capability has actionable text and stable JSON code" {
     );
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ModelImageCapabilityUnavailable\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\"}\n",
         json,
     );
 }
@@ -5625,7 +6249,7 @@ test "stdin read failure has distinct text and JSON output contracts" {
         try runWithDeps(alloc, &.{"--json"}, testConfig(), deps),
     );
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
         stdout_capture.bytes.items,
     );
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
@@ -5760,17 +6384,7 @@ test "fx ask automatic review observes worker cancellation" {
     var review_turn = TestReviewTurn.init("Create cancelled.txt.", call);
     try std.testing.expectError(
         error.Cancelled,
-        requestToolPermissionOutcomeWithRequest(
-            &ctx,
-            arena_state.allocator(),
-            call,
-            review_turn.context(),
-            .auto,
-            &.{},
-            null,
-            null,
-            &.{},
-        ),
+        requestToolPermissionOutcomeWithRequest(&ctx, arena_state.allocator(), call, review_turn.context(), .auto, &.{}, null, null, &.{}, null),
     );
 }
 
@@ -5845,6 +6459,7 @@ fn testLoadStartupStateWithCancellation(
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
+    _: ?[]const u8,
 ) !app_lifecycle.StartupState {
     const state = try testPresentKeyStartup(
         alloc,
@@ -5852,6 +6467,7 @@ fn testLoadStartupStateWithCancellation(
         secret_store,
         default_model,
         default_agent_step_limit,
+        null,
     );
     if (test_startup_cancellation_stage == .after_startup_state) {
         requestTestHeadlessInterrupt();
@@ -6267,17 +6883,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
     };
     var direct_review = TestReviewTurn.init("Inspect the workspace.", direct_call);
-    const direct = try requestToolPermissionOutcomeWithRequest(
-        &ctx,
-        arena,
-        direct_call,
-        direct_review.context(),
-        .auto,
-        &.{},
-        null,
-        null,
-        &.{},
-    );
+    const direct = try requestToolPermissionOutcomeWithRequest(&ctx, arena, direct_call, direct_review.context(), .auto, &.{}, null, null, &.{}, null);
     try std.testing.expectEqual(
         command_admission.ShellAuthorizationSource.auto_classifier,
         direct.execution_authority.?.run_command.shell_allowed.source,
@@ -6290,17 +6896,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"touch accepted.txt\"}",
     };
     var accepted_review = TestReviewTurn.init("Create accepted.txt.", accepted_call);
-    const accepted = try requestToolPermissionOutcomeWithRequest(
-        &ctx,
-        arena,
-        accepted_call,
-        accepted_review.context(),
-        .auto,
-        &.{},
-        null,
-        null,
-        &.{},
-    );
+    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, accepted_call, accepted_review.context(), .auto, &.{}, null, null, &.{}, null);
     switch ((accepted.execution_authority orelse return error.TestExpectedEqual).run_command) {
         .direct_only => return error.TestExpectedShellAllowed,
         .shell_allowed => |authority| try std.testing.expectEqual(
@@ -6317,17 +6913,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"touch check.txt\"}",
     };
     var check_review = TestReviewTurn.init("Check this command.", check_call);
-    const blocked = try requestToolPermissionOutcomeWithRequest(
-        &ctx,
-        arena,
-        check_call,
-        check_review.context(),
-        .auto,
-        &.{},
-        null,
-        null,
-        &.{},
-    );
+    const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, check_call, check_review.context(), .auto, &.{}, null, null, &.{}, null);
     try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
     try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, blocked.denial_reason.?);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
@@ -6655,12 +7241,11 @@ test "fx ask prepared file mutation callback preserves terminal permission promp
     var ctx = AskContext.init(alloc, testConfig(), deps, workspace);
     defer ctx.deinit();
 
-    const target_path = try std.fs.path.join(arena, &.{ external, "desktop-test.txt" });
+    const target_path = try std.Io.Dir.path.join(arena, &.{ external, "desktop-test.txt" });
     const call: ToolCall = .{
         .id = "external-write",
         .name = "write_file",
-        .arguments_json = try std.fmt.allocPrint(
-            arena,
+        .arguments_json = try arena.print(
             "{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}",
             .{target_path},
         ),
@@ -6670,6 +7255,7 @@ test "fx ask prepared file mutation callback preserves terminal permission promp
         .workspace_root = workspace,
     })) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer prepared.deinit(arena);
@@ -6752,9 +7338,8 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
         FakeClassifier.classify,
     );
 
-    const target_path = try std.fs.path.join(arena, &.{ external, "desktop-test.txt" });
-    const arguments_json = try std.fmt.allocPrint(
-        arena,
+    const target_path = try std.Io.Dir.path.join(arena, &.{ external, "desktop-test.txt" });
+    const arguments_json = try arena.print(
         "{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}",
         .{target_path},
     );
@@ -6764,7 +7349,7 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
         .arguments_json = arguments_json,
     };
     var review_turn = TestReviewTurn.init("Write hello to desktop-test.txt.", call);
-    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, call, review_turn.context(), .auto, &.{}, null, null, &.{});
+    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, call, review_turn.context(), .auto, &.{}, null, null, &.{}, null);
 
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqualStrings("", fake.root_text);
@@ -6814,8 +7399,7 @@ test "fx ask preserves CLI headless blocker diagnostics" {
         &.{},
         &.{},
     ));
-    const expected_configured_stderr = try std.fmt.allocPrint(
-        arena,
+    const expected_configured_stderr = try arena.print(
         "fx ask: permission required by configured rule\n" ++
             "fx ask: blocked action: {s}\n" ++
             "fx ask: reason=noninteractive_permission_prompt_unavailable\n" ++
@@ -6844,8 +7428,7 @@ test "fx ask preserves CLI headless blocker diagnostics" {
         &.{},
         &.{},
     ));
-    const expected_approval_stderr = try std.fmt.allocPrint(
-        arena,
+    const expected_approval_stderr = try arena.print(
         "fx ask: permission required for tool execution in noninteractive mode\n" ++
             "fx ask: blocked action: {s}\n" ++
             "fx ask: reason=noninteractive_permission_prompt_unavailable\n" ++
@@ -6967,6 +7550,34 @@ test "final ask json keeps shell tool call shape and adds command result" {
     try std.testing.expectEqual(@as(i64, 2), command_result.get("stdout_bytes").?.integer);
 }
 
+test "final ask json reports the resolved provider or null" {
+    const alloc = std.testing.allocator;
+
+    const routed = PromptRunResult{
+        .exit_code = 0,
+        .assistant_output = try alloc.dupe(u8, "ok"),
+        .model = try alloc.dupe(u8, "anthropic/claude-sonnet-5"),
+        .resolved_provider = try alloc.dupe(u8, "bedrock"),
+    };
+    defer routed.deinit(alloc);
+    const routed_json = try renderFinalJsonResult(alloc, routed);
+    defer alloc.free(routed_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, routed_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("bedrock", parsed.value.object.get("resolved_provider").?.string);
+
+    const unrouted = PromptRunResult{
+        .exit_code = 0,
+        .assistant_output = try alloc.dupe(u8, "ok"),
+    };
+    defer unrouted.deinit(alloc);
+    const unrouted_json = try renderFinalJsonResult(alloc, unrouted);
+    defer alloc.free(unrouted_json);
+    var parsed_unrouted = try std.json.parseFromSlice(std.json.Value, alloc, unrouted_json, .{});
+    defer parsed_unrouted.deinit();
+    try std.testing.expect(parsed_unrouted.value.object.get("resolved_provider").? == .null);
+}
+
 test "runWithDeps honors no-save by skipping ask session stores" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
@@ -7019,7 +7630,7 @@ test "runWithDeps retains full terminal projection with saved capability" {
 
 test "exec-only terminal projection propagates view allocation failure" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -7184,12 +7795,11 @@ fn exerciseSavedAskSessionStoreAllocation(
     defer stdout_capture.deinit(setup_alloc);
     var stderr_capture: TestCapture = .{};
     defer stderr_capture.deinit(setup_alloc);
-    var deps = testPromptRunDeps(
+    const deps = testPromptRunDeps(
         &stdout_capture,
         &stderr_capture,
         testPresentKeyStartup,
     );
-    deps.start_subagent_background_recovery = false;
     var ctx = AskContext.init(
         alloc,
         testConfig(),
@@ -7207,7 +7817,7 @@ fn exerciseSavedAskSessionStoreAllocation(
 }
 
 test "saved ask allocation failures keep managed borrows owned" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var counting = std.testing.FailingAllocator.init(backing, .{});
     try exerciseSavedAskSessionStoreAllocation(counting.allocator(), false);
 
@@ -7225,93 +7835,6 @@ test "saved ask allocation failures keep managed borrows owned" {
                 .{ fail_index, @errorName(err) },
             );
             return err;
-        };
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(
-            failing.allocated_bytes,
-            failing.freed_bytes,
-        );
-    }
-}
-
-fn exerciseCurrentAskStateAllocation(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-    alloc: Allocator,
-) !void {
-    const previous_alloc = ctx.alloc;
-    ctx.alloc = alloc;
-    defer ctx.alloc = previous_alloc;
-
-    var state = try currentAskState(ctx, writable, io_mod.milliTimestamp());
-    defer state.deinit(alloc);
-}
-
-test "current ask state releases partial snapshots on allocation failure" {
-    const setup_alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home = try io_mod.dirRealpathAlloc(setup_alloc, tmp.dir, "home");
-    defer setup_alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        setup_alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer setup_alloc.free(workspace);
-    const test_home = try TestAskHome.install(setup_alloc, home);
-    defer test_home.deinit();
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(setup_alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(setup_alloc);
-    var ctx = AskContext.init(
-        setup_alloc,
-        testConfig(),
-        testPromptRunDeps(
-            &stdout_capture,
-            &stderr_capture,
-            testPresentKeyStartup,
-        ),
-        workspace,
-    );
-    defer ctx.deinit();
-    try ctx.initializeSessionStores();
-    try ctx.session.appendAssistantHistoryTurn(
-        setup_alloc,
-        "question",
-        "answer",
-    );
-    const sequence = try ctx.session.usage.reserveInvocation();
-    try ctx.session.usage.finishObservedInvocation(
-        setup_alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    const writable = &ctx.writable.?;
-
-    var counting = std.testing.FailingAllocator.init(setup_alloc, .{});
-    try exerciseCurrentAskStateAllocation(&ctx, writable, counting.allocator());
-
-    for (0..counting.alloc_index) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(
-            setup_alloc,
-            .{ .fail_index = fail_index },
-        );
-        exerciseCurrentAskStateAllocation(
-            &ctx,
-            writable,
-            failing.allocator(),
-        ) catch |err| {
-            if (err != error.OutOfMemory) return err;
         };
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(
@@ -7385,7 +7908,7 @@ test "saved ask classifies unsafe store failure by request mode" {
 }
 
 test "saved ask propagates store allocation failure" {
-    const setup_alloc = std.testing.allocator;
+    const setup_alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home");
@@ -7463,7 +7986,6 @@ test "saved ask initializes the direct subagent host" {
     try std.testing.expect(deps.prepare_parent_turn_context == null);
     try std.testing.expect(deps.acknowledge_parent_turn_context == null);
     try std.testing.expect(ctx.writable != null);
-    try std.testing.expect(ctx.writable.?.state.usage != null);
 
     var store = try session_store.Store.initFromHome(alloc, home, workspace);
     defer store.deinit(alloc);
@@ -7510,116 +8032,6 @@ test "headless ask overwrites session usage from latest completion" {
     try std.testing.expectEqual(@as(u64, 23), ctx.writable.?.state.total_output_tokens);
 }
 
-test "saved ask settles profile publication before persistence teardown" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const test_home = try TestAskHome.install(alloc, home);
-    defer test_home.deinit();
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(alloc);
-    var ctx = AskContext.init(
-        alloc,
-        testConfig(),
-        testPromptRunDeps(
-            &stdout_capture,
-            &stderr_capture,
-            testPresentKeyStartup,
-        ),
-        workspace,
-    );
-    var ctx_live = true;
-    defer if (ctx_live) ctx.deinit();
-    try ctx.initializeSessionStores();
-    _ = agentRuntimeDeps(&ctx);
-
-    const PublicationProbe = struct {
-        allow_generation: bool = false,
-        successful_generations: usize = 0,
-
-        fn publish(
-            raw: *anyopaque,
-            event: usage_report.ProfileEvent,
-        ) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            switch (event) {
-                .generation => {
-                    if (!self.allow_generation) {
-                        return error.InjectedPublicationFailure;
-                    }
-                    self.successful_generations += 1;
-                },
-                .pending, .incident => {},
-            }
-        }
-    };
-    var publication: PublicationProbe = .{};
-    ctx.session.usage.configurePublicationSink(.{
-        .context = &publication,
-        .allocator = alloc,
-        .publish = PublicationProbe.publish,
-    });
-
-    const generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV";
-    const sequence = try ctx.session.usage.reserveInvocation();
-    try ctx.session.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        generation_id,
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    try ctx.session.usage.applyGeneration(alloc, .{
-        .id = generation_id,
-        .created_at_ms = 1,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-    var pending = try ctx.session.usage.snapshot(alloc);
-    defer pending.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), pending.pending.len);
-    try std.testing.expectEqual(@as(usize, 1), pending.publication_backlog.len);
-
-    publication.allow_generation = true;
-    ctx.deinit();
-    ctx_live = false;
-    try std.testing.expectEqual(@as(usize, 1), publication.successful_generations);
-
-    var store = try session_store.Store.initFromHome(alloc, home, workspace);
-    defer store.deinit(alloc);
-    var resumed = try store.resumeTargetForWrite(
-        alloc,
-        .last,
-        workspace,
-        .{},
-    );
-    defer resumed.deinit(alloc);
-    const usage = resumed.state.usage orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(session_usage.Availability.complete, usage.billing);
-    try std.testing.expectEqual(@as(usize, 0), usage.pending.len);
-    try std.testing.expectEqual(@as(usize, 0), usage.publication_backlog.len);
-    try std.testing.expectEqual(@as(u64, 10), usage.input_tokens);
-    try std.testing.expectEqual(@as(u64, 2), usage.output_tokens);
-}
-
 test "saved ask ignores existing legacy task files" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7649,7 +8061,7 @@ test "saved ask ignores existing legacy task files" {
         session_id,
     );
     defer alloc.free(session_dir);
-    const tasks_path = try std.fs.path.join(alloc, &.{ session_dir, "tasks" });
+    const tasks_path = try std.Io.Dir.path.join(alloc, &.{ session_dir, "tasks" });
     defer alloc.free(tasks_path);
     var tasks_file = try std.Io.Dir.createFileAbsolute(
         io_mod.getIo(),
@@ -7771,6 +8183,58 @@ test "parse options rejects repeated resume targets and no-save resume" {
     );
 }
 
+test "ask usage survives normal and typed error result capture" {
+    const alloc = std.testing.allocator;
+    const Outcome = enum { success, read_failed, permission_required };
+    inline for (std.meta.tags(Outcome)) |outcome| {
+        const Process = struct {
+            fn run(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+                agent.startTurn();
+                agent.observeUsage(.{ .input_tokens = 10, .output_tokens = 20 });
+                agent.observeUsage(.{ .input_tokens = 7, .output_tokens = 3 });
+                try testPushAssistantText(deps, "reported usage");
+                if (std.mem.eql(u8, job.prompt, "read_failed")) return error.ReadFailed;
+                if (std.mem.eql(u8, job.prompt, "permission_required")) return error.NonInteractivePermissionRequired;
+            }
+        };
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var deps = testPromptRunDepsWithProcess(&stdout_capture, &stderr_capture, Process.run);
+        deps.stdout_is_tty = TestTty.no;
+        const exit_code = try runWithDeps(alloc, &.{ "--json", "--no-save", @tagName(outcome) }, testConfig(), deps);
+        try std.testing.expectEqual(@as(u8, if (outcome == .success) 0 else 1), exit_code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+        defer parsed.deinit();
+        const usage = parsed.value.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 17), usage.get("input_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 23), usage.get("output_tokens").?.integer);
+        try std.testing.expectEqualStrings("reported usage", parsed.value.object.get("output").?.string);
+        try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+        switch (outcome) {
+            .success => try std.testing.expect(parsed.value.object.get("error") == null),
+            .read_failed => try std.testing.expectEqualStrings("ReadFailed", parsed.value.object.get("error").?.string),
+            .permission_required => try std.testing.expectEqualStrings("NonInteractivePermissionRequired", parsed.value.object.get("error").?.string),
+        }
+    }
+}
+
+test "ask usage JSON distinguishes unavailable totals from reported zero" {
+    const alloc = std.testing.allocator;
+    const json = try renderFinalJsonResult(alloc, .{
+        .exit_code = 0,
+        .assistant_output = &.{},
+        .usage = .{ .input_tokens = 0 },
+    });
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const usage = parsed.value.object.get("usage").?.object;
+    try std.testing.expectEqual(@as(i64, 0), usage.get("input_tokens").?.integer);
+    try std.testing.expect(usage.get("output_tokens").? == .null);
+}
+
 test "render final JSON preserves shape escaping order and newline" {
     const alloc = std.testing.allocator;
     const tool_calls = try alloc.alloc(ToolCallRecord, 1);
@@ -7792,7 +8256,7 @@ test "render final JSON preserves shape escaping order and newline" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}]}\n",
+        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"resolved_provider\":null,\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
         json,
     );
 }
@@ -7809,7 +8273,7 @@ test "render final JSON emits empty tool call array" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
         json,
     );
 }
@@ -7835,7 +8299,7 @@ test "render final JSON reports the successful recovery attempt" {
     try std.testing.expectEqual(@as(i64, 3), recovery.get("attempt").?.integer);
     try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
     try std.testing.expectEqualStrings(
-        "✓ recovered · succeeded on attempt 3/10",
+        "✓ recovered · succeeded on attempt 3",
         recovery.get("message").?.string,
     );
     try std.testing.expect(std.mem.find(u8, recovery.get("message").?.string, "provider_error") == null);
@@ -7863,9 +8327,9 @@ test "render final JSON includes the latest terminal recovery diagnostic" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     const recovery = parsed.value.object.get("recovery").?.object;
-    try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+    try std.testing.expectEqualStrings("failed", recovery.get("state").?.string);
     try std.testing.expectEqualStrings(
-        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · recovery paused after 2/2 attempts",
+        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · stopped after 2 attempts",
         recovery.get("message").?.string,
     );
 }
@@ -8430,7 +8894,7 @@ test "shell diagnostic codes remain bounded semantic identifiers" {
 
 test "fx ask JSON permission-denied capture is best effort under allocation failure" {
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var ctx = AskContext.init(
@@ -8595,7 +9059,7 @@ fn checkAskJsonCaptureAllocationFailures(alloc: Allocator) !void {
 
 test "fx ask JSON capture cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAskJsonCaptureAllocationFailures,
         .{},
     );
@@ -8631,8 +9095,7 @@ test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
     @memset(question_bytes[0..255], 'a');
     question_bytes[255] = 0xc3;
     question_bytes[256] = 0xa9;
-    const arguments_json = try std.fmt.allocPrint(
-        alloc,
+    const arguments_json = try alloc.print(
         "{{\"questions\":[{{\"question\":\"{s}\"}}]}}",
         .{question_bytes[0..]},
     );
@@ -8684,9 +9147,105 @@ test "json run with missing API key prints diagnostic then final object" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
     );
+}
+
+test "resumed ask preserves user and image identity after a retained mid-turn checkpoint" {
+    const Process = struct {
+        fn run(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+            if (job.recovery_checkpoint) |checkpoint| {
+                try std.testing.expectEqual(@as(u64, 7), checkpoint.turn_id);
+                try std.testing.expectEqualStrings("original request", job.prompt);
+                try std.testing.expectEqual(@as(usize, 7), job.images[0].id);
+                try std.testing.expectEqual(@as(usize, 1), job.authorized_image_catalog.len);
+                try std.testing.expectEqualStrings(job.images[0].snapshot_sha256.?, job.authorized_image_catalog[0].snapshot_sha256.?);
+            }
+            try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{
+                .user = .{ .text = job.prompt, .images = job.images },
+                .assistant = @constCast("new answer"),
+            } });
+            try testPushAssistantText(deps, "new answer");
+        }
+    };
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { prompt: [:0]const u8, continue_recovery: bool = false }{
+        .{ .prompt = "different request" },
+        .{ .prompt = "original request" },
+        .{ .prompt = "original request", .continue_recovery = true },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(home);
+        const test_home = try TestAskHome.install(alloc, home);
+        defer test_home.deinit();
+        const session_id = "retained-open-session";
+        var store = try session_store.Store.initFromHome(alloc, home, "/tmp/fx-test");
+        defer store.deinit(alloc);
+        var state = try testAskDurableState(alloc, "/tmp/fx-test", session_id);
+        defer state.deinit(alloc);
+        var images = [_]ImageAttachment{.{
+            .id = 7,
+            .path = @constCast("/missing/original.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = @constCast("images/image-7-aaaaaaaaaaaaaaaa.bin"),
+            .snapshot_sha256 = @constCast(text_utils.repeat("a", 64)),
+        }};
+        const old_user = types.UserTurn{
+            .text = @constCast("original request"),
+            .images = if (case.continue_recovery) &images else &.{},
+        };
+        {
+            var writable = try store.startWritableSession(alloc, state);
+            defer writable.deinit(alloc);
+            _ = try writable.commitContextCompaction(alloc, .{
+                .summary = @constCast("<context_handoff>Earlier work completed.</context_handoff>"),
+                .removed_turn_count = 0,
+                .compaction_count = 1,
+            }, .{ .user = old_user, .assistant = @constCast("") }, null, 10);
+            _ = try writable.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = .{
+                .turn_id = 7,
+                .user = old_user,
+                .assistant_source = @constCast("old partial answer"),
+                .cause = .network_interrupted,
+                .action = .paused,
+                .authority = .{ .provider = .gateway, .model = @constCast("model") },
+                .requested_fast_mode = false,
+                .fast_mode = false,
+                .max_provider_attempts = 3,
+                .consumed_provider_attempts = 1,
+            } } }, 20);
+        }
+
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeySavedStartup);
+        deps.initialize_session_stores = initializeSessionStoresDefault;
+        deps.process_queued_prompt = Process.run;
+        const args: []const [:0]const u8 = if (case.continue_recovery)
+            &.{ "--json", "--resume-id", session_id, "--continue-recovery" }
+        else
+            &.{ "--json", "--resume-id", session_id, case.prompt };
+        try std.testing.expectEqual(@as(u8, 0), try runWithDeps(alloc, args, testConfig(), deps));
+
+        var restored = try store.loadReadOnly(alloc, session_id);
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, if (case.continue_recovery) 2 else 3), restored.history.len);
+        if (!case.continue_recovery) {
+            try std.testing.expect(restored.history[1] == .interrupted);
+            try std.testing.expectEqualStrings("original request", restored.history[1].interrupted.user.text);
+            try std.testing.expectEqualStrings("old partial answer", restored.history[1].interrupted.assistant.?);
+        }
+        const last = restored.history[restored.history.len - 1].assistant;
+        try std.testing.expectEqualStrings(case.prompt, last.user.text);
+        try std.testing.expectEqualStrings("new answer", last.assistant);
+        try std.testing.expect(restored.recovery_checkpoint == null);
+    }
 }
 
 test "recovery continuation checks local checkpoint before credentials" {
@@ -8778,7 +9337,7 @@ test "missing API key returns before project context gathering" {
     try std.testing.expectEqual(@as(usize, 0), test_gather_project_context_calls);
 }
 
-test "fx ask emits one discovery warning when catalog truncation and a skill read report it" {
+test "fx ask forwards its catalog and deduplicates repeated discovery warnings" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -8800,7 +9359,6 @@ test "fx ask emits one discovery warning when catalog truncation and a skill rea
         @as(usize, 1),
         std.mem.count(u8, stderr_capture.bytes.items, "skill discovery warning:"),
     );
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "[context] skill catalog omitted 1 entries") != null);
 }
 
 test "fx ask carries resolved auto mode and initial registry context into the queued prompt" {
@@ -8836,7 +9394,7 @@ test "default fx ask passes canonical image paths as initial context targets" {
     }
     const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "target.png");
     defer alloc.free(image_path);
-    const image_path_z = try alloc.dupeZ(u8, image_path);
+    const image_path_z = try alloc.dupeSentinel(u8, image_path, 0);
     defer alloc.free(image_path_z);
 
     var stdout_capture: TestCapture = .{};
@@ -8892,8 +9450,8 @@ test "default fx ask preserves project context gathering error mappings" {
         json: ?[]const u8,
     }{
         .{ .err = error.OutOfMemory, .json = null },
-        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"NoSpaceLeft\"}\n" },
-        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"WriteFailed\"}\n" },
+        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"NoSpaceLeft\"}\n" },
+        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"WriteFailed\"}\n" },
     };
 
     for (cases) |case| {
@@ -8946,8 +9504,8 @@ test "quiet suppresses streaming while quiet json captures final output" {
 
     const json_exit = try runWithDeps(alloc, &.{ "--quiet", "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup));
     try std.testing.expectEqual(@as(u8, 0), json_exit);
-    try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"session_id\":\""));
-    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[]}\n"));
+    try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"resolved_provider\":null,\"session_id\":\""));
+    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n"));
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
@@ -8970,7 +9528,7 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
     try std.testing.expectEqualStrings("assistant text", parsed.value.object.get("output").?.string);
     try std.testing.expect(parsed.value.object.get("recovery") == null);
     try std.testing.expectEqualStrings(
-        "[notice] ⚠ Network interrupted · waiting for connection · attempt 1/10\n",
+        "[notice] ⚠ Network interrupted · waiting for connection\n",
         stderr_capture.bytes.items,
     );
 }
@@ -8992,15 +9550,15 @@ test "fx ask JSON reports the consumed attempt after retry admission failure" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
     defer parsed.deinit();
     const recovery = parsed.value.object.get("recovery").?.object;
-    try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+    try std.testing.expectEqualStrings("failed", recovery.get("state").?.string);
     try std.testing.expectEqual(@as(i64, 1), recovery.get("attempt").?.integer);
     try std.testing.expectEqual(@as(i64, 0), recovery.get("delay_seconds").?.integer);
     try std.testing.expectEqualStrings(
         "TestProviderSerializationFailed",
         parsed.value.object.get("error").?.string,
     );
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s · attempt 1/2") != null);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "recovery paused after 1/2 attempts") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "stopped after 1 attempt") != null);
 }
 
 test "fx ask JSON preserves partial output on prompt failure" {
@@ -9157,6 +9715,71 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
     try std.testing.expectEqualStrings("final answer", parsed.value.object.get("final_output").?.string);
 }
 
+test "CLI response restart preserves completed output and removes only the failed JSON preview" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+    const deps = agentRuntimeDeps(&ctx);
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = "Completed tool commentary." });
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = "DISCARDED partial" });
+    try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart notice\n" });
+    try std.testing.expectEqualStrings("Completed tool commentary.DISCARDED partial", ctx.assistant_output.items);
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement." });
+    try std.testing.expectEqualStrings("Completed tool commentary.\n\nReplacement.", ctx.assistant_output.items);
+    try std.testing.expectEqualStrings("Restart notice\n", stderr_capture.bytes.items);
+    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
+
+    ctx.output_mode = .raw;
+    try deps.push_text(deps.ctx, .{ .assistant_source = "partial" });
+    try deps.push_text(deps.ctx, .{ .assistant_restarted = "\n\nRestart notice\n\n" });
+    try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement." });
+    try std.testing.expectEqualStrings("partial\n\nRestart notice\n\nReplacement.", stdout_capture.bytes.items);
+}
+
+test "CLI keeps an unreplaced preview on failure and discards it on completion" {
+    const alloc = std.testing.allocator;
+    for ([_]types.TurnPresentationOutcome{ .paused, .failed, .interrupted, .completed }) |outcome| {
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var ctx = AskContext.init(
+            alloc,
+            testConfig(),
+            testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+            "/tmp/workspace",
+        );
+        defer ctx.deinit();
+        ctx.output_mode = .json;
+        const deps = agentRuntimeDeps(&ctx);
+        try deps.push_text(deps.ctx, .assistant_started);
+        try deps.push_text(deps.ctx, .{ .assistant_source = "Completed commentary.\n\n" });
+        try deps.push_text(deps.ctx, .assistant_started);
+        try deps.push_text(deps.ctx, .{ .assistant_source = "Retained preview." });
+        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
+        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
+        try deps.finalize_turn(deps.ctx, 1, outcome, null);
+        try std.testing.expectEqualStrings(
+            if (outcome == .completed) "Completed commentary.\n\n" else "Completed commentary.\n\nRetained preview.",
+            ctx.assistant_output.items,
+        );
+        try std.testing.expectEqual(@as(usize, 0), ctx.final_output.items.len);
+    }
+}
+
 test "CLI final output admits only completed assistant finish prompts" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
@@ -9215,7 +9838,57 @@ test "CLI final output admits only completed assistant finish prompts" {
         const owned = try types.dupeFinishedPrompt(std.heap.c_allocator, source);
         try deps.push_event(deps.ctx, .{ .finish_prompt = owned });
         try std.testing.expectEqual(@as(usize, 0), ctx.final_output.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.final_source.items.len);
     }
+}
+
+test "CLI final source keeps only the completed response with its Markdown" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+    const deps = agentRuntimeDeps(&ctx);
+
+    const draft = "Add note probe\n\n## Summary\n\n- Uses **bold** and `inline code`.";
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = "Let me check the note first." });
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = draft });
+    const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast(draft),
+        } },
+        .terminal_outcome = .completed,
+    });
+    try deps.push_event(deps.ctx, .{ .finish_prompt = finished });
+
+    const result = try takePromptRunResult(&ctx, alloc);
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, result.assistant_output, "Let me check the note first."));
+    try std.testing.expectEqualStrings(draft, result.final_source);
+    try std.testing.expectEqualStrings("Add note probe\n\n## Summary\n\n- Uses bold and inline code.", result.final_output);
+
+    const displayed = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast(draft),
+        } },
+        .presentation_text = "Earlier candidate.\n\n" ++ draft,
+        .terminal_outcome = .completed,
+    });
+    try deps.push_event(deps.ctx, .{ .finish_prompt = displayed });
+    try std.testing.expectEqualStrings(draft, ctx.final_source.items);
+    try std.testing.expect(std.mem.startsWith(u8, ctx.final_output.items, "Earlier candidate."));
 }
 
 test "CLI command output completion terminates only an open display line" {
@@ -9274,7 +9947,7 @@ test "CLI nonterminal progress preserves distinct not-run labels without duplica
     } });
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 1, .call_id = "deferred_write" },
-        .outcome = .{ .kind = .deferred, .summary = "Not run — project instructions changed: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Reading project instructions before continuing: Writing file" },
     } });
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
 
@@ -9291,7 +9964,7 @@ test "CLI nonterminal progress preserves distinct not-run labels without duplica
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 2, .call_id = "retry_write" },
-        .outcome = .{ .kind = .deferred, .summary = "Not run — project instructions changed: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Reading project instructions before continuing: Writing file" },
     } });
 
     try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{

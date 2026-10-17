@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const list_window = @import("../../core/shared/list_window.zig");
@@ -24,7 +25,6 @@ const SkillsMenuLayout = struct {
     visible_items: u16 = 0,
     show_header: bool = true,
     first_item_row: u16 = header_rows,
-    description_row_count: u16 = 0,
     item_stride: u16 = title_rows,
     row_count: u16 = 0,
 
@@ -61,7 +61,6 @@ const SkillsMenuLayout = struct {
                 .selected = selected,
                 .visible_items = 1,
                 .first_item_row = 1,
-                .description_row_count = 1,
                 .item_stride = title_rows + description_rows,
                 .row_count = 3,
             };
@@ -76,7 +75,6 @@ const SkillsMenuLayout = struct {
             .selected = selected,
             .visible_items = visible_items,
             .first_item_row = first_item_row,
-            .description_row_count = description_rows,
             .item_stride = item_stride,
             .row_count = first_item_row + visible_items * item_stride - item_gap_rows,
         };
@@ -346,7 +344,7 @@ fn composeHeaderRow(
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Skills {d}", .{count}) catch "Skills";
+    const title = std.mem.print(&buf, "Skills {d}", .{count}) catch "Skills";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -426,7 +424,7 @@ fn composeEmptyRow(
         "No skills found."
     else blk: {
         var buf: [96]u8 = undefined;
-        break :blk std.fmt.bufPrint(
+        break :blk std.mem.print(
             &buf,
             "No {s} skills found.",
             .{skill_runtime.skillMenuFilterLabel(source_filter)},
@@ -621,7 +619,7 @@ test "prepared skills menu borrows one indexed query without allocating" {
         .index_ready = true,
     };
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 

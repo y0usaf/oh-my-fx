@@ -1,13 +1,17 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_child_store = @import("session_child_store.zig");
+const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
+const migration = @import("session_migration.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
+const session_replay = @import("session_replay.zig");
 const Allocator = std.mem.Allocator;
 
 const authority = @import("session_authority.zig");
@@ -16,9 +20,8 @@ const types = @import("session_store_types.zig");
 
 const classifyAuthority = authority.classifyAuthority;
 const entryExistsRelative = authority.entryExistsRelative;
-const eventFileStat = authority.eventFileStat;
+const eventLogSize = authority.eventLogSize;
 const loadAuthorityMarkerOptional = authority.loadAuthorityMarkerOptional;
-const loadAuthorityTransitionOptional = authority.loadAuthorityTransitionOptional;
 const manifestSchemaVersion = authority.manifestSchemaVersion;
 const openSessionFile = authority.openSessionFile;
 const readOptionalSessionFile = authority.readOptionalSessionFile;
@@ -58,23 +61,10 @@ pub const ReadOnlyCandidate = struct {
     summary: SessionSummary,
     storage: CandidateStorage,
     projection_state: ProjectionState,
+    subagent_child: ?bool = null,
 
     pub fn deinit(self: *ReadOnlyCandidate, alloc: Allocator) void {
         self.summary.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const WritableCandidate = struct {
-    id: []u8,
-    workspace_root: []u8,
-    updated_at_ms: i64,
-    storage: CandidateStorage,
-    projection_state: ProjectionState,
-
-    pub fn deinit(self: *WritableCandidate, alloc: Allocator) void {
-        alloc.free(self.id);
-        alloc.free(self.workspace_root);
         self.* = undefined;
     }
 };
@@ -129,31 +119,11 @@ pub fn appendDoctorDiagnostic(
     bytes: ?u64,
 ) !void {
     const owned_id = try alloc.dupe(u8, session_id);
-    errdefer alloc.free(owned_id);
+    errdefer mem_utils.free(alloc, owned_id);
     try diagnostics.append(alloc, .{
         .session_id = owned_id,
         .kind = kind,
         .bytes = bytes,
-    });
-}
-
-fn appendDoctorGrowthDiagnostic(
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    alloc: Allocator,
-    session_id: []const u8,
-    kind: DoctorIssueKind,
-    bytes: u64,
-    growth_bytes: u64,
-    growth_frames: u64,
-) !void {
-    const owned_id = try alloc.dupe(u8, session_id);
-    errdefer alloc.free(owned_id);
-    try diagnostics.append(alloc, .{
-        .session_id = owned_id,
-        .kind = kind,
-        .bytes = bytes,
-        .growth_bytes = growth_bytes,
-        .growth_frames = growth_frames,
     });
 }
 
@@ -168,229 +138,58 @@ pub fn inspectDoctorSession(
     diagnostics: *std.ArrayList(DoctorDiagnostic),
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
-    options: DoctorInspectionOptions,
+    _: DoctorInspectionOptions,
 ) !void {
-    const transition = loadAuthorityTransitionOptional(alloc, session_dir) catch |err| {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .invalid_authority_transition,
-            null,
-        );
-        return;
-    };
-    if (transition) |transition_value| {
-        var owned = transition_value;
-        defer owned.deinit(alloc);
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .authority_transition_pending, null);
-        return;
-    }
-
-    const marker = loadAuthorityMarkerOptional(alloc, session_dir) catch |err| {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .invalid_authority,
-            null,
-        );
-        return;
-    };
-    if (marker == null) {
-        return inspectAuthoritylessSession(ctx, alloc, diagnostics, session_dir, session_id);
-    }
-
-    var owned_marker = marker.?;
-    defer owned_marker.deinit(alloc);
-    if (!std.mem.eql(u8, owned_marker.session_id, session_id)) {
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .invalid_authority, null);
-        return;
-    }
-
-    return inspectSchemaV3Session(ctx, alloc, diagnostics, session_dir, session_id, options);
-}
-
-/// Diagnoses a session that carries no authority marker: either an in-flight
-/// schema-v3 creation orphan, an oversized legacy snapshot, or a missing
-/// authority record. Terminal: appends exactly one classification and returns.
-fn inspectAuthoritylessSession(
-    ctx: StoreContext,
-    alloc: Allocator,
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-) !void {
-    const manifest_bytes = try readOptionalSessionFile(
-        alloc,
-        session_dir,
-        "session.json",
-        session_projection.manifest_max_bytes,
-    );
-    if (manifest_bytes) |bytes| {
-        defer alloc.free(bytes);
-        const schema_version = manifestSchemaVersion(alloc, bytes) catch {
-            try appendDoctorDiagnostic(diagnostics, alloc, session_id, .missing_authority, null);
-            return;
-        };
-        if (schema_version == 3) {
-            var manifest = session_projection.decodeManifest(alloc, bytes) catch {
-                try appendDoctorDiagnostic(diagnostics, alloc, session_id, .missing_authority, null);
-                return;
-            };
-            defer manifest.deinit(alloc);
+    if (try session_log.hasConversationMetadata(alloc, session_dir)) {
+        var root = ctx.canonical_root;
+        var state = root.loadReadOnly(alloc, session_id, .{}) catch |err| {
             try appendDoctorDiagnostic(
                 diagnostics,
                 alloc,
                 session_id,
-                if (std.mem.eql(u8, manifest.id, session_id))
-                    .authority_less_creation_orphan
+                if (err == error.SessionPathUnsafe)
+                    .unsafe_path
                 else
-                    .missing_authority,
+                    .canonical_state_invalid,
                 null,
             );
-            return;
-        }
-
-        var legacy_file = try openSessionFile(session_dir, "session.json", .read_only);
-        defer legacy_file.close(io_mod.getIo());
-        const legacy_stat = try legacy_file.stat(io_mod.getIo());
-        if (legacy_stat.size > automatic_legacy_max_bytes) {
-            try appendDoctorDiagnostic(diagnostics, alloc, session_id, .oversized_legacy_snapshot, legacy_stat.size);
-        }
-        try inspectDoctorManagedChildren(ctx, alloc, diagnostics, session_dir, session_id);
-        return;
-    }
-
-    const has_prepared_log = entryExistsRelative(session_dir, "events.jsonl") catch false;
-    try appendDoctorDiagnostic(
-        diagnostics,
-        alloc,
-        session_id,
-        if (has_prepared_log) .authority_less_creation_orphan else .missing_authority,
-        null,
-    );
-}
-
-/// Diagnoses a session that owns a valid authority marker: validates the
-/// projection manifest, event log size, commit watermark, compaction growth,
-/// stale/cleanup artifacts, managed children, and finally a canonical replay.
-/// Terminal: stops at the first disqualifying problem.
-fn inspectSchemaV3Session(
-    ctx: StoreContext,
-    alloc: Allocator,
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-    options: DoctorInspectionOptions,
-) !void {
-    const manifest_bytes = try readOptionalSessionFile(
-        alloc,
-        session_dir,
-        "session.json",
-        session_projection.manifest_max_bytes,
-    );
-    if (manifest_bytes == null) {
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .projection_missing, null);
-    }
-
-    var manifest: ?session_projection.Manifest = null;
-    defer if (manifest) |*value| value.deinit(alloc);
-    if (manifest_bytes) |bytes| {
-        defer alloc.free(bytes);
-        manifest = session_projection.decodeManifest(alloc, bytes) catch {
-            try appendDoctorDiagnostic(diagnostics, alloc, session_id, .projection_invalid, null);
             return;
         };
+        state.deinit(alloc);
+        try inspectDoctorManagedChildren(
+            ctx,
+            alloc,
+            diagnostics,
+            session_dir,
+            session_id,
+        );
+        return;
     }
 
-    const event_stat = eventFileStat(session_dir, "events.jsonl") catch |err| {
+    if ((entryExistsRelative(session_dir, "authority.pending.json") catch false) or
+        (entryExistsRelative(session_dir, "commit.pending.json") catch false))
+    {
         try appendDoctorDiagnostic(
             diagnostics,
             alloc,
             session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .canonical_state_invalid,
+            .authority_transition_pending,
             null,
         );
         return;
-    };
-    if (event_stat.size >= 128 * 1024 * 1024) {
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .canonical_log_large, event_stat.size);
-        return;
     }
 
-    const watermark = session_log.inspectCommitWatermark(alloc, session_dir, session_id) catch |err| {
+    var candidate = classifyReadOnlyCandidate(
+        alloc,
+        session_dir,
+        session_id,
+    ) catch |err| {
         try appendDoctorDiagnostic(
             diagnostics,
             alloc,
             session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .canonical_state_invalid,
-            null,
-        );
-        return;
-    };
-    switch (watermark.status) {
-        .missing, .invalid, .mismatched => {
-            try appendDoctorDiagnostic(
-                diagnostics,
-                alloc,
-                session_id,
-                switch (watermark.status) {
-                    .missing => .commit_watermark_missing,
-                    .invalid => .commit_watermark_invalid,
-                    .mismatched => .commit_watermark_mismatched,
-                    .valid => unreachable,
-                },
-                null,
-            );
-            return;
-        },
-        .valid => {},
-    }
-
-    const committed_position = watermark.position.?;
-    const has_failed_compaction = try session_log.hasValidatedCompactionTemp(alloc, session_dir, session_id);
-    if (manifest) |value| {
-        try appendCompactionGrowthIfNeeded(
-            diagnostics,
-            alloc,
-            session_id,
-            value,
-            committed_position,
-            has_failed_compaction,
-            options,
-        );
-    }
-    if (manifest) |value| {
-        if (session_projection.isManifestStale(value, event_stat)) {
-            try appendDoctorDiagnostic(diagnostics, alloc, session_id, .projection_stale, null);
-        }
-        try appendCleanupCandidateIfPresent(diagnostics, alloc, session_id, session_dir, value);
-    }
-
-    try inspectDoctorManagedChildren(ctx, alloc, diagnostics, session_dir, session_id);
-
-    const has_commit_intent = entryExistsRelative(session_dir, "commit.pending.json") catch |err| {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (err == error.SessionPathUnsafe) .unsafe_path else .invalid_commit_intent,
-            null,
-        );
-        return;
-    };
-
-    var root = ctx.canonical_root;
-    var state = root.loadReadOnly(alloc, session_id, .{}) catch |err| {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (has_commit_intent and err == error.SessionCommitBoundaryUnavailable)
-                .commit_intent_pending
-            else if (has_commit_intent)
-                .invalid_commit_intent
+            if (err == error.LegacySessionTooLarge)
+                .oversized_legacy_snapshot
             else if (err == error.SessionPathUnsafe)
                 .unsafe_path
             else
@@ -399,61 +198,34 @@ fn inspectSchemaV3Session(
         );
         return;
     };
-    state.deinit(alloc);
-}
-
-/// Appends a compaction diagnostic when the committed log has grown past the
-/// configured byte/frame thresholds within the manifest's current generation.
-/// No-op when the generation differs or growth is under threshold.
-fn appendCompactionGrowthIfNeeded(
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    alloc: Allocator,
-    session_id: []const u8,
-    manifest: session_projection.Manifest,
-    committed_position: session_log.CommitPosition,
-    has_failed_compaction: bool,
-    options: DoctorInspectionOptions,
-) !void {
-    const same_generation = std.mem.eql(u8, &manifest.log_generation, &committed_position.log_generation);
-    if (!same_generation) return;
-    const growth_bytes = committed_position.through_event_log_bytes -
-        @min(committed_position.through_event_log_bytes, manifest.generation_base_bytes);
-    const growth_frames = committed_position.through_seq -
-        @min(committed_position.through_seq, manifest.generation_base_seq);
-    if (growth_bytes >= options.compaction_byte_threshold or
-        growth_frames >= options.compaction_frame_threshold)
-    {
-        try appendDoctorGrowthDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (has_failed_compaction)
-                .canonical_log_compaction_failed
-            else
-                .canonical_log_compaction_overdue,
-            committed_position.through_event_log_bytes,
-            growth_bytes,
-            growth_frames,
-        );
+    const stale_schema_v3 = candidate.storage == .schema_v3 and candidate.projection_state == .stale;
+    candidate.deinit(alloc);
+    // A stale schema-v3 session resumes from its committed log, so a log that
+    // cannot be replayed leaves the session unreadable even though its
+    // manifest is valid; latest resume skips it for the same reason.
+    if (stale_schema_v3) {
+        if (migration.loadSchemaV3ReadOnly(alloc, session_dir, session_id)) |value| {
+            var replay = value;
+            replay.deinit(alloc);
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try appendDoctorDiagnostic(
+                diagnostics,
+                alloc,
+                session_id,
+                if (err == error.SessionPathUnsafe) .unsafe_path else .canonical_state_invalid,
+                null,
+            );
+            return;
+        }
     }
-}
-
-/// Appends a single cleanup-candidate diagnostic if the directory contains a
-/// compaction artifact from a generation other than the manifest's current one.
-fn appendCleanupCandidateIfPresent(
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    alloc: Allocator,
-    session_id: []const u8,
-    session_dir: *io_mod.VerifiedDir,
-    manifest: session_projection.Manifest,
-) !void {
-    var entries = session_dir.dir.iterate();
-    while (try entries.next(io_mod.getIo())) |entry| {
-        const generation = session_log.cleanupCandidateGeneration(entry.name) orelse continue;
-        if (std.mem.eql(u8, &generation, &manifest.log_generation)) continue;
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .cleanup_candidate, null);
-        break;
-    }
+    try inspectDoctorManagedChildren(
+        ctx,
+        alloc,
+        diagnostics,
+        session_dir,
+        session_id,
+    );
 }
 
 fn inspectDoctorManagedChildren(
@@ -500,16 +272,136 @@ pub fn classifyReadOnlyCandidate(
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !ReadOnlyCandidate {
-    return switch (try classifyAuthority(alloc, session_dir, session_id)) {
+    return classifyReadOnlyCandidateWithCancellation(alloc, session_dir, session_id, null);
+}
+
+pub fn classifyReadOnlyCandidateCancellable(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    cancelled: *const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
+    return classifyReadOnlyCandidateWithCancellation(alloc, session_dir, session_id, cancelled);
+}
+
+fn classifyReadOnlyCandidateWithCancellation(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    if (try session_log.readConversationMetadata(alloc, session_dir)) |value| {
+        var metadata = value;
+        defer metadata.deinit();
+        return classifyConversationCandidate(alloc, session_dir, session_id, metadata.value, cancelled);
+    }
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    const candidate = switch (try classifyAuthority(alloc, session_dir, session_id)) {
         .schema_v3 => classifySchemaV3Candidate(alloc, session_dir, session_id),
-        .legacy => classifyLegacyCandidate(alloc, session_dir, session_id),
+        .legacy => classifyLegacyCandidateWithCancellation(alloc, session_dir, session_id, cancelled),
+    };
+    var owned = try candidate;
+    errdefer owned.deinit(alloc);
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    return owned;
+}
+
+fn classifyConversationCandidate(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    metadata: session_codec.SessionMetadata,
+    cancelled: ?*const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
+    if (!std.mem.eql(u8, metadata.id, session_id)) {
+        return error.InvalidSessionFormat;
+    }
+
+    const event_stat = try session_dir.dir.statFile(
+        io_mod.getIo(),
+        "events.jsonl",
+        .{ .follow_symlinks = false },
+    );
+    if (event_stat.kind != .file or event_stat.nlink != 1) {
+        return error.SessionPathUnsafe;
+    }
+    var history_len: usize = 0;
+    var has_checkpoint = false;
+    if (event_stat.size > 0) {
+        var event_file = try openSessionFile(session_dir, "events.jsonl", .read_only);
+        defer event_file.close(io_mod.getIo());
+        var offset: u64 = 0;
+        var buffer: [8192]u8 = undefined;
+        var reader = event_file.reader(io_mod.getIo(), &buffer);
+        while (offset < event_stat.size) {
+            const read = session_replay.readBufferedLine(alloc, &reader, event_stat.size, cancelled);
+            const line = read catch |err| switch (err) {
+                error.TruncatedEventFrame => break,
+                else => return err,
+            } orelse break;
+            defer alloc.free(line.bytes);
+            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+            defer decoded.deinit();
+            switch (decoded.value.event) {
+                .context_checkpoint => has_checkpoint = true,
+                .turn_completed, .interrupted => history_len = std.math.add(
+                    usize,
+                    history_len,
+                    1,
+                ) catch return error.InvalidSessionFormat,
+                else => {},
+            }
+            offset = line.next_offset;
+        }
+    }
+
+    const id = try alloc.dupe(u8, metadata.id);
+    errdefer mem_utils.free(alloc, id);
+    const origin = try alloc.dupe(u8, metadata.origin_workspace_root);
+    errdefer mem_utils.free(alloc, origin);
+    const workspace = try alloc.dupe(u8, metadata.workspace_root);
+    errdefer mem_utils.free(alloc, workspace);
+    const title = if (metadata.title) |value| try alloc.dupe(u8, value) else null;
+    return .{
+        .summary = .{
+            .id = id,
+            .workspace_root = workspace,
+            .origin_workspace_root = origin,
+            .title = title,
+            .created_at_ms = metadata.created_at_ms,
+            .updated_at_ms = if (history_len == 0 and !has_checkpoint)
+                metadata.updated_at_ms
+            else
+                @max(
+                    metadata.updated_at_ms,
+                    std.math.cast(
+                        i64,
+                        @divFloor(event_stat.mtime.nanoseconds, std.time.ns_per_ms),
+                    ) orelse std.math.maxInt(i64),
+                ),
+            .conversation_language = session.ConversationLanguage.fromSlice(
+                metadata.conversation_language,
+            ) catch return error.InvalidSessionFormat,
+            .history_len = history_len,
+            .has_checkpoint = has_checkpoint,
+        },
+        .storage = .conversation,
+        .projection_state = .current,
+        .subagent_child = metadata.subagent_child,
     };
 }
 
 /// Builds a read-only candidate from a schema-v3 manifest, validating the
 /// authority marker, manifest identity, and projection freshness.
 /// Fails with `error.InvalidSessionFormat` / `error.UnsupportedSessionSchema` on mismatch.
-pub fn classifySchemaV3Candidate(
+fn classifySchemaV3Candidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
@@ -547,21 +439,21 @@ pub fn classifySchemaV3Candidate(
     {
         return error.InvalidSessionFormat;
     }
-    const current_stat = try eventFileStat(session_dir, "events.jsonl");
+    const event_log_size = try eventLogSize(session_dir, "events.jsonl");
     const projection_state: ProjectionState = if (session_projection.isManifestStale(
         manifest,
-        current_stat,
+        event_log_size,
     )) .stale else .current;
     try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
 
     const history_len = std.math.cast(usize, manifest.history_len) orelse
         return error.InvalidSessionFormat;
     const id = try alloc.dupe(u8, manifest.id);
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const origin_workspace_root = try alloc.dupe(u8, manifest.origin_workspace_root);
-    errdefer alloc.free(origin_workspace_root);
+    errdefer mem_utils.free(alloc, origin_workspace_root);
     const workspace_root = try alloc.dupe(u8, manifest.workspace_root);
-    errdefer alloc.free(workspace_root);
+    errdefer mem_utils.free(alloc, workspace_root);
     var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
     if (display.origin_workspace_root) |root| {
         alloc.free(root);
@@ -586,42 +478,251 @@ pub fn classifySchemaV3Candidate(
     };
 }
 
-/// Builds a read-only candidate from a legacy `session.json` snapshot via a
-/// streaming summary parse. Rejects directories carrying an authority fence.
-pub fn classifyLegacyCandidate(
+/// Listing's recovery of a schema-v3 session whose manifest is missing or
+/// cannot be read: its committed log is the authority, so the summary is
+/// replayed from it, as latest selection always did. Returns null when the
+/// session is not schema-v3, sits behind an interrupted upgrade (the route
+/// classification refuses it), or its log cannot be replayed either, leaving
+/// the caller to report the classification error.
+pub fn recoverSchemaV3Candidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) !?ReadOnlyCandidate {
+    if (try session_log.hasConversationMetadata(alloc, session_dir)) return null;
+    const route = classifyAuthority(alloc, session_dir, session_id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (route != .schema_v3) return null;
+
+    var candidate: ReadOnlyCandidate = candidate: {
+        const id = try alloc.dupe(u8, session_id);
+        errdefer mem_utils.free(alloc, id);
+        var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
+        if (display.origin_workspace_root) |root| {
+            alloc.free(root);
+            display.origin_workspace_root = null;
+        }
+        break :candidate .{
+            .summary = .{
+                .id = id,
+                .title = display.title,
+                .preview = display.preview,
+                .display_metadata_present = display.present,
+                .created_at_ms = 0,
+                .updated_at_ms = 0,
+                .conversation_language = .default(),
+                .history_len = 0,
+            },
+            .storage = .schema_v3,
+            .projection_state = .stale,
+        };
+    };
+    errdefer candidate.deinit(alloc);
+    if (!try replayCommittedLog(alloc, session_dir, &candidate, cancelled)) {
+        candidate.deinit(alloc);
+        return null;
+    }
+    debug_trace.logf("session", "schema_v3 manifest unreadable id={s}; listed from the committed log", .{session_id});
+    return candidate;
+}
+
+/// Listing's summary of a stale schema-v3 projection: a stale manifest carries
+/// the wrong workspace and recency, so the summary is replaced by one replayed
+/// from the committed log, and the child identity comes from its first event.
+/// If the replay fails the stale summary stays listed: exact opens report the
+/// failure, and latest resume skips the session. Exact opens replay the log
+/// themselves, so only listing calls this.
+pub fn summarizeStaleProjection(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    candidate: *ReadOnlyCandidate,
+    cancelled: ?*const std.atomic.Value(bool),
+) !void {
+    if (candidate.storage != .schema_v3 or candidate.projection_state != .stale) return;
+    _ = try replayCommittedLog(alloc, session_dir, candidate, cancelled);
+}
+
+/// Replaces the log-derived fields of a schema-v3 candidate with a replay of
+/// its committed log and marks it replayed. Returns false, leaving the
+/// candidate unchanged, when the log cannot be replayed.
+fn replayCommittedLog(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    candidate: *ReadOnlyCandidate,
+    cancelled: ?*const std.atomic.Value(bool),
+) !bool {
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    var replay = migration.loadSchemaV3ReadOnly(alloc, session_dir, candidate.summary.id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "schema_v3 log replay failed id={s} err={s}", .{ candidate.summary.id, @errorName(err) });
+            return false;
+        },
+    };
+    defer replay.deinit(alloc);
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    const state = &replay.state;
+    const origin_workspace_root = try alloc.dupe(u8, state.origin_workspace_root);
+    errdefer alloc.free(origin_workspace_root);
+    const workspace_root = try alloc.dupe(u8, state.workspace_root);
+
+    const summary = &candidate.summary;
+    if (summary.origin_workspace_root) |root| alloc.free(root);
+    if (summary.workspace_root) |root| alloc.free(root);
+    summary.origin_workspace_root = origin_workspace_root;
+    summary.workspace_root = workspace_root;
+    summary.created_at_ms = state.created_at_ms;
+    summary.updated_at_ms = state.updated_at_ms;
+    summary.conversation_language = state.conversation_language;
+    summary.history_len = state.history.len;
+    candidate.projection_state = .replayed;
+    candidate.subagent_child = state.subagent_child;
+    return true;
+}
+
+/// Builds a read-only candidate from a legacy `session.json` snapshot via a
+/// streaming summary parse. Rejects directories carrying an authority fence.
+fn classifyLegacyCandidateWithCancellation(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
+    return classifyLegacySnapshot(alloc, session_dir, session_id, "session.json", .must_be_absent, cancelled);
+}
+
+/// Summarizes a legacy session whose upgrade was interrupted, from its stable
+/// snapshot, without recovering it. Listing uses this so the session stays
+/// reachable; resuming it runs the canonical recovery or reports the boundary.
+/// Caller owns the candidate.
+pub fn classifyFencedLegacyCandidate(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) !ReadOnlyCandidate {
+    if (!try entryExistsRelative(session_dir, "authority.pending.json")) {
+        return error.SessionAuthorityBoundaryUnavailable;
+    }
+    const name: []const u8 = if (try entryExistsRelative(session_dir, "session.legacy.json"))
+        "session.legacy.json"
+    else
+        "session.json";
+    return classifyLegacySnapshot(alloc, session_dir, session_id, name, .pending_allowed, cancelled);
+}
+
+fn classifyLegacySnapshot(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    name: []const u8,
+    fence: enum { must_be_absent, pending_allowed },
+    cancelled: ?*const std.atomic.Value(bool),
 ) !ReadOnlyCandidate {
     if (try entryExistsRelative(session_dir, "authority.json")) {
         return error.InvalidSessionFormat;
     }
-    var file = try openSessionFile(session_dir, "session.json", .read_only);
+    // Opening a FIFO or device for reading can block, so the helper checks
+    // the entry and opens it without blocking.
+    var file = io_mod.openExistingRegularFile(session_dir.dir, name, .read_only) catch |err| switch (err) {
+        error.DurablePathUnsafe => return error.SessionPathUnsafe,
+        else => return err,
+    };
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
     if (stat.size > automatic_legacy_max_bytes) return error.LegacySessionTooLarge;
     var buffer: [16 * 1024]u8 = undefined;
     var reader = file.readerStreaming(io_mod.getIo(), &buffer);
-    var legacy = session_json.parseLegacySummaryStreaming(
-        LegacyCandidateSummary,
-        alloc,
-        &reader.interface,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return err,
-    };
+    var legacy = try readLegacySummary(alloc, &reader.interface, cancelled);
     errdefer legacy.deinit(alloc);
     if (!std.mem.eql(u8, legacy.id, session_id)) {
         return error.InvalidSessionFormat;
     }
-    try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
+    if (fence == .must_be_absent) try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
     const storage = candidateStorageForLegacy(legacy.schema_version);
     return .{
         .summary = legacy.intoSessionSummary(),
         .storage = storage,
-        .projection_state = .current,
+        .projection_state = if (fence == .must_be_absent) .current else .stale,
     };
+}
+
+const CancellableReader = struct {
+    source: *std.Io.Reader,
+    cancelled: ?*const std.atomic.Value(bool),
+    interface: std.Io.Reader,
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *CancellableReader = @fieldParentPtr("interface", reader);
+        if (self.cancelled) |stop| {
+            if (stop.load(.acquire)) return error.ReadFailed;
+        }
+        return self.source.stream(writer, limit.min(.limited(8192)));
+    }
+};
+
+fn readLegacySummary(
+    alloc: Allocator,
+    source: *std.Io.Reader,
+    cancelled: ?*const std.atomic.Value(bool),
+) !LegacyCandidateSummary {
+    var buffer: [8192]u8 = undefined;
+    var reader = CancellableReader{
+        .source = source,
+        .cancelled = cancelled,
+        .interface = .{ .vtable = &.{ .stream = CancellableReader.stream }, .buffer = &buffer, .seek = 0, .end = 0 },
+    };
+    var result = session_json.parseLegacySummaryStreaming(LegacyCandidateSummary, alloc, &reader.interface) catch |err| {
+        if (cancelled) |stop| {
+            if (stop.load(.acquire)) return error.Cancelled;
+        }
+        return err;
+    };
+    errdefer result.deinit(alloc);
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+    return result;
+}
+
+test "legacy summary cancellation stops after streaming starts" {
+    const alloc = std.testing.allocator;
+    const bytes = "{\"schema_version\":2,\"history\":[{\"user\":\"request\",\"assistant\":\"response\"}]," ++
+        "\"id\":\"legacy\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":null," ++
+        "\"conversation_language\":\"en\",\"history_len\":1}";
+    const Source = struct {
+        input: std.Io.Reader,
+        stopped: *std.atomic.Value(bool),
+        reads: usize = 0,
+        interface: std.Io.Reader = .{ .vtable = &.{ .stream = stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+
+        fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *@This() = @fieldParentPtr("interface", reader);
+            self.reads += 1;
+            const count = try self.input.stream(writer, limit.min(.limited(32)));
+            self.stopped.store(true, .release);
+            return count;
+        }
+    };
+    var stopped = std.atomic.Value(bool).init(false);
+    var source = Source{ .input = .fixed(bytes), .stopped = &stopped };
+    try std.testing.expectError(error.Cancelled, readLegacySummary(alloc, &source.interface, &stopped));
+    try std.testing.expectEqual(@as(usize, 1), source.reads);
+    try std.testing.expect(source.input.seek > 0 and source.input.seek < bytes.len);
+    stopped.store(false, .release);
+    var complete = std.Io.Reader.fixed(bytes);
+    var summary = try readLegacySummary(alloc, &complete, &stopped);
+    defer summary.deinit(alloc);
+    try std.testing.expectEqualStrings("legacy", summary.id);
+    try std.testing.expectEqual(@as(usize, 1), summary.history_len);
 }
 
 /// Projects a durable session state into the lightweight `SessionSummary`
@@ -631,11 +732,11 @@ pub fn summaryFromState(
     state: session_codec.DurableSessionState,
 ) !SessionSummary {
     const id = try alloc.dupe(u8, state.id);
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const origin_workspace_root = try alloc.dupe(u8, state.origin_workspace_root);
-    errdefer alloc.free(origin_workspace_root);
+    errdefer mem_utils.free(alloc, origin_workspace_root);
     const workspace_root = try alloc.dupe(u8, state.workspace_root);
-    errdefer alloc.free(workspace_root);
+    errdefer mem_utils.free(alloc, workspace_root);
     var display = try session_display_metadata.deriveFromHistory(alloc, state.history);
     errdefer display.deinit(alloc);
 
@@ -650,28 +751,6 @@ pub fn summaryFromState(
         .updated_at_ms = state.updated_at_ms,
         .conversation_language = state.conversation_language,
         .history_len = state.history.len,
-    };
-}
-
-/// Constructs a writable candidate, taking owned copies of the id and
-/// workspace root from caller-provided slices.
-pub fn dupeWritableCandidate(
-    alloc: Allocator,
-    id_source: []const u8,
-    workspace_source: []const u8,
-    updated_at_ms: i64,
-    storage: CandidateStorage,
-    projection_state: ProjectionState,
-) !WritableCandidate {
-    const id = try alloc.dupe(u8, id_source);
-    errdefer alloc.free(id);
-    const workspace_root = try alloc.dupe(u8, workspace_source);
-    return .{
-        .id = id,
-        .workspace_root = workspace_root,
-        .updated_at_ms = updated_at_ms,
-        .storage = storage,
-        .projection_state = projection_state,
     };
 }
 
@@ -694,18 +773,6 @@ pub fn storageFormatForLegacy(
     };
 }
 
-/// Orders writable candidates: newer `updated_at_ms` wins, ties broken by
-/// descending id. Used to select the most recent writable session.
-pub fn writableCandidateNewer(
-    candidate: WritableCandidate,
-    current: WritableCandidate,
-) bool {
-    if (candidate.updated_at_ms != current.updated_at_ms) {
-        return candidate.updated_at_ms > current.updated_at_ms;
-    }
-    return std.mem.order(u8, candidate.id, current.id) == .gt;
-}
-
 /// Emits one structured discovery trace line. Pure logging; never fails.
 pub fn logDiscovery(
     mode: DiscoveryMode,
@@ -716,6 +783,7 @@ pub fn logDiscovery(
     outcome: DiscoveryOutcome,
     err: ?anyerror,
 ) void {
+    if (err == null and outcome != .selected) return;
     debug_trace.logf(
         "core",
         "session discovery mode={s} cause={s} storage_format={s} projection_state={s} validated_candidate_id={s} outcome={s} error={s}",

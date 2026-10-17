@@ -20,7 +20,7 @@ pub const Category = enum {
     }
 };
 
-pub const category_count = std.meta.fields(Category).len;
+pub const category_count = @typeInfo(Category).@"enum".field_names.len;
 
 pub const SettingId = enum {
     statusline_context,
@@ -28,9 +28,11 @@ pub const SettingId = enum {
     statusline_workspace,
     slash_menu_categories,
     collapse_tool_calls,
+    session_titles,
     model,
     effort,
     fast_mode,
+    ultrafast_mode,
     permission_mode,
     sound_level,
     startup_scrollback,
@@ -50,12 +52,15 @@ pub const Snapshot = struct {
     reasoning_efforts: model_capabilities.ReasoningEffortOptions = .{},
     fast_mode: bool = false,
     supports_fast_mode: bool = false,
+    ultrafast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
     permission_mode: []const u8 = "ask",
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
+    session_titles: bool = true,
     startup_scrollback: bool = true,
     prompt_history: bool = true,
     sound_level: []const u8 = "on",
@@ -65,12 +70,14 @@ pub const Snapshot = struct {
             .model => self.model,
             .effort => self.effort,
             .fast_mode => onOff(self.fast_mode),
-            .permission_mode => self.permission_mode,
+            .ultrafast_mode => onOff(self.ultrafast_mode),
+            .permission_mode => if (std.mem.eql(u8, self.permission_mode, "yolo")) "full access" else self.permission_mode,
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
             .statusline_workspace => onOff(self.statusline_workspace),
             .slash_menu_categories => onOff(self.slash_menu_categories),
             .collapse_tool_calls => onOff(self.collapse_tool_calls),
+            .session_titles => onOff(self.session_titles),
             .startup_scrollback => onOff(self.startup_scrollback),
             .prompt_history => onOff(self.prompt_history),
             .sound_level => self.sound_level,
@@ -206,10 +213,10 @@ pub const Menu = struct {
     pub fn cycleCategory(self: *Menu, delta: i32) bool {
         if (!self.active) return false;
         const count: i32 = @intCast(category_count);
-        var next: i32 = @intFromEnum(self.category) + delta;
+        var next: i32 = @backingInt(self.category) + delta;
         while (next < 0) next += count;
         while (next >= count) next -= count;
-        self.category = @enumFromInt(next);
+        self.category = @fromBackingInt(@intCast(next));
         self.selected_index = 0;
         self.window_start = 0;
         return true;
@@ -260,29 +267,22 @@ const specs = [_]Spec{
     .{ .id = .model, .category = .agent, .label = "Model", .description = "Choose the model used for new turns" },
     .{ .id = .effort, .category = .agent, .label = "Reasoning effort", .description = "Control how much reasoning the model applies" },
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
+    .{ .id = .ultrafast_mode, .category = .agent, .label = "Ultra mode", .description = "Request the highest-speed mode when the model supports it" },
     .{ .id = .permission_mode, .category = .agent, .label = "Permission mode", .description = "Choose when fx asks before taking actions" },
+    .{ .id = .session_titles, .category = .agent, .label = "Session titles", .description = "Generate a short session title from the first prompt" },
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when fx starts" },
     .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },
 };
 
 const on_off_options = [_][]const u8{ "off", "on" };
-const permission_options = [_][]const u8{ "ask", "auto", "yolo" };
+const permission_options = [_][]const u8{ "ask", "auto", "full access" };
 const sound_level_options = [_][]const u8{ "off", "on", "max" };
 
 pub fn filteredCount(snapshot: Snapshot, category: Category, query: []const u8) usize {
     var count: usize = 0;
     for (specs) |spec| {
         if (matches(snapshot, spec, category, query)) count += 1;
-    }
-    return count;
-}
-
-pub fn categoryFilteredCount(snapshot: Snapshot, category: Category, query: []const u8) usize {
-    if (category == .all) return filteredCount(snapshot, .all, query);
-    var count: usize = 0;
-    for (specs) |spec| {
-        if (spec.category == category and matchesQuery(snapshot, spec, query)) count += 1;
     }
     return count;
 }
@@ -305,13 +305,6 @@ pub fn itemAt(snapshot: Snapshot, category: Category, query: []const u8, display
     return null;
 }
 
-pub fn specFor(id: SettingId) *const Spec {
-    for (&specs) |*spec| {
-        if (spec.id == id) return spec;
-    }
-    unreachable;
-}
-
 pub fn optionCount(snapshot: *const Snapshot, id: SettingId) usize {
     return switch (id) {
         .effort => if (snapshot.reasoning_efforts.len > 0 or !std.ascii.eqlIgnoreCase(snapshot.effort, "default"))
@@ -319,6 +312,7 @@ pub fn optionCount(snapshot: *const Snapshot, id: SettingId) usize {
         else
             0,
         .fast_mode => if (snapshot.supports_fast_mode or snapshot.fast_mode) on_off_options.len else 0,
+        .ultrafast_mode => if (snapshot.supports_ultrafast_mode or snapshot.ultrafast_mode) on_off_options.len else 0,
         else => staticOptionsFor(id).len,
     };
 }
@@ -367,11 +361,13 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
     return switch (id) {
         .model, .effort => &.{},
         .fast_mode,
+        .ultrafast_mode,
         .statusline_context,
         .statusline_session,
         .statusline_workspace,
         .slash_menu_categories,
         .collapse_tool_calls,
+        .session_titles,
         .startup_scrollback,
         .prompt_history,
         => &on_off_options,
@@ -393,10 +389,10 @@ fn matchesQuery(snapshot: Snapshot, spec: Spec, query: []const u8) bool {
 }
 
 fn tokenMatches(snapshot: Snapshot, spec: Spec, token: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(spec.label, token) != null or
-        std.ascii.indexOfIgnoreCase(spec.description, token) != null or
-        std.ascii.indexOfIgnoreCase(snapshot.value(spec.id), token) != null or
-        std.ascii.indexOfIgnoreCase(@tagName(spec.id), token) != null;
+    return std.ascii.findIgnoreCase(spec.label, token) != null or
+        std.ascii.findIgnoreCase(spec.description, token) != null or
+        std.ascii.findIgnoreCase(snapshot.value(spec.id), token) != null or
+        std.ascii.findIgnoreCase(@tagName(spec.id), token) != null;
 }
 
 fn onOff(value: bool) []const u8 {
@@ -430,9 +426,9 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 12), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
-    try std.testing.expectEqual(@as(usize, 4), filteredCount(snapshot, .agent, ""));
+    try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
     try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
 
@@ -444,6 +440,14 @@ test "settings catalog projects grouped searchable preferences" {
     try std.testing.expectEqual(SettingId.startup_scrollback, startup.id);
     try std.testing.expectEqualStrings("on", startup.value);
     try std.testing.expect(itemAt(snapshot, .all, "missing preference", 0) == null);
+}
+
+test "settings catalog displays legacy yolo as full access and cycles from it" {
+    const snapshot: Snapshot = .{ .permission_mode = "yolo" };
+    try std.testing.expectEqualStrings("full access", snapshot.value(.permission_mode));
+    try std.testing.expectEqual(@as(usize, 2), selectedOptionIndex(&snapshot, .permission_mode).?);
+    try std.testing.expectEqualStrings("ask", cycleChange(&snapshot, .permission_mode, 1).?.value);
+    try std.testing.expectEqualStrings("auto", cycleChange(&snapshot, .permission_mode, -1).?.value);
 }
 
 test "settings catalog returns typed edit choices without effects" {
@@ -466,7 +470,7 @@ test "settings catalog returns typed edit choices without effects" {
 
     try std.testing.expect(changeAt(&snapshot, .model, 0) == null);
     try std.testing.expectEqual(@as(usize, 3), optionCount(&snapshot, .permission_mode));
-    try std.testing.expectEqualStrings("yolo", optionAt(&snapshot, .permission_mode, 2).?);
+    try std.testing.expectEqualStrings("full access", optionAt(&snapshot, .permission_mode, 2).?);
     try std.testing.expectEqual(@as(usize, 3), optionCount(&snapshot, .effort));
     try std.testing.expectEqualStrings("default", optionAt(&snapshot, .effort, 0).?);
     try std.testing.expectEqualStrings("future-tier", optionAt(&snapshot, .effort, 1).?);

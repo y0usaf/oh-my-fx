@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin_mod = @import("builtin");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const io_mod = @import("../shared/io.zig");
@@ -102,7 +103,7 @@ pub fn directoryIdentity(
 }
 
 pub fn descriptorDevice(handle: std.Io.File.Handle) FileIdentityError!u64 {
-    return switch (builtin_mod.os.tag) {
+    return switch (builtin_mod.target.os.tag) {
         .linux => blk: {
             const linux = std.os.linux;
             while (true) {
@@ -150,7 +151,7 @@ pub fn directoryEntryDevice(
     component_z_buffer[component.len] = 0;
     const component_z = component_z_buffer[0..component.len :0];
 
-    return switch (builtin_mod.os.tag) {
+    return switch (builtin_mod.target.os.tag) {
         .linux => blk: {
             const linux = std.os.linux;
             while (true) {
@@ -218,9 +219,29 @@ pub fn resolveWorkspaceOrExternalPath(
         arena,
         workspace_root,
         input_path,
-        io_mod.getenv("HOME"),
+        io_mod.homeDir(),
         .existing,
     );
+}
+
+/// Resolves decoded filename bytes without trimming or unescaping them.
+/// The returned path is owned by `arena`; root and containment policy are unchanged.
+pub fn resolve_workspace_or_external_literal_path(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    path: []const u8,
+) ![]const u8 {
+    return resolve_workspace_or_external_literal_path_with_home(arena, workspace_root, path, io_mod.homeDir());
+}
+
+/// Same literal policy with captured HOME bytes. The caller owns the result.
+pub fn resolve_workspace_or_external_literal_path_with_home(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    path: []const u8,
+    home_dir: ?[]const u8,
+) ![]const u8 {
+    return resolve_literal_path(arena, workspace_root, path, home_dir, .existing, .workspace_or_external);
 }
 
 pub fn resolveWorkspaceOrExternalCreatePath(
@@ -232,7 +253,7 @@ pub fn resolveWorkspaceOrExternalCreatePath(
         arena,
         workspace_root,
         input_path,
-        io_mod.getenv("HOME"),
+        io_mod.homeDir(),
         .create,
     );
 }
@@ -282,10 +303,19 @@ fn resolvePath(
     mode: types.ResolveMode,
     scope: PathScope,
 ) ![]const u8 {
-    const cleaned = std.mem.trim(u8, input_path, path_entry_whitespace);
-    if (cleaned.len == 0) return error.InvalidPath;
+    return resolve_literal_path(arena, workspace_root, std.mem.trim(u8, input_path, path_entry_whitespace), home_dir, mode, scope);
+}
 
-    const input = try resolveInput(arena, workspace_root, cleaned, home_dir, scope);
+fn resolve_literal_path(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    path: []const u8,
+    home_dir: ?[]const u8,
+    mode: types.ResolveMode,
+    scope: PathScope,
+) ![]const u8 {
+    if (path.len == 0) return error.InvalidPath;
+    const input = try resolveInput(arena, workspace_root, path, home_dir, scope);
 
     const resolved = switch (mode) {
         .existing => try io_mod.realpathAlloc(arena, input.absolute),
@@ -308,34 +338,34 @@ fn resolveInput(
 ) !ResolvedInput {
     if (scope == .workspace_only) {
         return .{
-            .absolute = if (std.fs.path.isAbsolute(cleaned))
-                try std.fs.path.resolve(arena, &.{cleaned})
+            .absolute = if (std.Io.Dir.path.isAbsolute(cleaned))
+                try std.Io.Dir.path.resolveAlloc(arena, &.{cleaned})
             else
-                try std.fs.path.resolve(arena, &.{ workspace_root, cleaned }),
+                try std.Io.Dir.path.resolveAlloc(arena, &.{ workspace_root, cleaned }),
             .external_intent = false,
         };
     }
 
     return switch (try classifyExternalPathInput(cleaned)) {
         .absolute => |absolute| .{
-            .absolute = try std.fs.path.resolve(arena, &.{absolute}),
+            .absolute = try std.Io.Dir.path.resolveAlloc(arena, &.{absolute}),
             .external_intent = true,
         },
         .home_relative => |relative| blk: {
             const home = home_dir orelse return error.HomeNotSet;
-            if (home.len == 0 or !std.fs.path.isAbsolute(home)) return error.InvalidPath;
+            if (home.len == 0 or !std.Io.Dir.path.isAbsolute(home)) return error.InvalidPath;
 
             const expanded = if (relative.len == 0)
                 home
             else
                 try std.mem.concat(arena, u8, &.{ home, relative });
             break :blk .{
-                .absolute = try std.fs.path.resolve(arena, &.{expanded}),
+                .absolute = try std.Io.Dir.path.resolveAlloc(arena, &.{expanded}),
                 .external_intent = true,
             };
         },
         .workspace_relative => |relative| blk: {
-            const absolute = try std.fs.path.resolve(arena, &.{ workspace_root, relative });
+            const absolute = try std.Io.Dir.path.resolveAlloc(arena, &.{ workspace_root, relative });
             break :blk .{
                 .absolute = absolute,
                 .external_intent = !pathInside(workspace_root, absolute),
@@ -346,7 +376,7 @@ fn resolveInput(
 
 fn classifyExternalPathInput(cleaned: []const u8) error{InvalidPath}!ExternalPathInput {
     if (cleaned.len == 0) return error.InvalidPath;
-    if (std.fs.path.isAbsolute(cleaned)) return .{ .absolute = cleaned };
+    if (std.Io.Dir.path.isAbsolute(cleaned)) return .{ .absolute = cleaned };
     if (std.mem.eql(u8, cleaned, "~")) return .{ .home_relative = "" };
     if (std.mem.startsWith(u8, cleaned, "~/")) {
         return .{ .home_relative = cleaned[1..] };
@@ -366,15 +396,15 @@ fn resolveBoundedFileTargetInput(
             .external_intent = true,
         },
         .home_relative => |relative| blk: {
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-            if (home.len == 0 or !std.fs.path.isAbsolute(home)) return error.InvalidPath;
+            const home = io_mod.homeDir() orelse return error.HomeNotSet;
+            if (home.len == 0 or !std.Io.Dir.path.isAbsolute(home)) return error.InvalidPath;
             break :blk .{
                 .absolute = try normalizeBaseRelativePathInto(scratch, home, relative),
                 .external_intent = true,
             };
         },
         .workspace_relative => |relative| blk: {
-            if (workspace_root.len == 0 or !std.fs.path.isAbsolute(workspace_root)) {
+            if (workspace_root.len == 0 or !std.Io.Dir.path.isAbsolute(workspace_root)) {
                 return error.WorkspaceUnavailable;
             }
             const absolute = try normalizeBaseRelativePathInto(scratch, workspace_root, relative);
@@ -469,7 +499,7 @@ fn traverseBoundedAbsoluteFileTarget(
     }
 
     const absolute = pending_scratch[0..pending_path_len];
-    path_scratch[0] = std.fs.path.sep;
+    path_scratch[0] = std.Io.Dir.path.sep;
     var path_len: usize = 1;
     var component_count: usize = 0;
     const workspace_target = pathInside(workspace_root, absolute);
@@ -614,9 +644,9 @@ fn resolveBoundedIntermediateSymlink(
     if (link_len == 0) return error.InvalidPath;
 
     const link_target = pending_scratch[0..link_len];
-    var resolved_len: usize = if (std.fs.path.isAbsolute(link_target)) absolute: {
+    var resolved_len: usize = if (std.Io.Dir.path.isAbsolute(link_target)) absolute: {
         if (output_scratch.len == 0) return error.InvalidPath;
-        output_scratch[0] = std.fs.path.sep;
+        output_scratch[0] = std.Io.Dir.path.sep;
         break :absolute 1;
     } else parent_path_end;
 
@@ -637,18 +667,18 @@ const PathComponentIterator = struct {
     fn init(path: []const u8) PathComponentIterator {
         return .{
             .path = path,
-            .index = if (path.len > 0 and path[0] == std.fs.path.sep) 1 else 0,
+            .index = if (path.len > 0 and path[0] == std.Io.Dir.path.sep) 1 else 0,
         };
     }
 
     fn next(self: *PathComponentIterator) ?[]const u8 {
-        while (self.index < self.path.len and self.path[self.index] == std.fs.path.sep) {
+        while (self.index < self.path.len and self.path[self.index] == std.Io.Dir.path.sep) {
             self.index += 1;
         }
         if (self.index >= self.path.len) return null;
 
         const start = self.index;
-        while (self.index < self.path.len and self.path[self.index] != std.fs.path.sep) {
+        while (self.index < self.path.len and self.path[self.index] != std.Io.Dir.path.sep) {
             self.index += 1;
         }
         const end = self.index;
@@ -677,10 +707,10 @@ fn boundedResolution(
 }
 
 fn normalizeAbsolutePathInto(scratch: []u8, raw_path: []const u8) FileTargetResolveError![]const u8 {
-    if (!std.fs.path.isAbsolute(raw_path)) return error.InvalidPath;
+    if (!std.Io.Dir.path.isAbsolute(raw_path)) return error.InvalidPath;
     if (scratch.len == 0) return error.InvalidPath;
 
-    scratch[0] = std.fs.path.sep;
+    scratch[0] = std.Io.Dir.path.sep;
     var len: usize = 1;
     try normalizeRelativePathPartInto(scratch, &len, raw_path);
     return scratch[0..len];
@@ -691,10 +721,10 @@ fn normalizeBaseRelativePathInto(
     base_abs: []const u8,
     relative_path: []const u8,
 ) FileTargetResolveError![]const u8 {
-    if (!std.fs.path.isAbsolute(base_abs)) return error.InvalidPath;
+    if (!std.Io.Dir.path.isAbsolute(base_abs)) return error.InvalidPath;
     if (scratch.len == 0) return error.InvalidPath;
 
-    scratch[0] = std.fs.path.sep;
+    scratch[0] = std.Io.Dir.path.sep;
     var len: usize = 1;
     try normalizeRelativePathPartInto(scratch, &len, base_abs);
     try normalizeRelativePathPartInto(scratch, &len, relative_path);
@@ -708,13 +738,13 @@ fn normalizeRelativePathPartInto(
 ) FileTargetResolveError!void {
     var index: usize = 0;
     while (index < raw_path.len) {
-        while (index < raw_path.len and raw_path[index] == std.fs.path.sep) {
+        while (index < raw_path.len and raw_path[index] == std.Io.Dir.path.sep) {
             index += 1;
         }
         if (index >= raw_path.len) return;
 
         const start = index;
-        while (index < raw_path.len and raw_path[index] != std.fs.path.sep) : (index += 1) {
+        while (index < raw_path.len and raw_path[index] != std.Io.Dir.path.sep) : (index += 1) {
             if (raw_path[index] == 0) return error.InvalidPath;
         }
         const component = raw_path[start..index];
@@ -733,7 +763,7 @@ fn popNormalizedPathComponent(path: []const u8, path_len: *usize) void {
     if (path_len.* <= 1) return;
 
     var index = path_len.* - 1;
-    while (index > 0 and path[index] != std.fs.path.sep) {
+    while (index > 0 and path[index] != std.Io.Dir.path.sep) {
         index -= 1;
     }
     path_len.* = if (index == 0) 1 else index;
@@ -753,7 +783,7 @@ fn appendBoundedPathComponent(
     if (required_len > scratch.len) return error.InvalidPath;
 
     if (needs_separator) {
-        scratch[path_len.*] = std.fs.path.sep;
+        scratch[path_len.*] = std.Io.Dir.path.sep;
         path_len.* += 1;
     }
 
@@ -865,7 +895,7 @@ pub fn resolveWorkspacePathEntry(
 ) ![]const u8 {
     const parts = try resolveWorkspacePathEntryParts(arena, workspace_root, input_path);
     const resolved_parent = try resolveWorkspacePath(arena, workspace_root, parts.parent, .existing);
-    return std.fs.path.join(arena, &.{ resolved_parent, parts.basename });
+    return std.Io.Dir.path.join(arena, &.{ resolved_parent, parts.basename });
 }
 
 pub fn resolveWorkspacePathEntryExisting(
@@ -885,7 +915,7 @@ pub fn resolveWorkspacePathEntryCreate(
 ) ![]const u8 {
     const parts = try resolveWorkspacePathEntryParts(arena, workspace_root, input_path);
     const resolved_parent = try resolveWorkspacePathEntryCreateParent(arena, workspace_root, parts.parent);
-    return std.fs.path.join(arena, &.{ resolved_parent, parts.basename });
+    return std.Io.Dir.path.join(arena, &.{ resolved_parent, parts.basename });
 }
 
 pub fn resolveCreateTargetPath(
@@ -923,16 +953,16 @@ pub fn resolveCreateTargetFromNearestExisting(
             var i = missing_components.items.len;
             while (i > 0) {
                 i -= 1;
-                resolved = try std.fs.path.join(arena, &.{ resolved, missing_components.items[i] });
+                resolved = try std.Io.Dir.path.join(arena, &.{ resolved, missing_components.items[i] });
             }
             return resolved;
         } else |err| switch (err) {
             error.FileNotFound => {
-                const basename = std.fs.path.basename(current);
+                const basename = std.Io.Dir.path.basename(current);
                 if (basename.len == 0) return err;
                 try missing_components.append(arena, basename);
 
-                const parent = std.fs.path.dirname(current) orelse return err;
+                const parent = std.Io.Dir.path.dirname(current) orelse return err;
                 if (std.mem.eql(u8, parent, current)) return err;
                 current = parent;
             },
@@ -974,7 +1004,7 @@ fn resolveAbsoluteCreateTargetFromNearestExisting(
             var i = missing_components.items.len;
             while (i > 0) {
                 i -= 1;
-                resolved = try std.fs.path.join(arena, &.{ resolved, missing_components.items[i] });
+                resolved = try std.Io.Dir.path.join(arena, &.{ resolved, missing_components.items[i] });
             }
             return resolved;
         } else |err| switch (err) {
@@ -984,16 +1014,16 @@ fn resolveAbsoluteCreateTargetFromNearestExisting(
                     var i = missing_components.items.len;
                     while (i > 0) {
                         i -= 1;
-                        resolved_target = try std.fs.path.join(arena, &.{ resolved_target, missing_components.items[i] });
+                        resolved_target = try std.Io.Dir.path.join(arena, &.{ resolved_target, missing_components.items[i] });
                     }
                     return resolveAbsoluteCreateTargetPath(arena, resolved_target, depth + 1);
                 }
 
-                const basename = std.fs.path.basename(current);
+                const basename = std.Io.Dir.path.basename(current);
                 if (basename.len == 0) return err;
                 try missing_components.append(arena, basename);
 
-                const parent = std.fs.path.dirname(current) orelse return err;
+                const parent = std.Io.Dir.path.dirname(current) orelse return err;
                 if (std.mem.eql(u8, parent, current)) return err;
                 current = parent;
             },
@@ -1021,9 +1051,9 @@ fn ensureCreateTargetSymlinksInsideWorkspace(
                     try ensureCreateTargetSymlinksInsideWorkspace(arena, workspace_root, target, depth + 1);
                 }
 
-                const basename = std.fs.path.basename(current);
+                const basename = std.Io.Dir.path.basename(current);
                 if (basename.len == 0) return err;
-                const parent = std.fs.path.dirname(current) orelse return err;
+                const parent = std.Io.Dir.path.dirname(current) orelse return err;
                 if (std.mem.eql(u8, parent, current)) return err;
                 current = parent;
             },
@@ -1039,15 +1069,15 @@ fn symlinkTargetAbsolute(arena: std.mem.Allocator, path: []const u8) !?[]const u
     };
     if (stat.kind != .sym_link) return null;
 
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const len = try std.Io.Dir.readLinkAbsolute(io_mod.getIo(), path, &buf);
     const target = buf[0..len];
-    if (std.fs.path.isAbsolute(target)) {
-        return try std.fs.path.resolve(arena, &.{target});
+    if (std.Io.Dir.path.isAbsolute(target)) {
+        return try std.Io.Dir.path.resolveAlloc(arena, &.{target});
     }
 
-    const parent = std.fs.path.dirname(path) orelse return error.PathOutsideWorkspace;
-    return try std.fs.path.resolve(arena, &.{ parent, target });
+    const parent = std.Io.Dir.path.dirname(path) orelse return error.PathOutsideWorkspace;
+    return try std.Io.Dir.path.resolveAlloc(arena, &.{ parent, target });
 }
 
 pub fn ensurePathInsideWorkspace(workspace_root: []const u8, absolute: []const u8) !void {
@@ -1061,11 +1091,11 @@ pub fn workspaceRelativePath(
     absolute: []const u8,
 ) ![]const u8 {
     if (!pathInside(workspace_root, absolute)) return arena.dupe(u8, absolute);
-    return std.fs.path.relative(arena, "/", null, workspace_root, absolute) catch try arena.dupe(u8, absolute);
+    return std.Io.Dir.path.relativeAlloc(arena, "/", null, workspace_root, absolute) catch try arena.dupe(u8, absolute);
 }
 
 pub fn ensureParentDirectories(path_abs: []const u8) !void {
-    const parent = std.fs.path.dirname(path_abs) orelse return;
+    const parent = std.Io.Dir.path.dirname(path_abs) orelse return;
 
     var root = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), "/", .{});
     defer root.close(io_mod.getIo());
@@ -1088,15 +1118,15 @@ fn resolveWorkspacePathEntryParts(
     const cleaned = std.mem.trim(u8, input_path, path_entry_whitespace);
     if (cleaned.len == 0) return error.InvalidPath;
 
-    if (invalidPathEntryBasename(std.fs.path.basename(cleaned))) return error.InvalidPath;
+    if (invalidPathEntryBasename(std.Io.Dir.path.basename(cleaned))) return error.InvalidPath;
 
-    const absolute = if (std.fs.path.isAbsolute(cleaned))
-        try std.fs.path.resolve(arena, &.{cleaned})
+    const absolute = if (std.Io.Dir.path.isAbsolute(cleaned))
+        try std.Io.Dir.path.resolveAlloc(arena, &.{cleaned})
     else
-        try std.fs.path.resolve(arena, &.{ workspace_root, cleaned });
+        try std.Io.Dir.path.resolveAlloc(arena, &.{ workspace_root, cleaned });
 
-    const parent = std.fs.path.dirname(absolute) orelse return error.PathOutsideWorkspace;
-    const basename = std.fs.path.basename(absolute);
+    const parent = std.Io.Dir.path.dirname(absolute) orelse return error.PathOutsideWorkspace;
+    const basename = std.Io.Dir.path.basename(absolute);
     if (invalidPathEntryBasename(basename)) return error.InvalidPath;
 
     return .{ .parent = parent, .basename = basename };
@@ -1126,8 +1156,8 @@ pub fn pathInside(root: []const u8, candidate: []const u8) bool {
     if (std.mem.eql(u8, root, candidate)) return true;
     if (!std.mem.startsWith(u8, candidate, root)) return false;
     if (root.len == 0) return false;
-    if (root[root.len - 1] == std.fs.path.sep) return true;
-    return candidate.len > root.len and candidate[root.len] == std.fs.path.sep;
+    if (root[root.len - 1] == std.Io.Dir.path.sep) return true;
+    return candidate.len > root.len and candidate[root.len] == std.Io.Dir.path.sep;
 }
 
 test "pathInside preserves exact child empty-root and prefix semantics" {
@@ -1147,7 +1177,7 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
 
 fn createTestSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []const u8, is_directory: bool) !void {
     const builtin = @import("builtin");
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     dir.symLink(io_mod.getIo(), target_path, link_path, .{ .is_directory = is_directory }) catch |err| {
         if (err == error.AccessDenied or std.mem.eql(u8, @errorName(err), "Permission" ++ "Denied")) {
             return error.SkipZigTest;
@@ -1170,10 +1200,10 @@ test "bounded resolver anchors existing workspace target at workspace root" {
 
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const expected = try std.fs.path.join(arena, &.{ workspace, "src", "file.txt" });
+    const expected = try std.Io.Dir.path.join(arena, &.{ workspace, "src", "file.txt" });
 
-    var primary: [std.fs.max_path_bytes]u8 = undefined;
-    var secondary: [std.fs.max_path_bytes]u8 = undefined;
+    var primary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var secondary: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var components: [8]BoundedFileTargetComponent = undefined;
 
     const resolved = try resolveFileMutationTargetBounded(
@@ -1212,8 +1242,8 @@ test "bounded resolver anchors existing explicit external target at parent" {
     defer alloc.free(external_parent);
     const external = try io_mod.dirRealpathAlloc(arena, tmp.dir, "external/file.txt");
 
-    var primary: [std.fs.max_path_bytes]u8 = undefined;
-    var secondary: [std.fs.max_path_bytes]u8 = undefined;
+    var primary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var secondary: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var components: [8]BoundedFileTargetComponent = undefined;
 
     const resolved = try resolveFileMutationTargetBounded(
@@ -1248,10 +1278,10 @@ test "bounded resolver resolves missing external final target from existing pare
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const expected = try std.fs.path.join(arena, &.{ external, "missing.txt" });
+    const expected = try std.Io.Dir.path.join(arena, &.{ external, "missing.txt" });
 
-    var primary: [std.fs.max_path_bytes]u8 = undefined;
-    var secondary: [std.fs.max_path_bytes]u8 = undefined;
+    var primary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var secondary: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var components: [8]BoundedFileTargetComponent = undefined;
 
     const resolved = try resolveFileMutationTargetBounded(
@@ -1282,8 +1312,8 @@ test "bounded resolver rejects component scratch overflow" {
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
 
-    var primary: [std.fs.max_path_bytes]u8 = undefined;
-    var secondary: [std.fs.max_path_bytes]u8 = undefined;
+    var primary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var secondary: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var components: [2]BoundedFileTargetComponent = undefined;
 
     try std.testing.expectError(
@@ -1302,7 +1332,7 @@ test "bounded resolver rejects component scratch overflow" {
 
 test "bounded resolver resolves contained intermediate symlinks and preserves final symlink entry" {
     const builtin = @import("builtin");
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -1322,18 +1352,18 @@ test "bounded resolver resolves contained intermediate symlinks and preserves fi
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const expected_contained = try std.fs.path.join(arena, &.{ workspace, "real", "target.txt" });
-    const external_file = try std.fs.path.join(arena, &.{ external, "target.txt" });
-    const expected_missing = try std.fs.path.join(arena, &.{ workspace, "real", "missing-parent", "target.txt" });
-    const expected_final_link = try std.fs.path.join(arena, &.{ workspace, "final-link.txt" });
+    const expected_contained = try std.Io.Dir.path.join(arena, &.{ workspace, "real", "target.txt" });
+    const external_file = try std.Io.Dir.path.join(arena, &.{ external, "target.txt" });
+    const expected_missing = try std.Io.Dir.path.join(arena, &.{ workspace, "real", "missing-parent", "target.txt" });
+    const expected_final_link = try std.Io.Dir.path.join(arena, &.{ workspace, "final-link.txt" });
 
     try createTestSymlinkOrSkip(tmp.dir, "real", "workspace/contained-dir-link", true);
     try createTestSymlinkOrSkip(tmp.dir, "real/missing-parent", "workspace/missing-dir-link", true);
     try createTestSymlinkOrSkip(tmp.dir, external, "workspace/external-dir-link", true);
     try createTestSymlinkOrSkip(tmp.dir, external_file, "workspace/final-link.txt", false);
 
-    var primary: [std.fs.max_path_bytes]u8 = undefined;
-    var secondary: [std.fs.max_path_bytes]u8 = undefined;
+    var primary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var secondary: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var components: [8]BoundedFileTargetComponent = undefined;
 
     const contained = try resolveFileMutationTargetBounded(
@@ -1398,7 +1428,7 @@ test "bounded resolver resolves contained intermediate symlinks and preserves fi
 
 test "bounded resolver reports intermediate symlink loops" {
     const builtin = @import("builtin");
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
 
@@ -1412,8 +1442,8 @@ test "bounded resolver reports intermediate symlink loops" {
     try createTestSymlinkOrSkip(tmp.dir, "loop-b", "workspace/loop-a", true);
     try createTestSymlinkOrSkip(tmp.dir, "loop-a", "workspace/loop-b", true);
 
-    var primary: [std.fs.max_path_bytes]u8 = undefined;
-    var secondary: [std.fs.max_path_bytes]u8 = undefined;
+    var primary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var secondary: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var components: [8]BoundedFileTargetComponent = undefined;
 
     try std.testing.expectError(
@@ -1430,7 +1460,7 @@ test "bounded resolver reports intermediate symlink loops" {
 }
 
 test "bounded resolver does not allocate while resolving from fixed scratch" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1445,8 +1475,8 @@ test "bounded resolver does not allocate while resolving from fixed scratch" {
     try std.testing.expectError(error.OutOfMemory, failing_alloc.alloc(u8, 1));
     const allocation_attempts_before = failing.alloc_index;
 
-    var primary: [std.fs.max_path_bytes]u8 = undefined;
-    var secondary: [std.fs.max_path_bytes]u8 = undefined;
+    var primary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var secondary: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var components: [4]BoundedFileTargetComponent = undefined;
 
     const resolved = try resolveFileMutationTargetBounded(
@@ -1479,10 +1509,10 @@ test "bounded resolver read-only create mode does not create target or parents" 
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const expected = try std.fs.path.join(arena, &.{ external, "new-parent", "target.txt" });
+    const expected = try std.Io.Dir.path.join(arena, &.{ external, "new-parent", "target.txt" });
 
-    var primary: [std.fs.max_path_bytes]u8 = undefined;
-    var secondary: [std.fs.max_path_bytes]u8 = undefined;
+    var primary: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var secondary: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var components: [8]BoundedFileTargetComponent = undefined;
 
     const resolved = try resolveFileMutationTargetBounded(
@@ -1567,6 +1597,27 @@ test "resolveWorkspacePath rejects absolute paths outside the workspace" {
 
     const result = resolveWorkspacePath(arena, workspace, outside, .existing);
     try std.testing.expectError(error.PathOutsideWorkspace, result);
+}
+
+test "literal path resolution preserves filename spaces while raw entry trims" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = " name ", .data = "literal" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "name", .data = "raw" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const literal = try resolve_workspace_or_external_literal_path(alloc, root, " name ");
+    defer alloc.free(literal);
+    const raw = try resolveWorkspaceOrExternalPath(alloc, root, " name ");
+    defer alloc.free(raw);
+    const expected = try std.Io.Dir.path.join(alloc, &.{ root, " name " });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, literal);
+    try std.testing.expectEqualStrings("name", std.Io.Dir.path.basename(raw));
+    try std.testing.expectError(error.InvalidPath, resolve_workspace_or_external_literal_path(alloc, root, ""));
 }
 
 test "resolveWorkspaceOrExternalPath allows explicit absolute existing paths outside the workspace" {
@@ -1658,8 +1709,8 @@ test "external resolver supports create targets below home and outside workspace
     defer alloc.free(home);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const external_target = try std.fs.path.join(arena, &.{ external, "new", "nested.txt" });
-    const home_target = try std.fs.path.join(arena, &.{ home, "new", "nested.txt" });
+    const external_target = try std.Io.Dir.path.join(arena, &.{ external, "new", "nested.txt" });
+    const home_target = try std.Io.Dir.path.join(arena, &.{ home, "new", "nested.txt" });
 
     const from_relative = try resolveWorkspaceOrExternalPathWithHome(
         arena,
@@ -1843,7 +1894,7 @@ test "external resolver preserves workspace intent for lexical re-entry" {
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
     const inside_file = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace/inside.txt");
-    const create_target = try std.fs.path.join(arena, &.{ workspace, "new", "nested.txt" });
+    const create_target = try std.Io.Dir.path.join(arena, &.{ workspace, "new", "nested.txt" });
 
     const existing = try resolveWorkspaceOrExternalPathWithHome(
         arena,
@@ -1899,7 +1950,7 @@ test "external resolver normalizes aliases without shell expansion" {
     defer alloc.free(workspace);
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
-    const home_with_separator = try std.fmt.allocPrint(arena, "{s}/", .{home});
+    const home_with_separator = try arena.print("{s}/", .{home});
     const inside = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace/inside.txt");
     const literal_home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace/$HOME/literal.txt");
     const literal_star = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace/*/literal.txt");
@@ -1966,7 +2017,7 @@ test "external resolver canonicalizes a symlinked home root" {
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
     const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
-    const home_link = try std.fs.path.join(arena, &.{ root, "home-link" });
+    const home_link = try std.Io.Dir.path.join(arena, &.{ root, "home-link" });
     const home_file = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home/file.txt");
 
     const resolved = try resolveWorkspaceOrExternalPathWithHome(
@@ -2024,8 +2075,8 @@ test "external create resolver handles absolute outside and workspace targets" {
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
     const existing_outside = try io_mod.dirRealpathAlloc(arena, tmp.dir, "external/existing.txt");
-    const missing_outside = try std.fs.path.join(arena, &.{ external, "missing.txt" });
-    const missing_inside = try std.fs.path.join(arena, &.{ workspace, "missing", "new.txt" });
+    const missing_outside = try std.Io.Dir.path.join(arena, &.{ external, "missing.txt" });
+    const missing_inside = try std.Io.Dir.path.join(arena, &.{ workspace, "missing", "new.txt" });
 
     const resolved_existing = try resolveWorkspaceOrExternalPathWithHome(arena, workspace, existing_outside, null, .create);
     try std.testing.expectEqualStrings(existing_outside, resolved_existing);
@@ -2053,13 +2104,13 @@ test "resolveWorkspaceOrExternalCreatePath allows missing external targets" {
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const missing_external = try std.fs.path.join(arena, &.{ external, "missing", "new.txt" });
+    const missing_external = try std.Io.Dir.path.join(arena, &.{ external, "missing", "new.txt" });
 
     const resolved = try resolveWorkspaceOrExternalPathWithHome(arena, workspace, missing_external, null, .create);
     try std.testing.expectEqualStrings(missing_external, resolved);
 
     const relative_escape = try resolveWorkspaceOrExternalPathWithHome(arena, workspace, "../external/escape.txt", null, .create);
-    const expected_escape = try std.fs.path.join(arena, &.{ external, "escape.txt" });
+    const expected_escape = try std.Io.Dir.path.join(arena, &.{ external, "escape.txt" });
     try std.testing.expectEqualStrings(expected_escape, relative_escape);
 }
 
@@ -2080,11 +2131,11 @@ test "resolveWorkspaceOrExternalCreatePath resolves dangling symlink targets out
     defer alloc.free(workspace);
     const actual_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "actual");
     defer alloc.free(actual_dir);
-    const actual_missing = try std.fs.path.join(arena, &.{ actual_dir, "missing.txt" });
+    const actual_missing = try std.Io.Dir.path.join(arena, &.{ actual_dir, "missing.txt" });
     try createTestSymlinkOrSkip(tmp.dir, actual_missing, "allowed/link.txt", false);
 
     const link_path = try io_mod.dirRealpathAlloc(arena, tmp.dir, "allowed");
-    const requested = try std.fs.path.join(arena, &.{ link_path, "link.txt" });
+    const requested = try std.Io.Dir.path.join(arena, &.{ link_path, "link.txt" });
 
     const resolved = try resolveWorkspaceOrExternalPathWithHome(arena, workspace, requested, null, .create);
     try std.testing.expectEqualStrings(actual_missing, resolved);
@@ -2105,7 +2156,7 @@ test "resolveWorkspacePath create rejects dangling final symlink escaping worksp
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const external_missing = try std.fs.path.join(arena, &.{ external, "missing.txt" });
+    const external_missing = try std.Io.Dir.path.join(arena, &.{ external, "missing.txt" });
     try createTestSymlinkOrSkip(tmp.dir, external_missing, "workspace/outside-link", false);
 
     const result = resolveWorkspacePath(arena, workspace, "outside-link", .create);
@@ -2149,7 +2200,7 @@ test "resolveWorkspacePath create preserves dangling symlink targeting workspace
     try createTestSymlinkOrSkip(tmp.dir, "missing-inside.txt", "workspace/inside-link", false);
 
     const resolved = try resolveWorkspacePath(arena, workspace, "inside-link", .create);
-    const expected = try std.fs.path.join(arena, &.{ workspace, "inside-link" });
+    const expected = try std.Io.Dir.path.join(arena, &.{ workspace, "inside-link" });
     try std.testing.expectEqualStrings(expected, resolved);
 }
 
@@ -2184,7 +2235,7 @@ test "resolveWorkspacePathEntry rejects absolute paths outside the workspace" {
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const outside_path = try std.fs.path.join(arena, &.{ external, "outside.txt" });
+    const outside_path = try std.Io.Dir.path.join(arena, &.{ external, "outside.txt" });
 
     const result = resolveWorkspacePathEntry(arena, workspace, outside_path);
     try std.testing.expectError(error.PathOutsideWorkspace, result);
@@ -2204,7 +2255,7 @@ test "resolveWorkspacePathEntryCreate uses nearest existing parent for missing n
     defer alloc.free(workspace);
 
     const resolved = try resolveWorkspacePathEntryCreate(arena, workspace, "missing/deeper/final.txt");
-    const expected = try std.fs.path.join(arena, &.{ workspace, "missing", "deeper", "final.txt" });
+    const expected = try std.Io.Dir.path.join(arena, &.{ workspace, "missing", "deeper", "final.txt" });
 
     try ensurePathInsideWorkspace(workspace, resolved);
     try std.testing.expectEqualStrings(expected, resolved);
@@ -2212,7 +2263,7 @@ test "resolveWorkspacePathEntryCreate uses nearest existing parent for missing n
 
 test "resolveWorkspacePathEntryExisting preserves the final symlink entry" {
     const builtin = @import("builtin");
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2233,7 +2284,7 @@ test "resolveWorkspacePathEntryExisting preserves the final symlink entry" {
 
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const expected_link = try std.fs.path.join(arena, &.{ workspace, "link.txt" });
+    const expected_link = try std.Io.Dir.path.join(arena, &.{ workspace, "link.txt" });
     const followed_target = try io_mod.realpathAlloc(arena, expected_link);
 
     const resolved = try resolveWorkspacePathEntryExisting(arena, workspace, "link.txt");
@@ -2253,8 +2304,8 @@ test "ensureParentDirectories creates missing absolute parent directories" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const file_path = try std.fs.path.join(arena, &.{ root, "a", "b", "created.txt" });
-    const parent_path = try std.fs.path.join(arena, &.{ root, "a", "b" });
+    const file_path = try std.Io.Dir.path.join(arena, &.{ root, "a", "b", "created.txt" });
+    const parent_path = try std.Io.Dir.path.join(arena, &.{ root, "a", "b" });
 
     try ensureParentDirectories(file_path);
 

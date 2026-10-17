@@ -1,5 +1,5 @@
 const std = @import("std");
-const change_tracker = @import("change_tracker.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("workspace_access.zig");
@@ -58,6 +58,7 @@ pub const OmissionReason = enum {
     non_regular,
     symlink,
     selection_cap,
+    host_unreadable,
 
     pub fn label(self: OmissionReason) []const u8 {
         return switch (self) {
@@ -69,8 +70,55 @@ pub const OmissionReason = enum {
             .non_regular => "non-regular rule file",
             .symlink => "symlinked rule file",
             .selection_cap => "selection cap",
+            .host_unreadable => "host cannot read instruction files",
         };
     }
+};
+
+/// One project instruction file read through a host. `bytes` is owned by the
+/// allocator passed to `InstructionFileReader.read` and holds the first
+/// `@min(total_bytes, max_bytes)` bytes.
+pub const InstructionFile = struct {
+    bytes: []u8,
+    total_bytes: u64,
+};
+
+pub const InstructionFileError = Allocator.Error || error{
+    /// The host has no instruction file access.
+    HostUnreadable,
+    /// The host failed, timed out, or returned malformed or non-UTF-8 content.
+    Unreadable,
+    /// The path is outside what the host allows fx to read.
+    UnsafePath,
+};
+
+/// Reads project instruction files (AGENTS.md) through an embedding host.
+pub const InstructionFileReader = struct {
+    read_fn: *const fn (Allocator, path: []const u8, max_bytes: usize) InstructionFileError!?InstructionFile,
+    /// Largest prefix one read copies; callers never request more.
+    max_read_bytes: usize,
+
+    /// Returns null when the file does not exist. The read may block on the host.
+    pub fn read(self: InstructionFileReader, alloc: Allocator, path: []const u8, max_bytes: usize) InstructionFileError!?InstructionFile {
+        return self.read_fn(alloc, path, max_bytes);
+    }
+};
+
+/// Where the default provider finds project instruction files.
+pub const InstructionFiles = union(enum) {
+    /// The local filesystem, with HOME taken from the environment.
+    filesystem,
+    /// A host workspace. `home` is an absolute host path borrowed from the
+    /// composing host for the lifetime of the registry that carries it.
+    host: struct {
+        home: []const u8,
+        reader: InstructionFileReader,
+    },
+    /// A host workspace exists but cannot read instruction files. The provider
+    /// reports the omission instead of silently skipping AGENTS.md.
+    host_unreadable,
+    /// No workspace exists, so there are no instruction files to read.
+    none,
 };
 
 pub const ContextOmissionInput = struct {
@@ -80,20 +128,20 @@ pub const ContextOmissionInput = struct {
 
 pub const ContextOmissionSummary = struct {
     omitted_count: usize,
-    reason_counts: [std.meta.fields(OmissionReason).len]usize,
+    reason_counts: [@typeInfo(OmissionReason).@"enum".field_names.len]usize,
     digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 };
 
 pub const ContextOmissionSummaryBuilder = struct {
     omitted_count: usize = 0,
-    reason_counts: [std.meta.fields(OmissionReason).len]usize = @splat(0),
+    reason_counts: [@typeInfo(OmissionReason).@"enum".field_names.len]usize = @splat(0),
     hasher: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
 
     pub fn add(self: *ContextOmissionSummaryBuilder, source: []const u8, reason: OmissionReason) void {
         self.omitted_count += 1;
-        self.reason_counts[@intFromEnum(reason)] += 1;
+        self.reason_counts[@backingInt(reason)] += 1;
         self.hasher.update("fx.context.omission-record\x00");
-        self.hasher.update(&.{@intFromEnum(reason)});
+        self.hasher.update(&.{@backingInt(reason)});
         hashUsize(&self.hasher, source.len);
         self.hasher.update(source);
     }
@@ -131,7 +179,11 @@ pub const InitialContextInput = struct {
     targets: []const ApplicableTarget = &.{},
     omissions: []const ContextOmissionInput = &.{},
     omission_summary: ?ContextOmissionSummary = null,
+    /// Internal request reconstruction only; ordinary gathers retain their work limits.
+    bounded_reconstruction: bool = false,
     context_limits: context_limits.Values = .{},
+    /// Assigned by `Registry` from its composition when routed through it.
+    instruction_files: InstructionFiles = .filesystem,
 };
 
 pub const LaterContextInput = struct {
@@ -141,6 +193,8 @@ pub const LaterContextInput = struct {
     delivered_sources: []const []const u8,
     evaluated_endpoints: []const []const u8,
     context_limits: context_limits.Values = .{},
+    /// Assigned by `Registry` from its composition when routed through it.
+    instruction_files: InstructionFiles = .filesystem,
 };
 
 /// Owns provider-produced context bytes and delivery-state additions. The
@@ -250,7 +304,9 @@ pub const TransientContextInput = struct {
     access_scope: ?workspace_access.AccessScope = null,
     interactive: bool,
     permission_mode: types.PermissionMode,
-    tracker: ?*change_tracker.ChangeTracker,
+    /// True when the resumed session history references shell execution handles
+    /// the current process does not own; the model must not reuse them.
+    stale_shell_handles: bool = false,
 };
 
 pub const Provider = struct {
@@ -277,12 +333,31 @@ pub const Provider = struct {
     }
 };
 
+fn gather_empty_context(_: Allocator, _: InitialContextInput) ProviderError!ProviderContext {
+    return .{};
+}
+
+fn append_no_context(_: StaticContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+fn append_no_transient_context(_: TransientContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+pub const empty_provider = Provider{
+    .id = "core.empty_context",
+    .gather_project_context_fn = gather_empty_context,
+    .select_applicable_project_context_fn = selectNoApplicableProjectContext,
+    .append_static_fn = append_no_context,
+    .append_transient_fn = append_no_transient_context,
+};
+
 pub fn selectNoApplicableProjectContext(_: Allocator, _: LaterContextInput) ProviderError!ProviderContext {
     return .{};
 }
 
 pub const Registry = struct {
     default_provider: Provider,
+    /// Every gather and selection routed through this registry reads project
+    /// instruction files from this source, so later context matches startup.
+    instruction_files: InstructionFiles = .filesystem,
 
     pub fn defaultProvider(self: Registry) Provider {
         return self.default_provider;
@@ -290,7 +365,9 @@ pub const Registry = struct {
 
     pub fn gatherDefaultSnapshot(self: Registry, alloc: Allocator, input: InitialContextInput) ProviderError!GatheredContextSnapshot {
         const provider = self.defaultProvider();
-        var gathered = try provider.gatherProjectContext(alloc, input);
+        var routed = input;
+        routed.instruction_files = self.instruction_files;
+        var gathered = try provider.gatherProjectContext(alloc, routed);
         errdefer gathered.deinit(alloc);
 
         var snapshot: GatheredContextSnapshot = .{
@@ -320,7 +397,9 @@ pub const Registry = struct {
     }
 
     pub fn selectDefaultApplicableContext(self: Registry, alloc: Allocator, input: LaterContextInput) ProviderError!ProviderContext {
-        return self.defaultProvider().selectApplicableProjectContext(alloc, input);
+        var routed = input;
+        routed.instruction_files = self.instruction_files;
+        return self.defaultProvider().selectApplicableProjectContext(alloc, routed);
     }
 
     pub fn appendDefaultStatic(self: Registry, input: StaticContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
@@ -421,13 +500,11 @@ pub const EntryPoint = enum {
 pub const DriftStatus = enum {
     intentional,
     temporary,
-    phase12_follow_up,
 
     fn label(self: DriftStatus) []const u8 {
         return switch (self) {
             .intentional => "intentional",
             .temporary => "temporary",
-            .phase12_follow_up => "phase12_follow_up",
         };
     }
 };
@@ -732,7 +809,7 @@ test "entrypoint model-visible layout snapshot covers major entrypoints" {
 test "context registry routes the default provider" {
     const Fixture = struct {
         fn gather(alloc: Allocator, input: InitialContextInput) ProviderError!ProviderContext {
-            return .{ .content = try std.fmt.allocPrint(alloc, "project:{s}", .{input.workspace_root}) };
+            return .{ .content = try alloc.print("project:{s}", .{input.workspace_root}) };
         }
 
         fn appendStatic(input: StaticContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
@@ -740,7 +817,7 @@ test "context registry routes the default provider" {
         }
 
         fn appendTransient(input: TransientContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
-            const content = try std.fmt.allocPrint(alloc, "runtime:{s}", .{input.workspace_root});
+            const content = try alloc.print("runtime:{s}", .{input.workspace_root});
             try messages.append(alloc, .{ .role = .system, .content = content });
         }
     };
@@ -758,8 +835,6 @@ test "context registry routes the default provider" {
     defer snapshot.deinit(alloc);
     const contribution = snapshot.contribution orelse return error.TestExpectedEqual;
 
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(alloc);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -771,13 +846,57 @@ test "context registry routes the default provider" {
         .workspace_root = "/workspace",
         .interactive = true,
         .permission_mode = .ask,
-        .tracker = &tracker,
     }, arena, &messages);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqualStrings("test.default_context", contribution.provider_id);
     try std.testing.expectEqualStrings("project:/workspace", messages.items[0].content.?);
     try std.testing.expectEqualStrings("runtime:/workspace", messages.items[1].content.?);
+}
+
+test "registry routes its instruction file source to gathers and later selections" {
+    const Fixture = struct {
+        var gathered: ?std.meta.Tag(InstructionFiles) = null;
+        var selected: ?std.meta.Tag(InstructionFiles) = null;
+
+        fn gather(_: Allocator, input: InitialContextInput) ProviderError!ProviderContext {
+            gathered = std.meta.activeTag(input.instruction_files);
+            return .{};
+        }
+
+        fn select(_: Allocator, input: LaterContextInput) ProviderError!ProviderContext {
+            selected = std.meta.activeTag(input.instruction_files);
+            return .{};
+        }
+
+        fn appendStatic(_: StaticContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+        fn appendTransient(_: TransientContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+    };
+
+    const registry = Registry{
+        .default_provider = .{
+            .id = "test.instruction_files",
+            .gather_project_context_fn = Fixture.gather,
+            .select_applicable_project_context_fn = Fixture.select,
+            .append_static_fn = Fixture.appendStatic,
+            .append_transient_fn = Fixture.appendTransient,
+        },
+        .instruction_files = .host_unreadable,
+    };
+    const alloc = std.testing.allocator;
+    var snapshot = try registry.gatherDefaultSnapshot(alloc, .{ .workspace_root = "/workspace", .instruction_files = .filesystem });
+    defer snapshot.deinit(alloc);
+    var later = try registry.selectDefaultApplicableContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = &.{},
+        .delivered_sources = &.{},
+        .evaluated_endpoints = &.{},
+    });
+    defer later.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?std.meta.Tag(InstructionFiles), .host_unreadable), Fixture.gathered);
+    try std.testing.expectEqual(@as(?std.meta.Tag(InstructionFiles), .host_unreadable), Fixture.selected);
 }
 
 test "gathered context snapshot duplicates provenance and content ownership" {
@@ -847,7 +966,7 @@ test "delivery state copies snapshot seeds and atomically takes selection identi
 }
 
 test "delivery state commit leaves selection identities owned on reserve failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var selected: ProviderContext = .{
         .delivered_sources = try dupeOwnedStrings(alloc, &.{"/workspace/src/AGENTS.md"}),
         .evaluated_endpoints = try dupeOwnedStrings(alloc, &.{"/workspace/src/nested"}),
@@ -888,7 +1007,7 @@ test "gathered context snapshot cleans partial allocation failures" {
         .append_static_fn = Fixture.appendStatic,
         .append_transient_fn = Fixture.appendTransient,
     } };
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
 
     var gather_probe = std.testing.FailingAllocator.init(backing, .{});
     var gathered = try registry.gatherDefaultSnapshot(gather_probe.allocator(), .{ .workspace_root = "/workspace" });

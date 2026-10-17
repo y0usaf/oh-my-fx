@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
+import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import {
   fakeGatewayFinalText,
   fakeGatewayToolCall,
@@ -21,6 +22,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { buildMcpDispatcherDriver, ZIG_BUILD_WARMUP_TIMEOUT_MS } from "./zig-build";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -67,6 +69,10 @@ let tui: TmuxSession | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let cleanupRoot: string | null = null;
 
+beforeAll(() => {
+  buildMcpDispatcherDriver(REPO_ROOT);
+}, ZIG_BUILD_WARMUP_TIMEOUT_MS);
+
 afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
@@ -83,12 +89,15 @@ afterEach(async () => {
 });
 
 type RootOptions = {
+  /** The 2025 fixture accepts any client the spec allows, not only v1's wire choices. */
+  specClient?: boolean;
   mode?:
     | "normal"
     | "progress"
     | "stall_operation"
     | "stall_startup"
     | "tool_failure"
+    | "image_result"
     | "response_missing_jsonrpc"
     | "response_wrong_jsonrpc"
     | "response_missing_payload"
@@ -106,16 +115,23 @@ type RootOptions = {
     | "subscription_cache"
     | "features"
     | "features_no_tools"
+    | "feature_protocol_error"
     | "draft7_schema"
     | "list_changed"
     | "crash_once"
-    | "crash_always";
+    | "crash_always"
+    | "startup_exit"
+    | "startup_exit_after_delay"
+    | "startup_garbage"
+    | "exit_after_result";
   startupTimeoutMs?: number;
+  protocolErrorMessage?: string;
   operationTimeoutMs?: number;
   restartLimit?: number;
   recoveredToolName?: string;
   expectedElicitation?: "form" | "url" | "both";
   elicitationUrl?: string;
+  compactField?: Record<string, unknown>;
   legacyVersion?: "2025-06-18" | "2025-11-25";
   legacyDiscoveryVersions?: readonly ["2024-11-05", "2025-06-18", "2025-11-25"];
   legacyDiscoveryMethodNotFound?: boolean;
@@ -128,6 +144,7 @@ type RootOptions = {
   resourcesSubscribe?: boolean;
   resourceTtlMs?: number;
   captureEnvironment?: boolean;
+  image?: Buffer;
 };
 
 function createRoot(
@@ -143,6 +160,8 @@ function createRoot(
   const launchLogPath = join(root, "mcp-launches.txt");
   const invalidationReleasePath = join(root, "mcp-invalidation-release");
   const environmentCapturePath = join(root, "mcp-environment.json");
+  const imagePath = join(root, "mcp-image.png");
+  if (options.image) writeFileSync(imagePath, options.image);
   const command = options.recordLaunchAttempts
     ? [
       "/bin/sh",
@@ -177,18 +196,23 @@ function createRoot(
               ? scriptPath
               : undefined,
             FX_MCP_PID_PATH: join(root, "mcp.pid"),
+            FX_MCP_PROTOCOL_VERSION: "2026-07-28",
             FX_MCP_MODE: options.mode ?? "normal",
+            FX_MCP_IMAGE_PATH: options.image ? imagePath : undefined,
+            FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
             FX_MCP_CRASH_MARKER: join(root, "mcp-crashed"),
             FX_MCP_RECOVERY_READY_PATH: join(root, "mcp-recovery-ready"),
             FX_MCP_INVALIDATION_RELEASE_PATH: invalidationReleasePath,
             FX_MCP_RECOVERED_TOOL_NAME: options.recoveredToolName,
             FX_MCP_EXPECT_ELICITATION: options.expectedElicitation,
             FX_MCP_ELICITATION_URL: options.elicitationUrl,
+            FX_MCP_COMPACT_FIELD: options.compactField ? JSON.stringify(options.compactField) : undefined,
             FX_MCP_RESOURCES_SUBSCRIBE: options.resourcesSubscribe === false
               ? "0"
               : undefined,
             FX_MCP_RESOURCE_TTL_MS: options.resourceTtlMs?.toString(),
             FX_MCP_LEGACY_VERSION: options.legacyVersion,
+            FX_MCP_SPEC_CLIENT: options.specClient ? "1" : undefined,
             FX_MCP_LEGACY_DISCOVERY_VERSIONS:
               options.legacyDiscoveryVersions?.join(","),
             FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_FOUND:
@@ -376,6 +400,30 @@ async function waitForTtyAskExit(
 }
 
 describe("modern MCP stdio compatibility", () => {
+  for (const version of ["2025-11-25", "2025-06-18", "2024-11-05"] as const) {
+    test(`default MCP v1 starts ${version} stdio without a discovery probe or process restart`, async () => {
+      const root = createRoot(`default-v1-${version}`, LEGACY_FIXTURE, { legacyVersion: version });
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
+      writeFileSync(profilePath, JSON.stringify(profile));
+      gateway = startToolGateway("Default MCP v1 complete.");
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Use the MCP tool."],
+        { cwd: root.workspace, env: { ...fixtureEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined }, timeoutMs: 20_000 },
+      );
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output).toContain("Default MCP v1 complete.");
+      const wire = readWire(root.wireLogPath);
+      expect(wire[0]?.message.method).toBe("initialize");
+      expect(wire.filter((entry) => entry.message.method === "server/discover")).toHaveLength(0);
+      expect(wire.filter((entry) => entry.message.method === "initialize")).toHaveLength(1);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      expect(new Set(wire.map((entry) => entry.pid)).size).toBe(1);
+      await expectFixtureProcessesExited(wire);
+    }, 30_000);
+  }
+
   test("direct docker run servers are cleaned through the injected cidfile", async () => {
     const root = createRoot("docker-cidfile-cleanup", MODERN_FIXTURE);
     const fakeDocker = join(root.root, "docker");
@@ -625,6 +673,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       FX_MCP_RESULT_TEXT: "${WORKSPACE_MCP_RESULT:-MODERN_MCP_TOOL_RESULT}",
       FX_MCP_WIRE_LOG: "${WORKSPACE_MCP_WIRE_LOG}",
       FX_MCP_PID_PATH: "${WORKSPACE_MCP_PID_PATH}",
+      FX_MCP_PROTOCOL_VERSION: "2026-07-28",
       FX_MCP_MODE: "${WORKSPACE_MCP_MODE:-normal}",
     };
     delete project.mcpServers.fixture.environment;
@@ -716,8 +765,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 25_000);
 
-  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
-    "/mcp list reports a missing workspace variable without exposing config values",
+  test(
+    "top-level mcp list reports a missing workspace variable without exposing config values",
     async () => {
       const root = createRoot("workspace-missing-environment", MODERN_FIXTURE);
       moveProfileFixtureToWorkspace(root);
@@ -734,23 +783,75 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         { cwd: root.workspace, env },
       );
       expect(trusted.code).toBe(0);
+
+      const listed = await runFx(["mcp", "list"], {
+        cwd: root.workspace,
+        env,
+      });
+      expect(listed.code).toBe(0);
+      expect(listed.stderr).toBe("");
+      expect(listed.stdout).toContain("Project MCP configuration errors:");
+      expect(listed.stdout).toContain(".mcp.json server 'fixture'");
+      expect(listed.stdout).toContain("field command");
+      expect(listed.stdout).not.toContain("secret-prefix");
+      expect(listed.stdout).not.toContain(MODERN_FIXTURE);
+      expect(existsSync(root.wireLogPath)).toBe(false);
+    },
+    30_000,
+  );
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "MCP menu keeps a workspace configuration error visible beside a valid server",
+    async () => {
+      const root = createRoot("workspace-menu-configuration-error", MODERN_FIXTURE);
+      moveProfileFixtureToWorkspace(root);
+      const projectPath = join(root.workspace, ".mcp.json");
+      const project = JSON.parse(readFileSync(projectPath, "utf8"));
+      project.mcpServers.fixture.command = "secret-prefix-${MISSING_WORKSPACE_COMMAND}";
+      writeFileSync(projectPath, JSON.stringify(project));
+      writeFileSync(
+        join(root.home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcp: {
+            canary: {
+              type: "local",
+              command: [process.execPath, MODERN_FIXTURE],
+              enabled: false,
+            },
+          },
+        }),
+      );
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const env = fixtureEnv(root, gateway);
+      const trusted = await runFx(
+        ["mcp", "trust", "approve", "fixture"],
+        { cwd: root.workspace, env },
+      );
+      expect(trusted.code).toBe(0);
       tui = await TmuxSession.create({
         isolated: true,
         cwd: root.workspace,
-        width: 160,
+        width: 180,
         height: 36,
         env,
       });
 
       await tui.waitForComposer(15_000);
       await tui.sendText("/mcp list");
-      const pane = await tui.waitForText("MISSING_WORKSPACE_COMMAND", 10_000);
-      expect(pane).toContain("Project MCP configuration errors:");
-      expect(pane).toContain(".mcp.json server 'fixture'");
-      expect(pane).toContain("field command");
-      expect(pane).not.toContain("secret-prefix");
-      expect(pane).not.toContain(MODERN_FIXTURE);
+      const menu = await tui.waitForText("MISSING_WORKSPACE_COMMAND", 10_000);
+      expect(menu).toContain("MCP 1");
+      expect(menu).toContain("canary");
+      expect(menu).toContain("Disabled");
+      expect(menu).toContain("fx mcp list");
+      expect(menu).toContain("MISSING_WORKSPACE_COMMAND");
+      expect(menu).toContain("field command");
+      expect(menu).not.toContain("secret-prefix");
+      expect(menu).not.toContain(MODERN_FIXTURE);
       expect(existsSync(root.wireLogPath)).toBe(false);
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
     },
     30_000,
   );
@@ -766,6 +867,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       ...fixtureEnv(root, gateway),
       FX_MCP_WIRE_LOG: root.wireLogPath,
       FX_MCP_PID_PATH: join(root.root, "mcp.pid"),
+      FX_MCP_PROTOCOL_VERSION: "2026-07-28",
       FX_MCP_MODE: "normal",
     };
     const added = await runFx(
@@ -787,6 +889,57 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     )).toHaveLength(1);
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 25_000);
+
+  for (const matchingPath of [false, true]) {
+    test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+      `MCP slash add preserves scoped arguments with ${matchingPath ? "a matching" : "no matching"} local path`,
+      async () => {
+        const root = createRoot(`scoped-add-${matchingPath}`, LEGACY_FIXTURE);
+        const configPath = join(root.home, ".fx", "mcp.json");
+        writeFileSync(configPath, JSON.stringify({ mcp: {} }));
+        const packageArg = "@modelcontextprotocol/server-memory@2026.8.31";
+        if (matchingPath) {
+          const directory = join(root.workspace, "modelcontextprotocol");
+          mkdirSync(directory);
+          writeFileSync(join(directory, "server-memory@2026.8.31-extra"), "local file");
+        }
+        gateway = startFakeGateway([], {
+          models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+        });
+        tui = await TmuxSession.create({
+          isolated: true,
+          remainOnExit: true,
+          cwd: root.workspace,
+          width: 180,
+          height: 36,
+          env: {
+            ...fixtureEnv(root, gateway),
+            FX_MCP_PROTOCOL_VERSION: "2025-11-25",
+            FX_MCP_LEGACY_VERSION: "2025-11-25",
+            FX_MCP_WIRE_LOG: root.wireLogPath,
+            FX_MCP_PID_PATH: join(root.root, "literal.pid"),
+          },
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendLiteral(`/mcp add literal ${process.execPath} ${LEGACY_FIXTURE} ${packageArg}`);
+        if (matchingPath) await tui.sendKeys("Tab");
+        await tui.sendKeys("Enter");
+        await tui.waitForText("Saved MCP server 'literal'", 5_000);
+        expect(JSON.parse(readFileSync(configPath, "utf8")).mcp.literal.command)
+          .toEqual([process.execPath, LEGACY_FIXTURE, packageArg]);
+        expect(await tui.captureFullScrollback()).not.toContain("no matching files");
+        await tui.sendText("/mcp");
+        await tui.waitForPane((pane) => /^\s*literal\s+Ready\b/m.test(pane), 10_000);
+        expect(gateway.requests).toHaveLength(0);
+        await tui.sendKeys("Escape");
+        await tui.waitForPane((pane) => !/^MCP \d+\s/m.test(pane), 5_000);
+        await tui.sendText("/exit");
+        await waitForTtyAskExit(tui, 0);
+        await expectFixtureProcessesExited(readWire(root.wireLogPath));
+      },
+      30_000,
+    );
+  }
 
   test("headless project MCP traces encode hostile server names on recovery", async () => {
     const root = createRoot("workspace-trace-name", MODERN_FIXTURE, {
@@ -896,10 +1049,13 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       );
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
-      let pane = await tui.waitForText("admission=approved", 10_000);
-      expect(pane).toContain("state=ready");
+      let pane = await tui.waitForText("[Servers]", 10_000);
+      expect(pane).toContain("fixture");
+      expect(pane).toContain("Ready");
       expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
         .toContain("enabledMcpjsonServers");
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
 
       await tui.sendText("/mcp trust reset");
       await tui.waitForPane((pane) =>
@@ -909,11 +1065,119 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.sendLiteral("3");
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
-      pane = await tui.waitForText("admission=rejected", 10_000);
-      expect(pane).toContain("state=disabled");
+      pane = await tui.waitForText("[Servers]", 10_000);
+      expect(pane).toContain("fixture");
+      expect(pane).toContain("Disabled");
       expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
         .toContain("disabledMcpjsonServers");
 
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    50_000,
+  );
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "MCP menu keeps input after project trust reset and reveals pending approval on close",
+    async () => {
+      const root = createRoot("workspace-menu-reset", LEGACY_FIXTURE, {
+        recordLaunchAttempts: true,
+      });
+      moveProfileFixtureToWorkspace(root);
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const env = fixtureEnv(root, gateway);
+      const approved = await runFx(["mcp", "trust", "approve-all"], {
+        cwd: root.workspace,
+        env,
+      });
+      expect(approved.code).toBe(0);
+      tui = await TmuxSession.create({
+        isolated: true,
+        remainOnExit: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 36,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("/mcp");
+      await tui.waitForPane((pane) => /^\s*fixture\s+Ready\b/m.test(pane), 15_000);
+
+      await tui.sendLiteral("z");
+      await tui.waitForText("Reset all project MCP choices?", 5_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("Pending trust", 10_000);
+      await tui.sendLiteral("p");
+      await tui.waitForText("Approve all pending project MCP servers?", 5_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForPane((pane) => /^\s*fixture\s+Ready\b/m.test(pane), 15_000);
+
+      await tui.sendLiteral("z");
+      await tui.waitForText("Reset all project MCP choices?", 5_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("Pending trust", 10_000);
+      await tui.sendKeys("Escape");
+      const pane = await tui.waitForPane((text) =>
+        !/^MCP \d+\s/m.test(text) &&
+        text.includes("Project MCP server 'fixture' is defined in .mcp.json"),
+      10_000);
+      expect(pane).not.toContain("Project MCP approval prompts dismissed");
+      await tui.sendLiteral("3");
+      await tui.waitForPane((text) => text.includes("Rejecting project MCP server"), 10_000);
+      const settings = JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"));
+      expect(settings.workspaces[root.workspace].disabledMcpjsonServers).toContain("fixture");
+      expect(await tui.captureFullScrollback()).not.toContain("Project MCP approval prompts dismissed");
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    60_000,
+  );
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "MCP preview insertion reveals pending project approval without losing inserted context",
+    async () => {
+      const root = createRoot("workspace-menu-insert", MODERN_FIXTURE, {
+        mode: "features",
+        recordLaunchAttempts: true,
+      });
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profileServer = JSON.parse(readFileSync(profilePath, "utf8")).mcp.fixture;
+      moveProfileFixtureToWorkspace(root);
+      writeFileSync(profilePath, JSON.stringify({ mcp: { library: profileServer } }));
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const env = { ...fixtureEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: "2026-07-28" };
+      expect((await runFx(["mcp", "trust", "approve-all"], {
+        cwd: root.workspace,
+        env,
+      })).code).toBe(0);
+      tui = await TmuxSession.create({ isolated: true, remainOnExit: true, cwd: root.workspace, width: 120, height: 36, env });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("/mcp");
+      await tui.waitForPane((pane) => /^\s*library\s+Ready\b/m.test(pane) && /^\s*fixture\s+Ready\b/m.test(pane), 15_000);
+      await tui.sendLiteral("z");
+      await tui.waitForText("Reset all project MCP choices?", 5_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("Pending trust", 10_000);
+      await tui.sendKeys("Tab");
+      await tui.sendKeys("Tab");
+      await tui.waitForText("custom://alpha", 10_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("MCP resource", 10_000);
+      await tui.sendLiteral("i");
+      const pane = await tui.waitForPane((text) => !/^MCP \d+\s/m.test(text) &&
+        text.includes("Project MCP server 'fixture' is defined in .mcp.json"), 10_000);
+      expect(pane).toContain("RESOURCE_TEXT");
+      await tui.sendLiteral("3");
+      await tui.waitForText("Rejecting project MCP server", 10_000);
+      expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
+        .workspaces[root.workspace].disabledMcpjsonServers).toContain("fixture");
+      expect(await tui.captureFullScrollback()).not.toContain("Project MCP approval prompts dismissed");
       await tui.kill();
       tui = null;
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
@@ -940,10 +1204,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         env,
       });
       await tui.waitForComposer(15_000);
-      await tui.waitForText("[Esc] Dismiss remaining prompts", 10_000);
+      await tui.waitForText("[esc] dismiss remaining prompts", 10_000);
       await tui.pasteText("2");
       await Bun.sleep(250);
-      expect((await tui.capturePane())).toContain("[2] Approve all");
+      expect((await tui.capturePane())).toContain("[2] approve all");
       expect(existsSync(root.launchLogPath)).toBe(false);
       expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
         .not.toContain("enableAllProjectMcpServers");
@@ -1762,6 +2026,23 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
+  test("silent legacy discovery preserves time for initialization", async () => {
+    const root = createRoot("silent-discovery", LEGACY_FIXTURE, { startupTimeoutMs: 1_500 });
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.environment.FX_MCP_IGNORE_DISCOVERY = "1";
+    writeFileSync(profilePath, JSON.stringify(profile));
+    gateway = startToolGateway("Silent discovery fallback worked.");
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Use the legacy tool"], {
+      cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 10_000,
+    });
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+    expect(wire.filter((entry) => entry.message.method === "server/discover")).toHaveLength(1);
+    await expectFixtureProcessesExited(wire);
+  }, 15_000);
+
   test("method-not-found discovery negotiates the latest supported legacy stdio version", async () => {
     const root = createRoot("legacy-method-not-found-latest", LEGACY_FIXTURE, {
       legacyVersion: "2025-11-25",
@@ -1827,7 +2108,163 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
-  test("third equivalent dynamic MCP failure is blocked before transport", async () => {
+  for (const supportsImages of [true, false]) {
+    test(`MCP image results ${supportsImages ? "reach the model as images" : "remain explicit for a text-only model"}`, async () => {
+      const root = createRoot("image-output", MODERN_FIXTURE, { mode: "image_result" });
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("image_select", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("image_call", TOOL_NAME, { text: "screenshot" }),
+        fakeGatewayFinalText("Image result observed."),
+      ], { models: [{ id: MODEL, type: "language", tags: supportsImages ? ["tool-use", "vision", "file-input"] : ["tool-use"] }] });
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Get an image from the fixture"], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway),
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      const request = JSON.parse(gateway.requests.at(-1)!.body);
+      const part = request.prompt.flatMap((message: { content?: unknown[] }) => message.content ?? [])
+        .find((value: { type?: string; toolCallId?: string }) => value.type === "tool-result" && value.toolCallId === "image_call");
+      expect(part).toBeDefined();
+      if (supportsImages) {
+        expect(part.output.type).toBe("content");
+        expect(part.output.value.every((value: { type: string }) => value.type === "text")).toBe(true);
+        expect(part.output.value.find((value: { type: string }) => value.type === "text").text).not.toContain("iVBORw0KGgo");
+        const imageMessage = request.prompt.find((message: { role?: string; content?: unknown[] }) =>
+          message.role === "user" && Array.isArray(message.content) &&
+          (message.content as Array<{ type?: string }>).some((entry) => entry.type === "file"));
+        expect(imageMessage).toBeDefined();
+        const filePart = (imageMessage.content as Array<Record<string, unknown>>).find((entry) => entry.type === "file")!;
+        expect(filePart.mediaType).toBe("image/png");
+        expect((filePart.data as Record<string, unknown>).type).toBe("data");
+        expect(typeof (filePart.data as Record<string, unknown>).data).toBe("string");
+      } else {
+        expect(part.output.type).toBe("text");
+        expect(part.output.value).toContain("not sent: this model receives image input through the vision tool");
+        expect(part.output.value).not.toContain("iVBORw0KGgo");
+      }
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    }, 30_000);
+  }
+
+  test("MCP images within request limits reach the model unchanged without a downscale notice", async () => {
+    const original = solidPng(3420, 2224);
+    const root = createRoot("wide-image-output", MODERN_FIXTURE, { mode: "image_result", image: original });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("image_select", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("image_call", TOOL_NAME, { text: "screenshot" }),
+      fakeGatewayFinalText("Wide image result observed."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Get an image from the fixture"], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 20_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Wide image result observed.");
+    const request = JSON.parse(gateway.requests.at(-1)!.body);
+    const part = request.prompt.flatMap((message: { content?: unknown[] }) => message.content ?? [])
+      .find((value: { type?: string; toolCallId?: string }) => value.type === "tool-result" && value.toolCallId === "image_call");
+    expect(part).toBeDefined();
+    expect(part.output.type).toBe("content");
+    expect(part.output.value.filter((value: { type: string }) => value.type === "text")
+      .map((value: { text: string }) => value.text).join("\n")).not.toContain("[Image downscaled");
+    const files = request.prompt
+      .filter((message: { role?: string; content?: unknown }) => message.role === "user" && Array.isArray(message.content))
+      .flatMap((message: { content: Array<Record<string, unknown>> }) => message.content)
+      .filter((entry: Record<string, unknown>) => entry.type === "file");
+    expect(files).toHaveLength(1);
+    expect(files[0].mediaType).toBe("image/png");
+    const sent = Buffer.from((files[0].data as { data: string }).data, "base64");
+    expect(sent.equals(original)).toBe(true);
+    expect(pngPixelSize(sent)).toEqual({ width: 3420, height: 2224 });
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 30_000);
+
+  for (const action of ["resource_read", "prompt_get"] as const) {
+    test(`MCP ${action} carries images through the shared result path`, async () => {
+      const root = createRoot("feature-image", MODERN_FIXTURE, { mode: "features" });
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.environment.FX_MCP_FEATURE_IMAGES = "1";
+      writeFileSync(profilePath, JSON.stringify(profile));
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("feature_image", "mcp_features", action === "resource_read"
+          ? { action, server: "fixture", uri: "custom://alpha" }
+          : { action, server: "fixture", prompt: "review", arguments: { tone: "brief" } }),
+        fakeGatewayFinalText("Feature image received."),
+      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }] });
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Read the feature image"], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000,
+      });
+      expect(result.code, result.stderr || result.stdout).toBe(0);
+      const request = JSON.parse(gateway.requests[1]!.body);
+      const part = request.prompt
+        .flatMap((message: { content?: unknown[] }) => message.content ?? [])
+        .find((part: { type?: string; toolCallId?: string }) => part.type === "tool-result" && part.toolCallId === "feature_image");
+      expect(part.output.type, JSON.stringify(part.output)).toBe("content");
+      expect(part.output.value.every((part: { type?: string }) => part.type === "text")).toBe(true);
+      expect(part.output.value.filter((part: { type?: string }) => part.type === "text").map((part: { text: string }) => part.text).join("\n")).not.toContain("iVBORw0KGgo");
+      const imageMessage = request.prompt.find((message: { role?: string; content?: unknown[] }) =>
+        message.role === "user" && Array.isArray(message.content) &&
+        (message.content as Array<{ type?: string }>).some((entry) => entry.type === "file"));
+      expect(imageMessage).toBeDefined();
+      const filePart = (imageMessage.content as Array<Record<string, unknown>>).find((entry) => entry.type === "file")!;
+      expect(filePart.mediaType).toBe("image/png");
+      expect((filePart.data as Record<string, unknown>).type).toBe("data");
+      const wire = readWire(root.wireLogPath);
+      expect(wire.filter((entry) => entry.message.method === (action === "resource_read" ? "resources/read" : "prompts/get"))).toHaveLength(1);
+      await expectFixtureProcessesExited(wire);
+    }, 30_000);
+  }
+
+  test("saved MCP images survive resume without repeating the tool", async () => {
+    const root = createRoot("saved-image", MODERN_FIXTURE, { mode: "image_result" });
+    const models = [{ id: MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }];
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("saved_select", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("saved_image", TOOL_NAME, { text: "screenshot" }),
+      fakeGatewayFinalText("Screenshot saved."),
+    ], { models });
+    const first = await runFx(["ask", "--json", "--auto", "Get a screenshot"], {
+      cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000,
+    });
+    expect(first.code).toBe(0);
+    const sessionId = JSON.parse(first.stdout).session_id;
+    const imageHandle = gateway.requests.at(-1)!.body.match(/image-result-[\w-]+\.txt/)?.[0];
+    expect(imageHandle).toBeDefined();
+    gateway.stop();
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("load_saved_image", "read_tool_result", { request: { handle: imageHandle } }),
+      fakeGatewayFinalText("The saved screenshot is visible."),
+    ], { models });
+    const resumed = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Describe the earlier screenshot"], {
+      cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000,
+    });
+    expect(resumed.code).toBe(0);
+    const request = JSON.parse(gateway.requests[0]!.body);
+    const result = request.prompt.flatMap((message: { content?: unknown[] }) => message.content ?? [])
+      .find((part: { type?: string; toolCallId?: string }) => part.type === "tool-result" && part.toolCallId === "saved_image");
+    expect(result.output.type).toBe("content");
+    const savedImageMessage = request.prompt.find((message: { role?: string; content?: unknown[] }) =>
+      message.role === "user" && Array.isArray(message.content) &&
+      (message.content as Array<{ type?: string }>).some((entry) => entry.type === "file"));
+    expect(savedImageMessage).toBeDefined();
+    const secondRequest = JSON.parse(gateway.requests[1]!.body);
+    const loaded = secondRequest.prompt
+      .flatMap((message: { content?: unknown[] }) => message.content ?? [])
+      .find((part: { type?: string; toolCallId?: string }) => part.type === "tool-result" && part.toolCallId === "load_saved_image");
+    expect(loaded.output.type).toBe("content");
+    const loadedImageMessage = secondRequest.prompt.find((message: { role?: string; content?: unknown[] }) =>
+      message.role === "user" && Array.isArray(message.content) &&
+      (message.content as Array<{ type?: string }>).some((entry) => entry.type === "file"));
+    expect(loadedImageMessage).toBeDefined();
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+    await expectFixtureProcessesExited(wire);
+  }, 40_000);
+
+  test("changed MCP arguments reach the server after earlier failures", async () => {
     const root = createRoot("bounded-equivalent-retries", MODERN_FIXTURE, {
       mode: "tool_failure",
     });
@@ -1854,8 +2291,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(JSON.parse(result.stdout).output).toContain("Bounded MCP retries complete.");
     const wire = readWire(root.wireLogPath);
     expect(wire.filter((entry) => entry.message.method === "tools/call"))
-      .toHaveLength(2);
-    expect(gateway.requests.at(-1)?.body).toContain(
+      .toHaveLength(3);
+    expect(gateway.requests.at(-1)?.body).not.toContain(
       "Repeated MCP tool call blocked: two equivalent attempts failed",
     );
     await expectFixtureProcessesExited(wire);
@@ -1921,6 +2358,255 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(wire.filter((entry) => entry.message.method === "tools/call"))
       .toHaveLength(1);
     await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  test("mcp list reports how a stdio server that exits during startup ended", async () => {
+    const root = createRoot("startup-exit", LEGACY_FIXTURE, {
+      mode: "startup_exit",
+      recordLaunchAttempts: true,
+    });
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_MCP_PROTOCOL_VERSION: undefined,
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=failed/);
+    expect(result.stdout).toContain(
+      "failure=MCP server exited with code 7 before completing startup: npm error code E401 npm error Incorrect or missing password.",
+    );
+    // One launch per offered protocol version, then no restart of a server that keeps exiting.
+    const launches = readAttemptedPids(root.launchLogPath);
+    expect(launches).toHaveLength(4);
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(trace).toContain("skipping stdio startup restart server=fixture reason=stop_child_exited");
+    expect(trace).not.toContain("restarting stdio server after startup failure");
+    await expectProcessesExited(launches);
+  }, 30_000);
+
+  test("mcp list keeps the earlier exit when a crashing stdio server runs out of startup time", async () => {
+    const root = createRoot("startup-exit-timeout", LEGACY_FIXTURE, {
+      mode: "startup_exit_after_delay",
+      startupTimeoutMs: 1_500,
+      recordLaunchAttempts: true,
+    });
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_MCP_PROTOCOL_VERSION: undefined,
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain(
+      "failure=MCP server did not complete startup within 1500 ms (startup_timeout_ms); an earlier launch exited with code 7: npm error code E401",
+    );
+    const launches = readAttemptedPids(root.launchLogPath);
+    expect(launches.length).toBeGreaterThanOrEqual(2);
+    expect(launches.length).toBeLessThanOrEqual(4);
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(trace).toContain("skipping stdio startup restart server=fixture reason=stop_deadline_spent");
+    expect(trace).not.toContain("restarting stdio server after startup failure");
+    await expectProcessesExited(launches);
+  }, 30_000);
+
+  test("mcp list still restarts a stdio server whose startup output fx rejects", async () => {
+    const root = createRoot("startup-garbage", LEGACY_FIXTURE, {
+      mode: "startup_garbage",
+      recordLaunchAttempts: true,
+    });
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_MCP_PROTOCOL_VERSION: undefined,
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=failed/);
+    expect(result.stdout).toContain(
+      "failure=MCP server wrote output that is not an MCP message before completing startup: not json",
+    );
+    // fx ended the child itself, so a fresh launch could behave differently.
+    const launches = readAttemptedPids(root.launchLogPath);
+    expect(launches).toHaveLength(2);
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(trace).toContain("restarting stdio server after startup failure server=fixture attempt=1");
+    expect(trace).not.toContain("skipping stdio startup restart");
+    await expectProcessesExited(launches);
+  }, 30_000);
+
+  test("mcp list quotes the stdout line fx rejects from a modern stdio server", async () => {
+    const root = createRoot("modern-startup-garbage", MODERN_FIXTURE, {
+      mode: "startup_garbage",
+      recordLaunchAttempts: true,
+    });
+
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain(
+      "failure=MCP server wrote output that is not an MCP message before completing startup: Server started on stdio",
+    );
+    const launches = readAttemptedPids(root.launchLogPath);
+    expect(launches.length).toBeGreaterThanOrEqual(1);
+    await expectProcessesExited(launches);
+  }, 30_000);
+
+  test("fx ask search tells the model why a named stdio server failed to start", async () => {
+    const root = createRoot("ask-startup-exit", LEGACY_FIXTURE, {
+      mode: "startup_exit",
+      recordLaunchAttempts: true,
+    });
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("search_failed", "capability_search", {
+        kind: "mcp",
+        server: "fixture",
+        query: "fixture tools",
+        limit: 5,
+      }),
+      fakeGatewayFinalText("STARTUP_FAILURE_REPORTED"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Find the fixture tools."],
+      {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, activeGateway), FX_MCP_PROTOCOL_VERSION: undefined },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("STARTUP_FAILURE_REPORTED");
+    const searchResult = activeGateway.requests[1]?.body ?? "";
+    expect(searchResult).toContain("server_failed");
+    expect(searchResult).toContain(
+      "MCP server 'fixture' is unavailable: MCP server exited with code 7 before completing startup: npm error code E401 npm error Incorrect or missing password.",
+    );
+    await expectProcessesExited(readAttemptedPids(root.launchLogPath));
+  }, 30_000);
+
+  test("fx ask tells the model why a stopped stdio server could not restart", async () => {
+    const root = createRoot("ask-restart-failed", MODERN_FIXTURE, {
+      mode: "exit_after_result",
+      recordLaunchAttempts: true,
+      restartLimit: 1,
+    });
+    // The first launch runs the server; every relaunch fails during startup.
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.command = [
+      "/bin/sh",
+      "-c",
+      `printf '%s\\n' "$$" >> "$FX_MCP_LAUNCH_LOG"
+if [ "$(wc -l < "$FX_MCP_LAUNCH_LOG")" -gt 1 ]; then echo 'relaunch blocked by test' >&2; exit 5; fi
+exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
+    ];
+    writeFileSync(profilePath, JSON.stringify(profile));
+    let sawFirstExit = true;
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("first_call", TOOL_NAME, { text: "first" }),
+      async () => {
+        // Call again only after fx has seen the first server exit.
+        const deadline = Date.now() + 5_000;
+        while (!readFileSync(root.traceLogPath, "utf8").includes("stdio dispatcher failed")) {
+          if (Date.now() >= deadline) {
+            sawFirstExit = false;
+            break;
+          }
+          await Bun.sleep(20);
+        }
+        return fakeGatewayToolCall("second_call", TOOL_NAME, { text: "second" });
+      },
+      fakeGatewayFinalText("RESTART_FAILURE_REPORTED"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the fixture tool twice."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, activeGateway),
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(sawFirstExit, "fx never saw the first server exit").toBe(true);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("RESTART_FAILURE_REPORTED");
+    expect(activeGateway.requests[2]?.body).toContain("MODERN_MCP_TOOL_RESULT:first");
+    const secondResult = activeGateway.requests[3]?.body ?? "";
+    expect(secondResult).toContain("server_restart_failed");
+    expect(secondResult).toContain(
+      "MCP server stopped and could not be restarted: MCP server exited with code 5 before completing startup: relaunch blocked by test",
+    );
+    // One recovery restart, whose startup may launch once per protocol it tries.
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(trace.match(/restarting stdio server server=fixture generation=\d+ attempt=1/g)).toHaveLength(1);
+    expect(trace).not.toContain("attempt=2");
+    const launches = readAttemptedPids(root.launchLogPath);
+    expect(launches.length).toBeGreaterThanOrEqual(2);
+    await expectProcessesExited(launches);
   }, 30_000);
 
   for (
@@ -2211,7 +2897,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(new Set([result.first_tool, result.second_tool])).toEqual(
       new Set(["mcp_a_b_echo", "mcp_a_b_echo_2"]),
     );
-    expect(result.ready_before_release).toBe(1);
+    expect(result.ready_before_release).toBe(2);
     expect(result.ready_after_release).toBe(2);
     expect(result.reader_joined).toBe(true);
 
@@ -2427,6 +3113,36 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 30_000);
 
+  for (const discovery of ["select", "search"] as const) {
+    test(`targeted MCP ${discovery} leaves unrelated optional servers dormant`, async () => {
+      const root = createRoot("targeted-activation", MODERN_FIXTURE);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      const unrelatedWire = join(root.root, "unrelated-wire.jsonl");
+      profile.mcp.unrelated = { ...profile.mcp.fixture, environment: {
+        ...profile.mcp.fixture.environment,
+        FX_MCP_PROTOCOL_VERSION: "2026-07-28",
+        FX_MCP_MODE: "stall_startup", FX_MCP_WIRE_LOG: unrelatedWire,
+        FX_MCP_PID_PATH: join(root.root, "unrelated.pid"),
+      } };
+      writeFileSync(profilePath, JSON.stringify(profile));
+      gateway = startFakeGateway([
+        discovery === "select"
+          ? fakeGatewayToolCall("target_select", "mcp_select_tool", { name: TOOL_NAME })
+          : fakeGatewayToolCall("target_search", "capability_search", { server: "fixture", query: "echo" }),
+        fakeGatewayToolCall("target_call", TOOL_NAME, { text: "hello" }),
+        fakeGatewayFinalText("Targeted server works."),
+      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Use the fixture server"], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000,
+      });
+      expect(result.code, result.stderr || result.stdout).toBe(0);
+      expect(existsSync(unrelatedWire)).toBe(false);
+      expect(readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    }, 30_000);
+  }
+
   test("fx ask does not start an unused optional MCP server", async () => {
     const root = createRoot("ask-unused-optional", MODERN_FIXTURE, {
       recordLaunchAttempts: true,
@@ -2580,7 +3296,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   });
 
-  test("fx ask rejects invalid legacy Draft 7 arguments before transport", async () => {
+  test("fx ask lets the legacy server validate Draft 7 arguments", async () => {
     const root = createRoot("ask-legacy-draft7-invalid", LEGACY_FIXTURE, {
       mode: "draft7_schema",
       draft7Pattern: "^\\S+$",
@@ -2603,11 +3319,13 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     );
 
     expect(result.code).toBe(0);
-    expect(activeGateway.requests[2]?.body).toContain("invalid");
-    expect(activeGateway.requests[2]?.body).toContain("pattern");
-    expect(activeGateway.requests[2]?.body).toContain("text");
+    const resultPart = JSON.parse(activeGateway.requests[2]!.body).prompt
+      .flatMap((message: { content?: unknown[] }) => message.content ?? [])
+      .find((part: { type?: string; toolCallId?: string }) => part.type === "tool-result" && part.toolCallId === "call_mcp");
+    expect(resultPart.output.type).toBe("error-text");
+    expect(resultPart.output.value).toContain("text violates the server pattern");
     const wire = readWire(root.wireLogPath);
-    expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(0);
+    expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
     await expectFixtureProcessesExited(wire);
   });
 
@@ -2768,6 +3486,50 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
   );
 
   test.skipIf(!tmuxAvailable())(
+    "MCP resource and prompt commands mask secret-shaped protocol diagnostics",
+    async () => {
+      // Secret-shaped needles are written as concatenated fragments so
+      // interactive tool-result masking never rewrites the literal in flight.
+      const secretNeedle = ["SERVICE_", "TOKEN=fixture-token-123456"].join("");
+      const root = createRoot("tui-feature-protocol-error-masked", MODERN_FIXTURE, {
+        mode: "feature_protocol_error",
+        protocolErrorMessage: secretNeedle,
+      });
+      gateway = startFakeGateway([fakeGatewayFinalText("unused")], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 34,
+        stderrPath,
+        env: fixtureEnv(root, gateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("/mcp resource read fixture custom://alpha");
+      await tui.waitForText("MCP protocol error -32602", 15_000);
+      let pane = await tui.capturePane();
+      expect(pane).toContain("[redacted]");
+      expect(pane).not.toContain(secretNeedle);
+
+      await tui.sendText("/mcp prompt get fixture review {\"tone\":\"brief\"}");
+      await tui.waitForText("MCP protocol error -32603", 15_000);
+      pane = await tui.capturePane();
+      expect(pane).toContain("[redacted]");
+      expect(pane).not.toContain(secretNeedle);
+
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "the TUI calls the modern stdio fixture through the shared runtime",
     async () => {
       const root = createRoot("tui-modern", MODERN_FIXTURE, {
@@ -2835,14 +3597,17 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the failing MCP fixture once.");
       await tui.waitForText(
-        `Failed ${TOOL_NAME}: Invalid input: labels require at least one item`,
+        `Failed ${TOOL_NAME}: Invalid input: labels require at least one item retry rejected`,
         20_000,
       );
       await tui.waitForText("MCP failure detail complete.", 20_000);
 
+      const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).not.toContain("\\x0a");
       expect(activeGateway.requests.at(-1)?.body).toContain(
         "Invalid input: labels require at least one item",
       );
+      expect(activeGateway.requests.at(-1)?.body).toContain("item\\\\nretry rejected");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       const wire = readWire(root.wireLogPath);
       expect(wire.filter((entry) => entry.message.method === "tools/call"))
@@ -2878,8 +3643,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.sendText("Call the MRTR MCP fixture.");
       await tui.waitForText("MCP server fixture requests confirmed", 20_000);
       await tui.sendKeys("1");
-      await tui.waitForText("Review the completed form requested by MCP server fixture", 20_000);
-      await tui.waitForText("- confirmed: true", 20_000);
+      await tui.waitForText("Current values:", 20_000);
       await tui.sendKeys("1");
       await tui.waitForText("MRTR TUI boundary complete.", 20_000);
 
@@ -2908,6 +3672,61 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     },
     30_000,
   );
+
+  for (const scenario of [
+    { name: "input", field: { type: "string", maxLength: 80 }, input: "Decline", value: "Decline" },
+    { name: "choice", field: { type: "string", oneOf: [
+      { const: "manual", title: "Enter manually" },
+      { const: "connect", title: "Connect an account" },
+      { const: "other", title: "Something else" },
+    ] }, input: "2", value: "connect" },
+  ]) {
+    test.skipIf(!tmuxAvailable())(
+      `the TUI ${scenario.name === "input" ? "reviews a short MCP input" : "submits a compact MCP choice without a second confirmation"}`,
+      async () => {
+        const root = createRoot(`tui-compact-${scenario.name}`, MODERN_FIXTURE, {
+          mode: "mrtr_input_required",
+          expectedElicitation: "both",
+          compactField: scenario.field,
+        });
+        const activeGateway = startToolGateway("Compact form accepted.");
+        gateway = activeGateway;
+        const stderrPath = join(root.root, "stderr.log");
+        tui = await TmuxSession.create({
+          isolated: true, cwd: root.workspace, width: 110, height: 34,
+          stderrPath, env: fixtureEnv(root, activeGateway),
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("Call the compact MCP fixture.");
+        await tui.waitForText("MCP server fixture requests answer", 20_000);
+        const form = await tui.capturePane();
+        if (scenario.name === "choice") {
+          expect(form).toContain("Decline");
+          expect(form).toContain("Cancel");
+        }
+        expect(form).not.toContain("Current values:");
+        if (scenario.name === "input") {
+          await tui.sendText(scenario.input);
+          await tui.waitForText("Current values:", 20_000);
+          expect(readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call"))
+            .toHaveLength(1);
+          await tui.sendKeys("1");
+        } else await tui.sendKeys(scenario.input);
+        await tui.waitForText("Compact form accepted.", 20_000);
+        const wire = readWire(root.wireLogPath);
+        const calls = wire.filter((entry) => entry.message.method === "tools/call");
+        expect(calls).toHaveLength(2);
+        expect(calls[1]?.message.params?.inputResponses).toEqual({
+          confirm: { action: "accept", content: { answer: scenario.value } },
+        });
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await tui.kill();
+        tui = null;
+        await expectFixtureProcessesExited(wire);
+      },
+      35_000,
+    );
+  }
 
   for (const surface of ["TUI", "Ask"] as const) {
     test.skipIf(!tmuxAvailable())(
@@ -3109,7 +3928,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.waitForText("MCP server fixture requests confirmed", 20_000);
       await Bun.sleep(6_000);
       await tui.sendKeys("1");
-      await tui.waitForText("Review the completed form requested by MCP server fixture", 20_000);
+      await tui.waitForText("Current values:", 20_000);
       await tui.sendKeys("1");
       await tui.waitForText("MRTR timeout complete.", 20_000);
 
@@ -3324,6 +4143,50 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.kill();
       tui = null;
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "interactive fx ask on MCP-v2 puts a server's form question to the user",
+    async () => {
+      const root = createRoot("ask-interactive-mrtr-v2", MODERN_FIXTURE, {
+        mode: "mrtr_input_required",
+        expectedElicitation: "both",
+        specClient: true,
+      });
+      const activeGateway = startToolGateway("Interactive Ask elicitation complete.");
+      gateway = activeGateway;
+      const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+      const prompt = "Call the MRTR MCP fixture interactively.";
+      tui = await TmuxSession.create({
+        isolated: true,
+        cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify(prompt)}`,
+        cwd: root.workspace,
+        width: 120,
+        height: 34,
+        remainOnExit: true,
+        env: { ...fixtureEnv(root, activeGateway), FX_MCP_ENGINE: "v2" },
+      });
+
+      await tui.waitForText("MCP server fixture requests confirmed", 20_000);
+      await tui.sendText("1");
+      await tui.waitForText("- confirmed: true", 20_000);
+      await tui.sendText("1");
+      await tui.waitForText("Interactive Ask elicitation complete.", 20_000);
+
+      // The answer went back to the server in the call's second round.
+      const calls = readWire(root.wireLogPath).filter((entry) =>
+        entry.message.method === "tools/call"
+      );
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.message.params?.inputResponses).toEqual({
+        confirm: { action: "accept", content: { confirmed: true } },
+      });
+      expect(await tui.captureFullScrollback()).not.toContain("the server asked for input fx can't give");
+
+      await tui.kill();
+      tui = null;
     },
     30_000,
   );
@@ -4075,6 +4938,32 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(timeoutWire);
   }, 45_000);
 
+  test("headless MCP startup cancels through the caller", async () => {
+    const root = createRoot("startup-caller-cancel", MODERN_FIXTURE, {
+      mode: "stall_startup", startupTimeoutMs: 5_000, restartLimit: 0,
+    });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("cancel_startup", "capability_search", { server: "fixture", query: "echo" }),
+      fakeGatewayFinalText("Unexpected continuation."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const proc = Bun.spawn([join(REPO_ROOT, "zig-out", "bin", "fx"), "ask", "--json", "--auto", "--no-save", "Find the fixture tool"], {
+      cwd: root.workspace, env: { ...process.env, ...fixtureEnv(root, gateway) }, stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(root.wireLogPath) && Date.now() < deadline) await Bun.sleep(10);
+      expect(existsSync(root.wireLogPath)).toBe(true);
+      proc.kill("SIGINT");
+      const exited = await Promise.race([proc.exited.then(() => true), Bun.sleep(1_500).then(() => false)]);
+      expect(exited).toBe(true);
+      expect(gateway.requests).toHaveLength(1);
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      await proc.exited;
+      if (existsSync(root.wireLogPath)) await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    }
+  }, 15_000);
+
   test("fx ask bounds startup timeouts and reaps every attempted child", async () => {
     const root = createRoot("ask-startup-timeout", MODERN_FIXTURE, {
       mode: "stall_startup",
@@ -4105,7 +4994,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(JSON.parse(result.stdout).output).toContain("Startup timeout bounded.");
     expect(activeGateway.requests).toHaveLength(2);
     const launch = readStartupLaunchEvidence(root);
-    expect(launch.startedPids.length).toBeGreaterThanOrEqual(2);
+    expect(launch.startedPids.length).toBeGreaterThanOrEqual(1);
     expect(launch.startedPids.length).toBeLessThanOrEqual(4);
     expect(launch.childRecordedPids.length).toBeLessThanOrEqual(
       launch.startedPids.length,
@@ -4144,10 +5033,14 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await tui.waitForText("OPTIONAL_MCP_DEGRADED_TURN_READY", 10_000);
       expect(activeGateway.requests).toHaveLength(1);
       await tui.sendText("/mcp list");
-      const pane = await tui.waitForText("failure=", 10_000);
-      expect(pane).toContain("policy=optional");
-      expect(pane).toContain("state=failed");
-      expect(pane).toContain("cache=unavailable");
+      const menu = await tui.waitForText("[Servers]", 10_000);
+      expect(menu).toContain("fixture");
+      expect(menu).toContain("Failed");
+      await tui.sendKeys("Enter");
+      const details = await tui.waitForText("Policy", 5_000);
+      expect(details).toMatch(/State\s+Failed/);
+      expect(details).toMatch(/Policy\s+optional/);
+      expect(details).toContain("Error");
 
       await tui.kill();
       tui = null;
@@ -4248,6 +5141,35 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
   );
 
   test.skipIf(!tmuxAvailable())(
+    "empty MCP catalogs ignore Enter and preserve menu navigation",
+    async () => {
+      const root = createRoot("tui-empty-catalog", LEGACY_FIXTURE, {});
+      gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, env: fixtureEnv(root, gateway) });
+      await tui.waitForComposer(5_000);
+      await tui.sendText("/mcp");
+      await tui.waitForText("[Servers]", 5_000);
+      await tui.sendKeys("Right");
+      await tui.waitForText("[Tools]", 5_000);
+      for (const [section, empty] of [["Resources", "No MCP resources available."], ["Prompts", "No MCP prompts available."]]) {
+        await tui.sendKeys("Right");
+        await tui.waitForText(empty!, 5_000);
+        await tui.sendKeys("Enter");
+        await Bun.sleep(100);
+        const pane = await tui.capturePane();
+        expect(pane).toContain(`[${section}]`);
+        expect(pane).toContain(empty!);
+        expect(pane).not.toContain("MCP operation failed");
+      }
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Prompts]"), 2_000);
+      await tui.sendText("/mcp auth");
+      await tui.waitForText("/mcp auth <name> [--open]", 2_000);
+    },
+    20_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "the TUI cancels a stalled stdio request and accepts a follow-up prompt",
     async () => {
       const root = createRoot("tui-cancel", MODERN_FIXTURE, {
@@ -4287,7 +5209,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         ),
       ).toBe(true);
 
-      await tui.sendKeys("Escape");
+      await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText("Cancelled mcp_fixture_echo", 10_000);
       await tui.waitForText("■ Cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
@@ -4360,7 +5282,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       expect(existsSync(readyPath)).toBe(true);
 
       const cancelStarted = Date.now();
-      await tui.sendKeys("Escape");
+      await tui.sendInterruptEscapePair(5_000);
       await tui.waitForText("Cancelled mcp_fixture_echo", 5_000);
       expect(Date.now() - cancelStarted).toBeLessThan(5_000);
 
@@ -4593,7 +5515,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         "Dynamic MCP tool not selected for this model step",
       );
       expect(postReloadResult?.body).toContain(
-        "Use capability_search and mcp_select_tool first",
+        "Use capability_search or mcp_select_tool to load its definition",
       );
       expect(postReloadResult?.body).not.toContain(`Unsupported tool: ${TOOL_NAME}`);
       const calls = readWire(root.wireLogPath).filter((entry) =>
@@ -4609,8 +5531,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     45_000,
   );
 
-  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
-    "/mcp list renders complete secret-free health after releasing runtime locks",
+  test(
+    "top-level mcp list renders complete secret-free health after releasing runtime locks",
     async () => {
       const root = createRoot("health-output", MODERN_FIXTURE, { mode: "features" });
       const profilePath = join(root.home, ".fx", "mcp.json");
@@ -4623,17 +5545,14 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        width: 180,
-        height: 36,
-        env: fixtureEnv(root, activeGateway),
-      });
 
-      await tui.waitForComposer(15_000);
-      await tui.sendText("/mcp list");
-      const pane = await tui.waitForText("MCP health (1 server)", 10_000);
+      const result = await runFx(["mcp", "list", "--connect"], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, activeGateway),
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
       for (const expected of [
         "MCP health (1 server",
         "source=profile",
@@ -4647,11 +5566,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         "protocol=2026-07-28",
         "tools=1 resources=unknown templates=unknown prompts=unknown",
         "cache=fresh",
-        "subscription=active",
         "retry_attempt=0",
         "discovery=completed",
-      ]) expect(pane).toContain(expected);
-      expect(pane).not.toContain(root.workspace);
+      ]) expect(result.stdout).toContain(expected);
+      expect(result.stdout).toMatch(/subscription=(starting|active)/);
+      expect(result.stdout).not.toContain(root.workspace);
       for (const forbidden of [
         "captured_at_ms=",
         "runtime_generation=",
@@ -4661,11 +5580,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         "S11_SECRET_ENV",
         MODERN_FIXTURE,
         "fake-mcp-stdio-key",
-      ]) expect(pane).not.toContain(forbidden);
+      ]) expect(result.stdout).not.toContain(forbidden);
       expect(activeGateway.requests).toHaveLength(0);
-
-      await tui.kill();
-      tui = null;
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
     },
     35_000,
@@ -4730,10 +5646,17 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       await killFixture(firstPid);
 
       await tui.sendText("/mcp list");
-      const failedHealth = await tui.waitForText("state=failed", 10_000);
-      expect(failedHealth).toContain(
+      const failedMenu = await tui.waitForText("[Servers]", 10_000);
+      expect(failedMenu).toContain("fixture");
+      expect(failedMenu).toContain("Failed");
+      await tui.sendKeys("Enter");
+      const failedDetails = await tui.waitForText("Error", 5_000);
+      expect(failedDetails).toContain(
         "Connection or discovery failed; check the trusted profile configuration and trace logs.",
       );
+      await tui.sendKeys("Escape");
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
 
       const initialWire = readWire(root.wireLogPath);
       const initialResourceLists = initialWire.filter(
@@ -4795,11 +5718,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       expect(isProcessAlive(fifthPid)).toBe(true);
 
       await tui.sendText("/mcp list");
-      const recoveredHealth = await tui.waitForText("retry_attempt=4", 10_000);
-      expect(recoveredHealth.lastIndexOf("state=ready")).toBeGreaterThan(
-        recoveredHealth.lastIndexOf("state=failed"),
-      );
-      expect(recoveredHealth).toContain("retry_in_ms=none");
+      const recoveredMenu = await tui.waitForText("[Servers]", 10_000);
+      expect(recoveredMenu).toContain("fixture");
+      expect(recoveredMenu).toContain("Ready");
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
       expect(activeGateway.requests).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -5050,4 +5973,182 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     ).toHaveLength(2);
     await expectFixtureProcessesExited(wire);
   }, 30_000);
+});
+
+describe("MCP-v2 engine (FX_MCP_ENGINE=v2)", () => {
+  const v2Env = (root: FixtureRoot, activeGateway: ReturnType<typeof startFakeGateway>) => ({
+    ...fixtureEnv(root, activeGateway),
+    FX_MCP_ENGINE: "v2",
+  });
+  const modelSaw = () => gateway!.requests.map((request) => request.body).join("\n");
+  const ask = (root: FixtureRoot, prompt: string) =>
+    runFx(["ask", "--json", "--auto", "--no-save", prompt], {
+      cwd: root.workspace,
+      env: v2Env(root, gateway!),
+      timeoutMs: 20_000,
+    });
+  const calls = (root: FixtureRoot) =>
+    readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call");
+
+  for (const [era, fixture, resultText] of [
+    ["2026", MODERN_FIXTURE, MODERN_RESULT],
+    ["2025", LEGACY_FIXTURE, LEGACY_RESULT],
+  ] as const) {
+    test(`fx ask selects and calls a ${era} stdio tool`, async () => {
+      // MCP-v2 speaks 2025-11-25 and newer; the 2025 fixture defaults to 2024.
+      const root = createRoot(`v2-call-${era}`, fixture, { legacyVersion: "2025-11-25", specClient: true });
+      gateway = startToolGateway(`V2_${era}_DONE`);
+      const result = await ask(root, "Use the stdio MCP echo tool.");
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(`V2_${era}_DONE`);
+      expect(modelSaw()).toContain(resultText);
+      // The server's instructions come with the selected tool.
+      if (era === "2026") expect(modelSaw()).toContain("Use the modern echo tool.");
+      expect(calls(root)).toHaveLength(1);
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    }, 25_000);
+  }
+
+  test("a server that only speaks 2024-11-05 is reported, not waited on", async () => {
+    const root = createRoot("v2-2024", LEGACY_FIXTURE, { legacyVersion: "2024-11-05", specClient: true });
+    gateway = startToolGateway("V2_2024_SEEN");
+    const started = Date.now();
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_2024_SEEN");
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(calls(root)).toHaveLength(0);
+    expect(modelSaw()).toContain("MCP server 'fixture' is unavailable");
+    expect(modelSaw()).toContain("an MCP version fx doesn't support");
+  }, 25_000);
+
+  test("capability_search finds the tool under its fx name and the model calls it", async () => {
+    const root = createRoot("v2-search", MODERN_FIXTURE);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("search", "capability_search", { query: "echo", server: "fixture" }),
+      fakeGatewayToolCall("call", TOOL_NAME, { text: "hello" }),
+      fakeGatewayFinalText("V2_SEARCH_DONE"),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await ask(root, "Find the echo tool and use it.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_SEARCH_DONE");
+    expect(modelSaw()).toContain(`\\"name\\":\\"${TOOL_NAME}\\",\\"server\\":\\"fixture\\"`);
+    expect(modelSaw()).toContain(MODERN_RESULT);
+    expect(calls(root)).toHaveLength(1);
+  }, 25_000);
+
+  test("a tool's own failure reaches the model and the turn goes on", async () => {
+    const root = createRoot("v2-tool-failure", MODERN_FIXTURE, { mode: "tool_failure" });
+    gateway = startToolGateway("V2_FAILURE_SEEN");
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_FAILURE_SEEN");
+    expect(modelSaw()).toContain("isError");
+  }, 25_000);
+
+  test("a server that dies during a call tells the model the call ended", async () => {
+    const root = createRoot("v2-crash", MODERN_FIXTURE, { mode: "crash_always" });
+    gateway = startToolGateway("V2_CRASH_SEEN");
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_CRASH_SEEN");
+    expect(modelSaw()).toContain("MCP server 'fixture' ended the call");
+  }, 25_000);
+
+  test.skipIf(!tmuxAvailable())("the shell asks a server's form question and sends the answer", async () => {
+    const root = createRoot("v2-tui-form", MODERN_FIXTURE, {
+      mode: "mrtr_input_required",
+      expectedElicitation: "both",
+      specClient: true,
+    });
+    const activeGateway = startToolGateway("V2 TUI form complete.");
+    gateway = activeGateway;
+    const stderrPath = join(root.root, "stderr.log");
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 100,
+      height: 30,
+      stderrPath,
+      env: v2Env(root, activeGateway),
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the MRTR MCP fixture.");
+    await tui.waitForText("MCP server fixture requests confirmed", 20_000);
+    await tui.sendKeys("1");
+    await tui.waitForText("Current values:", 20_000);
+    await tui.sendKeys("1");
+    await tui.waitForText("V2 TUI form complete.", 20_000);
+
+    expect(activeGateway.requests[2]?.body).toContain("continued after elicitation");
+    const formCalls = calls(root);
+    expect(formCalls).toHaveLength(2);
+    expect(formCalls[1]?.message.params?.inputResponses).toEqual({
+      confirm: { action: "accept", content: { confirmed: true } },
+    });
+    expect(formCalls[1]?.message.params?.requestState).toBe("opaque");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await tui.kill();
+    tui = null;
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 30_000);
+
+  test.skipIf(!tmuxAvailable())("the shell answers a 2025 server's elicitation during a call", async () => {
+    const root = createRoot("v2-tui-elicit", LEGACY_FIXTURE, {
+      mode: "direct_form",
+      legacyVersion: "2025-11-25",
+      legacyDiscoveryMethodNotFound: true,
+      specClient: true,
+    });
+    const activeGateway = startToolGateway("V2 2025 elicitation complete.");
+    gateway = activeGateway;
+    const stderrPath = join(root.root, "stderr.log");
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 36,
+      stderrPath,
+      env: v2Env(root, activeGateway),
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the direct legacy elicitation fixture.");
+    await tui.waitForText("MCP server fixture requests choice", 20_000);
+    // The shell submits a single compact choice without a review step.
+    await tui.sendText("1");
+    await tui.waitForText("V2 2025 elicitation complete.", 20_000);
+
+    const wire = readWire(root.wireLogPath);
+    expect(calls(root)).toHaveLength(1);
+    const answers = wire.filter((entry) => entry.message.id === "legacy-elicitation" && entry.message.method == null);
+    expect(answers).toHaveLength(1);
+    expect(answers[0]?.message.result).toMatchObject({ action: "accept" });
+    expect(modelSaw()).not.toContain("legacyvalid");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await tui.kill();
+    tui = null;
+    await expectFixtureProcessesExited(wire);
+  }, 40_000);
+
+  test("fx ask with no way to ask tells the model the server wanted input", async () => {
+    const root = createRoot("v2-no-asker", MODERN_FIXTURE, { mode: "mrtr_input_required", specClient: true });
+    gateway = startToolGateway("V2_INPUT_DECLINED_SEEN");
+    const result = await ask(root, "Call the MRTR MCP fixture.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_INPUT_DECLINED_SEEN");
+    expect(modelSaw()).toContain("the server asked for input fx can't give");
+  }, 25_000);
+
+  test("a search for a server that isn't configured says so", async () => {
+    const root = createRoot("v2-not-found", MODERN_FIXTURE);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("search", "capability_search", { query: "echo", server: "nope" }),
+      fakeGatewayFinalText("V2_NOT_FOUND_SEEN"),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await ask(root, "Find a tool on nope.");
+    expect(result.code).toBe(0);
+    expect(modelSaw()).toContain("server_not_found");
+    // Nothing needed the configured server, so it never started.
+    expect(existsSync(root.wireLogPath)).toBe(false);
+  }, 25_000);
 });

@@ -5,11 +5,13 @@
 //! moved into `McpRuntime`.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const startup_admission = @import("startup_admission.zig");
 const streamable_http = @import("streamable_http.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const McpAuthConfig = mcp_contract.McpAuthConfig;
@@ -18,6 +20,58 @@ const McpHttpHeader = mcp_contract.McpHttpHeader;
 const McpHttpHeaderEnv = mcp_contract.McpHttpHeaderEnv;
 const McpServerConfig = mcp_contract.McpServerConfig;
 const McpTransport = mcp_contract.McpTransport;
+
+/// Configuration equality includes admission and credential policy. A changed
+/// value needs a new connection owner; equal separately allocated values do not.
+pub fn sameServerConfig(left: McpServerConfig, right: McpServerConfig) bool {
+    return sameConfigValue(McpServerConfig, left, right);
+}
+
+fn sameConfigValue(comptime T: type, left: T, right: T) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => result: {
+            const info = @typeInfo(T).@"struct";
+            inline for (info.field_names, info.field_types) |field_name, field_type| {
+                if (!sameConfigValue(field_type, @field(left, field_name), @field(right, field_name))) break :result false;
+            }
+            break :result true;
+        },
+        .optional => |optional| if (left) |value|
+            if (right) |other| sameConfigValue(optional.child, value, other) else false
+        else
+            right == null,
+        .pointer => |pointer| result: {
+            if (pointer.size != .slice) @compileError("MCP configuration may only borrow slices");
+            if (left.len != right.len) break :result false;
+            for (left, right) |value, other| {
+                if (!sameConfigValue(pointer.child, value, other)) break :result false;
+            }
+            break :result true;
+        },
+        .bool, .int, .@"enum" => left == right,
+        else => @compileError("Handle this MCP configuration value explicitly"),
+    };
+}
+
+test "server reuse compares owned configuration values and all authority fields" {
+    var first_name = [_]u8{ 'o', 'n', 'e' };
+    var second_name = first_name;
+    var first = McpServerConfig{ .name = &first_name, .command = "node", .args = &.{"server.js"} };
+    var second = first;
+    second.name = &second_name;
+    try std.testing.expect(sameServerConfig(first, second));
+    second.args = &.{"other.js"};
+    try std.testing.expect(!sameServerConfig(first, second));
+    second = first;
+    second.allow_stored_credentials = true;
+    try std.testing.expect(!sameServerConfig(first, second));
+    first.source = .workspace;
+    first.scope = .workspace;
+    first.workspace_admission = .approved;
+    second = first;
+    second.workspace_admission = .rejected;
+    try std.testing.expect(!sameServerConfig(first, second));
+}
 
 pub const enabled_servers_key = "enabledMcpjsonServers";
 pub const disabled_servers_key = "disabledMcpjsonServers";
@@ -79,6 +133,8 @@ pub const WorkspaceEnvironmentField = enum {
 };
 
 pub const WorkspaceDiagnostic = struct {
+    /// About `~/.fx/mcp.json` rather than `.mcp.json`.
+    profile: bool = false,
     server_name: ?[]u8 = null,
     environment_variable: ?[]u8 = null,
     environment_field: ?WorkspaceEnvironmentField = null,
@@ -112,10 +168,10 @@ pub fn renderWorkspaceDiagnostic(
             @tagName(value)
         else
             "value";
-        return std.fmt.allocPrint(
-            alloc,
-            ".mcp.json server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
+        return alloc.print(
+            "{s} server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
             .{
+                diagnosticFile(diagnostic),
                 encoded_server.bytes,
                 field,
                 encoded_variable.bytes,
@@ -123,11 +179,14 @@ pub fn renderWorkspaceDiagnostic(
             },
         );
     }
-    return std.fmt.allocPrint(
-        alloc,
-        ".mcp.json server '{s}' was skipped: {s}.",
-        .{ encoded_server.bytes, @tagName(diagnostic.cause) },
+    return alloc.print(
+        "{s} server '{s}' was skipped: {s}.",
+        .{ diagnosticFile(diagnostic), encoded_server.bytes, @tagName(diagnostic.cause) },
     );
+}
+
+fn diagnosticFile(diagnostic: WorkspaceDiagnostic) []const u8 {
+    return if (diagnostic.profile) "~/.fx/mcp.json" else ".mcp.json";
 }
 
 pub const WorkspaceParseResult = struct {
@@ -344,6 +403,7 @@ fn serverEntryShape(value: std.json.Value) bool {
         return std.mem.eql(u8, kind.string, "local") or
             std.mem.eql(u8, kind.string, "stdio") or
             std.mem.eql(u8, kind.string, "http") or
+            std.mem.eql(u8, kind.string, "streamable-http") or
             std.mem.eql(u8, kind.string, "sse");
     }
     return false;
@@ -429,7 +489,7 @@ fn parseWorkspaceJsonInternal(
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 const server_name = try alloc.dupe(u8, entry.key_ptr.*);
-                errdefer alloc.free(server_name);
+                errdefer mem_utils.free(alloc, server_name);
                 try result.diagnostics.append(alloc, .{
                     .server_name = server_name,
                     .cause = .invalid_entry,
@@ -451,11 +511,34 @@ pub fn expandApprovedWorkspaceConfigs(
     result: *WorkspaceParseResult,
     environment: *const std.process.Environ.Map,
 ) Allocator.Error!void {
+    return expandConfigs(alloc, &result.configs, &result.diagnostics, environment, false);
+}
+
+/// Expands `${VAR}` in profile servers too, as MCP-v2 does; a
+/// server that can't be expanded is dropped
+/// with a diagnostic, as in `.mcp.json`.
+pub fn expandProfileConfigs(
+    alloc: Allocator,
+    configs: *std.ArrayList(McpServerConfig),
+    diagnostics: *std.ArrayList(WorkspaceDiagnostic),
+    environment: *const std.process.Environ.Map,
+) Allocator.Error!void {
+    return expandConfigs(alloc, configs, diagnostics, environment, true);
+}
+
+fn expandConfigs(
+    alloc: Allocator,
+    configs: *std.ArrayList(McpServerConfig),
+    diagnostics: *std.ArrayList(WorkspaceDiagnostic),
+    environment: *const std.process.Environ.Map,
+    profile: bool,
+) Allocator.Error!void {
     var expansion_budget = WorkspaceExpansionBudget.init();
     var index: usize = 0;
-    while (index < result.configs.items.len) {
-        const config = &result.configs.items[index];
-        if (config.workspace_admission != .approved) {
+    while (index < configs.items.len) {
+        const config = &configs.items[index];
+        const expands = if (profile) config.source == .profile else config.workspace_admission == .approved;
+        if (!expands) {
             index += 1;
             continue;
         }
@@ -469,27 +552,30 @@ pub fn expandApprovedWorkspaceConfigs(
             continue;
         };
         const server_name = try alloc.dupe(u8, config.name);
-        errdefer alloc.free(server_name);
+        errdefer mem_utils.free(alloc, server_name);
         switch (failure) {
             .missing => |missing| {
-                errdefer alloc.free(missing.variable_name);
-                try result.diagnostics.append(alloc, .{
+                errdefer mem_utils.free(alloc, missing.variable_name);
+                try diagnostics.append(alloc, .{
+                    .profile = profile,
                     .server_name = server_name,
                     .environment_variable = missing.variable_name,
                     .environment_field = missing.field,
                     .cause = .missing_environment_variable,
                 });
             },
-            .invalid => try result.diagnostics.append(alloc, .{
+            .invalid => try diagnostics.append(alloc, .{
+                .profile = profile,
                 .server_name = server_name,
                 .cause = .invalid_entry,
             }),
-            .limit_exceeded => try result.diagnostics.append(alloc, .{
+            .limit_exceeded => try diagnostics.append(alloc, .{
+                .profile = profile,
                 .server_name = server_name,
                 .cause = .environment_expansion_limit_exceeded,
             }),
         }
-        var removed = result.configs.orderedRemove(index);
+        var removed = configs.orderedRemove(index);
         removed.deinit(alloc);
     }
 }
@@ -699,7 +785,7 @@ pub fn parseChoices(
     for (approved) |name| {
         if (containsName(rejected, name)) {
             const server_name = try alloc.dupe(u8, name);
-            errdefer alloc.free(server_name);
+            errdefer mem_utils.free(alloc, server_name);
             try diagnostics.append(alloc, .{
                 .server_name = server_name,
                 .cause = .approved_rejected_overlap,
@@ -907,9 +993,10 @@ fn parseServerEntry(
         (if (kind_value == .string) kind_value.string else return failServerConfig(error.McpConfigInvalidType))
     else
         "local";
+    // Other clients' files spell Streamable HTTP out.
     const transport: McpTransport = if (std.mem.eql(u8, type_string, "sse"))
         .sse
-    else if (std.mem.eql(u8, type_string, "http"))
+    else if (std.mem.eql(u8, type_string, "http") or std.mem.eql(u8, type_string, "streamable-http"))
         .http
     else
         .stdio;
@@ -943,7 +1030,7 @@ fn parseServerEntry(
         const header_env = try parseRemoteHeaderEnv(alloc, object);
         errdefer freeHttpHeaderEnv(alloc, header_env);
         const bearer_token_env = try parseOptionalOwnedString(alloc, object, "bearer_token_env");
-        errdefer if (bearer_token_env) |field| alloc.free(field);
+        errdefer if (bearer_token_env) |field| mem_utils.free(alloc, field);
         if (bearer_token_env) |field| if (!isValidEnvName(field)) return failServerConfig(error.McpConfigInvalidBearerEnvironment);
         var auth = parseProfileAuth(alloc, object) catch |err| switch (err) {
             error.OutOfMemory => return failServerConfig(error.OutOfMemory),
@@ -951,7 +1038,7 @@ fn parseServerEntry(
         };
         errdefer if (auth) |*field| field.deinit(alloc);
         const owned_name = try alloc.dupe(u8, name);
-        errdefer alloc.free(owned_name);
+        errdefer mem_utils.free(alloc, owned_name);
         const owned_url = try alloc.dupe(u8, url_value.string);
         return .{
             .name = owned_name,
@@ -1047,7 +1134,7 @@ fn parseRemoteHeaders(
             return error.McpConfigInvalidHeaders;
         }
         const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(owned_name);
+        errdefer mem_utils.free(alloc, owned_name);
         const owned_value = try alloc.dupe(u8, entry.value_ptr.*.string);
         headers.appendAssumeCapacity(.{ .name = owned_name, .value = owned_value });
     }
@@ -1069,9 +1156,9 @@ fn parseRemoteHeaderEnv(alloc: Allocator, object: std.json.ObjectMap) ![]McpHttp
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, previous.name)) return error.McpConfigInvalidHeaders;
         }
         const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(owned_name);
+        errdefer mem_utils.free(alloc, owned_name);
         const owned_env = try alloc.dupe(u8, entry.value_ptr.*.string);
-        errdefer alloc.free(owned_env);
+        errdefer mem_utils.free(alloc, owned_env);
         try refs.append(alloc, .{
             .name = owned_name,
             .env = owned_env,
@@ -1095,7 +1182,10 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
     auth.client_id = try parseOptionalOwnedString(alloc, auth_object, "client_id");
     auth.client_secret_env = try parseOptionalOwnedString(alloc, auth_object, "client_secret_env");
     auth.client_metadata_url = try parseOptionalOwnedString(alloc, auth_object, "client_metadata_url");
-    if (auth_object.get("scopes")) |field| auth.scopes = try parseStringArray(alloc, field);
+    if (auth_object.get("scopes")) |field| {
+        auth.scopes = try parseStringArray(alloc, field);
+        auth.scopes_configured = true;
+    }
     auth.callback_port = try parseOptionalPort(auth_object, "callback_port");
     if (auth.client_secret_env) |field| {
         if (!isValidEnvName(field) or auth.client_id == null) return error.McpConfigInvalidOAuth;
@@ -1171,11 +1261,11 @@ fn parseCommandSpec(alloc: Allocator, object: std.json.ObjectMap) !ParsedCommand
                 return error.McpMissingCommand;
             }
             const command = try alloc.dupe(u8, command_value.array.items[0].string);
-            errdefer alloc.free(command);
+            errdefer mem_utils.free(alloc, command);
             const args = try alloc.alloc([]u8, command_value.array.items.len - 1);
-            errdefer alloc.free(args);
+            errdefer mem_utils.free(alloc, args);
             var initialized: usize = 0;
-            errdefer for (args[0..initialized]) |arg| alloc.free(arg);
+            errdefer for (args[0..initialized]) |arg| mem_utils.free(alloc, arg);
             for (command_value.array.items[1..], 0..) |field, index| {
                 if (field != .string) return error.McpMissingCommand;
                 args[index] = try alloc.dupe(u8, field.string);
@@ -1206,9 +1296,9 @@ fn parseEnvironment(alloc: Allocator, value: std.json.Value) ![]McpEnvVar {
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .string) return error.McpConfigInvalidEnvironment;
         const key = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(key);
+        errdefer mem_utils.free(alloc, key);
         const entry_value = try alloc.dupe(u8, entry.value_ptr.*.string);
-        errdefer alloc.free(entry_value);
+        errdefer mem_utils.free(alloc, entry_value);
         try vars.append(alloc, .{
             .key = key,
             .value = entry_value,
@@ -1220,9 +1310,9 @@ fn parseEnvironment(alloc: Allocator, value: std.json.Value) ![]McpEnvVar {
 fn parseStringArray(alloc: Allocator, value: std.json.Value) ![][]u8 {
     if (value != .array) return error.McpConfigInvalidStringArray;
     const items = try alloc.alloc([]u8, value.array.items.len);
-    errdefer alloc.free(items);
+    errdefer mem_utils.free(alloc, items);
     var initialized: usize = 0;
-    errdefer for (items[0..initialized]) |item| alloc.free(item);
+    errdefer for (items[0..initialized]) |item| mem_utils.free(alloc, item);
     for (value.array.items, 0..) |field, index| {
         if (field != .string) return error.McpConfigInvalidStringArray;
         items[index] = try alloc.dupe(u8, field.string);
@@ -1264,15 +1354,15 @@ fn appendOwnedName(
     name: []const u8,
 ) !void {
     const owned = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned);
+    errdefer mem_utils.free(alloc, owned);
     try output.append(alloc, owned);
 }
 
 fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     const result = try alloc.alloc([]u8, values.len);
-    errdefer alloc.free(result);
+    errdefer mem_utils.free(alloc, result);
     var initialized: usize = 0;
-    errdefer for (result[0..initialized]) |value| alloc.free(value);
+    errdefer for (result[0..initialized]) |value| mem_utils.free(alloc, value);
     for (values, 0..) |value, index| {
         result[index] = try alloc.dupe(u8, value);
         initialized += 1;
@@ -1510,7 +1600,7 @@ test "workspace template expansion is explicit bounded and deterministic" {
     long_name[0] = 'A';
     @memset(long_name[1..], 'B');
     try environment.put(&long_name, "long-name-value");
-    const long_template = try std.fmt.allocPrint(alloc, "${{{s}}}", .{long_name});
+    const long_template = try alloc.print("${{{s}}}", .{long_name});
     defer alloc.free(long_template);
     var long_budget = WorkspaceExpansionBudget.init();
     var long_expansion = try expandWorkspaceTemplate(
@@ -1642,7 +1732,7 @@ test "workspace environment expansion never refunds rejected entry work" {
 }
 
 test "workspace environment expansion rejects exhausted budget before allocation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var environment = std.process.Environ.Map.init(alloc);
     defer environment.deinit();
     try environment.put("TOKEN", "secret");
@@ -1702,6 +1792,17 @@ test "workspace parsing isolates invalid entries" {
     try std.testing.expectEqualStrings("good", result.configs.items[0].name);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
     try std.testing.expectEqualStrings("bad", result.diagnostics.items[0].server_name.?);
+}
+
+test "streamable-http reads as http in both files" {
+    const alloc = std.testing.allocator;
+    var profile = try parseProfileJson(alloc, "{\"mcpServers\":{\"web\":{\"type\":\"streamable-http\",\"url\":\"https://w.example/mcp\"}}}");
+    defer deinitConfigs(alloc, &profile);
+    try std.testing.expectEqual(McpTransport.http, profile.items[0].transport);
+    var project = try parseWorkspaceJson(alloc, "{\"mcpServers\":{\"web\":{\"type\":\"streamable-http\",\"url\":\"https://w.example/mcp\"}}}", .workspace, .{});
+    defer project.deinit(alloc);
+    try std.testing.expectEqual(McpTransport.http, project.configs.items[0].transport);
+    try std.testing.expectEqual(@as(usize, 0), project.diagnostics.items.len);
 }
 
 test "choice transitions are normalized and reject precedence is stable" {
@@ -1815,7 +1916,7 @@ test "workspace parsing releases every partial allocation failure" {
     var fail_index: usize = 0;
     while (fail_index < 256) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         var result = parseWorkspaceJson(failing.allocator(), json, .workspace, .{}) catch |err| switch (err) {
@@ -1828,7 +1929,7 @@ test "workspace parsing releases every partial allocation failure" {
 }
 
 test "choice parsing and mutation release every partial allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         alloc,

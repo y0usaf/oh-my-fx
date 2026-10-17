@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -8,7 +9,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
+const compaction_activity = @import("../output/compaction_activity.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 
@@ -16,23 +17,38 @@ pub const PendingPhase = enum {
     awaiting_frame,
     awaiting_adoption,
     adopted,
+    awaiting_auth,
     queued,
 };
 
 const PendingPhaseError = error{InvalidPendingPhase};
 
+pub const PendingPromptDraft = struct {
+    turn_id: u64,
+    prompt: []u8,
+    images: []types.ImageAttachment,
+    skill_display_spans: []worker_runtime.SkillDisplaySpan,
+
+    fn deinit(self: PendingPromptDraft, alloc: std.mem.Allocator) void {
+        alloc.free(self.prompt);
+        types.freeImageAttachmentSlice(alloc, self.images);
+        worker_runtime.freeSkillDisplaySpans(alloc, self.skill_display_spans);
+    }
+};
+
 pub const PendingSubmission = struct {
-    draft: worker_runtime.QueuedPromptDraft,
+    draft: PendingPromptDraft,
     phase: PendingPhase = .awaiting_frame,
+    credential_admitted: bool = false,
     skill_refresh_generation: ?u64 = null,
 
-    fn init(draft: worker_runtime.QueuedPromptDraft) PendingSubmission {
+    fn init(draft: PendingPromptDraft) PendingSubmission {
         std.debug.assert(draft.turn_id != 0);
         return .{ .draft = draft };
     }
 
     pub fn deinit(self: *PendingSubmission, alloc: std.mem.Allocator) void {
-        worker_runtime.freeQueuedPromptDraft(alloc, self.draft);
+        self.draft.deinit(alloc);
         self.* = undefined;
     }
 
@@ -66,15 +82,18 @@ pub const PendingSkillRefresh = enum {
 pub const State = struct {
     pending: ?PendingSubmission = null,
     retry_after_auth: bool = false,
+    compaction_pending: bool = false,
+    /// Identity only; auth retains its existing pending execution flag.
+    compaction_operation: ?compaction_activity.OperationId = null,
 };
 
-fn buildQueuedPromptDraft(
+fn buildPendingPromptDraft(
     alloc: std.mem.Allocator,
     turn_id: u64,
     prompt_source: []const u8,
     image_source: []const types.ImageAttachment,
     skill_tokens: []const registered_entities.SkillTokenSpan,
-) !worker_runtime.QueuedPromptDraft {
+) !PendingPromptDraft {
     if (turn_id == 0) return error.InvalidTurnId;
 
     const prompt = try alloc.dupe(u8, prompt_source);
@@ -118,7 +137,75 @@ fn buildQueuedPromptDraft(
 
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
-        const queue_rt = input_queue_runtime.Runtime(App);
+        pub fn request_context_compaction(app: *App) !void {
+            if (app.submission.compaction_pending) return;
+            const observed = app.worker.compactionActivitySnapshot();
+            if (observed.operation) |op| if (op.active()) return;
+            defer app.shell.render_requests.request(.footer);
+            if (!app.hasContextToCompact()) {
+                app.worker.rejectCompactionActivity(.no_op);
+                return;
+            }
+            if (app.submission.pending != null or app.worker.isProcessing() or
+                app.worker.queuedPromptCount() > 0 or app.worker.contextCompactionStatus() != .idle)
+            {
+                app.worker.rejectCompactionActivity(.busy);
+                return;
+            }
+            app.submission.compaction_operation = app.worker.beginCompactionActivity(.manual, null);
+            app.submission.compaction_pending = true;
+            collect_context_compaction(app);
+            if (app.submission.compaction_pending) {
+                debug_trace.logf("input", "manual_compaction_auth_pending", .{});
+            }
+        }
+
+        fn collect_context_compaction(app: *App) void {
+            if (comptime !@hasDecl(App, "enqueueContextCompaction")) return;
+            if (!app.submission.compaction_pending) return;
+            admit_context_compaction(app) catch |err| {
+                settle_pending_compaction(app, if (err == error.WorkerBusy) .{ .outcome = .busy } else compaction_activity.failure(err, .preparation, false));
+                clear_context_compaction(app, "admission_failed");
+                app.submission.retry_after_auth = false;
+                debug_trace.logf("input", "manual compaction admission failed err={s}", .{@errorName(err)});
+                app.shell.render_requests.request(.footer);
+            };
+        }
+
+        fn admit_context_compaction(app: *App) !void {
+            switch (try App.collectPendingPromptCredential(app)) {
+                .pending => return,
+                .rejected => {
+                    settle_pending_compaction(app, compaction_activity.failure(error.CompactionAuthenticationRejected, .preparation, false));
+                    clear_context_compaction(app, "auth_rejected");
+                    app.submission.retry_after_auth = false;
+                    return;
+                },
+                .current => {},
+            }
+            const queued = try app.enqueueContextCompaction(app.submission.compaction_operation.?);
+            if (!queued) settle_pending_compaction(app, .{ .outcome = .busy });
+            app.submission.compaction_pending = false;
+            app.submission.compaction_operation = null;
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn settle_pending_compaction(app: *App, feedback: compaction_activity.Feedback) void {
+            if (comptime !@hasDecl(@TypeOf(app.worker), "settleCompactionActivity")) return;
+            const id = app.submission.compaction_operation orelse return;
+            app.worker.settleCompactionActivity(id, feedback);
+        }
+
+        fn clear_context_compaction(app: *App, reason: []const u8) void {
+            if (!app.submission.compaction_pending) return;
+            settle_pending_compaction(app, .{ .outcome = .cancelled });
+            app.submission.compaction_pending = false;
+            app.submission.compaction_operation = null;
+            debug_trace.logf("input", "manual compaction intent cleared reason={s}", .{reason});
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "cancelPromptCredentialRefresh")) app.auth.cancelPromptCredentialRefresh();
+            }
+        }
 
         pub fn requestPromptRetryAfterAuth(app: *App) void {
             app.submission.retry_after_auth = true;
@@ -126,6 +213,11 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub fn cancelPromptRetryAfterAuth(app: *App) void {
             app.submission.retry_after_auth = false;
+            const pending = app.submission.pending orelse return;
+            if (pending.phase != .awaiting_auth) return;
+            clearPendingSubmission(app, "auth_retry_cancelled");
+            app.shell.render_requests.request(.transcript);
+            app.shell.render_requests.request(.footer);
         }
 
         fn takePromptRetryAfterAuth(app: *App) bool {
@@ -134,8 +226,25 @@ pub fn SubmitRuntime(comptime App: type) type {
             return pending;
         }
 
+        fn resumePendingPromptAfterAuth(app: *App, trigger: []const u8) bool {
+            const pending = if (app.submission.pending) |*value| value else return false;
+            if (pending.phase != .awaiting_auth) return false;
+            pending.phase = .adopted;
+            app.submission.retry_after_auth = false;
+            app.shell.render_requests.request(.footer);
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_auth_resumed",
+                .{ .turn_id = pending.draft.turn_id },
+                "trigger={s}",
+                .{trigger},
+            );
+            return true;
+        }
+
         pub fn resumePromptAfterAuth(app: *App, max_prompt_history: usize) !void {
             if (!takePromptRetryAfterAuth(app)) return;
+            if (resumePendingPromptAfterAuth(app, "auth_completion")) return;
             try submit(app, max_prompt_history);
         }
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
@@ -156,19 +265,26 @@ pub fn SubmitRuntime(comptime App: type) type {
             preserve,
         };
 
-        const AcceptedDraftProjection = struct {
+        const ComposerHistoryProjection = struct {
             input: []const u8,
             pasted_blocks: std.ArrayList(paste_blocks.PastedBlock) = .empty,
             image_tokens: std.ArrayList(entity_spans.ImageTokenSpan) = .empty,
             skill_tokens: std.ArrayList(registered_entities.SkillTokenSpan) = .empty,
 
-            fn deinit(self: *AcceptedDraftProjection, alloc: std.mem.Allocator) void {
+            fn deinit(self: *ComposerHistoryProjection, alloc: std.mem.Allocator) void {
                 self.pasted_blocks.deinit(alloc);
                 self.image_tokens.deinit(alloc);
                 self.skill_tokens.deinit(alloc);
                 self.* = undefined;
             }
         };
+
+        fn composerHistoryEnabled(app: *const App) bool {
+            if (comptime @hasField(App, "prompt_history")) {
+                return app.prompt_history.enabled;
+            }
+            return true;
+        }
 
         pub fn noteCommittedFrame(app: *App) void {
             if (comptime !@hasField(App, "submission")) return;
@@ -194,6 +310,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub fn collectPendingSubmissionFacts(app: *App) void {
             if (comptime !@hasField(App, "submission")) return;
+            collect_context_compaction(app);
             var pending = if (app.submission.pending) |*value| value else return;
             if (pending.phase == .awaiting_adoption) {
                 adoptPendingSubmission(app) catch |err| {
@@ -209,6 +326,52 @@ pub fn SubmitRuntime(comptime App: type) type {
                 pending = &app.submission.pending.?;
             }
             if (pending.phase != .adopted) return;
+
+            if (!pending.credential_admitted) {
+                if (comptime @hasDecl(App, "collectPendingPromptCredential")) {
+                    const readiness = App.collectPendingPromptCredential(app) catch |err| {
+                        finishPendingSubmissionFailure(app, err);
+                        return;
+                    };
+                    switch (readiness) {
+                        .pending => return,
+                        .current => {},
+                        .rejected => {
+                            pending = &app.submission.pending.?;
+                            pending.phase = .awaiting_auth;
+                            requestPromptRetryAfterAuth(app);
+                            debug_trace.eventf(
+                                "input",
+                                "pending_prompt_awaiting_auth",
+                                .{ .turn_id = pending.draft.turn_id },
+                                "",
+                                .{},
+                            );
+                            return;
+                        },
+                    }
+                } else if (comptime @hasDecl(App, "ensurePromptCredential")) {
+                    const admitted = preflightPrompt(app) catch |err| {
+                        finishPendingSubmissionFailure(app, err);
+                        return;
+                    };
+                    pending = &app.submission.pending.?;
+                    if (!admitted) {
+                        pending.phase = .awaiting_auth;
+                        requestPromptRetryAfterAuth(app);
+                        debug_trace.eventf(
+                            "input",
+                            "pending_prompt_awaiting_auth",
+                            .{ .turn_id = pending.draft.turn_id },
+                            "",
+                            .{},
+                        );
+                        return;
+                    }
+                }
+                app.submission.pending.?.credential_admitted = true;
+                pending = &app.submission.pending.?;
+            }
 
             if (comptime @hasDecl(App, "collectPendingSkillRefresh")) {
                 const readiness = App.collectPendingSkillRefresh(app, pending) catch |err| {
@@ -265,12 +428,17 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub fn cancelPendingSubmission(app: *App) bool {
             if (comptime !@hasField(App, "submission")) return false;
+            if (app.submission.compaction_pending) {
+                clear_context_compaction(app, "cancelled");
+                app.shell.render_requests.request(.footer);
+                return true;
+            }
             const pending = app.submission.pending orelse return false;
             if (pending.phase == .queued) {
-                if (comptime !@hasDecl(@TypeOf(app.worker), "deleteQueuedPromptDraft")) {
+                if (comptime !@hasDecl(@TypeOf(app.worker), "removeQueuedPrompt")) {
                     return false;
                 }
-                if (!app.worker.deleteQueuedPromptDraft(
+                if (!app.worker.removeQueuedPrompt(
                     std.heap.c_allocator,
                     pending.draft.turn_id,
                     pending.draft.images,
@@ -308,6 +476,7 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn clearPendingSubmission(app: *App, reason: []const u8) void {
+            if (comptime @hasField(App, "submission")) clear_context_compaction(app, reason);
             const snapshot_cleanup: PendingSnapshotCleanup = if (transferPendingImageSnapshotsToComposerHistory(app))
                 .preserve
             else
@@ -316,6 +485,10 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn clearPendingSubmissionForSessionTransition(app: *App) void {
+            if (comptime @hasField(App, "submission")) clear_context_compaction(app, "session_transition");
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "cancelProviderPreparation")) _ = app.auth.cancelProviderPreparation();
+            }
             if (comptime !@hasField(App, "submission")) {
                 app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
                 return;
@@ -403,8 +576,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         fn finishPendingSubmissionFailure(app: *App, err: anyerror) void {
             const turn_id = app.submission.pending.?.draft.turn_id;
-            const body = std.fmt.allocPrint(
-                app.alloc,
+            const body = app.alloc.print(
                 "failed to submit prompt after presentation ({s})",
                 .{@errorName(err)},
             ) catch |notice_err| {
@@ -454,16 +626,60 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
+            if (comptime @hasField(App, "worker")) {
+                if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) {
+                    const observed = app.worker.compactionActivitySnapshot();
+                    if (observed.operation) |op| {
+                        if (app.worker.dismissCompactionActivity(op.id, observed.revision)) app.shell.render_requests.request(.footer);
+                    }
+                }
+            }
             if (comptime @hasField(App, "submission")) {
+                if (app.submission.compaction_pending and !pendingAuthRoutesLocalCommand(app)) return;
                 if (app.submission.pending) |pending| {
-                    debug_trace.eventf(
-                        "input",
-                        "prompt_submit_deferred_for_pending",
-                        .{ .turn_id = pending.draft.turn_id },
-                        "phase={s}",
-                        .{@tagName(pending.phase)},
-                    );
-                    return;
+                    const route_local_command = pending.phase == .awaiting_auth and
+                        pendingAuthRoutesLocalCommand(app);
+                    if (!route_local_command and
+                        pending.phase == .awaiting_auth and
+                        app.input_runtime.edit_state.input.items.len == 0)
+                    {
+                        if (comptime @hasDecl(App, "retryPendingPromptCredential")) {
+                            switch (try App.retryPendingPromptCredential(app)) {
+                                .pending => {
+                                    app.submission.retry_after_auth = false;
+                                    app.submission.pending.?.phase = .adopted;
+                                    app.shell.render_requests.request(.footer);
+                                },
+                                .current => {
+                                    const resumed = resumePendingPromptAfterAuth(app, "submit");
+                                    std.debug.assert(resumed);
+                                },
+                                .rejected => {},
+                            }
+                        } else if (try preflightPrompt(app)) {
+                            const resumed = resumePendingPromptAfterAuth(app, "submit");
+                            std.debug.assert(resumed);
+                        }
+                        return;
+                    }
+                    if (route_local_command) {
+                        debug_trace.eventf(
+                            "input",
+                            "pending_prompt_auth_command_routed",
+                            .{ .turn_id = pending.draft.turn_id },
+                            "",
+                            .{},
+                        );
+                    } else {
+                        debug_trace.eventf(
+                            "input",
+                            "prompt_submit_deferred_for_pending",
+                            .{ .turn_id = pending.draft.turn_id },
+                            "phase={s}",
+                            .{@tagName(pending.phase)},
+                        );
+                        return;
+                    }
                 }
             }
             const expanded_len = paste_blocks.expandedLen(
@@ -488,13 +704,6 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             const expanded = try paste_blocks.expand(app.alloc, app.input_runtime.edit_state.input.items, app.input_runtime.entities.pasted_blocks.items);
             defer if (expanded.owned) app.alloc.free(expanded.text);
-
-            if (directCommand(expanded.text)) |command| {
-                if (comptime @hasDecl(App, "submitDirectTerminal")) {
-                    try App.submitDirectTerminal(app, command);
-                    return;
-                }
-            }
 
             const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
             const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
@@ -531,8 +740,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
-                    if (!try preflightPrompt(app)) return;
-                    const admission = try enqueuePromptForSubmit(app, "", &.{}, null);
+                    const admission = try enqueuePromptForSubmit(app, "", &.{});
                     if (admission == .rejected) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -541,28 +749,27 @@ pub fn SubmitRuntime(comptime App: type) type {
                     }
                     return;
                 }
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    if (try queue_rt.submitPausedQueueUnchanged(app)) {
-                        return;
-                    }
-                }
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
                 return;
             }
 
-            const first_image_id = try firstAvailableImageId(app.pending_images.items);
+            const first_image_id = if (comptime @hasDecl(App, "peekNextImageId"))
+                app.peekNextImageId()
+            else
+                try firstAvailableImageId(app.pending_images.items);
             var extracted = image_attachments.extractInlineImageAttachments(
                 app.alloc,
                 app.workspace_root,
-                trimmed,
+                expanded.text,
                 first_image_id,
             ) catch |err| {
                 const message = switch (err) {
+                    error.InvalidImageId, error.ImageIdOverflow => return err,
                     error.UnsupportedImageType => try app.alloc.dupe(u8, "unsupported image type"),
                     error.FileNotFound => try app.alloc.dupe(u8, "image file not found"),
                     error.ImageTooLarge => try app.alloc.dupe(u8, image_attachments.image_too_large_notice),
-                    else => try std.fmt.allocPrint(app.alloc, "failed to attach image: {s}", .{@errorName(err)}),
+                    else => try app.alloc.print("failed to attach image: {s}", .{@errorName(err)}),
                 };
                 defer app.alloc.free(message);
                 try app.writeDomainNotice(.{
@@ -578,16 +785,16 @@ pub fn SubmitRuntime(comptime App: type) type {
                 extracted.discard(app.alloc)
             else
                 extracted.deinit(app.alloc);
-            try assignStableExtractedImageIds(app, &extracted);
+            for (extracted.images) |image| {
+                if (image_attachments.findImageIndexById(app.pending_images.items, image.id) != null) return error.DuplicateImageId;
+            }
             if (try captureExtractedImages(app, extracted.images) == .rejected) {
                 app.shell.render_requests.request(.footer);
                 return;
             }
 
             const has_inline_images = extracted.images.len > 0;
-            const effective_text = if (has_inline_images) extracted.text else expanded.text;
-
-            if (!try preflightPrompt(app)) return;
+            const effective_text = extracted.text;
 
             var staged_images = if (app.pending_images.items.len > 0 or extracted.images.len > 0)
                 try stagePendingImages(app.alloc, app.pending_images.items, extracted.images)
@@ -599,14 +806,12 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app.alloc,
                 app.input_runtime.edit_state.input.items,
                 expanded.text,
-                trimmed,
                 effective_text,
                 app.input_runtime.entities.pasted_blocks.items,
                 app.input_runtime.entities.image_tokens.items,
                 app.pending_images.items,
-                extracted.image_spans,
+                extracted.edits,
                 extracted.images,
-                has_inline_images,
             );
             defer image_occurrences.deinit(app.alloc);
 
@@ -626,24 +831,26 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app.alloc,
                 app.input_runtime.edit_state.input.items,
                 expanded.text,
-                trimmed,
                 effective_text,
                 visual_text.text,
                 app.input_runtime.entities.pasted_blocks.items,
                 app.input_runtime.entities.skill_tokens.items,
-                has_inline_images,
+                extracted.edits,
                 image_occurrences.items,
             );
             defer if (display_skill_tokens.len > 0) app.alloc.free(display_skill_tokens);
-            var accepted_draft = try prepareAcceptedDraftProjection(
-                app,
-                expanded.text,
-                visual_text.text,
-                display_skill_tokens,
-                image_occurrences.items,
-                has_inline_images,
-            );
-            defer accepted_draft.deinit(app.alloc);
+            var history_projection: ?ComposerHistoryProjection = if (composerHistoryEnabled(app))
+                try prepareComposerHistoryProjection(
+                    app,
+                    expanded.text,
+                    visual_text.text,
+                    display_skill_tokens,
+                    image_occurrences.items,
+                    has_inline_images,
+                )
+            else
+                null;
+            defer if (history_projection) |*projection| projection.deinit(app.alloc);
             const has_images_for_submit = if (staged_images) |*images|
                 images.items.len > 0
             else
@@ -654,7 +861,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                     app,
                     visual_text.text,
                     display_skill_tokens,
-                    &accepted_draft,
                     images,
                 )
             else
@@ -662,17 +868,18 @@ pub fn SubmitRuntime(comptime App: type) type {
                     app,
                     visual_text.text,
                     display_skill_tokens,
-                    &accepted_draft,
                 );
             if (admission == .rejected) return;
             commitStableExtractedImageIds(app, extracted.images);
             commitRemappedImageIds(app, visual_text.next_image_id);
             if (visual_text.text.len > 0) {
-                recordAcceptedPromptComposerHistory(
-                    app,
-                    max_prompt_history,
-                    &accepted_draft,
-                );
+                if (history_projection) |*projection| {
+                    recordAcceptedPromptComposerHistory(
+                        app,
+                        max_prompt_history,
+                        projection,
+                    );
+                }
             }
             if (admission == .enqueued and !has_images_for_submit and visual_text.text.len > 0) {
                 recordAcceptedInput(app, visual_text.text);
@@ -698,6 +905,17 @@ pub fn SubmitRuntime(comptime App: type) type {
             return true;
         }
 
+        fn pendingAuthRoutesLocalCommand(app: *App) bool {
+            const input = std.mem.trimStart(
+                u8,
+                app.input_runtime.edit_state.input.items,
+                " \t\r\n",
+            );
+            const submission = resolvedSlashSubmission(app, input);
+            const command = knownSlashCommand(app, submission) orelse return false;
+            return !requiresPromptCredential(command, submission);
+        }
+
         fn knownSlashCommand(app: *const App, text: []const u8) ?*const command_specs.SlashSpec {
             if (text.len == 0 or text[0] != '/') return null;
             var command_end: usize = 1;
@@ -707,9 +925,9 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         fn shouldRouteUnknownSlashCommand(app: *App, text: []const u8) bool {
             if (text.len == 0 or text[0] != '/') return false;
-            const command_end = std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
+            const command_end = std.mem.findAny(u8, text, " \t\r\n") orelse text.len;
             if (command_end != text.len) return false;
-            if (std.mem.indexOfScalar(u8, text[1..command_end], '/') != null) return false;
+            if (std.mem.findScalar(u8, text[1..command_end], '/') != null) return false;
             if (app.input_runtime.picker.isInlinePickerDismissed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
             return completion_rt.slashCompletionCandidateCount(app) == 0;
@@ -875,58 +1093,17 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            accepted_draft: ?*const AcceptedDraftProjection,
         ) !PromptAdmission {
             switch (try installPendingSubmission(app, prompt, skill_tokens)) {
                 .installed => return .pending,
                 .unavailable => {},
             }
-            const resume_review = if (comptime @hasField(App, "queued_prompt_review"))
-                app.queued_prompt_review.active()
-            else
-                false;
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                switch (try queue_rt.promptAdmission(
-                    app,
-                    if (accepted_draft) |draft| draft.input else prompt,
-                    if (accepted_draft) |draft| draft.pasted_blocks.items else &.{},
-                    if (accepted_draft) |draft| draft.image_tokens.items else &.{},
-                    if (accepted_draft) |draft| draft.skill_tokens.items else skill_tokens,
-                )) {
-                    .replaced => {
-                        return .enqueued;
-                    },
-                    .enqueue => {},
-                }
-            }
-
-            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) blk: {
-                if (accepted_draft) |draft| {
-                    break :blk try App.enqueuePromptWithReviewDraft(
-                        app,
-                        prompt,
-                        skill_tokens,
-                        draft.input,
-                        draft.pasted_blocks.items,
-                        draft.image_tokens.items,
-                        draft.skill_tokens.items,
-                    );
-                }
-                break :blk try App.enqueuePromptWithSkillBindings(
-                    app,
-                    prompt,
-                    skill_tokens,
-                );
-            } else if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
+            if (!try preflightPrompt(app)) return .rejected;
+            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else
                 try App.enqueuePrompt(app, prompt);
             if (!accepted) return .rejected;
-            if (resume_review) {
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    queue_rt.resumeAfterNewPrompt(app);
-                }
-            }
             return .enqueued;
         }
 
@@ -959,7 +1136,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (!app.worker.tryHoldTurnStart()) return .unavailable;
             errdefer app.worker.releaseTurnStartHold();
 
-            const draft = try buildQueuedPromptDraft(
+            const draft = try buildPendingPromptDraft(
                 app.alloc,
                 debug_trace.nextTurnId(),
                 prompt,
@@ -983,7 +1160,6 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            accepted_draft: *const AcceptedDraftProjection,
             staged_images: *std.ArrayList(types.ImageAttachment),
         ) !PromptAdmission {
             const original_images = app.pending_images;
@@ -998,7 +1174,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app,
                 prompt,
                 skill_tokens,
-                accepted_draft,
             );
             if (admission == .rejected) {
                 staged_images.* = app.pending_images;
@@ -1015,95 +1190,6 @@ pub fn SubmitRuntime(comptime App: type) type {
             var highest_id: usize = 0;
             for (images) |image| highest_id = @max(highest_id, image.id);
             return std.math.add(usize, highest_id, 1);
-        }
-
-        fn assignStableExtractedImageIds(
-            app: *App,
-            extracted: *image_attachments.ExtractedInlineImages,
-        ) !void {
-            if (extracted.images.len == 0) return;
-            if (comptime !@hasDecl(App, "peekNextImageId")) return;
-
-            const stable_ids = try app.alloc.alloc(usize, extracted.images.len);
-            defer app.alloc.free(stable_ids);
-            const first_stable_id = app.peekNextImageId();
-            _ = std.math.add(
-                usize,
-                first_stable_id,
-                extracted.images.len,
-            ) catch return error.ImageIdOverflow;
-            var ids_changed = false;
-            for (extracted.images, 0..) |image, index| {
-                const stable_id = first_stable_id + index;
-                if (stable_id == 0) return error.ImageIdOverflow;
-                for (app.pending_images.items) |pending_image| {
-                    if (pending_image.id == stable_id) return error.DuplicateImageId;
-                }
-                stable_ids[index] = stable_id;
-                ids_changed = ids_changed or stable_id != image.id;
-            }
-            if (!ids_changed) return;
-            if (extracted.image_spans.len != extracted.images.len) {
-                return error.InvalidImageOccurrence;
-            }
-
-            const stable_spans = try app.alloc.alloc(
-                image_attachments.ImagePlaceholderSpan,
-                extracted.image_spans.len,
-            );
-            errdefer app.alloc.free(stable_spans);
-            var remapped: std.Io.Writer.Allocating = .init(app.alloc);
-            defer remapped.deinit();
-            var cursor: usize = 0;
-            var span_index: usize = 0;
-            while (cursor < extracted.text.len) {
-                if (span_index < extracted.image_spans.len and
-                    extracted.image_spans[span_index].start == cursor)
-                {
-                    const source_span = extracted.image_spans[span_index];
-                    if (source_span.end > extracted.text.len or
-                        source_span.id != extracted.images[span_index].id)
-                    {
-                        return error.InvalidImageOccurrence;
-                    }
-                    const match = image_attachments.matchImagePlaceholder(
-                        extracted.text,
-                        source_span.start,
-                    ) orelse return error.InvalidImageOccurrence;
-                    if (match.id != source_span.id or
-                        source_span.start + match.length != source_span.end)
-                    {
-                        return error.InvalidImageOccurrence;
-                    }
-                    const remapped_start = remapped.written().len;
-                    var placeholder_buf: [32]u8 = undefined;
-                    try remapped.writer.writeAll(
-                        try image_attachments.formatImagePlaceholder(
-                            &placeholder_buf,
-                            stable_ids[span_index],
-                        ),
-                    );
-                    stable_spans[span_index] = .{
-                        .start = remapped_start,
-                        .end = remapped.written().len,
-                        .id = stable_ids[span_index],
-                    };
-                    cursor = source_span.end;
-                    span_index += 1;
-                    continue;
-                }
-                try remapped.writer.writeByte(extracted.text[cursor]);
-                cursor += 1;
-            }
-            if (span_index != extracted.image_spans.len) {
-                return error.InvalidImageOccurrence;
-            }
-            const text = try remapped.toOwnedSlice();
-            app.alloc.free(extracted.text);
-            app.alloc.free(extracted.image_spans);
-            extracted.text = text;
-            extracted.image_spans = stable_spans;
-            for (extracted.images, stable_ids) |*image, stable_id| image.id = stable_id;
         }
 
         fn commitStableExtractedImageIds(
@@ -1168,8 +1254,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (outcome != .warning) return;
             const err = app.prompt_history.lastAppendError() orelse
                 error.PromptHistoryWriteFailed;
-            const notice = std.fmt.allocPrint(
-                app.alloc,
+            const notice = app.alloc.print(
                 "failed to save input history ({s}); submission continued",
                 .{@errorName(err)},
             ) catch |notice_err| {
@@ -1197,16 +1282,16 @@ pub fn SubmitRuntime(comptime App: type) type {
         fn recordAcceptedPromptComposerHistory(
             app: *App,
             max_prompt_history: usize,
-            accepted: *const AcceptedDraftProjection,
+            projection: *const ComposerHistoryProjection,
         ) void {
             recordComposerHistory(
                 app,
                 max_prompt_history,
-                accepted.input,
-                accepted.pasted_blocks.items,
+                projection.input,
+                projection.pasted_blocks.items,
                 app.pending_images.items,
-                accepted.image_tokens.items,
-                accepted.skill_tokens.items,
+                projection.image_tokens.items,
+                projection.skill_tokens.items,
             );
         }
 
@@ -1256,14 +1341,14 @@ pub fn SubmitRuntime(comptime App: type) type {
             };
         }
 
-        fn prepareAcceptedDraftProjection(
+        fn prepareComposerHistoryProjection(
             app: *App,
             expanded_text: []const u8,
             visual_text: []const u8,
             display_skill_tokens: []const registered_entities.SkillTokenSpan,
             image_occurrences: []const ImageOccurrence,
             has_extracted_images: bool,
-        ) !AcceptedDraftProjection {
+        ) !ComposerHistoryProjection {
             var submitted_image_tokens: std.ArrayList(entity_spans.ImageTokenSpan) = .empty;
             defer submitted_image_tokens.deinit(app.alloc);
             try submitted_image_tokens.ensureTotalCapacity(
@@ -1272,11 +1357,12 @@ pub fn SubmitRuntime(comptime App: type) type {
             );
             for (image_occurrences) |occurrence| {
                 if (occurrence.submitted_id == 0) continue;
+                const span = occurrence.submitted_span orelse return error.InvalidImageOccurrence;
                 submitted_image_tokens.appendAssumeCapacity(.{
                     .id = occurrence.submitted_id,
                     .span = .{
-                        .raw_start = occurrence.span.start,
-                        .raw_end = occurrence.span.end,
+                        .raw_start = span.start,
+                        .raw_end = span.end,
                     },
                 });
             }
@@ -1284,7 +1370,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (app.input_runtime.entities.pasted_blocks.items.len > 0 and
                 !has_extracted_images)
             {
-                if (try prepareCompactAcceptedDraftProjection(
+                if (try prepareCompactComposerHistoryProjection(
                     app,
                     expanded_text,
                     visual_text,
@@ -1307,7 +1393,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 );
             }
 
-            var fallback = AcceptedDraftProjection{ .input = visual_text };
+            var fallback = ComposerHistoryProjection{ .input = visual_text };
             errdefer fallback.deinit(app.alloc);
             try fallback.image_tokens.appendSlice(
                 app.alloc,
@@ -1320,19 +1406,19 @@ pub fn SubmitRuntime(comptime App: type) type {
             return fallback;
         }
 
-        fn prepareCompactAcceptedDraftProjection(
+        fn prepareCompactComposerHistoryProjection(
             app: *App,
             expanded_text: []const u8,
             visual_text: []const u8,
             display_skill_tokens: []const registered_entities.SkillTokenSpan,
             submitted_image_tokens: []const entity_spans.ImageTokenSpan,
-        ) !?AcceptedDraftProjection {
+        ) !?ComposerHistoryProjection {
             const raw_input = app.input_runtime.edit_state.input.items;
             if (!std.mem.eql(u8, expanded_text, visual_text)) return null;
             const raw_start: usize = 0;
             const raw_end = raw_input.len;
 
-            var compact = AcceptedDraftProjection{
+            var compact = ComposerHistoryProjection{
                 .input = raw_input[raw_start..raw_end],
             };
             var transferred = false;
@@ -1443,57 +1529,35 @@ pub fn SubmitRuntime(comptime App: type) type {
         };
 
         const ImageOccurrence = struct {
+            /// Coordinates before collision-driven ID rewriting.
             span: Span,
             attachment_index: usize,
             source_id: usize,
             submitted_id: usize = 0,
+            submitted_span: ?Span = null,
         };
 
         fn projectImageOccurrencesForSubmit(
             alloc: std.mem.Allocator,
             raw_input: []const u8,
             expanded_text: []const u8,
-            trimmed_text: []const u8,
             effective_text: []const u8,
             pasted_blocks: []const paste_blocks.PastedBlock,
             image_tokens: []const entity_spans.ImageTokenSpan,
             pending_images: []const types.ImageAttachment,
-            extracted_spans: []const image_attachments.ImagePlaceholderSpan,
+            edits: []const image_attachments.InlineImageEdit,
             extracted_images: []const types.ImageAttachment,
-            has_inline_images: bool,
         ) !std.ArrayList(ImageOccurrence) {
             var occurrences: std.ArrayList(ImageOccurrence) = .empty;
             errdefer occurrences.deinit(alloc);
-            const trim_start = if (has_inline_images)
-                leadingTrimLen(expanded_text)
-            else
-                0;
-            const projection_source = if (has_inline_images)
-                trimmed_text
-            else
-                expanded_text;
-
             for (image_tokens) |token| {
                 if (!validRawImageToken(raw_input, token)) continue;
-                const attachment_index = image_attachments.findImageIndexById(
-                    pending_images,
-                    token.id,
-                ) orelse continue;
-                var span = projectSpanThroughPasteExpansion(raw_input, pasted_blocks, .{
+                const attachment_index = image_attachments.findImageIndexById(pending_images, token.id) orelse continue;
+                const expanded = projectSpanThroughPasteExpansion(raw_input, pasted_blocks, .{
                     .start = token.span.raw_start,
                     .end = token.span.raw_end,
                 }) orelse continue;
-                if (span.start < trim_start or span.end < span.start) continue;
-                span.start -= trim_start;
-                span.end -= trim_start;
-                if (span.end > projection_source.len) continue;
-                if (has_inline_images) {
-                    span = projectSpanThroughInlineImageExtraction(
-                        projection_source,
-                        effective_text,
-                        span,
-                    ) orelse continue;
-                }
+                const span = project_inline_span(expanded_text.len, expanded, edits) orelse continue;
                 try appendImageOccurrenceSorted(alloc, &occurrences, .{
                     .span = span,
                     .attachment_index = attachment_index,
@@ -1501,17 +1565,15 @@ pub fn SubmitRuntime(comptime App: type) type {
                 });
             }
 
-            for (extracted_spans, 0..) |span, index| {
-                if (index >= extracted_images.len or span.id != extracted_images[index].id) continue;
-                const match = image_attachments.matchImagePlaceholder(
-                    effective_text,
-                    span.start,
-                ) orelse continue;
-                if (match.id != span.id or span.start + match.length != span.end) continue;
+            if (edits.len != extracted_images.len) return error.InvalidImageOccurrence;
+            for (edits, extracted_images, 0..) |edit, image, index| {
+                if (edit.id != image.id or !edit.output.isValid(effective_text.len)) return error.InvalidImageOccurrence;
+                const match = image_attachments.matchImagePlaceholder(effective_text, edit.output.raw_start) orelse return error.InvalidImageOccurrence;
+                if (match.id != edit.id or edit.output.raw_start + match.length != edit.output.raw_end) return error.InvalidImageOccurrence;
                 try appendImageOccurrenceSorted(alloc, &occurrences, .{
-                    .span = .{ .start = span.start, .end = span.end },
+                    .span = .{ .start = edit.output.raw_start, .end = edit.output.raw_end },
                     .attachment_index = pending_images.len + index,
-                    .source_id = span.id,
+                    .source_id = edit.id,
                 });
             }
             return occurrences;
@@ -1580,6 +1642,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     remapped_id = try nextRemappedImageId(
                         text,
                         occurrences,
+                        images.items,
                         remapped_id,
                     );
                     image.id = remapped_id;
@@ -1587,6 +1650,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     ids_changed = true;
                 }
                 occurrence.submitted_id = image.id;
+                occurrence.submitted_span = occurrence.span;
                 ordered.appendAssumeCapacity(image);
                 used[occurrence.attachment_index] = true;
             }
@@ -1603,17 +1667,19 @@ pub fn SubmitRuntime(comptime App: type) type {
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(alloc);
             var cursor: usize = 0;
-            for (occurrences) |occurrence| {
+            for (occurrences) |*occurrence| {
                 if (occurrence.span.start < cursor or occurrence.span.end > text.len) {
                     return error.InvalidImageOccurrence;
                 }
                 try out.appendSlice(alloc, text[cursor..occurrence.span.start]);
+                const start = out.items.len;
                 var placeholder_buf: [64]u8 = undefined;
                 const placeholder = try image_attachments.formatImagePlaceholder(
                     &placeholder_buf,
                     occurrence.submitted_id,
                 );
                 try out.appendSlice(alloc, placeholder);
+                occurrence.submitted_span = .{ .start = start, .end = out.items.len };
                 cursor = occurrence.span.end;
             }
             try out.appendSlice(alloc, text[cursor..]);
@@ -1646,10 +1712,11 @@ pub fn SubmitRuntime(comptime App: type) type {
         fn nextRemappedImageId(
             text: []const u8,
             occurrences: []const ImageOccurrence,
+            images: []const types.ImageAttachment,
             first_candidate: usize,
         ) !usize {
             var candidate = first_candidate;
-            while (literalImageIdUsed(text, occurrences, candidate)) {
+            while (literalImageIdUsed(text, occurrences, candidate) or image_attachments.findImageIndexById(images, candidate) != null) {
                 candidate = try std.math.add(usize, candidate, 1);
             }
             return candidate;
@@ -1713,49 +1780,26 @@ pub fn SubmitRuntime(comptime App: type) type {
             var source_cursor: usize = 0;
             var output_cursor: usize = 0;
             for (occurrences) |occurrence| {
+                const output = occurrence.submitted_span orelse return null;
                 if (occurrence.span.start < source_cursor or
-                    occurrence.span.end < occurrence.span.start or
+                    occurrence.span.end <= occurrence.span.start or
                     occurrence.span.end > text.len or
-                    occurrence.submitted_id == 0)
+                    occurrence.submitted_id == 0 or output.end <= output.start)
                 {
                     return null;
                 }
+                const start = std.math.add(usize, output_cursor, occurrence.span.start - source_cursor) catch return null;
+                if (output.start != start) return null;
                 if (source_offset < occurrence.span.start) {
-                    return std.math.add(
-                        usize,
-                        output_cursor,
-                        source_offset - source_cursor,
-                    ) catch null;
+                    return std.math.add(usize, output_cursor, source_offset - source_cursor) catch null;
                 }
-                output_cursor = std.math.add(
-                    usize,
-                    output_cursor,
-                    occurrence.span.start - source_cursor,
-                ) catch return null;
                 if (source_offset < occurrence.span.end) {
-                    return if (source_offset == occurrence.span.start)
-                        output_cursor
-                    else
-                        null;
+                    return if (source_offset == occurrence.span.start) output.start else null;
                 }
-
-                var placeholder_buf: [64]u8 = undefined;
-                const placeholder = image_attachments.formatImagePlaceholder(
-                    &placeholder_buf,
-                    occurrence.submitted_id,
-                ) catch return null;
-                output_cursor = std.math.add(
-                    usize,
-                    output_cursor,
-                    placeholder.len,
-                ) catch return null;
+                output_cursor = output.end;
                 source_cursor = occurrence.span.end;
             }
-            return std.math.add(
-                usize,
-                output_cursor,
-                source_offset - source_cursor,
-            ) catch null;
+            return std.math.add(usize, output_cursor, source_offset - source_cursor) catch null;
         }
 
         fn resolveSlashSubmission(registry: command_specs.SlashRegistry, text: []const u8, selected_index: usize) []const u8 {
@@ -1774,12 +1818,11 @@ pub fn SubmitRuntime(comptime App: type) type {
             alloc: std.mem.Allocator,
             raw_input: []const u8,
             expanded_text: []const u8,
-            trimmed_text: []const u8,
             effective_text: []const u8,
             final_text: []const u8,
             pasted_blocks: []const paste_blocks.PastedBlock,
             skill_tokens: []const registered_entities.SkillTokenSpan,
-            has_inline_images: bool,
+            edits: []const image_attachments.InlineImageEdit,
             image_occurrences: []const ImageOccurrence,
         ) ![]registered_entities.SkillTokenSpan {
             if (skill_tokens.len == 0) return &.{};
@@ -1787,30 +1830,13 @@ pub fn SubmitRuntime(comptime App: type) type {
             var projected: std.ArrayList(registered_entities.SkillTokenSpan) = .empty;
             errdefer projected.deinit(alloc);
 
-            const trim_start = if (has_inline_images)
-                leadingTrimLen(expanded_text)
-            else
-                0;
-            const projection_source = if (has_inline_images)
-                trimmed_text
-            else
-                expanded_text;
             for (skill_tokens) |token| {
                 if (token.name.len == 0 or token.path.len == 0) continue;
-
-                var span = projectSpanThroughPasteExpansion(raw_input, pasted_blocks, .{
+                const expanded = projectSpanThroughPasteExpansion(raw_input, pasted_blocks, .{
                     .start = token.raw_start,
                     .end = token.raw_end,
                 }) orelse continue;
-
-                if (span.start < trim_start or span.end < span.start) continue;
-                span.start -= trim_start;
-                span.end -= trim_start;
-                if (span.end > projection_source.len) continue;
-
-                if (has_inline_images) {
-                    span = projectSpanThroughInlineImageExtraction(projection_source, effective_text, span) orelse continue;
-                }
+                const span = project_inline_span(expanded_text.len, expanded, edits) orelse continue;
 
                 const final_span = projectSpanThroughSubmittedImages(
                     effective_text,
@@ -1852,96 +1878,12 @@ pub fn SubmitRuntime(comptime App: type) type {
             return .{ .start = start, .end = end };
         }
 
-        fn leadingTrimLen(text: []const u8) usize {
-            var i: usize = 0;
-            while (i < text.len and image_attachments.isWhitespace(text[i])) : (i += 1) {}
-            return i;
-        }
-
-        fn projectSpanThroughInlineImageExtraction(
-            source: []const u8,
-            extracted_text: []const u8,
-            span: Span,
-        ) ?Span {
-            if (span.start > span.end or span.end > source.len) return null;
-            const start = projectOffsetThroughInlineImageExtraction(
-                source,
-                extracted_text,
-                span.start,
-            ) orelse return null;
-            const end = projectOffsetThroughInlineImageExtraction(
-                source,
-                extracted_text,
-                span.end,
-            ) orelse return null;
-            if (end < start) return null;
-            return .{ .start = start, .end = end };
-        }
-
-        fn projectOffsetThroughInlineImageExtraction(
-            source: []const u8,
-            extracted_text: []const u8,
-            source_offset: usize,
-        ) ?usize {
-            if (source_offset > source.len) return null;
-
-            var in_pos: usize = 0;
-            var written: usize = 0;
-            while (true) {
-                while (in_pos < source.len and image_attachments.isWhitespace(source[in_pos])) : (in_pos += 1) {}
-                if (in_pos >= source.len) break;
-
-                const token_start = in_pos;
-                const token_end = image_attachments.nextShellTokenEnd(source, token_start);
-                const raw = source[token_start..token_end];
-                in_pos = token_end;
-
-                const output_start = preservedTokenStart(extracted_text, written, raw);
-                if (token_start <= source_offset and source_offset <= token_end) {
-                    const token_output_start = output_start orelse return null;
-                    return token_output_start + (source_offset - token_start);
-                }
-
-                if (output_start) |start| {
-                    written = start + raw.len;
-                } else {
-                    const image_token = image_attachments.splitImagePathToken(raw) orelse return null;
-                    const replacement_start = written + @intFromBool(written > 0);
-                    if (replacement_start >= extracted_text.len) return null;
-                    const replacement = image_attachments.matchImagePlaceholder(
-                        extracted_text,
-                        replacement_start,
-                    ) orelse return null;
-                    const suffix_start = replacement_start + replacement.length;
-                    const suffix_end = suffix_start + image_token.suffix.len;
-                    if (suffix_end > extracted_text.len or
-                        !std.mem.eql(
-                            u8,
-                            extracted_text[suffix_start..suffix_end],
-                            image_token.suffix,
-                        ))
-                    {
-                        return null;
-                    }
-                    written = suffix_end;
-                }
-            }
-            return if (source_offset == source.len) extracted_text.len else null;
-        }
-
-        fn preservedTokenStart(output: []const u8, written: usize, raw: []const u8) ?usize {
-            if (raw.len == 0 or written > output.len) return null;
-
-            var start = written;
-            if (written > 0) {
-                if (start >= output.len or output[start] != ' ') return null;
-                start += 1;
-            }
-            if (start > output.len or output.len - start < raw.len) return null;
-            if (!std.mem.eql(u8, output[start .. start + raw.len], raw)) return null;
-            const end = start + raw.len;
-            if (end < output.len and output[end] != ' ') return null;
-            return start;
+        fn project_inline_span(source_len: usize, span: Span, edits: []const image_attachments.InlineImageEdit) ?Span {
+            const projected = image_attachments.project_inline_image_span(source_len, .{
+                .raw_start = span.start,
+                .raw_end = span.end,
+            }, edits) orelse return null;
+            return .{ .start = projected.raw_start, .end = projected.raw_end };
         }
 
         fn skillMarkerAt(text: []const u8, start: usize, name: []const u8) ?Span {
@@ -1963,21 +1905,42 @@ pub fn SubmitRuntime(comptime App: type) type {
     };
 }
 
-pub fn directCommand(expanded: []const u8) ?[]const u8 {
-    if (expanded.len == 0 or expanded[0] != '!') return null;
-    return expanded[1..];
-}
-
-test "direct terminal route requires the literal first character" {
-    try std.testing.expectEqualStrings("printf ready", directCommand("!printf ready").?);
-    try std.testing.expectEqualStrings("", directCommand("!").?);
-    try std.testing.expect(directCommand(" !printf prompt") == null);
-    try std.testing.expect(directCommand("ordinary prompt") == null);
+test "inline image collision map keeps reserved stable IDs and final coordinates distinct" {
+    const alloc = std.testing.allocator;
+    const Rt = SubmitRuntime(struct {});
+    const text = "literal [Image #9]\n[Image #9] $review [Image #10]";
+    const first = "literal [Image #9]\n".len;
+    const second = text.len - "[Image #10]".len;
+    var occurrences = [_]Rt.ImageOccurrence{
+        .{ .span = .{ .start = first, .end = first + "[Image #9]".len }, .attachment_index = 0, .source_id = 9 },
+        .{ .span = .{ .start = second, .end = text.len }, .attachment_index = 1, .source_id = 10 },
+    };
+    const original_first = occurrences[0].span;
+    const original_second = occurrences[1].span;
+    var images = std.ArrayList(types.ImageAttachment).fromOwnedSlice(try types.dupeImageAttachmentSlice(alloc, &.{
+        .{ .id = 9, .path = @constCast("first.png"), .media_type = @constCast("image/png") },
+        .{ .id = 10, .path = @constCast("second.png"), .media_type = @constCast("image/png") },
+    }));
+    defer Rt.deinitOwnedImageList(alloc, &images);
+    const result = try Rt.mapSubmittedImages(alloc, text, &images, &occurrences, 9);
+    defer if (result.owned) alloc.free(result.text);
+    try std.testing.expectEqualStrings("literal [Image #9]\n[Image #11] $review [Image #10]", result.text);
+    try std.testing.expectEqual(@as(usize, 11), images.items[0].id);
+    try std.testing.expectEqual(@as(usize, 10), images.items[1].id);
+    try std.testing.expectEqualDeep(original_first, occurrences[0].span);
+    try std.testing.expectEqualDeep(original_second, occurrences[1].span);
+    for (occurrences, [_][]const u8{ "[Image #11]", "[Image #10]" }) |occurrence, expected| {
+        const span = occurrence.submitted_span.?;
+        try std.testing.expectEqualStrings(expected, result.text[span.start..span.end]);
+    }
+    const skill_start = std.mem.find(u8, text, "$review").?;
+    const skill = Rt.projectSpanThroughSubmittedImages(text, &occurrences, .{ .start = skill_start, .end = skill_start + "$review".len }).?;
+    try std.testing.expectEqualStrings("$review", result.text[skill.start..skill.end]);
 }
 
 test "pending submission phase methods keep hold ownership explicit" {
     const alloc = std.testing.allocator;
-    var pending = PendingSubmission.init(try buildQueuedPromptDraft(
+    var pending = PendingSubmission.init(try buildPendingPromptDraft(
         alloc,
         41,
         "use $review",
@@ -2015,7 +1978,7 @@ test "pending submission phase methods keep hold ownership explicit" {
 }
 
 fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !void {
-    const draft = try buildQueuedPromptDraft(
+    const draft = try buildPendingPromptDraft(
         alloc,
         77,
         "hello $review",
@@ -2031,7 +1994,7 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
             .path = "/tmp/review/SKILL.md",
         }},
     );
-    defer worker_runtime.freeQueuedPromptDraft(alloc, draft);
+    defer draft.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 77), draft.turn_id);
     try std.testing.expectEqualStrings("hello $review", draft.prompt);
     try std.testing.expectEqual(@as(usize, 1), draft.images.len);
@@ -2040,13 +2003,202 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
 
 test "pending draft construction frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPendingDraftConstructionAllocationFailure,
         .{},
     );
 }
 
+const CompactionAdmissionFake = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    submission: State = .{},
+    has_context: bool = true,
+    readiness: enum { pending, current, rejected } = .pending,
+    readiness_error: ?anyerror = null,
+    enqueue_error: ?anyerror = null,
+    credential_checks: usize = 0,
+    enqueue_count: usize = 0,
+    notice_error: bool = false,
+    notice_count: usize = 0,
+    notices: std.ArrayList(u8) = .empty,
+    auth: struct {
+        cancelled: usize = 0,
+        pub fn cancelPromptCredentialRefresh(self: *@This()) void {
+            self.cancelled += 1;
+        }
+    } = .{},
+    shell: struct { render_requests: @import("../../ui/render_request.zig").RenderRequestState = .{} } = .{},
+    worker: struct {
+        busy: bool = false,
+        queued: usize = 0,
+        status: worker_runtime.ContextCompactionStatus = .idle,
+        activity: compaction_activity.State = .{},
+        released_holds: usize = 0,
+
+        pub fn compactionActivitySnapshot(self: *@This()) compaction_activity.Snapshot {
+            return self.activity.snapshot;
+        }
+        pub fn beginCompactionActivity(self: *@This(), origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {
+            return self.activity.begin(origin, turn_id, 0);
+        }
+        pub fn settleCompactionActivity(self: *@This(), id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
+            self.activity.settle(id, feedback, 0);
+        }
+        pub fn rejectCompactionActivity(self: *@This(), outcome: compaction_activity.Outcome) void {
+            const id = self.activity.begin(.manual, null, 0);
+            self.activity.settle(id, .{ .outcome = outcome }, 0);
+        }
+        pub fn isProcessing(self: *@This()) bool {
+            return self.busy;
+        }
+        pub fn queuedPromptCount(self: *@This()) usize {
+            return self.queued;
+        }
+        pub fn contextCompactionStatus(self: *@This()) worker_runtime.ContextCompactionStatus {
+            return self.status;
+        }
+        pub fn releaseTurnStartHold(self: *@This()) void {
+            self.released_holds += 1;
+        }
+        pub fn clearQueuedPrompts(self: *@This(), _: std.mem.Allocator, _: []const types.ImageAttachment) void {
+            self.queued = 0;
+        }
+    } = .{},
+
+    fn deinit(self: *CompactionAdmissionFake) void {
+        SubmitRuntime(CompactionAdmissionFake).clear_context_compaction(self, "test_cleanup");
+        self.notices.deinit(self.alloc);
+    }
+    pub fn hasContextToCompact(self: *CompactionAdmissionFake) bool {
+        return self.has_context;
+    }
+    pub fn collectPendingPromptCredential(self: *CompactionAdmissionFake) !@TypeOf(self.readiness) {
+        self.credential_checks += 1;
+        if (self.readiness_error) |err| return err;
+        return self.readiness;
+    }
+    pub fn enqueueContextCompaction(self: *CompactionAdmissionFake, id: compaction_activity.OperationId) !bool {
+        if (self.enqueue_error) |err| return err;
+        std.debug.assert(id == self.submission.compaction_operation.?);
+        self.worker.activity.queued(id, 1, 10);
+        self.enqueue_count += 1;
+        return true;
+    }
+    pub fn writeDomainNotice(self: *CompactionAdmissionFake, notice: types.SemanticNotice, _: bool) !void {
+        self.notice_count += 1;
+        if (self.notice_error) return error.OutOfMemory;
+        try self.notices.appendSlice(self.alloc, notice.body);
+    }
+};
+
+test "manual compaction admission waits for authentication and enqueues once" {
+    var app: CompactionAdmissionFake = .{};
+    defer app.deinit();
+    const Runtime = SubmitRuntime(CompactionAdmissionFake);
+    try Runtime.request_context_compaction(&app);
+    const accepted = app.worker.activity.snapshot;
+    try Runtime.request_context_compaction(&app);
+    try std.testing.expectEqualDeep(accepted, app.worker.activity.snapshot);
+    try std.testing.expect(accepted.operation.?.phase == .preparing);
+    try std.testing.expect(app.submission.compaction_pending);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
+    try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+    app.readiness = .current;
+    Runtime.collect_context_compaction(&app);
+    Runtime.collect_context_compaction(&app);
+    try std.testing.expect(!app.submission.compaction_pending);
+    try std.testing.expectEqual(@as(usize, 1), app.enqueue_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.cancelled);
+    try std.testing.expectEqual(accepted.operation.?.id, app.worker.activity.snapshot.operation.?.id);
+    try std.testing.expectEqual(@as(i64, 10), app.worker.activity.snapshot.operation.?.started_at_ms);
+    try std.testing.expectEqual(@as(?u64, 1), app.worker.activity.snapshot.operation.?.turn_id);
+}
+
+test "manual compaction empty and busy admission does not prepare authentication" {
+    for (0..4) |case| {
+        var app: CompactionAdmissionFake = .{};
+        defer app.deinit();
+        switch (case) {
+            0 => app.has_context = false,
+            1 => app.worker.busy = true,
+            2 => app.worker.queued = 1,
+            3 => app.worker.status = .queued,
+            else => unreachable,
+        }
+        try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+        try std.testing.expect(!app.submission.compaction_pending);
+        try std.testing.expectEqual(@as(usize, 0), app.credential_checks);
+        try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+        const feedback = app.worker.activity.snapshot.operation.?.phase.terminal;
+        try std.testing.expectEqual(if (case == 0) compaction_activity.Outcome.no_op else .busy, feedback.outcome);
+    }
+}
+
+test "manual compaction rejected authentication cannot submit a draft later" {
+    var app: CompactionAdmissionFake = .{ .readiness = .rejected };
+    defer app.deinit();
+    app.submission.retry_after_auth = true;
+    try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+    try std.testing.expect(!app.submission.compaction_pending);
+    try std.testing.expect(!app.submission.retry_after_auth);
+    app.readiness = .current;
+    SubmitRuntime(CompactionAdmissionFake).collect_context_compaction(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+}
+
+test "manual compaction admission errors stay local and release pending ownership" {
+    for ([_]bool{ false, true }) |after_readiness| {
+        var app: CompactionAdmissionFake = .{ .readiness = .current };
+        defer app.deinit();
+        if (after_readiness) app.enqueue_error = error.MissingApiKey else app.readiness_error = error.OutOfMemory;
+        try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+        try std.testing.expect(!app.submission.compaction_pending);
+        try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+        try std.testing.expectEqual(@as(usize, 0), app.notices.items.len);
+        const feedback = app.worker.activity.snapshot.operation.?.phase.terminal;
+        try std.testing.expectEqual(compaction_activity.Outcome.failed, feedback.outcome);
+        try std.testing.expectEqual(if (after_readiness) @as(anyerror, error.MissingApiKey) else error.OutOfMemory, feedback.err.?);
+    }
+}
+
+test "manual compaction queued work never produces a transcript notice" {
+    var app: CompactionAdmissionFake = .{ .readiness = .current, .notice_error = true };
+    defer app.deinit();
+    try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.enqueue_count);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+    try std.testing.expect(!app.submission.compaction_pending);
+    const accepted = app.worker.activity.snapshot;
+    try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+    try std.testing.expectEqualDeep(accepted, app.worker.activity.snapshot);
+    try std.testing.expectEqual(@as(usize, 1), app.enqueue_count);
+}
+
+test "manual compaction cancellation and transition clearing prevent late enqueue" {
+    for (0..3) |boundary| {
+        var app: CompactionAdmissionFake = .{};
+        defer app.deinit();
+        const Runtime = SubmitRuntime(CompactionAdmissionFake);
+        try Runtime.request_context_compaction(&app);
+        switch (boundary) {
+            0 => try std.testing.expect(Runtime.cancelPendingSubmission(&app)),
+            1 => Runtime.clearPendingSubmissionForSessionTransition(&app),
+            2 => Runtime.clearPendingSubmission(&app, "shutdown"),
+            else => unreachable,
+        }
+        Runtime.clearPendingSubmission(&app, "repeated_cleanup");
+        app.readiness = .current;
+        Runtime.collect_context_compaction(&app);
+        try std.testing.expectEqual(@as(usize, 1), app.auth.cancelled);
+        try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+        try std.testing.expectEqual(@as(usize, 0), app.worker.released_holds);
+        try std.testing.expectEqual(compaction_activity.Outcome.cancelled, app.worker.activity.snapshot.operation.?.phase.terminal.outcome);
+    }
+}
+
 const PendingLifecycleFake = struct {
+    const CredentialReadiness = enum { pending, current, rejected };
+
     alloc: std.mem.Allocator,
     submission: State = .{},
     worker: struct {
@@ -2063,7 +2215,7 @@ const PendingLifecycleFake = struct {
             self.release_count += 1;
         }
 
-        pub fn deleteQueuedPromptDraft(
+        pub fn removeQueuedPrompt(
             self: *@This(),
             _: std.mem.Allocator,
             turn_id: u64,
@@ -2091,6 +2243,7 @@ const PendingLifecycleFake = struct {
     finalization_count: usize = 0,
     finalization_error: bool = false,
     notice_count: usize = 0,
+    credential_checks: usize = 0,
     skill_refresh: enum { pending, current, failed } = .current,
     skill_refresh_checks: usize = 0,
 
@@ -2100,7 +2253,7 @@ const PendingLifecycleFake = struct {
 
     pub fn adoptPendingUserPrompt(
         self: *PendingLifecycleFake,
-        _: *const worker_runtime.QueuedPromptDraft,
+        _: *const PendingPromptDraft,
     ) !void {
         if (self.adoption_failures_remaining > 0) {
             self.adoption_failures_remaining -= 1;
@@ -2111,11 +2264,18 @@ const PendingLifecycleFake = struct {
 
     pub fn finalizePendingSubmission(
         self: *PendingLifecycleFake,
-        draft: *const worker_runtime.QueuedPromptDraft,
+        draft: *const PendingPromptDraft,
     ) !void {
         self.finalization_count += 1;
         if (self.finalization_error) return error.InjectedFinalizationFailure;
         self.worker.queued_turn_id = draft.turn_id;
+    }
+
+    pub fn collectPendingPromptCredential(
+        self: *PendingLifecycleFake,
+    ) !CredentialReadiness {
+        self.credential_checks += 1;
+        return .current;
     }
 
     pub fn collectPendingSkillRefresh(
@@ -2145,7 +2305,7 @@ const PendingLifecycleFake = struct {
 fn pendingLifecycleFake(alloc: std.mem.Allocator, turn_id: u64) !PendingLifecycleFake {
     return .{
         .alloc = alloc,
-        .submission = .{ .pending = PendingSubmission.init(try buildQueuedPromptDraft(
+        .submission = .{ .pending = PendingSubmission.init(try buildPendingPromptDraft(
             alloc,
             turn_id,
             "visible prompt",
@@ -2162,7 +2322,7 @@ fn pendingLifecycleFakeWithSnapshot(
 ) !PendingLifecycleFake {
     return .{
         .alloc = alloc,
-        .submission = .{ .pending = PendingSubmission.init(try buildQueuedPromptDraft(
+        .submission = .{ .pending = PendingSubmission.init(try buildPendingPromptDraft(
             alloc,
             turn_id,
             "visible image prompt",
@@ -2230,13 +2390,18 @@ test "pending submission waits for its skill catalog generation before queueing"
     Runtime.collectPendingSubmissionFacts(&app);
     try std.testing.expectEqual(PendingPhase.adopted, app.submission.pending.?.phase);
     try std.testing.expect(app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
     try std.testing.expectEqual(@as(usize, 0), app.finalization_count);
     try std.testing.expectEqual(@as(?u64, 1), app.submission.pending.?.skill_refresh_generation);
+
+    Runtime.collectPendingSubmissionFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
 
     app.skill_refresh = .current;
     Runtime.collectPendingSubmissionFacts(&app);
     try std.testing.expectEqual(PendingPhase.queued, app.submission.pending.?.phase);
     try std.testing.expect(!app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
     try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
 }
 

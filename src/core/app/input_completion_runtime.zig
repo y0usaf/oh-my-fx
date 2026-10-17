@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const edit_contract = @import("../input/editor_state.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
+const file_completion_state = @import("../input/file_completion_state.zig");
 const horizontal_navigation = @import("../input/horizontal_navigation.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -19,7 +20,6 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 const types = @import("../shared/types.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
@@ -30,14 +30,17 @@ const render_input = @import("../../ui/footer/render_input.zig");
 const skills_menu_presentation = @import("../../ui/footer/skills_menu_presentation.zig");
 const model_menu_presentation = @import("../../ui/footer/model_menu_presentation.zig");
 const resume_menu_presentation = @import("../../ui/footer/resume_menu_presentation.zig");
+const fork_menu_presentation = @import("../../ui/footer/fork_menu_presentation.zig");
 const help_menu_presentation = @import("../../ui/footer/help_menu_presentation.zig");
 const settings_menu_presentation = @import("../../ui/footer/settings_menu_presentation.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
 const footer_paint_plan = @import("../../ui/footer/paint_plan.zig");
+const render_request = @import("../../ui/render_request.zig");
 
 const ModelPickerStage = picker_state.ModelPickerStage;
 
-pub const file_picker_completion_cap: usize = 32;
+pub const FilePickerReceipt = file_completion_state.Receipt;
+pub const file_picker_completion_cap: usize = file_completion_state.capacity;
 const file_picker_match_span_cap = file_picker_completion_cap * file_index.max_path_len;
 pub const file_picker_path_storage_cap = file_picker_completion_cap * file_index.max_path_len;
 
@@ -66,11 +69,14 @@ pub const InlineCompletion = union(enum) {
 
 pub fn CompletionRuntime(comptime App: type) type {
     return struct {
-        const queue_rt = input_queue_runtime.Runtime(App);
         const FilePickerSelection = struct {
             query: picker_state.FilePickerQuery,
             choice: file_index.SearchResult,
         };
+
+        /// What accepting a folder row does: Tab opens it to list its
+        /// contents, Enter selects the folder itself.
+        const FolderAction = enum { open, select };
 
         pub fn slashCompletionCandidateCount(app: *App) usize {
             const prefix = command_specs.slashCompletionPrefix(
@@ -90,8 +96,8 @@ pub fn CompletionRuntime(comptime App: type) type {
         fn slashCompletionQueryActive(app: *App) bool {
             if (app.input_runtime.picker.isInlinePickerSuppressed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
-            // Model query always owns this slot. Mid-turn bare `/model` does too
-            // (list stays hidden); idle bare `/model` still surfaces slash rows.
+            // Model query always owns this slot. Mid-turn bare `/model` does too;
+            // idle bare `/model` still surfaces slash rows.
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return false;
             }
@@ -141,9 +147,8 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active) {
-                    if (queueReviewOwnsComposer(app)) {
-                        return if (hasFileQuery(app)) .file else null;
-                    }
+                    if (hasModelQuery(app)) return .model;
+                    if (hasFileQuery(app)) return .file;
                     if (visibleInlineSlashCompletion(app) != null) return .slash;
                     if (visibleSlashCompletionCount(app) > 0) return .slash;
                     return null;
@@ -226,13 +231,6 @@ pub fn CompletionRuntime(comptime App: type) type {
                 return;
             }
 
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                if (try queue_rt.routeVertical(app, direction)) {
-                    app.input_runtime.vertical_navigation.reset();
-                    return;
-                }
-            }
-
             const scan = if (page)
                 ui_input.scanInputCursorRows(
                     &app.input_runtime,
@@ -278,6 +276,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     &app.input_runtime.vertical_navigation,
                 );
             } else if (direction == .up) {
+                if (try restoreQueuedSteerToComposer(app)) return;
                 try navigatePromptHistory(app, -1);
             } else if (app.input_runtime.edit_state.cursor < app.input_runtime.edit_state.input.items.len) {
                 _ = horizontal_navigation.move(
@@ -289,6 +288,31 @@ pub fn CompletionRuntime(comptime App: type) type {
             } else {
                 try navigatePromptHistory(app, 1);
             }
+        }
+
+        /// Pulls the newest queued steering prompt that still waits for a
+        /// boundary back into the empty composer for editing. Returns false when
+        /// no steer is retractable, leaving history navigation to run unchanged.
+        /// An active history episode keeps its stashed draft untouched.
+        fn restoreQueuedSteerToComposer(app: *App) !bool {
+            if (comptime !@hasField(App, "worker")) return false;
+            if (comptime !@hasDecl(@TypeOf(app.worker), "popQueuedSteerForEdit")) return false;
+            if (app.input_runtime.edit_state.input.items.len > 0) return false;
+            if (app.input_runtime.composer_history.activeIndex() != null) return false;
+            const text = (try app.worker.popQueuedSteerForEdit(std.heap.c_allocator)) orelse return false;
+            defer std.heap.c_allocator.free(text);
+            try app.input_runtime.edit_state.setText(app.alloc, text);
+            app.input_runtime.vertical_navigation.reset();
+            app.input_runtime.historyBoundary(app.alloc);
+            debug_trace.eventf(
+                "input",
+                "queued_steer_restored",
+                .{},
+                "bytes={d}",
+                .{text.len},
+            );
+            app.shell.render_requests.request(.footer);
+            return true;
         }
 
         pub fn navigatePromptHistory(app: *App, delta: i32) !void {
@@ -368,6 +392,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn routeNonSlashPickerMove(app: *App, delta: i32) !bool {
+            if (try routeMcpHostMenuMove(app, delta)) return true;
             if (try routeSettingsMenuMove(app, delta)) return true;
             if (try routeHelpMenuMove(app, delta)) return true;
             if (try routeModelMenuMove(app, delta)) return true;
@@ -375,14 +400,14 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (try routeSkillsMenuMove(app, delta)) return true;
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
                 if (try routeSessionPickerMove(app, delta)) return true;
+                if (try routeForkMenuMove(app, delta)) return true;
             }
-            const stream_suppresses_file_picker = app.stream.active and !queueReviewOwnsComposer(app);
-            if (!stream_suppresses_file_picker and hasFileQuery(app)) {
+            if (hasFileQuery(app)) {
                 navigateFilePicker(app, delta);
                 return true;
             }
             if (hasModelQuery(app)) {
-                if (!app.stream.active) navigateModelPicker(app, delta);
+                navigateModelPicker(app, delta);
                 return true;
             }
             if (provider_picker_runtime.Runtime(App).hasQuery(app)) {
@@ -392,6 +417,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             // Mid-turn bare `/model`: consume arrows without slash/skill navigation.
             if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return true;
             return false;
+        }
+
+        fn routeMcpHostMenuMove(app: *App, delta: i32) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!app.mcp.hostMenuActive()) return false;
+            try app.mcpHostMenuKey(if (delta < 0) .up else .down);
+            return true;
         }
 
         fn routeSettingsMenuMove(app: *App, delta: i32) !bool {
@@ -469,6 +501,19 @@ pub fn CompletionRuntime(comptime App: type) type {
             return true;
         }
 
+        fn routeForkMenuMove(app: *App, delta: i32) !bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            const menu = &app.session_persistence.fork_menu;
+            if (!menu.active()) return false;
+            menu.move(delta);
+            menu.window_start = fork_menu_presentation.windowStart(
+                menu.projection(),
+                app.shell.layout.cols,
+                try inlineMenuRowBudget(app, fork_menu_presentation.max_inline_rows),
+            );
+            return true;
+        }
+
         fn routeAuthPickerMove(app: *App, delta: i32) bool {
             if (comptime !@hasField(App, "auth")) return false;
             if (app.stream.active) return false;
@@ -515,44 +560,24 @@ pub fn CompletionRuntime(comptime App: type) type {
                 app.shell.layout.content_bottom,
                 true,
             );
-            if (comptime !@hasField(App, "queued_prompt_review")) {
+            if (comptime !@hasDecl(@TypeOf(app.worker), "snapshotSteeringPresentation")) {
                 return .{ .input_extra = capped.input_extra, .banner_rows = 0 };
             }
-
-            const measurement = try input_queue_runtime.measureVisibleReviewRows(
-                app.alloc,
-                &app.queued_prompt_review,
-                .{
-                    .input = app.input_runtime.edit_state.input.items,
-                    .cursor = app.input_runtime.edit_state.cursor,
-                    .terminal_cols = app.shell.layout.cols,
-                    .images = app.pending_images.items,
-                    .pasted_blocks = app.input_runtime.entities.pasted_blocks.items,
-                    .image_tokens = app.input_runtime.entities.image_tokens.items,
-                    .skill_tokens = app.input_runtime.entities.skill_tokens.items,
-                },
+            var steering = try app.worker.snapshotSteeringPresentation(app.alloc);
+            defer steering.deinit(app.alloc);
+            const requested_banner_rows = render_input.steeringBannerRowsForMessages(
+                steering.messages,
+                steering.waits_for_boundary,
+                app.shell.layout.cols,
             );
-            const preview = app.worker.queuePreview();
-            const card_count = if (measurement.card_rows > 0)
-                app.queued_prompt_review.entries.len
-            else
-                0;
-            const queued_count = if (card_count > 0) card_count else preview.count;
-            const input_extra: u16 = if (measurement.editor_active) 0 else capped.input_extra;
-            const requested_banner_rows = render_input.queuedBannerRowsForFacts(.{
-                .queued_count = queued_count,
-                .paused = preview.paused,
-                .card_count = card_count,
-                .card_rows = measurement.card_rows,
-            });
             return .{
-                .input_extra = input_extra,
-                .banner_rows = surface_frame.clampQueuedBannerRows(
+                .input_extra = capped.input_extra,
+                .banner_rows = surface_frame.clampSteeringBannerRows(
                     requested_banner_rows,
                     app.shell.layout.rows,
                     true,
                     footer_paint_plan.composerTopChromeRows(),
-                    input_extra,
+                    capped.input_extra,
                 ),
             };
         }
@@ -593,6 +618,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn hasFileQuery(app: *App) bool {
+            if (comptime !runtime_profile.allows(App, .file_index)) return false;
             return app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null;
         }
 
@@ -673,9 +699,6 @@ pub fn CompletionRuntime(comptime App: type) type {
                 skill_runtime.skillDisplaySource(app.skills.items, completion.skill),
             );
             app.input_runtime.picker.resetInlinePickerEpisode();
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                queue_rt.markVisibleSelectionDirty(app);
-            }
             return .inserted;
         }
 
@@ -712,14 +735,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 if (app.approval_prompt.isActive()) return false;
             }
             if (catalogMenuOwnsSurface(app)) return false;
-            return !queueReviewOwnsComposer(app);
-        }
-
-        fn queueReviewOwnsComposer(app: *App) bool {
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                return app.queued_prompt_review.visible;
-            }
-            return false;
+            return true;
         }
 
         fn catalogMenuOwnsSurface(app: *App) bool {
@@ -738,96 +754,249 @@ pub fn CompletionRuntime(comptime App: type) type {
             return false;
         }
 
-        fn navigateFilePicker(app: *App, delta: i32) void {
-            const query = app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) orelse return;
+        fn fileScopeEpoch(app: *const App) u64 {
+            if (comptime @hasDecl(App, "fileCompletionScopeEpoch")) return app.fileCompletionScopeEpoch();
+            return 0;
+        }
+
+        fn filePickerEligible(app: *App) bool {
+            if (comptime !runtime_profile.allows(App, .file_index)) return false;
+            if (comptime @hasField(App, "question_prompt")) if (app.question_prompt.isActive()) return false;
+            if (comptime @hasField(App, "approval_prompt")) if (app.approval_prompt.isActive()) return false;
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) if (app.auth.pickerView().active) return false;
+            }
+            if (comptime @hasField(App, "shell")) {
+                if (comptime @hasDecl(@TypeOf(app.shell), "fullTranscriptActive")) if (app.shell.fullTranscriptActive()) return false;
+            }
+            return !catalogMenuOwnsSurface(app);
+        }
+
+        pub fn reconcileFilePicker(app: *App) void {
+            if (comptime !runtime_profile.allows(App, .file_index)) return;
+            const picker = &app.input_runtime.picker;
+            const query = picker.activeFilePickerQuery(&app.input_runtime.edit_state);
+            var decoded_storage: [file_index.max_path_len]u8 = undefined;
+            const indexed = if (query) |q| blk: {
+                const decoded = q.decoded_query(&decoded_storage) catch break :blk true;
+                break :blk fileCompletionsDependOnIndex(app, decoded);
+            } else true;
+            if (picker.file_completion.reconcile(query, fileScopeEpoch(app), indexed)) picker.resetFilePickerIndex();
+            const eligible = filePickerEligible(app);
+            if (!eligible) picker.file_completion.distrust();
+            if (comptime @hasDecl(App, "reconcileDirectoryCompletion")) app.reconcileDirectoryCompletion(eligible);
+            if (comptime @hasField(App, "shell")) {
+                if (comptime @hasField(@TypeOf(app.shell), "render_requests")) {
+                    if (app.shell.render_requests.resizeLifecyclePending()) picker.file_completion.distrust();
+                }
+                if (comptime @hasField(@TypeOf(app.shell), "terminal_reset_pending")) {
+                    if (app.shell.terminal_reset_pending or app.shell.terminal_dimensions_invalid) picker.file_completion.distrust();
+                }
+            }
+        }
+
+        pub fn collectFilePickerFacts(app: *App) void {
+            if (comptime !runtime_profile.allows(App, .file_index)) return;
+            reconcileFilePicker(app);
+            app.harvestDirectoryCompletion(filePickerEligible(app));
+        }
+
+        /// Returns true while the frame for a keystroke that started a folder
+        /// listing should wait for its rows, so they paint together.
+        pub fn holdFrameForFileListing(app: *App, now_ms: i64) bool {
+            if (comptime !runtime_profile.allows(App, .file_index)) return false;
+            app.harvestDirectoryCompletion(filePickerEligible(app));
+            const picker = &app.input_runtime.picker;
+            const state = &picker.file_completion;
+            if (!state.active) {
+                picker.file_listing_wait = .{};
+                return false;
+            }
+            const in_flight = !state.indexed and state.directory_request != null;
+            const was_holding = picker.file_listing_wait.active(now_ms);
+            const hold = picker.file_listing_wait.hold(in_flight, now_ms);
+            if (was_holding and !hold and in_flight) {
+                debug_trace.logf("input", "file picker painted before folder listing request={d}", .{state.directory_request.?});
+            }
+            return hold;
+        }
+
+        /// For the first tick of every folder listing, the event loop checks
+        /// back every millisecond instead of every tick. A listing that
+        /// finishes in that time is seen at once, which also turns waiting
+        /// back on after a slow folder.
+        pub fn fileListingHoldPending(app: *const App, now_ms: i64) bool {
+            if (comptime !runtime_profile.allows(App, .file_index)) return false;
+            return app.input_runtime.picker.file_listing_wait.measuring(now_ms);
+        }
+
+        /// The sole acquisition boundary. Called after input batching, never by
+        /// painters, navigation or acceptance. Directory work is scheduled, not run.
+        pub fn prepareFilePicker(app: *App) void {
+            if (comptime !runtime_profile.allows(App, .file_index)) return;
+            reconcileFilePicker(app);
+            const picker = &app.input_runtime.picker;
+            const state = &picker.file_completion;
+            if (!state.active or !filePickerEligible(app)) return;
+            if (state.refresh_requested) {
+                state.refresh_requested = false;
+                if (state.indexed) {
+                    var refresh = true;
+                    if (!picker.file_picker_episode_seen) {
+                        picker.file_picker_episode_seen = true;
+                        if (comptime @hasDecl(App, "isFileIndexLoading")) refresh = !app.isFileIndexLoading();
+                    }
+                    if (refresh) {
+                        if (comptime @hasDecl(App, "refreshFileIndex")) app.refreshFileIndex();
+                    }
+                }
+            }
+            var source: file_index.ReadableRevision = .{ .scope_epoch = fileScopeEpoch(app), .state = .ready };
+            if (state.indexed) {
+                if (comptime @hasDecl(App, "fileCompletionRevision")) {
+                    source = app.fileCompletionRevision();
+                } else {
+                    if (comptime @hasDecl(App, "isFileIndexLoading")) {
+                        if (app.isFileIndexLoading()) source.state = .loading;
+                    }
+                    if (comptime @hasDecl(App, "isFileIndexFailed")) {
+                        if (app.isFileIndexFailed()) source.state = .failed;
+                    }
+                }
+            }
+            if (!state.needsLookup(source)) return;
+            const query = picker.activeFilePickerQuery(&app.input_runtime.edit_state) orelse return;
+            var decoded_storage: [file_index.max_path_len]u8 = undefined;
+            const decoded = query.decoded_query(&decoded_storage) catch {
+                state.stage(app.alloc, source, .unavailable, null);
+                return;
+            };
+            if (decoded.len > file_index.max_path_len or source.scope_epoch != fileScopeEpoch(app)) {
+                state.stage(app.alloc, source, .unavailable, null);
+                return;
+            }
+            if (!state.indexed) {
+                app.prepareDirectoryCompletion();
+                return;
+            }
             var results: [file_picker_completion_cap]file_index.SearchResult = undefined;
             var spans: [file_picker_match_span_cap]file_index.MatchSpan = undefined;
             var paths: [file_picker_path_storage_cap]u8 = undefined;
-            const count = app.fileCompletions(query.query, &results, &spans, &paths) catch |err| {
-                debug_trace.logf("input", "file picker navigation search failed err={s}", .{@errorName(err)});
-                app.input_runtime.picker.resetFilePickerIndex();
+            const lookup = if (comptime @hasDecl(App, "fileCompletionsAtRevision"))
+                app.fileCompletionsAtRevision(source, decoded, &results, &spans, &paths)
+            else
+                app.fileCompletions(decoded, &results, &spans, &paths);
+            const count = lookup catch |err| {
+                debug_trace.logf("input", "file picker preparation failed err={s}", .{@errorName(err)});
+                state.stage(app.alloc, source, .unavailable, null);
                 return;
             };
-            navigatePickerOptions(&app.input_runtime.picker.file_completion_index, &app.input_runtime.picker.file_completion_window_start, count, delta);
+            const status: file_completion_state.Status = if (count > 0) .ready else switch (source.state) {
+                .loading => .loading,
+                .failed => .unavailable,
+                .idle, .ready => .empty,
+            };
+            const rows = file_completion_state.Rows.copy(app.alloc, results[0..count]) catch |err| {
+                debug_trace.logf("input", "file picker result copy failed err={s}", .{@errorName(err)});
+                state.stage(app.alloc, source, .unavailable, null);
+                return;
+            };
+            state.stage(app.alloc, source, status, rows);
+            debug_trace.logf("input", "file picker prepared revision={d} count={d} indexed={}", .{ state.next_revision -% 1, count, state.indexed });
+            app.shell.render_requests.request(.footer);
+        }
+
+        pub fn filePickerView(app: *App) file_completion_state.View {
+            if (comptime !runtime_profile.allows(App, .file_index)) return .{};
+            const picker = &app.input_runtime.picker;
+            return picker.file_completion.view(picker.file_completion_index, picker.file_completion_window_start);
+        }
+
+        pub fn acknowledgeFilePicker(app: *App, receipt: FilePickerReceipt) void {
+            if (comptime !runtime_profile.allows(App, .file_index)) return;
+            if (!filePickerEligible(app)) return;
+            const picker = &app.input_runtime.picker;
+            picker.file_completion.acknowledge(app.alloc, receipt, &picker.file_completion_index, &picker.file_completion_window_start);
+        }
+
+        pub fn distrustFilePicker(app: *App) void {
+            if (comptime runtime_profile.allows(App, .file_index)) app.input_runtime.picker.file_completion.distrust();
+        }
+
+        fn navigateFilePicker(app: *App, delta: i32) void {
+            reconcileFilePicker(app);
+            if (!filePickerEligible(app)) return;
+            const picker = &app.input_runtime.picker;
+            picker.file_completion.navigate(&picker.file_completion_index, &picker.file_completion_window_start, delta);
         }
 
         pub fn autocompleteFilePickerSelection(app: *App, max_input_len: usize) !edit_contract.InsertResult {
-            var results: [file_picker_completion_cap]file_index.SearchResult = undefined;
-            var spans: [file_picker_match_span_cap]file_index.MatchSpan = undefined;
-            var paths: [file_picker_path_storage_cap]u8 = undefined;
-            const selection = resolveFilePickerSelection(app, &results, &spans, &paths) catch |err| {
-                rejectFilePickerSearch(app, err);
+            if (comptime !runtime_profile.allows(App, .file_index)) return .inactive;
+            reconcileFilePicker(app);
+            if (!filePickerEligible(app)) return .inactive;
+            const selection = resolveFilePickerSelection(app) orelse {
+                const picker = &app.input_runtime.picker;
+                const status = filePickerView(app).status;
+                if (status != .loading and (status == .unavailable or status == .stale or picker.file_completion.selection_missing)) picker.file_completion.retry();
+                app.shell.render_requests.request(.footer);
                 return .inactive;
-            } orelse return .inactive;
-            return applyFilePickerSelection(app, selection, max_input_len);
-        }
-
-        fn resolveFilePickerSelection(
-            app: *App,
-            out: *[file_picker_completion_cap]file_index.SearchResult,
-            match_spans: *[file_picker_match_span_cap]file_index.MatchSpan,
-            path_storage: *[file_picker_path_storage_cap]u8,
-        ) !?FilePickerSelection {
-            const query = app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) orelse return null;
-            const count = try app.fileCompletions(query.query, out, match_spans, path_storage);
-            if (count == 0) return null;
-
-            const idx = app.input_runtime.picker.file_completion_index % count;
-            return .{
-                .query = query,
-                .choice = out[idx],
             };
+            return applyFilePickerSelection(app, selection, max_input_len, .open);
         }
 
-        fn rejectFilePickerSearch(app: *App, err: anyerror) void {
-            debug_trace.logf("input", "file picker selection search failed err={s}", .{@errorName(err)});
-            app.input_runtime.picker.resetFilePickerIndex();
+        fn resolveFilePickerSelection(app: *App) ?FilePickerSelection {
+            const picker = &app.input_runtime.picker;
+            const query = picker.activeFilePickerQuery(&app.input_runtime.edit_state) orelse return null;
+            const choice = picker.file_completion.selected(picker.file_completion_index) orelse return null;
+            return .{ .query = query, .choice = choice };
         }
 
         fn applyFilePickerSelection(
             app: *App,
             selection: FilePickerSelection,
             max_input_len: usize,
+            folder_action: FolderAction,
         ) !edit_contract.InsertResult {
             if (!file_picker_path.isRepresentable(selection.choice.path)) {
                 debug_trace.logf("input", "file picker rejected unrepresentable selection bytes={d}", .{selection.choice.path.len});
                 app.input_runtime.picker.resetFilePickerIndex();
                 return .inactive;
             }
-            if (!isCurrentFileCompletion(app, selection.query.query, selection.choice.path, selection.choice.kind)) {
+            var query_storage: [file_index.max_path_len]u8 = undefined;
+            const decoded_query = try selection.query.decoded_query(&query_storage);
+            const indexed = fileCompletionsDependOnIndex(app, decoded_query);
+            if (!isCurrentFileCompletion(app, decoded_query, selection.choice.path, selection.choice.kind)) {
                 debug_trace.logf("input", "file picker rejected stale selection bytes={d} kind={s}", .{ selection.choice.path.len, @tagName(selection.choice.kind) });
-                app.input_runtime.picker.resetFilePickerIndex();
-                if (fileCompletionsDependOnIndex(app, selection.query.query)) {
-                    if (comptime @hasDecl(App, "refreshFileIndex")) app.refreshFileIndex();
-                }
+                app.input_runtime.picker.file_completion.rejectSelection();
                 return .inactive;
             }
 
             const items = app.input_runtime.edit_state.input.items;
             const replace_start = selection.query.at_offset;
-            const replace_end = selection.query.token_start + selection.query.query.len;
+            const replace_end = selection.query.replace_end;
             const tail = items[replace_end..];
             const reuses_terminator = tail.len > 0 and picker_state.isFilePickerTerminator(tail[0]);
             const is_directory = selection.choice.kind == .directory;
-            const uses_quote = selection.query.quoted or file_picker_path.needsQuotes(selection.choice.path);
-            const directory_slash_len: usize = @intFromBool(is_directory);
-            const quote_len: usize = @intFromBool(uses_quote);
-            const closing_quote_len: usize = @intFromBool(uses_quote and !is_directory);
-            const inserted_path_len = selection.choice.path.len + directory_slash_len;
-            const adds_terminator = !is_directory and !reuses_terminator;
-            const inserted_len = 1 + quote_len + inserted_path_len + closing_quote_len + @intFromBool(adds_terminator);
-
-            var replacement: std.ArrayList(u8) = .empty;
+            const opens_directory = is_directory and folder_action == .open;
+            const adds_terminator = !opens_directory and !reuses_terminator;
+            // An opened folder stays an active query so its contents list next.
+            // A selected folder is finished like a file: its path with the
+            // trailing slash, any quote closed, and a separating space.
+            const selected_folder = if (is_directory and !opens_directory)
+                try std.mem.concat(app.alloc, u8, &.{ selection.choice.path, "/" })
+            else
+                null;
+            defer if (selected_folder) |path| app.alloc.free(path);
+            const encoded = try file_picker_path.encode(app.alloc, selected_folder orelse selection.choice.path, .{
+                .quoted = selection.query.quoted,
+                .directory = opens_directory,
+                .workspace_relative = indexed,
+            });
+            var replacement = std.ArrayList(u8).fromOwnedSlice(encoded);
             defer replacement.deinit(app.alloc);
-            try replacement.ensureTotalCapacity(app.alloc, inserted_len);
-            replacement.appendAssumeCapacity('@');
-            if (uses_quote) replacement.appendAssumeCapacity('"');
-            replacement.appendSliceAssumeCapacity(selection.choice.path);
-            if (is_directory) replacement.appendAssumeCapacity('/');
-            if (uses_quote and !is_directory) replacement.appendAssumeCapacity('"');
             const separator_offset = replace_start + replacement.items.len;
-            if (adds_terminator) replacement.appendAssumeCapacity(' ');
-            const cursor_after_replacement = replace_start + replacement.items.len + @intFromBool(!is_directory and reuses_terminator);
+            if (adds_terminator) try replacement.append(app.alloc, ' ');
+            const cursor_after_replacement = replace_start + replacement.items.len + @intFromBool(!opens_directory and reuses_terminator);
 
             const result = try app.input_runtime.replacementState(&app.pending_images).replaceRangeBounded(
                 app.alloc,
@@ -844,24 +1013,20 @@ pub fn CompletionRuntime(comptime App: type) type {
                         separator_offset,
                     );
                 }
-                if (is_directory) app.input_runtime.picker.resetFilePickerIndex();
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    queue_rt.markVisibleSelectionDirty(app);
-                }
+                if (opens_directory) app.input_runtime.picker.resetFilePickerIndex();
             }
             return result;
         }
 
         pub fn submitFilePickerOnEnter(app: *App, max_input_len: usize) !?edit_contract.InsertResult {
+            if (comptime !runtime_profile.allows(App, .file_index)) return null;
+            reconcileFilePicker(app);
             if (!filePickerOwnsSurface(app)) return null;
-            var results: [file_picker_completion_cap]file_index.SearchResult = undefined;
-            var spans: [file_picker_match_span_cap]file_index.MatchSpan = undefined;
-            var paths: [file_picker_path_storage_cap]u8 = undefined;
-            const selection = resolveFilePickerSelection(app, &results, &spans, &paths) catch |err| {
-                rejectFilePickerSearch(app, err);
+            const selection = resolveFilePickerSelection(app) orelse {
+                if (app.input_runtime.picker.file_completion.acceptedEmpty()) return null;
                 return .inactive;
-            } orelse return null;
-            const result = try applyFilePickerSelection(app, selection, max_input_len);
+            };
+            const result = try applyFilePickerSelection(app, selection, max_input_len, .select);
             debug_trace.logf(
                 "input",
                 "file picker Enter consumed selected={s} limit_exceeded={s}",
@@ -874,7 +1039,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn filePickerOwnsSurface(app: *App) bool {
-            return visibleInlinePickerKind(app) == .file;
+            return filePickerEligible(app) and hasFileQuery(app);
         }
 
         fn isCurrentFileCompletion(app: *App, query: []const u8, path: []const u8, kind: file_index.CandidateKind) bool {
@@ -900,8 +1065,19 @@ pub fn CompletionRuntime(comptime App: type) type {
                     navigatePickerOptions(&app.input_runtime.picker.model_picker_effort_index, &app.input_runtime.picker.model_picker_effort_window_start, effortCompletionValues(app, query.query, &values), delta);
                 },
                 .fast => {
-                    var labels: [2][]const u8 = undefined;
-                    navigatePickerOptions(&app.input_runtime.picker.model_picker_fast_index, &app.input_runtime.picker.model_picker_fast_window_start, fastCompletionLabels(query.query, &labels), delta);
+                    var labels: [3][]const u8 = undefined;
+                    const count = speedPickerLabels(app, query.query, &labels);
+                    if (count == 0) return;
+                    var display_index = speedPickerIndex(app, labels[0..count]);
+                    navigatePickerOptions(
+                        &display_index,
+                        &app.input_runtime.picker.model_picker_fast_window_start,
+                        count,
+                        delta,
+                    );
+                    app.input_runtime.picker.model_picker_fast_index = speedOptionIndex(
+                        labels[display_index % count],
+                    );
                 },
             }
         }
@@ -969,7 +1145,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         const navigatePickerOptions = list_window.advanceSelection;
 
         fn setModelComposerText(app: *App, comptime fmt: []const u8, args: anytype) !void {
-            const text = try std.fmt.allocPrint(app.alloc, fmt, args);
+            const text = try app.alloc.print(fmt, args);
             defer app.alloc.free(text);
             try app.input_runtime.textReplacementState().replace(app.alloc, text);
         }
@@ -992,6 +1168,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         model,
                         model_capabilities.reasoningEffortIndex(capabilities, effort),
                         capabilities.supports_fast_mode,
+                        false,
                         .effort,
                     );
                 },
@@ -1001,10 +1178,9 @@ pub fn CompletionRuntime(comptime App: type) type {
                     const capabilities = model_capabilities.resolveForApp(App, app, model);
                     const effort = model_capabilities.reasoningEffortAtIndex(capabilities, app.input_runtime.picker.model_picker_effort_index);
                     const effort_index = model_capabilities.reasoningEffortIndex(capabilities, effort);
-                    const fast_mode = selectedFastCompletion(app) orelse return;
-                    const fast_label = if (fast_mode) picker_state.model_picker_fast_options[1] else picker_state.model_picker_fast_options[0];
-                    try setModelComposerText(app, "/model {s} {s} {s}", .{ model, effort.label(), fast_label });
-                    try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, effort_index, fast_mode, .fast);
+                    const speed = selectedSpeedCompletion(app) orelse return;
+                    try setModelComposerText(app, "/model {s} {s} {s}", .{ model, effort.label(), speed.label });
+                    try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, effort_index, speed.fast_mode, speed.ultrafast_mode, .fast);
                 },
             }
             app.shell.render_requests.request(.footer);
@@ -1026,10 +1202,10 @@ pub fn CompletionRuntime(comptime App: type) type {
                     defer app.alloc.free(model);
                     const effort = exactEffortCompletion(app, query.query) orelse return false;
                     const capabilities = model_capabilities.resolveForApp(App, app, model);
-                    if (!capabilities.supports_fast_mode) return false;
+                    if (!capabilities.supports_fast_mode and !capabilities.supports_ultrafast_mode) return false;
 
                     try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
-                    try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, .fast);
+                    try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), capabilities.supports_fast_mode, false, .fast);
                     return true;
                 },
                 .fast => return false,
@@ -1072,9 +1248,9 @@ pub fn CompletionRuntime(comptime App: type) type {
                     const capabilities = model_capabilities.resolveForApp(App, app, model);
                     if (capabilities.supports_fast_mode) {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
-                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, .fast);
+                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, false, .fast);
                     } else {
-                        try session_commands.Commands(App).selectModelFromPicker(app, model, effort, app.fast_mode);
+                        try session_commands.Commands(App).selectModelFromPicker(app, model, effort, app.fast_mode, false);
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     }
                     app.shell.render_requests.request(.footer);
@@ -1084,12 +1260,12 @@ pub fn CompletionRuntime(comptime App: type) type {
                     if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return false;
                     const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
                     defer app.alloc.free(model);
-                    const fast_mode = selectedFastCompletion(app) orelse {
+                    const speed = selectedSpeedCompletion(app) orelse {
                         app.shell.render_requests.request(.footer);
                         return true;
                     };
                     const effort = model_capabilities.reasoningEffortAtIndex(model_capabilities.resolveForApp(App, app, model), app.input_runtime.picker.model_picker_effort_index);
-                    try session_commands.Commands(App).selectModelFromPicker(app, model, effort, fast_mode);
+                    try session_commands.Commands(App).selectModelFromPicker(app, model, effort, speed.fast_mode, speed.ultrafast_mode);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     app.shell.render_requests.request(.footer);
                     return true;
@@ -1118,22 +1294,29 @@ pub fn CompletionRuntime(comptime App: type) type {
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             const supports_effort = capabilities.reasoning_efforts.len > 0;
             const supports_fast = capabilities.supports_fast_mode;
+            const supports_ultrafast = capabilities.supports_ultrafast_mode;
+            const supports_speed = supports_fast or supports_ultrafast;
 
-            if (!supports_effort and !supports_fast) {
-                try session_commands.Commands(App).selectModelFromPicker(app, model, app.effort, app.fast_mode);
+            if (!supports_effort and !supports_speed) {
+                try session_commands.Commands(App).selectModelFromPicker(app, model, app.effort, app.fast_mode, false);
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
                 return;
             }
 
             const stage: ModelPickerStage = if (supports_effort) .effort else .fast;
-            try setModelComposerText(app, "/model {s} ", .{model});
-            // Preselect the product effort default and enable Fast mode when supported.
+            if (supports_effort) {
+                try setModelComposerText(app, "/model {s} ", .{model});
+            } else {
+                try setModelComposerText(app, "/model {s} auto ", .{model});
+            }
+            // Preselect the product effort default and Fast mode when supported.
             try app.input_runtime.picker.beginModelPickerFlow(
                 app.alloc,
                 model,
                 model_capabilities.reasoningEffortIndex(capabilities, .auto),
                 supports_fast,
+                false,
                 stage,
             );
             app.shell.render_requests.request(.footer);
@@ -1161,7 +1344,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     if (capabilities.reasoning_efforts.len > 0) {
                         const effort_index = model_capabilities.reasoningEffortIndex(capabilities, model_capabilities.reasoningEffortAtIndex(capabilities, app.input_runtime.picker.model_picker_effort_index));
                         try setModelComposerText(app, "/model {s} ", .{model});
-                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, effort_index, app.fast_mode, .effort);
+                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, effort_index, app.fast_mode, app.worker.agent_turn_settings.ultrafast_mode, .effort);
                     } else {
                         try restoreModelPickerModelStage(app, model);
                     }
@@ -1251,29 +1434,76 @@ pub fn CompletionRuntime(comptime App: type) type {
             return values[app.input_runtime.picker.model_picker_effort_index % count];
         }
 
-        fn fastCompletionLabels(query: []const u8, out: *[2][]const u8) usize {
-            return picker_state.filterCompletionLabels(query, picker_state.model_picker_fast_options[0..], out[0..]);
+        const SpeedSelection = struct {
+            label: []const u8,
+            fast_mode: bool,
+            ultrafast_mode: bool,
+        };
+
+        pub fn speedPickerLabels(app: *App, query: []const u8, out: *[3][]const u8) usize {
+            const capabilities = model_capabilities.resolveForApp(
+                App,
+                app,
+                app.input_runtime.picker.model_picker_pending_model.items,
+            );
+            var options: [3][]const u8 = .{ picker_state.model_picker_speed_options[0], undefined, undefined };
+            var option_count: usize = 1;
+            if (capabilities.supports_fast_mode) {
+                options[option_count] = picker_state.model_picker_speed_options[1];
+                option_count += 1;
+            }
+            if (capabilities.supports_ultrafast_mode) {
+                options[option_count] = picker_state.model_picker_speed_options[2];
+                option_count += 1;
+            }
+            return picker_state.filterCompletionLabels(query, options[0..option_count], out[0..]);
         }
 
-        fn exactFastCompletion(raw_query: []const u8) ?bool {
-            const query = std.mem.trim(u8, raw_query, " \t");
-            if (std.ascii.eqlIgnoreCase(query, picker_state.model_picker_fast_options[0])) return false;
-            if (std.ascii.eqlIgnoreCase(query, picker_state.model_picker_fast_options[1])) return true;
+        pub fn speedPickerIndex(app: *const App, labels: []const []const u8) usize {
+            const selected = picker_state.model_picker_speed_options[
+                app.input_runtime.picker.model_picker_fast_index % picker_state.model_picker_speed_options.len
+            ];
+            for (labels, 0..) |label, index| {
+                if (std.ascii.eqlIgnoreCase(label, selected)) return index;
+            }
+            return 0;
+        }
+
+        fn speedOptionIndex(label: []const u8) usize {
+            for (picker_state.model_picker_speed_options, 0..) |option, index| {
+                if (std.ascii.eqlIgnoreCase(label, option)) return index;
+            }
+            return 0;
+        }
+
+        fn speedSelection(label: []const u8) ?SpeedSelection {
+            if (std.ascii.eqlIgnoreCase(label, picker_state.model_picker_speed_options[0])) {
+                return .{ .label = picker_state.model_picker_speed_options[0], .fast_mode = false, .ultrafast_mode = false };
+            }
+            if (std.ascii.eqlIgnoreCase(label, picker_state.model_picker_speed_options[1])) {
+                return .{ .label = picker_state.model_picker_speed_options[1], .fast_mode = true, .ultrafast_mode = false };
+            }
+            if (std.ascii.eqlIgnoreCase(label, picker_state.model_picker_speed_options[2])) {
+                return .{ .label = picker_state.model_picker_speed_options[2], .fast_mode = false, .ultrafast_mode = true };
+            }
             return null;
         }
 
-        fn selectedFastCompletion(app: *App) ?bool {
+        fn selectedSpeedCompletion(app: *App) ?SpeedSelection {
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return null;
             if (query.stage != .fast) return null;
 
             const normalized_query = std.mem.trim(u8, query.query, " \t");
-            if (exactFastCompletion(normalized_query)) |fast_mode| return fast_mode;
-
-            var labels: [2][]const u8 = undefined;
-            const count = fastCompletionLabels(normalized_query, &labels);
+            var labels: [3][]const u8 = undefined;
+            const count = speedPickerLabels(app, normalized_query, &labels);
             if (count == 0) return null;
-            const label = labels[app.input_runtime.picker.model_picker_fast_index % count];
-            return std.mem.eql(u8, label, picker_state.model_picker_fast_options[1]);
+            if (speedSelection(normalized_query)) |selection| {
+                for (labels[0..count]) |label| {
+                    if (std.ascii.eqlIgnoreCase(label, selection.label)) return selection;
+                }
+                return null;
+            }
+            return speedSelection(labels[speedPickerIndex(app, labels[0..count])]);
         }
     };
 }
@@ -1282,17 +1512,37 @@ const FilePickerTestApp = struct {
     alloc: std.mem.Allocator,
     input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
-    queued_prompt_review: input_queue_runtime.State = .{},
     stream: types.StreamState = .{},
-    shell: struct {} = .{},
+    shell: struct { render_requests: render_request.RenderRequestState = .{} } = .{},
     file_completion_values: []const file_index.Candidate = &.{},
+    file_completion_calls: usize = 0,
+    file_index_refreshes: usize = 0,
+
+    pub fn prepareDirectoryCompletion(self: *FilePickerTestApp) void {
+        var results: [file_picker_completion_cap]file_index.SearchResult = undefined;
+        for (self.file_completion_values, 0..) |value, i| results[i] = .{ .path = value.path, .kind = value.kind, .matched_spans = &.{} };
+        const state = &self.input_runtime.picker.file_completion;
+        const rows = file_completion_state.Rows.copy(self.alloc, results[0..self.file_completion_values.len]) catch {
+            state.stage(self.alloc, .{ .state = .ready }, .unavailable, null);
+            return;
+        };
+        self.file_completion_calls += 1;
+        state.stage(self.alloc, .{ .state = .ready }, if (rows.results.len == 0) .empty else .ready, rows);
+    }
+
+    pub fn refreshFileIndex(self: *FilePickerTestApp) void {
+        self.file_index_refreshes += 1;
+    }
+
+    pub fn fileCompletionsDependOnIndex(_: *const FilePickerTestApp, query: []const u8) bool {
+        return @import("../workspace/path_completion.zig").queryMode(query) == .workspace_index;
+    }
 
     pub fn slashRegistry(_: *const FilePickerTestApp) command_specs.SlashRegistry {
         return .{};
     }
 
     fn deinit(self: *FilePickerTestApp) void {
-        self.queued_prompt_review.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.pending_images.deinit(self.alloc);
     }
@@ -1304,6 +1554,7 @@ const FilePickerTestApp = struct {
         _: *[file_picker_match_span_cap]file_index.MatchSpan,
         _: *[file_picker_path_storage_cap]u8,
     ) file_index.SearchError!usize {
+        self.file_completion_calls += 1;
         const count = @min(self.file_completion_values.len, out.len);
         for (self.file_completion_values[0..count], 0..) |value, index| {
             out[index] = .{
@@ -1322,11 +1573,24 @@ const FilePickerTestApp = struct {
 
 const FilesystemFilePickerTestApp = struct {
     alloc: std.mem.Allocator,
+    shell: struct { render_requests: render_request.RenderRequestState = .{} } = .{},
     workspace_root: []const u8,
     workspace: app_workspace_runtime.State = .{},
     file_index: file_index.FileIndex = .{},
     input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+
+    pub fn reconcileDirectoryCompletion(self: *FilesystemFilePickerTestApp, eligible: bool) void {
+        app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).reconcileDirectoryCompletion(self, eligible);
+    }
+
+    pub fn prepareDirectoryCompletion(self: *FilesystemFilePickerTestApp) void {
+        app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).prepareDirectoryCompletion(self);
+    }
+
+    pub fn harvestDirectoryCompletion(self: *FilesystemFilePickerTestApp, eligible: bool) void {
+        app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).harvestDirectoryCompletion(self, eligible);
+    }
 
     fn deinit(self: *FilesystemFilePickerTestApp) void {
         app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).deinit(self);
@@ -1390,7 +1654,6 @@ const InlineCompletionTestApp = struct {
     alloc: std.mem.Allocator,
     input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
-    queued_prompt_review: input_queue_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
     model_cache: struct {
         menu: struct {
@@ -1406,6 +1669,7 @@ const InlineCompletionTestApp = struct {
         layout: struct {
             cols: u16 = 80,
         } = .{},
+        render_requests: render_request.RenderRequestState = .{},
     } = .{},
 
     pub fn slashRegistry(_: *const InlineCompletionTestApp) command_specs.SlashRegistry {
@@ -1413,56 +1677,10 @@ const InlineCompletionTestApp = struct {
     }
 
     fn deinit(self: *InlineCompletionTestApp) void {
-        self.queued_prompt_review.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.pending_images.deinit(self.alloc);
     }
 };
-
-const SkillsNavigationTestWorker = struct {
-    fn queuePreview(_: *SkillsNavigationTestWorker) @import("../agent/worker_runtime.zig").QueuePreview {
-        return .{ .count = 2 };
-    }
-};
-
-const SkillsNavigationTestApp = struct {
-    alloc: std.mem.Allocator,
-    input_runtime: core_input_runtime.Runtime = .{},
-    pending_images: std.ArrayList(types.ImageAttachment) = .empty,
-    queued_prompt_review: input_queue_runtime.State = .{},
-    worker: SkillsNavigationTestWorker = .{},
-    skills: skill_runtime.Runtime = .{},
-    shell: struct {
-        layout: types.Layout = .{
-            .rows = 24,
-            .cols = 40,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-    } = .{},
-
-    fn deinit(self: *SkillsNavigationTestApp) void {
-        self.queued_prompt_review.deinit(self.alloc);
-        self.input_runtime.deinit(self.alloc);
-        self.pending_images.deinit(self.alloc);
-    }
-};
-
-fn makeSkillsNavigationReviewEntry(
-    alloc: std.mem.Allocator,
-    turn_id: u64,
-    text: []const u8,
-) !input_queue_runtime.ReviewEntry {
-    return .{ .draft = .{
-        .turn_id = turn_id,
-        .prompt = try alloc.dupe(u8, text),
-        .images = &.{},
-        .skill_display_spans = &.{},
-    } };
-}
 
 const ModelPickerCompletionTestApp = struct {
     alloc: std.mem.Allocator,
@@ -1493,7 +1711,7 @@ test "model picker effort completion labels survive capability resolution" {
     const rt = CompletionRuntime(ModelPickerCompletionTestApp);
     var app = ModelPickerCompletionTestApp{ .alloc = alloc };
     defer app.deinit();
-    try app.input_runtime.picker.beginModelPickerFlow(alloc, "test/model", 0, false, .effort);
+    try app.input_runtime.picker.beginModelPickerFlow(alloc, "test/model", 0, false, false, .effort);
 
     var values: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
     const count = rt.effortCompletionValues(&app, "", &values);
@@ -1503,43 +1721,6 @@ test "model picker effort completion labels survive capability resolution" {
     try std.testing.expectEqualStrings("default", values[0].displayLabel());
     try std.testing.expectEqualStrings("future-tier", values[1].displayLabel());
     try std.testing.expectEqualStrings("high", values[2].displayLabel());
-}
-
-test "command skills navigation measures a width-changed queued editor before frame commit" {
-    const alloc = std.testing.allocator;
-    const rt = CompletionRuntime(SkillsNavigationTestApp);
-    const skills = [_]skill_runtime.Skill{
-        .{ .name = "one", .description = "", .path = "/tmp/one", .source = .global_fx },
-        .{ .name = "two", .description = "", .path = "/tmp/two", .source = .global_fx },
-        .{ .name = "three", .description = "", .path = "/tmp/three", .source = .global_fx },
-        .{ .name = "four", .description = "", .path = "/tmp/four", .source = .global_fx },
-        .{ .name = "five", .description = "", .path = "/tmp/five", .source = .global_fx },
-        .{ .name = "six", .description = "", .path = "/tmp/six", .source = .global_fx },
-        .{ .name = "seven", .description = "", .path = "/tmp/seven", .source = .global_fx },
-    };
-    var app = SkillsNavigationTestApp{ .alloc = alloc };
-    defer app.deinit();
-    app.skills.items = @constCast(&skills);
-    app.skills.openMenu();
-    try app.input_runtime.textReplacementState().replace(alloc, "x" ** 60);
-
-    const entries = try alloc.alloc(input_queue_runtime.ReviewEntry, 2);
-    entries[0] = try makeSkillsNavigationReviewEntry(alloc, 1, "stored");
-    entries[1] = try makeSkillsNavigationReviewEntry(alloc, 2, "selected");
-    app.queued_prompt_review = .{
-        .entries = entries,
-        .selected_index = 1,
-        .reason = .manual,
-        .visible = true,
-    };
-
-    app.shell.layout.cols = 12;
-    try std.testing.expect(try rt.routeSkillsMenuMove(&app, 1));
-    try std.testing.expect(try rt.routeSkillsMenuMove(&app, 1));
-    try std.testing.expect(try rt.routeSkillsMenuMove(&app, 1));
-
-    try std.testing.expectEqual(@as(usize, 3), app.skills.menu.selected_index);
-    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
 }
 
 test "inline slash completion uses the shared visible suffix and acceptance path" {
@@ -1649,18 +1830,6 @@ test "inline skill completion stays inactive when its suffix cannot render" {
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "x $man");
 
-    app.queued_prompt_review.visible = true;
-    try std.testing.expectEqual(
-        @as(?InlineSkillCompletion, null),
-        rt.visibleInlineSkillCompletion(&app),
-    );
-    try std.testing.expectEqual(
-        edit_contract.InsertResult.inactive,
-        try rt.autocompleteInlineSkillCompletion(&app, 4096),
-    );
-    try std.testing.expectEqualStrings("x $man", app.input_runtime.edit_state.input.items);
-
-    app.queued_prompt_review.visible = false;
     app.shell.layout.cols = 8;
     try std.testing.expectEqual(
         @as(?InlineSkillCompletion, null),
@@ -1761,7 +1930,106 @@ fn expectInlineSkillCompletionInactive(app: *InlineCompletionTestApp) !void {
     );
 }
 
-test "streaming suppresses file selection until queued review owns the composer" {
+test "file picker disabled profile never claims literal input or prepares rows" {
+    const DisabledApp = struct {
+        pub const host_profile = runtime_profile.wasm;
+        input_runtime: core_input_runtime.Runtime = .{},
+    };
+    const rt = CompletionRuntime(DisabledApp);
+    var app: DisabledApp = .{};
+    defer app.input_runtime.deinit(std.testing.allocator);
+    try app.input_runtime.textReplacementState().replace(std.testing.allocator, "@./file");
+    rt.prepareFilePicker(&app);
+    rt.reconcileFilePicker(&app);
+    rt.collectFilePickerFacts(&app);
+    const workspace_rt = app_workspace_runtime.Runtime(DisabledApp);
+    workspace_rt.prepareDirectoryCompletion(&app);
+    workspace_rt.reconcileDirectoryCompletion(&app, true);
+    workspace_rt.harvestDirectoryCompletion(&app, true);
+    workspace_rt.requestStop(&app);
+    try std.testing.expect(!rt.hasFileQuery(&app));
+    try std.testing.expect(!rt.filePickerOwnsSurface(&app));
+    try std.testing.expectEqual(@as(?edit_contract.InsertResult, null), try rt.submitFilePickerOnEnter(&app, 4096));
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, try rt.autocompleteFilePickerSelection(&app, 4096));
+    try std.testing.expect(!app.input_runtime.picker.file_completion.active);
+    try std.testing.expectEqualStrings("@./file", app.input_runtime.edit_state.input.items);
+}
+
+test "file picker defers bare at refresh until the settled query mode" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app = FilePickerTestApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.edit_state.insertSlice(alloc, "@");
+    rt.reconcileFilePicker(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.file_index_refreshes);
+    try app.input_runtime.edit_state.insertSlice(alloc, "~");
+    rt.reconcileFilePicker(&app);
+    rt.prepareFilePicker(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.file_index_refreshes);
+    try std.testing.expect(!app.input_runtime.picker.file_completion.indexed);
+    // A mode change inside the same occurrence must still refresh the index.
+    try app.input_runtime.edit_state.insertSlice(alloc, "notes");
+    rt.reconcileFilePicker(&app);
+    rt.prepareFilePicker(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.file_index_refreshes);
+    rt.prepareFilePicker(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.file_index_refreshes);
+}
+
+test "file picker resize invalidation blocks acceptance without another lookup" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app = FilePickerTestApp{ .alloc = alloc, .file_completion_values = &.{.{ .path = "file.txt", .kind = .file }} };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "@file");
+    try presentFilePickerForTest(&app);
+    app.shell.render_requests.observeResizeSignal(0, 100);
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqualStrings("@file", app.input_runtime.edit_state.input.items);
+    rt.prepareFilePicker(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
+    app.shell.render_requests.completeResizeGeometry(false);
+    rt.acknowledgeFilePicker(&app, rt.filePickerView(&app).receipt.?);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
+}
+
+test "file picker preparation caches data but requires an explicit visible receipt" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app = FilePickerTestApp{ .alloc = alloc, .file_completion_values = &.{.{ .path = "file.txt", .kind = .file }} };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "@file");
+    rt.prepareFilePicker(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqualStrings("@file", app.input_runtime.edit_state.input.items);
+    rt.prepareFilePicker(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
+    rt.acknowledgeFilePicker(&app, rt.filePickerView(&app).receipt.?);
+    rt.navigateFilePicker(&app, 1);
+    _ = rt.filePickerView(&app);
+    rt.prepareFilePicker(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
+    try std.testing.expectEqualStrings("@file.txt ", app.input_runtime.edit_state.input.items);
+}
+
+fn presentFilePickerForTest(app: anytype) !void {
+    const rt = CompletionRuntime(@TypeOf(app.*));
+    rt.prepareFilePicker(app);
+    if (comptime @TypeOf(app.*) == FilesystemFilePickerTestApp) {
+        while (app.input_runtime.picker.file_completion.directory_request != null) {
+            rt.collectFilePickerFacts(app);
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+    }
+    if (rt.filePickerView(app).receipt) |receipt| rt.acknowledgeFilePicker(app, receipt);
+}
+
+test "streaming file selection commits the selected path" {
     const alloc = std.testing.allocator;
     const rt = CompletionRuntime(FilePickerTestApp);
     var app = FilePickerTestApp{
@@ -1771,23 +2039,16 @@ test "streaming suppresses file selection until queued review owns the composer"
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "review @src/mai");
     app.stream.active = true;
+    try presentFilePickerForTest(&app);
 
-    try std.testing.expectEqual(
-        @as(?edit_contract.InsertResult, null),
-        try rt.submitFilePickerOnEnter(&app, 4096),
-    );
-    try std.testing.expectEqualStrings("review @src/mai", app.input_runtime.edit_state.input.items);
-
-    app.queued_prompt_review.visible = true;
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
         (try rt.submitFilePickerOnEnter(&app, 4096)).?,
     );
     try std.testing.expectEqualStrings("review @src/main.zig ", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(app.queued_prompt_review.selected_dirty);
 }
 
-test "file picker rejects paths that would reopen quote grammar" {
+test "file picker encodes literal quotes without reopening quote grammar" {
     const alloc = std.testing.allocator;
     const rt = CompletionRuntime(FilePickerTestApp);
     var app = FilePickerTestApp{
@@ -1796,12 +2057,27 @@ test "file picker rejects paths that would reopen quote grammar" {
     };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "@we");
+    try presentFilePickerForTest(&app);
 
     try std.testing.expectEqual(
-        edit_contract.InsertResult.inactive,
+        edit_contract.InsertResult.inserted,
         try rt.autocompleteFilePickerSelection(&app, 4096),
     );
-    try std.testing.expectEqualStrings("@we", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("@\"\\\"weird\" ", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
+}
+
+test "file picker quoted middle replacement preserves only the outside tail" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app = FilePickerTestApp{ .alloc = alloc, .file_completion_values = &.{.{ .path = "a\\b.txt", .kind = .file }} };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "read @\"a\\\\old.txt\" suffix");
+    app.input_runtime.edit_state.cursor = "read @\"a\\\\".len;
+    try presentFilePickerForTest(&app);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, try rt.autocompleteFilePickerSelection(&app, 4096));
+    try std.testing.expectEqualStrings("read @\"a\\\\b.txt\" suffix", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual("read @\"a\\\\b.txt\" ".len, app.input_runtime.edit_state.cursor);
 }
 
 test "filesystem file picker pipeline drills into a directory and selects a file" {
@@ -1826,6 +2102,7 @@ test "filesystem file picker pipeline drills into a directory and selects a file
     defer app.deinit();
 
     try app.input_runtime.textReplacementState().replace(alloc, "@./space");
+    try presentFilePickerForTest(&app);
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
         try rt.autocompleteFilePickerSelection(&app, 4096),
@@ -1840,6 +2117,7 @@ test "filesystem file picker pipeline drills into a directory and selects a file
     );
 
     try app.input_runtime.edit_state.insertSlice(alloc, "item");
+    try presentFilePickerForTest(&app);
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
         try rt.autocompleteFilePickerSelection(&app, 4096),
@@ -1849,4 +2127,119 @@ test "filesystem file picker pipeline drills into a directory and selects a file
         app.input_runtime.edit_state.input.items,
     );
     try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
+}
+
+test "filesystem file picker lists an opened folder first and Enter selects it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/space dir");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "workspace/space dir/item.txt",
+        .data = "inside",
+    });
+
+    const io_mod = @import("../shared/io.zig");
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const rt = CompletionRuntime(FilesystemFilePickerTestApp);
+    var app = FilesystemFilePickerTestApp{
+        .alloc = alloc,
+        .workspace_root = workspace_root,
+    };
+    defer app.deinit();
+
+    try app.input_runtime.textReplacementState().replace(alloc, "@./space");
+    try presentFilePickerForTest(&app);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, try rt.autocompleteFilePickerSelection(&app, 4096));
+    try std.testing.expectEqualStrings("@\"./space dir/", app.input_runtime.edit_state.input.items);
+
+    try presentFilePickerForTest(&app);
+    const folder = app.input_runtime.picker.file_completion.selected(0).?;
+    try std.testing.expectEqualStrings("./space dir", folder.path);
+    try std.testing.expectEqual(file_index.CandidateKind.directory, folder.kind);
+    try std.testing.expectEqualStrings("./space dir/item.txt", app.input_runtime.picker.file_completion.selected(1).?.path);
+
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqualStrings("@\"./space dir/\" ", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
+}
+
+test "filesystem file picker releases a held folder frame only with its rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/tree");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/tree/leaf.txt", .data = "leaf" });
+
+    const io_mod = @import("../shared/io.zig");
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const rt = CompletionRuntime(FilesystemFilePickerTestApp);
+    var app = FilesystemFilePickerTestApp{
+        .alloc = alloc,
+        .workspace_root = workspace_root,
+    };
+    defer app.deinit();
+
+    try app.input_runtime.textReplacementState().replace(alloc, "@./tree/");
+    rt.prepareFilePicker(&app);
+    // The clock stands still, so the wait can end only because the rows arrived.
+    const now_ms: i64 = 1_000;
+    var polls: usize = 0;
+    while (rt.holdFrameForFileListing(&app, now_ms)) : (polls += 1) {
+        if (polls == 5_000) return error.TestUnexpectedResult;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch unreachable;
+    }
+    const view = rt.filePickerView(&app);
+    try std.testing.expectEqual(file_completion_state.Status.ready, view.status);
+    try std.testing.expectEqual(@as(usize, 2), view.items.len);
+    try std.testing.expectEqualStrings("./tree", view.items[0].path);
+    try std.testing.expectEqualStrings("./tree/leaf.txt", view.items[1].path);
+    try std.testing.expect(!rt.fileListingHoldPending(&app, now_ms));
+}
+
+test "file picker keeps watching a listing after a slow folder so waiting can turn back on" {
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app: FilePickerTestApp = .{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    // The previous folder outlasted the wait, so this listing's frame paints
+    // at once, but the loop still checks back every millisecond.
+    app.input_runtime.picker.file_listing_wait = .{ .started_ms = 1_000, .last_outlasted_hold = true };
+    try std.testing.expect(!app.input_runtime.picker.file_listing_wait.active(1_001));
+    try std.testing.expect(rt.fileListingHoldPending(&app, 1_001));
+}
+
+test "file picker loading Tab preserves pending request and Enter never queues acceptance" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app: FilePickerTestApp = .{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "@./pending/");
+    rt.reconcileFilePicker(&app);
+    const state = &app.input_runtime.picker.file_completion;
+    state.stage(alloc, .{ .state = .ready }, .loading, null);
+    state.directory_request = 71;
+    state.rejectSelection(); // A retry of stale rows must also stay loading.
+    for (0..4) |_| {
+        try std.testing.expectEqual(edit_contract.InsertResult.inactive, try rt.autocompleteFilePickerSelection(&app, 4096));
+        try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+        rt.prepareFilePicker(&app);
+        try std.testing.expectEqual(@as(?u64, 71), state.directory_request);
+        try std.testing.expect(!state.lookup_dirty);
+    }
+    try std.testing.expectEqual(@as(usize, 0), app.file_completion_calls);
+    try std.testing.expectEqualStrings("@./pending/", app.input_runtime.edit_state.input.items);
+    state.directory_request = null;
+    state.stage(alloc, .{ .state = .ready }, .ready, try file_completion_state.Rows.copy(alloc, &.{.{ .path = "./pending/a", .kind = .file, .matched_spans = &.{} }}));
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqualStrings("@./pending/", app.input_runtime.edit_state.input.items);
+    rt.acknowledgeFilePicker(&app, rt.filePickerView(&app).receipt.?);
+    try std.testing.expectEqualStrings("@./pending/", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    rt.navigateFilePicker(&app, 1);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
 }

@@ -1,5 +1,7 @@
 const std = @import("std");
 const credentials = @import("../auth/credentials.zig");
+const model_provider = @import("../config/model_provider.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const collections = @import("../shared/collections.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -75,7 +77,7 @@ pub fn failureForHttpStatus(status: std.http.Status) Failure {
         return .{ .category = .rate_limited, .http_status = status, .retryable = true };
     }
 
-    const code = @intFromEnum(status);
+    const code = @backingInt(status);
     if (code >= 500 and code < 600) {
         return .{
             .category = .gateway_unavailable,
@@ -135,15 +137,50 @@ pub const FetchFn = *const fn (
 ) Allocator.Error!ProviderResult;
 
 pub const Provider = struct {
-    /// When set, context must remain valid until every in-flight `fetch` returns.
+    /// When set, context must outlive every in-flight fetch and capability lookup.
     context: ?*anyopaque = null,
     fetch_fn: FetchFn,
+    /// Reads already-owned metadata without allocation, I/O, or waiting.
+    lookup_capabilities_fn: ?*const fn (?*anyopaque, []const u8) model_capabilities.Capabilities = null,
+    provider_id: model_provider.ProviderId = .gateway,
+    refresh_interval_ms: ?i64 = null,
 
     /// Returns owned catalog entries; the caller frees them with `freeModelCatalog`.
     pub fn fetch(self: Provider, alloc: Allocator, input: FetchInput) Allocator.Error!ProviderResult {
         return self.fetch_fn(self.context, alloc, input);
     }
+
+    /// Null means lookup is unsupported, not that the model is unknown.
+    pub fn lookupCapabilities(self: Provider, model: []const u8) ?model_capabilities.Capabilities {
+        const lookup = self.lookup_capabilities_fn orelse return null;
+        return lookup(self.context, model);
+    }
 };
+
+test "catalog capability lookup distinguishes unsupported and unknown without fetching" {
+    const Fixture = struct {
+        fetches: usize = 0,
+        limit: u32 = 512,
+
+        fn fetch(raw: ?*anyopaque, _: Allocator, _: FetchInput) Allocator.Error!ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.fetches += 1;
+            return .{ .failure = .{ .category = .runtime } };
+        }
+
+        fn lookup(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return if (std.mem.eql(u8, model, "known")) .{ .max_output_tokens = self.limit } else .{};
+        }
+    };
+    var fixture: Fixture = .{};
+    var provider = Provider{ .context = &fixture, .fetch_fn = Fixture.fetch };
+    try std.testing.expect(provider.lookupCapabilities("known") == null);
+    provider.lookup_capabilities_fn = Fixture.lookup;
+    try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("known").?.max_output_tokens);
+    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("unknown").?);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+}
 
 pub const FetchResult = union(enum) {
     loaded: struct {
@@ -261,7 +298,7 @@ fn traceCatalogLoadOutcome(
             "model_catalog_load",
             .{},
             common_format ++ " http_status={d} retryable={s}",
-            common_args ++ .{ @intFromEnum(status), retryable },
+            common_args ++ .{ @backingInt(status), retryable },
         );
     } else {
         debug_trace.eventf(
@@ -276,12 +313,15 @@ fn traceCatalogLoadOutcome(
 
 pub const ModelCatalogEntry = struct {
     id: []u8,
+    /// The catalog's display name, trimmed; null when the catalog has none.
+    name: ?[]u8 = null,
     model_type: []u8,
     released: i64 = 0,
     has_tool_use: bool = false,
     has_reasoning: bool = false,
     reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty,
     supports_fast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
     has_vision: bool = false,
     has_file_input: bool = false,
     has_web_search: bool = false,
@@ -299,6 +339,7 @@ pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelC
 
 pub fn freeModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) void {
     alloc.free(entry.id);
+    if (entry.name) |name| alloc.free(name);
     alloc.free(entry.model_type);
     var reasoning_efforts = entry.reasoning_efforts;
     reasoning_efforts.deinit(alloc);
@@ -327,6 +368,8 @@ fn appendClonedModelCatalogEntry(alloc: std.mem.Allocator, entries: *std.ArrayLi
 fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !ModelCatalogEntry {
     const id = try alloc.dupe(u8, entry.id);
     errdefer alloc.free(id);
+    const name = if (entry.name) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (name) |value| alloc.free(value);
     const model_type = try alloc.dupe(u8, entry.model_type);
     errdefer alloc.free(model_type);
     var reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty;
@@ -335,12 +378,14 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
 
     var cloned = ModelCatalogEntry{
         .id = id,
+        .name = name,
         .model_type = model_type,
         .released = entry.released,
         .has_tool_use = entry.has_tool_use,
         .has_reasoning = entry.has_reasoning,
         .reasoning_efforts = reasoning_efforts,
         .supports_fast_mode = entry.supports_fast_mode,
+        .supports_ultrafast_mode = entry.supports_ultrafast_mode,
         .has_vision = entry.has_vision,
         .has_file_input = entry.has_file_input,
         .has_web_search = entry.has_web_search,
@@ -666,7 +711,7 @@ test "catalog authentication fallback is anonymous and bounded" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "catalog-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "catalog-trace.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     defer debug_trace.resetForTest();

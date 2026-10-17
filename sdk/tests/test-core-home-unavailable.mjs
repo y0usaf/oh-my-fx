@@ -2,7 +2,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, supportsJspi } from "../node.js";
+import { createFxEngine, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-core.wasm");
@@ -31,10 +31,10 @@ const mockFetch = async (url, init) => {
   }
   return new Response(new ReadableStream({
     start(controller) {
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n'));
-      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":3},"outputTokens":{"total":2}}}\n'));
-      controller.enqueue(encoded.encode("data: [DONE]\n"));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n\n'));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n\n'));
+      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":3},"outputTokens":{"total":2}}}\n\n'));
+      controller.enqueue(encoded.encode("data: [DONE]\n\n"));
       controller.close();
     },
   }), { status: 200, headers: { "content-type": "text/event-stream" } });
@@ -50,7 +50,7 @@ const timeout = (label, ms = 8000) => {
 
 const initializeTimeout = timeout("fx-core initialize");
 const agent = await Promise.race([
-  createFxAgent({
+  createFxEngine({
     backend: "wasm",
     wasm: await readFile(wasmPath),
     fetch: mockFetch,

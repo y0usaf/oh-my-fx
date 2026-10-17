@@ -38,7 +38,7 @@ pub const Header = struct {
     pending_slot: u64 = no_slot,
     pending_next_free: u64 = no_slot,
     pending_child_len: u16 = 0,
-    pending_child: [255]u8 = [_]u8{0} ** 255,
+    pending_child: [255]u8 = @splat(0),
 
     pub fn pendingChild(self: *const Header) []const u8 {
         return self.pending_child[0..self.pending_child_len];
@@ -62,7 +62,7 @@ pub const Slot = struct {
     occupied: bool = false,
     next_free: u64 = no_slot,
     child_len: u16 = 0,
-    child: [255]u8 = [_]u8{0} ** 255,
+    child: [255]u8 = @splat(0),
 
     pub fn childId(self: *const Slot) []const u8 {
         return self.child[0..self.child_len];
@@ -86,7 +86,7 @@ pub const Slot = struct {
 pub const PageData = struct {
     number: u64,
     storage_epoch: u64,
-    slots: [page_slots]Slot = [_]Slot{.{}} ** page_slots,
+    slots: [page_slots]Slot = @splat(.{}),
 
     // Field-wise init; a partial `.{}` literal materializes a page-sized
     // (~17KB) const template at every call site.
@@ -115,7 +115,7 @@ pub fn encodeHeader(alloc: Allocator, header: Header) Allocator.Error![]u8 {
     writeInt(&out.writer, u64, header.migration_size) catch return error.OutOfMemory;
     writeInt(&out.writer, i128, header.migration_mtime_ns) catch return error.OutOfMemory;
     writeInt(&out.writer, u64, header.migration_offset) catch return error.OutOfMemory;
-    out.writer.writeByte(@intFromEnum(header.pending_kind)) catch return error.OutOfMemory;
+    out.writer.writeByte(@backingInt(header.pending_kind)) catch return error.OutOfMemory;
     writeInt(&out.writer, u64, header.pending_slot) catch return error.OutOfMemory;
     writeInt(&out.writer, u64, header.pending_next_free) catch return error.OutOfMemory;
     writeInt(&out.writer, u16, header.pending_child_len) catch return error.OutOfMemory;
@@ -188,22 +188,6 @@ pub fn decodeHeader(bytes: []const u8) Error!Header {
         if (header.pending_slot == no_slot) return error.InvalidIndex;
     }
     return header;
-}
-
-pub fn encodePage(alloc: Allocator, page_data: PageData) Allocator.Error![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    out.writer.writeAll(page_magic) catch return error.OutOfMemory;
-    writeInt(&out.writer, u32, epoch_schema_version) catch return error.OutOfMemory;
-    writeInt(&out.writer, u64, page_data.number) catch return error.OutOfMemory;
-    writeInt(&out.writer, u64, page_data.storage_epoch) catch return error.OutOfMemory;
-    for (page_data.slots) |slot| {
-        out.writer.writeByte(if (slot.occupied) 1 else 0) catch return error.OutOfMemory;
-        writeInt(&out.writer, u64, slot.next_free) catch return error.OutOfMemory;
-        writeInt(&out.writer, u16, slot.child_len) catch return error.OutOfMemory;
-        out.writer.writeAll(slot.childId()) catch return error.OutOfMemory;
-    }
-    return out.toOwnedSlice();
 }
 
 pub fn decodePage(

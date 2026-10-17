@@ -1,0 +1,17 @@
+{
+  "name": "fx-demo-nuxt-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev --dotenv .env.local",
+    "build": "nuxt build",
+    "start": "node .output/server/index.mjs"
+  },
+  "dependencies": {
+    "libfx": "0.0.8",
+    "nuxt": "4.5.2"
+  },
+  "engines": {
+    "node": "24.x"
+  }
+}

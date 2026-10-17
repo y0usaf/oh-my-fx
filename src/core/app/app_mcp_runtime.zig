@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -12,12 +13,16 @@ const mcp_health = @import("../mcp/health.zig");
 const mcp_menu_state = @import("../mcp/menu_state.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_host = @import("../mcp_host/host.zig");
+const mcp_verbs = @import("../mcp_host/verbs.zig");
+const mcp_menu = @import("../mcp_host/menu.zig");
+const editor_state = @import("../input/editor_state.zig");
+const command_lex = @import("../shell_command/command_lex.zig");
+const mod_registry = @import("../mods/registry.zig");
 const completion_feature = @import("../mcp/features/completion.zig");
 const context_limits = @import("../config/context_limits.zig");
-const tool_projection = @import("../tooling/tool_projection.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
-const tool_set = @import("../tooling/tool_set.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -117,6 +122,7 @@ const ReloadPolicy = enum {
 
 pub const PresentationOrigin = union(enum) {
     command,
+    slack_setup,
     menu: u64,
 };
 
@@ -136,12 +142,11 @@ const PendingReload = struct {
     result: ?PendingResult = null,
     policy: ReloadPolicy = .transactional,
     rebuild: bool = true,
-    detached_runtime: ?*mcp_runtime.McpRuntime = null,
     superseded_reload: ?*PendingReload = null,
     superseded_authentication: ?*PendingAuthentication = null,
 
     fn run(self: *PendingReload) void {
-        if (self.policy == .authority_reducing) self.quiesceDetachedAuthority();
+        if (self.policy == .authority_reducing) self.quiesceSupersededWork();
         const outcome = switch (self.policy) {
             .transactional => self.owner.reloadControlled(
                 self.alloc,
@@ -177,18 +182,15 @@ const PendingReload = struct {
         self.done.store(true, .release);
     }
 
-    fn quiesceDetachedAuthority(self: *PendingReload) void {
-        if (self.superseded_reload) |task| {
-            self.superseded_reload = null;
-            task.deinit();
-        }
+    fn quiesceSupersededWork(self: *PendingReload) void {
+        // Authentication can hold the lease that a retiring reload is waiting for.
         if (self.superseded_authentication) |task| {
             self.superseded_authentication = null;
             cancelAndDeinitAuthentication(task, "authority_reduction");
         }
-        if (self.detached_runtime) |runtime| {
-            self.detached_runtime = null;
-            destroyRuntime(self.alloc, runtime);
+        if (self.superseded_reload) |task| {
+            self.superseded_reload = null;
+            task.deinit();
         }
     }
 
@@ -205,7 +207,7 @@ const PendingReload = struct {
 
     fn deinit(self: *PendingReload) void {
         self.join();
-        self.quiesceDetachedAuthority();
+        self.quiesceSupersededWork();
         if (self.result) |*result| switch (result.*) {
             .outcome => |*outcome| outcome.deinit(self.alloc),
             .failed, .cancelled => {},
@@ -217,6 +219,7 @@ const PendingReload = struct {
 
 pub const AuthenticationCompletion = struct {
     server_name: []u8,
+    reconnect_error: ?anyerror = null,
     result: anyerror!mcp_auth.AuthenticationResult,
 
     pub fn deinit(self: *AuthenticationCompletion, alloc: Allocator) void {
@@ -235,6 +238,7 @@ const PendingAuthentication = struct {
     cancel_requested: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    reconnect_error: ?anyerror = null,
     result: ?(anyerror!mcp_auth.AuthenticationResult) = null,
 
     fn run(self: *PendingAuthentication) void {
@@ -244,6 +248,13 @@ const PendingAuthentication = struct {
             openUrl,
             &self.cancel_requested,
         );
+        if (self.result.?) |outcome| {
+            if (outcome == .authenticated) {
+                self.lease.runtime.reconnectAuthenticatedServer(self.server_name, &self.cancel_requested) catch |err| {
+                    self.reconnect_error = err;
+                };
+            }
+        } else |_| {}
         self.done.store(true, .release);
     }
 
@@ -356,7 +367,7 @@ fn appendTemplateArgumentFields(
             if (variable.len > 0 and std.mem.findScalar(u8, "+#./;?&", variable[0]) != null) {
                 variable = variable[1..];
             }
-            const modifier = std.mem.indexOfAny(u8, variable, ":*") orelse variable.len;
+            const modifier = std.mem.findAny(u8, variable, ":*") orelse variable.len;
             const name = variable[0..modifier];
             if (name.len > 0) try appendMenuArgumentField(alloc, fields, name, true);
         }
@@ -404,7 +415,7 @@ fn expandResourceTemplate(
         var variables = std.mem.splitScalar(u8, variables_text, ',');
         var variable_index: usize = 0;
         while (variables.next()) |raw_variable| : (variable_index += 1) {
-            const modifier = std.mem.indexOfAny(u8, raw_variable, ":*") orelse raw_variable.len;
+            const modifier = std.mem.findAny(u8, raw_variable, ":*") orelse raw_variable.len;
             const name = raw_variable[0..modifier];
             const value = for (arguments) |argument| {
                 if (std.mem.eql(u8, argument.name, name)) break argument.value;
@@ -488,7 +499,6 @@ const MenuArgumentCompletion = struct {
 
 const MenuActionResult = struct {
     feedback: []u8,
-    reload: bool = false,
 
     fn deinit(self: *MenuActionResult, alloc: Allocator) void {
         alloc.free(self.feedback);
@@ -675,9 +685,9 @@ const PendingMenuOperation = struct {
         else
             try allocMenuText(
                 self.alloc,
-                &.{ "Logged out of MCP server '", server_name, "'." },
+                &.{ "Logged out of MCP server '", server_name, "'. Run /mcp auth ", server_name, " --open to sign in again." },
             );
-        return .{ .feedback = feedback, .reload = result.removed and !result.local_only };
+        return .{ .feedback = feedback };
     }
 
     fn previewTool(self: *PendingMenuOperation) !MenuPreview {
@@ -687,6 +697,7 @@ const PendingMenuOperation = struct {
             self.permission_rules,
             self.limits,
             .unrestricted,
+            &self.cancel_requested,
         )) orelse return error.McpToolNotFound;
         defer schema.deinit(self.alloc);
         const payload = switch (schema) {
@@ -837,7 +848,7 @@ fn makeMenuPreview(alloc: Allocator, heading: []const u8, raw: []const u8) !Menu
 
 fn makeMenuPreviewOwned(alloc: Allocator, heading: []const u8, insert: []u8) !MenuPreview {
     errdefer alloc.free(insert);
-    var encoded = try text_utils.encodeTerminalSafe(alloc, insert, max_menu_preview_bytes);
+    var encoded = try text_utils.encodeTerminalSafeInline(alloc, insert, max_menu_preview_bytes);
     defer encoded.deinit(alloc);
     return .{
         .display = try std.mem.concat(alloc, u8, &.{ heading, encoded.bytes }),
@@ -916,11 +927,7 @@ const MenuArgumentForm = struct {
     }
 };
 
-pub const MenuCompletionEffect = union(enum) {
-    none,
-    repaint,
-    reload: u64,
-};
+pub const MenuCompletionEffect = enum { none, repaint };
 
 const SpawnPendingReloadFn = *const fn (*PendingReload) anyerror!std.Thread;
 
@@ -939,9 +946,53 @@ fn deinitAuthenticationResult(result: anyerror!mcp_auth.AuthenticationResult) vo
 pub const State = struct {
     lock: std.Io.RwLock = .init,
     runtime: ?*mcp_runtime.McpRuntime = null,
+    /// MCP-v2's host when FX_MCP_ENGINE=v2 selects it; `runtime` then stays
+    /// null. Replaced on the UI thread when `/mcp` changes the
+    /// config; other threads use it through `leaseHost`.
+    host: ?*mcp_host.Host = null,
+    /// Guards `host` against other threads, and its leases.
+    host_mutex: std.Io.Mutex = .init,
+    host_load: ?mcp_host.LoadFn = null,
+    host_questions: elicitation.Capabilities = .{},
+    /// Where the host's owner thread and `/mcp` threads leave what they have
+    /// to say. On the heap, because the app is moved after the host starts
+    /// and the host keeps this address.
+    host_sink: ?*HostSink = null,
+    /// What `/mcp` completes, rebuilt on the UI thread from the host's status.
+    host_completion: []const mod_registry.ArgumentCompletion = &.{},
+    host_completion_arena: ?std.heap.ArenaAllocator = null,
+    host_completion_at_ms: i64 = 0,
+    host_reload_requested: std.atomic.Value(bool) = .init(false),
+    /// The `/mcp` menu; what it shows of the servers,
+    /// rebuilt on the UI thread while it's open; and the open server's tools.
+    host_menu: mcp_menu.State = .{},
+    host_menu_rows: []const mcp_menu.Row = &.{},
+    host_menu_notes: usize = 0,
+    host_menu_arena: ?std.heap.ArenaAllocator = null,
+    host_menu_at_ms: i64 = 0,
+    host_menu_tools: mcp_menu.Tools = .loading,
+    /// The UI thread's copy of the sink's waiting sign-in, for the menu.
+    host_menu_sign_in: ?[]u8 = null,
+    /// The status line's MCP text, which `refreshHostStatus` rebuilds.
+    host_status_buf: [120]u8 = undefined,
+    host_status_len: usize = 0,
+    host_status_at_ms: i64 = 0,
+    host_menu_tools_arena: ?std.heap.ArenaAllocator = null,
+    /// Counts tool loads, so one for a server no longer open is dropped.
+    host_menu_load: usize = 0,
+    /// How the open server stood when its tools last loaded; a change, such
+    /// as finishing a login, loads them again.
+    host_menu_loaded: ?MenuLoadedAs = null,
+    /// `/mcp` commands and menu tool loads still running, and the flag that
+    /// ends them on quit.
+    host_verbs: std.atomic.Value(usize) = .init(0),
+    host_closing: std.atomic.Value(bool) = .init(false),
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
     pending_menu_operation: ?*PendingMenuOperation = null,
+    /// Set by process-exit teardown before it joins a pending reload, so the
+    /// reload discards its candidate runtime without grace or session DELETEs.
+    process_exiting: std.atomic.Value(bool) = .init(false),
     last_reload_completion_origin: PresentationOrigin = .command,
     last_authentication_completion_origin: PresentationOrigin = .command,
     project_prompts_suppressed: bool = false,
@@ -954,6 +1005,15 @@ pub const State = struct {
     menu_feedback: ?[]u8 = null,
     menu_add_form: MenuAddForm = .{},
     menu_argument_form: MenuArgumentForm = .{},
+    /// Main-thread only, like the menu fields: a startup summary notice is
+    /// owed once discovery settles with servers that need attention.
+    startup_health_notice_pending: bool = false,
+    model_catalog_baseline_lock: std.Io.Mutex = .init,
+    /// Server availability as of the previous model-catalog report, used to
+    /// surface mid-session changes (authentication, reload, recovery) to the
+    /// model explicitly. Owned by the `baseline_alloc` passed to
+    /// `snapshotModelCatalog`.
+    model_catalog_baseline: ?[]mcp_model_catalog.BaselineEntry = null,
 
     pub const MenuView = struct {
         state: mcp_menu_state.State,
@@ -984,6 +1044,7 @@ pub const State = struct {
     }
 
     pub fn openMenu(self: *State, alloc: Allocator, captured_at_ms: u64) !void {
+        debug_trace.logf("mcp", "opening MCP menu", .{});
         self.clearMenuOwned(alloc);
         var snapshot = if (self.acquire()) |lease_value| snapshot: {
             var lease = lease_value;
@@ -994,6 +1055,53 @@ pub const State = struct {
         self.menu_health = snapshot;
         self.menu = .{};
         _ = mcp_menu_state.apply(&self.menu, .{ .open = snapshot.servers.len });
+    }
+
+    pub fn refreshMenuHealth(self: *State, alloc: Allocator, captured_at_ms: u64) !bool {
+        if (!self.menu.active) return false;
+        if (self.menu_health) |current| {
+            if (captured_at_ms >= current.captured_at_ms and captured_at_ms - current.captured_at_ms < 100) return false;
+        }
+        const snapshot = if (self.acquire()) |lease_value| snapshot: {
+            var lease = lease_value;
+            defer lease.deinit();
+            break :snapshot try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+        } else try emptyHealthSnapshot(alloc, captured_at_ms);
+        return self.replaceMenuHealth(alloc, snapshot);
+    }
+
+    fn replaceMenuHealth(self: *State, alloc: Allocator, next: mcp_health.Snapshot) bool {
+        if (self.menu_health) |*current| {
+            if (mcp_health.sameState(current.*, next)) {
+                current.captured_at_ms = next.captured_at_ms;
+                var unchanged = next;
+                unchanged.deinit(alloc);
+                return false;
+            }
+            if (self.menu.selected_server_index < current.servers.len) {
+                const previous = &current.servers[self.menu.selected_server_index];
+                const selected = for (next.servers, 0..) |server, index| {
+                    if (server.source == previous.source and server.scope == previous.scope and
+                        std.mem.eql(u8, server.identity(), previous.identity())) break index;
+                } else null;
+                self.menu.selected_server_index = selected orelse 0;
+                if (self.menu.section == .servers) self.menu.selected_index = self.menu.selected_server_index;
+                if (selected == null) {
+                    self.cancelPendingMenuOperation("selected_server_removed");
+                    debug_trace.logf("mcp", "closing server-bound menu state because its selected server was removed", .{});
+                    self.menu.pending_generation = null;
+                    if (self.menu.screen != .add) {
+                        self.menu.screen = .browse;
+                        self.menu.section = .servers;
+                        self.menu.selected_index = self.menu.selected_server_index;
+                        self.menu.load_state = .ready;
+                    }
+                }
+            }
+            current.deinit(alloc);
+        }
+        self.menu_health = next;
+        return true;
     }
 
     fn emptyHealthSnapshot(alloc: Allocator, captured_at_ms: u64) !mcp_health.Snapshot {
@@ -1008,6 +1116,7 @@ pub const State = struct {
     }
 
     pub fn closeMenu(self: *State, alloc: Allocator) void {
+        debug_trace.logf("mcp", "closing MCP menu screen={s}", .{@tagName(self.menu.screen)});
         if (mcp_menu_state.apply(&self.menu, .close)) |effect| switch (effect) {
             .cancel => self.cancelPendingMenuOperation("menu_closed"),
             .load_catalog, .load_preview, .complete_argument, .action => {},
@@ -1200,9 +1309,12 @@ pub const State = struct {
         {
             const health = self.menu_health orelse return error.McpRuntimeUnavailable;
             if (operation.request.server_index >= health.servers.len) return error.McpServerNotFound;
+            if (health.servers[operation.request.server_index].runtime_generation != lease.runtime.generation) {
+                return error.McpMenuSelectionChanged;
+            }
             server_name = try alloc.dupe(
                 u8,
-                health.servers[operation.request.server_index].configured_name,
+                health.servers[operation.request.server_index].identity(),
             );
         }
         if (operation.kind == .preview or operation.kind == .completion) switch (operation.request.section) {
@@ -1406,16 +1518,18 @@ pub const State = struct {
             },
             .action => |action_result| {
                 self.menu_feedback = action_result.feedback;
-                const needs_reload = action_result.reload;
                 result = .cancelled;
                 self.returnMenuToServers();
-                if (needs_reload) return .{ .reload = request.generation };
                 _ = mcp_menu_state.apply(
                     &self.menu,
                     .{ .action_succeeded = request.generation },
                 );
             },
             .failed => |err| {
+                if (kind == .catalog and (err == error.McpResourcesUnsupported or err == error.McpPromptsUnsupported)) {
+                    self.completeEmptyMenuCatalog(alloc, request);
+                    return .repaint;
+                }
                 self.menu_feedback = try allocMenuText(
                     alloc,
                     &.{
@@ -1474,8 +1588,7 @@ pub const State = struct {
                 .published => |published| if (published.health == .ready)
                     try alloc.dupe(u8, "MCP configuration reloaded.")
                 else
-                    try std.fmt.allocPrint(
-                        alloc,
+                    try alloc.print(
                         "MCP reloaded with {d} unavailable server{s}.",
                         .{
                             published.unavailable_server_names.len,
@@ -1507,14 +1620,13 @@ pub const State = struct {
             break :snapshot try lease.runtime.snapshotHealth(alloc, captured_at_ms);
         } else try emptyHealthSnapshot(alloc, captured_at_ms);
         errdefer snapshot.deinit(alloc);
-        if (self.menu_health) |*previous| previous.deinit(alloc);
-        self.menu_health = snapshot;
+        _ = self.replaceMenuHealth(alloc, snapshot);
     }
 
     pub fn selectedMenuServerName(self: *const State) ?[]const u8 {
         const health = self.menu_health orelse return null;
         if (self.menu.selected_server_index >= health.servers.len) return null;
-        return health.servers[self.menu.selected_server_index].configured_name;
+        return health.servers[self.menu.selected_server_index].identity();
     }
 
     pub fn applyMenuAuthenticationCompletion(
@@ -1535,15 +1647,28 @@ pub const State = struct {
                             &.{
                                 "Authenticated MCP server '",
                                 completion.server_name,
-                                "'; reconnecting…",
+                                "'.",
                             },
                         )
                     else
-                        try std.fmt.allocPrint(
-                            alloc,
-                            "Authenticated '{s}'; repaired {d} credential entries; reconnecting…",
+                        try alloc.print(
+                            "Authenticated '{s}'; repaired {d} credential entries.",
                             .{ completion.server_name, authenticated.repaired_entries },
                         );
+                    if (completion.reconnect_error) |err| {
+                        const feedback = try alloc.print("{s} Connection failed: {s}. Check /mcp list.", .{ self.menu_feedback.?, @errorName(err) });
+                        alloc.free(self.menu_feedback.?);
+                        self.menu_feedback = feedback;
+                        _ = mcp_menu_state.apply(&self.menu, .{ .effect_failed = generation });
+                    } else {
+                        _ = mcp_menu_state.apply(&self.menu, .{ .action_succeeded = generation });
+                    }
+                    if (self.acquire()) |lease_value| {
+                        var lease = lease_value;
+                        defer lease.deinit();
+                        const snapshot = try lease.runtime.snapshotHealth(alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+                        _ = self.replaceMenuHealth(alloc, snapshot);
+                    }
                     return true;
                 },
                 .issuer_mismatch => {
@@ -1564,7 +1689,7 @@ pub const State = struct {
                     "MCP authentication for '",
                     completion.server_name,
                     "' failed: ",
-                    @errorName(err),
+                    mcp_auth.authentication_error_message(err),
                 },
             );
         }
@@ -1591,6 +1716,726 @@ pub const State = struct {
     pub fn cancelMenuOperation(self: *State) void {
         self.cancelPendingMenuOperation("menu_back");
     }
+
+    /// Loads the host at startup with `load`, which reloads use too. The host's
+    /// lifecycle is modeled in `tests/tla/mcp_host/HostLifecycle.tla`.
+    pub fn loadHost(
+        self: *State,
+        load: mcp_host.LoadFn,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        registry: tool_dispatch.Registry,
+        questions: elicitation.Capabilities,
+    ) !void {
+        self.host_load = load;
+        self.host_questions = questions;
+        if (self.host_sink == null) {
+            const sink = try std.heap.c_allocator.create(HostSink);
+            sink.* = .{};
+            self.host_sink = sink;
+        }
+        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify() }));
+    }
+
+    /// Loads the config again after `/mcp` changed it; calls still using the
+    /// old host finish on it.
+    pub fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
+        const load = self.host_load orelse return;
+        const sink = self.host_sink orelse return;
+        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify() }));
+        self.startHostServers();
+    }
+
+    pub fn hostStatusText(self: *const State) []const u8 {
+        return self.host_status_buf[0..self.host_status_len];
+    }
+
+    /// Rebuilds the status line's MCP text, at most every 250 ms since
+    /// servers change on their own; true when it changed.
+    pub fn refreshHostStatus(self: *State, now_ms: i64) bool {
+        if (self.host_status_at_ms != 0 and now_ms - self.host_status_at_ms < 250) return false;
+        self.host_status_at_ms = now_ms;
+        var next: [120]u8 = undefined;
+        const text = self.hostStatusLine(&next, now_ms);
+        if (std.mem.eql(u8, text, self.hostStatusText())) return false;
+        @memcpy(self.host_status_buf[0..text.len], text);
+        self.host_status_len = text.len;
+        return true;
+    }
+
+    fn hostStatusLine(self: *State, buf: []u8, now_ms: i64) []const u8 {
+        const sink = self.host_sink orelse return "";
+        const lease = self.leaseHost() orelse return "";
+        defer lease.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const statuses = lease.host.runtime.statuses(a) catch return "";
+        sink.mutex.lockUncancelable(io_mod.getIo());
+        const news: ?[]const u8 = if (sink.news) |text|
+            (if (now_ms - sink.news_at_ms < mcp_menu.news_ms) a.dupe(u8, text) catch null else null)
+        else
+            null;
+        const signing_in: ?[]const u8 = if (sink.sign_in) |waiting|
+            a.dupe(u8, waiting[0 .. std.mem.findScalar(u8, waiting, 0) orelse waiting.len]) catch null
+        else
+            null;
+        sink.mutex.unlock(io_mod.getIo());
+        return mcp_menu.statusLine(buf, statuses, signing_in, news, lease.host.notes.len);
+    }
+
+    /// Starts every server in the background, so each is ready before it's
+    /// needed. Nothing waits: the host's own thread connects them, and quitting
+    /// still signals them all at once.
+    pub fn startHostServers(self: *State) void {
+        const lease = self.leaseHost() orelse return;
+        defer lease.deinit();
+        for (0..lease.host.runtime.servers().len) |i| lease.host.runtime.prepare(i) catch |err| {
+            debug_trace.logf("mcp", "MCP servers not started in the background at={d} err={s}", .{ i, @errorName(err) });
+            return;
+        };
+    }
+
+    pub const HostLease = struct {
+        state: *State,
+        host: *mcp_host.Host,
+
+        pub fn deinit(l: HostLease) void {
+            l.state.releaseHost(l.host);
+        }
+    };
+
+    /// The current host, kept alive until the lease ends even if a reload
+    /// replaces it.
+    pub fn leaseHost(self: *State) ?HostLease {
+        self.host_mutex.lockUncancelable(io_mod.getIo());
+        defer self.host_mutex.unlock(io_mod.getIo());
+        const h = self.host orelse return null;
+        h.leases += 1;
+        return .{ .state = self, .host = h };
+    }
+
+    /// Every configured server's status, copied into `alloc`; null when
+    /// there is no host.
+    pub fn hostStatuses(self: *State, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
+        const lease = self.leaseHost() orelse return null;
+        defer lease.deinit();
+        return try lease.host.runtime.statuses(alloc);
+    }
+
+    fn releaseHost(self: *State, h: *mcp_host.Host) void {
+        self.host_mutex.lockUncancelable(io_mod.getIo());
+        h.leases -= 1;
+        const last = h.retired and h.leases == 0;
+        self.host_mutex.unlock(io_mod.getIo());
+        if (last) h.destroy();
+    }
+
+    /// Swaps in `next` on the UI thread; the old host goes with its last lease.
+    fn replaceHost(self: *State, next: ?*mcp_host.Host) void {
+        self.host_mutex.lockUncancelable(io_mod.getIo());
+        const old = self.host;
+        self.host = next;
+        const unused = if (old) |h| unused: {
+            h.retired = true;
+            break :unused h.leases == 0;
+        } else false;
+        self.host_mutex.unlock(io_mod.getIo());
+        if (unused) old.?.destroy();
+    }
+
+    fn destroyHost(self: *State) void {
+        self.host_closing.store(true, .release);
+        if (self.process_exiting.load(.acquire)) {
+            // Nothing is waited for: the servers get
+            // SIGTERM, and the host and `/mcp` threads are left to the
+            // exiting process.
+            mcp_host.signalServersForExit();
+            return;
+        }
+        // `/mcp` commands still running end first, so none outlives the state.
+        self.closeHostMenu();
+        var waited: usize = 0;
+        while (self.host_verbs.load(.acquire) > 0 and waited < 500) : (waited += 1) io_mod.sleep(10 * std.time.ns_per_ms);
+        if (self.host_verbs.load(.acquire) > 0) debug_trace.logf("mcp", "MCP commands still running at exit count={d}", .{self.host_verbs.load(.acquire)});
+        self.replaceHost(null);
+        if (self.host_completion_arena) |*arena| arena.deinit();
+        self.host_completion_arena = null;
+        self.host_completion = &.{};
+        // No host is left to notify, and no `/mcp` thread to push.
+        if (self.host_sink) |sink| {
+            sink.deinit();
+            std.heap.c_allocator.destroy(sink);
+            self.host_sink = null;
+        }
+    }
+
+    pub const HostNotice = struct { text: []u8, warning: bool };
+
+    /// What the host and `/mcp` threads have to say, until the UI thread
+    /// takes it. Everything in it is from `std.heap.c_allocator`.
+    pub const HostSink = struct {
+        mutex: std.Io.Mutex = .init,
+        notices: std.ArrayList(HostNotice) = .empty,
+        /// Servers whose sign-in was typed as `/mcp login NAME`: its outcome
+        /// goes in the transcript, like other typed commands' output.
+        typed: std.ArrayList([]u8) = .empty,
+        /// Any other sign-in's outcome, for the status line, and when it came.
+        news: ?[]u8 = null,
+        news_at_ms: i64 = 0,
+        /// The menu's tool load still running, so leaving the server cancels
+        /// it, and the last one finished, until the UI thread takes it.
+        menu_job: ?*MenuToolsJob = null,
+        menu_tools: ?MenuTools = null,
+        /// The sign-in waiting for the browser, as its server, a 0 byte, and
+        /// its address, so the menu can say so. Owned; the next one replaces it.
+        sign_in: ?[]u8 = null,
+
+        fn deinit(sink: *HostSink) void {
+            if (sink.menu_tools) |*done| done.arena.deinit();
+            if (sink.sign_in) |waiting| std.heap.c_allocator.free(waiting);
+            for (sink.notices.items) |n| std.heap.c_allocator.free(n.text);
+            sink.notices.deinit(std.heap.c_allocator);
+            for (sink.typed.items) |name| std.heap.c_allocator.free(name);
+            sink.typed.deinit(std.heap.c_allocator);
+            if (sink.news) |text| std.heap.c_allocator.free(text);
+        }
+
+        fn notify(sink: *HostSink) mcp_host.Notify {
+            return .{ .context = sink, .notice = onNotice };
+        }
+
+        /// On the host's owner thread: what a login or a call needs the user to hear.
+        fn onNotice(context: *anyopaque, notice: mcp_host.Notice) void {
+            const sink: *HostSink = @ptrCast(@alignCast(context));
+            const a = std.heap.c_allocator;
+            var arena: std.heap.ArenaAllocator = .init(a);
+            defer arena.deinit();
+            const aa = arena.allocator();
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            switch (notice) {
+                .authorize => |n| {
+                    sink.waitForSignIn(n.server, n.url);
+                    // The menu shows the address; a typed login prints it.
+                    if (!sink.isTyped(n.server)) return;
+                    const text = a.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch return;
+                    sink.pushLocked(text, false);
+                },
+                .signed_in => |server| {
+                    sink.endSignIn(server);
+                    sink.report(server, a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
+                },
+                .sign_in_failed => |n| {
+                    sink.endSignIn(n.server);
+                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
+                },
+                // The status line says so for as long as it's true.
+                .needs_login => {},
+            }
+        }
+
+        /// A sign-in's outcome: the transcript for a typed one, else the
+        /// status line's news. Takes `text`; locked by the caller.
+        fn report(sink: *HostSink, server: []const u8, text: []u8, warning: bool) void {
+            if (sink.untype(server)) return sink.pushLocked(text, warning);
+            if (sink.news) |old| std.heap.c_allocator.free(old);
+            sink.news = text;
+            sink.news_at_ms = io_mod.milliTimestamp();
+        }
+
+        /// On the UI thread, for `/mcp login NAME` typed in the shell.
+        fn markTyped(sink: *HostSink, server: []const u8) void {
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            if (sink.isTyped(server)) return;
+            const a = std.heap.c_allocator;
+            // Out of memory, its outcome goes to the status line instead.
+            const name = a.dupe(u8, server) catch return;
+            sink.typed.append(a, name) catch a.free(name);
+        }
+
+        fn isTyped(sink: *const HostSink, server: []const u8) bool {
+            for (sink.typed.items) |name| if (std.mem.eql(u8, name, server)) return true;
+            return false;
+        }
+
+        fn untype(sink: *HostSink, server: []const u8) bool {
+            for (sink.typed.items, 0..) |name, i| if (std.mem.eql(u8, name, server)) {
+                std.heap.c_allocator.free(sink.typed.swapRemove(i));
+                return true;
+            };
+            return false;
+        }
+
+        /// Locked by the caller. Out of memory, the menu just doesn't say it waits.
+        fn waitForSignIn(sink: *HostSink, server: []const u8, url: []const u8) void {
+            const a = std.heap.c_allocator;
+            const next = std.mem.concat(a, u8, &.{ server, "\x00", url }) catch null;
+            if (sink.sign_in) |old| a.free(old);
+            sink.sign_in = next;
+        }
+
+        /// Locked by the caller.
+        fn endSignIn(sink: *HostSink, server: []const u8) void {
+            const waiting = sink.sign_in orelse return;
+            const end = std.mem.findScalar(u8, waiting, 0) orelse waiting.len;
+            if (!std.mem.eql(u8, waiting[0..end], server)) return;
+            std.heap.c_allocator.free(waiting);
+            sink.sign_in = null;
+        }
+
+        /// Takes ownership of `text`.
+        fn push(sink: *HostSink, text: []u8, warning: bool) void {
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            sink.pushLocked(text, warning);
+        }
+
+        fn pushLocked(sink: *HostSink, text: []u8, warning: bool) void {
+            sink.notices.append(std.heap.c_allocator, .{ .text = text, .warning = warning }) catch {
+                debug_trace.logf("mcp", "MCP notice dropped: out of memory", .{});
+                std.heap.c_allocator.free(text);
+            };
+        }
+
+        fn safeText(arena: Allocator, raw: []const u8, max: usize) []const u8 {
+            return (text_utils.encodeTerminalSafeInline(arena, raw, max) catch return "?").bytes;
+        }
+    };
+
+    /// The notices waiting for the UI, owned by `std.heap.c_allocator`.
+    pub fn takeHostNotices(self: *State) []HostNotice {
+        const sink = self.host_sink orelse return &.{};
+        sink.mutex.lockUncancelable(io_mod.getIo());
+        defer sink.mutex.unlock(io_mod.getIo());
+        return sink.notices.toOwnedSlice(std.heap.c_allocator) catch &.{};
+    }
+
+    const verb_completions = [_]mod_registry.ArgumentCompletion{
+        .{ .full = "/mcp list", .description = "configured servers" },
+        .{ .full = "/mcp show", .description = "connect to a server and list its tools" },
+        .{ .full = "/mcp add", .description = "add a server" },
+        .{ .full = "/mcp remove", .description = "remove a server and its login" },
+        .{ .full = "/mcp login", .description = "sign in to an HTTP server" },
+        .{ .full = "/mcp logout", .description = "sign out of an HTTP server" },
+        .{ .full = "/mcp approve", .description = "approve a project server" },
+        .{ .full = "/mcp reject", .description = "reject a project server" },
+    };
+
+    /// On the UI thread: what `/mcp` completes, from the host's current
+    /// status. Rebuilt at most twice a second.
+    pub fn refreshCompletion(self: *State) void {
+        if (self.host_sink == null) return;
+        const now = io_mod.milliTimestamp();
+        if (self.host_completion.len > 0 and now - self.host_completion_at_ms < 500) return;
+        self.host_completion_at_ms = now;
+        var next: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+        const entries = self.buildCompletion(next.allocator()) catch {
+            next.deinit();
+            return;
+        };
+        if (self.host_completion_arena) |*old| old.deinit();
+        self.host_completion_arena = next;
+        self.host_completion = entries;
+    }
+
+    fn buildCompletion(self: *State, a: Allocator) ![]const mod_registry.ArgumentCompletion {
+        var out: std.ArrayList(mod_registry.ArgumentCompletion) = .empty;
+        try out.appendSlice(a, &verb_completions);
+        const lease = self.leaseHost() orelse return out.items;
+        defer lease.deinit();
+        const statuses = try lease.host.runtime.statuses(a);
+        for (statuses, lease.host.runtime.servers()) |status, server| {
+            if (!mcp_command_provider.isValidServerName(status.name)) continue;
+            const description = try mcp_verbs.statusText(a, status);
+            const applies = [_]struct { verb: []const u8, ok: bool }{
+                .{ .verb = "show", .ok = true },
+                .{ .verb = "remove", .ok = true },
+                .{ .verb = "login", .ok = server.transport != .stdio },
+                .{ .verb = "logout", .ok = server.transport != .stdio },
+                .{ .verb = "approve", .ok = server.source == .workspace },
+                .{ .verb = "reject", .ok = server.source == .workspace },
+            };
+            for (applies) |verb| if (verb.ok) try out.append(a, .{
+                .full = try a.print("/mcp {s} {s}", .{ verb.verb, status.name }),
+                .description = description,
+            });
+        }
+        return out.items;
+    }
+
+    /// Whether a `/mcp` command changed the config since the last call.
+    pub fn takeHostReload(self: *State) bool {
+        return self.host_reload_requested.swap(false, .acq_rel);
+    }
+
+    /// Runs `/mcp ARGS` off the UI thread, since `show` may wait for a
+    /// server; what it prints and any reload it asks for reach the UI through
+    /// `takeHostNotices` and `takeHostReload`.
+    pub fn runVerbs(self: *State, home: []const u8, workspace_root: []const u8, rest: []const u8) !void {
+        const a = std.heap.c_allocator;
+        var argv = command_lex.tokenize_argv(a, rest) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                const sink = self.host_sink orelse return;
+                sink.push(try a.dupe(u8, "/mcp: that command line has an unmatched quote or a character fx doesn't take here."), true);
+                return;
+            },
+        };
+        defer argv.deinit(a);
+        const args = try a.alloc([]const u8, argv.tokens.len);
+        defer a.free(args);
+        for (argv.tokens, args) |t, *arg| arg.* = t.value;
+        if (args.len >= 2 and std.mem.eql(u8, args[0], "login")) {
+            if (self.host_sink) |sink| sink.markTyped(args[args.len - 1]);
+        }
+        try self.startVerbs(home, workspace_root, args);
+    }
+
+    /// Runs `/mcp` with `args` off the UI thread, like `runVerbs`.
+    fn startVerbs(self: *State, home: []const u8, workspace_root: []const u8, args: []const []const u8) !void {
+        if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
+        const a = std.heap.c_allocator;
+        const job = try a.create(VerbJob);
+        errdefer a.destroy(job);
+        job.* = .{ .state = self };
+        errdefer job.free();
+        const owned = try a.alloc([]const u8, args.len);
+        @memset(owned, "");
+        job.args = owned;
+        for (args, owned) |arg, *copy| copy.* = try a.dupe(u8, arg);
+        job.home = try a.dupe(u8, home);
+        job.workspace_root = try a.dupe(u8, workspace_root);
+        _ = self.host_verbs.fetchAdd(1, .acq_rel);
+        errdefer _ = self.host_verbs.fetchSub(1, .acq_rel);
+        const thread = try std.Thread.spawn(.{}, VerbJob.run, .{job});
+        thread.detach();
+    }
+
+    const VerbJob = struct {
+        state: *State,
+        args: []const []const u8 = &.{},
+        home: []const u8 = "",
+        workspace_root: []const u8 = "",
+
+        fn free(job: *VerbJob) void {
+            const a = std.heap.c_allocator;
+            for (job.args) |arg| a.free(arg);
+            a.free(job.args);
+            a.free(job.home);
+            a.free(job.workspace_root);
+        }
+
+        fn run(job: *VerbJob) void {
+            const a = std.heap.c_allocator;
+            const self = job.state;
+            const args = job.args;
+            defer {
+                job.free();
+                a.destroy(job);
+                _ = self.host_verbs.fetchSub(1, .acq_rel);
+            }
+            var out: std.Io.Writer.Allocating = .init(a);
+            defer out.deinit();
+            var err: std.Io.Writer.Allocating = .init(a);
+            defer err.deinit();
+            _ = mcp_verbs.run(.{
+                .gpa = a,
+                .out = &out.writer,
+                .err = &err.writer,
+                .surface = .shell,
+                .home = job.home,
+                .workspace_root = job.workspace_root,
+                .hosts = .{ .context = self, .get = getHost, .release = putHost, .changed = configChanged },
+                .cancel = &self.host_closing,
+            }, args);
+            const sink = self.host_sink orelse return;
+            for ([_]*std.Io.Writer.Allocating{ &out, &err }, [_]bool{ false, true }) |w, warning| {
+                const text = std.mem.trimEnd(u8, w.written(), "\n");
+                if (text.len == 0) continue;
+                sink.push(a.dupe(u8, text) catch continue, warning);
+            }
+        }
+
+        fn getHost(context: *anyopaque, _: ?mcp_host.Notify) anyerror!?*mcp_host.Host {
+            const self: *State = @ptrCast(@alignCast(context));
+            return if (self.leaseHost()) |l| l.host else null;
+        }
+
+        fn putHost(context: *anyopaque, h: *mcp_host.Host) void {
+            const self: *State = @ptrCast(@alignCast(context));
+            self.releaseHost(h);
+        }
+
+        fn configChanged(context: *anyopaque) void {
+            const self: *State = @ptrCast(@alignCast(context));
+            self.host_reload_requested.store(true, .release);
+        }
+    };
+
+    pub fn hostMenuActive(self: *const State) bool {
+        return self.host_menu.active;
+    }
+
+    pub fn openHostMenu(self: *State) void {
+        self.closeHostMenu();
+        mcp_menu.open(&self.host_menu);
+        _ = self.refreshHostMenu("");
+    }
+
+    /// Each screen keeps its own filter in the composer: opening a server
+    /// starts its tool filter empty, and going back brings the list's back.
+    pub fn swapHostMenuFilter(self: *State, was: mcp_menu.Screen, alloc: Allocator, composer: *editor_state.State) Allocator.Error!void {
+        if (!self.host_menu.active) return;
+        if (was == .list and self.host_menu.screen == .server) {
+            self.host_menu.keepListFilter(composer.input.items);
+            composer.clearRetainingCapacity();
+        } else if (was != .list and self.host_menu.screen == .list) {
+            try composer.setText(alloc, self.host_menu.listFilter());
+        }
+    }
+
+    /// The composer changed: on a server's screen, that's its tool filter.
+    pub fn hostMenuFilterChanged(self: *State, filter: []const u8) void {
+        if (!self.host_menu.active or self.host_menu.screen != .server) return;
+        const view = mcp_menu.viewOf(&self.host_menu, self.host_menu_rows, filter, self.host_menu_tools, &.{});
+        mcp_menu.filterChanged(&self.host_menu, view, filter.len > 0);
+    }
+
+    pub fn closeHostMenu(self: *State) void {
+        self.stopMenuTools();
+        self.host_menu = .{};
+        if (self.host_menu_arena) |*arena| arena.deinit();
+        self.host_menu_arena = null;
+        self.host_menu_rows = &.{};
+        self.host_menu_notes = 0;
+        self.host_menu_at_ms = 0;
+        if (self.host_menu_sign_in) |waiting| std.heap.c_allocator.free(waiting);
+        self.host_menu_sign_in = null;
+    }
+
+    /// The address the open server's sign-in waits on, if one does.
+    pub fn hostMenuSignInUrl(self: *const State) ?[]const u8 {
+        if (self.host_menu.screen == .list) return null;
+        const waiting = self.host_menu_sign_in orelse return null;
+        const end = std.mem.findScalar(u8, waiting, 0) orelse return null;
+        if (!std.mem.eql(u8, waiting[0..end], self.host_menu.selectedName())) return null;
+        return waiting[end + 1 ..];
+    }
+
+    /// Copies the sink's waiting sign-in; true when it changed.
+    fn takeSignIn(self: *State) bool {
+        const sink = self.host_sink orelse return false;
+        sink.mutex.lockUncancelable(io_mod.getIo());
+        defer sink.mutex.unlock(io_mod.getIo());
+        const now = sink.sign_in;
+        const had = self.host_menu_sign_in;
+        if (now == null and had == null) return false;
+        if (now != null and had != null and std.mem.eql(u8, now.?, had.?)) return false;
+        const a = std.heap.c_allocator;
+        if (had) |old| a.free(old);
+        self.host_menu_sign_in = if (now) |w| a.dupe(u8, w) catch null else null;
+        return true;
+    }
+
+    /// A key in the menu, with `filter` typed in the composer. A choice runs
+    /// the `/mcp` command it shows, which prints in the conversation.
+    pub fn hostMenuKey(self: *State, key: mcp_menu.Key, filter: []const u8, home: []const u8, workspace_root: []const u8) !void {
+        const buf = try std.heap.c_allocator.alloc(mcp_menu.Row, self.host_menu_rows.len);
+        defer std.heap.c_allocator.free(buf);
+        const view = mcp_menu.viewOf(&self.host_menu, self.host_menu_rows, filter, self.host_menu_tools, buf);
+        switch (mcp_menu.press(&self.host_menu, view, key)) {
+            .none => {},
+            .close => self.closeHostMenu(),
+            .open => |name| try self.startMenuTools(name),
+            .back => self.stopMenuTools(),
+            .run => |run| {
+                // A confirmed Remove went back to the list already.
+                if (self.host_menu.screen == .list) self.stopMenuTools();
+                try self.startVerbs(home, workspace_root, &.{ run.choice.verb(), run.server });
+                // The status follows sooner than the next refresh would show it.
+                self.host_menu_at_ms = 0;
+            },
+        }
+    }
+
+    /// On the UI thread while the menu is open: the servers' status at most
+    /// four times a second, and the open server's tools once they load.
+    /// Whether anything it shows changed.
+    /// `filter` is what the composer holds: the list's, or the open server's tools'.
+    pub fn refreshHostMenu(self: *State, filter: []const u8) bool {
+        if (!self.host_menu.active) return false;
+        var changed = false;
+        const now = io_mod.milliTimestamp();
+        if (now - self.host_menu_at_ms >= 250) {
+            changed = true;
+            self.host_menu_at_ms = now;
+            var next: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+            if (self.buildMenuRows(next.allocator())) |rows| {
+                if (self.host_menu_arena) |*old| old.deinit();
+                self.host_menu_arena = next;
+                self.host_menu_rows = rows;
+            } else |err| {
+                next.deinit();
+                debug_trace.logf("mcp", "MCP menu kept its old rows err={s}", .{@errorName(err)});
+            }
+        }
+        if (self.takeMenuTools()) changed = true;
+        if (self.takeSignIn()) changed = true;
+        const view = mcp_menu.viewOf(&self.host_menu, self.host_menu_rows, filter, self.host_menu_tools, &.{});
+        if (mcp_menu.settle(&self.host_menu, view) == .back) {
+            self.stopMenuTools();
+            return true;
+        }
+        // A server that became usable since its tools failed to load, by
+        // logging in or being approved, loads them again. Only then: a
+        // failing server moving between retrying and failed is left alone.
+        const open = view.open orelse return changed;
+        if (self.host_menu_tools == .ready or self.host_menu_tools == .loading) return changed;
+        if (open.status.needs_login or (open.status.state != .ready and open.status.state != .idle)) return changed;
+        if (self.host_menu_loaded) |was| if (std.meta.eql(was, MenuLoadedAs.of(open))) return changed;
+        self.startMenuTools(open.status.name) catch |err|
+            debug_trace.logf("mcp", "MCP menu tools reload failed err={s}", .{@errorName(err)});
+        return true;
+    }
+
+    fn buildMenuRows(self: *State, a: Allocator) ![]const mcp_menu.Row {
+        const lease = self.leaseHost() orelse {
+            self.host_menu_notes = 0;
+            return &.{};
+        };
+        defer lease.deinit();
+        const statuses = try lease.host.runtime.statuses(a);
+        const rows = try a.alloc(mcp_menu.Row, statuses.len);
+        for (statuses, lease.host.runtime.servers(), rows) |status, server, *row| row.* = .{
+            .status = status,
+            .target = if (server.url orelse server.command) |target| try a.dupe(u8, target) else null,
+        };
+        self.host_menu_notes = lease.host.notes.len;
+        return rows;
+    }
+
+    pub const MenuTools = struct { load: usize, arena: std.heap.ArenaAllocator, tools: mcp_menu.Tools };
+
+    const MenuLoadedAs = struct {
+        state: @import("../mcp_host/runtime.zig").State,
+        needs_login: bool,
+        signed_in: bool,
+
+        fn of(row: mcp_menu.Row) MenuLoadedAs {
+            return .{ .state = row.status.state, .needs_login = row.status.needs_login, .signed_in = row.status.signed_in };
+        }
+    };
+
+    /// Connects `name` off the UI thread and lists its tools for the menu.
+    fn startMenuTools(self: *State, name: []const u8) !void {
+        if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
+        self.stopMenuTools();
+        self.host_menu_load +%= 1;
+        const open = for (self.host_menu_rows) |row| {
+            if (std.mem.eql(u8, row.status.name, name)) break row;
+        } else null;
+        self.host_menu_loaded = if (open) |row| MenuLoadedAs.of(row) else null;
+        const sink = self.host_sink orelse return;
+        const a = std.heap.c_allocator;
+        const job = try a.create(MenuToolsJob);
+        errdefer a.destroy(job);
+        job.* = .{ .state = self, .load = self.host_menu_load, .name = try a.dupe(u8, name) };
+        errdefer a.free(job.name);
+        _ = self.host_verbs.fetchAdd(1, .acq_rel);
+        errdefer _ = self.host_verbs.fetchSub(1, .acq_rel);
+        // Registered before it starts, so it can't finish unseen.
+        sink.mutex.lockUncancelable(io_mod.getIo());
+        sink.menu_job = job;
+        sink.mutex.unlock(io_mod.getIo());
+        const thread = std.Thread.spawn(.{}, MenuToolsJob.run, .{job}) catch |err| {
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            sink.menu_job = null;
+            sink.mutex.unlock(io_mod.getIo());
+            return err;
+        };
+        thread.detach();
+    }
+
+    /// Cancels the menu's tool load, and drops the tools it had.
+    fn stopMenuTools(self: *State) void {
+        if (self.host_sink) |sink| {
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            if (sink.menu_job) |job| job.cancel.store(true, .release);
+            sink.menu_job = null;
+            if (sink.menu_tools) |*done| done.arena.deinit();
+            sink.menu_tools = null;
+        }
+        if (self.host_menu_tools_arena) |*arena| arena.deinit();
+        self.host_menu_tools_arena = null;
+        self.host_menu_tools = .loading;
+    }
+
+    fn takeMenuTools(self: *State) bool {
+        const sink = self.host_sink orelse return false;
+        sink.mutex.lockUncancelable(io_mod.getIo());
+        const done = sink.menu_tools orelse {
+            sink.mutex.unlock(io_mod.getIo());
+            return false;
+        };
+        sink.menu_tools = null;
+        sink.mutex.unlock(io_mod.getIo());
+        if (done.load != self.host_menu_load) {
+            done.arena.deinit();
+            return false;
+        }
+        if (self.host_menu_tools_arena) |*old| old.deinit();
+        self.host_menu_tools_arena = done.arena;
+        self.host_menu_tools = done.tools;
+        return true;
+    }
+
+    const MenuToolsJob = struct {
+        state: *State,
+        load: usize,
+        name: []const u8,
+        cancel: std.atomic.Value(bool) = .init(false),
+
+        fn run(job: *MenuToolsJob) void {
+            const a = std.heap.c_allocator;
+            const self = job.state;
+            defer {
+                a.free(job.name);
+                a.destroy(job);
+                _ = self.host_verbs.fetchSub(1, .acq_rel);
+            }
+            var arena: std.heap.ArenaAllocator = .init(a);
+            const tools = job.list(arena.allocator()) catch |err| switch (err) {
+                error.OutOfMemory => mcp_menu.Tools{ .failed = "fx ran out of memory" },
+                else => mcp_menu.Tools{ .failed = "the server stopped answering" },
+            };
+            const sink = self.host_sink orelse return arena.deinit();
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            // Left or replaced while it ran: nobody wants these.
+            if (sink.menu_job != job) return arena.deinit();
+            sink.menu_job = null;
+            if (sink.menu_tools) |*old| old.arena.deinit();
+            sink.menu_tools = .{ .load = job.load, .arena = arena, .tools = tools };
+        }
+
+        fn list(job: *MenuToolsJob, arena: Allocator) !mcp_menu.Tools {
+            const lease = job.state.leaseHost() orelse return .{ .failed = "MCP isn't running" };
+            defer lease.deinit();
+            return switch (try lease.host.runtime.tools(arena, job.name, &job.cancel)) {
+                .tools => |found| blk: {
+                    const out = try arena.alloc(mcp_menu.Tool, found.len);
+                    for (found, out) |t, *o| o.* = .{ .name = t.name, .description = (try mcp_verbs.toolDescription(arena, t.raw)) orelse "" };
+                    break :blk .{ .ready = out };
+                },
+                .needs_login => .needs_login,
+                .failed => |reason| .{ .failed = reason },
+                .unknown_server => .{ .failed = "it's no longer configured" },
+            };
+        }
+    };
 
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
         std.debug.assert(self.runtime == null);
@@ -1635,9 +2480,35 @@ pub const State = struct {
     }
 
     pub fn startDiscovery(self: *State, registry: tool_dispatch.Registry) void {
+        // MCP-v2 starts each server when the model first needs it.
+        if (self.host != null) return;
         var lease = self.acquire() orelse return;
         defer lease.deinit();
         lease.runtime.startDiscovery(registry);
+        // Main-thread only, like the menu fields: post one summary notice once
+        // startup discovery settles with servers that need attention.
+        self.startup_health_notice_pending = true;
+    }
+
+    /// Returns the one-shot startup summary notice once discovery has settled
+    /// with servers needing attention. Main-thread only, like the menu fields.
+    pub fn takeStartupHealthNotice(self: *State, alloc: Allocator) !?[]u8 {
+        if (!self.startup_health_notice_pending) return null;
+        var lease = self.acquire() orelse {
+            debug_trace.logf(
+                "mcp",
+                "dropping startup health notice: runtime unavailable",
+                .{},
+            );
+            self.startup_health_notice_pending = false;
+            return null;
+        };
+        defer lease.deinit();
+        if (lease.runtime.isDiscovering()) return null;
+        self.startup_health_notice_pending = false;
+        var snapshot = try lease.runtime.snapshotHealth(alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+        defer snapshot.deinit(alloc);
+        return try mcp_health.renderStartupNotice(alloc, snapshot);
     }
 
     pub fn acquire(self: *State) ?Lease {
@@ -1655,6 +2526,10 @@ pub const State = struct {
     }
 
     pub fn hasTool(self: *State, name: []const u8, access: tool_mcp_runtime.Access) bool {
+        if (self.leaseHost()) |l| {
+            defer l.deinit();
+            return l.host.catalog.hasTool(name, access);
+        }
         var lease = self.acquire() orelse return false;
         defer lease.deinit();
         return lease.runtime.hasToolWithAccess(name, access);
@@ -1667,6 +2542,10 @@ pub const State = struct {
         arguments_json: []const u8,
         access: tool_mcp_runtime.Access,
     ) !tool_mcp_runtime.ValidationResult {
+        if (self.leaseHost()) |l| {
+            defer l.deinit();
+            return l.host.catalog.validateTool(arena, name, arguments_json, access);
+        }
         var lease = self.acquire() orelse return .not_available;
         defer lease.deinit();
         return lease.runtime.validateToolArgumentsByNameWithAccess(
@@ -1685,6 +2564,10 @@ pub const State = struct {
         max_tool_result_bytes: usize,
         options: tool_mcp_runtime.CallOptions,
     ) !?tool_mcp_runtime.CallResult {
+        if (self.leaseHost()) |l| {
+            defer l.deinit();
+            return l.host.catalog.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
+        }
         var lease = self.acquire() orelse return null;
         defer lease.deinit();
         return lease.runtime.callToolByNameWithOptions(
@@ -1703,11 +2586,16 @@ pub const State = struct {
         permission_rules: types.PermissionRuleSet,
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
+        cancel_flag: ?*std.atomic.Value(bool),
     ) !tool_mcp_runtime.SearchResult {
+        if (self.leaseHost()) |l| {
+            defer l.deinit();
+            return l.host.catalog.searchTools(arena, request, permission_rules, limits, access, cancel_flag);
+        }
         var lease = self.acquire() orelse
             return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
         defer lease.deinit();
-        return lease.runtime.searchToolsPrepared(arena, request, permission_rules, limits, access);
+        return lease.runtime.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
     }
 
     pub fn toolSchema(
@@ -1717,7 +2605,12 @@ pub const State = struct {
         permission_rules: types.PermissionRuleSet,
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
+        cancel_flag: ?*std.atomic.Value(bool),
     ) !?tool_mcp_runtime.ToolSchemaResult {
+        if (self.leaseHost()) |l| {
+            defer l.deinit();
+            return l.host.catalog.toolSchema(arena, name, permission_rules, limits, access, cancel_flag);
+        }
         var lease = self.acquire() orelse return null;
         defer lease.deinit();
         return lease.runtime.toolSchemaJsonByNameWithAccess(
@@ -1726,6 +2619,7 @@ pub const State = struct {
             permission_rules,
             limits,
             access,
+            cancel_flag,
         );
     }
 
@@ -1749,11 +2643,25 @@ pub const State = struct {
         return mcp_health.renderSummary(alloc, snapshot);
     }
 
+    pub fn snapshotToolDefinition(self: *State, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access) !tool_mcp_runtime.DefinitionSnapshot {
+        if (self.leaseHost()) |l| {
+            defer l.deinit();
+            return l.host.catalog.snapshotToolDefinition(alloc, name, known, permission_rules, limits, access);
+        }
+        var lease = self.acquire() orelse return .unavailable;
+        defer lease.deinit();
+        return lease.runtime.snapshotToolDefinition(alloc, name, known, permission_rules, limits, access);
+    }
+
     pub fn snapshotToolNames(
         self: *State,
         alloc: Allocator,
         permission_rules: types.PermissionRuleSet,
     ) ![][]u8 {
+        if (self.leaseHost()) |l| {
+            defer l.deinit();
+            return l.host.catalog.snapshotToolNames(alloc, permission_rules);
+        }
         var lease = self.acquire() orelse return alloc.alloc([]u8, 0);
         defer lease.deinit();
         return lease.runtime.snapshotToolNames(alloc, permission_rules);
@@ -1767,6 +2675,10 @@ pub const State = struct {
         permission_rules: types.PermissionRuleSet,
         features_visible: bool,
     ) !?mcp_access.View {
+        if (self.leaseHost()) |l| {
+            defer l.deinit();
+            return try l.host.catalog.snapshotAccessView(alloc, owner_id, parent_id, permission_rules, features_visible);
+        }
         var lease = self.acquire() orelse return null;
         defer lease.deinit();
         const view = try lease.runtime.snapshotAccessView(
@@ -1782,16 +2694,83 @@ pub const State = struct {
     pub fn snapshotModelCatalog(
         self: *State,
         alloc: Allocator,
+        baseline_alloc: Allocator,
         permission_rules: types.PermissionRuleSet,
         include_ask_deferred: bool,
-    ) !mcp_model_catalog.Snapshot {
-        var lease = self.acquire() orelse return mcp_model_catalog.Snapshot.empty(alloc);
-        defer lease.deinit();
-        return lease.runtime.snapshotModelCatalog(
-            alloc,
-            permission_rules,
-            include_ask_deferred,
-        );
+    ) !mcp_model_catalog.Report {
+        var snapshot = if (self.leaseHost()) |l| leased: {
+            defer l.deinit();
+            break :leased try l.host.catalog.modelSnapshot(alloc);
+        } else snapshot: {
+            var lease = self.acquire() orelse return .{
+                .snapshot = try mcp_model_catalog.Snapshot.empty(alloc),
+            };
+            defer lease.deinit();
+            break :snapshot try lease.runtime.snapshotModelCatalog(
+                alloc,
+                permission_rules,
+                include_ask_deferred,
+            );
+        };
+        errdefer snapshot.deinit(alloc);
+        const notice = try self.updateModelCatalogBaseline(alloc, baseline_alloc, snapshot.servers);
+        return .{ .snapshot = snapshot, .change_notice = notice };
+    }
+
+    /// Compares the freshly rendered model catalog against the availability
+    /// the previous report showed the model, returning an owned note when it
+    /// changed. `baseline_alloc` owns the retained baseline and must be the
+    /// same long-lived allocator across calls and `deinit`.
+    fn updateModelCatalogBaseline(
+        self: *State,
+        alloc: Allocator,
+        baseline_alloc: Allocator,
+        current: []const mcp_model_catalog.ServerSummary,
+    ) !?[]u8 {
+        // A discovery pass that is still settling is not a model-visible
+        // change; wait for a stable listing before teaching the model about
+        // availability deltas so session startup never renders a notice.
+        for (current) |server| {
+            if (server.availability == .discovering) return null;
+        }
+        self.model_catalog_baseline_lock.lockUncancelable(io_mod.getIo());
+        defer self.model_catalog_baseline_lock.unlock(io_mod.getIo());
+        const notice = if (self.model_catalog_baseline) |baseline|
+            try mcp_model_catalog.renderChangeNotice(alloc, baseline, current)
+        else
+            null;
+        errdefer if (notice) |text| alloc.free(text);
+        try self.replaceModelCatalogBaselineLocked(baseline_alloc, current);
+        return notice;
+    }
+
+    fn replaceModelCatalogBaselineLocked(
+        self: *State,
+        baseline_alloc: Allocator,
+        current: []const mcp_model_catalog.ServerSummary,
+    ) !void {
+        var next = try baseline_alloc.alloc(mcp_model_catalog.BaselineEntry, current.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (next[0..initialized]) |entry| baseline_alloc.free(entry.name);
+            baseline_alloc.free(next);
+        }
+        for (current, 0..) |server, index| {
+            next[index] = .{
+                .name = try baseline_alloc.dupe(u8, server.name),
+                .availability = server.availability,
+            };
+            initialized += 1;
+        }
+        self.clearModelCatalogBaselineLocked(baseline_alloc);
+        self.model_catalog_baseline = next;
+    }
+
+    fn clearModelCatalogBaselineLocked(self: *State, baseline_alloc: Allocator) void {
+        const baseline = self.model_catalog_baseline orelse return;
+        for (baseline) |entry| baseline_alloc.free(entry.name);
+        baseline_alloc.free(baseline);
+        self.model_catalog_baseline = null;
     }
 
     pub fn waitForRequired(
@@ -1800,9 +2779,11 @@ pub const State = struct {
         cancel_flag: ?*std.atomic.Value(bool),
         captured_at_ms: u64,
     ) !?[]u8 {
+        // MCP-v2 servers start on demand, so startup waits for none.
+        if (self.host != null) return null;
         var lease = self.acquire() orelse return null;
         defer lease.deinit();
-        try lease.runtime.waitForDiscovery(cancel_flag);
+        try lease.runtime.waitForRequiredDiscovery(cancel_flag);
         return lease.runtime.requiredStartupFailure(alloc, captured_at_ms);
     }
 
@@ -1913,9 +2894,11 @@ pub const State = struct {
         const result = pending.result.?;
         pending.result = null;
         const server_name = pending.server_name;
+        const reconnect_error = pending.reconnect_error;
         pending.lease.deinit();
         pending.alloc.destroy(pending);
         return .{
+            .reconnect_error = reconnect_error,
             .server_name = server_name,
             .result = result,
         };
@@ -1975,6 +2958,29 @@ pub const State = struct {
             registry,
             captured_at_ms,
             .command,
+            spawnPendingReload,
+        );
+    }
+
+    pub fn beginSlackSetup(
+        self: *State,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+    ) !void {
+        return self.beginReloadWithOriginAndSpawner(
+            alloc,
+            workspace_root,
+            elicitation_capabilities,
+            loader,
+            preview_workspace_authority,
+            registry,
+            captured_at_ms,
+            .slack_setup,
             spawnPendingReload,
         );
     }
@@ -2039,6 +3045,7 @@ pub const State = struct {
         presentation_origin: PresentationOrigin,
         spawn_reload: SpawnPendingReloadFn,
     ) !void {
+        self.cancelPendingAuthentication("reload");
         self.cancelPendingReload();
 
         const pending = try alloc.create(PendingReload);
@@ -2186,10 +3193,9 @@ pub const State = struct {
         if (superseded_authentication) |task| task.cancel_requested.store(true, .release);
         pending.superseded_reload = superseded_reload;
         pending.superseded_authentication = superseded_authentication;
-        pending.detached_runtime = self.runtime;
+        if (self.runtime) |runtime| _ = runtime.revokeWorkspaceExceptNames(&.{});
         self.pending_reload = pending;
         self.pending_authentication = null;
-        self.runtime = null;
         self.lock.unlock(io_mod.getIo());
 
         if (comptime builtin.single_threaded) {
@@ -2202,7 +3208,7 @@ pub const State = struct {
         }
     }
 
-    pub fn retireAuthoritySynchronously(self: *State, alloc: Allocator) void {
+    pub fn retireAuthoritySynchronously(self: *State, _: Allocator) void {
         self.lock.lockUncancelable(io_mod.getIo());
         const pending_reload = self.pending_reload;
         if (pending_reload) |task| task.cancel_requested.store(true, .release);
@@ -2211,14 +3217,13 @@ pub const State = struct {
         const runtime = self.runtime;
         self.pending_reload = null;
         self.pending_authentication = null;
-        self.runtime = null;
         self.lock.unlock(io_mod.getIo());
 
-        if (pending_reload) |task| task.deinit();
         if (pending_authentication) |task| {
             cancelAndDeinitAuthentication(task, "authority_reduction_sync");
         }
-        if (runtime) |value| destroyRuntime(alloc, value);
+        if (pending_reload) |task| task.deinit();
+        if (runtime) |value| _ = value.revokeWorkspaceExceptNames(&.{});
     }
 
     pub fn takeReloadCompletion(self: *State) ?ReloadCompletion {
@@ -2281,133 +3286,21 @@ pub const State = struct {
         pending: ?*PendingReload,
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
+        var lease = self.acquire();
+        defer if (lease) |*current| current.deinit();
         const next_authority = preview_workspace_authority(alloc, workspace_root) catch |err| {
-            const detached = try self.detachForReducingReload(cancel_requested, pending);
-            if (detached) |runtime| {
-                destroyRuntime(alloc, runtime);
-                debug_trace.logf(
-                    "mcp",
-                    "authority-reducing reload preflight failed after retirement err={s}",
-                    .{@errorName(err)},
-                );
-                return error.McpAuthorityReducedReloadFailed;
+            if (lease) |current| {
+                if (current.runtime.revokeWorkspaceExceptNames(&.{})) return error.McpAuthorityReducedReloadFailed;
             }
             return err;
         };
         defer mcp_contract.freeOwnedStrings(alloc, next_authority);
-        var authority_reduced = false;
-        var detached_reduced_runtime: ?*mcp_runtime.McpRuntime = null;
-        self.lock.lockUncancelable(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or
-            (pending != null and self.pending_reload != pending.?))
-        {
-            self.lock.unlock(io_mod.getIo());
-            return error.Cancelled;
-        }
-        if (self.runtime) |current| {
-            authority_reduced = current.workspaceAuthorityReducedAgainstNames(
-                next_authority,
-                .all,
-            );
-            if (authority_reduced) {
-                detached_reduced_runtime = current;
-                self.runtime = null;
-            }
-        }
-        self.lock.unlock(io_mod.getIo());
-        if (detached_reduced_runtime) |runtime| {
-            detached_reduced_runtime = null;
-            destroyRuntime(alloc, runtime);
-        }
-
+        const authority_reduced = if (lease) |current| current.runtime.revokeWorkspaceExceptNames(next_authority) else false;
         const candidate = loader(alloc, workspace_root, elicitation_capabilities) catch |err| {
-            if (authority_reduced) {
-                debug_trace.logf(
-                    "mcp",
-                    "authority-reducing reload failed after retirement err={s}",
-                    .{@errorName(err)},
-                );
-                return error.McpAuthorityReducedReloadFailed;
-            }
+            if (authority_reduced) return error.McpAuthorityReducedReloadFailed;
             return err;
         };
-        var candidate_owned = candidate != null;
-        errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
-        if (cancel_requested.load(.acquire)) return error.Cancelled;
-
-        if (!authority_reduced) {
-            if (candidate) |next| {
-                self.lock.lockUncancelable(io_mod.getIo());
-                if (cancel_requested.load(.acquire) or
-                    (pending != null and self.pending_reload != pending.?))
-                {
-                    self.lock.unlock(io_mod.getIo());
-                    return error.Cancelled;
-                }
-                if (self.runtime) |current| {
-                    authority_reduced = current.workspaceAuthorityReducedAgainst(next, .all);
-                    if (authority_reduced) {
-                        detached_reduced_runtime = current;
-                        self.runtime = null;
-                    }
-                }
-                self.lock.unlock(io_mod.getIo());
-            }
-        }
-        if (detached_reduced_runtime) |runtime| destroyRuntime(alloc, runtime);
-
-        var published = if (candidate) |runtime| published: {
-            runtime.connectAllCancellable(registry, cancel_requested);
-            if (cancel_requested.load(.acquire)) return error.Cancelled;
-            var snapshot = try runtime.snapshotHealth(alloc, captured_at_ms);
-            defer snapshot.deinit(alloc);
-            const value = mcp_health.startupDecision(snapshot.servers);
-            if (!authority_reduced and !mcp_health.publishCandidateForDecision(value)) {
-                const failure = (try runtime.requiredStartupFailure(alloc, captured_at_ms)) orelse
-                    try alloc.dupe(u8, "A required MCP server is unavailable.");
-                destroyRuntime(alloc, runtime);
-                candidate_owned = false;
-                return .{ .retained_required_failure = failure };
-            }
-            break :published try PublishedReload.init(
-                alloc,
-                runtime.generation,
-                snapshot.servers,
-            );
-        } else try PublishedReload.init(alloc, null, &.{});
-        errdefer published.deinit(alloc);
-
-        self.lock.lockUncancelable(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or
-            (pending != null and self.pending_reload != pending.?))
-        {
-            self.lock.unlock(io_mod.getIo());
-            return error.Cancelled;
-        }
-        const previous = self.runtime;
-        self.runtime = candidate;
-        self.lock.unlock(io_mod.getIo());
-        candidate_owned = false;
-
-        if (previous) |runtime| destroyRuntime(alloc, runtime);
-        return .{ .published = published };
-    }
-
-    fn detachForReducingReload(
-        self: *State,
-        cancel_requested: *std.atomic.Value(bool),
-        pending: ?*PendingReload,
-    ) !?*mcp_runtime.McpRuntime {
-        self.lock.lockUncancelable(io_mod.getIo());
-        defer self.lock.unlock(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or
-            (pending != null and self.pending_reload != pending.?))
-        {
-            return error.Cancelled;
-        }
-        const runtime = self.runtime;
-        self.runtime = null;
-        return runtime;
+        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, !authority_reduced, true);
     }
 
     fn reloadAuthorityReducedControlled(
@@ -2423,40 +3316,107 @@ pub const State = struct {
         rebuild: bool,
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
-        const candidate = if (rebuild)
-            try loader(alloc, workspace_root, elicitation_capabilities)
-        else
-            null;
-        var candidate_owned = candidate != null;
-        errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
-        if (cancel_requested.load(.acquire)) return error.Cancelled;
+        if (!rebuild) {
+            if (self.acquire()) |owned| {
+                var lease = owned;
+                defer lease.deinit();
+                try lease.runtime.drainRetiredServers();
+                var snapshot = try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+                defer snapshot.deinit(alloc);
+                return .{ .published = try PublishedReload.init(alloc, if (snapshot.servers.len == 0) null else lease.runtime.generation, snapshot.servers) };
+            }
+            return .{ .published = try PublishedReload.init(alloc, null, &.{}) };
+        }
+        const candidate = try loader(alloc, workspace_root, elicitation_capabilities);
+        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, false, false);
+    }
 
-        var published = if (candidate) |runtime| published: {
+    /// Takes ownership of the unloaded candidate, including all error paths.
+    fn applyReloadCandidate(
+        self: *State,
+        alloc: Allocator,
+        candidate: ?*mcp_runtime.McpRuntime,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        cancel_requested: *std.atomic.Value(bool),
+        pending: ?*PendingReload,
+        retain_on_required_failure: bool,
+        refresh_catalogs: bool,
+    ) !ReloadOutcome {
+        var candidate_owned = candidate != null;
+        defer if (candidate_owned) destroyRuntime(
+            alloc,
+            candidate.?,
+            if (self.process_exiting.load(.acquire)) .process_exit else .discard,
+        );
+        self.lock.lockSharedUncancelable(io_mod.getIo());
+        const stale = cancel_requested.load(.acquire) or (pending != null and self.pending_reload != pending.?);
+        self.lock.unlockShared(io_mod.getIo());
+        if (stale) return error.Cancelled;
+        if (self.acquire()) |owned| {
+            var lease = owned;
+            defer lease.deinit();
+            if (try lease.runtime.reconcile(candidate, cancel_requested, retain_on_required_failure)) |failure| {
+                return .{ .retained_required_failure = failure };
+            }
+            if (refresh_catalogs) try lease.runtime.reloadCatalogs(cancel_requested);
+            var snapshot = try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+            defer snapshot.deinit(alloc);
+            return .{ .published = try PublishedReload.init(
+                alloc,
+                if (snapshot.servers.len == 0) null else lease.runtime.generation,
+                snapshot.servers,
+            ) };
+        }
+        var published = if (candidate) |runtime| result: {
             runtime.connectAllCancellable(registry, cancel_requested);
             if (cancel_requested.load(.acquire)) return error.Cancelled;
             var snapshot = try runtime.snapshotHealth(alloc, captured_at_ms);
             defer snapshot.deinit(alloc);
-            break :published try PublishedReload.init(
-                alloc,
-                runtime.generation,
-                snapshot.servers,
-            );
+            if (retain_on_required_failure and !mcp_health.publishCandidateForDecision(mcp_health.startupDecision(snapshot.servers))) {
+                return .{ .retained_required_failure = (try runtime.requiredStartupFailure(alloc, captured_at_ms)) orelse try alloc.dupe(u8, "A required MCP server is unavailable.") };
+            }
+            break :result try PublishedReload.init(alloc, runtime.generation, snapshot.servers);
         } else try PublishedReload.init(alloc, null, &.{});
         errdefer published.deinit(alloc);
-
         self.lock.lockUncancelable(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or self.pending_reload != pending) {
-            self.lock.unlock(io_mod.getIo());
-            return error.Cancelled;
-        }
-        std.debug.assert(self.runtime == null);
+        defer self.lock.unlock(io_mod.getIo());
+        if (cancel_requested.load(.acquire) or (pending != null and self.pending_reload != pending.?) or self.runtime != null) return error.Cancelled;
         self.runtime = candidate;
-        self.lock.unlock(io_mod.getIo());
         candidate_owned = false;
         return .{ .published = published };
     }
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        self.deinitWithMode(alloc, .discard);
+    }
+
+    /// Teardown immediately followed by process exit: stdio servers are
+    /// killed without grace and remote sessions are left to expire.
+    pub fn deinitForProcessExit(self: *State, alloc: Allocator) void {
+        // A reload still in flight must see this before its children die,
+        // and `destroyHost` waits for nothing once it is set.
+        self.process_exiting.store(true, .release);
+        self.destroyHost();
+        if (!mcp_runtime.killAllStdioChildrenForProcessExit()) {
+            return self.deinitWithMode(alloc, .process_exit);
+        }
+        // Every stdio child is dead. Work the user started is still cancelled
+        // and logged, but runtimes, pending reloads, and their threads are
+        // left to the exiting process: joining them would only wait for each
+        // killed child to be reaped.
+        self.cancelPendingAuthentication("shutdown");
+        self.cancelPendingMenuOperation("shutdown");
+    }
+
+    fn deinitWithMode(self: *State, alloc: Allocator, mode: RuntimeTeardown) void {
+        if (mode == .process_exit) {
+            // A reload still in flight must see this before it is joined.
+            self.process_exiting.store(true, .release);
+            self.lock.lockSharedUncancelable(io_mod.getIo());
+            if (self.runtime) |runtime| runtime.prepareForProcessExit();
+            self.lock.unlockShared(io_mod.getIo());
+        }
         self.cancelPendingAuthentication("shutdown");
         self.cancelPendingReload();
         self.cancelPendingMenuOperation("shutdown");
@@ -2464,8 +3424,12 @@ pub const State = struct {
         const previous = self.runtime;
         self.runtime = null;
         self.lock.unlock(io_mod.getIo());
-        if (previous) |runtime| destroyRuntime(alloc, runtime);
+        if (previous) |runtime| destroyRuntime(alloc, runtime, mode);
+        self.destroyHost();
         self.clearMenuOwned(alloc);
+        self.model_catalog_baseline_lock.lockUncancelable(io_mod.getIo());
+        self.clearModelCatalogBaselineLocked(alloc);
+        self.model_catalog_baseline_lock.unlock(io_mod.getIo());
         self.* = .{};
     }
 };
@@ -2483,27 +3447,32 @@ fn cancelAndDeinitAuthentication(
     pending.deinit();
 }
 
-pub fn buildModelToolProjection(
-    state: *State,
+const RuntimeTeardown = enum { discard, process_exit };
+
+fn destroyRuntime(
     alloc: Allocator,
-    advertisement_set: tool_set.ToolSet,
-    options: tool_projection.Options,
-) !tool_projection.EffectiveToolProjection {
-    var lease = state.acquire();
-    defer if (lease) |*active| active.deinit();
-    var effective = options;
-    effective.mcp_runtime = if (lease) |active| active.runtime else null;
-    return tool_projection.buildModelToolProjectionForSet(
-        alloc,
-        advertisement_set,
-        effective,
-    );
+    runtime: *mcp_runtime.McpRuntime,
+    mode: RuntimeTeardown,
+) void {
+    runtime.retireAndWait();
+    switch (mode) {
+        .discard => runtime.deinit(),
+        .process_exit => runtime.deinitForProcessExit(),
+    }
+    alloc.destroy(runtime);
 }
 
-fn destroyRuntime(alloc: Allocator, runtime: *mcp_runtime.McpRuntime) void {
-    runtime.retireAndWait();
-    runtime.deinit();
-    alloc.destroy(runtime);
+test "MCP menu preview display flattens untrusted multi-line content" {
+    const alloc = std.testing.allocator;
+    var preview = try makeMenuPreview(alloc, "heading\n\n", "line one\n\nline two\x1b]0;owned\x07");
+    defer preview.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "heading\n\nline one line two\\x1b]0;owned\\x07",
+        preview.display,
+    );
+    try std.testing.expect(std.mem.find(u8, preview.display, "\\x0a") == null);
+    try std.testing.expectEqualStrings("line one\n\nline two\x1b]0;owned\x07", preview.insert);
 }
 
 test "MCP menu expands every resource template argument" {
@@ -2658,7 +3627,7 @@ test "MCP menu failures preserve exact menu-owned feedback" {
         &repaired_completion,
     ));
     try std.testing.expectEqualStrings(
-        "Authenticated 'fixture'; repaired 2 credential entries; reconnecting…",
+        "Authenticated 'fixture'; repaired 2 credential entries.",
         repaired_state.menu_feedback.?,
     );
 }
@@ -2695,6 +3664,23 @@ const TestReloadMode = enum {
 };
 
 var test_reload_mode: TestReloadMode = .empty;
+
+test "menu selection follows server identity when snapshots reorder" {
+    const alloc = std.testing.allocator;
+    var runtime = mcp_runtime.McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "first"), .command = try alloc.dupe(u8, "cmd") });
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "second"), .command = try alloc.dupe(u8, "cmd") });
+    var state: State = .{};
+    defer state.deinit(alloc);
+    state.menu_health = try runtime.snapshotHealth(alloc, 1);
+    state.menu = .{ .active = true, .section = .servers, .screen = .details, .selected_index = 1, .selected_server_index = 1 };
+    var reordered = try runtime.snapshotHealth(alloc, 200);
+    std.mem.swap(mcp_health.ServerSnapshot, &reordered.servers[0], &reordered.servers[1]);
+    try std.testing.expect(state.replaceMenuHealth(alloc, reordered));
+    try std.testing.expectEqual(@as(usize, 0), state.menu.selected_index);
+    try std.testing.expectEqualStrings("second", state.selectedMenuServerName().?);
+}
 
 fn loadTestReloadRuntime(
     alloc: Allocator,
@@ -2759,6 +3745,14 @@ fn failPendingReloadSpawn(_: *PendingReload) !std.Thread {
     return error.TestSpawnFailed;
 }
 
+fn expectNoActiveMcpServers(state: *State) !void {
+    var lease = state.acquire() orelse return;
+    defer lease.deinit();
+    var snapshot = try lease.runtime.snapshotHealth(std.testing.allocator, 0);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.servers.len);
+}
+
 test "transactional reload retains old runtime and publishes only accepted candidates" {
     const alloc = std.testing.allocator;
     var state: State = .{};
@@ -2785,7 +3779,7 @@ test "transactional reload retains old runtime and publishes only accepted candi
     switch (rejected) {
         .retained_required_failure => |failure| {
             try std.testing.expect(std.mem.find(u8, failure, "candidate") != null);
-            try std.testing.expect(std.mem.find(u8, failure, "required") != null);
+            try std.testing.expect(std.mem.find(u8, failure, "Required MCP server") != null);
         },
         .published => return error.TestUnexpectedResult,
     }
@@ -2801,23 +3795,20 @@ test "transactional reload retains old runtime and publishes only accepted candi
     switch (degraded) {
         .published => |published| {
             try std.testing.expectEqual(mcp_health.StartupDecision.degraded, published.health);
-            try std.testing.expect(published.generation.? != original_generation);
+            try std.testing.expectEqual(original_generation, published.generation.?);
             try std.testing.expectEqual(@as(usize, 1), published.configured_server_count);
             try std.testing.expectEqual(@as(usize, 1), published.unavailable_server_names.len);
             try std.testing.expectEqualStrings("candidate", published.unavailable_server_names[0]);
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(
-        error.McpAuthorityChanged,
-        state.callTool(
-            alloc,
-            "mcp_candidate_echo",
-            "{}",
-            1024,
-            .{ .expected_runtime_generation = original_generation },
-        ),
-    );
+    try std.testing.expectEqual(@as(?tool_mcp_runtime.CallResult, null), try state.callTool(
+        alloc,
+        "mcp_candidate_echo",
+        "{}",
+        1024,
+        .{ .expected_runtime_generation = original_generation },
+    ));
 
     test_reload_mode = .empty;
     var empty = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 40);
@@ -2831,7 +3822,7 @@ test "transactional reload retains old runtime and publishes only accepted candi
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "reducing preflight retires workspace authority before strict loader failure" {
@@ -2863,7 +3854,7 @@ test "reducing preflight retires workspace authority before strict loader failur
             10,
         ),
     );
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "project prompt display escapes repository control bytes" {
@@ -2888,7 +3879,7 @@ test "project prompt display escapes repository control bytes" {
 }
 
 test "project prompt allocation failure releases the runtime lease" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var state: State = .{};
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     runtime.* = mcp_runtime.McpRuntime.init(alloc);
@@ -2952,7 +3943,7 @@ test "pending reload returns immediately and publishes one completion" {
         .failed => return error.TestUnexpectedResult,
     }
     try std.testing.expect(state.takeReloadCompletion() == null);
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "reload thread start failure frees the task and copied workspace root once" {
@@ -2976,7 +3967,7 @@ test "reload thread start failure frees the task and copied workspace root once"
     try std.testing.expect(state.pending_reload == null);
 }
 
-test "authority reduction quiesces superseded tasks before detached runtime retirement" {
+test "authority reduction drains revoked servers without waiting for unrelated runtime leases" {
     if (comptime builtin.single_threaded) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var state: State = .{};
@@ -2995,6 +3986,9 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
     var active_lease = state.acquire() orelse return error.TestUnexpectedResult;
     var active_lease_owned = true;
     defer if (active_lease_owned) active_lease.deinit();
+    var authentication_lease = state.acquire() orelse return error.TestUnexpectedResult;
+    var authentication_lease_owned = true;
+    defer if (authentication_lease_owned) authentication_lease.deinit();
 
     test_reload_mode = .delayed_empty;
     defer test_reload_mode = .empty;
@@ -3008,11 +4002,26 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         50,
     );
 
-    const authentication = try alloc.create(PendingAuthentication);
+    const retirement_deadline = io_mod.milliTimestamp() + 2_000;
+    while (true) {
+        var snapshot = try runtime.snapshotHealth(alloc, 0);
+        const revoked = snapshot.servers.len == 0;
+        snapshot.deinit(alloc);
+        if (revoked) break;
+        if (io_mod.milliTimestamp() >= retirement_deadline) return error.TestWorkspaceAuthorityNotRetired;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(!runtime.retiring.load(.acquire));
+
+    const authentication_name = try alloc.dupe(u8, "workspace");
+    const authentication = alloc.create(PendingAuthentication) catch |err| {
+        alloc.free(authentication_name);
+        return err;
+    };
     authentication.* = .{
         .alloc = alloc,
-        .server_name = try alloc.dupe(u8, "workspace"),
-        .lease = state.acquire() orelse return error.TestUnexpectedResult,
+        .server_name = authentication_name,
+        .lease = authentication_lease,
         .opener = host.unavailable_url_opener,
         .done = .init(true),
         .result = error.Cancelled,
@@ -3020,6 +4029,7 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
     state.lock.lockUncancelable(io_mod.getIo());
     state.pending_authentication = authentication;
     state.lock.unlock(io_mod.getIo());
+    authentication_lease_owned = false;
 
     try state.beginAuthorityReduction(
         alloc,
@@ -3030,19 +4040,9 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         60,
         false,
     );
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 
-    const retirement_deadline = io_mod.milliTimestamp() + 2_000;
-    while (!runtime.retiring.load(.acquire) and
-        io_mod.milliTimestamp() < retirement_deadline)
-    {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    try std.testing.expect(runtime.retiring.load(.acquire));
-    try std.testing.expect(state.takeReloadCompletion() == null);
-
-    active_lease.deinit();
-    active_lease_owned = false;
+    try std.testing.expect(!runtime.retiring.load(.acquire));
     var completion: ?ReloadCompletion = null;
     const completion_deadline = io_mod.milliTimestamp() + 2_000;
     while (completion == null and io_mod.milliTimestamp() < completion_deadline) {
@@ -3050,6 +4050,8 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         completion = state.takeReloadCompletion();
     }
     var loaded = completion orelse return error.TestUnexpectedResult;
+    active_lease.deinit();
+    active_lease_owned = false;
     defer loaded.deinit(alloc);
     switch (loaded) {
         .outcome => |outcome| switch (outcome) {
@@ -3060,7 +4062,7 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         },
         .failed => return error.TestUnexpectedResult,
     }
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "authority reduction thread start failure falls back synchronously" {
@@ -3090,7 +4092,7 @@ test "authority reduction thread start failure falls back synchronously" {
         false,
         failPendingReloadSpawn,
     );
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
     var completion = state.takeReloadCompletion() orelse
         return error.TestUnexpectedResult;
     defer completion.deinit(alloc);
@@ -3191,4 +4193,120 @@ test "superseding and deinitializing a stalled pending reload cancel before join
     const deinit_started_ms = io_mod.milliTimestamp();
     state.deinit(alloc);
     try std.testing.expect(io_mod.milliTimestamp() - deinit_started_ms < 1_000);
+}
+
+test "model catalog baseline surfaces availability changes once" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const before = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .authentication_required },
+    };
+    const first = try state.updateModelCatalogBaseline(alloc, alloc, &before);
+    try std.testing.expectEqual(@as(?[]u8, null), first);
+
+    const after = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+    };
+    const changed = try state.updateModelCatalogBaseline(alloc, alloc, &after);
+    defer if (changed) |notice| alloc.free(notice);
+    try std.testing.expect(changed != null);
+    try std.testing.expect(std.mem.find(u8, changed.?, "linear: authentication_required -> ready (74 tools)") != null);
+
+    const settled = try state.updateModelCatalogBaseline(alloc, alloc, &after);
+    try std.testing.expectEqual(@as(?[]u8, null), settled);
+}
+
+test "model catalog baseline waits out discovery before recording state" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const discovering = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .discovering },
+    };
+    const during_discovery = try state.updateModelCatalogBaseline(alloc, alloc, &discovering);
+    try std.testing.expectEqual(@as(?[]u8, null), during_discovery);
+    try std.testing.expect(state.model_catalog_baseline == null);
+
+    const ready = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+    };
+    const settled = try state.updateModelCatalogBaseline(alloc, alloc, &ready);
+    try std.testing.expectEqual(@as(?[]u8, null), settled);
+    try std.testing.expect(state.model_catalog_baseline != null);
+
+    const failed = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .failed },
+    };
+    const outage = try state.updateModelCatalogBaseline(alloc, alloc, &failed);
+    defer if (outage) |notice| alloc.free(notice);
+    try std.testing.expect(outage != null);
+    try std.testing.expect(std.mem.find(u8, outage.?, "linear: ready -> failed") != null);
+}
+
+test "model catalog baseline reports removals" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const before = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("slack"), .availability = .ready, .tool_count = 3 },
+    };
+    _ = try state.updateModelCatalogBaseline(alloc, alloc, &before);
+
+    const removed = try state.updateModelCatalogBaseline(alloc, alloc, &.{});
+    defer if (removed) |notice| alloc.free(notice);
+    try std.testing.expect(removed != null);
+    try std.testing.expect(std.mem.find(u8, removed.?, "slack: removed") != null);
+}
+
+test "startup health notice is held during discovery and consumed once" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    state.installInitial(runtime);
+    defer state.deinit(alloc);
+
+    try std.testing.expect(!state.startup_health_notice_pending);
+    try std.testing.expectEqual(@as(?[]u8, null), try state.takeStartupHealthNotice(alloc));
+
+    state.startDiscovery(.{});
+    try std.testing.expect(state.startup_health_notice_pending);
+
+    // Zero configured servers settle quickly; until then the notice is held.
+    const deadline = io_mod.milliTimestamp() + 5_000;
+    var notice: ?[]u8 = null;
+    while (io_mod.milliTimestamp() < deadline) {
+        notice = try state.takeStartupHealthNotice(alloc);
+        if (!state.startup_health_notice_pending) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(!state.startup_health_notice_pending);
+    try std.testing.expectEqual(@as(?[]u8, null), notice);
+    try std.testing.expectEqual(@as(?[]u8, null), try state.takeStartupHealthNotice(alloc));
+}
+
+test "a typed sign-in reports in the transcript, any other on the status line" {
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    const notify = sink.notify();
+    sink.markTyped("docs");
+    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
+    notify.notice(notify.context, .{ .signed_in = "docs" });
+    try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+    try std.testing.expectEqualStrings("Signed in to docs.", sink.notices.items[1].text);
+    try std.testing.expect(sink.news == null);
+    // Once reported, the next sign-in to it isn't typed.
+    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
+    try std.testing.expect(sink.sign_in != null);
+    notify.notice(notify.context, .{ .sign_in_failed = .{ .server = "docs", .reason = "it said no" } });
+    try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+    try std.testing.expectEqualStrings("Couldn't sign in to docs: it said no.", sink.news.?);
+    try std.testing.expect(sink.sign_in == null);
+    // Needing a login is the status line's to say.
+    notify.notice(notify.context, .{ .needs_login = "docs" });
+    try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
 }

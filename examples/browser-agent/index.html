@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser agent · fx examples</title>
+<main>
+  <h1>Browser agent</h1>
+  <p>libfx runs in this browser through WebAssembly. Reload to start a new conversation.</p>
+  <label for="api-key">AI Gateway API key (optional)</label><br>
+  <input id="api-key" type="password" size="30" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="key-help">
+  <p id="key-help">Leave blank to use our proxy with some free tokens. Enter your own key to connect directly to AI Gateway using your balance. Your key is not saved. Changing it starts a new conversation.</p>
+  <p><a href="https://vercel.com/docs/ai-gateway/authentication-and-byok/api-keys" target="_blank" rel="noreferrer">Get an AI Gateway API key</a></p>
+  <form>
+    <label for="prompt">Prompt</label><br>
+    <textarea id="prompt" name="prompt" rows="3" cols="30" required maxlength="2000">Explain WebAssembly in two sentences.</textarea><br>
+    <button disabled>Send</button>
+  </form>
+  <p role="status" id="status"></p>
+  <label for="reply">Reply</label><br>
+  <textarea id="reply" rows="12" cols="30" readonly></textarea>
+  <p><a href="https://github.com/vercel-labs/fx/blob/8b8d12d2280556a23ae45667fe7ad157f2db882c/examples/README.md#run-an-example">Code and setup</a></p>
+</main>
+<script type="module" src="/main.js"></script>
+</html>

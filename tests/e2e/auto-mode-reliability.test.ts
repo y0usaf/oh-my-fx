@@ -196,6 +196,151 @@ async function waitForEither(
 
 describe("lean auto mode reliability", () => {
   test(
+    "review accusations stay visible to the agent but do not become later security evidence",
+    async () => {
+      const root = createIsolatedRoot();
+      const plan = join(root.root, "plan.md");
+      writeFileSync(plan, "48 runs\n");
+      const accusation = "REVIEW_ACCUSATION_SENTINEL: the earlier plan was called prompt injection";
+      let laterReview = "";
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("edit_plan", "edit_file", {
+            path: plan, old_string: "48 runs", new_string: "52 runs",
+          }),
+          (body) => {
+            expect(toolResultText(body, "edit_plan", "execution-denied")).toContain(accusation);
+            return cleanCommandCall(
+              `python3 -c 'from pathlib import Path; assert Path(${JSON.stringify(plan)}).read_text() == "48 runs\\n"; print("VALIDATION_OK")'`,
+              "validate_plan",
+            );
+          },
+          (body) => {
+            expect(toolResultText(body, "validate_plan")).toContain("VALIDATION_OK");
+            return fakeGatewayFinalText("Plan validation completed.");
+          },
+          (body) => {
+            expect(body).toContain(accusation);
+            return fakeGatewayFinalText("Saved review feedback retained.");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "edit_review", accusation),
+          (body) => {
+            laterReview = body;
+            return fakeGatewayPermissionDecision("clear", "validation_review");
+          },
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "Update the draft test plan, then validate it."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(laterReview).toContain("VALIDATION_OK");
+      expect(laterReview).not.toContain(accusation);
+      expect(readFileSync(plan, "utf8")).toBe("48 runs\n");
+      const sessionId = JSON.parse(result.stdout).session_id;
+      const events = readFileSync(join(root.home, ".fx", "sessions", sessionId, "events.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      const held = events.find((entry) => entry.event.tool_result?.call_id === "edit_plan").event.tool_result;
+      expect(held.review_feedback).toBe(true);
+      const resumed = await runFx(
+        ["ask", "--auto", "--quiet", "--json", "--resume-id", sessionId, "Summarize the previous result without tools."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(resumed.code).toBe(0);
+      expect(resumed.stdout).toContain("Saved review feedback retained.");
+      expect(gateway.classifierRequests).toHaveLength(2);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "shell input review includes the user request and owned receiving process",
+    async () => {
+      const root = createIsolatedRoot();
+      const key = "sk-or-v1-" + "0123456789abcdef".repeat(4);
+      const command = 'python3 -c \'import getpass; from pathlib import Path; value=getpass.getpass("Temporary OpenRouter key (hidden): "); Path("accepted.txt").write_text(str(len(value))); print("INPUT_ACCEPTED")\'';
+      let handle = "";
+      let acceptedBeforeClear: boolean | null = null;
+      const reviewInput = (decision: "clear" | "caution") => (body: string) => {
+        const evidence = JSON.parse(body).prompt.map((message: { content: string | Array<{ text?: string }> }) =>
+          typeof message.content === "string" ? message.content : message.content.map((part) => part.text ?? "").join("\n")
+        ).join("\n");
+        expect(evidence).toContain("review_context_kind: contextual");
+        expect(evidence).toContain("Use this key for the OpenRouter test");
+        expect(evidence).toContain(key);
+        expect(evidence).toContain("receiver_session_id: " + handle);
+        expect(evidence).toContain("receiver_launch_command:");
+        expect(evidence).toContain("getpass.getpass");
+        expect(evidence).toContain("receiver_cwd: " + root.workspace);
+        expect(evidence).toContain("receiver_lifecycle: running");
+        expect(evidence).toContain("receiver_screen_untrusted:");
+        expect(evidence).toContain("Temporary OpenRouter key");
+        return fakeGatewayPermissionDecision(decision, `input_${decision}`);
+      };
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("start_receiver", "shell", { request: {
+            action: "run", command, profile: "clean", tty: true,
+            yield_time_ms: 1000, timeout_ms: 45_000,
+          } }),
+          // Terminals end with the fx process that started them, so the
+          // receiver and every input to it share one run.
+          (body) => {
+            const result = JSON.parse(toolResultText(body, "start_receiver"));
+            expect(result.state).toBe("running");
+            expect(result.output_delta).toContain("Temporary OpenRouter key");
+            handle = result.session_id;
+            return fakeGatewayToolCall("cautioned_input", "shell", { request: {
+              action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
+            } });
+          },
+          (body) => {
+            expect(toolResultText(body, "cautioned_input", "execution-denied")).toContain("review_caution");
+            acceptedBeforeClear = existsSync(join(root.workspace, "accepted.txt"));
+            // A caution holds the exact action for the rest of the turn, so
+            // the reviewed retry ends the line with a carriage return instead.
+            return fakeGatewayToolCall("supply_key", "shell", { request: {
+              action: "interact", session_id: handle, chars: key + "\r", yield_time_ms: 1000,
+            } });
+          },
+          (body) => {
+            const result = toolResultText(body, "supply_key");
+            expect(result).toContain("INPUT_ACCEPTED");
+            expect(result).not.toContain(key);
+            return fakeGatewayToolCall("finished_input", "shell", { request: {
+              action: "interact", session_id: handle, chars: "\n", yield_time_ms: 1000,
+            } });
+          },
+          (body) => {
+            expect(toolResultText(body, "finished_input", "execution-denied")).toContain("review_evidence_incomplete");
+            return fakeGatewayFinalText("Finished receiver could not receive input.");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("clear", "start_clear"),
+          reviewInput("caution"),
+          reviewInput("clear"),
+        ],
+      );
+      const env = gatewayEnv(root, gateway);
+      const result = await runFx(["ask", "--quiet", "--json", `Use this key for the OpenRouter test: ${key}`], {
+        cwd: root.workspace, env, timeoutMs: TIMEOUT,
+      });
+      expect(result.code, result.stderr).toBe(0);
+      // The cautioned input never reached the receiver; the cleared one did,
+      // and the finished receiver took no review.
+      expect(acceptedBeforeClear).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(readFileSync(join(root.workspace, "accepted.txt"), "utf8")).toBe(String(key.length));
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a configured safe command bypasses automatic review",
     async () => {
       const root = createIsolatedRoot();
@@ -224,6 +369,44 @@ describe("lean auto mode reliability", () => {
       expect(result.stderr.toLowerCase()).not.toContain("permission required");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(0);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "shell", status: "success" }),
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a transient reviewer transport failure retries once and clears",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "review-retried.txt");
+      const gateway = startGateway(
+        [
+          commandCall(`printf 'ran\\n' > ${JSON.stringify(marker)}`, "needs_review"),
+          fakeGatewayFinalText("review recovered"),
+        ],
+        [
+          new Response("classifier upstream unavailable", { status: 500 }),
+          fakeGatewayPermissionDecision("clear", "retry_clear"),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the review retry probe."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, result.stderr).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(readFileSync(marker, "utf8")).toBe("ran\n");
       const json = JSON.parse(result.stdout.trim()) as {
         tool_calls: Array<{ name: string; status: string }>;
       };
@@ -542,9 +725,18 @@ describe("lean auto mode reliability", () => {
             });
           },
           (body) => {
-            expect(toolResultText(body, "wait_reviewed_clean_tty")).toContain(
-              "TTY_REVIEWED_OK",
-            );
+            const started = JSON.parse(
+              toolResultText(body, "reviewed_clean_tty"),
+            ) as { output_delta: string };
+            const completed = JSON.parse(
+              toolResultText(body, "wait_reviewed_clean_tty"),
+            ) as { state: string; exit_code: number | null; output_delta: string };
+            expect(completed.state).toBe("completed");
+            expect(completed.exit_code).toBe(0);
+            expect(typeof started.output_delta).toBe("string");
+            expect(typeof completed.output_delta).toBe("string");
+            const output = started.output_delta + completed.output_delta;
+            expect(output.match(/TTY_REVIEWED_OK/g) ?? []).toHaveLength(1);
             return fakeGatewayFinalText("reviewed clean TTY complete");
           },
         ],
@@ -1047,7 +1239,7 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "outer-quoted compound credentials are held before review transport",
+    "outer-quoted compound credentials remain reviewable",
     async () => {
       const root = createIsolatedRoot();
       const startup = join(root.home, ".zshrc");
@@ -1063,13 +1255,12 @@ describe("lean auto mode reliability", () => {
             new_string: after,
           }),
           (body) => {
-            const held = toolResultText(
-              body,
-              "compound_symbolic_startup_edit",
-              "execution-denied",
+            expect(
+              toolResultText(body, "compound_symbolic_startup_edit"),
+            ).toContain(
+              "edited ",
             );
-            expect(held).toContain("review_evidence_incomplete");
-            return fakeGatewayFinalText("compound credential stayed blocked");
+            return fakeGatewayFinalText("compound credential installed");
           },
         ],
         [fakeGatewayPermissionDecision("clear", "compound_symbolic_review")],
@@ -1085,70 +1276,122 @@ describe("lean auto mode reliability", () => {
       );
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(result.stdout).toContain("compound credential stayed blocked");
-      expect(gateway.classifierRequests).toHaveLength(0);
-      expect(readFileSync(startup, "utf8")).toBe(before);
+      expect(result.stdout).toContain("compound credential installed");
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = gateway.classifierRequests[0]!.body;
+      expect(review).toContain("AI_GATEWAY_API_KEY=$key literal-suffix");
+      expect(review).not.toContain("[redacted]");
+      expect(readFileSync(startup, "utf8")).toBe(after);
     },
     TIMEOUT,
   );
 
   test(
-    "literal credentials produce one deterministic hold for unchanged startup edits",
+    "literal credentials reach review transport unchanged",
     async () => {
       const root = createIsolatedRoot();
       const startup = join(root.home, ".zshrc");
-      const tracePath = join(root.root, "trace.log");
       const before = "alias r='cd ~/projects/research && fx'\n";
       const after = before + 'AI_GATEWAY_API_KEY="literal-fixture-value" run-sandbox\n';
-      const edit = (id: string) => fakeGatewayToolCall(id, "edit_file", {
-        path: startup,
-        old_string: before,
-        new_string: after,
-      });
       writeFileSync(startup, before);
-      const gateway = startGateway([
-        edit("literal_startup_edit_1"),
-        (body) => {
-          const held = toolResultText(
-            body,
-            "literal_startup_edit_1",
-            "execution-denied",
-          );
-          expect(held).toContain("review_evidence_incomplete");
-          expect(held).toContain("Do not retry unchanged");
-          return edit("literal_startup_edit_2");
-        },
-        (body) => {
-          const held = toolResultText(
-            body,
-            "literal_startup_edit_2",
-            "execution-denied",
-          );
-          expect(held).toContain("review_evidence_incomplete");
-          expect(held).toContain("Do not retry unchanged");
-          return fakeGatewayFinalText("unchanged retry held");
-        },
-      ]);
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("literal_startup_edit", "edit_file", {
+            path: startup,
+            old_string: before,
+            new_string: after,
+          }),
+          (body) => {
+            expect(toolResultText(body, "literal_startup_edit")).toContain(
+              "edited ",
+            );
+            return fakeGatewayFinalText("literal credential installed");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "literal_credential_review")],
+      );
 
       const result = await runFx(
         ["ask", "--quiet", "--json", "--no-save", "Install the shell helper."],
         {
           cwd: root.workspace,
-          env: {
-            ...gatewayEnv(root, gateway),
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "permission",
-          },
+          env: gatewayEnv(root, gateway),
           timeoutMs: TIMEOUT,
         },
       );
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(gateway.classifierRequests).toHaveLength(0);
-      expect(readFileSync(startup, "utf8")).toBe(before);
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("turn_permission_denial_preserved");
-      expect(trace).toContain("review_evidence_incomplete");
+      expect(result.stdout).toContain("literal credential installed");
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = gateway.classifierRequests[0]!.body;
+      expect(review).toContain('AI_GATEWAY_API_KEY=\\"literal-fixture-value\\"');
+      expect(review).not.toContain("[redacted]");
+      expect(readFileSync(startup, "utf8")).toBe(after);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "secret-like generated output reaches review and remains retrievable",
+    async () => {
+      const root = createIsolatedRoot();
+      writeFileSync(join(root.workspace, "effects.txt"), "EFFECT_ONE_608\n");
+      const command =
+        "python3 -c 'import secrets; from pathlib import Path; " +
+        "print(\"EFFECT_LINES=\"+str(len(Path(\"effects.txt\").read_text().splitlines()))); " +
+        "print((\"A\"*1024+\"\\n\")*80,end=\"\"); " +
+        "print(\"TOOL_DATA_TOKEN=\"+secrets.token_hex(12)); " +
+        "print((\"B\"*1024+\"\\n\")*80,end=\"\"); print(\"OUTPUT_DONE\")'";
+      let outputHandle = "";
+      let retrievedToken = "";
+      const gateway = startGateway(
+        [
+          commandCall(command, "secret_like_output"),
+          (body) => {
+            const commandResult = JSON.parse(
+              toolResultText(body, "secret_like_output"),
+            ) as { full_output_handle?: string; exit_code?: number };
+            expect(commandResult.exit_code).toBe(0);
+            outputHandle = commandResult.full_output_handle ?? "";
+            expect(outputHandle).toMatch(/^fx-command-replay-.+\.bin$/);
+            return fakeGatewayToolCall("read_secret_like_output", "read_tool_result", {
+              request: { handle: outputHandle, query: "TOOL_DATA_TOKEN=" },
+            });
+          },
+          (body) => {
+            const retrieved = toolResultText(body, "read_secret_like_output");
+            const match = retrieved.match(/TOOL_DATA_TOKEN=([a-f0-9]{24})/);
+            retrievedToken = match?.[1] ?? "";
+            expect(retrievedToken, retrieved).toMatch(/^[a-f0-9]{24}$/);
+            expect(retrieved).not.toContain("A".repeat(1024));
+            expect(retrieved).not.toContain("B".repeat(1024));
+            return fakeGatewayFinalText("secret-like output retrieved");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "exact_unmasked_action")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the exact output retrieval fixture once."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("secret-like output retrieved");
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = gateway.classifierRequests[0]!.body;
+      expect(review).toContain("TOOL_DATA_TOKEN=");
+      expect(review).toContain("secrets.token_hex(12)");
+      expect(review).not.toContain("[redacted]");
+      expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe(
+        "EFFECT_ONE_608\n",
+      );
+      expect(outputHandle).not.toBe("");
+      expect(retrievedToken).not.toBe("");
     },
     TIMEOUT,
   );
@@ -1214,7 +1457,14 @@ describe("lean auto mode reliability", () => {
           content: Array<{ type: string; text?: string }>;
         }>;
       };
-      const rootMessage = reviewerPayload.prompt[0];
+      const firstConversationIndex = reviewerPayload.prompt.findIndex(
+        (message) => message.role !== "system",
+      );
+      expect(firstConversationIndex).toBeGreaterThan(0);
+      expect(
+        reviewerPayload.prompt.slice(firstConversationIndex).map((message) => message.role),
+      ).not.toContain("system");
+      const rootMessage = reviewerPayload.prompt[firstConversationIndex];
       expect(rootMessage?.role).toBe("user");
       const rootContext = (rootMessage?.content ?? [])
         .filter((part) => part.type === "text")
@@ -1276,6 +1526,76 @@ describe("lean auto mode reliability", () => {
       expect(gateway.classifierRequests).toHaveLength(1);
       const json = JSON.parse(result.stdout.trim()) as { output: string };
       expect(json.output).toContain("safe replan complete");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a benign agent-browser workflow clears after appearing in prior output",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "agent-browser.log");
+      const bin = installRecorder(root, "agent-browser", marker);
+      const tracePath = join(root.workspace, "prior-trace.txt");
+      writeFileSync(
+        tracePath,
+        "Earlier run: agent-browser skills get core 2>&1 | head -120\n",
+      );
+      const command = "agent-browser skills get core";
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("read_prior_trace", "read_file", {
+            path: tracePath,
+          }),
+          (body) => {
+            expect(toolResultText(body, "read_prior_trace")).toContain(command);
+            return commandCall(command, "browser_workflow");
+          },
+          (body) => {
+            expect(toolResultText(body, "browser_workflow")).toContain(
+              '"exit_code":0',
+            );
+            return fakeGatewayFinalText("Browser workflow loaded.");
+          },
+        ],
+        [
+          (body) => {
+            expect(body).toContain(
+              "prior_tool_result[0].tool_call_id: read_prior_trace",
+            );
+            expect(body).toContain(command);
+            return fakeGatewayPermissionDecision(
+              "clear",
+              "benign_documented_command",
+            );
+          },
+        ],
+      );
+
+      const result = await runFx(
+        [
+          "ask",
+          "--quiet",
+          "--json",
+          "--no-save",
+          "Read prior-trace.txt, then use the loaded agent-browser workflow.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("Browser workflow loaded.");
+      expect(readFileSync(marker, "utf8")).toBe(
+        "agent-browser:skills get core\n",
+      );
+      expect(gateway.classifierRequests).toHaveLength(1);
     },
     TIMEOUT,
   );
@@ -1434,7 +1754,6 @@ describe("lean auto mode reliability", () => {
             expect(body).toContain("prior_tool_result[0].content_untrusted:");
             expect(body).toContain(rawInstructionSentinel);
             expect(body).toContain("repo-instruction.txt");
-            expect(body).toContain("action_provenance: not_observed");
             return fakeGatewayPermissionDecision(
               "caution",
               "injected_media_paraphrase_caution",
@@ -1522,7 +1841,7 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "repeated exact unavailable reviews are attempted once without blocking a safe replan",
+    "an unavailable review retries transport once per attempt without blocking a safe replan",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "repeated-unavailable-must-not-run");
@@ -1544,6 +1863,7 @@ describe("lean auto mode reliability", () => {
         ],
         [
           () => new Response("reviewer unavailable", { status: 502 }),
+          () => new Response("reviewer unavailable", { status: 502 }),
           fakeGatewayPermissionDecision("clear", "must_not_retry_reviewer"),
         ],
       );
@@ -1564,12 +1884,59 @@ describe("lean auto mode reliability", () => {
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(existsSync(marker)).toBe(false);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      // One review attempt: a first send plus one transport retry.
+      expect(gateway.classifierRequests).toHaveLength(2);
       expect(gateway.requests).toHaveLength(4);
       expect(JSON.parse(result.stdout).output).toContain("Unavailable review handled normally.");
       const trace = readFileSync(tracePath, "utf8");
       expect(trace.match(/event=auto_review_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_retry/g)).toHaveLength(1);
       expect(trace).toContain("fallback_reason=transport_transient");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a valid decision survives an oversized reviewer rationale",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "package-command.log");
+      const bin = installRecorder(root, "pnpm", marker);
+      const command = "pnpm dlx react-doctor@0.9.13";
+      const gateway = startGateway(
+        [
+          cleanCommandCall(command, "run_react_doctor"),
+          (body) => {
+            expect(toolResultText(body, "run_react_doctor")).toContain('"exit_code":0');
+            expect(body).not.toContain("review_unavailable");
+            return fakeGatewayFinalText("Reviewer metadata handled normally.");
+          },
+        ],
+        [
+          fakeGatewayToolCall("long_rationale_clear", "permission_decision", {
+            decision: "clear",
+            rationale: "x".repeat(512),
+          }),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run React Doctor."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(2);
+      expect(readFileSync(marker, "utf8")).toBe("pnpm:dlx react-doctor@0.9.13\n");
+      expect(JSON.parse(result.stdout).output).toContain("Reviewer metadata handled normally.");
     },
     TIMEOUT,
   );

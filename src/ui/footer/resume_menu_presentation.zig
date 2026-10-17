@@ -270,8 +270,8 @@ fn composeHeaderRow(alloc: Allocator, projection: SessionMenuProjection, width: 
     var wide: std.ArrayList(u8) = .empty;
     defer wide.deinit(alloc);
     try appendHeaderTitle(alloc, &wide, projection.filteredItemCount());
-    inline for (std.meta.fields(session_catalog.Scope)) |field| {
-        const scope: session_catalog.Scope = @enumFromInt(field.value);
+    inline for (@typeInfo(session_catalog.Scope).@"enum".field_values) |field_value| {
+        const scope: session_catalog.Scope = @fromBackingInt(@intCast(field_value));
         try wide.appendSlice(alloc, "  ");
         try appendScopeTab(alloc, &wide, scope, scope == projection.scope);
     }
@@ -290,7 +290,7 @@ fn composeHeaderRow(alloc: Allocator, projection: SessionMenuProjection, width: 
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Sessions {d}", .{count}) catch "Sessions";
+    const title = std.mem.print(&buf, "Sessions {d}", .{count}) catch "Sessions";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -317,11 +317,11 @@ const MetadataColumns = struct {
 };
 
 fn sessionWorkspaceLabel(summary: session_store.SessionSummary) []const u8 {
-    return std.fs.path.basename(session_catalog.workspacePath(summary));
+    return std.Io.Dir.path.basename(session_catalog.workspacePath(summary));
 }
 
 fn sessionTurnsText(buf: []u8, history_len: usize) []const u8 {
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "{d} {s}",
         .{ history_len, if (history_len == 1) "turn" else "turns" },
@@ -461,8 +461,8 @@ fn composeSelectionFailureRow(
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
     try row.appendSlice(alloc, ui_render.red_style);
     const message = switch (failure) {
-        .open_elsewhere => "This session is open in another fx. Close it there, then press Enter to retry.",
-        .being_updated => "This session is being updated. Wait a moment, then press Enter to retry.",
+        .open_elsewhere => "This session is open in another fx. Close it there, then press enter to retry.",
+        .being_updated => "This session is being updated. Wait a moment, then press enter to retry.",
         .unavailable => "Unable to resume this session.",
     };
     try row_text.appendSingleLineEllipsized(
@@ -617,11 +617,11 @@ test "resume menu explains retryable selected session contention" {
     }{
         .{
             .failure = .open_elsewhere,
-            .message = "This session is open in another fx. Close it there, then press Enter to retry.",
+            .message = "This session is open in another fx. Close it there, then press enter to retry.",
         },
         .{
             .failure = .being_updated,
-            .message = "This session is being updated. Wait a moment, then press Enter to retry.",
+            .message = "This session is being updated. Wait a moment, then press enter to retry.",
         },
         .{
             .failure = .unavailable,
@@ -673,7 +673,7 @@ test "resume menu keeps selected title and retry feedback in compact layouts" {
     try std.testing.expect(std.mem.find(u8, three_row_title.items, "Selected session") != null);
     var three_row_feedback = try composeSessionMenuRow(alloc, projection, 2, 100, 3);
     defer three_row_feedback.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, three_row_feedback.items, "press Enter to retry") != null);
+    try std.testing.expect(std.mem.find(u8, three_row_feedback.items, "press enter to retry") != null);
 
     var paged_projection = projection;
     paged_projection.has_more = true;
@@ -691,7 +691,7 @@ test "resume menu keeps selected title and retry feedback in compact layouts" {
         );
         defer paged_feedback.deinit(alloc);
         try std.testing.expect(
-            std.mem.find(u8, paged_feedback.items, "press Enter to retry") != null,
+            std.mem.find(u8, paged_feedback.items, "press enter to retry") != null,
         );
         var paged_title = try composeSessionMenuRow(
             alloc,

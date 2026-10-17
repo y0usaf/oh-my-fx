@@ -2,12 +2,33 @@ name: Benchmarks
 
 on:
   workflow_dispatch:
+    inputs:
+      long_turn_memory:
+        description: Run the long-turn memory benchmark
+        type: boolean
+        default: false
+      libfx_runtime:
+        description: Run the libfx runtime benchmark
+        type: boolean
+        default: false
+      signed_run:
+        description: Successful main Release validation run to compare (no signing credentials used)
+        type: string
+        default: ""
+      pgso_control_artifact:
+        description: Qualified main PGSO artifact ID
+        type: string
+        default: ""
+      pgso_candidate_artifact:
+        description: Qualified PR merge PGSO artifact ID
+        type: string
+        default: ""
   push:
     branches: [main]
   pull_request:
 
 concurrency:
-  group: bench-${{ github.ref }}
+  group: bench-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}${{ (inputs.pgso_control_artifact != '' || inputs.pgso_candidate_artifact != '') && '-pgso-artifacts' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -15,15 +36,18 @@ permissions:
 
 jobs:
   bench:
+    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: Startup Latency
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
+          cache-key: bench-ReleaseSafe
 
       - name: Build (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
@@ -41,7 +65,7 @@ jobs:
 
       - name: Run UI activity progress benchmark
         run: |
-          for run in 1 2 3; do
+          for _ in 1 2 3; do
             zig build run-bench-ui-activity -Doptimize=ReleaseSafe
           done
 
@@ -63,16 +87,97 @@ jobs:
           path: ${{ runner.temp }}/tui-performance.json
           if-no-files-found: warn
 
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  long-turn-memory:
+    if: github.event_name == 'workflow_dispatch' && inputs.long_turn_memory && inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    name: Long-turn memory
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        id: zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: bench-ReleaseSafe
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run long-turn memory benchmark
+        run: python3 benchmarks/long_turn_memory.py --binary ./zig-out/bin/fx --output ${{ runner.temp }}/long-turn-memory --steps 500 --limit-mib 1024 --timeout 480
+
+      - name: Enforce memory budget
+        run: jq -e '.completed == true and (.peak_rss_kib < 524288)' ${{ runner.temp }}/long-turn-memory/measurements.json
+
+      - name: Upload long-turn memory evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-turn-memory-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/long-turn-memory/measurements.json
+            ${{ runner.temp }}/long-turn-memory/stderr.log
+            ${{ runner.temp }}/long-turn-memory/stdout.json
+          if-no-files-found: warn
+
+  shell-command-overhead:
+    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    name: Shell command overhead
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: bench-ReleaseSafe
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run shell command overhead benchmark
+        run: python3 benchmarks/shell_command_overhead.py --binary ./zig-out/bin/fx --output ${{ runner.temp }}/shell-command-overhead --calls 100 --timeout 480
+
+      # The 60 ms per-call median budget is provisional, set from local macOS
+      # runs. Linux runners use bash as the login shell, so this job measures bash.
+      - name: Enforce shell command overhead budget
+        run: jq -e '.completed == true and .rc_loads == 1 and .per_call_ms.median <= 60 and .total_ms <= (.rc_delay_ms + 100*60 + 1000)' ${{ runner.temp }}/shell-command-overhead/measurements.json
+
+      - name: Upload shell command overhead evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-command-overhead-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/shell-command-overhead/measurements.json
+            ${{ runner.temp }}/shell-command-overhead/stderr.log
+            ${{ runner.temp }}/shell-command-overhead/stdout.json
+            ${{ runner.temp }}/shell-command-overhead/home/rc-loads.log
+          if-no-files-found: warn
+
   libfx-ttft:
-    name: libfx TTFT (report only)
+    if: github.event_name == 'workflow_dispatch' && inputs.libfx_runtime && inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    name: libfx Runtime
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
+          cache-key: bench-ReleaseSafe
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -82,7 +187,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.2"
 
       - name: Build libfx artifacts
         run: |
@@ -92,17 +197,216 @@ jobs:
       - name: Install pinned Pi benchmark target
         run: npm install --prefix /tmp/libfx-pi @earendil-works/pi-coding-agent@0.84.4
 
+      - name: Build external inference fixture
+        run: zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=${{ runner.temp }}/libfx-fake-inference-server
+
       - name: Measure libfx and Pi
         run: |
-          node benchmarks/libfx/bench-suite.mjs --samples 20 --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
-          node benchmarks/libfx/bench-bridge.mjs --backend native --samples 20 > benchmarks/results/libfx/bridge-node-native.json
-          node --experimental-wasm-jspi benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 20 > benchmarks/results/libfx/bridge-node-wasm.json
-          bun benchmarks/libfx/bench-bridge.mjs --backend native --samples 20 > benchmarks/results/libfx/bridge-bun-native.json
-          bun benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 20 > benchmarks/results/libfx/bridge-bun-wasm.json
+          node benchmarks/libfx/bench-suite.mjs --samples 100 --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
+          node benchmarks/libfx/bench-bridge.mjs --backend native --samples 100 > benchmarks/results/libfx/bridge-node-native.json
+          node --experimental-wasm-jspi benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 100 > benchmarks/results/libfx/bridge-node-wasm.json
+          bun benchmarks/libfx/bench-bridge.mjs --backend native --samples 100 > benchmarks/results/libfx/bridge-bun-native.json
+          bun benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 100 > benchmarks/results/libfx/bridge-bun-wasm.json
+          node benchmarks/libfx/bench-runtime.mjs --backend native --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-node-native.json
+          node --experimental-wasm-jspi benchmarks/libfx/bench-runtime.mjs --backend wasm --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-node-wasm.json
+          bun benchmarks/libfx/bench-runtime.mjs --backend native --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-bun-native.json
+          bun benchmarks/libfx/bench-runtime.mjs --backend wasm --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-bun-wasm.json
+          node --expose-gc benchmarks/libfx/bench-capacity.mjs --backend native --count 25 > benchmarks/results/libfx/capacity-node-native.json
+          node --experimental-wasm-jspi --expose-gc benchmarks/libfx/bench-capacity.mjs --backend wasm --count 25 > benchmarks/results/libfx/capacity-node-wasm.json
+          bun benchmarks/libfx/bench-capacity.mjs --backend native --count 25 > benchmarks/results/libfx/capacity-bun-native.json
+          bun benchmarks/libfx/bench-capacity.mjs --backend wasm --count 25 > benchmarks/results/libfx/capacity-bun-wasm.json
+          node benchmarks/libfx/bench-competitive.mjs --server ${{ runner.temp }}/libfx-fake-inference-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx --samples 100 --warmups 3 --rounds 3
+
+      - name: Enforce deterministic libfx contracts
+        run: node benchmarks/libfx/check-results.mjs --dir benchmarks/results/libfx
 
       - name: Upload raw libfx TTFT samples
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: libfx-ttft-${{ github.sha }}
           path: benchmarks/results/libfx/*.json
           if-no-files-found: error
+
+  signed-macos:
+    name: Signed macOS comparison
+    if: github.event_name == 'workflow_dispatch' && inputs.signed_run != '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download a successful main validation pair
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED_RUN: ${{ inputs.signed_run }}
+        run: |
+          [[ "$SIGNED_RUN" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SIGNED_RUN" > "$RUNNER_TEMP/signed-source.json"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .conclusion == "success" and .head_branch == "main" and
+            .event == "workflow_dispatch" and .path == ".github/workflows/release.yml" and
+            .head_repository.full_name == $repo
+          ' "$RUNNER_TEMP/signed-source.json"
+          gh run download "$SIGNED_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name fx-macos-aarch64 --name signing-control-macos-arm64 \
+            --dir "$RUNNER_TEMP/signed-input"
+          mkdir -p "$RUNNER_TEMP/signed-control" "$RUNNER_TEMP/signed-candidate"
+          tar -xzf "$RUNNER_TEMP/signed-input/signing-control-macos-arm64/fx-signing-control.tar.gz" -C "$RUNNER_TEMP/signed-control" fx
+          tar -xzf "$RUNNER_TEMP/signed-input/fx-macos-aarch64/fx-macos-aarch64.tar.gz" -C "$RUNNER_TEMP/signed-candidate" fx
+
+      - name: Install measurement tools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          command -v hyperfine >/dev/null || brew install hyperfine
+          xcrun clang -O2 benchmarks/signed_macos_resources.c -o "$RUNNER_TEMP/signed-resources"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Compare signed startup
+        run: |
+          python3 -m scripts.compare_signed_macos \
+            --control "$RUNNER_TEMP/signed-control/fx" \
+            --candidate "$RUNNER_TEMP/signed-candidate/fx" \
+            --source-sha "$(jq -r .head_sha "$RUNNER_TEMP/signed-source.json")" \
+            --output "$RUNNER_TEMP/signed-comparison"
+
+      - name: Compare native image-flow memory
+        env:
+          FX_SIGNED_COMPARE_DIR: ${{ runner.temp }}/signed-comparison
+          FX_SIGNED_RESOURCE_PROBE: ${{ runner.temp }}/signed-resources
+        run: bun test benchmarks/signed_macos_memory.test.ts
+
+      - name: Retain paired measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-macos-comparison-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/signed-comparison/manifest.json
+            ${{ runner.temp }}/signed-comparison/startup-*.json
+            ${{ runner.temp }}/signed-comparison/startup-*/logs/
+            ${{ runner.temp }}/signed-comparison/memory-*.json
+            ${{ runner.temp }}/signed-source.json
+          if-no-files-found: error
+
+  pgso-artifacts:
+    name: PGSO artifact comparison
+    if: github.event_name == 'workflow_dispatch' && (inputs.pgso_control_artifact != '' || inputs.pgso_candidate_artifact != '')
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    env:
+      FX_E2E_DISABLE_DOTENV: "1"
+      FX_SOUND: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set comparison directories
+        run: |
+          echo "FX_PGSO_COMPARE_INPUT=$RUNNER_TEMP/pgso-input" >> "$GITHUB_ENV"
+          echo "FX_PGSO_COMPARE_OUTPUT=$RUNNER_TEMP/pgso-comparison" >> "$GITHUB_ENV"
+
+      - name: Resolve immutable qualified artifacts
+        id: artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_ARTIFACT: ${{ inputs.pgso_control_artifact }}
+          CANDIDATE_ARTIFACT: ${{ inputs.pgso_candidate_artifact }}
+          SIGNED_RUN: ${{ inputs.signed_run }}
+        run: |
+          test -z "$SIGNED_RUN"
+          [[ "$CONTROL_ARTIFACT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_ARTIFACT" =~ ^[1-9][0-9]*$ ]]
+          test "$CONTROL_ARTIFACT" != "$CANDIDATE_ARTIFACT"
+          mkdir -p "$FX_PGSO_COMPARE_INPUT"
+          for lane in control candidate; do
+            artifact_id="$CONTROL_ARTIFACT"
+            if [[ "$lane" == candidate ]]; then artifact_id="$CANDIDATE_ARTIFACT"; fi
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" > "$FX_PGSO_COMPARE_INPUT/$lane-artifact.json"
+            jq -e --argjson id "$artifact_id" '
+              .id == $id and .expired == false and .size_in_bytes > 0 and
+              .size_in_bytes <= 67108864 and
+              (.name | test("^pgso-evidence-macos-arm64-[a-f0-9]{40}(-attempt-[1-9][0-9]*)?$"))
+            ' "$FX_PGSO_COMPARE_INPUT/$lane-artifact.json"
+            run_id=$(jq -er .workflow_run.id "$FX_PGSO_COMPARE_INPUT/$lane-artifact.json")
+            [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$FX_PGSO_COMPARE_INPUT/$lane-run.json"
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg lane "$lane" '
+              .status == "completed" and .conclusion == "success" and
+              (.path == ".github/workflows/pgso-macos-arm64.yml" or
+                ($lane == "control" and .path == ".github/workflows/release.yml" and
+                  .head_branch == "main" and (.event == "push" or .event == "workflow_dispatch"))) and
+              .repository.full_name == $repo and .head_repository.full_name == $repo
+            ' "$FX_PGSO_COMPARE_INPUT/$lane-run.json"
+            echo "${lane}_run=$run_id" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Download control by artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.artifacts.outputs.control_run }}
+          artifact-ids: ${{ inputs.pgso_control_artifact }}
+          merge-multiple: true
+          path: ${{ env.FX_PGSO_COMPARE_INPUT }}/control
+
+      - name: Download candidate by artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.artifacts.outputs.candidate_run }}
+          artifact-ids: ${{ inputs.pgso_candidate_artifact }}
+          merge-multiple: true
+          path: ${{ env.FX_PGSO_COMPARE_INPUT }}/candidate
+
+      - name: Retain source commit relationships
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for lane in control candidate; do
+            source_sha=$(jq -er .evidence.identity.source_sha "$FX_PGSO_COMPARE_INPUT/$lane/manifest.json")
+            [[ "$source_sha" =~ ^[a-f0-9]{40}$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$source_sha" > "$FX_PGSO_COMPARE_INPUT/$lane-source.json"
+          done
+          if jq -e '.event == "workflow_dispatch"' "$FX_PGSO_COMPARE_INPUT/candidate-run.json" > /dev/null; then
+            control_sha=$(jq -er .sha "$FX_PGSO_COMPARE_INPUT/control-source.json")
+            candidate_sha=$(jq -er .sha "$FX_PGSO_COMPARE_INPUT/candidate-source.json")
+            gh api "repos/$GITHUB_REPOSITORY/compare/$control_sha...$candidate_sha" --jq '
+              {status, ahead_by, behind_by, total_commits,
+               base_commit: {sha: .base_commit.sha}, merge_base_commit: {sha: .merge_base_commit.sha},
+               commits: [.commits[] | {sha}]}
+            ' > "$FX_PGSO_COMPARE_INPUT/candidate-ancestry.json"
+          fi
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Compare calibrated native memory and latency
+        run: |
+          bun test --max-concurrency=1 benchmarks/pgso_artifacts.test.ts
+          jq -e '.status == "passed" and (.cohorts | length == 5) and all(.cohorts[]; .passed)' "$FX_PGSO_COMPARE_OUTPUT/results.json"
+
+      - name: Retain complete comparison evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pgso-artifact-comparison-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ env.FX_PGSO_COMPARE_INPUT }}/*.json
+            ${{ env.FX_PGSO_COMPARE_OUTPUT }}/*.json
+            ${{ env.FX_PGSO_COMPARE_OUTPUT }}/*/samples.json
+            ${{ env.FX_PGSO_COMPARE_OUTPUT }}/*/*/*.json
+          if-no-files-found: error
+          retention-days: 14

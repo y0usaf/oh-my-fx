@@ -13,6 +13,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, platform, tmpdir } from "node:os";
@@ -28,8 +29,25 @@ import {
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   startFakeGateway,
 } from "./tmux-helpers";
+import {
+  codexBreakdownBody,
+  codexProfileBody,
+  codexUsageBody,
+  DAY_MS,
+  grokBillingBody,
+  grokSettingsBody,
+  type ReportRow,
+  USAGE_NOW_MS,
+  usageEnv,
+  usageFake,
+  utcDate,
+  writeChatGptLogin,
+  writeGrokLogin,
+  writeUsageClock,
+} from "./usage-fakes";
 
 const TIMEOUT = 15_000;
 const NO_GATEWAY_AUTH = {
@@ -246,6 +264,70 @@ function writeLegacySession(
   );
 }
 
+function writeConversationSession(
+  home: string,
+  workspaceRoot: string,
+  sessionId: string,
+  opts: {
+    createdAtMs?: number;
+    updatedAtMs?: number;
+    title?: string | null;
+    conversationLanguage?: string;
+    turns?: string[];
+  } = {},
+): void {
+  const sessionDir = join(home, ".fx", "sessions", sessionId);
+  mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  chmodSync(join(home, ".fx"), 0o700);
+  chmodSync(join(home, ".fx", "sessions"), 0o700);
+  chmodSync(sessionDir, 0o700);
+  writeFileSync(
+    join(sessionDir, "session.json"),
+    JSON.stringify({
+      schema_version: 4,
+      id: sessionId,
+      origin_workspace_root: workspaceRoot,
+      workspace_root: workspaceRoot,
+      created_at_ms: opts.createdAtMs ?? 1,
+      updated_at_ms: opts.updatedAtMs ?? 2,
+      conversation_language: opts.conversationLanguage ?? "en",
+      provider: "gateway",
+      model: FAKE_GATEWAY_MODEL,
+      effort: "auto",
+      fast_mode: false,
+      title: opts.title ?? null,
+      subagent_child: false,
+    }) + "\n",
+    { mode: 0o600 },
+  );
+
+  let seq = 0;
+  const frames: string[] = [];
+  for (const text of opts.turns ?? []) {
+    const append = (event: object): void => {
+      seq += 1;
+      frames.push(JSON.stringify({
+        schema_version: 1,
+        seq,
+        timestamp_ms: opts.updatedAtMs ?? 2,
+        event,
+      }));
+    };
+    append({ user: { text, images: [], work_id: null } });
+    append({ assistant: { text: "done" } });
+    append({ turn_completed: {} });
+  }
+  const eventsPath = join(sessionDir, "events.jsonl");
+  writeFileSync(
+    eventsPath,
+    frames.length > 0 ? `${frames.join("\n")}\n` : "",
+    { mode: 0o600 },
+  );
+  const updatedSeconds = (opts.updatedAtMs ?? 2) / 1000;
+  utimesSync(eventsPath, updatedSeconds, updatedSeconds);
+  writeFileSync(join(sessionDir, "session.lock"), "", { mode: 0o600 });
+}
+
 describe("cli: help", () => {
   test(
     "top-level help aliases render the same accurate navigation page",
@@ -317,26 +399,38 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
-  --auto                Automatically review unresolved permission requests
-  --yolo                Disable fx permission checks
-  --image PATH          Attach an image file; repeat for multiple images
-  --system TEXT         Replace the built-in system prompt for this request
-  --json                Emit machine-readable JSON instead of text
-  --quiet               Suppress assistant output
-  --prompt-permissions  Prompt for Y/N permission approval when stdin is a TTY
-  --no-save             Do not save the session; incompatible with --resume and --resume-id
-  --no-color            Render TTY output without colors or hyperlinks
-  --resume <last|id>    Continue the last session or a session by id
-  --resume-id <id>      Continue a session by exact id
-  --continue-recovery   Resume the paused model response in the selected session
-  --                    Treat every following argument as prompt text
+  --auto                      Automatically review unresolved permission requests
+  --full-access               Disable fx permission checks
+  --yolo                      Alias for --full-access
+  --model <id>                Override the model for this request
+  --effort <level>            Override the reasoning effort for this request
+  --fast                      Enable Fast mode for this request when the model supports it
+  --no-fast                   Disable Fast mode for this request
+  --ultrafast                 Request Ultra mode for this request when the model supports it
+  --no-ultrafast              Disable Ultra mode for this request
+  --provider-order <a,b,...>  Prefer these gateway providers in order for this request
+  --provider-strict           Restrict this request to only the providers in --provider-order
+  --no-provider-strict        Clear the provider restriction for this request
+  --image PATH                Attach an image file; repeat for multiple images
+  --system TEXT               Replace the built-in system prompt for this request
+  --json                      Emit machine-readable JSON instead of text
+  --quiet                     Suppress assistant output
+  --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
+  --no-save                   Do not save the session; incompatible with --resume and --resume-id
+  --sessions-v2               Use the experimental v2 session store, also set by FX_SESSIONS_V2=1; its sessions resume only with it
+  --no-color                  Render TTY output without colors or hyperlinks
+  --resume <last|id>          Continue the last session or a session by id
+  --resume-id <id>            Continue a session by exact id
+  --continue-recovery         Resume the paused model response in the selected session
+  --                          Treat every following argument as prompt text
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
+JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Nested usage and dollar spend are excluded.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -379,9 +473,11 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--model <id>] [--log-file <path>]",
+          "Usage:\n  fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
+        expect(r.stdout).toContain("--ultrafast");
+        expect(r.stdout).toContain("--no-ultrafast");
         expect(r.stdout).toContain("--log-file <path>");
       }
     },
@@ -409,7 +505,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--log-file <path>]\n",
+          "usage: fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n",
         );
       }
     },
@@ -629,6 +725,136 @@ describe("cli: status", () => {
     TIMEOUT,
   );
 
+  for (const scenario of [
+    { name: "automatic Gateway", provider: "gateway", source: undefined, help: MISSING_AUTH_MESSAGE },
+    { name: "Gateway with a stale Codex preference", provider: "gateway", source: "chatgpt_subscription", help: MISSING_AUTH_MESSAGE },
+    { name: "Gateway with a stale Grok preference", provider: "gateway", source: "grok_subscription", help: MISSING_AUTH_MESSAGE },
+    { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected." },
+    { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected." },
+    { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected." },
+    { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected." },
+    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex." },
+    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok." },
+  ]) {
+    test(
+      `status and doctor respect ${scenario.name} when credentials are missing`,
+      async () => {
+        const root = mkdtempSync(join(tmpdir(), "fx-e2e-provider-diagnostics-"));
+        try {
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          mkdirSync(join(home, ".fx"), { recursive: true });
+          mkdirSync(workspace);
+          const settingsPath = join(home, ".fx", "settings.json");
+          const settings = JSON.stringify({
+            provider: scenario.provider,
+            models: { [scenario.provider]: "test-model" },
+            credential_source: scenario.source,
+          });
+          writeFileSync(settingsPath, settings);
+          const options = {
+            cwd: realpathSync(workspace),
+            env: { ...NO_GATEWAY_AUTH, HOME: realpathSync(home), FX_DISABLE_KEYCHAIN: "1" },
+          };
+
+          for (const command of ["status", "doctor"]) {
+            const text = await runFx([command], options);
+            const json = await runFx([command, "--json"], options);
+            expect(text.code).toBe(0);
+            expect(json.code).toBe(0);
+            expect(text.stderr).toBe("");
+            expect(json.stderr).toBe("");
+            expect(text.stdout).toContain(scenario.help);
+            const value = JSON.parse(json.stdout);
+            expect(value.auth).toBe("missing");
+            expect(value.auth_refreshable).toBe(false);
+            if (command === "status") {
+              expect(value.auth_help).toBe(scenario.help);
+            } else {
+              expect(value.checks).toContainEqual({
+                name: "auth", status: "fail", detail: scenario.help,
+              });
+            }
+          }
+
+          const ask = await runFx(["ask", "--json", "--no-save", "Say hello."], options);
+          expect(ask.code).toBe(1);
+          expect(JSON.parse(ask.stdout).error).toBe("MissingCredentials");
+          expect(ask.stderr).toContain(scenario.help);
+          expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
+  test("fresh and resumed asks retain an unavailable exact login with an environment key", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-ask-exact-source-"));
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("SESSION_SEEDED"),
+      fakeGatewayFinalText("AUTOMATIC_KEY_WORKS"),
+    ]);
+    try {
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      const settingsPath = join(home, ".fx", "settings.json");
+      const settings = { provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL } };
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      const options = {
+        cwd: realpathSync(workspace),
+        env: {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "exact-source-control-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        },
+      };
+      const seeded = await runFx(["ask", "--json", "Create a short greeting."], options);
+      expect(seeded.code).toBe(0);
+      const sessionId = JSON.parse(seeded.stdout).session_id;
+      expect(sessionId.length).toBeGreaterThan(0);
+      expect(gateway.requests).toHaveLength(1);
+
+      const pinned = JSON.stringify({ ...settings, credential_source: "fx_login" });
+      writeFileSync(settingsPath, pinned);
+      const status = await runFx(["status", "--json"], options);
+      const help = JSON.parse(status.stdout).auth_help;
+      expect(help).toContain("fx login is selected but unavailable");
+      for (const resumed of [false, true]) {
+        for (const json of [false, true]) {
+          const result = await runFx([
+            "ask", ...(json ? ["--json"] : []),
+            ...(resumed ? ["--resume-id", sessionId] : ["--no-save"]),
+            "Continue with a greeting.",
+          ], options);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain(help);
+          expect(result.stderr).not.toContain("set AI_GATEWAY_API_KEY");
+          if (json) expect(JSON.parse(result.stdout).error).toBe("MissingCredentials");
+          expect(readFileSync(settingsPath, "utf8")).toBe(pinned);
+          expect(gateway.requests).toHaveLength(1);
+        }
+      }
+
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      const automatic = await runFx(["ask", "--json", "--no-save", "Give a greeting."], options);
+      expect(automatic.code).toBe(0);
+      expect(JSON.parse(automatic.stdout).output).toContain("AUTOMATIC_KEY_WORKS");
+      expect(gateway.requests).toHaveLength(2);
+    } finally {
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   test(
     "status and doctor share fx login source, team, and refreshability",
     async () => {
@@ -804,6 +1030,45 @@ describe("cli: status", () => {
           update_channel: "dev",
           build_channel: "stable",
         });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx status reports the effort a new session starts with, workspace override first",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-effort-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const elsewhere = join(root, "elsewhere");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        mkdirSync(elsewhere);
+        const env = { ...NO_GATEWAY_AUTH, HOME: home };
+
+        const unset = await runFx(["status", "--json"], { cwd: realpathSync(elsewhere), env });
+        expect(unset.code).toBe(0);
+        expect(JSON.parse(unset.stdout.trim()).effort).toBe("auto");
+
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          JSON.stringify({ effort: "xhigh", workspaces: { [realpathSync(workspace)]: { effort: "low" } } }) + "\n",
+          { mode: 0o600 },
+        );
+        const inWorkspace = await runFx(["status", "--json"], { cwd: realpathSync(workspace), env });
+        const global = await runFx(["status", "--json"], { cwd: realpathSync(elsewhere), env });
+        const text = await runFx(["status"], { cwd: realpathSync(elsewhere), env });
+        for (const result of [inWorkspace, global, text]) {
+          expect(result.code).toBe(0);
+          expect(result.stderr).toBe("");
+        }
+        expect(JSON.parse(inWorkspace.stdout.trim()).effort).toBe("low");
+        expect(JSON.parse(global.stdout.trim()).effort).toBe("xhigh");
+        expect(text.stdout).toContain("[status] effort=xhigh\n");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -1035,331 +1300,279 @@ describe("cli: status", () => {
 });
 
 describe("cli: usage", () => {
-  test(
-    "fx usage reads rolling local facts without credentials or profile mutation",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        const now = Date.now();
-        const records = [
-          {
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 60 * 60 * 1000,
-              model: "provider/a",
-              input_tokens: 15,
-              output_tokens: 3,
-              cache_read_tokens: 5,
-              cache_write_tokens: 1,
-              reasoning_tokens: 2,
-              total_cost: 0.25,
-            },
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
-              created_at_ms: now - 2 * 24 * 60 * 60 * 1000,
-              model: "provider/b",
-              input_tokens: 10,
-              output_tokens: 2,
-              cache_read_tokens: 0,
-              cache_write_tokens: 0,
-              reasoning_tokens: null,
-              total_cost: 0.1,
-            },
-          },
-        ];
-        const usagePath = join(fxDir, "usage.jsonl");
-        writeFileSync(
-          usagePath,
-          records.map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        chmodSync(usagePath, 0o600);
-        const before = readFileSync(usagePath, "utf8");
-        const entriesBefore = readdirSync(fxDir).sort();
-        const env = {
-          ...NO_GATEWAY_AUTH,
-          HOME: realpathSync(home),
-          FX_DISABLE_KEYCHAIN: "1",
-        };
+  const today = utcDate(USAGE_NOW_MS);
+  const reportRow = (start: string, end: string): ReportRow[] => {
+    if (start === today) {
+      return [{ model: "provider/a", request_count: 2, input_tokens: 10, output_tokens: 5, total_cost: 0.5 }];
+    }
+    if (end !== utcDate(USAGE_NOW_MS - DAY_MS)) return [];
+    // The month's finished days add a second model on top of the week's.
+    return start === "2026-10-01"
+      ? [
+        { model: "provider/b", request_count: 4, input_tokens: 40, output_tokens: 8, total_cost: 2 },
+        { model: "provider/a", request_count: 1, input_tokens: 4, output_tokens: 1, total_cost: 0.25 },
+      ]
+      : [{ model: "provider/a", request_count: 1, input_tokens: 4, output_tokens: 1, total_cost: 0.25 }];
+  };
 
+  function usageFixture(prefix: string, options: Parameters<typeof usageFake>[0] = {}) {
+    const root = mkdtempSync(join(tmpdir(), prefix));
+    const home = join(root, "home");
+    mkdirSync(home);
+    const clock = join(root, "clock");
+    writeUsageClock(clock, USAGE_NOW_MS);
+    const fake = usageFake({ report: reportRow, ...options });
+    const gateway = startFakeGateway([], { usage: fake.handler });
+    const env = {
+      ...NO_GATEWAY_AUTH,
+      ...usageEnv(gateway.baseUrl, clock),
+      HOME: realpathSync(home),
+    };
+    return {
+      root,
+      home,
+      clock,
+      fake,
+      gateway,
+      env,
+      stop() {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      },
+    };
+  }
+
+  test(
+    "fx usage without a sign-in says so, reads nothing, and leaves the profile alone",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-none-");
+      try {
+        const text = await runFx(["usage"], { env: fixture.env });
+        expect(text.code).toBe(1);
+        expect(text.stdout).toContain("Usage needs an AI Gateway sign-in: run fx login or set an API key.");
+        const json = await runFx(["usage", "--json"], { env: fixture.env });
+        expect(json.code).toBe(1);
+        expect(JSON.parse(json.stdout)).toMatchObject({
+          kind: "usage",
+          schema_version: 2,
+          source: "ai_gateway",
+          status: "unavailable",
+          reason: "no_gateway_sign_in",
+        });
+        expect(fixture.fake.requests).toEqual([]);
+        expect(readdirSync(fixture.home)).toEqual([]);
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage reads an API key's spend from AI Gateway and fetches finished days once a day",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-key-");
+      const env = { ...fixture.env, AI_GATEWAY_API_KEY: "e2e-usage-key" };
+      try {
+        const month = await runFx(["usage", "--json"], { env });
+        expect(month.code).toBe(0);
+        expect(month.stderr).toBe("");
+        const report = JSON.parse(month.stdout);
+        expect(report).toMatchObject({
+          source: "ai_gateway",
+          period: "month",
+          status: "ready",
+          reason: null,
+          budget: null,
+          totals: { request_count: 7, input_tokens: 54, output_tokens: 14 },
+        });
+        expect(report.totals.spend).toBeCloseTo(2.75, 6);
+        expect(report.models.map((row: { model: string }) => row.model)).toEqual(["provider/b", "provider/a"]);
+        expect(fixture.fake.reportRanges()).toEqual([
+          `${today}..${today}`,
+          "2026-10-06..2026-10-11",
+          "2026-10-01..2026-10-11",
+        ]);
+        for (const request of fixture.fake.requests) {
+          expect(request.authorization).toBe("Bearer e2e-usage-key");
+          expect(request.query.get("api_key_id")).toBe("self");
+          expect(request.query.get("group_by")).toBe("model");
+        }
+
+        // Later the same day only today is read again; the cache answers the rest.
+        const week = await runFx(["usage", "--period", "7d"], { env });
+        expect(week.code).toBe(0);
+        expect(week.stderr).toBe("");
+        expect(week.stdout).toContain("Usage (7d, UTC) from AI Gateway");
+        expect(week.stdout).toContain("Requests      3");
+        expect(week.stdout).toContain("- provider/a  $0.7500  3 requests  20 tokens");
+        expect(fixture.fake.reportRanges().slice(3)).toEqual([`${today}..${today}`]);
+
+        // A new UTC day reads its finished days again.
+        writeUsageClock(fixture.clock, USAGE_NOW_MS + DAY_MS);
+        const next = await runFx(["usage", "--json", "--period", "today"], { env });
+        expect(next.code).toBe(0);
+        expect(fixture.fake.reportRanges().slice(4)).toEqual([
+          "2026-10-13..2026-10-13",
+          "2026-10-07..2026-10-12",
+          "2026-10-01..2026-10-12",
+        ]);
+        const output = month.stdout + week.stdout + next.stdout;
+        expect(output).not.toContain("e2e-usage-key");
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage with fx login reads the member's team spend and budget",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-member-", {
+        budget: {
+          users: [{ budget: { limitAmount: 50, currentSpend: 12, refreshPeriod: "monthly" } }],
+        },
+      });
+      writeSeededFxAuth(fixture.home, "team_e2e", fixture.gateway.baseUrl);
+      const env = { ...fixture.env, FX_E2E_OAUTH_ISSUER_URL: fixture.gateway.baseUrl };
+      try {
+        const json = await runFx(["usage", "--json"], { env });
+        expect(json.code).toBe(0);
+        expect(json.stderr).toBe("");
+        expect(JSON.parse(json.stdout)).toMatchObject({
+          status: "ready",
+          budget: { limit: 50, spent: 12, period: "monthly" },
+        });
+        const reports = fixture.fake.requests.filter((request) => request.path === "/v1/report");
+        expect(reports).toHaveLength(3);
+        for (const request of reports) {
+          expect(request.authorization).toBe(`Bearer ${SEEDED_GATEWAY_TOKEN}`);
+          expect(request.team).toBe("team_e2e");
+          expect(request.query.get("metered_scope")).toBe("user");
+        }
+        const budget = fixture.fake.requests.find((request) => request.path === "/ai-gateway/usage-report");
+        expect(budget?.query.get("teamId")).toBe("team_e2e");
+        expect(budget?.query.get("scope")).toBe("user");
+
+        const text = await runFx(["usage"], { env });
+        expect(text.code).toBe(0);
+        expect(text.stdout).toContain("Budget        $12.00 of $50.00 this month");
+        expect(text.stdout).not.toContain(SEEDED_GATEWAY_TOKEN);
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage keeps the last numbers when AI Gateway refuses the sign-in",
+    async () => {
+      let refuse = false;
+      const fixture = usageFixture("fx-e2e-usage-refused-", {
+        report: (start, end) =>
+          refuse ? new Response("unauthorized", { status: 401 }) : reportRow(start, end),
+      });
+      const env = { ...fixture.env, AI_GATEWAY_API_KEY: "e2e-usage-key" };
+      try {
+        expect((await runFx(["usage", "--json"], { env })).code).toBe(0);
+        refuse = true;
+        // Past the one-minute floor, so the second process fetches again.
+        writeUsageClock(fixture.clock, USAGE_NOW_MS + 2 * 60 * 1000);
+        const json = await runFx(["usage", "--json"], { env });
+        expect(json.code).toBe(1);
+        const report = JSON.parse(json.stdout);
+        expect(report).toMatchObject({ status: "failed", reason: "refused" });
+        expect(report.totals.request_count).toBe(7);
+        const text = await runFx(["usage"], { env });
+        expect(text.stdout).toContain("Refresh failed: AI Gateway refused this sign-in.");
+        expect(text.stdout).toContain("Requests      7");
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage with Codex reads the ChatGPT plan's limits and activity",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-codex-", {
+        codex: {
+          usage: codexUsageBody(),
+          profile: codexProfileBody(),
+          breakdown: codexBreakdownBody(),
+        },
+      });
+      writeChatGptLogin(fixture.home, "acct_e2e");
+      // Times show in the local zone, fixed here at five and a half hours east of UTC.
+      const env = { ...fixture.env, FX_PROVIDER: "codex", FX_MODEL: "codex-e2e-model", TZ: "IST-5:30" };
+      try {
+        const text = await runFx(["usage", "--period", "today"], { env });
+        expect(text.code).toBe(0);
+        expect(text.stderr).toBe("");
+        expect(text.stdout).toContain("Codex usage from ChatGPT for samdoe, updated 21:00 IST");
+        expect(text.stdout).toContain("Tokens        40000 today, 100000 7d, 100000 month, 9000000 lifetime");
+        expect(text.stdout).toContain("Share by model (today): gpt-e2e-large fast 70.0%, gpt-e2e-small standard 30.0%");
+        expect(text.stdout).toContain("Plan          pro");
+        expect(text.stdout).toContain("Credits       12.40");
+        expect(text.stdout).toContain("- codex (5h window): 42% used, resets 23:00 IST");
+        expect(text.stdout).toContain("- codex (168h window): 18% used");
+        const paths = fixture.fake.requests.map((request) => request.path).sort();
+        expect(paths).toEqual([
+          "/backend-api/wham/profiles/me",
+          "/backend-api/wham/usage",
+          "/backend-api/wham/usage/daily-token-usage-breakdown",
+        ]);
+        for (const request of fixture.fake.requests) {
+          expect(request.chatgptAccount).toBe("acct_e2e");
+          expect(request.authorization?.startsWith("Bearer header.")).toBe(true);
+        }
+        expect(fixture.fake.reportRanges()).toEqual([]);
+
+        const json = await runFx(["usage", "--json"], { env });
+        expect(JSON.parse(json.stdout)).toMatchObject({
+          source: "chatgpt",
+          status: "ready",
+          codex: { plan: "pro" },
+        });
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage with Grok reads the plan's allowance and credits",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-grok-", {
+        grok: { billing: grokBillingBody(), settings: grokSettingsBody() },
+      });
+      writeGrokLogin(fixture.home, "acct_grok_e2e");
+      // Times show in the local zone; five and a half hours east, the reset moves to the next day.
+      const env = { ...fixture.env, FX_PROVIDER: "grok", FX_MODEL: "grok-4.20", TZ: "IST-5:30" };
+      try {
         const text = await runFx(["usage"], { env });
         expect(text.code).toBe(0);
         expect(text.stderr).toBe("");
-        expect(text.stdout).toContain("Usage (30 days)");
-        expect(text.stdout).toContain("Total tokens  30");
-        expect(text.stdout.indexOf("provider/a")).toBeLessThan(
-          text.stdout.indexOf("provider/b"),
-        );
-
-        const json = await runFx(
-          ["usage", "--json", "--period", "24h"],
-          { env },
-        );
-        expect(json.code).toBe(0);
-        expect(json.stderr).toBe("");
-        const report = JSON.parse(json.stdout);
-        expect(report).toMatchObject({
-          kind: "usage",
-          schema_version: 1,
-          period: "24h",
-          completeness: "complete",
-          totals: {
-            total_tokens: 18,
-            input_tokens: 15,
-            output_tokens: 3,
-            request_count: 1,
-          },
-        });
-        expect(report.models.map((model: { model: string }) => model.model))
-          .toEqual(["provider/a"]);
-        expect(readFileSync(usagePath, "utf8")).toBe(before);
-        expect(readdirSync(fxDir).sort()).toEqual(entriesBefore);
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage preserves known totals when the ledger is incomplete",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-incomplete-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        const now = Date.now();
-        const records = [
-          {
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 2,
-              model: "provider/model",
-              input_tokens: 4,
-              output_tokens: 2,
-              cache_read_tokens: 0,
-              cache_write_tokens: 0,
-              reasoning_tokens: 1,
-              total_cost: 0.01,
-            },
-          },
-          {
-            schema_version: 1,
-            kind: "incident",
-            occurred_at_ms: now - 1,
-            completeness: "incomplete",
-          },
-        ];
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          records.map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const env = {
-          ...NO_GATEWAY_AUTH,
-          HOME: realpathSync(home),
-          FX_DISABLE_KEYCHAIN: "1",
-        };
-
-        const text = await runFx(["usage"], { env });
-        expect(text.code).toBe(0);
-        expect(text.stdout).toContain("Known totals may be incomplete.");
-        expect(text.stdout).toContain("Total tokens  6");
+        expect(text.stdout).toContain("Grok usage from xAI, updated 21:00 IST");
+        expect(text.stdout).toContain("Plan          SuperGrok Heavy");
+        expect(text.stdout).toContain("Used          63% of the weekly allowance, resets Oct 15, 2026 02:00 IST");
+        expect(text.stdout).toContain("Credits       $12.50");
+        expect(text.stdout).toContain("Pay as you go $3.00 of $100.00 this month");
+        expect(fixture.fake.requests.map((request) => request.path).sort()).toEqual(["/billing", "/settings"]);
+        for (const request of fixture.fake.requests) {
+          expect(request.grokUser).toBe("acct_grok_e2e");
+        }
+        expect(fixture.fake.requests.find((request) => request.path === "/billing")?.query.get("format"))
+          .toBe("credits");
 
         const json = await runFx(["usage", "--json"], { env });
-        expect(json.code).toBe(0);
-        expect(JSON.parse(json.stdout)).toMatchObject({
-          completeness: "incomplete",
-          totals: { total_tokens: 6, spend: 0.01 },
-        });
+        expect(JSON.parse(json.stdout)).toMatchObject({ source: "grok", status: "ready" });
       } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage distinguishes empty, invalid, corrupt, and unsafe local state",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-states-"));
-      try {
-        const home = realpathSync(root);
-        const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
-        const empty = await runFx(["usage", "--json"], { env });
-        expect(empty.code).toBe(0);
-        expect(JSON.parse(empty.stdout)).toMatchObject({
-          coverage: { status: "not_started" },
-          totals: null,
-        });
-        expect(existsSync(join(home, ".fx"))).toBe(false);
-
-        const invalid = await runFx(
-          ["usage", "--period", "session", "--json"],
-          { env },
-        );
-        expect(invalid.code).toBe(1);
-        expect(JSON.parse(invalid.stdout)).toMatchObject({
-          kind: "usage",
-          code: "InvalidUsageArgs",
-        });
-
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          `${JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: Date.now() - 1,
-          })}\n`,
-          { mode: 0o600 },
-        );
-        if (platform() !== "win32") {
-          chmodSync(fxDir, 0o755);
-          const entries = readdirSync(fxDir);
-          const unsafeDirectory = await runFx(["usage", "--json"], { env });
-          expect(unsafeDirectory.code).toBe(1);
-          expect(JSON.parse(unsafeDirectory.stdout)).toMatchObject({
-            kind: "usage",
-            code: "PrivateStatePermissionsUnsupported",
-          });
-          expect(lstatSync(fxDir).mode & 0o777).toBe(0o755);
-          expect(readdirSync(fxDir)).toEqual(entries);
-          chmodSync(fxDir, 0o700);
-        }
-        writeFileSync(join(fxDir, "usage.jsonl"), "{\"broken\":true}\n", {
-          mode: 0o600,
-        });
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const corrupt = await runFx(["usage", "--json"], { env });
-        expect(corrupt.code).toBe(1);
-        expect(JSON.parse(corrupt.stdout)).toMatchObject({
-          kind: "usage",
-          code: "InvalidUsageStore",
-        });
-
-        if (platform() !== "win32") {
-          rmSync(join(fxDir, "usage.jsonl"));
-          const fifo = spawnSync("mkfifo", [join(fxDir, "usage.jsonl")]);
-          expect(fifo.status).toBe(0);
-          const special = await runFx(["usage", "--json"], { env });
-          expect(special.code).toBe(1);
-          expect(JSON.parse(special.stdout)).toMatchObject({
-            kind: "usage",
-            code: "DurablePathUnsafe",
-          });
-
-          rmSync(join(fxDir, "usage.jsonl"));
-          const socketPath = join(fxDir, "usage.jsonl");
-          const server = createServer();
-          await new Promise<void>((resolve, reject) => {
-            server.once("error", reject);
-            server.listen(socketPath, () => {
-              server.off("error", reject);
-              resolve();
-            });
-          });
-          try {
-            const socket = await runFx(["usage", "--json"], { env });
-            expect(socket.code).toBe(1);
-            expect(JSON.parse(socket.stdout)).toMatchObject({
-              kind: "usage",
-              code: "DurablePathUnsafe",
-            });
-          } finally {
-            await new Promise<void>((resolve) => server.close(() => resolve()));
-          }
-        }
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage preserves known totals but fails closed when recovery storage is unsafe",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-recovery-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          [
-            {
-              schema_version: 1,
-              kind: "coverage",
-              started_at_ms: Date.now() - 40 * 24 * 60 * 60 * 1000,
-            },
-            {
-              schema_version: 1,
-              kind: "generation",
-              fact: {
-                id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                created_at_ms: Date.now() - 1,
-                model: "provider/model",
-                input_tokens: 4,
-                output_tokens: 2,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                reasoning_tokens: 1,
-                total_cost: 0.01,
-              },
-            },
-          ].map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const outside = join(root, "outside");
-        writeFileSync(outside, "not a session directory");
-        symlinkSync(outside, join(fxDir, "sessions"));
-
-        const result = await runFx(["usage", "--json"], {
-          env: {
-            ...NO_GATEWAY_AUTH,
-            HOME: realpathSync(home),
-            FX_DISABLE_KEYCHAIN: "1",
-          },
-        });
-        expect(result.code).toBe(0);
-        expect(result.stderr).toBe("");
-        expect(JSON.parse(result.stdout)).toMatchObject({
-          kind: "usage",
-          coverage: { status: "full" },
-          completeness: "incomplete",
-          totals: { total_tokens: 6, spend: 0.01 },
-        });
-      } finally {
-        rmSync(root, { recursive: true, force: true });
+        fixture.stop();
       }
     },
     TIMEOUT,
@@ -1460,7 +1673,7 @@ describe("cli: doctor", () => {
   );
 
   test(
-    "fx doctor --json bounds session diagnostics without summary cache",
+    "fx doctor --json bounds diagnostics while reporting the cache-free session count",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-doctor-bounded-"));
       try {
@@ -1508,18 +1721,13 @@ describe("cli: doctor", () => {
             }),
             expect.objectContaining({
               name: "sessions",
-              status: "warn",
+              status: "ok",
               detail: expect.stringContaining(
-                "unavailable without a full session scan",
+                `${sessionCount} saved session(s)`,
               ),
             }),
           ]),
         );
-        expect(
-          json.checks.some((check: { detail: string }) =>
-            check.detail.includes(`${sessionCount} saved session(s)`),
-          ),
-        ).toBe(false);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -1655,7 +1863,7 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout removes a saved login rejected for unsafe permissions",
+    "fx logout removes an unsafe saved login and warns that it could not revoke it",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-rejected-login-"));
       const issuer = startLogoutIssuer([200, 200]);
@@ -1674,7 +1882,9 @@ describe("cli: logout", () => {
 
         expect(logout.code).toBe(0);
         expect(logout.stdout).toBe("Signed out of fx.\n");
-        expect(logout.stderr).toBe("");
+        expect(logout.stderr).toBe(
+          "Warning: signed out locally, but the remote session could not be revoked.\n",
+        );
         expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([]);
         for (const secret of [
@@ -2322,59 +2532,37 @@ describe("cli: sessions", () => {
         chmodSync(join(home, ".fx"), 0o700);
         chmodSync(sessionsDir, 0o700);
         const workspaceRoot = realpathSync(workspace);
-        const named = {
-          id: "named-session",
-          workspace_root: workspaceRoot,
-          origin_workspace_root: workspaceRoot,
+        writeConversationSession(home, workspaceRoot, "named-session", {
           title: "Investigate cache misses",
-          preview: null,
-          display_metadata_present: true,
-          created_at_ms: 1,
-          updated_at_ms: 3,
-          conversation_language: "en",
-          history_len: 2,
-        };
-        const unnamed = {
-          ...named,
-          id: "unnamed-session",
-          title: null,
-          display_metadata_present: false,
-          updated_at_ms: 2,
-          history_len: 0,
-        };
-        const scriptOnly = {
-          ...named,
-          id: "script-only-session",
+          updatedAtMs: 3,
+          turns: ["first named turn", "second named turn"],
+        });
+        writeConversationSession(home, workspaceRoot, "unnamed-session", {
+          updatedAtMs: 2,
+        });
+        writeConversationSession(home, workspaceRoot, "script-only-session", {
           title: "Review landing page",
-          updated_at_ms: 1_700_000_000_123,
-          conversation_language: "und-Latn",
-          history_len: 1,
-        };
-        const indexPath = join(sessionsDir, "index.json");
-        writeFileSync(
-          indexPath,
-          JSON.stringify({
-            schema_version: 3,
-            sessions: [scriptOnly, named, unnamed],
-          }),
-          { mode: 0o600 },
-        );
+          updatedAtMs: 1_700_000_000_123,
+          conversationLanguage: "und-Latn",
+          turns: ["review the landing page"],
+        });
 
+        // Updated times show in the local zone, fixed here at five and a half hours east of UTC.
         const first = await runFx(["sessions"], {
           cwd: workspaceRoot,
-          env: { HOME: home, ...NO_GATEWAY_AUTH },
+          env: { HOME: home, ...NO_GATEWAY_AUTH, TZ: "IST-5:30" },
           timeoutMs: TIMEOUT,
         });
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         expect(first.stdout).toContain(
-          " - Investigate cache misses\n   id=named-session | 2 turns | English | updated 1970-01-01 00:00:00.003 UTC",
+          " - Investigate cache misses\n   id=named-session | 2 turns | English | updated 1970-01-01 05:30:00.003 IST",
         );
         expect(first.stdout).toContain(
-          " - Untitled session\n   id=unnamed-session | 0 turns | English | updated 1970-01-01 00:00:00.002 UTC",
+          " - Untitled session\n   id=unnamed-session | 0 turns | English | updated 1970-01-01 05:30:00.002 IST",
         );
         expect(first.stdout).toContain(
-          " - Review landing page\n   id=script-only-session | 1 turn | Latin script | updated 2023-11-14 22:13:20.123 UTC",
+          " - Review landing page\n   id=script-only-session | 1 turn | Latin script | updated 2023-11-15 03:43:20.123 IST",
         );
         expect(first.stdout).not.toContain("updated_at_ms");
         expect(first.stdout).not.toContain("language=");
@@ -2392,18 +2580,12 @@ describe("cli: sessions", () => {
           conversation_language: "und-Latn",
         });
 
-        writeFileSync(
-          indexPath,
-          JSON.stringify({
-            schema_version: 3,
-            sessions: [
-              scriptOnly,
-              { ...named, title: "Investigate cache hits" },
-              unnamed,
-            ],
-          }),
-          { mode: 0o600 },
-        );
+        const namedPath = join(sessionsDir, "named-session", "session.json");
+        const renamedMetadata = JSON.parse(readFileSync(namedPath, "utf8"));
+        renamedMetadata.title = "Investigate cache hits";
+        writeFileSync(namedPath, JSON.stringify(renamedMetadata) + "\n", {
+          mode: 0o600,
+        });
         const renamed = await runFx(["sessions"], {
           cwd: workspaceRoot,
           env: { HOME: home, ...NO_GATEWAY_AUTH },
@@ -2423,7 +2605,47 @@ describe("cli: sessions", () => {
   );
 
   test(
-    "session listing pages a 9001-entry index without scanning session directories",
+    "fx sessions text applies daylight saving time for each session's own date",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-dst-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+        // 2023-07-10 14:40:00 UTC, during daylight saving time.
+        writeConversationSession(home, workspaceRoot, "summer-session", {
+          title: "Summer session",
+          updatedAtMs: 1_689_000_000_000,
+        });
+        // 2023-11-14 22:13:20.123 UTC, after daylight saving time ends.
+        writeConversationSession(home, workspaceRoot, "winter-session", {
+          title: "Winter session",
+          updatedAtMs: 1_700_000_000_123,
+        });
+
+        const listed = await runFx(["sessions"], {
+          cwd: workspaceRoot,
+          env: { HOME: home, ...NO_GATEWAY_AUTH, TZ: "EST5EDT,M3.2.0,M11.1.0" },
+          timeoutMs: TIMEOUT,
+        });
+        expect(listed.code).toBe(0);
+        expect(listed.stderr).toBe("");
+        expect(listed.stdout).toContain(
+          " - Summer session\n   id=summer-session | 0 turns | English | updated 2023-07-10 10:40:00.000 EDT",
+        );
+        expect(listed.stdout).toContain(
+          " - Winter session\n   id=winter-session | 0 turns | English | updated 2023-11-14 17:13:20.123 EST",
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session listing pages direct metadata without an index",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-pages-"));
       try {
@@ -2435,26 +2657,15 @@ describe("cli: sessions", () => {
         chmodSync(join(home, ".fx"), 0o700);
         chmodSync(sessionsDir, 0o700);
         const workspaceRoot = realpathSync(workspace);
-        const sessions = Array.from({ length: 9_001 }, (_, index) => {
-          const id = `indexed-session-${index.toString().padStart(5, "0")}`;
-          return {
-            id,
-            workspace_root: workspaceRoot,
-            origin_workspace_root: workspaceRoot,
+        for (let index = 0; index < 201; index += 1) {
+          const id = `direct-session-${index.toString().padStart(5, "0")}`;
+          writeConversationSession(home, workspaceRoot, id, {
             title: id,
-            preview: `${id} preview`,
-            display_metadata_present: true,
-            created_at_ms: 20_000 - index,
-            updated_at_ms: 20_000 - index,
-            conversation_language: "en",
-            history_len: 0,
-          };
-        });
-        writeFileSync(
-          join(sessionsDir, "index.json"),
-          JSON.stringify({ schema_version: 3, sessions }),
-          { mode: 0o600 },
-        );
+            createdAtMs: 20_000 - index,
+            updatedAtMs: 20_000 - index,
+          });
+        }
+        expect(existsSync(join(sessionsDir, "index.json"))).toBe(false);
 
         const first = await runFx(["sessions", "--json"], {
           cwd: workspaceRoot,
@@ -2473,10 +2684,10 @@ describe("cli: sessions", () => {
         expect(firstJson.has_more).toBe(true);
         expect(firstJson.sessions).toHaveLength(100);
         expect(firstJson.sessions[0]).toMatchObject({
-          id: "indexed-session-00000",
+          id: "direct-session-00000",
           history_len: 0,
         });
-        expect(firstJson.sessions[99].id).toBe("indexed-session-00099");
+        expect(firstJson.sessions[99].id).toBe("direct-session-00099");
 
         const second = await runFx(
           ["sessions", "--json", "--cursor", firstJson.next_cursor],
@@ -2494,8 +2705,8 @@ describe("cli: sessions", () => {
         };
         expect(secondJson.count).toBe(100);
         expect(secondJson.has_more).toBe(true);
-        expect(secondJson.sessions[0].id).toBe("indexed-session-00100");
-        expect(secondJson.sessions[99].id).toBe("indexed-session-00199");
+        expect(secondJson.sessions[0].id).toBe("direct-session-00100");
+        expect(secondJson.sessions[99].id).toBe("direct-session-00199");
 
         const one = await runFx(["sessions", "--json", "--limit", "1"], {
           cwd: workspaceRoot,
@@ -2506,7 +2717,7 @@ describe("cli: sessions", () => {
         expect(JSON.parse(one.stdout)).toMatchObject({
           count: 1,
           has_more: true,
-          sessions: [{ id: "indexed-session-00000" }],
+          sessions: [{ id: "direct-session-00000" }],
         });
 
         const invalid = await runFx(["sessions", "--limit", "0"], {
@@ -2523,7 +2734,7 @@ describe("cli: sessions", () => {
   );
 
   test(
-    "session lists use projections without opening unreadable event logs",
+    "session lists use projections when event logs are unreadable",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-projections-"));
       try {
@@ -3071,6 +3282,7 @@ describe("cli: models", () => {
             more_count: 0,
             private_models_hidden: true,
             ids: ["public/fallback"],
+            models: [{ id: "public/fallback", efforts: [], fast: false, ultrafast: false }],
           });
 
           expect(gateway.modelRequests).toHaveLength(2);
@@ -3091,6 +3303,53 @@ describe("cli: models", () => {
           gateway.stop();
           cleanupIsolatedTestHome(home);
         }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx models --json describes each Gateway model's name, efforts, and speed lanes",
+    async () => {
+      const home = createIsolatedTestHome();
+      const gateway = startFakeGateway([], {
+        models: () => [
+          {
+            id: "openai/astra",
+            name: "Astra ",
+            type: "language",
+            owned_by: "openai",
+            tags: ["tool-use"],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+            pricing: {
+              service_tiers: {
+                priority: { input: "1", output: "2" },
+                ultrafast: { input: "3", output: "4" },
+              },
+            },
+          },
+          { id: "provider/plain", type: "language", tags: ["tool-use"] },
+        ],
+      });
+
+      try {
+        const result = await runFx(["models", "--json"], {
+          env: modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        const json = JSON.parse(result.stdout.trim());
+        expect(json.models).toHaveLength(2);
+        expect(json.models).toEqual(
+          expect.arrayContaining([
+            { id: "openai/astra", name: "Astra", efforts: ["low", "high"], fast: true, ultrafast: true },
+            { id: "provider/plain", efforts: [], fast: false, ultrafast: false },
+          ]),
+        );
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
       }
     },
     TIMEOUT,
@@ -3841,8 +4100,10 @@ describe("cli: ask success", () => {
           "Explicitly invoked skill content for this query:",
         );
         expect(gateway.requests[0]!.body).toContain(
-          '<skill_content name=\\"cli-explicit\\" resource=\\"SKILL.md\\"',
+          '<skill_content name=\\"cli-explicit\\"',
         );
+        expect(gateway.requests[0]!.body).toContain('resource=\\"SKILL.md\\"');
+        expect(gateway.requests[0]!.body).toContain('complete=\\"true\\"');
         expect(gateway.requests[0]!.body).toContain(skillBody);
       } finally {
         gateway.stop();
@@ -3861,6 +4122,14 @@ describe("cli: ask success", () => {
       const sizes = [1024 * 1024 - 1, 1024 * 1024, 1024 * 1024 + 1, 3 * 1024 * 1024];
       const gateway = startFakeGateway(
         sizes.map((_, index) => fakeGatewayFinalText(`large stdin ${index}`)),
+        { models: [{
+          id: FAKE_GATEWAY_MODEL,
+          type: "language",
+          tags: ["tool-use"],
+          // Keep the stdin transport cases below the separate compaction threshold.
+          context_window: 2_000_000,
+          max_tokens: 16_384,
+        }] },
       );
       try {
         mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
@@ -3887,7 +4156,7 @@ describe("cli: ask success", () => {
             },
           );
 
-          expect(result.code).toBe(0);
+          expect(result.code, JSON.stringify({ size, stdout: result.stdout, stderr: result.stderr })).toBe(0);
           expect(JSON.parse(result.stdout).output.trim()).toBe(`large stdin ${index}`);
           const request = JSON.parse(gateway.requests[index]!.body) as {
             prompt: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
@@ -3930,7 +4199,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,
@@ -4000,7 +4269,7 @@ describe("cli: ask success", () => {
           maxOutputTokens: 64_000,
         });
         expect(gateway.modelRequests).toHaveLength(1);
-        expect(request).not.toHaveProperty("providerOptions");
+        expect(request.providerOptions).toEqual({ gateway: { caching: "auto" } });
         expect(
           gateway.requests[0]!.headers.get(
             "ai-language-model-specification-version",
@@ -4070,6 +4339,124 @@ describe("cli: ask success", () => {
     120_000,
   );
 
+  test.each([
+    {
+      name: "reports exact provider totals",
+      reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
+      expectedUsage: { input_tokens: 17, output_tokens: 23 },
+      toolLoop: false,
+      json: true,
+    },
+    {
+      name: "reports null when provider totals are missing",
+      reportedUsage: undefined,
+      expectedUsage: { input_tokens: null, output_tokens: null },
+      toolLoop: false,
+      json: true,
+    },
+    {
+      name: "sums main-agent completions across a read_file tool loop",
+      reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
+      expectedUsage: { input_tokens: 20, output_tokens: 28 },
+      toolLoop: true,
+      json: true,
+    },
+    {
+      name: "leaves plain output unchanged",
+      reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
+      expectedUsage: undefined,
+      toolLoop: false,
+      json: false,
+    },
+  ])(
+    "fx ask usage $name",
+    async ({ reportedUsage, expectedUsage, toolLoop, json }) => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-usage-"));
+      const answer = "Usage fixture complete.\n";
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          toolLoop
+            ? {
+                type: "tool-call",
+                toolCallId: "read_usage_fixture",
+                toolName: "read_file",
+                input: JSON.stringify({ path: "fixture.txt" }),
+              }
+            : { type: "text-delta", id: "answer_1", delta: answer },
+          {
+            type: "finish",
+            finishReason: toolLoop
+              ? { unified: "tool-calls", raw: "tool-calls" }
+              : { unified: "stop", raw: "stop" },
+            usage: reportedUsage,
+          },
+        ]),
+        ...(toolLoop ? [fakeGatewayFinalText(answer)] : []),
+      ]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(home);
+        mkdirSync(workspace);
+        writeFileSync(join(workspace, "fixture.txt"), "usage fixture contents\n");
+
+        const result = await runFx(
+          [
+            "ask",
+            ...(json ? ["--json"] : []),
+            "--auto",
+            "--no-save",
+            toolLoop ? "Read fixture.txt and reply." : "Reply with the fixture answer.",
+          ],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-ask-usage-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: 60_000,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        if (json) {
+          const output = JSON.parse(result.stdout);
+          expect(output.output).toBe(answer);
+          expect(output.final_output).toBe(answer.trimEnd());
+          expect(output.exit_code).toBe(0);
+          expect(output.session_id).toBe("");
+          expect(output.usage).toEqual(expectedUsage);
+          expect(output.tool_calls).toEqual(
+            toolLoop ? [{ name: "read_file", status: "success" }] : [],
+          );
+        } else {
+          expect(result.stdout).toBe(answer);
+        }
+        if (toolLoop) {
+          expect(result.stderr).toContain("Reading fixture.txt");
+          expect(gateway.requests[1]!.body).toContain("usage fixture contents");
+        } else {
+          expect(result.stderr).toBe("");
+        }
+        expect(gateway.requests).toHaveLength(toolLoop ? 2 : 1);
+        expect(gateway.classifierRequests).toHaveLength(0);
+        expect(existsSync(join(home, ".fx"))).toBe(false);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
   test(
     "saved ask resumes the exact session while no-save creates no durable state",
     async () => {
@@ -4108,6 +4495,7 @@ describe("cli: ask success", () => {
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         const firstJson = JSON.parse(first.stdout.trim());
+        expect(firstJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(typeof firstJson.session_id).toBe("string");
         expect(firstJson.session_id.length).toBeGreaterThan(0);
         expect(gateway.requests[0]?.headers.get("x-session-id")).toBe(
@@ -4151,9 +4539,9 @@ describe("cli: ask success", () => {
         );
         expect(resumed.code).toBe(0);
         expect(resumed.stderr).toBe("");
-        expect(JSON.parse(resumed.stdout.trim()).session_id).toBe(
-          firstJson.session_id,
-        );
+        const resumedJson = JSON.parse(resumed.stdout.trim());
+        expect(resumedJson.session_id).toBe(firstJson.session_id);
+        expect(resumedJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(gateway.requests[1]?.headers.get("x-session-id")).toBe(
           firstJson.session_id,
         );
@@ -4190,7 +4578,9 @@ describe("cli: ask success", () => {
         );
         expect(noSave.code).toBe(0);
         expect(noSave.stderr).toBe("");
-        expect(JSON.parse(noSave.stdout.trim()).session_id).toBe("");
+        const noSaveJson = JSON.parse(noSave.stdout.trim());
+        expect(noSaveJson.session_id).toBe("");
+        expect(noSaveJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(gateway.requests[2]?.headers.get("x-session-id")).toBeNull();
         expect(gateway.requests[2]?.headers.get("x-session-affinity")).toBeNull();
         expect(existsSync(join(noSaveHome, ".fx"))).toBe(false);
@@ -4204,30 +4594,157 @@ describe("cli: ask success", () => {
   );
 
   test(
-    "saved ask survives session cache contention and repairs after release",
+    "saved ask converts a legacy session once and continues after restart",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-cache-contention-"));
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-legacy-convert-"));
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("LEGACY_CONVERTED_OK"),
+        fakeGatewayFinalText("LEGACY_RESTART_OK"),
+      ]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(home);
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+        const sessionId = "legacy-ask-convert";
+        writeLegacySession(home, workspaceRoot, sessionId);
+        const sessionDir = join(home, ".fx", "sessions", sessionId);
+        const legacyPath = join(sessionDir, "session.json");
+        const legacy = JSON.parse(readFileSync(legacyPath, "utf8"));
+        const legacyOutput = "LEGACY_AVAILABLE_RESULT_BYTES";
+        const legacySummary = "LEGACY_ONLY_EARLIER_CONTEXT: deploy to eu-west-1.";
+        legacy.history_len = 2;
+        legacy.history = [{
+          kind: "compacted_summary",
+          summary: legacySummary,
+          removed_turn_count: 12,
+          compaction_count: 1,
+        }, {
+          kind: "assistant",
+          user: { text: "LEGACY_ORIGINAL_REQUEST", images: [] },
+          assistant: "LEGACY_ORIGINAL_ANSWER",
+          execution: {
+            schema_version: 2,
+            tool_steps: [{
+              assistant: null,
+              tool_calls: [{ id: "legacy-read", name: "read_file", arguments_json: '{"path":"past.txt"}', provider_result: null }],
+              tool_results: [{
+                tool_call_id: "legacy-read", tool_name: "read_file", status: "success",
+                output: legacyOutput, output_handle: null, preview: null,
+                output_bytes: legacyOutput.length, stored_output_bytes: legacyOutput.length,
+                truncated: false, provider_native: false, created_at_ms: 2, permission_feedback: [],
+              }],
+            }],
+            files: [
+              { path: "", new_path: null, tool_call_id: "legacy-read", tool_name: "read_file", action: "unknown", status: "success", model_view_covers_full_file: false, stale: false },
+              { path: "past.txt", new_path: null, tool_call_id: "legacy-read", tool_name: "read_file", action: "unknown", status: "success", model_view_covers_full_file: false, stale: false },
+            ], steering: [],
+          },
+        }];
+        writeFileSync(legacyPath, JSON.stringify(legacy) + "\n", { mode: 0o600 });
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-legacy-convert-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        };
+
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--resume-id", sessionId, "Convert and continue."],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(first.code, first.stderr + first.stdout).toBe(0);
+        expect(first.stderr).toBe("");
+        expect(JSON.parse(first.stdout)).toMatchObject({
+          session_id: sessionId,
+          final_output: "LEGACY_CONVERTED_OK",
+        });
+
+        const metadata = JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8"));
+        expect(metadata.schema_version).toBe(4);
+        expect(Object.hasOwn(metadata, "history")).toBe(false);
+        expect(existsSync(join(sessionDir, "authority.json"))).toBe(false);
+        expect(existsSync(join(sessionDir, "checkpoint.json"))).toBe(false);
+        expect(existsSync(join(sessionDir, "events.v3.backup"))).toBe(false);
+
+        const second = await runFx(
+          ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue after restart."],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(second.code).toBe(0);
+        expect(second.stderr).toBe("");
+        expect(JSON.parse(second.stdout)).toMatchObject({
+          session_id: sessionId,
+          final_output: "LEGACY_RESTART_OK",
+        });
+        const records = readFileSync(join(sessionDir, "events.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        const events = records.map((record) => Object.keys(record.event)[0]);
+        expect(events).toEqual([
+          "context_checkpoint",
+          "user",
+          "tool_call",
+          "tool_result",
+          "assistant",
+          "turn_completed",
+          "user",
+          "assistant",
+          "turn_completed",
+          "user",
+          "assistant",
+          "turn_completed",
+        ]);
+        expect(gateway.requests).toHaveLength(2);
+        for (const request of gateway.requests) {
+          expect(request.body).toContain(legacySummary);
+          expect(request.body).toContain("LEGACY_ORIGINAL_REQUEST");
+          expect(request.body).toContain("LEGACY_ORIGINAL_ANSWER");
+          expect(request.body).toContain(legacyOutput);
+        }
+        const preserved = records.find((record) => record.event.tool_result)?.event.tool_result;
+        expect(preserved.call_id).toBe("legacy-read");
+        expect(preserved.completeness).not.toBe("complete");
+        expect(readFileSync(join(sessionDir, "tool-results", preserved.artifact_ref), "utf8")).toBe(legacyOutput);
+        const files = records.find((record) => record.event.turn_completed)?.event.turn_completed.files;
+        expect(files.map((file: { path: string }) => file.path)).toEqual(["past.txt"]);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
+
+  test(
+    "saved asks remain discoverable and resumable without session caches",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-cache-free-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
-      const lockReady = join(root, "latest-lock-ready");
       const unrelatedReply = `unrelated saved turn ${"x".repeat(64 * 1024)}`;
       const gateway = startFakeGateway([
         fakeGatewayFinalText(unrelatedReply),
         fakeGatewayFinalText("first saved turn"),
-        fakeGatewayFinalText("created during contention"),
-        fakeGatewayFinalText("contended exact turn"),
-        fakeGatewayFinalText("contended latest turn"),
-        fakeGatewayFinalText("repairing turn"),
-        fakeGatewayFinalText("repaired created turn"),
+        fakeGatewayFinalText("second saved turn"),
+        fakeGatewayFinalText("exact resumed turn"),
+        fakeGatewayFinalText("latest resumed turn"),
+        fakeGatewayFinalText("continued target turn"),
+        fakeGatewayFinalText("continued second turn"),
       ]);
-      let lockHolder: ReturnType<typeof Bun.spawn> | null = null;
       try {
         mkdirSync(home);
         mkdirSync(workspace);
         const workspaceRoot = realpathSync(workspace);
         const env = {
           HOME: realpathSync(home),
-          AI_GATEWAY_API_KEY: "fake-session-cache-contention-key",
+          AI_GATEWAY_API_KEY: "fake-session-cache-free-key",
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -4253,46 +4770,20 @@ describe("cli: ask success", () => {
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         const sessionId = JSON.parse(first.stdout).session_id as string;
-        const lockPath = join(home, ".fx", "sessions", "latest.lock");
-        lockHolder = Bun.spawn(
-          [
-            "python3",
-            "-c",
-            [
-              "import fcntl, os, sys, time",
-              "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)",
-              "fcntl.flock(fd, fcntl.LOCK_EX)",
-              "open(sys.argv[2], 'w').close()",
-              "time.sleep(300)",
-            ].join("\n"),
-            lockPath,
-            lockReady,
-          ],
-          { stdout: "ignore", stderr: "pipe" },
-        );
-        for (let attempt = 0; attempt < 250 && !existsSync(lockReady); attempt += 1) {
-          await Bun.sleep(20);
-        }
-        expect(existsSync(lockReady)).toBe(true);
+        const sessionsDir = join(home, ".fx", "sessions");
+        expect(existsSync(join(sessionsDir, "index.json"))).toBe(false);
+        expect(existsSync(join(sessionsDir, "latest"))).toBe(false);
+        expect(existsSync(join(sessionsDir, "latest.lock"))).toBe(false);
 
-        const createdDuringContention = await runFx(
-          ["ask", "--json", "--auto", "Create a saved turn while the cache is busy."],
+        const createdNext = await runFx(
+          ["ask", "--json", "--auto", "Create another saved turn."],
           { cwd: workspaceRoot, env, timeoutMs: 60_000 },
         );
-        expect(createdDuringContention.code).toBe(0);
-        expect(createdDuringContention.stderr).toBe("");
-        const createdDuringContentionJson = JSON.parse(createdDuringContention.stdout);
-        const createdDuringContentionId = createdDuringContentionJson.session_id as string;
-        expect(createdDuringContentionJson.output.trim()).toBe("created during contention");
-        const createdDuringContentionTokenPath = join(
-          home,
-          ".fx",
-          "sessions",
-          "latest",
-          "deferred",
-          createdDuringContentionId,
-        );
-        expect(existsSync(createdDuringContentionTokenPath)).toBe(true);
+        expect(createdNext.code).toBe(0);
+        expect(createdNext.stderr).toBe("");
+        const createdNextJson = JSON.parse(createdNext.stdout);
+        const createdNextId = createdNextJson.session_id as string;
+        expect(createdNextJson.output.trim()).toBe("second saved turn");
 
         const exact = await runFx(
           [
@@ -4301,22 +4792,13 @@ describe("cli: ask success", () => {
             "--auto",
             "--resume-id",
             sessionId,
-            "Reply with the contended exact turn.",
+            "Reply with the exact resumed turn.",
           ],
           { cwd: workspaceRoot, env, timeoutMs: 60_000 },
         );
         expect(exact.code).toBe(0);
         expect(exact.stderr).toBe("");
-        expect(JSON.parse(exact.stdout).output.trim()).toBe("contended exact turn");
-        const tokenPath = join(
-          home,
-          ".fx",
-          "sessions",
-          "latest",
-          "deferred",
-          sessionId,
-        );
-        expect(existsSync(tokenPath)).toBe(true);
+        expect(JSON.parse(exact.stdout).output.trim()).toBe("exact resumed turn");
 
         const listed = await runFx(["sessions", "--json"], {
           cwd: workspaceRoot,
@@ -4331,14 +4813,14 @@ describe("cli: ask success", () => {
           history_len: 2,
         });
         expect(listedSessions[1]).toMatchObject({
-          id: createdDuringContentionId,
+          id: createdNextId,
           history_len: 1,
         });
         expect(listedSessions[2]).toMatchObject({
           id: unrelatedSessionId,
           history_len: 1,
         });
-        expect(existsSync(tokenPath)).toBe(true);
+        expect(existsSync(join(sessionsDir, "latest"))).toBe(false);
 
         const latest = await runFx(
           [
@@ -4347,19 +4829,15 @@ describe("cli: ask success", () => {
             "--auto",
             "--resume",
             "last",
-            "Reply with the contended latest turn.",
+            "Reply with the latest resumed turn.",
           ],
           { cwd: workspaceRoot, env, timeoutMs: 60_000 },
         );
         expect(latest.code).toBe(0);
         expect(latest.stderr).toBe("");
         expect(JSON.parse(latest.stdout).session_id).toBe(sessionId);
-        expect(JSON.parse(latest.stdout).output.trim()).toBe("contended latest turn");
-        expect(existsSync(tokenPath)).toBe(true);
+        expect(JSON.parse(latest.stdout).output.trim()).toBe("latest resumed turn");
 
-        lockHolder.kill();
-        await lockHolder.exited;
-        lockHolder = null;
         const repaired = await runFx(
           [
             "ask",
@@ -4367,36 +4845,34 @@ describe("cli: ask success", () => {
             "--auto",
             "--resume-id",
             sessionId,
-            "Reply with the repairing turn.",
+            "Reply with the continued target turn.",
           ],
           { cwd: workspaceRoot, env, timeoutMs: 60_000 },
         );
         expect(repaired.code).toBe(0);
         expect(repaired.stderr).toBe("");
-        expect(JSON.parse(repaired.stdout).output.trim()).toBe("repairing turn");
-        expect(existsSync(tokenPath)).toBe(false);
-        const createdDuringContentionDetail = await runFx(
-          ["session", "--id", createdDuringContentionId, "--json"],
+        expect(JSON.parse(repaired.stdout).output.trim()).toBe("continued target turn");
+        const createdNextDetail = await runFx(
+          ["session", "--id", createdNextId, "--json"],
           { cwd: workspaceRoot, env: { HOME: home }, timeoutMs: 60_000 },
         );
-        expect(createdDuringContentionDetail.code).toBe(0);
-        expect(createdDuringContentionDetail.stderr).toBe("");
-        expect(JSON.parse(createdDuringContentionDetail.stdout).history_len).toBe(1);
-        const repairedCreated = await runFx(
+        expect(createdNextDetail.code).toBe(0);
+        expect(createdNextDetail.stderr).toBe("");
+        expect(JSON.parse(createdNextDetail.stdout).history_len).toBe(1);
+        const continuedNext = await runFx(
           [
             "ask",
             "--json",
             "--auto",
             "--resume-id",
-            createdDuringContentionId,
-            "Repair the newly created session.",
+            createdNextId,
+            "Continue the second saved session.",
           ],
           { cwd: workspaceRoot, env, timeoutMs: 60_000 },
         );
-        expect(repairedCreated.code).toBe(0);
-        expect(repairedCreated.stderr).toBe("");
-        expect(JSON.parse(repairedCreated.stdout).output.trim()).toBe("repaired created turn");
-        expect(existsSync(createdDuringContentionTokenPath)).toBe(false);
+        expect(continuedNext.code).toBe(0);
+        expect(continuedNext.stderr).toBe("");
+        expect(JSON.parse(continuedNext.stdout).output.trim()).toBe("continued second turn");
         const targetDetail = await runFx(
           ["session", "--id", sessionId, "--json"],
           { cwd: workspaceRoot, env: { HOME: home }, timeoutMs: 60_000 },
@@ -4413,10 +4889,6 @@ describe("cli: ask success", () => {
         expect(JSON.parse(unrelatedDetail.stdout).history_len).toBe(1);
         expect(gateway.requests).toHaveLength(7);
       } finally {
-        if (lockHolder) {
-          lockHolder.kill();
-          await lockHolder.exited;
-        }
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
       }
@@ -4562,7 +5034,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
@@ -4916,7 +5388,7 @@ describe("cli: MCP profile add", () => {
           fixture: {
             type: "local",
             command: [process.execPath, MODERN_MCP_FIXTURE],
-            environment: { FX_MCP_PID_PATH: pidPath },
+            environment: { FX_MCP_PID_PATH: pidPath, FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
           },
         },
       }),
@@ -5071,6 +5543,16 @@ describe("cli: MCP profile add", () => {
         ["mcp", "add", "local", "/bin/sh", "-c", `touch ${marker}`],
         { env: { HOME: home, ...NO_GATEWAY_AUTH } },
       );
+      const bare = await runFx(["mcp"], { env: { HOME: home, ...NO_GATEWAY_AUTH } });
+      expect(bare.code).toBe(0);
+      expect(bare.stdout).toBe(help.stdout);
+      expect(existsSync(marker)).toBe(false);
+      const missingAuthName = await runFx(["mcp", "auth"], {
+        env: { HOME: home, ...NO_GATEWAY_AUTH },
+      });
+      expect(missingAuthName.code).toBe(1);
+      expect(missingAuthName.stderr).toBe("usage: fx mcp auth NAME\n");
+      expect(existsSync(marker)).toBe(false);
       expect(local.code).toBe(0);
       expect(local.stderr).toBe("");
       expect(local.stdout).toContain("Saved MCP server 'local'");

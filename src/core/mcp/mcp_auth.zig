@@ -3,11 +3,16 @@ const host_target = @import("../hosts/target.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const operation_control = @import("operation_control.zig");
 const browser_callback = @import("../auth/browser_callback.zig");
+const oauth = @import("../auth/oauth.zig");
 const secret = @import("../auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
+const Form = oauth.FormBody;
+const percentEncode = oauth.percentEncode;
+const queryValueAlloc = oauth.queryValueAlloc;
 
 pub const max_document_bytes: usize = 256 * 1024;
 pub const expiry_skew_ms: i64 = 60 * 1000;
@@ -46,7 +51,7 @@ pub const Challenge = struct {
             try alloc.dupe(u8, value)
         else
             null;
-        errdefer if (resource_metadata) |value| alloc.free(value);
+        errdefer if (resource_metadata) |value| mem_utils.free(alloc, value);
         return .{
             .resource_metadata = resource_metadata,
             .scope = if (self.scope) |value| try alloc.dupe(u8, value) else null,
@@ -62,6 +67,7 @@ pub const ClientConfig = struct {
     client_secret: ?[]const u8 = null,
     client_metadata_url: ?[]const u8 = null,
     scopes: []const []const u8 = &.{},
+    scopes_configured: bool = false,
     callback_port: ?u16 = null,
 };
 
@@ -104,13 +110,13 @@ pub const Credentials = struct {
 
     pub fn clone(self: Credentials, alloc: Allocator) !Credentials {
         const endpoint = try alloc.dupe(u8, self.endpoint);
-        errdefer alloc.free(endpoint);
+        errdefer mem_utils.free(alloc, endpoint);
         const resource = try alloc.dupe(u8, self.resource);
-        errdefer alloc.free(resource);
+        errdefer mem_utils.free(alloc, resource);
         const issuer = try alloc.dupe(u8, self.issuer);
-        errdefer alloc.free(issuer);
+        errdefer mem_utils.free(alloc, issuer);
         const client_id = try alloc.dupe(u8, self.client_id);
-        errdefer alloc.free(client_id);
+        errdefer mem_utils.free(alloc, client_id);
         const client_secret = if (self.client_secret) |value|
             try alloc.dupe(u8, value)
         else
@@ -124,15 +130,15 @@ pub const Credentials = struct {
             null;
         errdefer if (refresh_token) |value| secret.zeroAndFree(alloc, value);
         const scope = try alloc.dupe(u8, self.scope);
-        errdefer alloc.free(scope);
+        errdefer mem_utils.free(alloc, scope);
         const token_type = try alloc.dupe(u8, self.token_type);
-        errdefer alloc.free(token_type);
+        errdefer mem_utils.free(alloc, token_type);
         const auth_method = try alloc.dupe(u8, self.token_endpoint_auth_method);
-        errdefer alloc.free(auth_method);
+        errdefer mem_utils.free(alloc, auth_method);
         const authorization_endpoint = try alloc.dupe(u8, self.authorization_endpoint);
-        errdefer alloc.free(authorization_endpoint);
+        errdefer mem_utils.free(alloc, authorization_endpoint);
         const token_endpoint = try alloc.dupe(u8, self.token_endpoint);
-        errdefer alloc.free(token_endpoint);
+        errdefer mem_utils.free(alloc, token_endpoint);
         const revocation_endpoint = if (self.revocation_endpoint) |value|
             try alloc.dupe(u8, value)
         else
@@ -174,7 +180,7 @@ pub const IssuerMismatch = struct {
         returned: []const u8,
     ) !IssuerMismatch {
         const owned_expected = try alloc.dupe(u8, expected);
-        errdefer alloc.free(owned_expected);
+        errdefer mem_utils.free(alloc, owned_expected);
         return .{
             .owner_alloc = alloc,
             .source = source,
@@ -241,6 +247,27 @@ pub const InteractiveAuthorizationOptions = struct {
     open_url: OpenUrlFn,
     cancel_flag: ?*const std.atomic.Value(bool) = null,
     lifecycle_cancel_flag: ?*const std.atomic.Value(bool) = null,
+    completion: ?*InteractiveCompletion = null,
+};
+
+pub const InteractiveCompletion = struct {
+    stream: ?std.Io.net.Stream = null,
+    origin: []const u8 = "https://fx.sh",
+
+    pub fn finish(self: *InteractiveCompletion, saved: bool) void {
+        const stream = self.stream orelse return;
+        self.stream = null;
+        defer stream.close(io_mod.getIo());
+        var buffer: [1024]u8 = undefined;
+        var writer = stream.writer(io_mod.getIo(), &buffer);
+        writer.interface.print(
+            "HTTP/1.1 303 See Other\r\nLocation: {s}/api/slack/auth/complete?result={s}\r\n" ++
+                "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n" ++
+                "Content-Length: 0\r\nConnection: close\r\n\r\n",
+            .{ self.origin, if (saved) "success" else "failed" },
+        ) catch return;
+        writer.interface.flush() catch {};
+    }
 };
 
 pub const ResourceMetadata = struct {
@@ -430,7 +457,7 @@ pub fn canonicalResource(alloc: Allocator, endpoint: []const u8) ![]u8 {
     defer alloc.free(origin);
     const path = rawPathAlloc(alloc, uri) catch return error.InvalidMcpAuthEndpoint;
     defer alloc.free(path);
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ origin, path });
+    return alloc.print("{s}{s}", .{ origin, path });
 }
 
 pub fn isLoopbackEndpoint(endpoint: []const u8) bool {
@@ -465,16 +492,14 @@ pub fn protectedResourceMetadataUrls(
     var urls: std.ArrayList([]u8) = .empty;
     errdefer freeStringList(alloc, &urls);
     if (!std.mem.eql(u8, path, "/")) {
-        const suffix = if (path[0] == '/') path else try std.fmt.allocPrint(alloc, "/{s}", .{path});
+        const suffix = if (path[0] == '/') path else try alloc.print("/{s}", .{path});
         defer if (suffix.ptr != path.ptr) alloc.free(suffix);
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/oauth-protected-resource{s}",
             .{ origin, suffix },
         ));
     }
-    try urls.append(alloc, try std.fmt.allocPrint(
-        alloc,
+    try urls.append(alloc, try alloc.print(
         "{s}/.well-known/oauth-protected-resource",
         .{origin},
     ));
@@ -498,29 +523,24 @@ pub fn authorizationMetadataUrls(
     var urls: std.ArrayList([]u8) = .empty;
     errdefer freeStringList(alloc, &urls);
     if (trimmed_path.len == 0) {
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/oauth-authorization-server",
             .{origin},
         ));
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/openid-configuration",
             .{origin},
         ));
     } else {
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/oauth-authorization-server/{s}",
             .{ origin, trimmed_path },
         ));
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/openid-configuration/{s}",
             .{ origin, trimmed_path },
         ));
-        try urls.append(alloc, try std.fmt.allocPrint(
-            alloc,
+        try urls.append(alloc, try alloc.print(
             "{s}/.well-known/openid-configuration",
             .{issuer},
         ));
@@ -539,7 +559,7 @@ pub fn parseResourceMetadata(
     const object = parsed.value.object;
     const resource = try requiredString(object, "resource");
     const canonical_resource = try canonicalResource(alloc, resource);
-    errdefer alloc.free(canonical_resource);
+    errdefer mem_utils.free(alloc, canonical_resource);
     if (!resourceCoversEndpoint(canonical_resource, expected_resource)) {
         return error.McpAuthResourceMismatch;
     }
@@ -614,13 +634,13 @@ fn parseAuthorizationMetadataOutcome(
         ) };
     }
     const authorization_endpoint = try dupeRequiredUrl(alloc, object, "authorization_endpoint");
-    errdefer alloc.free(authorization_endpoint);
+    errdefer mem_utils.free(alloc, authorization_endpoint);
     const token_endpoint = try dupeRequiredUrl(alloc, object, "token_endpoint");
-    errdefer alloc.free(token_endpoint);
+    errdefer mem_utils.free(alloc, token_endpoint);
     const registration_endpoint = try dupeOptionalUrl(alloc, object, "registration_endpoint");
-    errdefer if (registration_endpoint) |value| alloc.free(value);
+    errdefer if (registration_endpoint) |value| mem_utils.free(alloc, value);
     const revocation_endpoint = try dupeOptionalUrl(alloc, object, "revocation_endpoint");
-    errdefer if (revocation_endpoint) |value| alloc.free(value);
+    errdefer if (revocation_endpoint) |value| mem_utils.free(alloc, value);
     const scopes_supported = try dupeOptionalStringArray(alloc, object, "scopes_supported");
     errdefer freeStrings(alloc, scopes_supported);
     const grant_types_supported = try dupeOptionalStringArray(alloc, object, "grant_types_supported");
@@ -710,9 +730,9 @@ pub fn parseAuthorizationRedirect(
     alloc: Allocator,
     location: []const u8,
 ) !AuthorizationResponse {
-    const question = std.mem.indexOfScalar(u8, location, '?') orelse
+    const question = std.mem.findScalar(u8, location, '?') orelse
         return error.InvalidAuthorizationRedirect;
-    const fragment = std.mem.indexOfScalarPos(u8, location, question + 1, '#') orelse location.len;
+    const fragment = std.mem.findScalarPos(u8, location, question + 1, '#') orelse location.len;
     const query = location[question + 1 .. fragment];
     const code = try queryValueAlloc(alloc, query, "code");
     errdefer secret.zeroAndFree(alloc, code);
@@ -762,20 +782,6 @@ fn encodeBase64UrlNoPad(output: []u8, input: []const u8) []const u8 {
     return output[0..encoded_len];
 }
 
-pub fn generatePkce(
-    verifier_buf: *[64]u8,
-    challenge_buf: *[43]u8,
-    random: std.Random,
-) struct { verifier: []const u8, challenge: []const u8 } {
-    var entropy: [48]u8 = undefined;
-    random.bytes(&entropy);
-    const verifier = encodeBase64UrlNoPad(verifier_buf, &entropy);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
-    const challenge = encodeBase64UrlNoPad(challenge_buf, &digest);
-    return .{ .verifier = verifier, .challenge = challenge };
-}
-
 test "PKCE base64url encoding covers complete and partial groups" {
     const cases = .{
         .{ "", "" },
@@ -794,7 +800,7 @@ test "PKCE base64url encoding covers complete and partial groups" {
 }
 
 pub fn bearerHeaderAlloc(alloc: Allocator, access_token: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    return alloc.print("Bearer {s}", .{access_token});
 }
 
 pub fn validateClientMetadataUrl(url: []const u8) !void {
@@ -933,7 +939,14 @@ fn refreshCredentialsCore(
         auth.headers(),
     );
     defer response.deinit(alloc);
-    if (response.status != .ok) return error.McpRefreshRejected;
+    if (response.status != .ok) {
+        // Only OAuth's terminal grant rejection means re-authenticate; a 429
+        // or 5xx from the token endpoint is transient and retries as-is.
+        if (response.status == .bad_request and try refreshRejectionIsFinal(alloc, response.body)) {
+            return error.McpRefreshRejected;
+        }
+        return error.McpRefreshUnavailable;
+    }
     try validateJsonContentType(response.content_type);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
@@ -945,9 +958,9 @@ fn refreshCredentialsCore(
     const refresh_replacement = try dupeOptionalSecret(alloc, object, "refresh_token");
     errdefer if (refresh_replacement) |value| secret.zeroAndFree(alloc, value);
     const scope_replacement = try dupeOptionalString(alloc, object, "scope");
-    errdefer if (scope_replacement) |value| alloc.free(value);
+    errdefer if (scope_replacement) |value| mem_utils.free(alloc, value);
     const token_type_replacement = try dupeOptionalString(alloc, object, "token_type");
-    errdefer if (token_type_replacement) |value| alloc.free(value);
+    errdefer if (token_type_replacement) |value| mem_utils.free(alloc, value);
     if (token_type_replacement) |value| {
         if (!std.ascii.eqlIgnoreCase(value, "Bearer")) {
             return error.InvalidTokenResponse;
@@ -987,6 +1000,15 @@ fn waitForRefreshDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
     try deadline.wait(io_mod.getIo());
 }
 
+/// RFC 6749 §5.2: only invalid_grant marks the grant permanently dead.
+fn refreshRejectionIsFinal(alloc: Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const error_value = parsed.value.object.get("error") orelse return false;
+    return error_value == .string and std.mem.eql(u8, error_value.string, "invalid_grant");
+}
+
 pub fn revokeCredentials(alloc: Allocator, credentials: Credentials) !void {
     const endpoint = credentials.revocation_endpoint orelse
         return error.RevocationEndpointMissing;
@@ -1018,10 +1040,13 @@ pub fn authorizeAutomated(
     alloc: Allocator,
     options: AutomatedAuthorizationOptions,
 ) !AuthorizationResult {
+    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config);
+    defer if (bridge) |value| alloc.free(value.scope);
     return authorizeWithRedirect(
         alloc,
         options,
         "http://localhost:3000/callback",
+        if (bridge) |value| value.scope else null,
         null,
         requestAutomatedAuthorization,
     );
@@ -1029,9 +1054,9 @@ pub fn authorizeAutomated(
 
 fn callbackRedirectUri(alloc: Allocator, configured_port: ?u16, bound_port: u16) ![]u8 {
     if (configured_port) |port| {
-        return std.fmt.allocPrint(alloc, "http://localhost:{d}/callback", .{port});
+        return alloc.print("http://localhost:{d}/callback", .{port});
     }
-    return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/callback", .{bound_port});
+    return alloc.print("http://127.0.0.1:{d}/callback", .{bound_port});
 }
 
 const CallbackSocketCreation = struct {
@@ -1079,7 +1104,7 @@ fn listenPinnedCallback(address: std.Io.net.IpAddress) std.Io.net.IpAddress.List
             break :values .{ .family = posix.AF.INET6, .len = @sizeOf(posix.sockaddr.in6) };
         },
     };
-    const socket_creation = comptime callbackSocketCreation(builtin.os.tag);
+    const socket_creation = comptime callbackSocketCreation(builtin.target.os.tag);
 
     const socket_fd = while (true) {
         const rc = posix.system.socket(details.family, socket_creation.flags, 0);
@@ -1169,10 +1194,15 @@ pub fn authorizeInteractive(
     alloc: Allocator,
     options: InteractiveAuthorizationOptions,
 ) !AuthorizationResult {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
-    const configured_port = options.config.callback_port;
+    const bridge = try slack_bridge_config(alloc, options.endpoint, options.config);
+    defer if (bridge) |value| alloc.free(value.scope);
+    const bridge_origin = if (bridge) |value| value.origin else null;
+    if (bridge_origin != null and options.completion == null) return error.MissingAuthorizationCompletion;
+    errdefer if (options.completion) |completion| completion.finish(false);
+    const configured_port = if (bridge_origin == null) options.config.callback_port else null;
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", configured_port orelse 0);
     var listener = if (configured_port != null)
         listenPinnedCallback(address) catch return error.McpCallbackPortUnavailable
@@ -1188,7 +1218,7 @@ pub fn authorizeInteractive(
         };
     }
     defer if (ipv6_listener) |*value| value.deinit(io_mod.getIo());
-    const redirect_uri = try callbackRedirectUri(
+    const redirect_uri = if (bridge_origin != null) try alloc.dupe(u8, slack_callback_url) else try callbackRedirectUri(
         alloc,
         configured_port,
         listener.socket.address.getPort(),
@@ -1203,6 +1233,8 @@ pub fn authorizeInteractive(
             .caller = options.cancel_flag,
             .runtime = options.lifecycle_cancel_flag,
         },
+        .bridge_origin = bridge_origin,
+        .completion = options.completion,
     };
     return authorizeWithRedirect(
         alloc,
@@ -1215,33 +1247,110 @@ pub fn authorizeInteractive(
             .lifecycle_cancel_flag = options.lifecycle_cancel_flag,
         },
         redirect_uri,
+        if (bridge) |value| value.scope else null,
         &context,
         requestInteractiveAuthorization,
     );
 }
 
+const slack_callback_url = "https://fx.sh/api/slack/oauth/callback";
+const fx_slack_client_id = @import("slack_preset.zig").client_id;
+
+const SlackBridgeConfig = struct { origin: []const u8, scope: []u8 };
+
+fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_config: ClientConfig) !?SlackBridgeConfig {
+    const configured_client = client_config.client_id orelse return null;
+    if (!std.mem.eql(u8, configured_client, fx_slack_client_id)) return null;
+    const origin = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
+    const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
+    if (fixture) {
+        if (!std.mem.startsWith(u8, origin, "http://127.0.0.1:")) return error.InvalidSlackTestOrigin;
+        const port = std.fmt.parseInt(u16, origin[17..], 10) catch return error.InvalidSlackTestOrigin;
+        if (port < 1024) return error.InvalidSlackTestOrigin;
+    }
+    const resource = if (fixture) try alloc.print("{s}/mcp", .{origin}) else "https://mcp.slack.com/mcp";
+    defer if (fixture) alloc.free(resource);
+    if (!std.mem.eql(u8, endpoint, resource)) return null;
+    const url = try alloc.print("{s}/api/slack/install/config?flow=auth", .{origin});
+    defer alloc.free(url);
+    var response = try request(alloc, .GET, url, null, null, &.{});
+    defer response.deinit(alloc);
+    if (response.status != .ok) return error.SlackBridgeUnavailable;
+    try validateJsonContentType(response.content_type);
+    var config_arena = std.heap.ArenaAllocator.init(alloc);
+    defer config_arena.deinit();
+    const config = try std.json.parseFromSliceLeaky(struct {
+        client_id: []const u8,
+        redirect_uri: []const u8,
+        user_scopes: ?[]const []const u8 = null,
+    }, config_arena.allocator(), response.body, .{ .ignore_unknown_fields = true });
+    if (!std.mem.eql(u8, config.redirect_uri, slack_callback_url)) return error.InvalidSlackBridgeConfiguration;
+    if (!std.mem.eql(u8, configured_client, config.client_id)) return error.InvalidSlackBridgeConfiguration;
+    const scopes = config.user_scopes orelse return error.InvalidSlackBridgeConfiguration;
+    if (scopes.len == 0 or scopes.len > max_scope_tokens) return error.InvalidSlackBridgeConfiguration;
+    for (scopes) |scope| {
+        if (scope.len == 0 or scope.len > max_scope_token_bytes) return error.InvalidSlackBridgeConfiguration;
+        for (scope) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != ':' and byte != '.' and byte != '_' and byte != '-') return error.InvalidSlackBridgeConfiguration;
+        }
+    }
+    if (client_config.scopes_configured or client_config.scopes.len > 0) {
+        var configured_scopes: std.ArrayList([]const u8) = .empty;
+        defer configured_scopes.deinit(alloc);
+        for (client_config.scopes) |scope| try appendScopeTokens(alloc, &configured_scopes, scope);
+        for (scopes) |scope| {
+            if (!contains(configured_scopes.items, scope)) return error.SlackScopeConfigurationMismatch;
+        }
+    }
+    const scope = (try requestedScope(alloc, scopes, null, &.{}, null, false)).?;
+    errdefer alloc.free(scope);
+    if (scope.len > 1024) return error.InvalidSlackBridgeConfiguration;
+    return .{ .origin = origin, .scope = scope };
+}
+
+pub fn authentication_error_message(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SlackConfigurationConflict => @import("slack_preset.zig").configuration_conflict,
+        error.McpAuthorizationDenied => "Authorization was declined. Run the connection command again to retry",
+        error.McpAuthorizationCallbackTimedOut => "Authorization timed out. Run the connection command again and finish authorization in your browser while fx stays open",
+        error.SlackScopeConfigurationMismatch => "Your configured Slack scopes request fewer permissions than fx requires. Authorization was not started. Custom scope subsets are not supported for the fx app. Remove the local scopes override only if you want to authorize the full shared scope set",
+        else => @errorName(err),
+    };
+}
+
+const AuthorizationRequest = struct {
+    url: []const u8,
+    redirect_uri: []const u8,
+    endpoint: []const u8,
+    resource: []const u8,
+    state: []const u8,
+    code_challenge: []const u8,
+    client_id: []const u8,
+    scope: ?[]const u8,
+};
+
 const AuthorizationRequestFn = *const fn (
     ctx: ?*anyopaque,
     alloc: Allocator,
-    authorization_url: []const u8,
-    redirect_uri: []const u8,
+    request: AuthorizationRequest,
 ) anyerror!AuthorizationResponse;
 
 fn authorizeWithRedirect(
     alloc: Allocator,
     options: AutomatedAuthorizationOptions,
     redirect_uri: []const u8,
+    fixed_scope: ?[]const u8,
     authorization_ctx: ?*anyopaque,
     request_authorization: AuthorizationRequestFn,
 ) !AuthorizationResult {
     try checkAuthorizationCancellation(options.cancellation());
     const endpoint = try canonicalResource(alloc, options.endpoint);
-    errdefer alloc.free(endpoint);
+    errdefer mem_utils.free(alloc, endpoint);
     var resource = if (options.config.resource) |configured|
         try canonicalResource(alloc, configured)
     else
         try alloc.dupe(u8, endpoint);
-    errdefer alloc.free(resource);
+    errdefer mem_utils.free(alloc, resource);
 
     var prm = try discoverResourceMetadata(
         alloc,
@@ -1275,7 +1384,7 @@ fn authorizeWithRedirect(
     defer registration.deinit(alloc);
     try checkAuthorizationCancellation(options.cancellation());
 
-    const scope = try requestedScope(
+    const scope = if (fixed_scope) |value| try alloc.dupe(u8, value) else try requestedScope(
         alloc,
         options.config.scopes,
         options.challenge.scope,
@@ -1322,8 +1431,16 @@ fn authorizeWithRedirect(
     var callback = try request_authorization(
         authorization_ctx,
         alloc,
-        authorization_url,
-        redirect_uri,
+        .{
+            .url = authorization_url,
+            .redirect_uri = redirect_uri,
+            .endpoint = metadata.authorization_endpoint,
+            .resource = resource,
+            .state = state,
+            .code_challenge = code_challenge,
+            .client_id = registration.client_id,
+            .scope = scope,
+        },
     );
     defer callback.deinit(alloc);
     try checkAuthorizationCancellation(options.cancellation());
@@ -1357,11 +1474,11 @@ fn authorizeWithRedirect(
     errdefer grant.deinit(alloc);
     try checkAuthorizationCancellation(options.cancellation());
     const owned_issuer = try alloc.dupe(u8, metadata.issuer);
-    errdefer alloc.free(owned_issuer);
+    errdefer mem_utils.free(alloc, owned_issuer);
     const authorization_endpoint = try alloc.dupe(u8, metadata.authorization_endpoint);
-    errdefer alloc.free(authorization_endpoint);
+    errdefer mem_utils.free(alloc, authorization_endpoint);
     const token_endpoint = try alloc.dupe(u8, metadata.token_endpoint);
-    errdefer alloc.free(token_endpoint);
+    errdefer mem_utils.free(alloc, token_endpoint);
     const revocation_endpoint = if (metadata.revocation_endpoint) |value|
         try alloc.dupe(u8, value)
     else
@@ -1389,13 +1506,12 @@ fn authorizeWithRedirect(
 fn requestAutomatedAuthorization(
     _: ?*anyopaque,
     alloc: Allocator,
-    authorization_url: []const u8,
-    redirect_uri: []const u8,
+    authorization: AuthorizationRequest,
 ) !AuthorizationResponse {
     var response = try request(
         alloc,
         .GET,
-        authorization_url,
+        authorization.url,
         null,
         null,
         &.{},
@@ -1406,7 +1522,7 @@ fn requestAutomatedAuthorization(
     }
     const location = response.location orelse
         return error.AuthorizationRedirectMissing;
-    try validateRedirectTarget(location, redirect_uri);
+    try validateRedirectTarget(location, authorization.redirect_uri);
     return parseAuthorizationRedirect(alloc, location);
 }
 
@@ -1416,6 +1532,8 @@ const InteractiveAuthorizationContext = struct {
     open_ctx: ?*anyopaque,
     open_url: OpenUrlFn,
     cancellation: operation_control.CancellationSources,
+    bridge_origin: ?[]const u8 = null,
+    completion: ?*InteractiveCompletion = null,
 };
 
 const interactive_callback_timeout_ms: i32 = 5 * 60 * 1000;
@@ -1470,12 +1588,12 @@ fn waitForInteractiveCallback(
 fn requestInteractiveAuthorization(
     raw_ctx: ?*anyopaque,
     alloc: Allocator,
-    authorization_url: []const u8,
-    _: []const u8,
+    authorization: AuthorizationRequest,
 ) !AuthorizationResponse {
     const ctx: *InteractiveAuthorizationContext = @ptrCast(@alignCast(raw_ctx.?));
+    if (ctx.bridge_origin != null) return request_bridged_authorization(ctx, alloc, authorization);
     try checkAuthorizationCancellation(ctx.cancellation);
-    if (!try ctx.open_url(ctx.open_ctx, alloc, authorization_url)) {
+    if (!try ctx.open_url(ctx.open_ctx, alloc, authorization.url)) {
         return error.McpAuthorizationBrowserOpenFailed;
     }
     const max_accepts = if (ctx.ipv6_listener == null)
@@ -1504,6 +1622,116 @@ fn requestInteractiveAuthorization(
     return error.InvalidAuthorizationCallback;
 }
 
+fn request_bridged_authorization(
+    ctx: *InteractiveAuthorizationContext,
+    alloc: Allocator,
+    authorization: AuthorizationRequest,
+) !AuthorizationResponse {
+    const origin = ctx.bridge_origin.?;
+    const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
+    const endpoint = if (fixture) try alloc.print("{s}/authorize", .{origin}) else "https://slack.com/oauth/v2_user/authorize";
+    defer if (fixture) alloc.free(endpoint);
+    if (!std.mem.eql(u8, authorization.endpoint, endpoint)) return error.InvalidSlackAuthorizationEndpoint;
+    const expected_resource = if (fixture) try alloc.print("{s}/", .{origin}) else "https://mcp.slack.com/";
+    defer if (fixture) alloc.free(expected_resource);
+    if (!std.mem.eql(u8, authorization.resource, expected_resource)) return error.InvalidSlackAuthorizationResource;
+    const scope = authorization.scope orelse return error.InvalidSlackBridgeConfiguration;
+    var start: std.Io.Writer.Allocating = .init(alloc);
+    defer start.deinit();
+    try start.writer.print("{s}/api/slack/auth?", .{origin});
+    var form: Form = .{};
+    try form.append(&start.writer, "state", authorization.state);
+    try form.append(&start.writer, "challenge", authorization.code_challenge);
+    try form.append(&start.writer, "client_id", authorization.client_id);
+    try form.append(&start.writer, "scope", scope);
+    var port_buffer: [5]u8 = undefined;
+    try form.append(&start.writer, "port", try std.mem.print(&port_buffer, "{d}", .{ctx.listener.socket.address.getPort()}));
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .raw = .fromSeconds(300), .clock = .boot });
+    try checkAuthorizationCancellation(ctx.cancellation);
+    if (!try ctx.open_url(ctx.open_ctx, alloc, start.written())) return error.McpAuthorizationBrowserOpenFailed;
+    var parser = oauth.FormCallbackContext{
+        .expected_state = authorization.state,
+        .invalid_error = error.InvalidAuthorizationCallback,
+        .allow_issuer = true,
+        .max_value_bytes = 2048,
+    };
+    while (true) {
+        try checkAuthorizationCancellation(ctx.cancellation);
+        if (deadline.durationFromNow(io_mod.getIo()).raw.nanoseconds <= 0) return error.McpAuthorizationCallbackTimedOut;
+        var accepted = (try browser_callback.await_form(oauth.FormCallback, oauth.parse_form_callback, alloc, ctx.listener, &parser, ctx.cancellation.caller, ctx.cancellation.runtime, origin)) orelse continue;
+        ctx.completion.?.stream = accepted.stream;
+        ctx.completion.?.origin = origin;
+        errdefer accepted.callback.deinit(alloc);
+        try checkAuthorizationCancellation(ctx.cancellation);
+        if (deadline.durationFromNow(io_mod.getIo()).raw.nanoseconds <= 0) return error.McpAuthorizationCallbackTimedOut;
+        if (accepted.callback.denied) return error.McpAuthorizationDenied;
+        const response: AuthorizationResponse = .{
+            .state = accepted.callback.state,
+            .code = accepted.callback.code.?,
+            .issuer = accepted.callback.issuer,
+        };
+        accepted.callback.state = &.{};
+        accepted.callback.code = null;
+        accepted.callback.issuer = null;
+        return response;
+    }
+}
+
+test "personal Slack relay consumes state once and preserves issuer and form encoding" {
+    const alloc = std.testing.allocator;
+    var context = oauth.FormCallbackContext{
+        .expected_state = "expected",
+        .invalid_error = error.InvalidAuthorizationCallback,
+        .allow_issuer = true,
+        .max_value_bytes = 2048,
+    };
+    try std.testing.expect(oauth.parse_form_callback(&context, alloc, "state=wrong&code=code") == .unrelated);
+    var parsed = oauth.parse_form_callback(&context, alloc, "state=expected&code=code%2Bvalue&iss=https%3A%2F%2Fmcp.slack.com");
+    try std.testing.expect(parsed == .accepted);
+    defer parsed.accepted.deinit(alloc);
+    try std.testing.expectEqualStrings("code+value", parsed.accepted.code.?);
+    try std.testing.expectEqualStrings("https://mcp.slack.com", parsed.accepted.issuer.?);
+    try std.testing.expect(oauth.parse_form_callback(&context, alloc, "state=expected&code=code") == .unrelated);
+    for ([_][]const u8{
+        "state=expected&state=expected&code=x",
+        "state=expected&code=x&code=y",
+        "state=expected&code=x&error=denied",
+        "state=expected&code=x&iss=a&iss=b",
+        "state=expected&code=x&redirect_uri=https://evil.example",
+        "state=expected&code=%zz",
+    }) |body| {
+        var other = oauth.FormCallbackContext{
+            .expected_state = "expected",
+            .invalid_error = error.InvalidAuthorizationCallback,
+            .allow_issuer = true,
+            .max_value_bytes = 2048,
+        };
+        try std.testing.expect(oauth.parse_form_callback(&other, alloc, body) == .failed);
+        try std.testing.expect(!other.consumed);
+    }
+    var invalid_escape_context = oauth.FormCallbackContext{
+        .expected_state = "expected",
+        .invalid_error = error.InvalidAuthorizationCallback,
+        .allow_issuer = true,
+        .max_value_bytes = 2048,
+    };
+    const invalid_escape = oauth.parse_form_callback(
+        &invalid_escape_context,
+        alloc,
+        "state=expected&code=%zz",
+    );
+    try std.testing.expectEqual(error.InvalidPercentEncoding, invalid_escape.failed);
+    var denied_context = oauth.FormCallbackContext{
+        .expected_state = "expected",
+        .invalid_error = error.InvalidAuthorizationCallback,
+        .allow_issuer = true,
+        .max_value_bytes = 2048,
+    };
+    var denied = oauth.parse_form_callback(&denied_context, alloc, "state=expected&error=access_denied");
+    defer denied.accepted.deinit(alloc);
+    try std.testing.expect(denied.accepted.denied);
+}
+
 fn readInteractiveAuthorizationCallback(
     alloc: Allocator,
     stream: std.Io.net.Stream,
@@ -1522,13 +1750,13 @@ fn readInteractiveAuthorizationCallback(
         if (std.mem.endsWith(u8, request_bytes[0..request_len], "\r\n\r\n")) break;
     }
     if (request_len == request_bytes.len) return error.AuthorizationCallbackTooLarge;
-    const line_end = std.mem.indexOf(u8, request_bytes[0..request_len], "\r\n") orelse
+    const line_end = std.mem.find(u8, request_bytes[0..request_len], "\r\n") orelse
         return error.InvalidAuthorizationCallback;
     const request_line = request_bytes[0..line_end];
     if (!std.mem.startsWith(u8, request_line, "GET ")) {
         return error.InvalidAuthorizationCallback;
     }
-    const target_end = std.mem.indexOfScalarPos(u8, request_line, 4, ' ') orelse
+    const target_end = std.mem.findScalarPos(u8, request_line, 4, ' ') orelse
         return error.InvalidAuthorizationCallback;
     const target = request_line[4..target_end];
     if (!std.mem.startsWith(u8, target, "/callback?")) {
@@ -1544,8 +1772,8 @@ fn readInteractiveAuthorizationCallback(
 }
 
 fn validateRedirectTarget(location: []const u8, redirect_uri: []const u8) !void {
-    const query = std.mem.indexOfScalar(u8, location, '?') orelse
-        std.mem.indexOfScalar(u8, location, '#') orelse location.len;
+    const query = std.mem.findScalar(u8, location, '?') orelse
+        std.mem.findScalar(u8, location, '#') orelse location.len;
     if (!std.mem.eql(u8, location[0..query], redirect_uri)) {
         return error.InvalidAuthorizationCallback;
     }
@@ -1629,7 +1857,7 @@ fn resolveClientRegistration(
 ) !ClientRegistration {
     if (config.client_id) |client_id| {
         const owned_client_id = try alloc.dupe(u8, client_id);
-        errdefer alloc.free(owned_client_id);
+        errdefer mem_utils.free(alloc, owned_client_id);
         const client_secret = if (config.client_secret) |value|
             try alloc.dupe(u8, value)
         else
@@ -1652,7 +1880,7 @@ fn resolveClientRegistration(
         if (config.client_metadata_url) |url| {
             try validateOAuthUrlForResource(url, resource);
             const client_id = try alloc.dupe(u8, url);
-            errdefer alloc.free(client_id);
+            errdefer mem_utils.free(alloc, client_id);
             return .{
                 .client_id = client_id,
                 .client_secret = null,
@@ -1698,7 +1926,7 @@ fn resolveClientRegistration(
     if (parsed.value != .object) return error.ClientRegistrationFailed;
     const object = parsed.value.object;
     const client_id = try dupeRequiredSecret(alloc, object, "client_id");
-    errdefer alloc.free(client_id);
+    errdefer mem_utils.free(alloc, client_id);
     const client_secret = try dupeOptionalSecret(alloc, object, "client_secret");
     errdefer if (client_secret) |value| secret.zeroAndFree(alloc, value);
     const returned_method = if (object.get("token_endpoint_auth_method")) |value|
@@ -1723,6 +1951,7 @@ fn chooseTokenEndpointAuthMethod(
     if (has_secret and metadata.supports(.client_secret_basic)) return "client_secret_basic";
     if (has_secret and metadata.supports(.client_secret_post)) return "client_secret_post";
     if (metadata.supports(.none)) return "none";
+    if (!has_secret and metadata.supports(.s256)) return "none";
     if (metadata.supports(.client_secret_basic)) return "client_secret_basic";
     if (metadata.supports(.client_secret_post)) return "client_secret_post";
     return error.UnsupportedTokenEndpointAuthenticationMethod;
@@ -1741,7 +1970,7 @@ fn buildAuthorizationUrl(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.writeAll(endpoint);
-    try out.writer.writeByte(if (std.mem.indexOfScalar(u8, endpoint, '?') == null) '?' else '&');
+    try out.writer.writeByte(if (std.mem.findScalar(u8, endpoint, '?') == null) '?' else '&');
     var form: Form = .{};
     try form.append(&out.writer, "response_type", "code");
     try form.append(&out.writer, "client_id", client_id);
@@ -1830,7 +2059,7 @@ fn tokenEndpointAuthentication(
     );
     defer secret.zeroAndFree(alloc, encoded);
     _ = std.base64.standard.Encoder.encode(encoded, pair.written());
-    const authorization = try std.fmt.allocPrint(alloc, "Basic {s}", .{encoded});
+    const authorization = try alloc.print("Basic {s}", .{encoded});
     return .{
         .authorization = authorization,
         .header = .{.{
@@ -1892,7 +2121,7 @@ fn exchangeAuthorizationCode(
     const refresh_token = try dupeOptionalSecret(alloc, object, "refresh_token");
     errdefer if (refresh_token) |value| secret.zeroAndFree(alloc, value);
     const token_type = try dupeOptionalStringDefault(alloc, object, "token_type", "Bearer");
-    errdefer alloc.free(token_type);
+    errdefer mem_utils.free(alloc, token_type);
     if (!std.ascii.eqlIgnoreCase(token_type, "Bearer")) return error.InvalidTokenResponse;
     const scope = try dupeOptionalStringDefault(
         alloc,
@@ -1900,11 +2129,11 @@ fn exchangeAuthorizationCode(
         "scope",
         requested_scope orelse "",
     );
-    errdefer alloc.free(scope);
+    errdefer mem_utils.free(alloc, scope);
     const expires_at_ms = try tokenExpiresAt(object, io_mod.milliTimestamp());
 
     const client_id = try alloc.dupe(u8, registration.client_id);
-    errdefer alloc.free(client_id);
+    errdefer mem_utils.free(alloc, client_id);
     const client_secret = if (registration.client_secret) |value|
         try alloc.dupe(u8, value)
     else
@@ -1914,7 +2143,7 @@ fn exchangeAuthorizationCode(
         u8,
         registration.token_endpoint_auth_method,
     );
-    errdefer alloc.free(auth_method);
+    errdefer mem_utils.free(alloc, auth_method);
     return .{
         .client_id = client_id,
         .client_secret = client_secret,
@@ -1961,38 +2190,6 @@ fn revokeToken(
     );
     defer response.deinit(alloc);
     if (response.status != .ok) return error.TokenRevocationFailed;
-}
-
-const Form = struct {
-    first: bool = true,
-
-    fn append(
-        self: *Form,
-        writer: *std.Io.Writer,
-        key: []const u8,
-        value: []const u8,
-    ) !void {
-        if (!self.first) try writer.writeByte('&');
-        self.first = false;
-        try percentEncode(writer, key);
-        try writer.writeByte('=');
-        try percentEncode(writer, value);
-    }
-};
-
-fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
-    const hex = "0123456789ABCDEF";
-    for (value) |byte| {
-        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or
-            byte == '.' or byte == '~')
-        {
-            try writer.writeByte(byte);
-        } else {
-            try writer.writeByte('%');
-            try writer.writeByte(hex[byte >> 4]);
-            try writer.writeByte(hex[byte & 0x0f]);
-        }
-    }
 }
 
 fn request(
@@ -2044,7 +2241,7 @@ fn request(
         try alloc.dupe(u8, value)
     else
         null;
-    errdefer if (response_content_type) |value| alloc.free(value);
+    errdefer if (response_content_type) |value| mem_utils.free(alloc, value);
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
     const body = reader.allocRemaining(
@@ -2208,13 +2405,12 @@ fn originAlloc(alloc: Allocator, uri: std.Uri) ![]u8 {
     const default_port = (std.ascii.eqlIgnoreCase(uri.scheme, "https") and uri.port == 443) or
         (std.ascii.eqlIgnoreCase(uri.scheme, "http") and uri.port == 80);
     if (uri.port) |port| {
-        if (!default_port) return std.fmt.allocPrint(
-            alloc,
+        if (!default_port) return alloc.print(
             "{s}://{s}:{d}",
             .{ scheme, canonical_host, port },
         );
     }
-    return std.fmt.allocPrint(alloc, "{s}://{s}", .{ scheme, canonical_host });
+    return alloc.print("{s}://{s}", .{ scheme, canonical_host });
 }
 
 fn rawPathAlloc(alloc: Allocator, uri: std.Uri) ![]u8 {
@@ -2276,7 +2472,7 @@ fn dupeOptionalStringArrayDefault(
 ) ![][]u8 {
     const value = object.get(key) orelse {
         const result = try alloc.alloc([]u8, 1);
-        errdefer alloc.free(result);
+        errdefer mem_utils.free(alloc, result);
         result[0] = try alloc.dupe(u8, default_value);
         return result;
     };
@@ -2287,9 +2483,9 @@ fn dupeStringArray(alloc: Allocator, value: std.json.Value) ![][]u8 {
     if (value != .array) return error.InvalidMetadataField;
     if (value.array.items.len == 0) return &.{};
     const result = try alloc.alloc([]u8, value.array.items.len);
-    errdefer alloc.free(result);
+    errdefer mem_utils.free(alloc, result);
     var initialized: usize = 0;
-    errdefer for (result[0..initialized]) |item| alloc.free(item);
+    errdefer for (result[0..initialized]) |item| mem_utils.free(alloc, item);
     for (value.array.items, 0..) |item, index| {
         if (item != .string or item.string.len == 0) return error.InvalidMetadataField;
         result[index] = try alloc.dupe(u8, item.string);
@@ -2339,35 +2535,6 @@ fn appendUnique(
     for (tokens.items) |existing| if (std.mem.eql(u8, existing, value)) return;
     if (tokens.items.len >= max_scope_tokens) return error.TooManyOAuthScopes;
     try tokens.append(alloc, value);
-}
-
-fn queryValueAlloc(alloc: Allocator, query: []const u8, key: []const u8) ![]u8 {
-    var pairs = std.mem.splitScalar(u8, query, '&');
-    while (pairs.next()) |pair| {
-        const equals = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (!std.mem.eql(u8, pair[0..equals], key)) continue;
-        return percentDecodeAlloc(alloc, pair[equals + 1 ..]);
-    }
-    return error.MissingQueryParameter;
-}
-
-fn percentDecodeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    var index: usize = 0;
-    while (index < value.len) {
-        if (value[index] == '%') {
-            if (index + 2 >= value.len) return error.InvalidPercentEncoding;
-            const high = std.fmt.charToDigit(value[index + 1], 16) catch return error.InvalidPercentEncoding;
-            const low = std.fmt.charToDigit(value[index + 2], 16) catch return error.InvalidPercentEncoding;
-            try out.writer.writeByte((high << 4) | low);
-            index += 3;
-        } else {
-            try out.writer.writeByte(if (value[index] == '+') ' ' else value[index]);
-            index += 1;
-        }
-    }
-    return out.toOwnedSlice();
 }
 
 fn freeStrings(alloc: Allocator, values: []const []u8) void {
@@ -2541,6 +2708,25 @@ test "authorization metadata defaults omitted token endpoint authentication to c
     try std.testing.expectEqualStrings(
         "client_secret_basic",
         try chooseTokenEndpointAuthMethod(metadata, false),
+    );
+}
+
+test "authorization metadata chooses none for secretless clients when S256 PKCE is supported" {
+    const alloc = std.testing.allocator;
+    var metadata = try parseAuthorizationMetadata(
+        alloc,
+        "{\"issuer\":\"https://mcp.slack.com\",\"authorization_endpoint\":\"https://slack.com/oauth/v2_user/authorize\",\"token_endpoint\":\"https://slack.com/api/oauth.v2.user.access\",\"token_endpoint_auth_methods_supported\":[\"client_secret_post\"],\"code_challenge_methods_supported\":[\"S256\"]}",
+        "https://mcp.slack.com",
+    );
+    defer metadata.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "none",
+        try chooseTokenEndpointAuthMethod(metadata, false),
+    );
+    try std.testing.expectEqualStrings(
+        "client_secret_post",
+        try chooseTokenEndpointAuthMethod(metadata, true),
     );
 }
 
@@ -2747,7 +2933,7 @@ test "interactive callback redirect honors a pinned port" {
 }
 
 test "interactive callback rejects a pinned port already listening" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -2772,7 +2958,7 @@ test "interactive callback rejects a pinned port already listening" {
 }
 
 test "interactive callback rejects a pinned IPv6 port already listening" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     var address = try std.Io.net.IpAddress.parse("::1", 0);
@@ -2800,7 +2986,7 @@ test "interactive callback rejects a pinned IPv6 port already listening" {
 }
 
 test "interactive callback immediately reuses a completed pinned port" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -2864,7 +3050,7 @@ test "pinned callback sockets create close-on-exec atomically where supported" {
 }
 
 test "interactive callback wait observes caller and lifecycle cancellation" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -2894,4 +3080,12 @@ test "interactive callback wait observes caller and lifecycle cancellation" {
         );
         try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
     }
+}
+
+test "refresh rejection is final only for invalid_grant" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try refreshRejectionIsFinal(alloc, "{\"error\":\"invalid_grant\"}"));
+    try std.testing.expect(!(try refreshRejectionIsFinal(alloc, "{\"error\":\"temporarily_unavailable\"}")));
+    try std.testing.expect(!(try refreshRejectionIsFinal(alloc, "<html>502</html>")));
+    try std.testing.expect(!(try refreshRejectionIsFinal(alloc, "{}")));
 }

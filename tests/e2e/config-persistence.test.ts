@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import {
   existsSync,
   mkdirSync,
@@ -6,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -63,7 +65,7 @@ async function disablePromptHistory(
   settingsPath: string,
 ): Promise<void> {
   await session.sendText("/settings");
-  await session.waitForText("←→ Change", TIMEOUT);
+  await session.waitForText("←→ change", TIMEOUT);
   await session.sendLiteral("prompt history");
   await session.waitForPane(
     (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
@@ -82,7 +84,7 @@ async function disablePromptHistory(
   if (enabled !== false) throw new Error("Timed out disabling prompt history");
   await session.sendKeys("Escape");
   await session.waitForPane(
-    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ Change"),
+    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
     TIMEOUT,
   );
 }
@@ -109,7 +111,7 @@ function migrationSnapshotPath(home: string, field: string): string {
 function clearedPaneWithoutAllowlistRules(pane: string): boolean {
   return (
     hasEmptyComposer(pane) &&
-    !pane.includes("● Allowlist:") &&
+    !pane.match(/[*✓!✗⊘i] allowlist:/) &&
     !pane.includes("user *")
   );
 }
@@ -124,6 +126,147 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     session = null;
     secondSession = null;
   });
+
+  serialTest("configured provider interactive unsafe profile permits inspection but blocks model sends", async () => {
+    const fixture = createConfiguredProviderFixture();
+    const profile = join(fixture.home, ".fx");
+    const target = join(fixture.home, "profile-target");
+    try {
+      renameSync(profile, target);
+      symlinkSync(target, profile);
+      session = await TmuxSession.create({ cwd: fixture.workspace, env: fixture.env });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("must not send with an unreadable profile");
+      await session.waitForText("restart fx before sending a message", TIMEOUT);
+      expect(fixture.requests).toHaveLength(0);
+      rmSync(profile);
+      renameSync(target, profile);
+      await session.sendKeys("C-u");
+      await session.sendText("must still not send until restart");
+      await Bun.sleep(300);
+      await session.kill();
+      session = null;
+      expect(fixture.requests).toHaveLength(0);
+    } finally {
+      await session?.kill();
+      session = null;
+      fixture.close();
+    }
+  }, TIMEOUT * 2);
+
+  serialTest("configured provider interactive resume isolates keys and honors process selection", async () => {
+    const fixture = createConfiguredProviderFixture();
+    try {
+      (fixture.settings.providers.local as any).auth = { type: "bearer", env: "FX_TEST_LOCAL_TOKEN" };
+      fixture.save();
+      const env = { ...fixture.env, FX_TEST_LOCAL_TOKEN: "local-only-token" };
+      const created = await runFx(["ask", "--json", "remember remote"], { cwd: fixture.workspace, env: { ...env, FX_PROVIDER: "remote" } });
+      if (created.code !== 0) throw new Error(created.stdout + created.stderr);
+      const id = JSON.parse(created.stdout).session_id;
+      for (const [index, override] of [undefined, "local"].entries()) {
+        session = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume ${JSON.stringify(id)}`, cwd: fixture.workspace, env: { ...env, FX_PROVIDER: override } });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText(`resume check ${index}`);
+        await session.waitForText("local reply", TIMEOUT);
+        await session.waitForComposer(TIMEOUT);
+        const until = Date.now() + TIMEOUT;
+        while (fixture.requests.length < index + 2 && Date.now() < until) await Bun.sleep(20);
+        expect(fixture.requests).toHaveLength(index + 2);
+        expect(fixture.requests[index + 1].authorization).toBe(override ? "Bearer local-only-token" : "Bearer own-provider-token");
+        expect(fixture.requests[index + 1].body.model).toBe(override ? "local-model" : "remote-model");
+        expect(await session.captureFullScrollbackEscapes()).toContain(`resume check ${index}`);
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+      }
+    } finally {
+      await session?.kill();
+      session = null;
+      fixture.close();
+    }
+  }, TIMEOUT * 3);
+
+  serialTest("configured provider interactive resume cannot borrow a key when its own is missing", async () => {
+    const fixture = createConfiguredProviderFixture();
+    try {
+      (fixture.settings.providers.local as any).auth = { type: "bearer", env: "FX_TEST_LOCAL_TOKEN" };
+      fixture.save();
+      const env = { ...fixture.env, FX_TEST_LOCAL_TOKEN: "local-only-token" };
+      const created = await runFx(["ask", "--json", "remember remote"], { cwd: fixture.workspace, env: { ...env, FX_PROVIDER: "remote" } });
+      if (created.code !== 0) throw new Error(created.stdout + created.stderr);
+      const id = JSON.parse(created.stdout).session_id;
+      session = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume ${JSON.stringify(id)}`, cwd: fixture.workspace, env: { ...env, FX_TEST_PROVIDER_TOKEN: undefined } });
+      await session.waitForText("Configured provider authentication is unavailable", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("must not send with the startup key");
+      await Bun.sleep(500);
+      expect(fixture.requests).toHaveLength(1);
+      expect(await session.captureFullScrollback()).not.toContain("Connect ChatGPT");
+      await session.kill();
+      session = null;
+    } finally {
+      await session?.kill();
+      session = null;
+      fixture.close();
+    }
+  }, TIMEOUT * 2);
+
+  serialTest("configured provider interactive chat and compaction stay on the local connection", async () => {
+    let replies = 0;
+    let read = false;
+    const fixture = createConfiguredProviderFixture(body => {
+      if (!body.tools?.length) return configuredCompletion(body.model, "provider summary");
+      // The first turn reads a file, so compaction has work to summarize.
+      if (!read) {
+        read = true;
+        return configuredToolCompletion(body.model, "read_file", { path: "notes.txt" }, "local-read");
+      }
+      return configuredCompletion(body.model, `local reply ${++replies}`);
+    });
+    writeFileSync(join(fixture.workspace, "notes.txt"), "notes\n");
+    fixture.settings.providers.local.model_metadata["local-model"].context_window = 65536;
+    fixture.settings.providers.local.model_metadata["local-model"].max_output_tokens = 4096;
+    fixture.save();
+    const stderrPath = join(fixture.home, "stderr.log");
+    try {
+      session = await TmuxSession.create({ cwd: fixture.workspace, env: fixture.env, stderrPath });
+      await session.waitForComposer(TIMEOUT);
+      for (let turn = 1; turn <= 5; turn++) {
+        await session.sendText("remember context " + "detail ".repeat(500));
+        await session.waitForText(`local reply ${turn}`, TIMEOUT);
+        await session.waitForComposer(TIMEOUT);
+      }
+      expect(fixture.requests).toHaveLength(6);
+      await session.sendText("/status");
+      await session.waitForText(`provider_endpoint=${fixture.settings.providers.local.base_url}`, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/compact");
+      const until = Date.now() + TIMEOUT;
+      let committed = false;
+      while (Date.now() < until) {
+        const root = join(fixture.home, ".fx", "sessions");
+        if (existsSync(root)) committed = readdirSync(root, { withFileTypes: true }).filter(entry => entry.isDirectory()).some(entry => {
+          const events = join(root, entry.name, "events.jsonl");
+          return existsSync(events) && readFileSync(events, "utf8").includes("provider summary");
+        });
+        if (committed) break;
+        await Bun.sleep(25);
+      }
+      if (!committed) throw new Error(`compaction did not commit; requests=${JSON.stringify(fixture.requests.map(request => ({ bytes: JSON.stringify(request.body).length, tools: request.body.tools?.length, messageBytes: JSON.stringify(request.body.messages).length })))}\n${(await session.captureFullScrollback()).slice(-1500)}`);
+      expect(fixture.requests.length).toBeGreaterThanOrEqual(7);
+      expect(fixture.requests.every(request => request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
+      const scrollback = await session.captureFullScrollbackEscapes();
+      expect(scrollback).toContain("local reply");
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      session = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      await session?.kill();
+      session = null;
+      fixture.close();
+    }
+  }, TIMEOUT * 3);
 
   serialTest(
     "user preferences migrate globally and load in another project",
@@ -214,15 +357,15 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         );
         expect(beforeModelCommit).not.toHaveProperty("model");
         await session.sendKeys("Enter");
-        await session.waitForText("● Switched to anthropic/claude-opus-4.7", TIMEOUT);
+        await session.waitForText("* Switched to anthropic/claude-opus-4.7", TIMEOUT);
         await session.sendText("/fast");
-        await session.waitForText("● Fast: on", TIMEOUT);
+        await session.waitForText("* fast: on", TIMEOUT);
         await session.sendText("/statusline context");
-        await session.waitForText("● Statusline: context:", TIMEOUT);
+        await session.waitForText("* statusline: context:", TIMEOUT);
         await session.sendText("/statusline session");
-        await session.waitForText("● Statusline: session:", TIMEOUT);
+        await session.waitForText("* statusline: session:", TIMEOUT);
         await session.sendText("/statusline workspace");
-        await session.waitForText("● Statusline: workspace:", TIMEOUT);
+        await session.waitForText("* statusline: workspace:", TIMEOUT);
         await session.sendText("/settings startup-scrollback off");
         await session.waitForText("startup_scrollback: off", TIMEOUT);
         await disablePromptHistory(session, join(home, ".fx", "settings.json"));
@@ -288,14 +431,14 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(startup).not.toContain("adaptive");
         expect(startup).not.toContain("⚡︎ fast");
         await session.sendText("/settings");
-        const pane = await session.waitForText("←→ Change", TIMEOUT);
+        const pane = await session.waitForText("←→ change", TIMEOUT);
         expect(pane).toContain("anthropic/claude-opus-4.7");
         expect(pane).toContain("Startup scrollback");
         expect(pane).toContain("Prompt history");
         await session.sendKeys("Escape");
         await session.waitForPane(
           (current) =>
-            hasEmptyComposer(current) && !current.includes("←→ Change"),
+            hasEmptyComposer(current) && !current.includes("←→ change"),
           TIMEOUT,
         );
         await session.sendText("/statusline");
@@ -396,13 +539,13 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/allowlist view local");
         await session.waitForText(
-          "● Allowlist: local persistent allow rules: (none)",
+          "* allowlist: local persistent allow rules: (none)",
           TIMEOUT,
         );
         await session.sendText("/allowlist view user");
         await session.waitForText("user *", TIMEOUT);
         await session.sendText('/allowlist user remove command "padded *"');
-        await session.waitForText("● Allowlist: removed command", TIMEOUT);
+        await session.waitForText("* allowlist: removed command", TIMEOUT);
         await session.sendText("/clear");
         await session.waitForPane(
           clearedPaneWithoutAllowlistRules,
@@ -410,7 +553,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         );
         await session.sendText("/allowlist view effective");
         const inherited = await session.waitForText("user *", TIMEOUT);
-        expect(inherited).toContain("● Allowlist: effective persistent allow rules:");
+        expect(inherited).toContain("* allowlist: effective persistent allow rules:");
 
         await session.sendText('/allowlist add command "local-b *"');
         await session.waitForText("(scope=local)", TIMEOUT);
@@ -430,7 +573,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(localEffective).not.toContain("user *");
 
         await session.sendText('/allowlist user remove command "user *"');
-        await session.waitForText("● Allowlist: removed command", TIMEOUT);
+        await session.waitForText("* allowlist: removed command", TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
@@ -811,7 +954,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/settings");
-        await session.waitForText("←→ Change", TIMEOUT);
+        await session.waitForText("←→ change", TIMEOUT);
         await session.sendLiteral("reason");
         const effortSetting = await session.waitForText("Reasoning effort", TIMEOUT);
         expect(effortSetting).toContain("low");
@@ -1117,7 +1260,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           "Bearer fake-capability-key",
         );
         expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
-          reasoning: "max",
+          reasoning: "xhigh",
           providerOptions: { gateway: { speed: "fast" } },
         });
         expect(JSON.parse(gateway.requests[1]!.body)).not.toHaveProperty("fast");
@@ -1236,7 +1379,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const pickerPane = await session.waitForText("xai/grok-build-1", TIMEOUT);
         expect(pickerPane).toContain("xai/grok-build-1");
         await session.sendKeys("Enter");
-        await session.waitForText("● Switched to xai/grok-build-1", TIMEOUT);
+        await session.waitForText("* Switched to xai/grok-build-1", TIMEOUT);
         await session.waitForPane(
           (pane) =>
             hasEmptyComposer(pane) &&
@@ -1253,7 +1396,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         const scrollback = await session.captureFullScrollbackEscapes();
         expect(scrollback).toContain("grok-build-1");
-        expect(scrollback).toContain("● Switched to xai/grok-build-1");
+        expect(scrollback).toContain("* Switched to xai/grok-build-1");
         expect(gateway.requests).toHaveLength(0);
 
         await session.sendText("/quit");
@@ -1316,7 +1459,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/statusline context");
-        await session.waitForText("● Statusline: context: on", TIMEOUT);
+        await session.waitForText("* statusline: context: on", TIMEOUT);
         await session.sendLiteral("/model new-reasoning");
         await session.waitForText("provider/new-reasoning-model", TIMEOUT);
         await session.sendKeys("Enter");
@@ -1324,7 +1467,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(autoEffortPicker).toContain("future-tier");
         expect(autoEffortPicker).toContain("high");
         await session.sendKeys("Enter");
-        await session.waitForText("● Switched to provider/new-reasoning-model", TIMEOUT);
+        await session.waitForText("* Switched to provider/new-reasoning-model", TIMEOUT);
 
         let stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored.models.gateway).toBe("provider/new-reasoning-model");
@@ -1333,8 +1476,10 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         await session.sendText("Use portable auto.");
         await session.waitForText("portable auto complete", TIMEOUT);
-        const footer = await session.waitForText("Context: 0k/750k 0%", TIMEOUT);
+        const footer = await session.waitForText("0k/750k 0%", TIMEOUT);
         expect(footer).toContain("new-reasoning-model");
+        expect(footer).not.toMatch(/[*✓!✗⊘i] context:/);
+        expect(await session.captureFullScrollbackEscapes()).not.toMatch(/[*✓!✗⊘i] context:/);
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
           "provider/new-reasoning-model",
@@ -1377,9 +1522,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
           reasoning: "future-tier",
         });
-        expect(JSON.parse(gateway.requests[1]!.body)).not.toHaveProperty(
-          "providerOptions",
-        );
+        expect(JSON.parse(gateway.requests[1]!.body).providerOptions).toEqual({
+          gateway: { caching: "auto" },
+        });
 
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
@@ -1433,6 +1578,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         expect(tree(home)).toEqual([
           ".fx",
+          ".fx/diagnostics",
+          ".fx/diagnostics/last-shutdown.json",
           ".fx/history.jsonl",
           ".fx/history.lock",
           ".fx/sessions",
@@ -1440,6 +1587,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           ".fx/settings.lock",
         ]);
         expect(statSync(join(home, ".fx")).mode & 0o777).toBe(0o700);
+        expect(statSync(join(home, ".fx", "diagnostics")).mode & 0o777).toBe(0o700);
+        expect(statSync(join(home, ".fx", "diagnostics", "last-shutdown.json")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "history.jsonl")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "history.lock")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "settings.json")).mode & 0o777).toBe(0o600);
@@ -1634,7 +1783,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         ]);
         await Promise.all([
           session.waitForText("startup_scrollback: off", TIMEOUT),
-          secondSession.waitForText("● Statusline: context:", TIMEOUT),
+          secondSession.waitForText("* statusline: context:", TIMEOUT),
         ]);
         await Promise.all([
           session.sendText("/quit"),

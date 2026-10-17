@@ -1,8 +1,10 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("session_codec.zig");
 const session_event = @import("session_event.zig");
 const session_projection = @import("session_projection.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
@@ -24,18 +26,200 @@ pub const LineRead = struct {
     next_offset: u64,
 };
 
+/// Returns an owned line, borrowing the caller's positional reader and buffer.
+/// Read-ahead stays within the supplied committed boundary.
+pub fn readBufferedLine(
+    alloc: Allocator,
+    reader: *std.Io.File.Reader,
+    max_end: u64,
+    cancelled: ?*const std.atomic.Value(bool),
+) !?LineRead {
+    if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
+    if (reader.logicalPos() >= max_end) return null;
+    std.debug.assert(reader.interface.buffer.len > 0);
+    var line: std.ArrayList(u8) = .empty;
+    errdefer line.deinit(alloc);
+    while (reader.logicalPos() < max_end) {
+        if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
+        if (reader.interface.bufferedLen() == 0) {
+            const buffer = reader.interface.buffer;
+            reader.interface = std.Io.File.Reader.initInterface(buffer[0..@intCast(@min(
+                buffer.len,
+                max_end - reader.logicalPos(),
+            ))]);
+            defer reader.interface.buffer = buffer;
+            reader.interface.fill(1) catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (line.items.len == 0) return null;
+                    return error.TruncatedEventFrame;
+                },
+                error.ReadFailed => return reader.err orelse error.ReadFailed,
+            };
+        }
+        const buffered = reader.interface.buffered();
+        const bytes = buffered[0..@intCast(@min(buffered.len, max_end - reader.logicalPos()))];
+        const newline = std.mem.findScalar(u8, bytes, '\n');
+        const count = if (newline) |end| end + 1 else bytes.len;
+        try line.appendSlice(alloc, bytes[0..count]);
+        reader.interface.toss(count);
+        if (line.items.len > session_event.event_frame_max_bytes) return error.EventFrameTooLarge;
+        if (newline != null) return .{
+            .bytes = try line.toOwnedSlice(alloc),
+            .next_offset = reader.logicalPos(),
+        };
+    }
+    return error.TruncatedEventFrame;
+}
+
+test "buffered session lines retain unread bytes and exact boundaries" {
+    const Counter = struct {
+        reads: usize = 0,
+
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.reads += 1;
+            return std.testing.io.vtable.fileReadPositional(std.testing.io.userdata, file, data, offset);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = "one\n\ntwo-long\nignored\n";
+    var file = try tmp.dir.createFile(std.testing.io, "lines", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, bytes);
+    var counter: Counter = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileReadPositional = Counter.read;
+    var buffer: [8]u8 = undefined;
+    var reader = file.reader(.{ .userdata = &counter, .vtable = &vtable }, &buffer);
+    for ([_]struct { text: []const u8, end: u64 }{
+        .{ .text = "one\n", .end = 4 },
+        .{ .text = "\n", .end = 5 },
+        .{ .text = "two-long\n", .end = 14 },
+    }) |expected| {
+        const line = (try readBufferedLine(alloc, &reader, 14, null)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(line.bytes);
+        try std.testing.expectEqualStrings(expected.text, line.bytes);
+        try std.testing.expectEqual(expected.end, line.next_offset);
+    }
+    try std.testing.expect((try readBufferedLine(alloc, &reader, 14, null)) == null);
+    try std.testing.expectEqual(@as(usize, 2), counter.reads);
+    try std.testing.expectEqual(@as(u64, 14), reader.pos);
+}
+
+test "buffered session lines preserve cancellation truncation and I/O errors" {
+    const Failure = struct {
+        fn read(_: ?*anyopaque, _: std.Io.File, _: []const []u8, _: u64) std.Io.File.ReadPositionalError!usize {
+            return error.InputOutput;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "lines", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "a\nb\n");
+    var buffer: [3]u8 = undefined;
+    var reader = file.reader(std.testing.io, &buffer);
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, readBufferedLine(alloc, &reader, 4, &cancelled));
+    cancelled.store(false, .release);
+    const first = (try readBufferedLine(alloc, &reader, 4, &cancelled)).?;
+    defer alloc.free(first.bytes);
+    try std.testing.expectEqualStrings("a\n", first.bytes);
+    try std.testing.expectError(error.TruncatedEventFrame, readBufferedLine(alloc, &reader, 3, null));
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileReadPositional = Failure.read;
+    var failed = file.reader(.{ .userdata = null, .vtable = &vtable }, &buffer);
+    try std.testing.expectError(error.InputOutput, readBufferedLine(alloc, &failed, 4, null));
+}
+
+test "buffered session lines release allocations across buffer boundaries" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var file = try tmp.dir.createFile(std.testing.io, "lines", .{ .read = true });
+            defer file.close(std.testing.io);
+            const bytes = "longer than the tiny input buffer\n";
+            try file.writeStreamingAll(std.testing.io, bytes);
+            var buffer: [3]u8 = undefined;
+            var reader = file.reader(std.testing.io, &buffer);
+            const line = (try readBufferedLine(alloc, &reader, bytes.len, null)) orelse return error.TestUnexpectedResult;
+            defer alloc.free(line.bytes);
+            try std.testing.expectEqualStrings(bytes, line.bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
+}
+
+test "buffered session lines enforce frame size and physical EOF" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "lines", .{ .read = true });
+    defer file.close(std.testing.io);
+    const bytes = try alloc.alloc(u8, session_event.event_frame_max_bytes + 1);
+    defer alloc.free(bytes);
+    @memset(bytes, 'x');
+    bytes[bytes.len - 2] = '\n';
+    bytes[bytes.len - 1] = '\n';
+    try file.writeStreamingAll(std.testing.io, bytes);
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(std.testing.io, &buffer);
+    const maximum = (try readBufferedLine(alloc, &reader, bytes.len - 1, null)).?;
+    defer alloc.free(maximum.bytes);
+    try std.testing.expectEqual(bytes.len - 1, maximum.bytes.len);
+    try file.writePositionalAll(std.testing.io, "x", bytes.len - 2);
+    reader = file.reader(std.testing.io, &buffer);
+    try std.testing.expectError(error.EventFrameTooLarge, readBufferedLine(alloc, &reader, bytes.len, null));
+    try file.setLength(std.testing.io, 1);
+    reader = file.reader(std.testing.io, &buffer);
+    try std.testing.expectError(error.TruncatedEventFrame, readBufferedLine(alloc, &reader, 2, null));
+    reader = file.reader(std.testing.io, &buffer);
+    reader.pos = 1;
+    try std.testing.expect((try readBufferedLine(alloc, &reader, 2, null)) == null);
+}
+
 pub fn readLineAt(
     alloc: Allocator,
     file: std.Io.File,
     offset: u64,
     max_end: u64,
 ) !?LineRead {
+    return readLineAtWithCancellation(alloc, file, offset, max_end, null);
+}
+
+pub fn readLineAtCancellable(
+    alloc: Allocator,
+    file: std.Io.File,
+    offset: u64,
+    max_end: u64,
+    cancelled: *const std.atomic.Value(bool),
+) !?LineRead {
+    return readLineAtWithCancellation(alloc, file, offset, max_end, cancelled);
+}
+
+fn readLineAtWithCancellation(
+    alloc: Allocator,
+    file: std.Io.File,
+    offset: u64,
+    max_end: u64,
+    cancelled: ?*const std.atomic.Value(bool),
+) !?LineRead {
+    if (cancelled) |stop| {
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
     if (offset >= max_end) return null;
     var line: std.ArrayList(u8) = .empty;
     errdefer line.deinit(alloc);
     var cursor = offset;
     var chunk: [8192]u8 = undefined;
     while (cursor < max_end) {
+        if (cancelled) |stop| {
+            if (stop.load(.acquire)) return error.Cancelled;
+        }
         const limit = @min(@as(u64, chunk.len), max_end - cursor);
         const count = try file.readPositionalAll(
             io_mod.getIo(),
@@ -72,8 +256,47 @@ pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
     return envelope.log_generation;
 }
 
-pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File) !bool {
-    var envelope = try readSessionStarted(alloc, file);
+test "cancelled event reads release work before reading another frame" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+    defer file.close(std.testing.io);
+    const bytes = "{\"event\":1}\n";
+    try file.writeStreamingAll(std.testing.io, bytes);
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, readLineAtCancellable(alloc, file, 0, bytes.len, &cancelled));
+    cancelled.store(false, .release);
+    const line = (try readLineAtCancellable(alloc, file, 0, bytes.len, &cancelled)).?;
+    defer alloc.free(line.bytes);
+    try std.testing.expectEqualStrings(bytes, line.bytes);
+    try std.testing.expectEqual(@as(u64, bytes.len), line.next_offset);
+}
+
+/// Reads the child identity only when the first event ends within
+/// `max_bytes` of the log start. A real first event arrives in one positional
+/// read, so the cost never grows with the log; a longer or unterminated first
+/// line fails with `error.TruncatedEventFrame`.
+pub fn readSubagentChildIdentityWithin(
+    alloc: Allocator,
+    file: std.Io.File,
+    max_bytes: usize,
+) !bool {
+    const buffer = try alloc.alloc(u8, max_bytes);
+    defer alloc.free(buffer);
+    var filled: usize = 0;
+    const line_end: ?usize = while (filled < buffer.len) {
+        const count = try file.readPositional(io_mod.getIo(), &.{buffer[filled..]}, filled);
+        if (count == 0) break null;
+        const start = filled;
+        filled += count;
+        if (std.mem.findScalar(u8, buffer[start..filled], '\n')) |newline| break start + newline + 1;
+    } else null;
+    const end = line_end orelse {
+        if (filled == 0) return error.InvalidSessionFormat;
+        return error.TruncatedEventFrame;
+    };
+    var envelope = try decodeSessionStarted(alloc, buffer[0..end]);
     defer envelope.deinit(alloc);
     return envelope.event.session_started.subagent_child;
 }
@@ -83,7 +306,11 @@ fn readSessionStarted(alloc: Allocator, file: std.Io.File) !session_event.Envelo
     const first = try readLineAt(alloc, file, 0, length) orelse
         return error.InvalidSessionFormat;
     defer alloc.free(first.bytes);
-    var envelope = session_event.decodeFrame(alloc, first.bytes) catch |err| switch (err) {
+    return decodeSessionStarted(alloc, first.bytes);
+}
+
+fn decodeSessionStarted(alloc: Allocator, bytes: []const u8) !session_event.Envelope {
+    var envelope = session_event.decodeFrame(alloc, bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
@@ -131,25 +358,6 @@ pub fn replayBoundary(
     };
 }
 
-/// Replays one caller-supplied durable boundary without consulting a commit
-/// watermark. It never searches for or selects a different prefix.
-pub fn replayExactBoundary(
-    alloc: Allocator,
-    file: std.Io.File,
-    expected_generation: Identifier,
-    expected_seq: u64,
-    expected_bytes: u64,
-) !session_codec.DurableSessionState {
-    var replayed = try replayExactPosition(
-        alloc,
-        file,
-        expected_generation,
-        expected_seq,
-        expected_bytes,
-    );
-    return replayed.takeState();
-}
-
 /// Owns `state`; callers must call `deinit` or transfer it with `takeState`.
 pub const ExactReplay = struct {
     state: session_codec.DurableSessionState,
@@ -194,8 +402,47 @@ pub fn replayExactPosition(
     expected_seq: u64,
     expected_bytes: u64,
 ) !ExactReplay {
-    if (expected_bytes == 0 or
-        try file.length(io_mod.getIo()) != expected_bytes)
+    return replayPosition(
+        alloc,
+        file,
+        expected_generation,
+        expected_seq,
+        expected_bytes,
+        true,
+    );
+}
+
+/// Replays an explicitly committed prefix while ignoring later bytes. This is
+/// used only by the read-only legacy importer; current sessions never need a
+/// watermark or a generation boundary.
+pub fn replayCommittedPrefix(
+    alloc: Allocator,
+    file: std.Io.File,
+    expected_generation: Identifier,
+    expected_seq: u64,
+    expected_bytes: u64,
+) !ExactReplay {
+    return replayPosition(
+        alloc,
+        file,
+        expected_generation,
+        expected_seq,
+        expected_bytes,
+        false,
+    );
+}
+
+fn replayPosition(
+    alloc: Allocator,
+    file: std.Io.File,
+    expected_generation: Identifier,
+    expected_seq: u64,
+    expected_bytes: u64,
+    require_exact_length: bool,
+) !ExactReplay {
+    const file_bytes = try file.length(io_mod.getIo());
+    if (expected_bytes == 0 or file_bytes < expected_bytes or
+        (require_exact_length and file_bytes != expected_bytes))
     {
         return failExactReplay(error.InvalidSessionFormat);
     }
@@ -432,10 +679,10 @@ test "recovery replay preserves reader failure identity" {
 
 test "session replay parser honors exact copied boundary" {
     const alloc = std.testing.allocator;
-    const generation: Identifier = .{0x10} ** 16;
-    const first_id: Identifier = .{0x20} ** 16;
-    const second_id: Identifier = .{0x30} ** 16;
-    const first = try session_event.encodeFrame(alloc, .{
+    const generation: Identifier = @splat(0x10);
+    const first_id: Identifier = @splat(0x20);
+    const second_id: Identifier = @splat(0x30);
+    const first = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = first_id,
@@ -454,7 +701,7 @@ test "session replay parser honors exact copied boundary" {
         } },
     });
     defer alloc.free(first);
-    const second = try session_event.encodeFrame(alloc, .{
+    const second = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 2,
         .event_id = second_id,
@@ -487,6 +734,26 @@ test "session replay parser honors exact copied boundary" {
     defer state.deinit(alloc);
     try std.testing.expectEqualStrings("replay-boundary", state.id);
     try std.testing.expect(!state.preferences.fast_mode);
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        replayExactPosition(
+            alloc,
+            file,
+            generation,
+            copied.through_seq,
+            copied.through_event_log_bytes,
+        ),
+    );
+    var imported = try replayCommittedPrefix(
+        alloc,
+        file,
+        generation,
+        copied.through_seq,
+        copied.through_event_log_bytes,
+    );
+    defer imported.deinit(alloc);
+    try std.testing.expectEqualStrings("replay-boundary", imported.state.id);
+    try std.testing.expect(!imported.state.preferences.fast_mode);
 
     const complete = CommitPosition{
         .log_generation = generation,
@@ -517,7 +784,7 @@ test "session replay parser honors exact copied boundary" {
     try std.testing.expect(!exact.preferences.fast_mode);
 
     var mismatched = complete;
-    mismatched.through_event_id = .{0xff} ** 16;
+    mismatched.through_event_id = @splat(0xff);
     const rejected_state = try replayBoundary(alloc, file, copied);
     try std.testing.expectError(
         error.InvalidSessionFormat,
@@ -555,7 +822,7 @@ test "session replay parser honors exact copied boundary" {
     const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "events.jsonl");
     defer alloc.free(path);
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkRecoveryValidationAllocationFailures,
         .{ path, copied },
     );
@@ -563,8 +830,8 @@ test "session replay parser honors exact copied boundary" {
 
 test "session replay parser rejects malformed or truncated bounded input" {
     const alloc = std.testing.allocator;
-    const generation: Identifier = .{0x40} ** 16;
-    const event_id: Identifier = .{0x50} ** 16;
+    const generation: Identifier = @splat(0x40);
+    const event_id: Identifier = @splat(0x50);
     const malformed = "{not-json}\n";
 
     var tmp = std.testing.tmpDir(.{});
@@ -591,8 +858,8 @@ test "session replay parser rejects malformed or truncated bounded input" {
 
 test "session replay parser rejects oversized bounded frame" {
     const alloc = std.testing.allocator;
-    const generation: Identifier = .{0x60} ** 16;
-    const event_id: Identifier = .{0x70} ** 16;
+    const generation: Identifier = @splat(0x60);
+    const event_id: Identifier = @splat(0x70);
     const oversized = try alloc.alloc(u8, session_event.event_frame_max_bytes + 1);
     defer alloc.free(oversized);
     @memset(oversized, 'x');
@@ -621,11 +888,86 @@ test "session replay parser rejects oversized bounded frame" {
     );
 }
 
+test "bounded child identity reads stop at their limit" {
+    const alloc = std.testing.allocator;
+    const frame = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = @splat(0x81),
+        .seq = 1,
+        .event_id = @splat(0x91),
+        .timestamp_ms = 10,
+        .event = .{ .session_started = .{
+            .id = @constCast("bounded-child"),
+            .created_at_ms = 10,
+            .origin_workspace_root = @constCast("/tmp/origin"),
+            .workspace_root = @constCast("/tmp/current"),
+            .conversation_language = .literal("en"),
+            .subagent_child = true,
+            .preferences = .{
+                .model = @constCast("model-a"),
+                .effort = .auto,
+                .fast_mode = false,
+            },
+        } },
+    });
+    defer alloc.free(frame);
+    try std.testing.expect(std.mem.endsWith(u8, frame, "}\n"));
+    // JSON whitespace keeps the padded event valid while pushing its newline
+    // past the limit.
+    const limit: usize = 4096;
+    const padded = try std.mem.concat(alloc, u8, &.{
+        frame[0 .. frame.len - 2],
+        text_utils.repeat(" ", 8192),
+        frame[frame.len - 2 ..],
+    });
+    defer alloc.free(padded);
+    const followed = try std.mem.concat(alloc, u8, &.{ frame, "{\"seq\":2}\n" });
+    defer alloc.free(followed);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Case = struct { name: []const u8, bytes: []const u8 };
+    for ([_]Case{
+        .{ .name = "padded", .bytes = padded },
+        .{ .name = "followed", .bytes = followed },
+        .{ .name = "empty", .bytes = "" },
+        .{ .name = "unterminated", .bytes = frame[0 .. frame.len - 1] },
+    }) |case| {
+        try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = case.name, .data = case.bytes });
+    }
+    var padded_file = try tmp.dir.openFile(io_mod.getIo(), "padded", .{});
+    defer padded_file.close(io_mod.getIo());
+    // A limit of exactly the padded length decodes the whole event.
+    try std.testing.expect(try readSubagentChildIdentityWithin(alloc, padded_file, padded.len));
+    try std.testing.expectError(
+        error.TruncatedEventFrame,
+        readSubagentChildIdentityWithin(alloc, padded_file, limit),
+    );
+
+    // Only the first line is decoded, whatever follows it in the read.
+    var followed_file = try tmp.dir.openFile(io_mod.getIo(), "followed", .{});
+    defer followed_file.close(io_mod.getIo());
+    try std.testing.expect(try readSubagentChildIdentityWithin(alloc, followed_file, limit));
+
+    var empty_file = try tmp.dir.openFile(io_mod.getIo(), "empty", .{});
+    defer empty_file.close(io_mod.getIo());
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        readSubagentChildIdentityWithin(alloc, empty_file, limit),
+    );
+
+    var unterminated_file = try tmp.dir.openFile(io_mod.getIo(), "unterminated", .{});
+    defer unterminated_file.close(io_mod.getIo());
+    try std.testing.expectError(
+        error.TruncatedEventFrame,
+        readSubagentChildIdentityWithin(alloc, unterminated_file, limit),
+    );
+}
+
 test "session replay parser frees line allocation on every caller path" {
     const alloc = std.testing.allocator;
-    const generation: Identifier = .{0x80} ** 16;
-    const event_id: Identifier = .{0x90} ** 16;
-    const frame = try session_event.encodeFrame(alloc, .{
+    const generation: Identifier = @splat(0x80);
+    const event_id: Identifier = @splat(0x90);
+    const frame = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
         .event_id = event_id,

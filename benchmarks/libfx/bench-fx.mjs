@@ -5,6 +5,12 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  benchmarkInstructions,
+  benchmarkInstructionsBytes,
+  benchmarkPrompt,
+  requestMetrics,
+} from "./workload.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -32,15 +38,24 @@ async function runChild() {
   if (!gatewayUrl || !diagnosticsPath) throw new Error("benchmark child environment is incomplete");
 
   const startedAt = performance.now();
-  const { createFxAgent } = await import(new URL("../../sdk/node.js", import.meta.url));
+  const { createFxEngine } = await import(new URL("../../sdk/node.js", import.meta.url));
   const importedAt = performance.now();
   let fetchAt = null;
   let firstBodyAt = null;
   let firstTextAt = null;
+  let nonPromptFetches = 0;
+  let promptRequestMetrics = null;
   const tracedFetch = async (_url, init = {}) => {
     const isPrompt = (init.method ?? "GET") === "POST";
-    if (!isPrompt) return fetch(gatewayUrl, init);
+    if (!isPrompt) {
+      nonPromptFetches += 1;
+      if ((init.method ?? "GET") !== "GET" || String(_url) !== "https://ai-gateway.vercel.sh/coding-agent/v1/models") {
+        throw new Error("unexpected non-prompt benchmark request");
+      }
+      return fetch(gatewayUrl, init);
+    }
     fetchAt ??= performance.now();
+    promptRequestMetrics ??= requestMetrics(init.body);
     const response = await fetch(gatewayUrl, init);
     if (!response.body) return response;
     const reader = response.body.getReader();
@@ -65,7 +80,7 @@ async function runChild() {
     });
   };
 
-  const agent = await createFxAgent({
+  const agent = await createFxEngine({
     backend,
     nativeAddon: resolve(repoRoot, "zig-out/lib/libfx.node"),
     wasm: resolve(repoRoot, "zig-out/bin/fx-core.wasm"),
@@ -75,10 +90,11 @@ async function runChild() {
     apiKey: "libfx-benchmark-key",
     gatewayChatUrl: gatewayUrl,
     model: "benchmark/model",
+    instructions: benchmarkInstructions,
   });
   const agentReadyAt = performance.now();
   const promptAt = performance.now();
-  const turn = agent.prompt("Reply with hello.");
+  const turn = agent.prompt(benchmarkPrompt);
   let text = "";
   for await (const update of turn) {
     if (update.type !== "text_delta") continue;
@@ -101,6 +117,8 @@ async function runChild() {
     firstBodyAt,
     firstTextAt,
     finishedAt,
+    nonPromptFetches,
+    ...promptRequestMetrics,
     stopReason: result.stopReason,
     exitCode,
     text,
@@ -180,6 +198,9 @@ async function runSample(gatewayUrl, diagnosticsPath) {
   for (const field of ["fetchAt", "firstBodyAt", "firstTextAt"]) {
     if (diagnostics[field] === null) throw new Error(`benchmark child omitted ${field}`);
   }
+  if (diagnostics.stopReason !== "end_turn" || diagnostics.text !== "hello" || stdout !== "hello") {
+    throw new Error(`benchmark child did not complete the expected response: stdout=${JSON.stringify(stdout)} diagnostics=${JSON.stringify(diagnostics)}`);
+  }
   return {
     text: stdout,
     spawn_to_first_stdout_ms: firstStdoutAt - spawnedAt,
@@ -188,5 +209,9 @@ async function runSample(gatewayUrl, diagnosticsPath) {
     total_ms: exitedAt - spawnedAt,
     import_ms: diagnostics.importedAt - diagnostics.startedAt,
     create_agent_ms: diagnostics.agentReadyAt - diagnostics.importedAt,
+    non_prompt_fetches: diagnostics.nonPromptFetches,
+    request_bytes: diagnostics.request_bytes,
+    system_context_bytes: diagnostics.system_context_bytes,
+    system_context_overhead_bytes: diagnostics.system_context_bytes - benchmarkInstructionsBytes,
   };
 }

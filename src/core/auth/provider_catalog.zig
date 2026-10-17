@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_provider = @import("../config/model_provider.zig");
+const types = @import("../shared/types.zig");
 
 pub const Entry = struct {
     id: model_provider.ProviderId,
@@ -9,6 +10,7 @@ pub const Entry = struct {
     route_name: []const u8,
     description: []const u8,
     subscription: bool,
+    login_source: types.CredentialSource,
 };
 
 pub const entries = [_]Entry{
@@ -20,6 +22,7 @@ pub const entries = [_]Entry{
         .route_name = "Vercel AI Gateway",
         .description = "Vercel account or AI Gateway billing",
         .subscription = false,
+        .login_source = .fx_login,
     },
     .{
         .id = .codex,
@@ -28,6 +31,7 @@ pub const entries = [_]Entry{
         .route_name = "Codex subscription",
         .description = "ChatGPT Plus, Pro, Business, Enterprise, or Edu subscription",
         .subscription = true,
+        .login_source = .chatgpt_subscription,
     },
     .{
         .id = .grok,
@@ -36,6 +40,7 @@ pub const entries = [_]Entry{
         .route_name = "Grok subscription",
         .description = "SuperGrok or X Premium subscription",
         .subscription = true,
+        .login_source = .grok_subscription,
     },
 };
 
@@ -47,8 +52,19 @@ pub fn parse(value: []const u8) ?model_provider.ProviderId {
     return null;
 }
 
+const configured_entry = Entry{
+    .id = model_provider.parse("configured").?,
+    .slug = "configured",
+    .name = "Configured provider",
+    .route_name = "Configured provider",
+    .description = "Endpoint and authentication from profile settings",
+    .subscription = false,
+    .login_source = .configured,
+};
+
 pub fn find(id: model_provider.ProviderId) *const Entry {
-    for (&entries) |*entry| if (entry.id == id) return entry;
+    if (id == .configured) return &configured_entry;
+    for (&entries) |*entry| if (entry.id.eql(id)) return entry;
     unreachable;
 }
 

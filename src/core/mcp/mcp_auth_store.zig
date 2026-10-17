@@ -1,8 +1,10 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const mcp_auth = @import("mcp_auth.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("../auth/secret.zig");
@@ -109,13 +111,13 @@ fn storageBackend(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !StorageBackend {
     const disabled = native_keychain.isDisabled();
-    const available = if (builtin.os.tag == .macos and !disabled) blk: {
+    const available = if (builtin.target.os.tag == .macos and !disabled) blk: {
         break :blk if (cancel_flag) |flag|
             try native_keychain.userDefaultKeychainAvailableCancellable(alloc, flag)
         else
             try native_keychain.userDefaultKeychainAvailable(alloc);
     } else false;
-    return selectStorageBackend(builtin.os.tag, disabled, available);
+    return selectStorageBackend(builtin.target.os.tag, disabled, available);
 }
 
 fn selectReadDecision(
@@ -264,6 +266,22 @@ fn loadControlled(
     return if (matched) |entry| try entry.credentials.clone(alloc) else null;
 }
 
+/// Every login this store kept, for MCP-v2 to take over once: from the
+/// Keychain when `keychain`, else from the file. The caller holds the
+/// credential directory's lock, which both stores share, and `dir` is that
+/// directory; nothing here takes the lock again.
+pub fn eachLocked(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    keychain: bool,
+    context: anytype,
+    comptime each: fn (@TypeOf(context), server: []const u8, credentials: *const mcp_auth.Credentials) Allocator.Error!void,
+) !void {
+    var store = try loadStoreControlled(alloc, dir, if (keychain) .macos_keychain else .profile_file, native_keychain_backend, null);
+    defer store.deinit(alloc);
+    for (store.credentials.items) |*entry| try each(context, entry.server_identity, &entry.credentials);
+}
+
 pub fn status(
     alloc: Allocator,
     server_identity: []const u8,
@@ -371,7 +389,7 @@ fn openOrCreateLockedDir() !LockedDir {
 fn openOrCreateLockedDirControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !LockedDir {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
     };
@@ -410,7 +428,7 @@ fn openExistingLockedDir() !?LockedDir {
 fn openExistingLockedDirControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?LockedDir {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
             .iterate = true,
@@ -631,13 +649,13 @@ fn parseCredentials(
     object: std.json.ObjectMap,
 ) !mcp_auth.Credentials {
     const endpoint = try dupeRequiredString(alloc, object, "endpoint");
-    errdefer alloc.free(endpoint);
+    errdefer mem_utils.free(alloc, endpoint);
     const resource = try dupeRequiredString(alloc, object, "resource");
-    errdefer alloc.free(resource);
+    errdefer mem_utils.free(alloc, resource);
     const issuer = try dupeRequiredString(alloc, object, "issuer");
-    errdefer alloc.free(issuer);
+    errdefer mem_utils.free(alloc, issuer);
     const client_id = try dupeRequiredString(alloc, object, "client_id");
-    errdefer alloc.free(client_id);
+    errdefer mem_utils.free(alloc, client_id);
     const client_secret = try dupeOptionalString(alloc, object, "client_secret");
     errdefer if (client_secret) |value| secret.zeroAndFree(alloc, value);
     const access_token = try dupeRequiredString(alloc, object, "access_token");
@@ -645,29 +663,29 @@ fn parseCredentials(
     const refresh_token = try dupeOptionalString(alloc, object, "refresh_token");
     errdefer if (refresh_token) |value| secret.zeroAndFree(alloc, value);
     const scope = try dupeStringAllowEmpty(alloc, object, "scope");
-    errdefer alloc.free(scope);
+    errdefer mem_utils.free(alloc, scope);
     const token_type = try dupeRequiredString(alloc, object, "token_type");
-    errdefer alloc.free(token_type);
+    errdefer mem_utils.free(alloc, token_type);
     const token_endpoint_auth_method = try dupeRequiredString(
         alloc,
         object,
         "token_endpoint_auth_method",
     );
-    errdefer alloc.free(token_endpoint_auth_method);
+    errdefer mem_utils.free(alloc, token_endpoint_auth_method);
     const authorization_endpoint = try dupeRequiredString(
         alloc,
         object,
         "authorization_endpoint",
     );
-    errdefer alloc.free(authorization_endpoint);
+    errdefer mem_utils.free(alloc, authorization_endpoint);
     const token_endpoint = try dupeRequiredString(alloc, object, "token_endpoint");
-    errdefer alloc.free(token_endpoint);
+    errdefer mem_utils.free(alloc, token_endpoint);
     const revocation_endpoint = try dupeOptionalString(
         alloc,
         object,
         "revocation_endpoint",
     );
-    errdefer if (revocation_endpoint) |value| alloc.free(value);
+    errdefer if (revocation_endpoint) |value| mem_utils.free(alloc, value);
     const expires_at_value = object.get("expires_at_ms") orelse
         return error.InvalidMcpCredentialStore;
     const expires_at_ms: i64 = switch (expires_at_value) {
@@ -1037,7 +1055,7 @@ fn checkCredentialStoreIsolationAllocationFailures(alloc: Allocator) !void {
 
 test "credential store isolation cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCredentialStoreIsolationAllocationFailures,
         .{},
     );

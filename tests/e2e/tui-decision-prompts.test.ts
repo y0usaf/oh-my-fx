@@ -22,6 +22,8 @@ import {
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
   fakeGatewaySerializedToolCall,
+  fakeGatewayTitleDefault,
+  TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -383,6 +385,7 @@ function startFakeGateway(
         classifierRequests.push({ body, headers: req.headers });
         return fakeGatewayPermissionDecision(classifierDecision(body));
       }
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body, headers: req.headers });
       const next = responses.shift();
       if (!next) return new Response("unexpected request", { status: 500 });
@@ -391,7 +394,7 @@ function startFakeGateway(
   });
 
   return {
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     baseUrl: `http://127.0.0.1:${server.port}`,
     requests,
     classifierRequests,
@@ -1237,6 +1240,42 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "approval reports program status until the turn is done and clears it on exit",
+    async () => {
+      const tapeRoot = process.env.FX_RECORD
+        ? null
+        : mkdtempSync(join(tmpdir(), "fx-program-status-"));
+      if (tapeRoot) roots.push(tapeRoot);
+      const tapePath = process.env.FX_RECORD ?? join(tapeRoot!, "approval.fxtape");
+      const ctx = await openApprovalPrompt("program status approval", {
+        FX_RECORD: tapePath,
+      });
+      await ctx.session.sendLiteralText("1");
+      await ctx.session.waitForText("program status approval handled", TIMEOUT);
+      await ctx.session.sendText("/quit");
+      expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
+
+      const stdout = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload))
+        .toString("latin1");
+      const reports = [...stdout.matchAll(/\x1b\]7501;([^\x1b]*)\x1b\\/g)]
+        .map((match) => match[1]!);
+      expect(reports.map((report) => report.replace(/:msg=.*$/, ""))).toEqual([
+        "state=idle:app=fx",
+        "state=working:app=fx",
+        "state=blocked:kind=permission:app=fx",
+        "state=working:app=fx",
+        "state=done:app=fx",
+        "state=clear",
+      ]);
+      const encodedMessage = reports[2]!.split(":msg=")[1] ?? "";
+      expect(Buffer.from(encodedMessage, "base64").toString("utf8"))
+        .toContain("touch generic-preview-accepted.txt");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "long command approval renders the complete command before a decision",
     async () => {
       const tapeRoot = process.env.FX_RECORD
@@ -1305,7 +1344,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(initialPane).toContain(`${COMMAND_SCROLL_LINE_PREFIX}001`);
       const initialRows = initialPane.split("\n");
       const initialChoiceThreeRow = initialRows.findIndex((row) => row.includes("3. No"));
-      const initialControlsRow = initialRows.findIndex((row) => row.includes("1–3 Choose"));
+      const initialControlsRow = initialRows.findIndex((row) => row.includes("1–3 choose"));
       expect(initialRows[initialChoiceThreeRow + 1]!.trim()).toBe("");
       expect(initialRows[initialChoiceThreeRow + 2]!.trim()).toMatch(/^─+$/);
       expect(initialControlsRow).toBe(initialChoiceThreeRow + 3);
@@ -1371,7 +1410,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.session,
         "inline command approval footer",
         (value) =>
-          value.includes(APPROVAL_PROMPT) && value.includes("1–3 Choose"),
+          value.includes(APPROVAL_PROMPT) && value.includes("1–3 choose"),
         TIMEOUT,
       );
       const command = pane.replaceAll("\n    ", " ");
@@ -1380,7 +1419,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
       const paneRows = pane.split("\n");
       const choiceThreeRow = paneRows.findIndex((row) => row.includes("3. No"));
-      const controlsRow = paneRows.findIndex((row) => row.includes("1–3 Choose"));
+      const controlsRow = paneRows.findIndex((row) => row.includes("1–3 choose"));
       expect(paneRows[choiceThreeRow + 1]!.trim()).toBe("");
       expect(paneRows[choiceThreeRow + 2]!.trim()).toMatch(/^─+$/);
       expect(controlsRow).toBe(choiceThreeRow + 3);
@@ -1676,12 +1715,12 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         hasApprovalSelection(value, 2, COMMAND_ALWAYS_CHOICE),
       );
       expectApprovalSelection(pane, 2, COMMAND_ALWAYS_CHOICE);
-      expect(pane).toContain("Tab Options");
-      expect(pane).not.toContain("Tab Amend");
+      expect(pane).toContain("tab options");
+      expect(pane).not.toContain("tab amend");
 
       await ctx.session.sendKeys("Tab");
       pane = await waitForPaneState(ctx.session, "tab to denial", (value) =>
-        hasApprovalSelection(value, 3, COMMAND_NO_CHOICE) && value.includes("Tab Amend"),
+        hasApprovalSelection(value, 3, COMMAND_NO_CHOICE) && value.includes("tab amend"),
       );
       expectApprovalSelection(pane, 3, COMMAND_NO_CHOICE);
 
@@ -2675,6 +2714,21 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(
         requestContainsExactString(ctx.gateway.requests[1]?.body ?? "", LONG_QUESTION_ANSWER),
       ).toBe(true);
+
+      // The resolved question and answer wrap into hanging continuation rows
+      // in the transcript instead of trailing off with an ellipsis.
+      const resolvedRows = stripAnsi(await ctx.session.captureFullScrollbackEscapes()).split("\n");
+      const resolvedQuestionRow = resolvedRows.find((line) =>
+        line.includes("1) When you ask fx to ask a question"),
+      );
+      expect(resolvedQuestionRow).toBeDefined();
+      expect(resolvedQuestionRow).not.toContain("…");
+      const resolvedContinuation = resolvedRows.find((line) =>
+        line.includes("remain fully visible even when it wraps."),
+      );
+      expect(resolvedContinuation?.indexOf("remain fully visible even when it wraps.")).toBe(5);
+      const resolvedAnswer = resolvedRows.find((line) => line.includes(LONG_QUESTION_ANSWER));
+      expect(resolvedAnswer?.indexOf(LONG_QUESTION_ANSWER)).toBe(5);
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,
@@ -2725,10 +2779,10 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const pane = await waitForPaneState(
         ctx.session,
         "question freeform narrow hint",
-        (value) => value.includes("Shift+↑↓ Options"),
+        (value) => value.includes("shift+↑↓ options"),
       );
       expect(pane).toContain(
-        "↑↓ Cursor · Shift+↑↓ Options · Tab Questions · Enter Answer · Esc Cancel",
+        "↑↓ cursor · shift+↑↓ options · tab questions · enter answer · esc cancel",
       );
       expect(ctx.gateway.requests).toHaveLength(1);
 
@@ -2753,9 +2807,9 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const pane = await waitForPaneState(
         ctx.session,
         "approval narrow hint",
-        (value) => value.includes("Enter Confirm    Esc Cancel"),
+        (value) => value.includes("enter confirm    esc cancel"),
       );
-      expect(pane).toContain("1–3 Choose now    Enter Confirm    Esc Cancel");
+      expect(pane).toContain("1–3 choose now    enter confirm    esc cancel");
 
       await resolveApprovalWithDeny(ctx.session);
       await ctx.session.waitForText("approval narrow hint handled", TIMEOUT);

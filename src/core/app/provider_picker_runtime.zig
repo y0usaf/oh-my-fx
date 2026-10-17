@@ -62,6 +62,12 @@ pub fn Runtime(comptime App: type) type {
             // a caller-retained buffer.
             column.count = 0;
             if (comptime !supported(App)) return 0;
+            if (app.auth.sourceInventoryRefreshActive()) {
+                column.labels[0] = "checking credentials...";
+                column.annotations[0] = "";
+                column.count = 1;
+                return column.count;
+            }
             const active_provider = provider_runtime.provider(app);
             var count: usize = 0;
             switch (query.stage) {
@@ -71,7 +77,8 @@ pub fn Runtime(comptime App: type) type {
                     for (slugs[0..count], 0..) |slug, i| {
                         column.labels[i] = slug;
                         const id = provider_catalog.parse(slug) orelse .gateway;
-                        column.annotations[i] = if (id == active_provider) "current" else "";
+                        column.annotations[i] = if (id.eql(active_provider) and
+                            model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
                     }
                 },
                 .method => {
@@ -81,7 +88,7 @@ pub fn Runtime(comptime App: type) type {
                     const methods = provider_picker_catalog.providerMethods(provider);
                     for (methods, 0..) |method, i| {
                         column.labels[i] = provider_picker_catalog.methodSlug(method);
-                        const in_use = provider == active_provider and
+                        const in_use = provider.eql(active_provider) and
                             if (active_source) |source| provider_picker_catalog.methodMatchesSource(method, source) else false;
                         column.annotations[i] = if (in_use) "current" else "";
                     }
@@ -92,8 +99,8 @@ pub fn Runtime(comptime App: type) type {
                     // `current` always means "used for inference right now",
                     // so a key is only current while the gateway is active.
                     const active = if (active_provider == .gateway) app.auth.credentialSource() else null;
-                    inline for (@typeInfo(provider_picker_catalog.KeySource).@"enum".fields) |field| {
-                        const key_source = @field(provider_picker_catalog.KeySource, field.name);
+                    inline for (@typeInfo(provider_picker_catalog.KeySource).@"enum".field_names) |field_name| {
+                        const key_source = @field(provider_picker_catalog.KeySource, field_name);
                         const credential = provider_picker_catalog.keySourceCredential(key_source);
                         const detected = if (credential) |value| view.available_sources.contains(value) else true;
                         if (detected) {
@@ -150,17 +157,12 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn hasQuery(app: *App) bool {
             if (comptime !supported(App)) return false;
-            // The queued-prompt review borrows the composer to edit drafts;
-            // a draft that happens to spell a picker path must not make
-            // arrows or Enter act on providers.
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                if (app.queued_prompt_review.visible) return false;
-            }
             return app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) != null;
         }
 
         pub fn navigate(app: *App, delta: i32) void {
             if (comptime !supported(App)) return;
+            if (app.auth.sourceInventoryRefreshActive()) return;
             if (!hasQuery(app)) return;
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return;
             var column: ColumnBuffer = .{};
@@ -180,6 +182,7 @@ pub fn Runtime(comptime App: type) type {
         /// composer replacement does), so the stage is re-established after.
         pub fn autocomplete(app: *App) !void {
             if (comptime !supported(App)) return;
+            if (app.auth.sourceInventoryRefreshActive()) return;
             if (!hasQuery(app)) return;
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return;
             const stage = query.stage;
@@ -218,6 +221,7 @@ pub fn Runtime(comptime App: type) type {
         /// never commits and never touches the network.
         pub fn advanceOnSpace(app: *App) !bool {
             if (comptime !supported(App)) return false;
+            if (app.auth.sourceInventoryRefreshActive()) return false;
             if (!hasQuery(app)) return false;
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (app.input_runtime.edit_state.cursor != app.input_runtime.edit_state.input.items.len) return false;
@@ -244,6 +248,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn submit(app: *App) !bool {
             if (comptime !supported(App)) return false;
             if (!hasQuery(app)) return false;
+            if (app.auth.sourceInventoryRefreshActive()) return true;
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return false;
             var column: ColumnBuffer = .{};
             _ = columnOptions(app, query, &column);
@@ -297,9 +302,10 @@ pub fn Runtime(comptime App: type) type {
                     const provider_slug = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
                     defer app.alloc.free(provider_slug);
 
-                    switch (try app_auth_runtime.Runtime(App).loadTeamsForProviderPicker(app)) {
+                    const teams = try app_auth_runtime.Runtime(App).loadTeamsForProviderPicker(app);
+                    switch (teams) {
                         .ready => {},
-                        .needs_sign_in => {
+                        .needs_sign_in, .blocked => {
                             // An ambient OIDC token satisfies oauth without a
                             // browser round trip; switch to it instead of
                             // forcing a sign-in it does not need.
@@ -307,6 +313,7 @@ pub fn Runtime(comptime App: type) type {
                                 try commitSource(app, source, provider);
                                 return true;
                             }
+                            if (teams == .blocked) return true;
                             app.input_runtime.picker.clearProviderPickerFlow();
                             app.input_runtime.inputResetState().clearCurrent(app.alloc);
                             try app_auth_runtime.Runtime(App).beginSignInForProviderPicker(app);
@@ -462,7 +469,7 @@ pub fn Runtime(comptime App: type) type {
             // switching after a failed selection would strand the provider
             // without the credential the user just asked it to use.
             if (try auth_rt.applySourceChoice(app, source)) {
-                if (provider_runtime.provider(app) != provider) {
+                if (!provider_runtime.provider(app).eql(provider)) {
                     try auth_rt.applyPickerChoice(app, .{ .provider = provider });
                 }
             }
@@ -476,7 +483,7 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             const auth_rt = app_auth_runtime.Runtime(App);
             if (try auth_rt.applyTeamChoice(app, index)) {
-                if (provider_runtime.provider(app) != provider) {
+                if (!provider_runtime.provider(app).eql(provider)) {
                     try auth_rt.applyPickerChoice(app, .{ .provider = provider });
                 }
             }
@@ -559,7 +566,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn setComposerText(app: *App, comptime fmt: []const u8, args: anytype) !void {
-            const text = try std.fmt.allocPrint(app.alloc, fmt, args);
+            const text = try app.alloc.print(fmt, args);
             defer app.alloc.free(text);
             try app.input_runtime.textReplacementState().replace(app.alloc, text);
         }
@@ -601,12 +608,22 @@ const ColumnTestApp = struct {
     input_runtime: core_input_runtime.Runtime = .{},
     provider_selection: provider_runtime.Runtime,
     auth: TestAuth = .{},
+    shell: struct {
+        render_requests: struct {
+            fn request(_: *@This(), _: enum { footer }) void {}
+        } = .{},
+    } = .{},
 
     const TestAuth = struct {
         source: ?credentials.Source = null,
         mask_count: usize = 0,
         save_in_flight: bool = false,
+        inventory_refresh_active: bool = false,
         available: auth_runtime.SourceSet = .empty,
+
+        fn sourceInventoryRefreshActive(self: *const TestAuth) bool {
+            return self.inventory_refresh_active;
+        }
 
         fn credentialSource(self: *const TestAuth) ?credentials.Source {
             return self.source;
@@ -664,6 +681,7 @@ test "provider column lists every provider and marks the active one" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
+    app.auth.source = .ai_gateway_api_key;
 
     const column = columnFor(&app, .provider, "");
     try std.testing.expect(column.count >= 2);
@@ -674,6 +692,20 @@ test "provider column lists every provider and marks the active one" {
     }
 }
 
+test "provider column requires matching authentication for a current annotation" {
+    var app = ColumnTestApp.init(std.testing.allocator);
+    defer app.deinit();
+    for ([_]?credentials.Source{ null, .chatgpt_subscription }) |source| {
+        app.auth.source = source;
+        const column = columnFor(&app, .provider, "");
+        for (column.annotations[0..column.count]) |annotation| {
+            try std.testing.expectEqualStrings("", annotation);
+        }
+    }
+    app.auth.source = .host_managed;
+    try std.testing.expectEqualStrings("current", columnFor(&app, .provider, "").annotations[0]);
+}
+
 test "provider column narrows to what was typed" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
@@ -682,6 +714,30 @@ test "provider column narrows to what was typed" {
     const column = columnFor(&app, .provider, "gro");
     try std.testing.expectEqual(@as(usize, 1), column.count);
     try std.testing.expectEqualStrings("grok", column.labels[0]);
+}
+
+test "provider picker loading preserves query and selection instead of exposing cached options" {
+    const alloc = std.testing.allocator;
+    var app = ColumnTestApp.init(alloc);
+    defer app.deinit();
+    app.auth.inventory_refresh_active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/provider co");
+    app.input_runtime.picker.provider_column_index = 2;
+
+    const pending = columnFor(&app, .provider, "co");
+    try std.testing.expectEqual(@as(usize, 1), pending.count);
+    try std.testing.expectEqualStrings("checking credentials...", pending.labels[0]);
+    try Runtime(ColumnTestApp).autocomplete(&app);
+    Runtime(ColumnTestApp).navigate(&app, 1);
+    try std.testing.expectEqualStrings("/provider co", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 2), app.input_runtime.picker.provider_column_index);
+
+    app.auth.inventory_refresh_active = false;
+    const ready = columnFor(&app, .provider, "co");
+    try std.testing.expectEqual(@as(usize, 1), ready.count);
+    try std.testing.expectEqualStrings("codex", ready.labels[0]);
+    try Runtime(ColumnTestApp).autocomplete(&app);
+    try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
 }
 
 test "method column marks the credential the active provider is using" {
@@ -721,7 +777,7 @@ test "key column is a masked field, not a list of options" {
     app.auth.mask_count = 4;
     const typed = columnFor(&app, .api_key, "");
     try std.testing.expectEqual(@as(usize, 1), typed.count);
-    try std.testing.expect(std.mem.indexOf(u8, typed.labels[0], provider_picker_catalog.key_field_placeholder) == null);
+    try std.testing.expect(std.mem.find(u8, typed.labels[0], provider_picker_catalog.key_field_placeholder) == null);
 
     // While the save thread works the row says so instead of rendering an
     // empty ready-looking field.

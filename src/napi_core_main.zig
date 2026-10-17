@@ -4,34 +4,95 @@ const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
+const agent_steps = @import("core/config/agent_steps.zig");
+const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
+const host_attachments = @import("core/hosts/host_attachments.zig");
+const agent_checkpoint = @import("core/agent/runtime/checkpoint.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
+const host_openai_codex = @import("gateway/host_openai_codex.zig");
+const host_xai_grok = @import("gateway/host_xai_grok.zig");
+const host_chat_completions = @import("gateway/host_chat_completions.zig");
+const configured_provider = @import("core/config/configured_provider.zig");
+const provider_catalog = @import("core/auth/provider_catalog.zig");
+const model_provider = @import("core/config/model_provider.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
-const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
-const c = @cImport({
-    @cInclude("node_api.h");
-});
+const c = @import("node_api");
 
 const Allocator = std.mem.Allocator;
 const max_drain_bytes = 1024 * 1024;
 const max_input_bytes = 8 * 1024 * 1024;
 const max_output_bytes = 8 * 1024 * 1024;
+const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
 const max_fetch_response_bytes = 8 * 1024 * 1024;
+// One attachment holds one prompt image or one kernel checkpoint, the larger.
+const max_attachment_bytes = agent_checkpoint.max_checkpoint_bytes;
+const max_inbound_attachments = 8;
+const max_inbound_attachment_bytes = 8 * 1024 * 1024;
+const max_outbound_attachments = 4;
+const max_outbound_attachment_bytes = 8 * 1024 * 1024;
 const max_api_key_bytes = 64 * 1024;
 const max_model_bytes = 1024;
+// Matches types.ReasoningEffort.max_name_bytes.
+const max_effort_bytes = 64;
 const max_path_bytes = 16 * 1024;
 const max_url_bytes = 16 * 1024;
 const max_active_runtimes = 64;
 const runtime_handle_type_tag = c.napi_type_tag{
     .lower = 0x4c4942465852544d,
     .upper = 0xa71d7c52e9314b08,
+};
+
+const ReadyNotifier = struct {
+    reader: ?c_int,
+    writer: c_int,
+
+    fn init() error{ReadyChannelFailed}!ReadyNotifier {
+        var pair: [2]c_int = undefined;
+        const flags = if (@import("builtin").target.os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
+        const socket_type = std.c.SOCK.STREAM | flags;
+        if (std.c.socketpair(std.c.AF.UNIX, socket_type, 0, &pair) != 0) return error.ReadyChannelFailed;
+        errdefer for (pair) |fd| {
+            _ = std.c.close(fd);
+        };
+        // Darwin does not accept close-on-exec/nonblocking bits in socketpair's type.
+        if (flags == 0) for (pair) |fd| {
+            if (std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) != 0 or
+                std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true }))) != 0)
+                return error.ReadyChannelFailed;
+        };
+        return .{ .reader = pair[0], .writer = pair[1] };
+    }
+
+    fn notify(self: *ReadyNotifier) void {
+        const byte: u8 = 1;
+        while (true) {
+            const written = std.c.send(self.writer, &byte, 1, std.c.MSG.NOSIGNAL);
+            if (written == 1) return;
+            switch (std.posix.errno(written)) {
+                .INTR => continue,
+                // A full socket already has a wake pending; queue contents are authoritative.
+                .AGAIN => return,
+                else => {
+                    // Surface a broken notification channel as EOF instead of silently hanging.
+                    _ = std.c.shutdown(self.writer, std.c.SHUT.WR);
+                    return;
+                },
+            }
+        }
+    }
+
+    fn deinit(self: *ReadyNotifier) void {
+        if (self.reader) |fd| _ = std.c.close(fd);
+        _ = std.c.close(self.writer);
+    }
 };
 
 comptime {
@@ -77,7 +138,7 @@ const InputQueue = struct {
         const queued = self.bytes.items.len - self.offset;
         if (data.len > max_input_bytes or queued > max_input_bytes - data.len) return error.InputQueueFull;
         if (self.offset > 0) {
-            std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
+            @memmove(self.bytes.items[0..queued], self.bytes.items[self.offset..]);
             self.bytes.items.len = queued;
             self.offset = 0;
         }
@@ -100,21 +161,54 @@ const InputQueue = struct {
 
 const OutputQueue = struct {
     mutex: std.Io.Mutex = .init,
+    wake: std.Io.Condition = .init,
     bytes: std.ArrayList(u8) = .empty,
     offset: usize = 0,
+    ready: ?*ReadyNotifier = null,
+    closed: bool = false,
+    failed: bool = false,
 
     fn write(self: *OutputQueue, alloc: Allocator, data: []const u8) !void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const queued = self.bytes.items.len - self.offset;
-        if (data.len > max_output_bytes or queued > max_output_bytes - data.len) return error.OutputQueueFull;
-        if (self.offset > 0) {
-            std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
-            self.bytes.items.len = queued;
-            self.offset = 0;
+        self.writeLocked(alloc, data) catch |err| {
+            if (err != error.OutputClosed) {
+                self.failed = true;
+                self.wake.broadcast(io);
+                self.ready.?.notify();
+            }
+            return err;
+        };
+    }
+
+    fn writeLocked(self: *OutputQueue, alloc: Allocator, data: []const u8) !void {
+        const io = io_mod.getIo();
+        if (data.len > max_output_message_bytes) return error.OutputMessageTooLarge;
+        var written: usize = 0;
+        while (written < data.len) {
+            if (self.failed) return error.OutputFailed;
+            if (self.closed) return error.OutputClosed;
+            const queued = self.bytes.items.len - self.offset;
+            if (queued == max_output_bytes) {
+                self.wake.waitUncancelable(io, &self.mutex);
+                continue;
+            }
+            if (self.offset > 0) {
+                @memmove(self.bytes.items[0..queued], self.bytes.items[self.offset..]);
+                self.bytes.items.len = queued;
+                self.offset = 0;
+            }
+            const len = @min(data.len - written, max_output_bytes - queued);
+            const needed = queued + len;
+            if (needed > self.bytes.capacity) {
+                const capacity = @min(max_output_bytes, @max(needed, self.bytes.capacity + self.bytes.capacity / 2 + 8));
+                try self.bytes.ensureTotalCapacityPrecise(alloc, capacity);
+            }
+            self.bytes.appendSliceAssumeCapacity(data[written..][0..len]);
+            written += len;
+            if (queued == 0) self.ready.?.notify();
         }
-        try self.bytes.appendSlice(alloc, data);
     }
 
     fn drain(self: *OutputQueue, destination: []u8) usize {
@@ -130,14 +224,24 @@ const OutputQueue = struct {
             self.bytes.clearRetainingCapacity();
             self.offset = 0;
         }
+        self.wake.broadcast(io);
         return len;
     }
 
-    fn available(self: *OutputQueue) usize {
+    fn available(self: *OutputQueue) !usize {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        if (self.failed) return error.OutputFailed;
         return self.bytes.items.len - self.offset;
+    }
+
+    fn close(self: *OutputQueue) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.closed = true;
+        self.wake.broadcast(io);
     }
 
     fn deinit(self: *OutputQueue, alloc: Allocator) void {
@@ -145,19 +249,138 @@ const OutputQueue = struct {
     }
 };
 
+/// Raw payloads exchanged beside ACP frames. JavaScript writes inbound prompt
+/// images and restore checkpoints; the core writes outbound checkpoints for
+/// JavaScript to take. One mutex guards both maps, and every entry is owned by
+/// the C allocator. The core thread never touches JavaScript values here.
+const AttachmentTable = struct {
+    mutex: std.Io.Mutex = .init,
+    inbound: std.AutoHashMapUnmanaged(host_attachments.Id, []u8) = .empty,
+    inbound_bytes: usize = 0,
+    outbound: std.AutoHashMapUnmanaged(host_attachments.Id, []u8) = .empty,
+    outbound_bytes: usize = 0,
+    next_outbound: host_attachments.Id = 1,
+
+    const WriteError = Allocator.Error || error{ AttachmentExists, AttachmentTooLarge, AttachmentTableFull };
+
+    fn write(self: *AttachmentTable, id: host_attachments.Id, bytes: []const u8) WriteError!void {
+        if (bytes.len > max_attachment_bytes) return error.AttachmentTooLarge;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.inbound.contains(id)) return error.AttachmentExists;
+        if (self.inbound.count() >= max_inbound_attachments or
+            bytes.len > max_inbound_attachment_bytes - self.inbound_bytes) return error.AttachmentTableFull;
+        const owned = try std.heap.c_allocator.dupe(u8, bytes);
+        errdefer std.heap.c_allocator.free(owned);
+        try self.inbound.put(std.heap.c_allocator, id, owned);
+        self.inbound_bytes += owned.len;
+    }
+
+    /// Removes outbound `id` for JavaScript. The caller frees the result with
+    /// the C allocator.
+    fn takeOutbound(self: *AttachmentTable, id: host_attachments.Id) ?[]u8 {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const entry = self.outbound.fetchRemove(id) orelse return null;
+        self.outbound_bytes -= entry.value.len;
+        return entry.value;
+    }
+
+    /// Drops inbound payloads left by a prompt or restore that never reached
+    /// the core. JavaScript calls this before attaching new payloads.
+    fn discardInbound(self: *AttachmentTable) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        freeEntries(&self.inbound);
+        self.inbound.clearRetainingCapacity();
+        self.inbound_bytes = 0;
+    }
+
+    fn store(self: *AttachmentTable) host_attachments.Store {
+        return .{ .context = self, .take_fn = coreTake, .put_fn = corePut };
+    }
+
+    fn coreTake(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        id: host_attachments.Id,
+        max_bytes: usize,
+    ) host_attachments.TakeError![]u8 {
+        const self: *AttachmentTable = @ptrCast(@alignCast(raw.?));
+        const bytes = taken: {
+            const io = io_mod.getIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            const entry = self.inbound.fetchRemove(id) orelse return error.AttachmentUnavailable;
+            self.inbound_bytes -= entry.value.len;
+            break :taken entry.value;
+        };
+        defer std.heap.c_allocator.free(bytes);
+        if (bytes.len > max_bytes) return error.AttachmentTooLarge;
+        return alloc.dupe(u8, bytes);
+    }
+
+    fn corePut(raw: ?*anyopaque, bytes: []const u8) host_attachments.PutError!host_attachments.Id {
+        const self: *AttachmentTable = @ptrCast(@alignCast(raw.?));
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (bytes.len > max_attachment_bytes or
+            self.outbound.count() >= max_outbound_attachments or
+            bytes.len > max_outbound_attachment_bytes - self.outbound_bytes) return error.AttachmentStoreFull;
+        // At most max_outbound_attachments ids are in use, so this ends quickly.
+        var id = self.next_outbound;
+        while (self.outbound.contains(id)) id = nextAttachmentId(id);
+        self.next_outbound = nextAttachmentId(id);
+        const owned = try std.heap.c_allocator.dupe(u8, bytes);
+        errdefer std.heap.c_allocator.free(owned);
+        try self.outbound.put(std.heap.c_allocator, id, owned);
+        self.outbound_bytes += owned.len;
+        return id;
+    }
+
+    fn nextAttachmentId(id: host_attachments.Id) host_attachments.Id {
+        return if (id == std.math.maxInt(host_attachments.Id)) 1 else id + 1;
+    }
+
+    fn freeEntries(map: *std.AutoHashMapUnmanaged(host_attachments.Id, []u8)) void {
+        var values = map.valueIterator();
+        while (values.next()) |bytes| std.heap.c_allocator.free(bytes.*);
+    }
+
+    fn deinit(self: *AttachmentTable) void {
+        freeEntries(&self.inbound);
+        freeEntries(&self.outbound);
+        self.inbound.deinit(std.heap.c_allocator);
+        self.outbound.deinit(std.heap.c_allocator);
+    }
+};
+
+/// How long `FetchBridge.next` waits for response bytes before it returns
+/// `-3`, the cooperative pulse of the core's stream reader.
+const next_idle_wait: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+
 const FetchBridge = struct {
     mutex: std.Io.Mutex = .init,
     wake: std.Io.Condition = .init,
+    /// JSON metadata for the pending request. Its body stays raw beside it.
     request: std.ArrayList(u8) = .empty,
+    request_body: std.ArrayList(u8) = .empty,
     response: std.ArrayList(u8) = .empty,
     response_offset: usize = 0,
     phase: fetch_state.Phase = .idle,
+    // Logical consumption survives HTTP EOF, close, and normal runtime shutdown.
+    last_consumed_handle: ?fetch_state.Handle = null,
     next_handle: fetch_state.Handle = 1,
     status: u16 = 0,
+    ready: ?*ReadyNotifier = null,
 
     fn clearPendingRequest(self: *FetchBridge) void {
-        if (self.request.items.len == 0) return;
         self.request.clearRetainingCapacity();
+        self.request_body.clearRetainingCapacity();
     }
 
     fn advance_handle(self: *FetchBridge) void {
@@ -176,36 +399,39 @@ const FetchBridge = struct {
         const handle = self.next_handle;
         const decision = fetch_state.decide(self.phase, .{ .open = handle });
         switch (decision.action) {
-            .cancelled => {
-                self.phase = decision.phase;
-                return error.Cancelled;
-            },
             .unavailable, .shutting_down => return error.HostStreamUnavailable,
             .applied => {},
             else => unreachable,
         }
-        self.response_offset = 0;
-        self.response.clearRetainingCapacity();
-        var writer: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
-        defer writer.deinit();
-        const encoded_body = std.base64.standard.Encoder.calcSize(body.len);
-        const body_base64 = try std.heap.c_allocator.alloc(u8, encoded_body);
-        defer std.heap.c_allocator.free(body_base64);
-        _ = std.base64.standard.Encoder.encode(body_base64, body);
-        try std.json.Stringify.value(.{
+        if (body.len > max_fetch_request_bytes or method.len > max_fetch_request_bytes or
+            url.len > max_fetch_request_bytes or headers.len > max_fetch_request_bytes)
+            return error.HostStreamBackpressure;
+        const request: struct {
+            handle: fetch_state.Handle,
+            method: []const u8,
+            url: []const u8,
+            headers: []const u8,
+        } = .{
             .handle = handle,
             .method = method,
             .url = url,
             .headers = headers,
-            .body = body_base64,
-        }, .{}, &writer.writer);
-        const bytes = writer.writer.buffered();
-        if (bytes.len > max_fetch_request_bytes) return error.HostStreamBackpressure;
-        self.request.clearRetainingCapacity();
-        try self.request.appendSlice(std.heap.c_allocator, bytes);
+        };
+        var writer: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer writer.deinit();
+        try std.json.Stringify.value(request, .{}, &writer.writer);
+        const metadata = writer.writer.buffered();
+        // The body travels raw beside its metadata, and both share one budget.
+        if (metadata.len > max_fetch_request_bytes - body.len) return error.HostStreamBackpressure;
+        self.clearPendingRequest();
+        try self.request.appendSlice(std.heap.c_allocator, metadata);
+        try self.request_body.appendSlice(std.heap.c_allocator, body);
+        self.response_offset = 0;
+        self.response.clearRetainingCapacity();
         self.phase = decision.phase;
         self.advance_handle();
         self.wake.broadcast(io);
+        self.ready.?.notify();
         return handle;
     }
 
@@ -266,7 +492,14 @@ const FetchBridge = struct {
             self.response.clearRetainingCapacity();
             self.response_offset = 0;
             if (terminal_kind != null) return 0;
-            self.wake.waitUncancelable(io, &self.mutex);
+            // While no bytes arrive, the reader checks its request's cancel
+            // flag and deadline every pulse, so a cancel the core sets, such
+            // as a libfx steer cutting a reply short, does not wait for the
+            // model's next byte.
+            self.wake.waitTimeout(io, &self.mutex, next_idle_wait) catch |err| switch (err) {
+                error.Timeout => return -3,
+                error.Canceled => return -2,
+            };
         }
     }
 
@@ -283,6 +516,25 @@ const FetchBridge = struct {
         self.response.clearRetainingCapacity();
         self.response_offset = 0;
         self.wake.broadcast(io);
+        self.ready.?.notify();
+    }
+
+    fn markConsumed(raw: ?*anyopaque, handle: i32) void {
+        const self: *FetchBridge = @ptrCast(@alignCast(raw.?));
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const consumed = fetch_state.consumed_after(self.phase, self.last_consumed_handle, .{ .consumed = handle });
+        if (consumed == self.last_consumed_handle) return;
+        self.last_consumed_handle = consumed;
+        self.ready.?.notify();
+    }
+
+    fn disposition(self: *FetchBridge, handle: fetch_state.Handle) fetch_state.Disposition {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return fetch_state.disposition(self.phase, self.last_consumed_handle, handle);
     }
 
     fn startResponse(self: *FetchBridge, handle: fetch_state.Handle, status: u16) FetchOperationResult {
@@ -306,7 +558,7 @@ const FetchBridge = struct {
         const queued = self.response.items.len - self.response_offset;
         if (data.len > max_fetch_response_bytes or queued > max_fetch_response_bytes - data.len) return .backpressure;
         if (self.response_offset > 0) {
-            std.mem.copyForwards(u8, self.response.items[0..queued], self.response.items[self.response_offset..]);
+            @memmove(self.response.items[0..queued], self.response.items[self.response_offset..]);
             self.response.items.len = queued;
             self.response_offset = 0;
         }
@@ -349,9 +601,11 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .cancel);
+        self.last_consumed_handle = fetch_state.consumed_after(self.phase, self.last_consumed_handle, .cancel);
         self.clearPendingRequest();
         self.phase = decision.phase;
         self.wake.broadcast(io);
+        self.ready.?.notify();
     }
 
     fn shutdown(self: *FetchBridge) void {
@@ -366,6 +620,7 @@ const FetchBridge = struct {
 
     fn deinit(self: *FetchBridge) void {
         self.request.deinit(std.heap.c_allocator);
+        self.request_body.deinit(std.heap.c_allocator);
         self.response.deinit(std.heap.c_allocator);
     }
 };
@@ -379,14 +634,27 @@ const FetchOperationResult = enum(u8) {
 const Runtime = struct {
     alloc: Allocator,
     fetch: FetchBridge = .{},
+    attachments: AttachmentTable = .{},
     stream_context: host_stream_provider.ProviderContext = undefined,
+    codex_context: host_openai_codex.Context = undefined,
+    grok_context: host_xai_grok.Context = undefined,
+    /// The app's configured provider, when `provider` names one.
+    custom_context: ?host_chat_completions.Context = null,
     input: InputQueue = .{},
     output: OutputQueue = .{},
-    credential: []u8,
+    /// The Gateway API key; null for an agent that only uses a subscription.
+    credential: ?[]u8,
+    provider: ?model_provider.ProviderId,
+    /// The settings-style providers object behind `custom_context`.
+    configured_providers: ?[]u8,
     model: ?[]u8,
+    effort: ?[]u8,
+    fast: ?bool,
+    ultrafast: ?bool,
     home: []u8,
     workspace_root: []u8,
     gateway_chat_url: []u8,
+    ready: ReadyNotifier,
     thread: std.Thread,
     exited: std.atomic.Value(bool) = .init(false),
     exit_code: std.atomic.Value(u8) = .init(0),
@@ -399,7 +667,12 @@ const Runtime = struct {
     fn writeOutput(context: ?*anyopaque, bytes: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(context.?));
         self.output.write(self.alloc, bytes) catch |err| {
-            self.exit_code.store(1, .seq_cst);
+            if (err != error.OutputClosed) {
+                self.exit_code.store(1, .seq_cst);
+                self.input.close();
+                self.fetch.shutdown();
+                self.ready.notify();
+            }
             return err;
         };
     }
@@ -409,22 +682,41 @@ const Runtime = struct {
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
         };
-        var gateway = builtin_gateway.provider_bundle;
-        gateway.agent_stream = host_stream_provider.provider(&self.stream_context);
-        gateway.permission_reviewer = null;
-        const providers = provider_set.gateway_only(gateway);
+        var providers = provider_set.gateway_only(.{
+            .presentation = builtin_gateway.provider_bundle.presentation,
+            .auth_strategy = .vercel,
+            .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
+            .agent_stream = host_stream_provider.provider(&self.stream_context),
+            .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
+        });
+        providers.codex = .{
+            .presentation = provider_catalog.find(.codex),
+            .auth_strategy = .chatgpt,
+            .agent_stream = host_openai_codex.provider(&self.codex_context),
+            .model_catalog = host_openai_codex.modelCatalogProvider(&self.codex_context),
+        };
+        providers.grok = .{
+            .presentation = provider_catalog.find(.grok),
+            .auth_strategy = .grok,
+            .agent_stream = host_xai_grok.provider(&self.grok_context),
+            .model_catalog = host_xai_grok.modelCatalogProvider(&self.grok_context),
+        };
+        if (self.custom_context) |*context| {
+            providers.configured_fn = host_chat_completions.bundle;
+            providers.configured_context = context;
+        }
         acp_server.runWithTransport(
             self.alloc,
             .{
                 .default_model = builtin_gateway.default_model,
-                .default_agent_step_limit = 64,
+                .default_agent_step_limit = agent_steps.default_max_agent_steps,
                 .gateway_retry_count = 0,
                 .gateway_chat_url = self.gateway_chat_url,
                 .gateway_models_path = builtin_gateway.models_path,
                 .gateway_provider = provider,
                 .provider_set = providers,
                 .secret_store = host.unavailable_secret_store,
-                .prompt_policy = builtin_context.prompt_policy,
+                .prompt_policy = .{ .system_prompt = "" },
                 .ignored_list_entries = &.{},
                 .max_list_entries = 0,
                 .max_read_file_bytes = 0,
@@ -433,25 +725,36 @@ const Runtime = struct {
                 .max_command_output_bytes = 0,
                 .max_tool_result_bytes = 64 * 1024,
                 .max_history_turns = 100,
-                .context_registry = .{ .default_provider = builtin_context.provider },
+                .context_registry = .{ .default_provider = context_contract.empty_provider },
                 .mode_registry = builtin_modes.registry,
                 .credential_override = self.credential,
+                .provider_override = self.provider,
+                // The JS host adds provider credentials at its fetch edge.
+                .provider_auth_mode = .host_managed,
+                .configured_providers_json = self.configured_providers,
                 .model_override = self.model,
+                .effort_override = self.effort,
+                .fast_override = self.fast,
+                .ultrafast_override = self.ultrafast,
                 .home_override = self.home,
                 .workspace_root_override = self.workspace_root,
                 .allow_acp_mcp = false,
                 .allow_native_tools = false,
                 .minimal_kernel = true,
+                .host_attachments = self.attachments.store(),
             },
             jsonrpc.Reader.initCallback(self, Runtime.readInput),
             jsonrpc.Writer.initCallback(self, Runtime.writeOutput),
         ) catch {
             self.exit_code.store(1, .seq_cst);
         };
+        self.fetch.shutdown();
         self.exited.store(true, .seq_cst);
+        self.ready.notify();
     }
 
     fn closeInput(self: *Runtime) void {
+        self.output.close();
         self.input.close();
     }
 
@@ -463,11 +766,16 @@ const Runtime = struct {
         self.closeInput();
         self.fetch.shutdown();
         self.thread.join();
+        self.ready.deinit();
         self.fetch.deinit();
+        self.attachments.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
-        self.alloc.free(self.credential);
+        if (self.credential) |value| self.alloc.free(value);
+        if (self.custom_context) |*context| context.deinit(self.alloc);
+        if (self.configured_providers) |json| self.alloc.free(json);
         if (self.model) |model| self.alloc.free(model);
+        if (self.effort) |effort| self.alloc.free(effort);
         self.alloc.free(self.home);
         self.alloc.free(self.workspace_root);
         self.alloc.free(self.gateway_chat_url);
@@ -479,6 +787,16 @@ const Runtime = struct {
 const RuntimeHandle = struct {
     mutex: std.Io.Mutex = .init,
     runtime: ?*Runtime,
+    cleanup_hook_registered: bool,
+
+    fn unregisterCleanup(self: *RuntimeHandle, env: c.napi_env) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        const registered = self.cleanup_hook_registered;
+        self.cleanup_hook_registered = false;
+        self.mutex.unlock(io);
+        if (registered) _ = c.napi_remove_env_cleanup_hook(env, cleanupRuntimeHandle, self);
+    }
 
     fn destroy(self: *RuntimeHandle) void {
         const io = io_mod.getIo();
@@ -489,6 +807,15 @@ const RuntimeHandle = struct {
         if (runtime) |value| value.deinit();
     }
 };
+
+fn cleanupRuntimeHandle(data: ?*anyopaque) callconv(.c) void {
+    const handle: *RuntimeHandle = @ptrCast(@alignCast(data orelse return));
+    const io = io_mod.getIo();
+    handle.mutex.lockUncancelable(io);
+    handle.cleanup_hook_registered = false;
+    handle.mutex.unlock(io);
+    handle.destroy();
+}
 
 var threaded_io: ?std.Io.Threaded = null;
 var threaded_io_state: std.atomic.Value(u8) = .init(0);
@@ -512,8 +839,9 @@ fn ensureThreadedIo() void {
     if (threaded_io_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
         threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{});
         io_mod.setIo(threaded_io.?.io());
-        const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
-        io_mod.setRawEnviron(raw_environ);
+        // Node.js owns the environment and may grow it at any time, which
+        // can move and free libc's array, so it is read at each use.
+        io_mod.setLibcEnviron();
         threaded_io_state.store(2, .release);
         return;
     }
@@ -573,6 +901,29 @@ fn getNamedString(
     return try stringArg(env, value, alloc, max_len);
 }
 
+fn getNamedBool(
+    env: c.napi_env,
+    object: c.napi_value,
+    name: [*:0]const u8,
+) !?bool {
+    var present = false;
+    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok) {
+        if (exceptionPending(env)) return error.JavaScriptException;
+        return error.InvalidArgument;
+    }
+    if (!present) return null;
+    var value: c.napi_value = undefined;
+    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) {
+        if (exceptionPending(env)) return error.JavaScriptException;
+        return error.InvalidArgument;
+    }
+    var value_type: c.napi_valuetype = undefined;
+    if (c.napi_typeof(env, value, &value_type) != c.napi_ok or value_type != c.napi_boolean) return error.InvalidArgument;
+    var result = false;
+    if (c.napi_get_value_bool(env, value, &result) != c.napi_ok) return error.InvalidArgument;
+    return result;
+}
+
 fn exceptionPending(env: c.napi_env) bool {
     var pending = false;
     return c.napi_is_exception_pending(env, &pending) == c.napi_ok and pending;
@@ -582,31 +933,83 @@ const CreateError = error{
     JavaScriptException,
     TooManyRuntimes,
     InvalidApiKey,
+    InvalidProvider,
+    InvalidConfiguredProvider,
     InvalidModel,
+    InvalidEffort,
+    InvalidFast,
+    InvalidUltrafast,
     InvalidHome,
     InvalidWorkspaceRoot,
     InvalidGatewayUrl,
     OutOfMemory,
     ThreadFailed,
+    ReadyChannelFailed,
 };
+
+const max_provider_bytes = configured_provider.max_id_bytes;
+const max_configured_providers_bytes = 1024 * 1024;
+
+/// Reads the optional `provider` option: "gateway", "codex", "grok", or the name
+/// of the provider that the `configuredProviders` option defines.
+fn getProvider(env: c.napi_env, options: c.napi_value) CreateError!?model_provider.ProviderId {
+    const alloc = std.heap.c_allocator;
+    const raw = (getNamedString(env, options, "provider", alloc, max_provider_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProvider,
+    }) orelse return null;
+    defer alloc.free(raw);
+    if (std.mem.eql(u8, raw, "gateway")) return .gateway;
+    if (std.mem.eql(u8, raw, "codex")) return .codex;
+    if (std.mem.eql(u8, raw, "grok")) return .grok;
+    const configured = model_provider.parse(raw) orelse return error.InvalidProvider;
+    if (configured != .configured) return error.InvalidProvider;
+    return configured;
+}
 
 fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     if (!claimRuntimeSlot()) return error.TooManyRuntimes;
     errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
-    const credential = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
+    const provider = try getProvider(env, options);
+    const configured_providers = getNamedString(env, options, "configuredProviders", alloc, max_configured_providers_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidConfiguredProvider,
+    };
+    errdefer if (configured_providers) |json| alloc.free(json);
+    const configured = if (provider) |value| value == .configured else false;
+    if (configured != (configured_providers != null)) return error.InvalidConfiguredProvider;
+    const api_key = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidApiKey,
     };
-    const api_key = credential orelse return error.InvalidApiKey;
-    errdefer alloc.free(api_key);
+    errdefer if (api_key) |value| alloc.free(value);
+    // The host authorizes every provider but Gateway, which needs its API key.
+    const host_authorized = if (provider) |value| value != .gateway else false;
+    if (api_key == null and !host_authorized) return error.InvalidApiKey;
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidModel,
     };
     errdefer if (model) |value| alloc.free(value);
+    const effort = getNamedString(env, options, "effort", alloc, max_effort_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidEffort,
+    };
+    errdefer if (effort) |value| alloc.free(value);
+    const fast = getNamedBool(env, options, "fast") catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        else => return error.InvalidFast,
+    };
+    const ultrafast = getNamedBool(env, options, "ultrafast") catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        else => return error.InvalidUltrafast,
+    };
     const home = (getNamedString(env, options, "home", alloc, max_path_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
@@ -633,22 +1036,46 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
 
     const runtime = alloc.create(Runtime) catch return error.OutOfMemory;
     errdefer alloc.destroy(runtime);
+    var ready = try ReadyNotifier.init();
+    errdefer ready.deinit();
     runtime.* = .{
         .alloc = alloc,
         .credential = api_key,
+        .provider = provider,
+        .configured_providers = configured_providers,
         .model = model,
+        .effort = effort,
+        .fast = fast,
+        .ultrafast = ultrafast,
         .home = home,
         .workspace_root = workspace_root,
         .gateway_chat_url = gateway_chat_url,
+        .ready = ready,
         .thread = undefined,
     };
+    runtime.fetch.ready = &runtime.ready;
+    runtime.output.ready = &runtime.ready;
     runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
         .status_fn = FetchBridge.statusFn,
         .next_fn = FetchBridge.next,
         .close_fn = FetchBridge.close,
+        .consumed_fn = FetchBridge.markConsumed,
     });
+    runtime.codex_context = .{ .transport = runtime.stream_context.transport };
+    runtime.grok_context = .{ .transport = runtime.stream_context.transport };
+    if (configured_providers) |json| {
+        var context = host_chat_completions.Context.init(alloc, runtime.stream_context.transport, json) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidConfiguredProvider,
+        };
+        errdefer context.deinit(alloc);
+        // Saved sessions record the provider together with its binding.
+        runtime.provider = provider.?.bind(context.registry) catch return error.InvalidConfiguredProvider;
+        runtime.custom_context = context;
+    }
+    errdefer if (runtime.custom_context) |*context| context.deinit(alloc);
     runtime.thread = std.Thread.spawn(.{}, Runtime.run, .{runtime}) catch return error.ThreadFailed;
     return runtime;
 }
@@ -658,17 +1085,24 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
         error.JavaScriptException => null,
         error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
         error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
+        error.InvalidProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "provider must be \"gateway\", \"codex\", \"grok\" or a configured provider's name"),
+        error.InvalidConfiguredProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "configuredProviders must validly define the selected provider, without credentials"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
+        error.InvalidEffort => throw(env, "LIBFX_INVALID_ARGUMENT", "effort must be a bounded string"),
+        error.InvalidFast => throw(env, "LIBFX_INVALID_ARGUMENT", "fast must be a boolean"),
+        error.InvalidUltrafast => throw(env, "LIBFX_INVALID_ARGUMENT", "ultrafast must be a boolean"),
         error.InvalidHome => throw(env, "LIBFX_INVALID_ARGUMENT", "home is required and must be a bounded string"),
         error.InvalidWorkspaceRoot => throw(env, "LIBFX_INVALID_ARGUMENT", "workspaceRoot is required and must be a bounded string"),
         error.InvalidGatewayUrl => throw(env, "LIBFX_INVALID_ARGUMENT", "gatewayChatUrl must be a bounded string"),
         error.OutOfMemory => throw(env, "LIBFX_NATIVE_OOM", "could not allocate native runtime"),
         error.ThreadFailed => throw(env, "LIBFX_NATIVE_THREAD", "could not start native runtime thread"),
+        error.ReadyChannelFailed => throw(env, "LIBFX_NATIVE_IO", "could not create native readiness channel"),
     };
 }
 
-fn finalizeRuntimeHandle(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+fn finalizeRuntimeHandle(env: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     const handle: *RuntimeHandle = @ptrCast(@alignCast(data orelse return));
+    handle.unregisterCleanup(env);
     handle.destroy();
     std.heap.c_allocator.destroy(handle);
 }
@@ -676,15 +1110,24 @@ fn finalizeRuntimeHandle(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callc
 fn createCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     var argv: [1]c.napi_value = undefined;
     if (!callbackArgs(env, info, &argv)) return null;
-
     const runtime = createRuntime(env, argv[0]) catch |err| return throwCreateError(env, err);
     var runtime_owned = true;
     defer if (runtime_owned) runtime.deinit();
     const handle = std.heap.c_allocator.create(RuntimeHandle) catch
         return throw(env, "LIBFX_NATIVE_OOM", "could not allocate runtime handle");
     var handle_owned = true;
-    defer if (handle_owned) std.heap.c_allocator.destroy(handle);
-    handle.* = .{ .runtime = runtime };
+    defer if (handle_owned) {
+        handle.unregisterCleanup(env);
+        std.heap.c_allocator.destroy(handle);
+    };
+    handle.* = .{ .runtime = runtime, .cleanup_hook_registered = false };
+
+    if (!statusOk(
+        env,
+        c.napi_add_env_cleanup_hook(env, cleanupRuntimeHandle, handle),
+        "could not register native runtime cleanup",
+    )) return null;
+    handle.cleanup_hook_registered = true;
 
     var result: c.napi_value = undefined;
     if (!statusOk(env, c.napi_create_object(env, &result), "could not create runtime handle")) return null;
@@ -734,6 +1177,19 @@ fn unlockRuntime(handle: *RuntimeHandle) void {
     handle.mutex.unlock(io_mod.getIo());
 }
 
+fn takeCoreReadyFd(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [1]c.napi_value = undefined;
+    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const runtime = lockRuntime(env, handle) orelse return null;
+    defer unlockRuntime(handle);
+    const reader = runtime.ready.reader orelse
+        return throw(env, "LIBFX_INVALID_ARGUMENT", "readiness descriptor already transferred");
+    var value: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_int32(env, reader, &value), "could not transfer readiness descriptor")) return null;
+    runtime.ready.reader = null;
+    return value;
+}
+
 fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
     var number: f64 = 0;
     if (c.napi_get_value_double(env, value, &number) != c.napi_ok or
@@ -750,7 +1206,7 @@ fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
 
 fn fetch_operation_value(env: c.napi_env, result: FetchOperationResult) c.napi_value {
     var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, @intFromEnum(result), &value), "could not create fetch operation result")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, @backingInt(result), &value), "could not create fetch operation result")) return null;
     return value;
 }
 
@@ -789,7 +1245,9 @@ fn drainCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_va
     const handle = runtimeHandleArg(env, info, &argv) orelse return null;
     const runtime = lockRuntime(env, handle) orelse return null;
     defer unlockRuntime(handle);
-    const len = @min(runtime.output.available(), max_drain_bytes);
+    const available = runtime.output.available() catch
+        return throw(env, "LIBFX_NATIVE_IO", "native output delivery failed");
+    const len = @min(available, max_drain_bytes);
     var value: c.napi_value = undefined;
     var data: ?*anyopaque = null;
     if (!statusOk(env, c.napi_create_buffer(env, len, &data, &value), "could not allocate output Buffer")) return null;
@@ -808,19 +1266,91 @@ fn takeCoreFetch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.nap
     runtime.fetch.mutex.lockUncancelable(io);
     defer runtime.fetch.mutex.unlock(io);
     const decision = fetch_state.decide(runtime.fetch.phase, .take_request);
-    if (decision.action != .applied) {
-        var value: c.napi_value = undefined;
-        _ = c.napi_get_null(env, &value);
-        return value;
-    }
-    const len = runtime.fetch.request.items.len;
+    if (decision.action != .applied) return nullValue(env);
+    // `request` is the JSON metadata record; `body` is the raw request body.
     var value: c.napi_value = undefined;
-    var data: ?*anyopaque = null;
-    if (!statusOk(env, c.napi_create_buffer(env, len, &data, &value), "could not allocate fetch request Buffer")) return null;
-    if (len > 0) @memcpy(@as([*]u8, @ptrCast(data.?))[0..len], runtime.fetch.request.items);
-    runtime.fetch.request.clearRetainingCapacity();
+    if (!statusOk(env, c.napi_create_object(env, &value), "could not allocate fetch request")) return null;
+    const request = bufferFromBytes(env, runtime.fetch.request.items, "could not allocate fetch request Buffer") orelse return null;
+    const body = bufferFromBytes(env, runtime.fetch.request_body.items, "could not allocate fetch body Buffer") orelse return null;
+    if (!statusOk(env, c.napi_set_named_property(env, value, "request", request), "could not publish fetch request")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, value, "body", body), "could not publish fetch body")) return null;
+    runtime.fetch.clearPendingRequest();
     runtime.fetch.phase = decision.phase;
     return value;
+}
+
+fn nullValue(env: c.napi_env) c.napi_value {
+    var value: c.napi_value = undefined;
+    _ = c.napi_get_null(env, &value);
+    return value;
+}
+
+fn undefinedValue(env: c.napi_env) c.napi_value {
+    var value: c.napi_value = undefined;
+    _ = c.napi_get_undefined(env, &value);
+    return value;
+}
+
+/// Copies `bytes` into a new Node Buffer. Returns null after throwing.
+fn bufferFromBytes(env: c.napi_env, bytes: []const u8, message: [*:0]const u8) c.napi_value {
+    var value: c.napi_value = undefined;
+    var data: ?*anyopaque = null;
+    if (!statusOk(env, c.napi_create_buffer(env, bytes.len, &data, &value), message)) return null;
+    if (bytes.len > 0) @memcpy(@as([*]u8, @ptrCast(data.?))[0..bytes.len], bytes);
+    return value;
+}
+
+fn attachmentIdArg(env: c.napi_env, value: c.napi_value) ?host_attachments.Id {
+    var number: f64 = 0;
+    if (c.napi_get_value_double(env, value, &number) != c.napi_ok or
+        !std.math.isFinite(number) or
+        number < 1 or
+        number > @as(f64, @floatFromInt(std.math.maxInt(host_attachments.Id))) or
+        @floor(number) != number)
+    {
+        _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", "attachment id must be a positive uint32");
+        return null;
+    }
+    return @intFromFloat(number);
+}
+
+fn writeCoreAttachment(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [3]c.napi_value = undefined;
+    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const id = attachmentIdArg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, handle) orelse return null;
+    defer unlockRuntime(handle);
+    var data: ?*anyopaque = null;
+    var len: usize = 0;
+    if (!statusOk(env, c.napi_get_buffer_info(env, argv[2], &data, &len), "writeCoreAttachment() requires a Buffer")) return null;
+    const bytes = if (len == 0) &.{} else @as([*]const u8, @ptrCast(data orelse return throw(env, "LIBFX_NATIVE_IO", "Buffer data is unavailable")))[0..len];
+    runtime.attachments.write(id, bytes) catch |err| return switch (err) {
+        error.AttachmentExists => throw(env, "LIBFX_INVALID_ARGUMENT", "attachment id is already pending"),
+        error.AttachmentTooLarge => throw(env, "LIBFX_INVALID_ARGUMENT", "attachment exceeds the native attachment limit"),
+        error.AttachmentTableFull => throw(env, "LIBFX_NATIVE_BACKPRESSURE", "native attachment table is full"),
+        error.OutOfMemory => throw(env, "LIBFX_NATIVE_OOM", "could not store native attachment"),
+    };
+    return undefinedValue(env);
+}
+
+fn takeCoreAttachment(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [2]c.napi_value = undefined;
+    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const id = attachmentIdArg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, handle) orelse return null;
+    defer unlockRuntime(handle);
+    const bytes = runtime.attachments.takeOutbound(id) orelse return nullValue(env);
+    defer std.heap.c_allocator.free(bytes);
+    return bufferFromBytes(env, bytes, "could not allocate attachment Buffer");
+}
+
+fn discardCoreAttachments(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [1]c.napi_value = undefined;
+    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const runtime = lockRuntime(env, handle) orelse return null;
+    defer unlockRuntime(handle);
+    runtime.attachments.discardInbound();
+    return undefinedValue(env);
 }
 
 fn coreFetchActive(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
@@ -831,6 +1361,18 @@ fn coreFetchActive(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.n
     defer unlockRuntime(runtime_handle);
     var value: c.napi_value = undefined;
     _ = c.napi_get_boolean(env, runtime.fetch.is_active(fetch_handle), &value);
+    return value;
+}
+
+fn coreFetchDisposition(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [2]c.napi_value = undefined;
+    const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const fetch_handle = fetch_handle_arg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, runtime_handle) orelse return null;
+    defer unlockRuntime(runtime_handle);
+    const disposition = runtime.fetch.disposition(fetch_handle);
+    var value: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_int32(env, @backingInt(disposition), &value), "could not query fetch disposition")) return null;
     return value;
 }
 
@@ -913,6 +1455,7 @@ fn coreExitCode(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi
 fn destroyCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     var argv: [1]c.napi_value = undefined;
     const handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    handle.unregisterCleanup(env);
     handle.destroy();
     var value: c.napi_value = undefined;
     _ = c.napi_get_undefined(env, &value);
@@ -928,14 +1471,31 @@ fn exportFunction(env: c.napi_env, exports: c.napi_value, name: [*:0]const u8, c
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callconv(.c) c.napi_value {
     ensureThreadedIo();
     var api_version: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, 2, &api_version), "could not create API version")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, 4, &api_version), "could not create API version")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "libfxApiVersion", api_version), "could not export API version")) return null;
+    var supports_ultrafast: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_ultrafast), "could not create ultrafast capability")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsUltrafast", supports_ultrafast), "could not export ultrafast capability")) return null;
+    var supports_codex: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_codex), "could not create Codex capability")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsCodex", supports_codex), "could not export Codex capability")) return null;
+    var supports_grok: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_grok), "could not create Grok capability")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsGrok", supports_grok), "could not export Grok capability")) return null;
+    var supports_configured: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_configured), "could not create configured provider capability")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsConfiguredProvider", supports_configured), "could not export configured provider capability")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
+    if (!exportFunction(env, exports, "takeCoreReadyFd", takeCoreReadyFd)) return null;
     if (!exportFunction(env, exports, "writeCore", writeCore)) return null;
     if (!exportFunction(env, exports, "closeCore", closeCore)) return null;
     if (!exportFunction(env, exports, "drainCore", drainCore)) return null;
+    if (!exportFunction(env, exports, "writeCoreAttachment", writeCoreAttachment)) return null;
+    if (!exportFunction(env, exports, "takeCoreAttachment", takeCoreAttachment)) return null;
+    if (!exportFunction(env, exports, "discardCoreAttachments", discardCoreAttachments)) return null;
     if (!exportFunction(env, exports, "takeCoreFetch", takeCoreFetch)) return null;
     if (!exportFunction(env, exports, "coreFetchActive", coreFetchActive)) return null;
+    if (!exportFunction(env, exports, "coreFetchDisposition", coreFetchDisposition)) return null;
     if (!exportFunction(env, exports, "startCoreFetchResponse", startCoreFetchResponse)) return null;
     if (!exportFunction(env, exports, "pushCoreFetchResponse", pushCoreFetchResponse)) return null;
     if (!exportFunction(env, exports, "finishCoreFetch", finishCoreFetch)) return null;

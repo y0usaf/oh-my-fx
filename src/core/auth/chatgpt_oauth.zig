@@ -1,4 +1,5 @@
 const std = @import("std");
+const credentials = @import("credentials.zig");
 const browser_callback = @import("browser_callback.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -11,6 +12,10 @@ const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 
 const Allocator = std.mem.Allocator;
+const FormBody = oauth.FormBody;
+const isLoopbackHttpUrl = oauth.isLoopbackHttpUrl;
+const pkceChallengeAlloc = oauth.pkceChallengeAlloc;
+const randomUrlSafeSecret = oauth.randomUrlSafeSecret;
 
 pub const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const token_url = "https://auth.openai.com/oauth/token";
@@ -40,30 +45,32 @@ pub const Access = struct {
     }
 };
 
-const TokenSet = struct {
-    access_token: []u8,
-    refresh_token: []u8,
-    expires_in: i64,
-
-    fn deinit(self: *TokenSet, alloc: Allocator) void {
-        secret.zeroAndFree(alloc, self.access_token);
-        secret.zeroAndFree(alloc, self.refresh_token);
-        self.* = undefined;
-    }
-};
+const TokenSet = oauth.BrowserTokenSet;
 
 const BrowserLoginContext = struct {
     listener: std.Io.net.Server,
     redirect_uri: []u8,
     code_verifier: []u8,
     state: []u8,
+    pending_callback: ?browser_callback.Accepted(BrowserCallback) = null,
 
     fn deinit(self: *BrowserLoginContext, alloc: Allocator) void {
+        self.finishCallback(alloc, false);
         self.listener.deinit(io_mod.getIo());
         alloc.free(self.redirect_uri);
         secret.zeroAndFree(alloc, self.code_verifier);
         secret.zeroAndFree(alloc, self.state);
         self.* = undefined;
+    }
+
+    fn finishCallback(self: *BrowserLoginContext, alloc: Allocator, saved: bool) void {
+        var callback = self.pending_callback orelse return;
+        self.pending_callback = null;
+        defer callback.deinit();
+        defer callback.callback.deinit(alloc);
+        callback.respond(if (saved) .ok else .failed) catch |err| {
+            debug_trace.logf("auth", "Codex completion response failed err={s}", .{@errorName(err)});
+        };
     }
 };
 
@@ -77,6 +84,7 @@ pub fn startSignIn(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !bool {
+    try credentials.requireSignInStorage(.chatgpt_subscription);
     const browser = try prepareBrowserSignIn(alloc);
     return runtime.startPrepared(
         alloc,
@@ -91,6 +99,7 @@ pub fn startSignIn(
             },
             .complete = completeSignIn,
             .save = saveSignIn,
+            .finish = finishSignIn,
         },
     );
 }
@@ -99,14 +108,14 @@ fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
     const configured_issuer = try configuredEndpoint(alloc, e2e_issuer_url_env, issuer_url);
     defer alloc.free(configured_issuer);
     const configured_token_endpoint = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
-    errdefer alloc.free(configured_token_endpoint);
+    var token_endpoint_owned = true;
+    errdefer if (token_endpoint_owned) alloc.free(configured_token_endpoint);
 
     var listener = try bindBrowserCallback(io_mod.getenv(e2e_issuer_url_env) != null);
     var listener_owned = true;
     errdefer if (listener_owned) listener.deinit(io_mod.getIo());
     const callback_port = listener.socket.address.getPort();
-    const redirect_uri = try std.fmt.allocPrint(
-        alloc,
+    const redirect_uri = try alloc.print(
         "http://localhost:{d}/auth/callback",
         .{callback_port},
     );
@@ -124,7 +133,20 @@ fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
         code_challenge,
         state,
     );
-    errdefer alloc.free(authorization_url);
+    var authorization_url_owned = true;
+    errdefer if (authorization_url_owned) alloc.free(authorization_url);
+
+    var prepared = try login_flow.prepareBrowserLogin(alloc, .{
+        .issuer = configured_issuer,
+        .authorization_endpoint_suffix = "/oauth/authorize",
+        .token_endpoint = configured_token_endpoint,
+        .verification_uri = authorization_url,
+        .client_id = client_id,
+        .expires_in = browser_login_timeout_seconds,
+    });
+    token_endpoint_owned = false;
+    authorization_url_owned = false;
+    errdefer prepared.deinit(alloc);
 
     const context = try alloc.create(BrowserLoginContext);
     errdefer alloc.destroy(context);
@@ -136,37 +158,8 @@ fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
     };
     listener_owned = false;
 
-    const owned_issuer = try alloc.dupe(u8, configured_issuer);
-    errdefer alloc.free(owned_issuer);
-    const authorization_endpoint = try std.fmt.allocPrint(
-        alloc,
-        "{s}/oauth/authorize",
-        .{std.mem.trimEnd(u8, configured_issuer, "/")},
-    );
-    errdefer alloc.free(authorization_endpoint);
-    const device_code = try alloc.dupe(u8, "");
-    errdefer secret.zeroAndFree(alloc, device_code);
-    const user_code = try alloc.dupe(u8, "");
-    errdefer alloc.free(user_code);
-    const owned_client_id = try alloc.dupe(u8, client_id);
-    errdefer alloc.free(owned_client_id);
-
     return .{
-        .prepared = .{
-            .metadata = .{
-                .issuer = owned_issuer,
-                .device_authorization_endpoint = authorization_endpoint,
-                .token_endpoint = configured_token_endpoint,
-            },
-            .device = .{
-                .device_code = device_code,
-                .user_code = user_code,
-                .verification_uri = authorization_url,
-                .expires_in = browser_login_timeout_seconds,
-                .interval = 1,
-            },
-            .client_id = owned_client_id,
-        },
+        .prepared = prepared,
         .context = context,
     };
 }
@@ -192,24 +185,6 @@ fn bindBrowserCallback(e2e: bool) !std.Io.net.Server {
     return error.ChatGptOAuthCallbackPortUnavailable;
 }
 
-fn randomUrlSafeSecret(alloc: Allocator) ![]u8 {
-    var entropy: [32]u8 = undefined;
-    try io_mod.getIo().randomSecure(&entropy);
-    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(entropy.len);
-    const encoded = try alloc.alloc(u8, encoded_len);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, &entropy);
-    return encoded;
-}
-
-fn pkceChallengeAlloc(alloc: Allocator, verifier: []const u8) ![]u8 {
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
-    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(digest.len);
-    const encoded = try alloc.alloc(u8, encoded_len);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, &digest);
-    return encoded;
-}
-
 fn pollBrowserToken(
     raw: ?*anyopaque,
     alloc: Allocator,
@@ -229,10 +204,11 @@ fn pollBrowserToken(
         context.state,
         cancel_flag,
     )) orelse return .pending;
-    defer {
+    var callback_owned = true;
+    defer if (callback_owned) {
         accepted.callback.deinit(alloc);
         accepted.deinit();
-    }
+    };
 
     var token = exchangeAuthorizationCodeForRedirectWithBounds(
         alloc,
@@ -248,23 +224,11 @@ fn pollBrowserToken(
         return err;
     };
     errdefer token.deinit(alloc);
-    try accepted.respond(.ok);
 
-    const scope = try alloc.dupe(u8, "");
-    errdefer if (scope.len > 0) alloc.free(scope);
-    const token_type = try alloc.dupe(u8, "Bearer");
-    errdefer alloc.free(token_type);
-    const access_token = token.access_token;
-    token.access_token = &.{};
-    const refresh_token = token.refresh_token;
-    token.refresh_token = &.{};
-    return .{ .success = .{
-        .access_token = access_token,
-        .refresh_token = refresh_token,
-        .expires_in = token.expires_in,
-        .scope = scope,
-        .token_type = token_type,
-    } };
+    const result = try oauth.takeBrowserPollResult(alloc, &token);
+    context.pending_callback = accepted;
+    callback_owned = false;
+    return result;
 }
 
 const BrowserCallbackParserContext = struct {
@@ -341,6 +305,11 @@ fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCom
         .vercel, .grok => return error.InvalidSignInCompletion,
     };
     try chatgpt_session.saveNewSession(alloc, session);
+}
+
+fn finishSignIn(raw: ?*anyopaque, alloc: Allocator, saved: bool) void {
+    const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
+    context.finishCallback(alloc, saved);
 }
 
 pub fn runLogin(
@@ -428,6 +397,7 @@ fn refreshSession(
     mutation: *chatgpt_session.Mutation,
     session: *chatgpt_session.Session,
 ) !void {
+    try mutation.requireWritable();
     var body: std.Io.Writer.Allocating = .init(alloc);
     defer body.deinit();
     try body.writer.writeAll("{\"client_id\":");
@@ -435,16 +405,55 @@ fn refreshSession(
     try body.writer.writeAll(",\"grant_type\":\"refresh_token\",\"refresh_token\":");
     try std.json.Stringify.value(session.refresh_token, .{}, &body.writer);
     try body.writer.writeByte('}');
-    var token = try requestRefreshToken(alloc, transport, body.written());
+    var token = requestRefreshToken(alloc, transport, body.written()) catch |err| switch (err) {
+        error.CredentialRefreshRejected,
+        error.InvalidChatGptOAuthResponse,
+        => {
+            debug_trace.logf("auth", "retiring terminal Codex session reason={s}", .{@errorName(err)});
+            try retire_refresh_session(mutation);
+            return error.CredentialRefreshRejected;
+        },
+        else => return err,
+    };
     defer token.deinit(alloc);
 
+    var replacement = refresh_replacement(alloc, &token, session.*) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        debug_trace.logf("auth", "retiring unusable Codex refresh reason={s}", .{@errorName(err)});
+        try retire_refresh_session(mutation);
+        if (err == error.ChatGptAccountChanged) return err;
+        return error.CredentialRefreshRejected;
+    };
+    errdefer replacement.deinit(alloc);
+    mutation.save(alloc, replacement) catch |err| {
+        debug_trace.logf("auth", "retiring Codex session after refresh save failed err={s}", .{@errorName(err)});
+        retire_refresh_session(mutation) catch |cleanup_err| {
+            debug_trace.logf("auth", "Codex session retirement failed err={s}", .{@errorName(cleanup_err)});
+        };
+        return error.CredentialRefreshPersistenceUncertain;
+    };
+
+    session.deinit(alloc);
+    session.* = replacement;
+    replacement.access_token = &.{};
+    replacement.refresh_token = &.{};
+    replacement.account_id = &.{};
+}
+
+fn refresh_replacement(
+    alloc: Allocator,
+    token: *RefreshTokenResponse,
+    current: chatgpt_session.Session,
+) !chatgpt_session.Session {
     const account_id = try extractAccountId(alloc, token.access_token);
     errdefer alloc.free(account_id);
-    if (!std.mem.eql(u8, account_id, session.account_id)) {
+    if (!std.mem.eql(u8, account_id, current.account_id)) {
         return error.ChatGptAccountChanged;
     }
-    const refresh_token = if (token.refresh_token) |rotated| rotated else try alloc.dupe(u8, session.refresh_token);
-    if (token.refresh_token != null) token.refresh_token = null;
+    const refresh_token = if (token.refresh_token) |rotated|
+        rotated
+    else
+        try alloc.dupe(u8, current.refresh_token);
     errdefer secret.zeroAndFree(alloc, refresh_token);
     const expires_at_ms = if (token.expires_in) |expires_in| blk: {
         const duration_ms = std.math.mul(i64, expires_in, std.time.ms_per_s) catch
@@ -452,21 +461,20 @@ fn refreshSession(
         break :blk std.math.add(i64, io_mod.milliTimestamp(), duration_ms) catch
             return error.InvalidChatGptOAuthResponse;
     } else try accessTokenExpiresAtMs(alloc, token.access_token);
-    var replacement = chatgpt_session.Session{
+    const replacement = chatgpt_session.Session{
         .access_token = token.access_token,
         .refresh_token = refresh_token,
         .expires_at_ms = expires_at_ms,
         .account_id = account_id,
     };
     token.access_token = &.{};
-    errdefer replacement.deinit(alloc);
-    try mutation.save(alloc, replacement);
+    if (token.refresh_token != null) token.refresh_token = null;
+    return replacement;
+}
 
-    session.deinit(alloc);
-    session.* = replacement;
-    replacement.access_token = &.{};
-    replacement.refresh_token = &.{};
-    replacement.account_id = &.{};
+fn retire_refresh_session(mutation: *chatgpt_session.Mutation) !void {
+    const outcome = mutation.delete() catch return error.CredentialRefreshPersistenceUncertain;
+    if (outcome == .deleted_not_durable) return error.CredentialRefreshPersistenceUncertain;
 }
 
 const RefreshTokenResponse = struct {
@@ -488,13 +496,20 @@ fn requestRefreshToken(
 ) !RefreshTokenResponse {
     const endpoint_url = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
     defer alloc.free(endpoint_url);
-    const bytes = try requestAccepted(
-        alloc,
-        transport,
-        .post_json,
-        endpoint_url,
-        payload,
-    );
+    var response = try transport.execute(alloc, .{
+        .method = .post_json,
+        .url = endpoint_url,
+        .payload = payload,
+    });
+    defer response.deinit(alloc);
+    if (response.disposition != .accepted) {
+        debug_trace.logf("auth", "Codex refresh request rejected", .{});
+        if (chat_gpt_refresh_requires_sign_in(response.body)) {
+            return error.CredentialRefreshRejected;
+        }
+        return error.ChatGptOAuthRequestFailed;
+    }
+    const bytes = response.takeBody();
     defer secret.zeroAndFree(alloc, bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
@@ -516,6 +531,19 @@ fn requestRefreshToken(
         .refresh_token = refresh_token,
         .expires_in = expires_in,
     };
+}
+
+fn chat_gpt_refresh_requires_sign_in(body: []const u8) bool {
+    const terminal_codes = [_][]const u8{
+        "\"refresh_token_expired\"",
+        "\"refresh_token_reused\"",
+        "\"refresh_token_invalidated\"",
+        "\"invalid_grant\"",
+    };
+    for (terminal_codes) |code| {
+        if (std.mem.find(u8, body, code) != null) return true;
+    }
+    return false;
 }
 
 fn accessTokenExpiresAtMs(alloc: Allocator, token: []const u8) !i64 {
@@ -579,54 +607,17 @@ fn requestTokenAtWithBounds(
         deadline,
     );
     defer secret.zeroAndFree(alloc, bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidChatGptOAuthResponse;
-    const object = parsed.value.object;
-    const access_token = try dupeRequiredString(alloc, object, "access_token");
-    errdefer secret.zeroAndFree(alloc, access_token);
-    const refresh_token = try dupeRequiredString(alloc, object, "refresh_token");
-    errdefer secret.zeroAndFree(alloc, refresh_token);
-    return .{
-        .access_token = access_token,
-        .refresh_token = refresh_token,
-        .expires_in = try requiredPositiveInteger(object, "expires_in"),
+    return oauth.parseBrowserTokenSet(alloc, bytes) catch |err| switch (err) {
+        error.InvalidOAuthResponse => return error.InvalidChatGptOAuthResponse,
+        else => return err,
     };
 }
 
 fn configuredEndpoint(alloc: Allocator, env_name: []const u8, default_url: []const u8) ![]u8 {
-    const candidate = io_mod.getenv(env_name) orelse default_url;
-    if (io_mod.getenv(env_name) != null and !isLoopbackHttpUrl(candidate)) {
-        return error.InvalidE2EChatGptEndpoint;
-    }
-    return alloc.dupe(u8, candidate);
-}
-
-fn isLoopbackHttpUrl(url: []const u8) bool {
-    const uri = std.Uri.parse(url) catch return false;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") or
-        uri.user != null or
-        uri.password != null or
-        uri.port == null)
-    {
-        return false;
-    }
-    const host_component = uri.host orelse return false;
-    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host_name = host_component.toRaw(&host_buf) catch return false;
-    return std.mem.eql(u8, host_name, "127.0.0.1") or
-        std.ascii.eqlIgnoreCase(host_name, "localhost") or
-        std.mem.eql(u8, host_name, "[::1]");
-}
-
-fn requestAccepted(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    method: oauth_transport.Method,
-    url: []const u8,
-    payload: []const u8,
-) ![]u8 {
-    return requestAcceptedWithBounds(alloc, transport, method, url, payload, null, null);
+    return oauth.configuredEndpoint(alloc, env_name, default_url) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidE2EChatGptEndpoint,
+    };
 }
 
 fn requestAcceptedWithBounds(
@@ -652,24 +643,6 @@ fn requestAcceptedWithBounds(
         return error.ChatGptOAuthRequestFailed;
     }
     return response.takeBody();
-}
-
-fn sessionFromToken(alloc: Allocator, token: *TokenSet, now_ms: i64) !chatgpt_session.Session {
-    const account_id = try extractAccountId(alloc, token.access_token);
-    errdefer alloc.free(account_id);
-    const duration_ms = std.math.mul(i64, token.expires_in, std.time.ms_per_s) catch
-        return error.InvalidChatGptOAuthResponse;
-    const expires_at_ms = std.math.add(i64, now_ms, duration_ms) catch
-        return error.InvalidChatGptOAuthResponse;
-    const session = chatgpt_session.Session{
-        .access_token = token.access_token,
-        .refresh_token = token.refresh_token,
-        .expires_at_ms = expires_at_ms,
-        .account_id = account_id,
-    };
-    token.access_token = &.{};
-    token.refresh_token = &.{};
-    return session;
 }
 
 pub fn extractAccountId(alloc: Allocator, token: []const u8) ![]u8 {
@@ -700,24 +673,6 @@ fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const
     const value = object.get(key) orelse return error.InvalidChatGptOAuthResponse;
     if (value != .string or value.string.len == 0) return error.InvalidChatGptOAuthResponse;
     return alloc.dupe(u8, value.string);
-}
-
-fn requiredPositiveInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
-    const value = object.get(key) orelse return error.InvalidChatGptOAuthResponse;
-    if (value != .integer or value.integer <= 0) return error.InvalidChatGptOAuthResponse;
-    return value.integer;
-}
-
-fn flexiblePositiveInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
-    const value = object.get(key) orelse return error.InvalidChatGptOAuthResponse;
-    const result = switch (value) {
-        .integer => value.integer,
-        .string => std.fmt.parseInt(i64, std.mem.trim(u8, value.string, " \t\r\n"), 10) catch
-            return error.InvalidChatGptOAuthResponse,
-        else => return error.InvalidChatGptOAuthResponse,
-    };
-    if (result < 0) return error.InvalidChatGptOAuthResponse;
-    return result;
 }
 
 const BrowserCallback = struct {
@@ -780,63 +735,10 @@ fn parseBrowserCallbackTarget(
 }
 
 fn queryValueAlloc(alloc: Allocator, query: []const u8, key: []const u8) ![]u8 {
-    var pairs = std.mem.splitScalar(u8, query, '&');
-    while (pairs.next()) |pair| {
-        const equals = std.mem.findScalar(u8, pair, '=') orelse continue;
-        if (!std.mem.eql(u8, pair[0..equals], key)) continue;
-        return percentDecodeAlloc(alloc, pair[equals + 1 ..]);
-    }
-    return error.InvalidChatGptOAuthCallback;
-}
-
-fn percentDecodeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    var out = try alloc.alloc(u8, value.len);
-    errdefer alloc.free(out);
-    var read_index: usize = 0;
-    var write_index: usize = 0;
-    while (read_index < value.len) {
-        if (value[read_index] == '%') {
-            if (read_index + 2 >= value.len) return error.InvalidChatGptOAuthCallback;
-            const high = std.fmt.charToDigit(value[read_index + 1], 16) catch
-                return error.InvalidChatGptOAuthCallback;
-            const low = std.fmt.charToDigit(value[read_index + 2], 16) catch
-                return error.InvalidChatGptOAuthCallback;
-            out[write_index] = @as(u8, @intCast(high * 16 + low));
-            read_index += 3;
-        } else {
-            out[write_index] = if (value[read_index] == '+') ' ' else value[read_index];
-            read_index += 1;
-        }
-        write_index += 1;
-    }
-    if (write_index == 0) return error.InvalidChatGptOAuthCallback;
-    return alloc.realloc(out, write_index);
-}
-
-const FormBody = struct {
-    first: bool = true,
-
-    fn append(self: *FormBody, writer: *std.Io.Writer, key: []const u8, value: []const u8) !void {
-        if (!self.first) try writer.writeByte('&');
-        self.first = false;
-        try percentEncode(writer, key);
-        try writer.writeByte('=');
-        try percentEncode(writer, value);
-    }
-};
-
-fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
-    const hex = "0123456789ABCDEF";
-    for (value) |byte| {
-        const safe = std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~';
-        if (safe) {
-            try writer.writeByte(byte);
-        } else {
-            try writer.writeByte('%');
-            try writer.writeByte(hex[byte >> 4]);
-            try writer.writeByte(hex[byte & 0x0f]);
-        }
-    }
+    return oauth.queryValueNonEmptyAlloc(alloc, query, key) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidChatGptOAuthCallback,
+    };
 }
 
 fn writeStdout(text: []const u8) !void {
@@ -859,7 +761,7 @@ test "ChatGPT account id is extracted from the namespaced JWT claim" {
     const encoded = try alloc.alloc(u8, encoded_len);
     defer alloc.free(encoded);
     _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
-    const token = try std.fmt.allocPrint(alloc, "header.{s}.signature", .{encoded});
+    const token = try alloc.print("header.{s}.signature", .{encoded});
     defer alloc.free(token);
 
     const account_id = try extractAccountId(alloc, token);

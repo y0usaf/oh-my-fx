@@ -242,7 +242,7 @@ fn mergeAttemptInvalidation(
     incoming: paint_plan.FrameInvalidationRange,
 ) ?paint_plan.FrameInvalidationRange {
     var merged = incoming;
-    var consumed = [_]bool{false} ** paint_plan.max_frame_invalidation_ranges;
+    var consumed: [paint_plan.max_frame_invalidation_ranges]bool = @splat(false);
     var overlapped = false;
 
     var changed = true;
@@ -308,7 +308,6 @@ fn surfaceTestPlan() PaintPlan {
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = 6, .col = 1, .visible = true },
-        .footer_reservation_source = .footer_layout,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };

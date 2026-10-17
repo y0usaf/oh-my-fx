@@ -88,16 +88,17 @@ const stubFetch = async (input, init = {}) => {
   }
   if (url.href === "https://api.vercel.com/login/oauth/revoke") return json({});
   if (`${url.origin}${url.pathname}` === "https://ai-gateway.vercel.sh/coding-agent/v1/models") {
-    const requestTeam = url.searchParams.get("teamId") ?? headers.get("x-vercel-ai-gateway-team");
-    if (headers.get("authorization") === `Bearer ${accessToken}` && requestTeam !== teamId) {
-      throw new Error("authenticated model catalog omitted the selected team");
+    // Like AI Gateway, the catalog reads an fx login's team only from the
+    // teamId query value; the x-vercel-ai-gateway-team header is not enough.
+    if (headers.get("authorization") === `Bearer ${accessToken}` && url.searchParams.get("teamId") !== teamId) {
+      return json({ error: { message: "Authentication failed.", type: "authentication_error" } }, 401);
     }
     return json({
       object: "list",
       data: [{ id: "stub/login-model", type: "language", released: 1, tags: ["tool-use"] }],
     });
   }
-  if (url.href === "https://ai-gateway.vercel.sh/v3/ai/language-model") {
+  if (url.href === "https://ai-gateway.vercel.sh/v4/ai/language-model") {
     gatewayRequests.push({ authorization: headers.get("authorization") });
     return sseResponse(`LOGIN_GATEWAY_OK_${gatewayRequests.length}`);
   }

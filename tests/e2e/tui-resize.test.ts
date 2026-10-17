@@ -26,6 +26,7 @@ import {
   hasEmptyComposer,
   paneExitMatches,
   startFakeGateway,
+  startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
   tmuxRawPasteFlags,
@@ -1069,7 +1070,7 @@ function findInlineSkillsPicker(
   if (!isInputRow(grid[input]!)) return null;
   const bottomDivider = grid.findLastIndex((line) => isDividerRow(line));
   if (bottomDivider <= header || bottomDivider + 1 >= grid.length) return null;
-  if (!grid[bottomDivider + 1]!.includes("Esc Close")) return null;
+  if (!grid[bottomDivider + 1]!.includes("esc close")) return null;
   return {
     input,
     topDivider: header - 1,
@@ -1088,7 +1089,7 @@ function findInlineHelpPicker(
   if (!isInputRow(grid[input]!)) return null;
   const bottomDivider = grid.findLastIndex((line) => isDividerRow(line));
   if (bottomDivider <= header || bottomDivider + 1 >= grid.length) return null;
-  if (!grid[bottomDivider + 1]!.includes("Enter Open")) return null;
+  if (!grid[bottomDivider + 1]!.includes("enter open")) return null;
   return {
     input,
     topDivider: header - 1,
@@ -1235,7 +1236,7 @@ async function runLargeSkillResizeAttempt(attempt: number): Promise<string> {
       const grid = pane.split("\n");
       return (
         pane.includes("𝒇x") &&
-        !pane.includes("↑↓ Navigate") &&
+        !pane.includes("↑↓ navigate") &&
         findFooter(grid) !== null
       );
     }, 5_000);
@@ -1412,7 +1413,7 @@ async function runRapidSkillResizeAttempt(
       (pane) => {
         const grid = pane.replace(/\n$/, "").split("\n");
         return pane.includes("𝒇x") &&
-          !pane.includes("↑↓ Navigate") &&
+          !pane.includes("↑↓ navigate") &&
           findFooter(grid) !== null;
       },
       5_000,
@@ -1483,6 +1484,154 @@ async function runRapidSkillResizeAttempt(
 }
 
 describe.skipIf(SKIP)("tui: resize", () => {
+  for (const mode of ["choose-tree", "copy-mode"] as const) {
+    test(
+      `tmux ${mode} survives settled resize without auto closing`,
+      async () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-resize-${mode}-`)));
+        tempDirs.push(root);
+        const tracePath = join(root, "trace.log");
+        const stderrPath = join(root, "stderr.log");
+        writeFileSync(stderrPath, "");
+        // Never change the developer's tmux prefix, bindings, or server state.
+        const socketName = `fx-resize-${mode}-${process.pid}-${Date.now()}`;
+        const tmux = (...args: string[]) => execFileSync(
+          "tmux",
+          ["-L", socketName, ...args],
+          { encoding: "utf8", stdio: "pipe" },
+        ).trim();
+        let client: ReturnType<typeof Bun.spawn> | undefined;
+        try {
+          // Isolate configuration too: the shared helper expects window index 0.
+          tmux("-f", "/dev/null", "new-session", "-d", "-s", "bootstrap", "sleep 120");
+          session = await createResizeSession({
+            isolated: true,
+            socketName,
+            width: 120,
+            height: 40,
+            stderrPath,
+            remainOnExit: true,
+            env: {
+              HOME: join(root, "home"),
+              AI_GATEWAY_API_KEY: undefined,
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_AUTO_UPGRADE: "0",
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "frame_schedule,frame_diff,frame_commit,scroll,resize",
+              NO_COLOR: "1",
+            },
+          });
+          const active = session;
+          tmux("kill-session", "-t", "bootstrap");
+          await active.waitForComposer(10_000);
+          const pane = tmux("display-message", "-p", "-t", active.name, "#{pane_id}");
+          const format = (value: string) =>
+            tmux("display-message", "-p", "-t", pane, value);
+          const waitForFormat = async (value: string, expected: string) => {
+            const deadline = Date.now() + 5_000;
+            let actual = "";
+            while (Date.now() < deadline) {
+              actual = format(value);
+              if (actual === expected) return;
+              await Bun.sleep(10);
+            }
+            throw new Error(`tmux ${value}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+          };
+          const waitForSettledResize = (afterLine: number) =>
+            waitForCommittedTraceAttempt(
+              tracePath,
+              afterLine,
+              (attempt) => attemptHasReason(attempt, "resize") &&
+                attemptLine(attempt, "tmux_clear_history_complete") !== undefined,
+              10_000,
+            );
+          tmux("set-option", "-g", "prefix", "C-a");
+          tmux("bind-key", "-T", "prefix", "s", "choose-tree", "-Zs");
+          tmux("bind-key", "-T", "prefix", "[", "copy-mode");
+          tmux("set-option", "-g", "status", "off");
+          client = Bun.spawn(["tmux", "-L", socketName, "attach-session", "-t", active.name], {
+            env: { ...process.env, TMUX: undefined, TERM: "xterm-256color" },
+            terminal: {
+              cols: 120,
+              rows: 40,
+              data() {}, // Drain client output; pane and trace helpers own assertions.
+            },
+          });
+          await waitForFormat("#{session_attached}", "1");
+          const terminal = client.terminal!;
+
+          const beforeSplit = readTraceLines(tracePath).length - 1;
+          tmux("split-window", "-v", "-d", "-t", pane, "sleep 120");
+          tmux("select-pane", "-t", pane);
+          await waitForSettledResize(beforeSplit);
+          await active.waitForComposer(10_000);
+          expect(format("#{window_zoomed_flag}")).toBe("0");
+          const draft = `draft survives ${mode}`;
+          terminal.write(draft);
+          await active.waitForText(draft, 5_000);
+
+          const beforeMode = readTraceLines(tracePath).length - 1;
+          // send-keys bypasses the client's prefix table. These are real PTY
+          // keystrokes, so choose-tree -Zs also exercises its implicit zoom.
+          terminal.write(mode === "choose-tree" ? "\x01s" : "\x01[");
+          const paneMode = mode === "choose-tree" ? "tree-mode" : "copy-mode";
+          await waitForFormat("#{pane_mode}", paneMode);
+          if (mode === "choose-tree") {
+            expect(format("#{window_zoomed_flag}")).toBe("1");
+          } else {
+            terminal.resize(100, 32);
+          }
+          const settled = await waitForSettledResize(beforeMode);
+          expect(attemptLine(settled, "tmux_clear_history_complete")).toBeDefined();
+          expect(format("#{pane_mode}")).toBe(paneMode);
+          expect(format("#{pane_in_mode}")).toBe("1");
+          // Also catch a delayed mode exit after the committed frame.
+          await Bun.sleep(250);
+          expect(format("#{pane_mode}")).toBe(paneMode);
+
+          // Leave intentionally, then prove neither the prefix nor the quit key
+          // leaked into the composer and that ordinary editing still works.
+          const beforeExit = readTraceLines(tracePath).length - 1;
+          terminal.write("q");
+          await waitForFormat("#{pane_in_mode}", "0");
+          if (mode === "choose-tree") {
+            await waitForFormat("#{window_zoomed_flag}", "0");
+            await waitForSettledResize(beforeExit);
+          }
+          await waitForSettledFooter(active);
+          terminal.write(" usable!");
+          terminal.write("\x7f");
+          const grid = (await active.waitForPane(
+            (text) => text.split("\n").some((line) =>
+              isInputRow(line) && line.trimEnd().endsWith(`${draft} usable`)
+            ),
+            5_000,
+          )).split("\n");
+          expect(findFooter(grid)).not.toBeNull();
+          expect(format("#{window_zoomed_flag}")).toBe("0");
+          expect(active.isPaneAlive()).toBe(true);
+          expect(client.exitCode).toBeNull();
+          expectEmptyStderr(stderrPath);
+        } finally {
+          try {
+            if (client) {
+              try {
+                client.kill("SIGKILL");
+                await client.exited;
+              } finally {
+                client.terminal?.close();
+              }
+            }
+          } finally {
+            // afterEach still owns the TmuxSession fixture and temporary files.
+            try { tmux("kill-server"); } catch {}
+          }
+        }
+      },
+      60_000,
+    );
+  }
+
   test(
     "welcome header starts at the first terminal row",
     async () => {
@@ -1707,6 +1856,438 @@ describe.skipIf(SKIP)("tui: resize", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "assistant stream retention preserves visible rows at default cap",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-assistant-retention-")));
+      if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ collapse_tool_calls: true }));
+      const children = ["collapsed-child-one.txt", "collapsed-child-two.txt", "collapsed-child-three.txt"];
+      for (const path of children) writeFileSync(join(workspace, path), "retained tool fixture\n");
+      const streams: ReadableStreamDefaultController<Uint8Array>[] = [];
+      const encoder = new TextEncoder();
+      let requestIndex = 0;
+      const gateway = startDynamicFakeGateway(() => {
+        if (requestIndex++ === 1) return fakeGatewaySse([
+          ...children.map((path, index) => ({
+            type: "tool-call", toolCallId: `retention-read-${index}`,
+            toolName: "read_file", input: JSON.stringify({ path }),
+          })),
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]);
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streams.push(controller);
+              controller.enqueue(encoder.encode(": held response\n\n"));
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      });
+      gateways.push(gateway);
+      const send = (turn: number, delta: string) => streams[turn].enqueue(
+        encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: `answer-${turn}`, delta })}\n\n`),
+      );
+      const finish = (turn: number) => {
+        streams[turn].enqueue(encoder.encode(`data: ${JSON.stringify({
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+        })}\n\ndata: [DONE]\n\n`));
+        streams[turn].close();
+      };
+      // Bounded inert destinations consume the real cap without thousands of rows.
+      const inertRow = (marker: string) => Array.from({ length: 14 }, (_, index) =>
+        `[${index === 0 ? marker : "."}](https://example.invalid/${"x".repeat(1000)})`
+      ).join("") + "\n\n";
+      // Removing the old response must leave the collapsed group through a retention frame.
+      const old = (id: number) => id === 0
+        ? inertRow("RETAIN_OLD_0000")
+        : `RETAIN_OLD_${String(id).padStart(4, "0")} immutable sentinel\n\n`;
+      const tail = (id: number) => inertRow(`RETAIN_TAIL_${String(id).padStart(4, "0")}`);
+      session = await createResizeSession({
+        cmd: FX_BIN, cwd: workspace, width: 168, height: 75,
+        isolated: true, remainOnExit: true, minimumHistoryLines: 10_000, stderrPath,
+        env: {
+          HOME: home, AI_GATEWAY_API_KEY: "synthetic-retention-key",
+          VERCEL_OIDC_TOKEN: undefined, FX_DISABLE_KEYCHAIN: "1",
+          FX_E2E_DISABLE_DOTENV: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+          FX_SKIP_ONBOARDING: "1", FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TRACE_SCOPES: "transcript_retention,scroll", FX_TRACE_LOG: tracePath,
+          FX_RECORD: join(root, "terminal.fxtape"),
+        },
+      });
+      const waitStream = async (count: number) => {
+        const deadline = Date.now() + 15_000;
+        while (streams.length < count) {
+          expect(Date.now()).toBeLessThan(deadline);
+          expect(session!.paneStatus().dead).toBe(false);
+          await Bun.sleep(20);
+        }
+      };
+      const assertRows = async (tailCount: number) => {
+        const full = await session!.captureFullScrollback();
+        const ids = [...full.matchAll(/RETAIN_(?:OLD|TAIL)_\d{4}/g)].map(match => match[0]);
+        const expected = [
+          ...Array.from({ length: 120 }, (_, id) => `RETAIN_OLD_${String(id).padStart(4, "0")}`),
+          ...Array.from({ length: tailCount }, (_, id) => `RETAIN_TAIL_${String(id).padStart(4, "0")}`),
+        ];
+        expect(ids).toEqual(expected);
+        if (tailCount > 0) {
+          expect(full.match(/3 tool calls/g)).toHaveLength(1);
+          for (const path of children) expect(full).not.toContain(path);
+        }
+      };
+      await session.waitForStableComposer(15_000);
+      await session.sendText("First deterministic response.");
+      await waitStream(1);
+      send(0, old(0));
+      await session.waitForText("RETAIN_OLD_0000", 10_000);
+      for (let id = 1; id < 120; id += 4) {
+        send(0, Array.from({ length: Math.min(4, 120 - id) }, (_, offset) => old(id + offset)).join(""));
+        await Bun.sleep(80);
+      }
+      finish(0);
+      await session.waitForText("RETAIN_OLD_0119", 10_000);
+      await session.waitForStableComposer(15_000);
+      await assertRows(0);
+      await session.sendText("Second deterministic response.");
+      await waitStream(2);
+      await session.waitForText("3 tool calls", 10_000);
+      send(1, tail(0));
+      await session.waitForText("RETAIN_TAIL_0000", 10_000);
+      expect(await session.capturePane()).not.toContain("xxxxxxxx");
+      for (let id = 1; id < 65; id += 2) {
+        send(1, tail(id) + tail(id + 1));
+        await Bun.sleep(100);
+      }
+      await session.waitForText("RETAIN_TAIL_0064", 15_000);
+      await Bun.sleep(300);
+      await assertRows(65);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("pruned entry");
+      let tailCount = 65;
+      let retained = false;
+      for (let id = 65; id < 81; id++) {
+        send(1, tail(id));
+        await session.waitForText(`RETAIN_TAIL_${String(id).padStart(4, "0")}`, 10_000);
+        await Bun.sleep(150);
+        tailCount = id + 1;
+        await assertRows(tailCount);
+        if (readFileSync(tracePath, "utf8").includes("trimmed protected entry")) {
+          retained = true;
+          break;
+        }
+      }
+      expect(retained).toBe(true);
+      finish(1);
+      await session.waitForStableComposer(15_000);
+      await assertRows(tailCount);
+      await session.sendText("/status");
+      await session.waitForStableComposer(10_000);
+      await assertRows(tailCount);
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus().status).toBe(0);
+      expectEmptyStderr(stderrPath);
+    },
+    120_000,
+  );
+
+  for (const { label, pressure, viewerCols } of [
+    { label: "no-prune control", pressure: false, viewerCols: 0 },
+    { label: "pressure", pressure: true, viewerCols: 0 },
+    { label: "pressure with Ctrl+O", pressure: true, viewerCols: 80 },
+    { label: "pressure with Ctrl+O resize 80 to 100", pressure: true, viewerCols: 100 },
+  ]) {
+    test(
+      `command retention preserves native paragraphs at default cap (${label})`,
+      async () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-retention-")));
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const tracePath = join(root, "trace.log");
+        const stderrPath = join(root, "stderr.log");
+        const tapePath = join(root, "terminal.fxtape");
+        const releasePath = join(workspace, "release");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(workspace);
+        writeFileSync(join(home, ".fx", "settings.json"), "{}");
+        writeFileSync(stderrPath, "");
+        // Keep geometry and logical rows identical; only the old retained payload differs.
+        writeFileSync(join(workspace, "old.txt"), "S".repeat(pressure ? 1_040_000 : 8_000) + "\n");
+        writeFileSync(join(workspace, "new.txt"), "N".repeat(80_000) + "\n");
+        writeFileSync(join(workspace, "probe.sh"), [
+          "printf started > started",
+          "while [ ! -f release ]; do sleep 0.05; done",
+          "cat new.txt",
+          "printf finished > finished",
+          "",
+        ].join("\n"));
+        const oldLabels = Array.from({ length: 10 }, (_, index) =>
+          `RETENTION_OLD_${String(index).padStart(2, "0")}`
+        );
+        const oldParagraphs = [
+          "1. First result remains visible.",
+          "Second result retains its own paragraph.",
+          "Third result follows one blank separator.",
+          "Fourth result ends the first section.",
+          "Artifacts: prepared output remains available.",
+          "Artifact details retain their original row.",
+          "Checks: command output finished successfully.",
+          "Check details remain separate from artifacts.",
+          "Summary: all earlier results are preserved.",
+          "Summary details close the old response.",
+        ].map((text, index) => `${oldLabels[index]} ${text}`);
+        const laterLabels = Array.from({ length: 24 }, (_, index) =>
+          `RETENTION_LATER_${String(index).padStart(2, "0")}`
+        );
+        const oldResponse = oldParagraphs.join("\n\n");
+        const laterResponse = laterLabels.join("\n\n") + "\n\nRETENTION_FINISHED";
+        let requestCount = 0;
+        const gateway = startDynamicFakeGateway((body) => {
+          requestCount++;
+          writeFileSync(join(root, `request-${requestCount}.json`), body);
+          if (requestCount === 1 || requestCount === 3) return fakeGatewaySse([
+            {
+              type: "tool-call", toolCallId: `retention-${requestCount}`, toolName: "shell",
+              input: { request: {
+                action: "run", command: requestCount === 1 ? "cat old.txt" : "sh probe.sh",
+                profile: "clean", yield_time_ms: 30_000,
+              } },
+            },
+            ...(requestCount === 3 ? [{
+              type: "tool-call", toolCallId: "retention-second-admission", toolName: "shell",
+              input: { request: {
+                action: "run", command: "printf finished > sibling-finished; printf 'small sibling output\\n'",
+                profile: "clean", yield_time_ms: 30_000,
+              } },
+            }] : []),
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+          return fakeGatewayFinalText(requestCount === 2 ? oldResponse : laterResponse);
+        });
+        gateways.push(gateway);
+        const env = {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home,
+          AI_GATEWAY_API_KEY: "synthetic-command-retention", VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_MODEL: FAKE_GATEWAY_MODEL, FX_MAX_AGENT_STEPS: "4",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1",
+          FX_PERMISSION_MODE: "full-access",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TRACE_SCOPES: "transcript_retention,command_output,scroll,frame_plan,frame_commit,tool,ui_activity" +
+            (viewerCols ? ",full_transcript,full_transcript_cache,resize" : ""),
+          FX_TRACE_LOG: tracePath, FX_RECORD: tapePath, FX_RECORD_INPUT: "1",
+        };
+        const failures: Error[] = [];
+        const checks: Record<string, string> = {};
+        const check = (name: string, assertion: () => void) => {
+          try {
+            assertion();
+            checks[name] = "PASS";
+          } catch (error) {
+            checks[name] = String(error);
+            failures.push(new Error(`${name}: ${String(error)}`));
+          }
+        };
+        const capture = async (name: string) => {
+          const full = await session!.captureFullScrollback();
+          writeFileSync(join(root, `${name}.full.txt`), full);
+          writeFileSync(join(root, `${name}.ansi`), await session!.captureFullScrollbackEscapes());
+          return full;
+        };
+        const expectHistory = (full: string, later: boolean) => {
+          const labels = later ? [...oldLabels, ...laterLabels] : oldLabels;
+          const found = [...full.matchAll(/RETENTION_(?:OLD|LATER)_\d{2}/g)].map(match => match[0]);
+          expect(found).toEqual(labels);
+          for (const label of labels) expect(countOccurrences(full, label)).toBe(1);
+          const lines = full.split("\n").map(line => line.trim());
+          for (const line of lines) {
+            expect((line.match(/RETENTION_(?:OLD|LATER)_\d{2}/g) ?? []).length).toBeLessThanOrEqual(1);
+          }
+          const paragraphs = later ? [...oldParagraphs, ...laterLabels] : oldParagraphs;
+          for (let index = 0; index < labels.length; index++) {
+            expect(lines.filter(line => line.includes(labels[index]!))).toEqual([paragraphs[index]!]);
+          }
+          // Trim cell padding, never newlines: missing or added spacers must fail too.
+          const normalized = lines.join("\n");
+          for (let index = 1; index < oldParagraphs.length; index++) {
+            expect(normalized).toContain(`${oldParagraphs[index - 1]}\n\n${oldParagraphs[index]}`);
+          }
+          if (later) expect(normalized).toContain(laterResponse);
+        };
+        let passed = false;
+        try {
+          session = await createResizeSession({
+            cmd: quoteShellPath(FX_BIN), cwd: workspace, env,
+            isolated: true, remainOnExit: true, width: 80, height: 32,
+            minimumHistoryLines: 20_000, stderrPath,
+          });
+          await session.waitForStableComposer(15_000);
+          await session.sendText("Produce the old command output and labeled response.");
+          await session.waitForText(oldLabels.at(-1)!, TIMEOUT);
+          await session.waitForStableComposer(15_000);
+          const seeded = await capture("seeded");
+          check("seeded history", () => expectHistory(seeded, false));
+          check("seed stays below default cap", () => {
+            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
+          });
+
+          await session.sendText("Run the new prepared output, then the later response.");
+          const deadline = Date.now() + 15_000;
+          while (!existsSync(join(workspace, "started"))) {
+            expect(session.paneStatus().dead).toBe(false);
+            expect(Date.now()).toBeLessThan(deadline);
+            await Bun.sleep(25);
+          }
+          await capture("before-output");
+          const fullFooter = "full detail · ctrl+o close";
+          if (viewerCols) {
+            await session.sendHexBytes(["0f"]);
+            await session.waitForText(fullFooter, TIMEOUT);
+            await capture("viewer-open-before-output");
+            check("viewer admitted before first retirement", () => {
+              expect(existsSync(releasePath)).toBe(false);
+              expect(existsSync(join(workspace, "finished"))).toBe(false);
+              expect(requestCount).toBe(3);
+              expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
+            });
+          }
+          const traceOffset = readFileSync(tracePath, "utf8").length;
+          writeFileSync(releasePath, "go");
+          if (viewerCols) {
+            const sessionsRoot = join(home, ".fx", "sessions");
+            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
+              .filter(entry => entry.isDirectory()).map(entry => entry.name);
+            expect(ids).toHaveLength(1);
+            const eventsPath = join(sessionsRoot, ids[0]!, "events.jsonl");
+            // The main composer and text tail are hidden. Wait for the actual saved
+            // assistant and its following completion record, not a viewer repaint.
+            await session.waitForPane((pane) => {
+              expect(session!.paneStatus().dead).toBe(false);
+              expect(pane).toContain(fullFooter);
+              const text = readFileSync(eventsPath, "utf8");
+              // A concurrent append may end mid-record; only parse terminated lines.
+              const records = text.split("\n").slice(0, -1).map(line => JSON.parse(line));
+              const assistantIndex = records.findIndex(record =>
+                record.event.assistant?.text === laterResponse
+              );
+              const completed = assistantIndex >= 0 && records.slice(assistantIndex + 1)
+                .some(record => record.event.turn_completed !== undefined);
+              return completed && requestCount === 4 &&
+                existsSync(join(workspace, "finished")) &&
+                existsSync(join(workspace, "sibling-finished")) &&
+                /pruned (?:command output|entry)/.test(readFileSync(tracePath, "utf8").slice(traceOffset));
+            }, TIMEOUT);
+            checks["viewer turn completed and pruned before close"] = "PASS";
+            writeFileSync(join(root, "viewer-completed.events.jsonl"), readFileSync(eventsPath));
+            const viewerTrace = readFileSync(tracePath, "utf8").slice(traceOffset);
+            writeFileSync(join(root, "viewer-completed.trace.log"), viewerTrace);
+            await capture("viewer-completed-before-close");
+            check("retirement completed while viewer owns screen", () => {
+              expect(viewerTrace).toMatch(/pruned (?:command output|entry)/);
+              expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
+              expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
+              expect(gateway.requests).toHaveLength(4);
+            });
+            if (viewerCols !== 80) {
+              const resizeOffset = readFileSync(tracePath, "utf8").length;
+              await session.resizeWindow(viewerCols, 32, 0);
+              await session.waitForPane((pane) => {
+                expect(session!.paneStatus().dead).toBe(false);
+                return pane.includes(fullFooter) && readFileSync(tracePath, "utf8")
+                  .slice(resizeOffset).includes(`[full_transcript_cache] window cols=${viewerCols} `);
+              }, TIMEOUT);
+              expect(session.paneSize()).toEqual({ cols: viewerCols, rows: 32 });
+              await capture("viewer-resized-before-close");
+            }
+            expect(await session.capturePane()).toContain(fullFooter);
+            await session.sendKeys("Escape");
+            await session.waitForPane(pane => !pane.includes(fullFooter) && hasEmptyComposer(pane), TIMEOUT);
+            expect(session.paneSize()).toEqual({ cols: viewerCols, rows: 32 });
+          }
+          await session.waitForText("RETENTION_FINISHED", TIMEOUT);
+          await session.waitForStableComposer(15_000);
+          const afterOutput = await capture("after-output");
+          const boundary = readFileSync(tracePath, "utf8").slice(traceOffset);
+          writeFileSync(join(root, "output-trace.log"), boundary);
+          // Scheduling can coalesce atomic append/status frames. Require actual pruning,
+          // not a particular frame reason; coordinator tests own those exact boundaries.
+          check("retention boundary", () => {
+            const prunes = boundary.match(/pruned (?:command output|entry)/g) ?? [];
+            if (pressure) expect(prunes.length).toBeGreaterThan(0);
+            else expect(prunes).toHaveLength(0);
+          });
+          check("commands finished", () => {
+            expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
+            expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
+            expect(requestCount).toBe(4);
+            expect(gateway.requests).toHaveLength(4);
+          });
+          check("native history after output", () => expectHistory(afterOutput, true));
+          await session.sendText("/status");
+          await session.waitForText("agent_step_limit=", 10_000);
+          await session.waitForStableComposer(10_000);
+          const afterStatus = await capture("after-status");
+          check("native history after status", () => expectHistory(afterStatus, true));
+          if (!pressure) check("control never prunes", () => {
+            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
+          });
+          await session.sendText("/quit");
+          await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+          check("clean exit", () => {
+            expect(session!.paneStatus()).toEqual({ dead: true, status: 0 });
+            expectEmptyStderr(stderrPath);
+          });
+          check("persisted assistant paragraphs", () => {
+            const sessionsRoot = join(home, ".fx", "sessions");
+            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
+              .filter(entry => entry.isDirectory()).map(entry => entry.name);
+            expect(ids).toHaveLength(1);
+            const events = readFileSync(join(sessionsRoot, ids[0]!, "events.jsonl"), "utf8")
+              .trim().split("\n").map(line => JSON.parse(line));
+            const responses = events.filter(record => record.event.assistant !== undefined)
+              .map(record => record.event.assistant.text);
+            expect(responses).toEqual([oldResponse, laterResponse]);
+          });
+          check("recording replay", () => {
+            const replay = Bun.spawnSync([FX_BIN, "replay", tapePath, "--json"], {
+              cwd: workspace, env: { ...env, FX_RECORD: undefined, FX_TRACE_LOG: undefined },
+            });
+            writeFileSync(join(root, "replay.json"), replay.stdout);
+            writeFileSync(join(root, "replay.stderr"), replay.stderr);
+            expect(replay.exitCode).toBe(0);
+            expect(replay.stderr.toString()).toBe("");
+            const summary = JSON.parse(replay.stdout.toString());
+            expect(summary.frame_count).toBeGreaterThan(0);
+            expect(summary.stdout_bytes).toBeGreaterThan(0);
+            if (viewerCols) expect(summary.resize_count).toBe(viewerCols === 80 ? 0 : 1);
+          });
+          if (failures.length) throw new AggregateError(failures, "Command retention checks failed");
+          passed = true;
+        } finally {
+          writeFileSync(releasePath, "cleanup");
+          if (session) await capture("last");
+          writeFileSync(join(root, "checks.json"), JSON.stringify({ pressure, viewerCols, requestCount, checks }, null, 2));
+          if (passed && !KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
+          else console.error(`command retention evidence retained: ${root}`);
+        }
+      },
+      120_000,
+    );
+  }
 
   test(
     "structured retention keeps native scrollback complete before resize",
@@ -1971,7 +2552,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
         .slice(cancellationAttempt.endIndex + 1, cleanupAttempt.beginIndex)
         .join("\n");
       expect(cleanupTrace).toMatch(
-        /transcript_anchor_structured_rewrite_preserve .*reason=lifecycle_pin_cleanup/,
+        /transcript_source_publication_rebased .*reason=lifecycle_pin_cleanup/,
+      );
+      expect(cleanupTrace).toMatch(
+        /transcript_retention_rebase state=stable history=(\d+)->\1 view=(\d+)->\2(?:\s|$)/,
       );
       await active.waitForPane((pane) => {
         const lastLine = pane.trimEnd().split("\n").at(-1)?.trim() ?? "";
@@ -1984,7 +2568,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         help: countOccurrences(scrollback, "Run /help for commands"),
         recording: countOccurrences(
           scrollback,
-          "● Recording: visual terminal capture:",
+          "! recording: visual terminal capture:",
         ),
         seed: countOccurrences(scrollback, seedMarker),
       });
@@ -2104,6 +2688,168 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expectEmptyStderr(stderrPath);
     },
     TIMEOUT,
+  );
+
+  test(
+    "list paragraph indentation survives streaming and resize from 167 to 72 columns",
+    async () => {
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-resize-list-paragraph-")),
+      );
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const tapePath = join(root, "session.fxtape");
+      tempDirs.push(root);
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(stderrPath, "");
+
+      const paragraph =
+        "I recommend checking the dev channel every 60 seconds rather than the current 30 minutes. Leave stable-channel behavior unchanged. This detects published releases periodically, not instantly on a main merge.";
+      const source = [
+        "Recommended fix",
+        "",
+        "1. Continue polling while ready.",
+        `   ${paragraph}`,
+        "",
+        `2. ${paragraph}`,
+        "",
+        "- Bullet heading.",
+        `  ${paragraph}`,
+        "",
+        `- ${paragraph}`,
+        "",
+        "WRAP_REPRO_END",
+        "",
+      ].join("\n");
+      // Split both paragraph prefixes across deltas, including a spaces-only delta.
+      const chunks = [
+        "Recommended fix\n\n1. Continue polling while ready.\n ",
+        "  ",
+        paragraph.slice(0, 83),
+        `${paragraph.slice(83)}\n\n2. ${paragraph}\n\n- Bullet heading.\n `,
+        ` ${paragraph.slice(0, 83)}`,
+        `${paragraph.slice(83)}\n\n- ${paragraph}\n\nWRAP_REPRO_END\n`,
+      ];
+      expect(chunks.join("")).toBe(source);
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          { type: "text-start", id: "list-paragraph" },
+          ...chunks.map((delta) => ({ type: "text-delta", id: "list-paragraph", delta })),
+          { type: "text-end", id: "list-paragraph" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: { inputTokens: { total: 1 }, outputTokens: { total: 200 } },
+          },
+        ]),
+      ]);
+      gateways.push(gateway);
+      session = await createResizeSession({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-list-paragraph-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_RECORD: tapePath,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "resize,frame_schedule,scroll",
+          NO_COLOR: "1",
+        },
+        width: 167,
+        height: 40,
+        stderrPath,
+        isolated: true,
+        remainOnExit: true,
+        minimumHistoryLines: MINIMUM_RESIZE_HISTORY_LINES,
+      });
+      const active = session;
+      await active.waitForComposer(10_000);
+      await active.sendText("render the list wrapping fixture");
+
+      const expectListParagraphs = async (cols: number) => {
+        await active.waitForStableScrollback((text) => text.includes("WRAP_REPRO_END"));
+        await active.waitForStableComposer();
+        const scrollback = (await active.captureFullScrollbackEscapes())
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+        const lines = scrollback.split("\n");
+        const markers = [
+          "Recommended fix",
+          "1. Continue polling while ready.",
+          "2. I recommend checking",
+          "• Bullet heading.",
+          "• I recommend checking",
+          "WRAP_REPRO_END",
+        ];
+        const rows = semanticMarkerRows(scrollback, markers);
+        for (let index = 1; index < rows.length; index++) {
+          expect(rows[index]!).toBeGreaterThan(rows[index - 1]!);
+        }
+        const normalize = (text: string) => text.trim().replace(/\s+/g, " ");
+        expect(normalize(lines.slice(rows[0], rows[5]! + 1).join("\n")))
+          .toBe(normalize(source.replace(/^- /gm, "• ")));
+        expect(countOccurrences(scrollback, "I recommend checking")).toBe(4);
+
+        for (const [start, end, indent, marker] of [
+          [rows[1]! + 1, rows[2]!, 5, ""],
+          [rows[2]!, rows[3]!, 5, "2. "],
+          [rows[3]! + 1, rows[4]!, 4, ""],
+          [rows[4]!, rows[5]!, 4, "• "],
+        ] as const) {
+          const paragraphRows = lines.slice(start, end).filter((line) => line.trim() !== "");
+          expect(paragraphRows.length).toBeGreaterThan(1);
+          for (const [index, line] of paragraphRows.entries()) {
+            const expectedIndent = index === 0 && marker ? 2 : indent;
+            expect(line.length - line.trimStart().length).toBe(expectedIndent);
+            expect(line.length).toBeLessThanOrEqual(cols);
+          }
+          const text = paragraphRows.map((line) => line.trim());
+          expect(text[0]!.startsWith(marker)).toBe(true);
+          text[0] = text[0]!.slice(marker.length);
+          expect(text.join(" ")).toBe(paragraph);
+        }
+        const grid = await active.capturePaneGrid();
+        expect(grid.filter((line) => line.trim() === "┃")).toHaveLength(1);
+        expect(findFooter(grid)).not.toBeNull();
+        expect(active.paneStatus()).toEqual({ dead: false, status: null });
+        expectEmptyStderr(stderrPath);
+      };
+
+      await expectListParagraphs(167);
+      await active.resizeWindow(72, 40, 500);
+      await waitForTraceCount(tracePath, "settled_reset_committed", 1);
+      await expectListParagraphs(72);
+      await active.sendLiteralText("composer remains usable");
+      await active.waitForText("┃ composer remains usable");
+      await active.sendKeys("C-u");
+      await active.waitForStableComposer();
+      expect(gateway.requests).toHaveLength(1);
+      await active.sendText("/quit");
+      const exitDeadline = Date.now() + TIMEOUT;
+      while (!active.paneStatus().dead && Date.now() < exitDeadline) {
+        await Bun.sleep(25);
+      }
+      expect(active.paneStatus()).toEqual({ dead: true, status: 0 });
+      expectEmptyStderr(stderrPath);
+
+      const replay = Bun.spawnSync([FX_BIN, "replay", tapePath, "--json"], {
+        cwd: workspace,
+        env: { ...process.env, HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+      });
+      expect(replay.exitCode).toBe(0);
+      expect(replay.stderr.toString()).toBe("");
+      expect(JSON.parse(replay.stdout.toString()).resize_count).toBe(1);
+    },
+    60_000,
   );
 
   test(
@@ -2446,7 +3192,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 35 · Type to filter");
+      expect(shrinkStage).toContain("Commands 37 · type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -2615,24 +3361,24 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "help",
       width: 72,
       height: 16,
-      surfaceMarker: "Enter Open",
+      surfaceMarker: "enter open",
       editedInput: "x",
       async openSurface(active) {
         await active.resizeWindow(60, 12, 500);
         await active.sendText("/help");
-        await active.waitForText("Enter Open", TIMEOUT);
+        await active.waitForText("enter open", TIMEOUT);
       },
     },
     {
       issue: "FXC-125",
-      label: "cost",
+      label: "usage",
       width: 120,
       height: 36,
-      surfaceMarker: "[30 days]",
+      surfaceMarker: "not signed in to AI Gateway",
       editedInput: "x",
       async openSurface(active) {
-        await active.sendText("/cost");
-        await active.waitForText("[30 days]", TIMEOUT);
+        await active.sendText("/usage");
+        await active.waitForText("not signed in to AI Gateway", TIMEOUT);
         await active.resizeWindow(60, 12, 500);
       },
     },
@@ -3105,11 +3851,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
       }
 
       await session.resizeWindow(80, 17, 500);
-      pane = await session.waitForText("1–3 Choose", 5_000);
+      pane = await session.waitForText("1–3 choose", 5_000);
       expect(pane).toContain(FILE_APPROVAL_QUESTION);
       expect(pane).toContain("resize-approved.txt");
       expect(pane).toContain("+ preview-nine");
-      expect(pane).toContain("Wheel Scroll");
+      expect(pane).toContain("wheel scroll");
       expect(pane).not.toContain("omitted");
       fullBlock = findActiveFileApprovalBlock(await session.capturePaneGrid());
       expect(fullBlock).not.toBeNull();
@@ -3423,15 +4169,15 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForText("Commands 37", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 35");
+      expect(grid.join("\n")).toContain("Commands 37");
       expect(findInlineHelpPicker(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
-      await session.waitForPane((pane) => !pane.includes("Enter Open"), 5_000);
+      await session.waitForPane((pane) => !pane.includes("enter open"), 5_000);
       await session.waitForStableComposer(5_000);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(5_000)).toBe(true);
@@ -3445,7 +4191,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForText("Commands 37", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -3453,7 +4199,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 35");
+        expect(grid.join("\n")).toContain("Commands 37");
         expect(findInlineHelpPicker(grid)).not.toBeNull();
       };
 
@@ -3465,13 +4211,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+        (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
         5_000,
       );
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 35");
+      expect(restored).not.toContain("Commands 37");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -3666,7 +4412,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(dir, "stderr.log");
       const gateway = startFakeGateway([
         fakeGatewayFinalText("large paste resize complete"),
-      ]);
+      ], { models: [{
+        id: FAKE_GATEWAY_MODEL,
+        type: "language",
+        tags: ["tool-use"],
+        context_window: 16_000_000,
+        max_tokens: 64_000,
+      }] });
       gateways.push(gateway);
 
       session = await createResizeSession({
@@ -3676,6 +4428,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         env: {
           AI_GATEWAY_API_KEY: "test-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "input,worker,resize",
@@ -3712,6 +4466,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(await waitForQueuedPromptBytes(tracePath, 60_000)).toBe(
         payload.length,
       );
+      expect(await waitForSubmittedUserText(gateway, tracePath, stderrPath))
+        .toBe(payload);
       expectEmptyStderr(stderrPath);
     },
     90_000,
@@ -3726,7 +4482,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(dir, "stderr.log");
       const gateway = startFakeGateway([
         fakeGatewayFinalText("CPR-shaped paste resize complete"),
-      ]);
+      ], { models: [{
+        id: FAKE_GATEWAY_MODEL,
+        type: "language",
+        tags: ["tool-use"],
+        context_window: 16_000_000,
+        max_tokens: 64_000,
+      }] });
       gateways.push(gateway);
 
       session = await createResizeSession({
@@ -3736,6 +4498,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         env: {
           AI_GATEWAY_API_KEY: "test-key",
           VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "input,worker,resize",
@@ -3985,7 +4749,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 35", 5_000);
+        await session.waitForText("Commands 37", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
@@ -3994,12 +4758,12 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
         await session.sendKeys("Escape");
         await session.waitForPane(
-          (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+          (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
           5_000,
         );
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain(marker);
-        expect(scrollback).not.toContain("Commands 35");
+        expect(scrollback).not.toContain("Commands 37");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 
@@ -4129,8 +4893,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const lightReplayStart = stdoutAfterLightTheme.lastIndexOf("\x1b[3J");
       expect(lightReplayStart).toBeGreaterThanOrEqual(0);
       const lightReplayAndTail = stdoutAfterLightTheme.slice(lightReplayStart);
-      expect(lightReplayAndTail).toContain("\x1b[38;5;247m");
-      expect(lightReplayAndTail).not.toContain("\x1b[38;5;245m");
+      expect(lightReplayAndTail).toContain(`\x1b[38;5;235m${inlineMarker}`);
+      expect(lightReplayAndTail).not.toContain(`\x1b[38;5;255m${inlineMarker}`);
       const resetCountAfter = countOccurrences(
         Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString(),
         "\x1b[3J",

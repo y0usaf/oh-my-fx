@@ -1,37 +1,161 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const types = @import("../shared/types.zig");
+const session_commands = @import("../session/session_commands.zig");
 
 const Allocator = std.mem.Allocator;
 
 const max_error_code_bytes: usize = 64;
 
+/// Catalog candidates surfaced for ambiguous or unknown model overrides.
+pub const max_model_match_candidates: usize = 4;
+
+/// Outcome of matching a requested model override against the cached catalog.
+/// Returned slices are allocated from the allocator passed to
+/// `matchCatalogModel`; the caller owns them.
+pub const ModelCatalogMatch = union(enum) {
+    /// No catalog entries were available; the override passes through unchanged.
+    no_catalog,
+    /// Exactly one catalog entry is the best match.
+    matched: []const u8,
+    /// Several entries tie as the best confident match.
+    ambiguous: []const []const u8,
+    /// No confident match; carries close but inconclusive entries (may be empty).
+    unknown: []const []const u8,
+};
+
+/// Matches a model override against catalog IDs using the same scoring as
+/// interactive `/model` selection. Exact (case-insensitive) IDs and unique
+/// confident matches resolve; confident ties and weak matches do not.
+pub fn matchCatalogModel(
+    alloc: Allocator,
+    ids: []const []const u8,
+    query: []const u8,
+) Allocator.Error!ModelCatalogMatch {
+    if (ids.len == 0) return .no_catalog;
+    for (ids) |id| {
+        if (std.ascii.eqlIgnoreCase(id, query)) {
+            return .{ .matched = try alloc.dupe(u8, id) };
+        }
+    }
+    // Confident matches contain the query verbatim (case-insensitive). Every
+    // fuzzyModelScore band that may resolve (prefix, substring, suffix after
+    // the provider slash) requires substring membership, while its weaker
+    // token and subsequence bands can reach the same numeric scores without
+    // it, so a score threshold alone would let scrambled paraphrases resolve.
+    var confident_best: i32 = 0;
+    var confident_count: usize = 0;
+    var confident_id: ?[]const u8 = null;
+    var weak_best: i32 = 0;
+    for (ids) |id| {
+        const score = session_commands.fuzzyModelScore(id, query);
+        if (containsIgnoreCase(id, query)) {
+            if (confident_id == null or score > confident_best) {
+                confident_best = score;
+                confident_count = 1;
+                confident_id = id;
+            } else if (score == confident_best) {
+                confident_count += 1;
+            }
+        } else if (score > weak_best) {
+            weak_best = score;
+        }
+    }
+    if (confident_id) |id| {
+        if (confident_count == 1) return .{ .matched = try alloc.dupe(u8, id) };
+        return .{ .ambiguous = try collectScoredMatches(alloc, ids, query, confident_best, true) };
+    }
+    if (weak_best == 0) return .{ .unknown = &.{} };
+    return .{ .unknown = try collectScoredMatches(alloc, ids, query, weak_best, false) };
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[start..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Collects up to `max_model_match_candidates` IDs at the target score,
+/// optionally restricted to substring matches. Returned slices are owned by
+/// the caller.
+fn collectScoredMatches(
+    alloc: Allocator,
+    ids: []const []const u8,
+    query: []const u8,
+    target_score: i32,
+    require_substring: bool,
+) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |item| alloc.free(item);
+        out.deinit(alloc);
+    }
+    for (ids) |id| {
+        if (out.items.len == max_model_match_candidates) break;
+        if (require_substring and !containsIgnoreCase(id, query)) continue;
+        if (session_commands.fuzzyModelScore(id, query) != target_score) continue;
+        try out.append(alloc, try alloc.dupe(u8, id));
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 pub const Action = enum { run, message };
 
-pub const RunInput = struct { task: []const u8 };
+pub const RunInput = struct {
+    task: []const u8,
+    model: ?[]const u8 = null,
+    effort: ?[]const u8 = null,
+};
 pub const MessageInput = struct {
     agent: []const u8,
     instructions: ?[]const u8 = null,
     message: []const u8,
+    model: ?[]const u8 = null,
+    effort: ?[]const u8 = null,
 };
 pub const RequestInput = union(Action) {
     run: RunInput,
     message: MessageInput,
 };
 
+/// Creation-time routing overrides carried by a request. Both default to the
+/// parent's values; overrides apply only when a child session is created.
+pub const Override = struct {
+    model: ?[]const u8 = null,
+    effort: ?types.ReasoningEffort = null,
+
+    pub fn present(self: Override) bool {
+        return self.model != null or self.effort != null;
+    }
+};
+
 pub const Request = union(Action) {
-    run: struct { task: []u8 },
+    run: struct {
+        task: []u8,
+        model: ?[]u8 = null,
+        effort: ?types.ReasoningEffort = null,
+    },
     message: struct {
         agent: []u8,
         instructions: ?[]u8 = null,
         message: []u8,
+        model: ?[]u8 = null,
+        effort: ?types.ReasoningEffort = null,
     },
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
-            .run => |value| alloc.free(value.task),
+            .run => |value| {
+                alloc.free(value.task);
+                if (value.model) |model| alloc.free(model);
+            },
             .message => |value| {
                 alloc.free(value.agent);
                 if (value.instructions) |instructions| alloc.free(instructions);
                 alloc.free(value.message);
+                if (value.model) |model| alloc.free(model);
             },
         }
         self.* = undefined;
@@ -47,6 +171,14 @@ pub const Request = union(Action) {
             .run => null,
         };
     }
+
+    /// Borrows from the request; the request must outlive the returned value.
+    pub fn override(self: Request) Override {
+        return switch (self) {
+            .run => |value| .{ .model = value.model, .effort = value.effort },
+            .message => |value| .{ .model = value.model, .effort = value.effort },
+        };
+    }
 };
 
 pub const ValidationError = error{
@@ -55,6 +187,8 @@ pub const ValidationError = error{
     InvalidAgent,
     InvalidInstructions,
     InvalidMessage,
+    InvalidModel,
+    InvalidEffort,
 };
 
 pub fn validateRequest(
@@ -64,7 +198,14 @@ pub fn validateRequest(
     return switch (input) {
         .run => |value| blk: {
             try validateText(value.task, domain.max_prompt_bytes, error.InvalidTask);
-            break :blk .{ .run = .{ .task = try alloc.dupe(u8, value.task) } };
+            const effort = try validateOverrideText(value.model, value.effort);
+            const task = try alloc.dupe(u8, value.task);
+            errdefer alloc.free(task);
+            break :blk .{ .run = .{
+                .task = task,
+                .model = try dupeOptional(alloc, value.model),
+                .effort = effort,
+            } };
         },
         .message => |value| blk: {
             if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
@@ -76,6 +217,7 @@ pub fn validateRequest(
                 }
             }
             try validateText(value.message, domain.max_message_bytes, error.InvalidMessage);
+            const effort = try validateOverrideText(value.model, value.effort);
             const agent = try alloc.dupe(u8, value.agent);
             errdefer alloc.free(agent);
             const instructions = if (value.instructions) |instructions|
@@ -83,13 +225,34 @@ pub fn validateRequest(
             else
                 null;
             errdefer if (instructions) |owned| alloc.free(owned);
+            const message = try alloc.dupe(u8, value.message);
+            errdefer alloc.free(message);
             break :blk .{ .message = .{
                 .agent = agent,
                 .instructions = instructions,
-                .message = try alloc.dupe(u8, value.message),
+                .message = message,
+                .model = try dupeOptional(alloc, value.model),
+                .effort = effort,
             } };
         },
     };
+}
+
+/// Validates override text without allocating. Returns the parsed effort.
+fn validateOverrideText(
+    model: ?[]const u8,
+    effort: ?[]const u8,
+) ValidationError!?types.ReasoningEffort {
+    if (model) |raw| try validateText(raw, domain.max_model_bytes, error.InvalidModel);
+    if (effort) |raw| {
+        return types.ReasoningEffort.parse(raw) orelse error.InvalidEffort;
+    }
+    return null;
+}
+
+/// Returns an owned copy the caller frees, or null. Never fails on null.
+fn dupeOptional(alloc: Allocator, value: ?[]const u8) ValidationError!?[]u8 {
+    return if (value) |raw| try alloc.dupe(u8, raw) else null;
 }
 
 fn validateText(
@@ -106,7 +269,7 @@ fn validateText(
 }
 
 pub const Kind = enum { one_off, persistent };
-pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished };
+pub const Phase = @import("child_state.zig").Phase;
 pub const Snapshot = struct {
     kind: Kind,
     phase: Phase,
@@ -122,6 +285,7 @@ pub const Plan = union(enum) {
     create_one_off,
     create_persistent,
     continue_persistent,
+    steer_persistent,
     reject: RejectCode,
 };
 
@@ -132,7 +296,10 @@ pub fn plan(request: Request, snapshot: ?Snapshot) Plan {
             .one_off => .{ .reject = .child_not_persistent },
             .persistent => switch (child.phase) {
                 .idle, .interrupted => .continue_persistent,
-                .running, .awaiting_approval => .{ .reject = .child_busy },
+                .running, .awaiting_approval => if (request.message.instructions != null)
+                    .{ .reject = .child_busy }
+                else
+                    .steer_persistent,
                 .finished => .{ .reject = .child_unavailable },
             },
         } else .create_persistent,
@@ -159,14 +326,53 @@ pub fn requestFingerprint(request: Request) [32]u8 {
             hash.update(value.message);
         },
     }
+    // Overrides extend the identity only when present so that override-less
+    // requests keep their pre-override fingerprints in persisted registries.
+    // The leading NUL is unambiguous: validated request text never contains
+    // NUL, so the override section cannot be confused with task or message
+    // content.
+    const override = request.override();
+    if (override.present()) {
+        hash.update("\x00\x01");
+        if (override.model) |model| {
+            hash.update("\x01");
+            hash.update(model);
+        } else {
+            hash.update("\x00");
+        }
+        hash.update("\x00");
+        if (override.effort) |effort| {
+            hash.update("\x01");
+            hash.update(effort.label());
+        } else {
+            hash.update("\x00");
+        }
+    }
     return hash.finalResult();
 }
 
+pub const steering_pending_result = "The subagent is still running. Handle the user's steering now. Its result will arrive automatically; do not delegate again to poll for it.";
+
 pub const Result = struct {
     ok: bool,
+    pending: bool = false,
     result: ?[]const u8 = null,
     error_code: ?[]const u8 = null,
+    delivery: ?types.SteeringDelivery = null,
 };
+
+pub fn feedbackResult(delivery: types.SteeringDelivery) Result {
+    return .{
+        .ok = delivery != .not_applied,
+        .delivery = delivery,
+        .result = switch (delivery) {
+            .queued => "Feedback queued for the running child. Its result will arrive automatically.",
+            .applied => "Feedback consumed at the child's safe boundary. This is not a task-completion result.",
+            .not_applied => "Feedback was not applied before the child stopped.",
+        },
+        .error_code = if (delivery == .not_applied) "feedback_not_applied" else null,
+    };
+}
 
 pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -180,6 +386,8 @@ pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
         &out.writer,
         if (result.error_code) |code| code[0..@min(code.len, max_error_code_bytes)] else null,
     );
+    if (result.pending) try out.writer.writeAll(",\"pending\":true");
+    if (result.delivery) |delivery| try out.writer.print(",\"delivery\":\"{s}\"", .{@tagName(delivery)});
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -194,8 +402,7 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 
 test "minimal request validation owns one-off and persistent intent" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 2), @typeInfo(Action).@"enum".fields.len);
-    try std.testing.expectEqual(@as(usize, 4), @typeInfo(Plan).@"union".fields.len);
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(Action).@"enum".field_names.len);
     var run = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
     defer run.deinit(alloc);
     try std.testing.expectEqual(Action.run, run.action());
@@ -257,7 +464,108 @@ test "persistent instruction updates participate in operation identity" {
     ));
 }
 
-test "persistent planning derives continue and busy" {
+test "creation overrides validate and participate in operation identity" {
+    const alloc = std.testing.allocator;
+    var plain = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
+    defer plain.deinit(alloc);
+    var routed = try validateRequest(alloc, .{ .run = .{
+        .task = "review this",
+        .model = "gpt-5.6-sol-fast",
+        .effort = "medium",
+    } });
+    defer routed.deinit(alloc);
+    try std.testing.expectEqualStrings("gpt-5.6-sol-fast", routed.run.model.?);
+    try std.testing.expectEqualStrings("medium", routed.run.effort.?.label());
+    try std.testing.expect(plain.override().present() == false);
+    try std.testing.expect(routed.override().present());
+    // Override-less requests keep their pre-override fingerprint.
+    const plain_digest = requestFingerprint(plain);
+    const expected_plain = comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fx.subagent.request.v1\x00");
+        hash.update("run");
+        hash.update("\x00");
+        hash.update("review this");
+        break :blk hash.finalResult();
+    };
+    try std.testing.expectEqual(expected_plain, plain_digest);
+    const routed_digest = requestFingerprint(routed);
+    try std.testing.expect(!std.mem.eql(u8, &plain_digest, &routed_digest));
+
+    var rerouted = try validateRequest(alloc, .{ .message = .{
+        .agent = "reviewer",
+        .message = "review this",
+        .effort = "high",
+    } });
+    defer rerouted.deinit(alloc);
+    try std.testing.expect(rerouted.message.model == null);
+    try std.testing.expectEqualStrings("high", rerouted.message.effort.?.label());
+
+    try std.testing.expectError(
+        error.InvalidModel,
+        validateRequest(alloc, .{ .run = .{ .task = "t", .model = "" } }),
+    );
+    try std.testing.expectError(
+        error.InvalidEffort,
+        validateRequest(alloc, .{ .run = .{ .task = "t", .effort = "not an effort!" } }),
+    );
+}
+
+test "model override catalog matching resolves, rejects, and suggests" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{
+        "anthropic/claude-fable-5.1",
+        "openai/gpt-5.6-terra",
+        "openai/gpt-5.6-terra-fast",
+        "openai/gpt-6-astra",
+    };
+
+    try std.testing.expectEqual(ModelCatalogMatch.no_catalog, try matchCatalogModel(alloc, &.{}, "terra"));
+
+    const exact = try matchCatalogModel(alloc, &ids, "OpenAI/GPT-6-ASTRA");
+    try std.testing.expectEqualStrings("openai/gpt-6-astra", exact.matched);
+    alloc.free(exact.matched);
+
+    const unique = try matchCatalogModel(alloc, &ids, "gpt-5.6-terra-fast");
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", unique.matched);
+    alloc.free(unique.matched);
+
+    const ambiguous = try matchCatalogModel(alloc, &ids, "terra");
+    try std.testing.expectEqual(@as(usize, 2), ambiguous.ambiguous.len);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra", ambiguous.ambiguous[0]);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", ambiguous.ambiguous[1]);
+    for (ambiguous.ambiguous) |item| alloc.free(item);
+    alloc.free(ambiguous.ambiguous);
+
+    const unknown = try matchCatalogModel(alloc, &ids, "skldjf");
+    try std.testing.expectEqual(@as(usize, 0), unknown.unknown.len);
+}
+
+test "model override catalog matching never resolves token-only paraphrases" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{ "openai/gpt-5.6-terra-fast", "anthropic/claude-fable-5.1" };
+    // Every query token appears in the target ID, but the query is not a
+    // substring of it: token-band scores must not resolve silently.
+    const result = try matchCatalogModel(alloc, &ids, "gpt 5.6 terra fast");
+    try std.testing.expectEqual(@as(usize, 1), result.unknown.len);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", result.unknown[0]);
+    for (result.unknown) |item| alloc.free(item);
+    alloc.free(result.unknown);
+}
+
+test "model override catalog matching keeps weak matches as suggestions" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{ "openai/gpt-6-astra", "openai/gpt-5.6-terra" };
+    // Subsequence-only scores never resolve silently; they become suggestions.
+    const result = try matchCatalogModel(alloc, &ids, "ogpt");
+    try std.testing.expectEqual(@as(usize, 2), result.unknown.len);
+    try std.testing.expectEqualStrings("openai/gpt-6-astra", result.unknown[0]);
+    for (result.unknown) |item| alloc.free(item);
+    alloc.free(result.unknown);
+}
+
+test "persistent planning derives continuation steering and busy overlay changes" {
     const alloc = std.testing.allocator;
     var message = try validateRequest(alloc, .{ .message = .{
         .agent = "reviewer",
@@ -269,7 +577,9 @@ test "persistent planning derives continue and busy" {
         plan(message, .{ .kind = .persistent, .phase = .idle }),
     );
     const busy = plan(message, .{ .kind = .persistent, .phase = .running });
-    try std.testing.expectEqual(RejectCode.child_busy, busy.reject);
+    try std.testing.expect(busy == .steer_persistent);
+    message.message.instructions = try alloc.dupe(u8, "new overlay");
+    try std.testing.expectEqual(RejectCode.child_busy, plan(message, .{ .kind = .persistent, .phase = .running }).reject);
 }
 
 test "terminal result omits scheduler identities and phases" {

@@ -9,6 +9,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const io_mod = @import("../shared/io.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const shared_theme = @import("../shared/theme.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -21,8 +22,8 @@ const render_input = @import("../../ui/footer/render_input.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const render_request = @import("../../ui/render_request.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const program_status = @import("../../ui/terminal/program_status.zig");
 
-const QueuePreview = worker_runtime.QueuePreview;
 const WorkerEvent = worker_runtime.WorkerEvent;
 const InputRuntime = core_input_runtime.Runtime;
 
@@ -38,13 +39,6 @@ test {
     _ = activity_runtime;
 }
 
-fn allocDimmedTranscriptLine(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
-    if (std.mem.endsWith(u8, text, "\n")) {
-        return std.fmt.allocPrint(alloc, "{s}{s}{s}\n", .{ ui_render.dim_style, text[0 .. text.len - 1], reset_style });
-    }
-    return std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ ui_render.dim_style, text, reset_style });
-}
-
 fn discardTable(_: *anyopaque, table: assistant_presentation.TablePayload) !void {
     var owned = table;
     owned.deinit(std.heap.c_allocator);
@@ -56,8 +50,17 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
-fn discardContextCompaction(_: *anyopaque, _: types.HistoryTurn) !void {}
+fn discardContextCompaction(_: *anyopaque, _: worker_runtime.ContextCompaction) !void {}
+fn unavailableFreshPrompt(_: *anyopaque, _: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
+    return error.SessionPersistenceUnavailable;
+}
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
+
+/// A retained delivery owns its own payload; a settled delivery acknowledges history.
+pub const HistoryDelivery = union(enum) {
+    retained,
+    settled: assistant_pacer.FinishResult,
+};
 
 pub const WorkerEventHandlers = struct {
     ctx: *anyopaque,
@@ -75,8 +78,9 @@ pub const WorkerEventHandlers = struct {
     command_output: *const fn (*anyopaque, ?types.ToolLifecycleId, command_output_content.Stream, []const u8) anyerror!void,
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
-    context_compaction: *const fn (*anyopaque, types.HistoryTurn) anyerror!void = discardContextCompaction,
-    append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!void,
+    context_compaction: worker_runtime.ContextCompactionHandler = discardContextCompaction,
+    prepare_fresh_prompt: worker_runtime.FreshPromptHandler = unavailableFreshPrompt,
+    append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!HistoryDelivery,
     session_grant: *const fn (*anyopaque, types.PermissionGrant) anyerror!void,
     error_text: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
 };
@@ -85,6 +89,171 @@ pub const AssistantTextDrainResult = enum {
     drained,
     blocked,
 };
+
+/// Writes one full-detail record for an admitted route recovery transition.
+/// The footer status is transient; this preserves retry and failure history
+/// in the ctrl+o full transcript's detail section.
+fn recordRouteRecoveryNotice(app: anytype, status: types.RouteRecoveryStatus) !void {
+    var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    defer body.deinit();
+    try writeRouteRecoveryBody(&body.writer, status);
+    try app.shell.appendFullDetailRecord(app.alloc, .{
+        .topic = "recovery",
+        .tone = routeRecoveryNoticeTone(status),
+        .body = body.written(),
+        .visibility = .full_only,
+    });
+}
+
+fn routeRecoveryNoticeTone(status: types.RouteRecoveryStatus) types.NoticeTone {
+    return switch (status.tone()) {
+        .warning => .warning,
+        .success => .success,
+        .danger => .@"error",
+    };
+}
+
+/// Pure formatter for the recovery record body: footer label, then the
+/// structured facts the label cannot carry.
+fn writeRouteRecoveryBody(
+    writer: *std.Io.Writer,
+    status: types.RouteRecoveryStatus,
+) !void {
+    var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    try writer.writeAll(status.label(&label_buf));
+    try writer.print("\nkind: {s}", .{@tagName(status.kind)});
+    if (status.cause) |cause| try writer.print(" · cause: {s}", .{@tagName(cause)});
+    if (status.attempt_limit > 0) {
+        try writer.print(" · attempt: {d}/{d}", .{ status.reportedAttempt(), status.attempt_limit });
+    }
+    if (status.delay_seconds > 0) {
+        try writer.print(" · retry delay: {d}s", .{status.delay_seconds});
+    }
+    if (status.diagnostic) |diagnostic| {
+        try writer.print(" · diagnostic: {s}", .{diagnostic.view()});
+    }
+}
+
+test "shutdown settles queued and pacer-owned finishes exactly once" {
+    const session_runtime = @import("../session/session.zig");
+    const session_store = @import("../session/session_store.zig");
+    const session_codec = @import("../session/session_codec.zig");
+    const ShutdownApp = struct {
+        alloc: std.mem.Allocator,
+        session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
+        session_persistence: app_session_runtime.Persistence = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+        pacer: assistant_pacer.AssistantPacer = .{},
+        total_input_tokens: u64 = 7,
+        total_output_tokens: u64 = 11,
+    };
+    const Ownership = struct {
+        references: usize = 0,
+        transfers: usize = 0,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn transfer(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.transfers += 1;
+        }
+        fn handle(self: *@This()) types.SnapshotFileOwnership {
+            return .{ .ctx = self, .retain_fn = retain, .release_fn = release, .transfer_fn = transfer };
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |pacer_owned| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        var app: ShutdownApp = .{ .alloc = alloc };
+        defer app.session.deinit(alloc);
+        defer app.session_persistence.deinit(alloc);
+        defer app.worker.deinit(std.heap.c_allocator);
+        defer app.pacer.deinit(alloc);
+        app.session_persistence.store = try session_store.Store.initFromHome(alloc, root, root);
+        const store = &app.session_persistence.store.?;
+        app.session_persistence.writable = try store.startWritableSession(alloc, .{
+            .id = @constCast("shutdown-finish"),
+            .origin_workspace_root = @constCast(root),
+            .workspace_root = @constCast(root),
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+            .conversation_language = .literal("en"),
+            .history = &.{},
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+        });
+        const checkpoint: session_codec.RecoveryCheckpoint = .{
+            .turn_id = 41,
+            .user = .{ .text = @constCast("cancel this response") },
+            .assistant_source = @constCast("partial response"),
+            .cause = .response_interrupted,
+            .action = .continuing_response,
+            .authority = .{ .provider = .gateway, .model = @constCast("test-model") },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 10,
+            .consumed_provider_attempts = 1,
+        };
+        try app_session_runtime.Runtime(ShutdownApp).setRecoveryCheckpoint(&app, checkpoint);
+
+        var ownership: Ownership = .{};
+        const summary: types.TurnSummary = .{ .token_progress = .{ .input_tokens = 7, .output_tokens = 11 } };
+        const finished: types.FinishedPrompt = .{
+            .turn = checkpoint.interruptedTurn(),
+            .summary = summary,
+            .terminal_outcome = .interrupted,
+            .snapshot_file_ownership = ownership.handle(),
+        };
+        if (pacer_owned) {
+            try app.pacer.enqueue(alloc, "unrendered tail");
+            try std.testing.expect(try app.pacer.deferFinish(alloc, finished));
+        } else {
+            try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = finished });
+        }
+        // A later queued finish must follow the pacer-owned turn. Neither a
+        // begin nor a presentation event may invoke UI or admit another prompt.
+        try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later prompt") } });
+        try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("do not render") } });
+        try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("later prompt") },
+            .assistant = @constCast("later answer"),
+        } } } });
+        app.worker.requestShutdown();
+        app_session_runtime.Runtime(ShutdownApp).recordShutdownFailure(&app, error.PreviousSessionSaveFailed);
+        try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
+        try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint != null);
+
+        try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app);
+        try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app);
+        try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
+        try std.testing.expectEqual(@as(usize, 1), ownership.transfers);
+        try std.testing.expectEqual(@as(usize, 0), ownership.references);
+        try std.testing.expectEqual(@as(usize, 0), app.worker.worker_events.items.len);
+        try std.testing.expect(app.pacer.deferred_turn == null);
+        try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
+        try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
+        // Close the actual writer before reload so only durable state can pass.
+        app.session_persistence.writable.?.deinit(alloc);
+        app.session_persistence.writable = null;
+        var loaded = try store.loadReadOnly(alloc, "shutdown-finish");
+        defer loaded.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), loaded.history.len);
+        try std.testing.expectEqualStrings("partial response", loaded.history[0].interrupted.assistant.?);
+        try std.testing.expectEqualDeep(summary, types.historyTurnSummary(loaded.history[0]).?);
+        try std.testing.expectEqualStrings("later answer", loaded.history[1].assistant.assistant);
+        try std.testing.expect(loaded.recovery_checkpoint == null);
+    }
+}
 
 const DetachedWorkerEventBatch = struct {
     alloc: std.mem.Allocator,
@@ -119,6 +288,7 @@ const DetachedWorkerEventBatch = struct {
 
     fn deinit(self: *DetachedWorkerEventBatch) void {
         while (self.next_unvisited < self.events.items.len) : (self.next_unvisited += 1) {
+            debug_trace.logf("worker", "undelivered worker event discarded kind={s}", .{@tagName(self.events.items[self.next_unvisited])});
             worker_runtime.freeWorkerEvent(self.alloc, self.events.items[self.next_unvisited]);
         }
         self.events.deinit(self.alloc);
@@ -126,7 +296,7 @@ const DetachedWorkerEventBatch = struct {
     }
 };
 
-fn batchContainsInterruptedClosure(
+fn batchContainsTerminalClosure(
     events: []const WorkerEvent,
     id: types.ToolLifecycleId,
 ) bool {
@@ -137,12 +307,11 @@ fn batchContainsInterruptedClosure(
         };
         switch (lifecycle) {
             .terminal => |terminal| {
-                if (terminal.outcome.kind == .cancelled and
-                    terminal.id.turn_id == id.turn_id and
+                if (terminal.id.turn_id == id.turn_id and
                     std.mem.eql(u8, terminal.id.call_id, id.call_id)) return true;
             },
             .turn_finished => |finished| {
-                if (finished.outcome == .interrupted and finished.turn_id == id.turn_id) return true;
+                if (finished.turn_id == id.turn_id) return true;
             },
             .provisional, .authoritative_started, .progress => {},
         }
@@ -150,22 +319,30 @@ fn batchContainsInterruptedClosure(
     return false;
 }
 
-fn batchSegmentEndsInterrupted(events: []const WorkerEvent) bool {
-    for (events, 0..) |event, index| {
+fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u64) bool {
+    var turn_id: ?u64 = null;
+    scan: for (events, 0..) |event, index| {
         if (index > 0) switch (event) {
-            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => return false,
+            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => break :scan,
             else => {},
         };
-        const lifecycle = switch (event) {
-            .tool_lifecycle => |value| value,
-            else => continue,
-        };
-        switch (lifecycle) {
-            .turn_finished => |finished| if (finished.outcome == .interrupted) return true,
-            .provisional, .authoritative_started, .progress, .terminal => {},
+        switch (event) {
+            .begin_presented_prompt => |id| turn_id = id,
+            .turn_phase_update => |phase| turn_id = phase.turn_id,
+            .tool_lifecycle => |lifecycle| {
+                turn_id = switch (lifecycle) {
+                    .turn_finished => |finished| return finished.outcome == .interrupted,
+                    .provisional => |value| value.id.turn_id,
+                    .authoritative_started => |value| value.id.turn_id,
+                    .progress => |value| value.id.turn_id,
+                    .terminal => |value| value.id.turn_id,
+                };
+            },
+            else => {},
         }
     }
-    return false;
+    const cancelled = cancelled_turn_id orelse return false;
+    return turn_id == null or turn_id.? == cancelled;
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -175,7 +352,7 @@ pub fn Runtime(comptime App: type) type {
             id: types.ToolLifecycleId,
             batch_events: []const WorkerEvent,
         ) CancelledEventAdmission {
-            if (batchContainsInterruptedClosure(batch_events, id)) return .admit;
+            if (batchContainsTerminalClosure(batch_events, id)) return .admit;
             if (id.turn_id <= presenter.snapshot().finalized_turn_watermark) return .drop;
             return .defer_until_closure;
         }
@@ -189,10 +366,12 @@ pub fn Runtime(comptime App: type) type {
                 .assistant_presentation,
                 .open_model_picker,
                 .semantic_notice,
+                .full_detail_record,
                 .command_output,
                 .turn_token_update,
                 .turn_phase_update,
                 .diff_block,
+                .restore_failed_prompt,
                 => .drop,
                 .route_recovery_status => |status| if (status.action == .paused)
                     .admit
@@ -219,8 +398,10 @@ pub fn Runtime(comptime App: type) type {
                 .notification,
                 .question_requested,
                 .clear_route_recovery_status,
+                .provider_resolved,
                 .api_status_text,
                 .context_compaction,
+                .prepare_fresh_prompt,
                 .credential_refreshed,
                 .finish_prompt,
                 .session_grant,
@@ -238,6 +419,68 @@ pub fn Runtime(comptime App: type) type {
             return record.phase == .terminal and record.activity_kind == .command;
         }
 
+        /// After the worker joins, persist finished turns without presenting output
+        /// or admitting work. The pacer owns the finish preceding queued events.
+        pub fn settleFinishedPromptsForShutdown(app: *App) !void {
+            try settleDeferredFinish(app);
+
+            var batch = DetachedWorkerEventBatch.init(
+                std.heap.c_allocator,
+                app.worker.takeEvents(),
+            );
+            defer batch.deinit();
+            while (batch.claim()) |event| {
+                defer worker_runtime.freeWorkerEvent(batch.alloc, event);
+                switch (event) {
+                    .finish_prompt => |finished| try persistFinishedPrompt(app, finished),
+                    else => debug_trace.logf("worker", "shutdown worker event dropped kind={s}", .{@tagName(event)}),
+                }
+            }
+        }
+
+        fn persistFinishedPrompt(app: *App, finished: types.FinishedPrompt) !void {
+            const appended = if (comptime @hasField(App, "session"))
+                app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished)
+            else
+                app.appendFinishedPrompt(finished);
+            appended catch |err| {
+                app_session_runtime.Runtime(App).recordFailedHistoryDelivery(app, err);
+                return err;
+            };
+        }
+
+        fn settleDeferredFinish(app: *App) !void {
+            if (comptime !@hasField(@TypeOf(app.pacer), "deferred_turn")) return;
+            if (app.pacer.deferred_turn) |finished| {
+                app.pacer.deferred_turn = null;
+                app.pacer.deferred_started_ns = null;
+                defer types.freeFinishedPrompt(app.alloc, finished);
+                try persistFinishedPrompt(app, finished);
+            }
+        }
+
+        fn preserveFinishedAfterDrainFailure(app: *App, batch: *DetachedWorkerEventBatch, may_persist: bool) void {
+            var can_persist = may_persist;
+            if (can_persist) settleDeferredFinish(app) catch {
+                can_persist = false;
+            };
+            while (batch.claim()) |event| {
+                defer worker_runtime.freeWorkerEvent(batch.alloc, event);
+                switch (event) {
+                    .finish_prompt => |finished| {
+                        if (can_persist) {
+                            persistFinishedPrompt(app, finished) catch {
+                                can_persist = false;
+                            };
+                        } else {
+                            debug_trace.logf("worker", "finished turn not persisted after earlier save failure", .{});
+                        }
+                    },
+                    else => debug_trace.logf("worker", "presentation failure discarded worker event kind={s}", .{@tagName(event)}),
+                }
+            }
+        }
+
         pub fn authorizeInteractiveAdmission(app: *App) !bool {
             if (comptime @hasDecl(@TypeOf(app.worker), "interactiveAdmissionSnapshot")) {
                 switch (app.worker.interactiveAdmissionSnapshot()) {
@@ -252,10 +495,6 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             return true;
-        }
-
-        pub fn queuePreview(app: *App) QueuePreview {
-            return app.worker.queuePreview();
         }
 
         pub fn syncQueuedPromptModel(app: *App, model: []const u8) !void {
@@ -287,19 +526,22 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn commitContextCompaction(
             app: *App,
-            turn: types.HistoryTurn,
+            summary: types.CompactedSummaryHistoryTurn,
+            active_prefix: ?types.AssistantHistoryTurn,
+            retained_from: ?types.ContextHistoryCut,
             max_history_turns: usize,
         ) !void {
             if (comptime @hasDecl(@TypeOf(app.worker), "commitContextCompaction")) {
                 try app.worker.commitContextCompaction(
                     std.heap.c_allocator,
-                    turn,
+                    summary,
+                    active_prefix,
+                    retained_from,
                     max_history_turns,
                 );
                 return;
             }
-            try propagateHistoryTurn(app, turn, max_history_turns);
-            try pushEvent(app, .{ .context_compaction = turn });
+            return error.ContextCompactionPersistenceUnavailable;
         }
 
         pub fn propagateGrant(app: *App, tool_name: []const u8, target_path: []const u8) !void {
@@ -434,6 +676,16 @@ pub fn Runtime(comptime App: type) type {
             try pushOwnedEvent(app, .{ .diff_block = payload });
         }
 
+        /// Activate an admitted continuation without presenting another user turn.
+        pub fn beginRecoveryPresentation(app: *App) void {
+            app.stream = .{
+                .active = true,
+                .turn_started_ms = io_mod.milliTimestamp(),
+            };
+            _ = app.shell.worker_status_state().clear();
+            app.shell.render_requests.request(.footer);
+        }
+
         pub fn syncState(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
@@ -507,10 +759,6 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const modal_active = app.approval_prompt.isActive() or app.question_prompt.isActive();
-            const queue_review_active = if (comptime @hasField(@TypeOf(snapshot), "queue_review_reason"))
-                snapshot.queue_review_reason != null
-            else
-                false;
             const worker_events_pending = if (comptime @hasField(@TypeOf(snapshot), "pending_event_count"))
                 snapshot.pending_event_count > 0
             else
@@ -521,7 +769,7 @@ pub fn Runtime(comptime App: type) type {
                 !cancellation_stops_turn and
                 (snapshot.processing or
                     worker_events_pending or
-                    (snapshot.queued_count > 0 and !queue_review_active));
+                    snapshot.queued_count > 0);
             const awaiting_tool_terminal = snapshot.cancel_requested and
                 activeToolStatusCount(presenter) > 0;
             if (!modal_active and
@@ -542,6 +790,46 @@ pub fn Runtime(comptime App: type) type {
             // Waiting on an approval or question is not thinking: freeze the
             // elapsed clock for the duration of the wait.
             activity_status.syncWaitingClock(&app.stream, modal_active, io_mod.milliTimestamp());
+
+            if (comptime @hasField(App, "program_status")) {
+                reportProgramStatus(app, !cancellation_stops_turn and
+                    (app.stream.active or snapshot.processing or snapshot.queued_count > 0));
+            }
+        }
+
+        /// Tells the terminal what the user would see: a decision prompt,
+        /// running work, or the result of the last turn.
+        fn reportProgramStatus(app: *App, busy: bool) void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) {
+                app.program_status.noteCompaction(app.worker.compactionActivitySnapshot());
+            }
+            const activity: program_status.Activity = if (app.approval_prompt.isActive())
+                .{ .blocked = .{
+                    .kind = .permission,
+                    .message = if (app.approval_prompt.request) |*request| request.view().label else "",
+                } }
+            else if (app.question_prompt.isActive())
+                .{ .blocked = .{ .kind = .question, .message = activeQuestionText(app) } }
+            else if (busy)
+                .working
+            else
+                .settled;
+            const report = app.program_status.update(activity) orelse return;
+            debug_trace.logf("program_status", "report activity={s} settled={s}", .{
+                @tagName(activity),
+                @tagName(app.program_status.settled),
+            });
+            app.writeProgramStatus(report);
+        }
+
+        fn activeQuestionText(app: *const App) []const u8 {
+            const projection = app.question_prompt.projection() orelse return "";
+            const entry = projection.current_entry orelse return "";
+            return entry.question;
+        }
+
+        fn noteTurnStarted(app: *App) void {
+            if (comptime @hasField(App, "program_status")) app.program_status.noteTurnStarted();
         }
 
         fn activeToolStatusCount(
@@ -562,16 +850,12 @@ pub fn Runtime(comptime App: type) type {
             if (app.shell.worker_status_state().expire_transient(now_ms)) {
                 app.shell.render_requests.request(.footer);
             }
-            if (!app.approval_prompt.isActive() and
-                !app.question_prompt.isActive())
-            {
-                _ = advanceVisibleAnimation(
-                    app,
-                    event_handlers.tool_lifecycle,
-                    now_ms,
-                    std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
-                );
-            }
+            _ = advanceVisibleAnimation(
+                app,
+                event_handlers.tool_lifecycle,
+                now_ms,
+                std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
+            );
         }
 
         fn advanceVisibleAnimation(
@@ -580,9 +864,17 @@ pub fn Runtime(comptime App: type) type {
             now_ms: i64,
             now_awake: std.Io.Clock.Timestamp,
         ) bool {
+            const compaction: @import("../output/compaction_activity.zig").Snapshot = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{};
+            app.shell.render_requests.observeCompactionRevision(compaction.revision);
+            if (comptime @hasDecl(@TypeOf(app.worker), "expireCompactionActivity")) {
+                if (compaction.operation) |op| {
+                    if (app.worker.expireCompactionActivity(op.id, compaction.revision, now_ms)) app.shell.render_requests.request(.footer);
+                }
+            }
+            const compaction_active = if (compaction.operation) |op| op.active() and op.visible(now_ms) else false;
             const status_changed = app.shell.worker_status_state().refresh_route_recovery(now_awake);
             if (status_changed) app.shell.render_requests.request(.footer);
-            if (!app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
+            if (!compaction_active and !app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
                 return status_changed;
             }
             if (app.approval_prompt.isActive() or
@@ -593,7 +885,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             var label_buf: [256]u8 = undefined;
-            _ = activityShimmerLabel(app, presenter, &label_buf) orelse return status_changed;
+            _ = activityShimmerLabel(app, presenter, compaction, now_ms, &label_buf) orelse return status_changed;
             const previous_deadline = app.shell.render_requests.animation_next_deadline_ms;
             if (!app.shell.render_requests.requestAnimationDue(now_ms)) return status_changed;
             debug_trace.logf(
@@ -607,8 +899,18 @@ pub fn Runtime(comptime App: type) type {
         fn activityShimmerLabel(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
+            compaction: @import("../output/compaction_activity.zig").Snapshot,
+            now_ms: i64,
             buf: []u8,
         ) ?[]const u8 {
+            switch (app.shell.activityProjection()) {
+                .turn_thinking => |thinking| if (thinking.tone != .thinking) return null,
+                .none, .tool_slot => {},
+            }
+            switch (activity_status.compactionProjection(buf, compaction, app.stream, now_ms)) {
+                .turn_thinking => |thinking| return if (thinking.tone == .thinking) thinking.label else null,
+                .none, .tool_slot => {},
+            }
             // Existence guard only: pass no clock so the label skips the counter.
             if (!app.stream.active and app.pacer.hasCompletedAssistantPresentationTail()) {
                 return activity_status.buildTurnLabel(buf, .{ .active = true }, 0);
@@ -623,6 +925,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn drainEvents(app: *App, handlers: WorkerEventHandlers) !void {
+            errdefer if (comptime @hasDecl(@TypeOf(app.worker), "failPendingHistoryPublication")) {
+                app.worker.failPendingHistoryPublication(error.HistoryPublicationDeliveryFailed);
+            };
             const taken = app.worker.takeEventBatch();
             var batch = DetachedWorkerEventBatch.init(
                 std.heap.c_allocator,
@@ -643,15 +948,16 @@ pub fn Runtime(comptime App: type) type {
             };
             defer batch.deinit();
 
-            const cancel_requested = taken.cancel_requested;
-            var interrupted_segment = cancel_requested or batchSegmentEndsInterrupted(batch.events.items);
+            var can_persist_finished = true;
+            errdefer preserveFinishedAfterDrainFailure(app, &batch, can_persist_finished);
+
+            var interrupted_segment = batchSegmentIsInterrupted(batch.events.items, taken.cancelled_turn_id);
             var first_event = true;
 
             events: while (batch.claim()) |event| {
                 if (!first_event) switch (event) {
                     .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt => {
-                        interrupted_segment = cancel_requested or
-                            batchSegmentEndsInterrupted(batch.claimedAndRemaining());
+                        interrupted_segment = batchSegmentIsInterrupted(batch.claimedAndRemaining(), taken.cancelled_turn_id);
                     },
                     else => {},
                 };
@@ -695,6 +1001,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, true);
+                        noteTurnStarted(app);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -707,6 +1014,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, true);
+                        noteTurnStarted(app);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -723,6 +1031,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, true);
+                        noteTurnStarted(app);
                         app.stream.active = true;
                         app.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -830,6 +1139,9 @@ pub fn Runtime(comptime App: type) type {
                         }
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
+                    .full_detail_record => |notice| {
+                        try app.shell.appendFullDetailRecord(app.alloc, notice);
+                    },
                     .route_recovery_status => |status| {
                         if (!try requireAssistantTextDrain(handlers)) {
                             try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
@@ -838,12 +1150,17 @@ pub fn Runtime(comptime App: type) type {
                         }
                         app.shell.worker_status_state().set_route_recovery(status, io_mod.milliTimestamp());
                         app.shell.render_requests.request(.footer);
+                        try recordRouteRecoveryNotice(app, status);
                     },
                     .clear_route_recovery_status => {
                         if (app.shell.worker_status_state().clear_route_recovery()) {
                             app.shell.render_requests.request(.footer);
                         }
                     },
+                    // The serving provider already appears on the ctrl+o
+                    // network record; nothing interactive consumes the event
+                    // today. The batch drain frees the payload.
+                    .provider_resolved => {},
                     .api_status_text => |text| {
                         resetStream(app, false);
                         app.shell.worker_status_state().set_api(text, .danger);
@@ -868,8 +1185,21 @@ pub fn Runtime(comptime App: type) type {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
                     },
-                    .context_compaction => |turn| {
-                        try handlers.context_compaction(handlers.ctx, turn);
+                    .context_compaction => |value| {
+                        if (comptime @hasDecl(@TypeOf(app.worker), "resolveContextCompaction")) {
+                            app.worker.resolveContextCompaction(
+                                std.heap.c_allocator,
+                                value,
+                                handlers.ctx,
+                                handlers.context_compaction,
+                            );
+                        } else {
+                            try handlers.context_compaction(handlers.ctx, value);
+                        }
+                    },
+                    .prepare_fresh_prompt => |value| {
+                        const current = app_session_runtime.Runtime(App).normalizeFreshPromptPreparation(app, value);
+                        app.worker.resolveFreshPrompt(std.heap.c_allocator, current, handlers.ctx, handlers.prepare_fresh_prompt);
                     },
                     .tool_lifecycle => |lifecycle| {
                         switch (lifecycle) {
@@ -885,10 +1215,27 @@ pub fn Runtime(comptime App: type) type {
                         try applyToolLifecycle(app, handlers.tool_lifecycle, lifecycle);
                     },
                     .finish_prompt => |finished| {
+                        var accepted = false;
+                        errdefer if (!accepted) {
+                            settleDeferredFinish(app) catch {
+                                can_persist_finished = false;
+                            };
+                            if (can_persist_finished) persistFinishedPrompt(app, finished) catch {
+                                can_persist_finished = false;
+                            };
+                        };
                         try flushPendingCommandOutputAtTurnBoundary(app, handlers);
                         resetStream(app, false);
                         app.shell.render_requests.request(.footer);
-                        try handlers.append_history_turn(handlers.ctx, finished);
+                        const delivery = try handlers.append_history_turn(handlers.ctx, finished);
+                        accepted = true;
+                        switch (delivery) {
+                            .retained => {},
+                            .settled => |result| switch (result) {
+                                .committed => {},
+                                .presentation_failed => |err| return err,
+                            },
+                        }
                     },
                     .session_grant => |grant| {
                         try handlers.session_grant(handlers.ctx, grant);
@@ -900,8 +1247,26 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, false);
+                        if (comptime @hasField(App, "program_status")) {
+                            if (notice.tone == .@"error") app.program_status.noteFailure();
+                        }
                         app.shell.render_requests.request(.footer);
                         try handlers.error_text(handlers.ctx, notice);
+                    },
+                    .restore_failed_prompt => |prompt| {
+                        // Never clobber a draft the user typed while the doomed
+                        // turn was still retrying; only an empty composer gets
+                        // the failed prompt back.
+                        if (app.input_runtime.edit_state.input.items.len == 0) {
+                            try app.input_runtime.textReplacementState().replace(app.alloc, prompt);
+                            app.shell.render_requests.request(.footer);
+                        } else {
+                            debug_trace.logf(
+                                "worker",
+                                "event=restore_failed_prompt_skipped reason=composer_occupied",
+                                .{},
+                            );
+                        }
                     },
                 }
             }
@@ -960,6 +1325,9 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 lifecycle,
             );
+            if (comptime @hasField(App, "program_status")) {
+                if (lifecycle == .turn_finished) app.program_status.noteTurnFinished(lifecycle.turn_finished.outcome);
+            }
             if (transition.applied_activity_kind) |kind| {
                 applyToolActivity(&app.stream, kind);
             }
@@ -1037,15 +1405,13 @@ pub fn Runtime(comptime App: type) type {
 fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchProgress) ![]u8 {
     var query_buf: [160]u8 = undefined;
     return switch (progress) {
-        .query_started => |query| std.fmt.allocPrint(
-            alloc,
-            "● Searching\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{text_utils.clippedLabel(&query_buf, query, 120)},
+        .query_started => |query| alloc.print(
+            "● Searching\x1b[0m {s}{s}\x1b[0m",
+            .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&query_buf, query, 120) },
         ),
-        .results_received => |entry| std.fmt.allocPrint(
-            alloc,
-            "● Found {d} result{s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{ entry.result_count, if (entry.result_count == 1) "" else "s", text_utils.clippedLabel(&query_buf, entry.query, 120) },
+        .results_received => |entry| alloc.print(
+            "● Found {d} result{s}\x1b[0m {s}{s}\x1b[0m",
+            .{ entry.result_count, if (entry.result_count == 1) "" else "s", shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&query_buf, entry.query, 120) },
         ),
     };
 }
@@ -1053,15 +1419,13 @@ fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchPr
 fn formatWebFetchProgress(alloc: std.mem.Allocator, progress: types.WebFetchProgress) ![]u8 {
     var url_buf: [types.WebFetchCompletion.max_url_len]u8 = undefined;
     return switch (progress) {
-        .fetching => |url| std.fmt.allocPrint(
-            alloc,
-            "● Fetching\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{text_utils.clippedLabel(&url_buf, url, 120)},
+        .fetching => |url| alloc.print(
+            "● Fetching\x1b[0m {s}{s}\x1b[0m",
+            .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
-        .converting => |url| std.fmt.allocPrint(
-            alloc,
-            "● Converting\x1b[0m \x1b[38;5;245m{s}\x1b[0m",
-            .{text_utils.clippedLabel(&url_buf, url, 120)},
+        .converting => |url| alloc.print(
+            "● Converting\x1b[0m {s}{s}\x1b[0m",
+            .{ shared_theme.current().tool_stdout_style, text_utils.clippedLabel(&url_buf, url, 120) },
         ),
     };
 }
@@ -1136,6 +1500,9 @@ const FakeQuestionSnapshot = struct {
 };
 
 const FakeWorker = struct {
+    compaction: @import("../output/compaction_activity.zig").State = .{},
+    compaction_reads: usize = 0,
+
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     events: std.ArrayList(WorkerEvent) = .empty,
     queued_count: usize = 0,
@@ -1151,14 +1518,23 @@ const FakeWorker = struct {
     reset_cancel_after_take_events: bool = false,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
 
+    pub fn compactionActivitySnapshot(self: *FakeWorker) @import("../output/compaction_activity.zig").Snapshot {
+        self.compaction_reads += 1;
+        return self.compaction.snapshot;
+    }
+
+    pub fn expireCompactionActivity(self: *FakeWorker, id: @import("../output/compaction_activity.zig").OperationId, revision: u64, now_ms: i64) bool {
+        return self.compaction.expire(id, revision, now_ms);
+    }
+
+    fn resolveFreshPrompt(_: *FakeWorker, alloc: std.mem.Allocator, value: worker_runtime.FreshPromptPreparation, ctx: *anyopaque, handler: worker_runtime.FreshPromptHandler) void {
+        var result = handler(ctx, value) catch return;
+        result.deinit(alloc);
+    }
+
     fn deinit(self: *FakeWorker) void {
         for (self.events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         self.events.deinit(std.heap.c_allocator);
-    }
-
-    fn queuePreview(self: *FakeWorker) QueuePreview {
-        _ = self;
-        return .{};
     }
 
     fn pushEvent(self: *FakeWorker, alloc: std.mem.Allocator, event: WorkerEvent) !void {
@@ -1193,7 +1569,7 @@ const FakeWorker = struct {
         const cancel_requested = self.worker_cancel_requested.load(.seq_cst);
         return .{
             .events = self.takeEvents(),
-            .cancel_requested = cancel_requested,
+            .cancelled_turn_id = if (cancel_requested and self.active_turn_id != 0) self.active_turn_id else null,
         };
     }
 
@@ -1222,7 +1598,7 @@ const FakeWorker = struct {
         };
     }
 
-    fn interactiveAdmissionSnapshot(self: *FakeWorker) worker_runtime.InteractiveAdmissionSnapshot {
+    pub fn interactiveAdmissionSnapshot(self: *FakeWorker) worker_runtime.InteractiveAdmissionSnapshot {
         return self.admission_snapshot;
     }
 
@@ -1255,14 +1631,14 @@ const FakeWorker = struct {
         return self.active_turn_id;
     }
 
-    fn propagateHistoryTurn(self: *FakeWorker, alloc: std.mem.Allocator, turn: types.HistoryTurn, max_history_turns: usize) !void {
+    pub fn propagateHistoryTurn(self: *FakeWorker, alloc: std.mem.Allocator, turn: types.HistoryTurn, max_history_turns: usize) !void {
         _ = alloc;
         _ = turn;
         _ = max_history_turns;
         self.propagated_history_turns += 1;
     }
 
-    fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
         _ = alloc;
         _ = tool_name;
         _ = target_path;
@@ -1302,7 +1678,7 @@ const FakeApprovalPrompt = struct {
         return changed;
     }
 
-    fn syncReview(self: *FakeApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
+    pub fn syncReview(self: *FakeApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
         const request = self.request orelse {
             const changed = self.review != null;
             self.review = null;
@@ -1325,6 +1701,12 @@ const FakeQuestionPrompt = struct {
     activate_on_sync: bool = true,
     sync_count: usize = 0,
     clear_count: usize = 0,
+    question: []const u8 = "",
+
+    fn projection(self: *const FakeQuestionPrompt) ?struct { current_entry: ?struct { question: []const u8 } } {
+        if (!self.active) return null;
+        return .{ .current_entry = .{ .question = self.question } };
+    }
 
     fn syncFrom(self: *FakeQuestionPrompt, alloc: std.mem.Allocator, entries: anytype) !void {
         _ = alloc;
@@ -1392,6 +1774,10 @@ const FakeShell = struct {
     fn appendRawTranscriptEntry(self: *FakeShell, alloc: std.mem.Allocator, line: []const u8) !u32 {
         try self.raw_entries.append(alloc, try alloc.dupe(u8, line));
         return @intCast(self.raw_entries.items.len);
+    }
+
+    fn appendFullDetailRecord(self: *FakeShell, alloc: std.mem.Allocator, notice: types.SemanticNotice) !void {
+        return self.lifecycle.appendFullDetailRecord(alloc, notice);
     }
 
     fn appendRawTranscriptEntryClassified(self: *FakeShell, alloc: std.mem.Allocator, line: []const u8, class: transcript_runtime.RawEntryClass) !u32 {
@@ -1495,7 +1881,7 @@ const FakeShell = struct {
         self.command_output_display = .{};
     }
 
-    fn openCommandOutputLifecycleId(self: *const FakeShell) ?types.ToolLifecycleId {
+    pub fn openCommandOutputLifecycleId(self: *const FakeShell) ?types.ToolLifecycleId {
         return self.lifecycle.openCommandOutputLifecycleId();
     }
 };
@@ -1520,23 +1906,8 @@ const FakeSubagents = struct {
     child_shell: FakeShell = .{},
     child_render_requests: render_request.RenderRequestState = .{},
 
-    const ChildPresentationView = struct {
-        chat: struct {
-            busy_value: bool,
-
-            fn busy(self: @This()) bool {
-                return self.busy_value;
-            }
-        },
-    };
-
     fn isViewActive(self: FakeSubagents) bool {
         return self.view_active;
-    }
-
-    fn childPresentationView(self: *FakeSubagents) ?ChildPresentationView {
-        if (!self.view_active) return null;
-        return .{ .chat = .{ .busy_value = self.child_busy } };
     }
 
     fn childConversationRuntime(self: *FakeSubagents) ?*FakeShell {
@@ -1576,12 +1947,20 @@ const FakeApp = struct {
     attention_count: usize = 0,
     last_attention_turn_id: u64 = 0,
     last_attention_kind: ?@import("../hooks/hooks.zig").AttentionKind = null,
+    persisted_finishes: std.ArrayList(types.FinishedPrompt) = .empty,
+    finish_persistence_error: ?anyerror = null,
+    program_status: program_status.Reporter = .{},
+    program_status_reports: std.ArrayList(u8) = .empty,
+    program_status_capture_failed: bool = false,
 
     fn init(alloc: std.mem.Allocator) FakeApp {
         return .{ .alloc = alloc };
     }
 
     fn deinit(self: *FakeApp) void {
+        for (self.persisted_finishes.items) |finished| types.freeFinishedPrompt(self.alloc, finished);
+        self.persisted_finishes.deinit(self.alloc);
+        self.program_status_reports.deinit(self.alloc);
         self.session_persistence.deinit(self.alloc);
         self.worker.deinit();
         self.approval_prompt.deinit(self.alloc);
@@ -1593,6 +1972,14 @@ const FakeApp = struct {
 
     fn pacerCallbacks(self: *FakeApp) void {
         _ = self;
+    }
+
+    pub fn appendFinishedPrompt(self: *FakeApp, finished: types.FinishedPrompt) !void {
+        if (self.finish_persistence_error) |err| return err;
+        const owned = try types.dupeFinishedPrompt(self.alloc, finished);
+        errdefer types.freeFinishedPrompt(self.alloc, owned);
+        try self.persisted_finishes.append(self.alloc, owned);
+        if (finished.snapshot_file_ownership) |ownership| ownership.transfer();
     }
 
     fn writeTranscript(self: *FakeApp, text: []const u8, record: bool) !void {
@@ -1645,7 +2032,7 @@ const FakeApp = struct {
         return false;
     }
 
-    fn dispatchAttentionRequired(
+    pub fn dispatchAttentionRequired(
         self: *FakeApp,
         turn_id: u64,
         kind: @import("../hooks/hooks.zig").AttentionKind,
@@ -1654,7 +2041,107 @@ const FakeApp = struct {
         self.last_attention_turn_id = turn_id;
         self.last_attention_kind = kind;
     }
+
+    fn writeProgramStatus(self: *FakeApp, report: []const u8) void {
+        self.program_status_reports.appendSlice(self.alloc, report) catch {
+            self.program_status_capture_failed = true;
+        };
+    }
 };
+
+fn expectProgramStatusReports(app: *FakeApp, expected: []const u8) !void {
+    try std.testing.expect(!app.program_status_capture_failed);
+    const reports = try app.program_status_reports.toOwnedSlice(app.alloc);
+    defer app.alloc.free(reports);
+    try std.testing.expectEqualStrings(expected, reports);
+}
+
+test "core.app_worker_runtime program status follows decision prompts to the turn result" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=idle:app=fx\x1b\\");
+
+    app.worker.processing = true;
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("push it") } });
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=working:app=fx\x1b\\");
+
+    app.worker.pending_permission_request = .{ .label = "shell.run git push" };
+    try tickNoop(&app);
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=blocked:kind=permission:app=fx:msg=c2hlbGwucnVuIGdpdCBwdXNo\x1b\\",
+    );
+
+    app.worker.pending_permission_request = null;
+    app.worker.pending_question = true;
+    app.question_prompt.question = "Which branch?";
+    try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=blocked:kind=question:app=fx:msg=V2hpY2ggYnJhbmNoPw==\x1b\\");
+
+    app.worker.pending_question = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=working:app=fx\x1b\\");
+
+    try queueTurnFinished(&app, 1, .completed);
+    app.worker.processing = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(&app, "\x1b]7501;state=done:app=fx\x1b\\");
+
+    // Work that starts no turn and reports no result settles as idle instead
+    // of reporting the earlier result again.
+    app.worker.processing = true;
+    try tickNoop(&app);
+    app.worker.processing = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=working:app=fx\x1b\\\x1b]7501;state=idle:app=fx\x1b\\",
+    );
+
+    // A failed `/compact` reports an error although no turn ran.
+    app.worker.processing = true;
+    const compaction = app.worker.compaction.begin(.manual, null, 0);
+    try tickNoop(&app);
+    app.worker.compaction.settle(compaction, @import("../output/compaction_activity.zig").failure(error.ConnectionRefused, .summary, false), 1);
+    app.worker.processing = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=working:app=fx\x1b\\\x1b]7501;state=error:app=fx\x1b\\",
+    );
+
+    app.worker.processing = true;
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("again") } });
+    try tickNoop(&app);
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+        .topic = "system",
+        .tone = .@"error",
+        .body = "request failed: ConnectionRefused",
+    } });
+    app.worker.processing = false;
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=working:app=fx\x1b\\\x1b]7501;state=error:app=fx\x1b\\",
+    );
+
+    // An approval prompt that opens outside a turn does not bring the
+    // reported error back once it closes.
+    app.worker.pending_permission_request = .{ .label = "Remember allow for this saved session" };
+    try tickNoop(&app);
+    app.worker.pending_permission_request = null;
+    try tickNoop(&app);
+    try expectProgramStatusReports(
+        &app,
+        "\x1b]7501;state=blocked:kind=permission:app=fx:msg=UmVtZW1iZXIgYWxsb3cgZm9yIHRoaXMgc2F2ZWQgc2Vzc2lvbg==\x1b\\" ++
+            "\x1b]7501;state=idle:app=fx\x1b\\",
+    );
+}
 
 const NoopBridge = struct {
     fn user(_: *anyopaque, _: types.UserTurn) !void {}
@@ -1669,7 +2156,9 @@ const NoopBridge = struct {
     fn diff(_: *anyopaque, payload: @import("../output/diff.zig").DiffEntryPayload) !void {
         @import("../output/diff.zig").freeDiffEntryPayload(std.heap.c_allocator, payload);
     }
-    fn history(_: *anyopaque, _: types.FinishedPrompt) !void {}
+    fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+        return .{ .settled = .committed };
+    }
     fn grant(_: *anyopaque, _: types.PermissionGrant) !void {}
     fn err(_: *anyopaque, _: types.SemanticNotice) !void {}
 
@@ -1833,11 +2322,12 @@ const PacedTranscriptBridge = struct {
         self.notice_count += 1;
     }
 
-    fn appendHistoryTurn(raw: *anyopaque, finished: types.FinishedPrompt) !void {
+    fn appendHistoryTurn(raw: *anyopaque, finished: types.FinishedPrompt) !HistoryDelivery {
         const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
         self.history_count += 1;
-        if (try self.pacer.deferFinish(self.app.alloc, finished)) return;
+        if (try self.pacer.deferFinish(self.app.alloc, finished)) return .retained;
         self.finish_count += 1;
+        return .{ .settled = .committed };
     }
 
     fn emit(raw: *anyopaque, text: []const u8) !void {
@@ -1849,10 +2339,11 @@ const PacedTranscriptBridge = struct {
         );
     }
 
-    fn finish(raw: *anyopaque, _: types.FinishedPrompt) !void {
+    fn finish(raw: *anyopaque, _: types.FinishedPrompt) !assistant_pacer.FinishResult {
         const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
         self.finish_count += 1;
         self.record('F');
+        return .committed;
     }
 };
 
@@ -2016,7 +2507,7 @@ test "core.app_worker_runtime assistant chunk trace is metadata only" {
         ".",
     );
     defer alloc.free(trace_path);
-    const trace_file_path = try std.fs.path.join(
+    const trace_file_path = try std.Io.Dir.path.join(
         alloc,
         &.{ trace_path, "worker-trace.log" },
     );
@@ -2137,6 +2628,30 @@ test "core.app_worker_runtime next admitted model step returns running to thinki
     try std.testing.expectEqual(@as(u64, 13), app.stream.phase_step_id);
 }
 
+test "manual compaction schedules initial repaint animation and terminal expiry without a stream" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    const id = app.worker.compaction.begin(.manual, null, 1_000);
+    app.worker.compaction.running(id, .summary);
+    const presenter = NoopBridge.lifecyclePresenter(&app);
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_000, test_awake_timestamp(1_000)));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 1), app.worker.compaction_reads);
+    try std.testing.expect(!app.stream.active);
+    app.shell.shimmer_active = true;
+    app.shell.render_requests.animation_visible = true;
+    app.shell.render_requests.animation_next_deadline_ms = 1_050;
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_050, test_awake_timestamp(1_050)));
+    try std.testing.expect(app.shell.render_requests.hasReason(.animation));
+    app.shell.render_requests.clearReason(.animation);
+    app.worker.compaction.settle(id, .{ .outcome = .no_op }, 1_100);
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_599, test_awake_timestamp(2_599)));
+    try std.testing.expect(!app.worker.compaction.snapshot.operation.?.dismissed);
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_600, test_awake_timestamp(2_600)));
+    try std.testing.expect(app.worker.compaction.snapshot.operation.?.dismissed);
+    try std.testing.expect(!app.stream.active);
+}
+
 test "core.app_worker_runtime advances visible animation exactly at its deadline" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
@@ -2206,7 +2721,7 @@ test "core.app_worker_runtime refreshes root retry countdown" {
     ));
     switch (app.shell.activityProjection()) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · retrying request in 1s · attempt 1/3",
+            "⚠ Provider unavailable · retrying request in 1s",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -2296,7 +2811,7 @@ test "core.app_worker_runtime projects route recovery status activity and clears
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.warning, thinking.tone);
-            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request · attempt 1/3", thinking.label);
+            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -2341,7 +2856,7 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
     } });
     try tickNoop(&app);
     switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · recovery paused after 3/3 attempts", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · stopped after 3 attempts", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }
@@ -2372,7 +2887,7 @@ test "core.app_worker_runtime replaces a due retry with its consumed terminal at
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · TestProviderSerializationFailed · recovery paused after 1/2 attempts",
+            "⚠ Provider unavailable · TestProviderSerializationFailed · stopped after 1 attempt",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -2405,7 +2920,7 @@ test "core.app_worker_runtime recovery pause replaces cancelled waiting status" 
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
+            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2 · send a new message when you're ready",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -2433,11 +2948,12 @@ test "core.app_worker_runtime summary append clears recovered route status witho
     } } });
 
     const Capture = struct {
-        fn history(ctx: *anyopaque, finished: types.FinishedPrompt) !void {
+        fn history(ctx: *anyopaque, finished: types.FinishedPrompt) !HistoryDelivery {
             const inner: *FakeApp = @ptrCast(@alignCast(ctx));
             if (finished.summary) |summary| {
                 _ = try inner.shell.lifecycle.appendTurnSummaryEntry(inner.alloc, summary);
             }
+            return .{ .settled = .committed };
         }
     };
     var handlers = NoopBridge.handlers(&app);
@@ -2451,6 +2967,86 @@ test "core.app_worker_runtime summary append clears recovered route status witho
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, ui_render.dim_style) != null);
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
+}
+
+test "core.app_worker_runtime records admitted route recovery as a full-detail record" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 3,
+        .cause = .rate_limited,
+        .delay_seconds = 4,
+    } });
+    try tickNoop(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.full_detail_records.items.len);
+    const record = app.shell.lifecycle.full_detail_records.items[0].notice;
+    try std.testing.expectEqualStrings("recovery", record.topic);
+    try std.testing.expectEqual(types.NoticeTone.warning, record.tone);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
+    try std.testing.expect(std.mem.find(u8, record.body, "retrying request") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "kind: auto_retry") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "cause: rate_limited") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "attempt: 1/3") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "retry delay: 4s") != null);
+    // The record stays out of the transcript entry store.
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.entries.items.len);
+}
+
+test "core.app_worker_runtime records recovered route status with success tone" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .auto_recovered,
+        .succeeded_attempt = 2,
+        .attempt_limit = 3,
+    } });
+    try tickNoop(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.full_detail_records.items.len);
+    const record = app.shell.lifecycle.full_detail_records.items[0].notice;
+    try std.testing.expectEqual(types.NoticeTone.success, record.tone);
+    try std.testing.expect(std.mem.find(u8, record.body, "recovered") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "attempt: 2/3") != null);
+}
+
+test "core.app_worker_runtime skips the recovery record for statuses dropped by cancellation" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.worker.processing = true;
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.stream.active = true;
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 3,
+    } });
+    try tickNoop(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.full_detail_records.items.len);
+}
+
+test "writeRouteRecoveryBody omits absent facts" {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+
+    try writeRouteRecoveryBody(&body.writer, .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 3,
+        .attempt_limit = 3,
+        .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
+    });
+
+    try std.testing.expect(std.mem.find(u8, body.written(), "kind: terminal_provider_error") != null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "attempt: 3/3") != null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "diagnostic: TestProviderSerializationFailed") != null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "cause:") == null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "retry delay:") == null);
 }
 
 test "core.app_worker_runtime projects API status text as sticky status row" {
@@ -2489,7 +3085,6 @@ test "core.app_worker_runtime suppresses route recovery activity while question 
         .stream = app.stream,
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .question = .{
             .current_entry = null,
             .current_index = 0,
@@ -2524,6 +3119,31 @@ test "core.app_worker_runtime syncState does not start activity for idle queued 
 
     try std.testing.expect(!app.stream.active);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "core.app_worker_runtime admitted recovery activates progress without resetting command display" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 1,
+        .attempt_limit = 10,
+        .action = .paused,
+    } });
+    try tickNoop(&app);
+    app.shell.command_output_display.touched = true;
+    app.worker.queued_count = 1;
+
+    Runtime(FakeApp).beginRecoveryPresentation(&app);
+    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqual(types.TurnPhase.thinking, app.stream.phase);
+    try std.testing.expect(app.stream.turn_started_ms > 0);
+    try std.testing.expect(app.shell.activityProjection() == .none);
+    try std.testing.expect(app.shell.command_output_display.touched);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }
 
 test "core.app_worker_runtime syncState does not start activity for idle processing snapshot" {
@@ -3063,9 +3683,10 @@ test "core.app_worker_runtime cancellation suppresses payloads but retains turn 
             self.text_count += 1;
         }
 
-        fn history(raw: *anyopaque, _: types.FinishedPrompt) !void {
+        fn history(raw: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.history_count += 1;
+            return .{ .settled = .committed };
         }
     };
     var capture = Capture{};
@@ -3762,13 +4383,14 @@ test "core.app_worker_runtime split batches finalize lifecycle before history" {
         history_count: usize = 0,
         saw_finalized_fence: bool = false,
 
-        fn history(raw: *anyopaque, _: types.FinishedPrompt) !void {
+        fn history(raw: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.history_count += 1;
             self.saw_finalized_fence =
                 self.app.shell.finalizedToolTurnWatermark() == 1 and
                 self.app.shell.toolActivityRecordCount() == 0 and
                 self.app.shell.lifecyclePinCount() == 0;
+            return .{ .settled = .committed };
         }
     };
     var capture = Capture{ .app = &app };
@@ -3857,6 +4479,54 @@ test "core.app_worker_runtime reducer error settles batch and skips suffix" {
     try std.testing.expectEqual(@as(usize, 1), app.shell.lifecyclePinCount());
 }
 
+test "core.app_worker_runtime cancellation leaves an earlier completed segment drainable" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.worker.active_turn_id = 2;
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    try queueToolStart(&app, 1, "completed-call", "read_file");
+    try queueToolTerminal(&app, 1, "completed-call", .completed, "Read");
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("earlier completed answer") } });
+    try queueTurnFinished(&app, 1, .completed);
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later request") } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{ .turn_id = 2, .step_id = 1, .phase = .thinking } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("cancelled later answer") } });
+    try queueTurnFinished(&app, 2, .interrupted);
+    const Capture = struct {
+        fn text(raw: *anyopaque, bytes: []const u8) !void {
+            const target: *FakeApp = @ptrCast(@alignCast(raw));
+            try target.transcript.appendSlice(target.alloc, bytes);
+        }
+    };
+    var handlers = NoopBridge.handlers(&app);
+    handlers.ctx = &app;
+    handlers.append_text = Capture.text;
+    try Runtime(FakeApp).tick(&app, handlers);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "earlier completed answer") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "cancelled later answer") == null);
+}
+
+test "core.app_worker_runtime reducer failure preserves a completed turn in the suffix" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    try queueToolStart(&app, 1, "call", "read_file");
+    try queueLifecycle(&app, .{ .progress = .{
+        .id = .{ .turn_id = 1, .call_id = "call" },
+        .text = "Reading",
+    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+        .user = .{ .text = @constCast("accepted request") },
+        .assistant = @constCast("completed answer"),
+    } } } });
+    app.shell.fail_next_update = true;
+    try std.testing.expectError(error.InjectedTranscriptUpdateFailure, tickNoop(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.persisted_finishes.items.len);
+    try std.testing.expectEqualStrings("completed answer", app.persisted_finishes.items[0].turn.assistant.assistant);
+}
+
 test "core.app_worker_runtime failed turn terminalizes tool lifecycle before error text" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
@@ -3889,7 +4559,7 @@ test "core.app_worker_runtime failed turn terminalizes tool lifecycle before err
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecyclePinCount());
     var failed_status_expected: [64]u8 = undefined;
     try std.testing.expectEqualStrings(
-        try std.fmt.bufPrint(
+        try std.mem.print(
             &failed_status_expected,
             "{s}●{s} Tool failed",
             .{ ui_render.red_style, reset_style },
@@ -4107,7 +4777,9 @@ test "core.app_worker_runtime drains diff block through bridge handler" {
             self.payload = payload;
             try self.preview_buf.appendSlice(std.testing.allocator, payload.preview);
         }
-        fn history(_: *anyopaque, _: types.FinishedPrompt) !void {}
+        fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+            return .{ .settled = .committed };
+        }
         fn grant(_: *anyopaque, _: types.PermissionGrant) !void {}
         fn err(_: *anyopaque, _: types.SemanticNotice) !void {}
     };
@@ -4525,7 +5197,9 @@ test "core.app_worker_runtime cancelled drain skips diff block" {
             defer @import("../output/diff.zig").freeDiffEntryPayload(std.heap.c_allocator, payload);
             self.diff_count += 1;
         }
-        fn history(_: *anyopaque, _: types.FinishedPrompt) !void {}
+        fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+            return .{ .settled = .committed };
+        }
         fn grant(_: *anyopaque, _: types.PermissionGrant) !void {}
         fn err(_: *anyopaque, _: types.SemanticNotice) !void {}
     };
@@ -4548,4 +5222,61 @@ test "core.app_worker_runtime cancelled drain skips diff block" {
     });
 
     try std.testing.expectEqual(@as(usize, 0), capture.diff_count);
+}
+
+test "worker finish delivery separates unaccepted work from committed presentation failure" {
+    for ([_]bool{ false, true }) |committed| {
+        var app = FakeApp.init(std.testing.allocator);
+        defer app.deinit();
+        app.worker.processing = true;
+        const Capture = struct {
+            app: *FakeApp,
+            committed: bool,
+            fn history(raw: *anyopaque, finished: types.FinishedPrompt) !HistoryDelivery {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (!self.committed) return error.InjectedDeliveryFailure;
+                try self.app.appendFinishedPrompt(finished);
+                return .{ .settled = .{ .presentation_failed = error.InjectedDeliveryFailure } };
+            }
+        };
+        var capture = Capture{ .app = &app, .committed = committed };
+        var handlers = NoopBridge.handlers(&app);
+        handlers.ctx = &capture;
+        handlers.append_history_turn = Capture.history;
+        for ([_][]const u8{ "first answer", "second answer" }) |answer| {
+            try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("request") },
+                .assistant = @constCast(answer),
+            } } } });
+        }
+        try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, handlers));
+        try std.testing.expectEqual(@as(usize, 2), app.persisted_finishes.items.len);
+        try std.testing.expectEqualStrings("first answer", app.persisted_finishes.items[0].turn.assistant.assistant);
+        try std.testing.expectEqualStrings("second answer", app.persisted_finishes.items[1].turn.assistant.assistant);
+        try std.testing.expectEqual(@as(?anyerror, null), app.session_persistence.shutdown_failure);
+    }
+}
+
+test "unaccepted worker finish records save failure and stops the detached suffix" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.finish_persistence_error = error.InputOutput;
+    const Capture = struct {
+        fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
+            return error.InjectedDeliveryFailure;
+        }
+    };
+    var handlers = NoopBridge.handlers(&app);
+    handlers.append_history_turn = Capture.history;
+    for (0..2) |_| {
+        try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("request") },
+            .assistant = @constCast("answer"),
+        } } } });
+    }
+    try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, handlers));
+    try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.session_persistence.shutdown_failure);
+    try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }

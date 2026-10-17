@@ -68,6 +68,13 @@ pub const State = struct {
                 .{},
             );
         }
+        if (gesture_reset.cleared_escape_interrupt) {
+            debug_trace.logf(
+                "input",
+                "event=esc_interrupt_disarmed reason=pending_gesture_reset",
+                .{},
+            );
+        }
     }
 };
 
@@ -145,7 +152,7 @@ test "session input reset clears transient state and preserves prompt history" {
     picker.model_completion_window_start = 2;
     picker.file_completion_index = 4;
     picker.file_completion_window_start = 1;
-    try picker.beginModelPickerFlow(alloc, "provider/model", 2, true, .effort);
+    try picker.beginModelPickerFlow(alloc, "provider/model", 2, true, false, .effort);
     try std.testing.expect(vertical.applyTarget(&edit, &entities, edit.input.items.len, 4));
     _ = edit.beginSelection(0);
     _ = edit.extendSelection(edit.input.items.len);

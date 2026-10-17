@@ -1,4 +1,6 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
@@ -8,6 +10,9 @@ const mrtr = @import("mrtr.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
 const tools_feature = @import("features/tools.zig");
 
+const tool_content = @import("../tooling/tool_content.zig");
+const image_data = @import("../images/image_data.zig");
+const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ExtractOptions = struct {
@@ -20,7 +25,7 @@ pub const ExtractOptions = struct {
     legacy_wire: ?elicitation.Wire = null,
 };
 
-/// Parses an MCP response into the bounded, secret-masked model result.
+/// Parses an MCP response into the bounded, sanitized model result.
 /// The caller owns every allocation in the returned result.
 pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.CallResult {
     var outcome = tools_feature.parseCallOutcome(
@@ -28,12 +33,11 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
         options.response,
         options.protocol,
         options.output_schema_json,
-        options.max_tool_result_bytes,
+        @max(options.max_tool_result_bytes, image_data.max_result_frame_bytes),
         .{},
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const raw = try std.fmt.allocPrint(
-            alloc,
+        const raw = try alloc.print(
             "MCP protocol failure: {s}",
             .{@errorName(err)},
         );
@@ -58,7 +62,14 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
                 .{ .parse_numbers = false },
             ) catch return error.McpInvalidJson;
             defer parsed.deinit();
+            var images: []types.ToolImage = &.{};
+            errdefer types.freeToolImages(alloc, images);
+            if (parsed.value.object.getPtr("content")) |content| {
+                if (content.* == .array) images = try image_data.parseToolImages(alloc, content.array.items);
+                try tool_content.projectMediaForText(parsed.arena.allocator(), content);
+            }
             break :blk .{
+                .images = images,
                 .model_output = try serialize_capped(
                     alloc,
                     options.server_name,
@@ -93,12 +104,12 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
         },
         .input_required => |required| blk: {
             const input_requests_json = try mrtr.renderRequests(alloc, required.requests);
-            errdefer alloc.free(input_requests_json);
+            errdefer mem_utils.free(alloc, input_requests_json);
             const request_state_json = if (required.request_state_json) |state|
                 try alloc.dupe(u8, state)
             else
                 null;
-            errdefer if (request_state_json) |state| alloc.free(state);
+            errdefer if (request_state_json) |state| mem_utils.free(alloc, state);
             const raw = try render_input_required(
                 alloc,
                 input_requests_json,
@@ -129,7 +140,7 @@ pub fn protocol_diagnostic_alloc(
     data_json: ?[]const u8,
 ) ![]u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
     var raw: std.Io.Writer.Allocating = .init(scratch);
     try write_protocol_diagnostic(
@@ -147,7 +158,7 @@ pub fn format_protocol_error(
     protocol_error: protocol_negotiation.ProtocolError,
 ) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var raw: std.Io.Writer.Allocating = .init(arena);
 
@@ -159,7 +170,7 @@ pub fn format_protocol_error(
     try raw.writer.writeAll(try text_utils.maskSecrets(arena, safe_message));
     if (protocol_error.data) |data| {
         try raw.writer.writeAll("; data=");
-        try write_masked_json_value(arena, &raw.writer, data);
+        try writeJsonProjection(arena, &raw.writer, data, true);
     }
     return try alloc.dupe(u8, raw.writer.buffered());
 }
@@ -178,6 +189,28 @@ pub fn frame_too_large_result(
     try std.json.Stringify.value(tool_name, .{}, &out.writer);
     try out.writer.writeAll(",\"error\":{\"kind\":\"response_frame_too_large\",\"message\":\"MCP response frame exceeded the raw pre-parse cap\",\"cap_bytes\":");
     try out.writer.print("{d}", .{cap_bytes});
+    try out.writer.writeAll("}}");
+    return try out.toOwnedSlice();
+}
+
+/// A tool call that could not run because its stopped server failed to
+/// start again. `failure` is the server's recorded startup failure.
+pub fn restart_failed_result(
+    alloc: Allocator,
+    server_name: []const u8,
+    tool_name: []const u8,
+    failure: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"server\":");
+    try std.json.Stringify.value(server_name, .{}, &out.writer);
+    try out.writer.writeAll(",\"tool\":");
+    try std.json.Stringify.value(tool_name, .{}, &out.writer);
+    try out.writer.writeAll(",\"error\":{\"kind\":\"server_restart_failed\",\"message\":");
+    const message = try alloc.print("MCP server stopped and could not be restarted: {s}", .{failure});
+    defer alloc.free(message);
+    try std.json.Stringify.value(message, .{}, &out.writer);
     try out.writer.writeAll("}}");
     return try out.toOwnedSlice();
 }
@@ -203,7 +236,7 @@ fn legacy_url_required(
         required,
         .{},
     );
-    errdefer alloc.free(input_requests_json);
+    errdefer mem_utils.free(alloc, input_requests_json);
     const raw = try render_input_required(alloc, input_requests_json, null);
     defer alloc.free(raw);
     return .{
@@ -228,7 +261,7 @@ fn render_owned_protocol_error(
     max_tool_result_bytes: usize,
 ) ![]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
     var raw: std.Io.Writer.Allocating = .init(scratch);
     try write_protocol_diagnostic(
@@ -255,11 +288,11 @@ fn write_protocol_diagnostic(
 ) !void {
     try writer.print("MCP protocol error {d}: ", .{code});
     const safe_message = try text_utils.sanitizeModelText(scratch, message);
-    try writer.writeAll(try text_utils.maskSecrets(scratch, safe_message));
+    try writer.writeAll(safe_message);
     if (data_json) |data| {
         const safe_data = try text_utils.sanitizeModelText(scratch, data);
         try writer.writeAll("; data=");
-        try writer.writeAll(try text_utils.maskSecrets(scratch, safe_data));
+        try writer.writeAll(safe_data);
     }
 }
 
@@ -300,7 +333,7 @@ fn serialize_capped(
     max_tool_result_bytes: usize,
 ) ![]u8 {
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
-    defer arena_impl.deinit();
+    defer mem_utils.deinit_arena(arena_impl);
     const arena = arena_impl.allocator();
 
     var full = std.Io.Writer.Allocating.init(arena);
@@ -311,8 +344,7 @@ fn serialize_capped(
     }
 
     const combined = try collect_result_text(arena, result);
-    const marker = try std.fmt.allocPrint(
-        arena,
+    const marker = try arena.print(
         "\n... [mcp tool result truncated for {s}/{s}: original {d} bytes; cap is {d} bytes]\n",
         .{ server_name, tool_name, full_output.len, max_tool_result_bytes },
     );
@@ -375,30 +407,34 @@ fn write_envelope(
     try writer.writeAll(",\"tool\":");
     try std.json.Stringify.value(tool_name, .{}, writer);
     try writer.writeAll(",\"result\":");
-    try write_masked_json_value(alloc, writer, result);
+    try writeJsonProjection(alloc, writer, result, false);
     try writer.writeByte('}');
 }
 
-fn write_masked_json_value(
+/// JSON projection for MCP result envelopes. `mask_strings` selects the
+/// display projection (diagnostics); the model envelope uses the
+/// sanitize-only projection.
+fn writeJsonProjection(
     alloc: Allocator,
     writer: *std.Io.Writer,
     value: std.json.Value,
+    comptime mask_strings: bool,
 ) !void {
     switch (value) {
         .null, .bool, .integer, .float, .number_string => try std.json.Stringify.value(value, .{}, writer),
         .string => |text| {
             const sanitized = try text_utils.sanitizeModelText(alloc, text);
-            try std.json.Stringify.value(
-                try text_utils.maskSecrets(alloc, sanitized),
-                .{},
-                writer,
-            );
+            const projected = if (mask_strings)
+                try text_utils.maskSecrets(alloc, sanitized)
+            else
+                sanitized;
+            try std.json.Stringify.value(projected, .{}, writer);
         },
         .array => |array| {
             try writer.writeByte('[');
             for (array.items, 0..) |item, index| {
                 if (index > 0) try writer.writeByte(',');
-                try write_masked_json_value(alloc, writer, item);
+                try writeJsonProjection(alloc, writer, item, mask_strings);
             }
             try writer.writeByte(']');
         },
@@ -410,7 +446,7 @@ fn write_masked_json_value(
                 if (index > 0) try writer.writeByte(',');
                 try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
                 try writer.writeByte(':');
-                try write_masked_json_value(alloc, writer, entry.value_ptr.*);
+                try writeJsonProjection(alloc, writer, entry.value_ptr.*, mask_strings);
             }
             try writer.writeByte('}');
         },
@@ -433,9 +469,8 @@ fn append_text_strings(
     switch (value) {
         .string => |text| {
             const sanitized = try text_utils.sanitizeModelText(arena, text);
-            const masked = try text_utils.maskSecrets(arena, sanitized);
             if (needs_separator.*) try writer.writeByte('\n');
-            try writer.writeAll(masked);
+            try writer.writeAll(sanitized);
             needs_separator.* = true;
         },
         .array => |array| for (array.items) |item| {
@@ -498,7 +533,7 @@ fn extract_legacy(alloc: Allocator, response: []const u8) !tool_mcp_runtime.Call
 test "tool result extracts all content" {
     const alloc = std.testing.allocator;
     const response =
-        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello "},{"type":"image","data":"AA==","mimeType":"image/png"},{"type":"text","text":"world"}]}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello "},{"type":"image","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=","mimeType":"image/png"},{"type":"text","text":"world"}]}}
     ;
     var result = try extract_legacy(alloc, response);
     defer result.deinit(alloc);
@@ -516,8 +551,27 @@ test "tool result extracts all content" {
     );
     const content = parsed.value.object.get("result").?.object.get("content").?.array.items;
     try std.testing.expectEqualStrings("hello ", content[0].object.get("text").?.string);
-    try std.testing.expectEqualStrings("AA==", content[1].object.get("data").?.string);
+    try std.testing.expect(content[1].object.get("data") == null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=", result.images[0].data);
+    try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
     try std.testing.expectEqualStrings("world", content[2].object.get("text").?.string);
+}
+
+test "a tool call whose server could not restart carries the startup failure" {
+    const alloc = std.testing.allocator;
+    const output = try restart_failed_result(
+        alloc,
+        "fixture",
+        "mcp_fixture_echo",
+        "MCP server exited with code 5 before completing startup: \"relaunch\" blocked",
+    );
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(
+        "{\"server\":\"fixture\",\"tool\":\"mcp_fixture_echo\",\"error\":{\"kind\":\"server_restart_failed\"," ++
+            "\"message\":\"MCP server stopped and could not be restarted: MCP server exited with code 5 before completing startup: \\\"relaunch\\\" blocked\"}}",
+        output,
+    );
 }
 
 test "tool result retains protocol error diagnostics" {
@@ -582,7 +636,7 @@ fn check_input_required_allocation_failures(alloc: Allocator) !void {
 
 test "input-required result releases every allocation failure path" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_input_required_allocation_failures,
         .{},
     );
@@ -604,7 +658,7 @@ fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
 
 test "2025-11 URL-required errors become retry input only on that wire" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_legacy_url_required_allocation_failures,
         .{},
     );
@@ -639,9 +693,10 @@ test "invalid tool responses retain bounded protocol failures" {
     }
 }
 
-test "large tool results stay valid, bounded, and secret-masked" {
+test "large tool results stay valid, bounded, and verbatim" {
     const alloc = std.testing.allocator;
-    const large_text = "TOKEN=secret-value " ++ ("x" ** 1800);
+    const needle = "MY_NOTE_TOKEN=abcdefgh";
+    const large_text = needle ++ text_utils.repeat("x", 1800);
     const response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" ++ large_text ++ "\"}]}}";
     var result = try extract(alloc, .{
         .server_name = "filesystem",
@@ -653,16 +708,8 @@ test "large tool results stay valid, bounded, and secret-masked" {
     defer result.deinit(alloc);
 
     try std.testing.expect(result.model_output.len <= 1024);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "TOKEN=secret-value",
-    ) == null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "TOKEN=[redacted]",
-    ) != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, needle) != null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "[redacted]") == null);
     try std.testing.expect(std.mem.find(
         u8,
         result.model_output,

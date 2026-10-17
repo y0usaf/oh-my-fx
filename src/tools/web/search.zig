@@ -19,8 +19,6 @@ pub const readsOnly = search_args.readsOnly;
 pub const isIrreversible = search_args.isIrreversible;
 
 pub const Source = web_search_contract.Source;
-pub const SearchBlock = web_search_contract.SearchBlock;
-pub const TerminalIncomplete = web_search_contract.TerminalIncomplete;
 pub const ResultItem = web_search_contract.ResultItem;
 pub const Output = web_search_contract.Output;
 

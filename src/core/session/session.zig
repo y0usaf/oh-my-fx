@@ -1,34 +1,28 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
-const text_utils = @import("../shared/text_utils.zig");
 const language_script = @import("../shared/language_script.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
-const generation_usage_provider = @import("generation_usage_provider.zig");
+const compactor = @import("../compactor/compactor.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
 const command_replay_store = @import("command_replay_store.zig");
-pub const session_usage = @import("session_usage.zig");
-pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
+const session_child_store = @import("session_child_store.zig");
 const command_contract = @import("../execution/command_contract.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
-
-test {
-    _ = session_usage;
-    _ = profile_usage_runtime;
-}
 
 const compact_continuation_preamble = "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n";
 const compact_recent_messages_note = "Recent conversation turns are preserved verbatim.";
 const compact_direct_resume_instruction = "Continue the conversation from where it left off without asking the user to repeat context. Resume directly.";
-const compact_summary_max_chars: usize = 1200;
-const compact_summary_max_lines: usize = 24;
-const compact_summary_max_line_chars: usize = 160;
 
 pub const interrupted_turn_notice: core_types.SemanticNotice = .{
     .topic = "system",
@@ -56,8 +50,8 @@ pub const interrupted_turn_context =
     "</turn_aborted>";
 
 pub fn projectSnapshotLocator(buffer: []u8, path: []const u8) ![]const u8 {
-    if (!std.fs.path.isAbsolute(path)) return path;
-    return std.fmt.bufPrint(buffer, "images/{s}", .{std.fs.path.basename(path)});
+    if (!std.Io.Dir.path.isAbsolute(path)) return path;
+    return std.mem.print(buffer, "images/{s}", .{std.Io.Dir.path.basename(path)});
 }
 
 pub const interrupted_before_completion_output = "The previous response ended before completion.";
@@ -130,7 +124,7 @@ pub const WorkIdError = error{
 pub fn validateWorkId(work_id: []const u8) WorkIdError!void {
     if (work_id.len == 0 or work_id.len > max_work_id_bytes or
         !std.unicode.utf8ValidateSlice(work_id) or
-        std.mem.indexOfScalar(u8, work_id, 0) != null)
+        std.mem.findScalar(u8, work_id, 0) != null)
     {
         return error.InvalidWorkId;
     }
@@ -184,7 +178,6 @@ pub fn copyWorkIdToTurn(
 pub const freeHistoryTurn = core_types.freeHistoryTurn;
 pub const dupeToolCall = core_types.dupeToolCall;
 pub const freeToolCall = core_types.freeToolCall;
-pub const dupeCompletedToolNames = core_types.dupeCompletedToolNames;
 pub const freeCompletedToolNames = core_types.freeCompletedToolNames;
 pub const ExecutionMemory = core_types.ExecutionMemory;
 pub const ToolExecutionStep = core_types.ToolExecutionStep;
@@ -245,64 +238,6 @@ pub fn collect_image_catalog(
     }
     std.debug.assert(image_attachments.imageAttachmentsSortedById(catalog));
     return catalog;
-}
-
-/// Rebuilds an owned catalog after queue review replaces the current-turn
-/// attachments. Historical authority is retained; the old current slice must
-/// still match the catalog exactly or the replacement is rejected as stale.
-pub fn replace_image_catalog_current_images(
-    alloc: Allocator,
-    catalog: []const ImageAttachment,
-    old_current_images: []const ImageAttachment,
-    new_current_images: []const ImageAttachment,
-) (Allocator.Error || error{
-    ImageCatalogTooLarge,
-    InvalidImageId,
-    DuplicateImageId,
-    StaleImageCatalog,
-})![]ImageAttachment {
-    try validate_image_catalog(catalog);
-
-    for (old_current_images, 0..) |old_current, index| {
-        if (old_current.id == 0) return error.InvalidImageId;
-        for (old_current_images[0..index]) |prior| {
-            if (prior.id == old_current.id) return error.DuplicateImageId;
-        }
-        const authorized = image_attachment_for_id(catalog, old_current.id) orelse
-            return error.StaleImageCatalog;
-        if (!image_attachments_equal(authorized, old_current)) return error.StaleImageCatalog;
-    }
-
-    const retained_count = std.math.sub(usize, catalog.len, old_current_images.len) catch
-        return error.StaleImageCatalog;
-    const attachment_count = std.math.add(
-        usize,
-        retained_count,
-        new_current_images.len,
-    ) catch return error.ImageCatalogTooLarge;
-    if (attachment_count == 0) return &.{};
-
-    const replacement = try alloc.alloc(ImageAttachment, attachment_count);
-    errdefer alloc.free(replacement);
-    var copied: usize = 0;
-    errdefer for (replacement[0..copied]) |attachment| {
-        core_types.freeImageAttachment(alloc, attachment);
-    };
-
-    for (catalog) |attachment| {
-        if (image_attachment_for_id(old_current_images, attachment.id) != null) continue;
-        replacement[copied] = try dupeImageAttachment(alloc, attachment);
-        copied += 1;
-    }
-    std.debug.assert(copied == retained_count);
-    for (new_current_images) |attachment| {
-        replacement[copied] = try dupeImageAttachment(alloc, attachment);
-        copied += 1;
-    }
-
-    sort_utils.sort(ImageAttachment, replacement, {}, image_id_less_than);
-    try validate_image_catalog(replacement);
-    return replacement;
 }
 
 /// Returns a new owned catalog containing any image authority introduced by a
@@ -438,7 +373,7 @@ const LegacyImagePlaceholderIterator = struct {
     };
 
     fn next(self: *@This()) ?Slot {
-        const relative_start = std.mem.indexOf(u8, self.text[self.offset..], prefix) orelse
+        const relative_start = std.mem.find(u8, self.text[self.offset..], prefix) orelse
             return null;
         const start = self.offset + relative_start;
         if (image_attachments.matchImagePlaceholder(self.text, start)) |match| {
@@ -447,7 +382,7 @@ const LegacyImagePlaceholderIterator = struct {
         }
 
         const body_start = start + prefix.len;
-        self.offset = if (std.mem.indexOfScalar(u8, self.text[body_start..], ']')) |relative_end|
+        self.offset = if (std.mem.findScalar(u8, self.text[body_start..], ']')) |relative_end|
             body_start + relative_end + 1
         else
             body_start;
@@ -790,7 +725,7 @@ fn make_owned_legacy_image_turn(
 fn sessionTestSnapshotDir(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, "snapshots" });
+    return std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
 }
 
 fn writeSessionTestImage(
@@ -848,7 +783,7 @@ test "legacy image snapshot repair drops unavailable path-only images" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const missing_path = try std.fs.path.join(alloc, &.{ root, "missing.png" });
+    const missing_path = try std.Io.Dir.path.join(alloc, &.{ root, "missing.png" });
     defer alloc.free(missing_path);
     const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
     defer alloc.free(snapshot_dir);
@@ -865,7 +800,7 @@ test "legacy image snapshot repair drops unavailable path-only images" {
 }
 
 test "legacy image snapshot repair propagates OOM without changing memory or disk" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const image_bytes = "\x89PNG\r\n\x1a\nlegacy-oom";
@@ -874,14 +809,14 @@ test "legacy image snapshot repair propagates OOM without changing memory or dis
     var reached_success = false;
     for (0..256) |fail_index| {
         var name_buf: [64]u8 = undefined;
-        const snapshot_name = try std.fmt.bufPrint(
+        const snapshot_name = try std.mem.print(
             &name_buf,
             "snapshots-{d}",
             .{fail_index},
         );
         const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(root);
-        const snapshot_dir = try std.fs.path.join(alloc, &.{ root, snapshot_name });
+        const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, snapshot_name });
         defer alloc.free(snapshot_dir);
         const turn = try make_owned_legacy_image_turn(
             alloc,
@@ -1074,7 +1009,7 @@ test "legacy image repair rewrites three repeated ordinals across persisted turn
 }
 
 test "legacy image repair leaves history unchanged when text reconstruction runs out of memory" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var first_images = [_]ImageAttachment{.{
         .id = 0,
         .path = @constCast("/tmp/first.png"),
@@ -1523,15 +1458,30 @@ pub fn repairPersistedToolArguments(
     source: PersistedToolArgumentsSource,
 ) !void {
     for (calls) |call| {
-        if (call.argument_integrity == .malformed_json) {
+        if (call.argument_integrity != .valid) {
             _ = try persistedResultForMalformedCall(calls, results, call);
         }
     }
 
     for (calls) |*call| {
-        if (call.argument_integrity != .malformed_json) continue;
+        if (call.argument_integrity == .valid) continue;
         const result = try persistedResultForMalformedCall(calls, results, call.*);
-        const failure_output = try tool_result_errors.malformedToolArgumentsJson(alloc, call.name);
+        const integrity = call.argument_integrity;
+        if (integrity == .non_object_json) {
+            // Repair replay input without changing what the stored result says happened.
+            if (call.provider_result != null or result.provider_native) {
+                call.provenance = .provider_executed;
+                call.argument_integrity = .valid;
+                continue;
+            }
+            const safe_arguments = try alloc.dupe(u8, "{}");
+            alloc.free(call.arguments_json);
+            call.arguments_json = safe_arguments;
+            call.argument_integrity = .valid;
+            tracePersistedToolArgumentsRepair(call.*, source, true, integrity);
+            continue;
+        }
+        const failure_output = try tool_result_errors.malformedToolArgumentsJson(alloc, call.name, null);
 
         alloc.free(result.output);
         if (result.output_handle) |handle| alloc.free(handle);
@@ -1545,17 +1495,29 @@ pub fn repairPersistedToolArguments(
         result.truncated = false;
         result.provider_native = false;
         call.argument_integrity = .valid;
-        tracePersistedToolArgumentsRepair(call.*, source, true);
+        tracePersistedToolArgumentsRepair(call.*, source, true, integrity);
     }
 }
 
 pub fn repairPersistedInterruptedToolArguments(
+    alloc: Allocator,
     call: *ToolCall,
     source: PersistedToolArgumentsSource,
-) void {
-    if (call.argument_integrity != .malformed_json) return;
+) Allocator.Error!void {
+    if (call.argument_integrity == .valid) return;
+    const integrity = call.argument_integrity;
+    if (integrity == .non_object_json) {
+        if (call.provider_result != null) {
+            call.provenance = .provider_executed;
+            call.argument_integrity = .valid;
+            return;
+        }
+        const safe_arguments = try alloc.dupe(u8, "{}");
+        alloc.free(call.arguments_json);
+        call.arguments_json = safe_arguments;
+    }
     call.argument_integrity = .valid;
-    tracePersistedToolArgumentsRepair(call.*, source, false);
+    tracePersistedToolArgumentsRepair(call.*, source, false, integrity);
 }
 
 fn persistedResultForMalformedCall(
@@ -1585,13 +1547,14 @@ fn tracePersistedToolArgumentsRepair(
     call: ToolCall,
     source: PersistedToolArgumentsSource,
     paired_result: bool,
+    integrity: core_types.ToolArgumentIntegrity,
 ) void {
     debug_trace.eventf(
         "session",
         "persisted_tool_arguments_repaired",
         .{},
-        "source={s} call_id={s} tool={s} failure=malformed_json paired_result={s}",
-        .{ @tagName(source), call.id, call.name, if (paired_result) "true" else "false" },
+        "source={s} call_id={s} tool={s} failure={s} paired_result={s}",
+        .{ @tagName(source), call.id, call.name, @tagName(integrity), if (paired_result) "true" else "false" },
     );
 }
 
@@ -1601,6 +1564,102 @@ pub const WebFetchArtifactState = union(enum) {
     unavailable: anyerror,
 };
 
+const shell_id_key_raw = "\"session_id\":\"shell-";
+const shell_id_key_escaped = "\\\"session_id\\\":\\\"shell-";
+
+/// Collect every shell execution id referenced by restored history turns into
+/// `out` (deduplicated; slices borrow from the turns, so history must outlive
+/// the list). Matches both raw and JSON-escaped tool result envelopes.
+fn collectReferencedShellIds(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    out: *std.ArrayList([]const u8),
+) !void {
+    for (history) |turn| {
+        switch (turn) {
+            .assistant => |entry| {
+                if (entry.provider_replay) |replay|
+                    try collectShellIdsFromText(alloc, replay.parts_json, out);
+                try collectShellIdsFromExecution(alloc, entry.execution, out);
+            },
+            .interrupted => |entry| {
+                if (entry.tool_call) |call| {
+                    try collectShellIdsFromText(alloc, call.arguments_json, out);
+                    if (call.provider_result) |result|
+                        try collectShellIdsFromText(alloc, result, out);
+                }
+                try collectShellIdsFromExecution(alloc, entry.execution, out);
+            },
+            .compacted_summary => {},
+        }
+    }
+}
+
+fn collectShellIdsFromExecution(
+    alloc: Allocator,
+    execution: core_types.ExecutionMemory,
+    out: *std.ArrayList([]const u8),
+) !void {
+    for (execution.tool_steps) |step| {
+        for (step.tool_calls) |call| {
+            try collectShellIdsFromText(alloc, call.arguments_json, out);
+            if (call.provider_result) |result|
+                try collectShellIdsFromText(alloc, result, out);
+        }
+        for (step.tool_results) |result| {
+            try collectShellIdsFromText(alloc, result.output, out);
+            if (result.preview) |preview|
+                try collectShellIdsFromText(alloc, preview, out);
+        }
+        if (step.provider_replay) |replay|
+            try collectShellIdsFromText(alloc, replay.parts_json, out);
+    }
+}
+
+/// True when restored history references shell execution handles that `exec`
+/// does not own. Registry membership, not the resume event, decides staleness:
+/// in-process resumes share the registry with executions started by this
+/// process, so those handles stay valid and stay quiet.
+pub fn detectStaleShellHandles(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    exec: *managed_execution.Runtime,
+) !bool {
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, history, &ids);
+    for (ids.items) |id| {
+        if (exec.stateFor(id) == null) return true;
+    }
+    return false;
+}
+
+fn collectShellIdsFromText(alloc: Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
+    try collectShellIdsWithKey(alloc, text, shell_id_key_raw, out);
+    try collectShellIdsWithKey(alloc, text, shell_id_key_escaped, out);
+}
+
+fn collectShellIdsWithKey(alloc: Allocator, text: []const u8, key: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var from: usize = 0;
+    while (std.mem.find(u8, text[from..], key)) |rel| {
+        const at = from + rel;
+        from = at + key.len;
+        const id_start = at + key.len - "shell-".len;
+        var id_end = id_start + "shell-".len;
+        // Counter ids are digits; interactive terminal ids are base64url. Both
+        // share the charset checked by validHistoricalSessionId.
+        while (id_end < text.len) : (id_end += 1) {
+            const byte = text[id_end];
+            if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') break;
+        }
+        if (id_end == id_start + "shell-".len) continue;
+        const id = text[id_start..id_end];
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, id)) break;
+        } else try out.append(alloc, id);
+    }
+}
+
 pub const SessionRuntime = struct {
     agent: kernel_agent.Agent = .{},
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -1608,119 +1667,65 @@ pub const SessionRuntime = struct {
     web_fetch_artifacts: WebFetchArtifactState = .none,
     language_lock: std.Io.Mutex = .init,
     conversation_language: ConversationLanguage = ConversationLanguage.default(),
-    usage: session_usage.Usage = session_usage.Usage.initFresh(),
-    profile_usage: profile_usage_runtime.Runtime = .{},
     permission_state_lock: std.Io.Mutex = .init,
     permission_state: session_permission_state.State = .{},
     /// Count limit for owned model-context snapshots; canonical history is not truncated.
     max_history_turns: usize,
-    context_history_start: usize = 0,
     /// In-memory boundary for handle-free history loaded without writer
     /// provenance. It is never persisted; accepted checkpoints move the model
     /// window beyond it.
     unversioned_history_len: usize = 0,
+    /// True when restored history references shell execution handles that this
+    /// process does not own. Resume seams set it once after restore, before the
+    /// first agent turn of the resumed session, so no lock is required.
+    has_stale_shell_handles: bool = false,
 
-    pub fn init(
-        max_history_turns: usize,
-        provider: generation_usage_provider.Provider,
-    ) SessionRuntime {
-        return .{
-            .usage = session_usage.Usage.initFreshWithProvider(provider),
-            .max_history_turns = max_history_turns,
-        };
+    pub fn init(max_history_turns: usize) SessionRuntime {
+        return .{ .max_history_turns = max_history_turns };
     }
 
-    pub fn initWithProviders(
-        max_history_turns: usize,
-        providers: generation_usage_provider.Set,
-    ) SessionRuntime {
-        return .{
-            .usage = session_usage.Usage.initFreshWithProviders(providers),
-            .max_history_turns = max_history_turns,
-        };
+    /// `init` in place, for a runtime too large to build on the stack.
+    pub fn initInto(self: *SessionRuntime, max_history_turns: usize) void {
+        const session_runtime_info = @typeInfo(SessionRuntime).@"struct";
+        inline for (session_runtime_info.field_names, session_runtime_info.field_types, session_runtime_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "max_history_turns")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
+        }
+        self.max_history_turns = max_history_turns;
     }
 
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
         self.clearWebFetchArtifacts();
-        self.usage.configurePublicationSink(null);
-        self.usage.configureCheckpointSink(null);
-        self.usage.deinit(alloc);
-        self.profile_usage.deinit(alloc);
         self.permission_state.deinit(alloc);
         self.agent.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
     }
 
-    pub fn initializeProfileUsage(
-        self: *SessionRuntime,
-        alloc: Allocator,
-        home_path: ?[]const u8,
-    ) !profile_usage_runtime.InitializeOutcome {
-        self.usage.configurePublicationSink(null);
-        return self.profile_usage.initialize(alloc, home_path);
-    }
-
-    /// Attaches callbacks only after the host has placed SessionRuntime at its
-    /// final address.
-    pub fn attachProfileUsagePublisher(
-        self: *SessionRuntime,
-        alloc: Allocator,
-    ) void {
-        self.usage.configurePublicationSink(
-            if (self.profile_usage.isAvailable())
-                self.profile_usage.publisherSink(alloc)
-            else
-                null,
-        );
-    }
-
-    pub fn ensureProfileUsageReadable(
-        self: *SessionRuntime,
-        alloc: Allocator,
-        home_path: ?[]const u8,
-    ) !profile_usage_runtime.InitializeOutcome {
-        if (self.profile_usage.isAvailable()) return .available;
-        return self.initializeProfileUsage(alloc, home_path);
-    }
-
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
         self.clearWebFetchArtifacts();
-        self.usage.resetFresh(alloc);
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(ConversationLanguage.default());
+        self.has_stale_shell_handles = false;
     }
 
     pub fn restore(self: *SessionRuntime, alloc: Allocator, language: ConversationLanguage, history: []const HistoryTurn) !void {
         self.clearWebFetchArtifacts();
-        self.usage.resetLegacy(alloc);
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(language);
+        self.has_stale_shell_handles = false;
 
         for (history) |turn| {
             try self.appendHistoryEntry(alloc, turn);
         }
-        self.unversioned_history_len = self.agent.history.items.len;
-    }
-
-    pub fn restoreWithContextHistoryStart(
-        self: *SessionRuntime,
-        alloc: Allocator,
-        language: ConversationLanguage,
-        history: []const HistoryTurn,
-        context_history_start: usize,
-    ) !void {
-        if (context_history_start > history.len) return error.InvalidContextHistoryStart;
-        try self.restore(alloc, language, history);
-        self.context_history_start = context_history_start;
-        if (context_history_start < self.agent.history.items.len and
-            isCurrentCompactionCheckpoint(self.agent.history.items[context_history_start]))
-        {
-            self.unversioned_history_len = 0;
-        }
+        self.unversioned_history_len = if (self.agent.history.items.len > 0 and
+            isCurrentCompactionCheckpoint(self.agent.history.items[0]))
+            0
+        else
+            self.agent.history.items.len;
     }
 
     pub fn restoreWithPermissionState(
@@ -1728,23 +1733,14 @@ pub const SessionRuntime = struct {
         alloc: Allocator,
         language: ConversationLanguage,
         history: []const HistoryTurn,
-        context_history_start: usize,
         permission_state: session_permission_state.State,
     ) !void {
-        if (context_history_start > history.len) {
-            return error.InvalidContextHistoryStart;
-        }
         var permission_copy = try session_permission_state.dupe(
             alloc,
             permission_state,
         );
         errdefer permission_copy.deinit(alloc);
-        try self.restoreWithContextHistoryStart(
-            alloc,
-            language,
-            history,
-            context_history_start,
-        );
+        try self.restore(alloc, language, history);
         self.permission_state_lock.lockUncancelable(io_mod.getIo());
         defer self.permission_state_lock.unlock(io_mod.getIo());
         self.permission_state.deinit(alloc);
@@ -1811,6 +1807,22 @@ pub const SessionRuntime = struct {
         self.web_fetch_artifacts = .{ .store = store };
     }
 
+    /// As `configureWebFetchArtifacts`, for a v2 session, whose downloads
+    /// are its blobs (D44, D49).
+    pub fn configureWebFetchArtifactBlobs(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        capability: *const session_child_store.SessionChildCapability,
+        session_id: []const u8,
+    ) void {
+        self.clearWebFetchArtifacts();
+        const store = web_fetch_artifacts.Store.initBlobs(alloc, capability, session_id) catch |err| {
+            self.web_fetch_artifacts = .{ .unavailable = err };
+            return;
+        };
+        self.web_fetch_artifacts = .{ .store = store };
+    }
+
     pub fn clearWebFetchArtifacts(self: *SessionRuntime) void {
         switch (self.web_fetch_artifacts) {
             .store => |*store| store.deinit(),
@@ -1854,7 +1866,6 @@ pub const SessionRuntime = struct {
 
     pub fn clearHistory(self: *SessionRuntime, alloc: Allocator) void {
         self.agent.clearHistory(alloc);
-        self.context_history_start = 0;
         self.unversioned_history_len = 0;
     }
 
@@ -1862,17 +1873,12 @@ pub const SessionRuntime = struct {
         return self.agent.history.items.len;
     }
 
-    pub fn contextHistoryStart(self: *const SessionRuntime) usize {
-        return self.context_history_start;
-    }
-
     pub fn unversionedHistoryEnd(self: *const SessionRuntime) usize {
         return @min(self.unversioned_history_len, self.agent.history.items.len);
     }
 
     pub fn hasContextToCompact(self: *const SessionRuntime) bool {
-        const start = @min(self.context_history_start, self.agent.history.items.len);
-        for (self.agent.history.items[start..]) |turn| {
+        for (self.agent.history.items) |turn| {
             if (turn != .compacted_summary) return true;
         }
         return false;
@@ -1910,19 +1916,49 @@ pub const SessionRuntime = struct {
         return snapshotOwnedContextHistory(
             alloc,
             self.agent.history.items,
-            self.context_history_start,
+            0,
             self.max_history_turns,
         );
     }
 
     pub fn appendHistoryEntry(self: *SessionRuntime, alloc: Allocator, turn: HistoryTurn) !void {
-        try self.agent.appendHistoryEntry(alloc, turn);
-        if (turn == .compacted_summary) {
-            self.context_history_start = self.agent.history.items.len - 1;
-            if (isCurrentCompactionCheckpoint(turn)) {
-                self.unversioned_history_len = 0;
-            }
+        const prepared = try self.prepareHistoryEntry(alloc, turn);
+        self.commitPreparedHistoryEntry(alloc, prepared);
+    }
+
+    pub fn prepareHistoryEntry(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        turn: HistoryTurn,
+    ) !HistoryTurn {
+        try self.agent.history.ensureUnusedCapacity(alloc, 1);
+        return dupeHistoryTurn(alloc, turn);
+    }
+
+    pub fn commitPreparedHistoryEntry(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        turn: HistoryTurn,
+    ) void {
+        if (isCurrentCompactionCheckpoint(turn)) {
+            self.agent.clearHistory(alloc);
+            self.unversioned_history_len = 0;
         }
+        self.agent.history.appendAssumeCapacity(turn);
+        self.agent.fresh = false;
+        if (turn == .compacted_summary and isCurrentCompactionCheckpoint(turn)) {
+            self.unversioned_history_len = 0;
+        }
+    }
+
+    /// Takes ownership of a fully prepared replacement only after durable commit.
+    pub fn commitCompactedHistory(self: *SessionRuntime, alloc: Allocator, history: []HistoryTurn) void {
+        const uncertain = self.unversioned_history_len != 0;
+        self.agent.clearHistory(alloc);
+        self.agent.history.deinit(alloc);
+        self.agent.history = std.ArrayList(HistoryTurn).fromOwnedSlice(history);
+        self.agent.fresh = false;
+        self.unversioned_history_len = if (uncertain) history.len else 0;
     }
 
     pub fn appendAssistantHistoryTurn(self: *SessionRuntime, alloc: Allocator, user: []const u8, assistant: []const u8) !void {
@@ -1939,7 +1975,7 @@ pub const SessionRuntime = struct {
         messages: *std.ArrayList(message.Message),
         history: []const HistoryTurn,
     ) !void {
-        _ = try appendHistoryMessagesImpl(alloc, messages, history, true);
+        try appendHistoryMessagesImpl(alloc, messages, history);
     }
 
     pub fn appendHistoryChatMessages(
@@ -1947,7 +1983,7 @@ pub const SessionRuntime = struct {
         messages: *std.ArrayList(core_types.ChatMessage),
         history: []const HistoryTurn,
     ) !void {
-        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
+        try appendHistoryChatMessagesImpl(alloc, messages, history, .closed);
     }
 
     pub fn setConversationLanguageFromUserMessage(self: *SessionRuntime, text: []const u8) void {
@@ -1993,6 +2029,13 @@ pub const SessionRuntime = struct {
     }
 };
 
+test "session initInto preserves runtime defaults" {
+    var actual: SessionRuntime = undefined;
+    @memset(std.mem.asBytes(&actual), 0xa5);
+    actual.initInto(17);
+    try std.testing.expectEqualDeep(SessionRuntime.init(17), actual);
+}
+
 fn appendHistoryCopies(
     alloc: Allocator,
     destination: *std.ArrayList(HistoryTurn),
@@ -2009,46 +2052,59 @@ fn appendHistoryCopies(
 pub fn snapshotOwnedContextHistory(
     alloc: Allocator,
     canonical_history: []const HistoryTurn,
-    context_history_start: usize,
-    max_history_turns: usize,
+    _: usize,
+    _: usize,
 ) ![]HistoryTurn {
     var copy: std.ArrayList(HistoryTurn) = .empty;
     errdefer {
-        for (copy.items) |turn| {
-            freeHistoryTurn(alloc, turn);
-        }
+        for (copy.items) |turn| freeHistoryTurn(alloc, turn);
         copy.deinit(alloc);
     }
-
-    const start = @min(context_history_start, canonical_history.len);
-    try appendCompactedPrefix(
-        alloc,
-        &copy,
-        canonical_history[0..start],
-    );
-    try appendHistoryCopies(alloc, &copy, canonical_history[start..]);
-    _ = try compactHistory(&copy, alloc, max_history_turns);
+    try appendHistoryCopies(alloc, &copy, canonical_history);
     return copy.toOwnedSlice(alloc);
 }
 
-fn appendCompactedPrefix(
+pub fn prepareCompactedHistory(
     alloc: Allocator,
-    destination: *std.ArrayList(HistoryTurn),
     history: []const HistoryTurn,
-) !void {
-    if (history.len == 0) return;
-
-    const has_existing_summary = history[0] == .compacted_summary;
-    const existing_summary = if (has_existing_summary) history[0].compacted_summary else null;
-    const removed = history[@intFromBool(has_existing_summary)..];
-    if (removed.len == 0) {
-        try appendHistoryCopies(alloc, destination, history);
-        return;
+    summary: CompactedSummaryHistoryTurn,
+    cut: core_types.ContextHistoryCut,
+) ![]HistoryTurn {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const retained = try history_range.contextHistoryRange(arena_state.allocator(), history, cut, null);
+    var next: std.ArrayList(HistoryTurn) = .empty;
+    errdefer {
+        for (next.items) |turn| freeHistoryTurn(alloc, turn);
+        next.deinit(alloc);
     }
+    try next.ensureTotalCapacity(alloc, retained.len + 1);
+    next.appendAssumeCapacity(try dupeHistoryTurn(alloc, .{ .compacted_summary = summary }));
+    for (retained) |turn| next.appendAssumeCapacity(try dupeHistoryTurn(alloc, turn));
+    return next.toOwnedSlice(alloc);
+}
 
-    const summary = try buildCompactedSummaryTurn(alloc, existing_summary, removed);
-    errdefer freeHistoryTurn(alloc, .{ .compacted_summary = summary });
-    try destination.append(alloc, .{ .compacted_summary = summary });
+test "retained context history replacement is allocation-failure atomic" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            const replay = core_types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"retained\"}]" };
+            const source = [_]HistoryTurn{
+                .{ .assistant = .{ .user = .{ .text = @constCast("older request") }, .assistant = @constCast("older reply") } },
+                .{ .assistant = .{ .user = .{ .text = @constCast("recent request") }, .assistant = @constCast("recent reply"), .provider_replay = replay } },
+            };
+            const prepared = try prepareCompactedHistory(alloc, &source, .{
+                .summary = @constCast("<context_handoff>older facts</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            }, .{ .turns = 1 });
+            defer freeHistoryTurnSlice(alloc, prepared);
+            try std.testing.expectEqual(@as(usize, 2), prepared.len);
+            try std.testing.expectEqualStrings("recent reply", prepared[1].assistant.assistant);
+            try std.testing.expectEqualStrings(replay.parts_json, prepared[1].assistant.provider_replay.?.parts_json);
+            try std.testing.expectEqualStrings("older reply", source[0].assistant.assistant);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Fixture.run, .{});
 }
 
 /// Frees an owned image attachment slice and each attachment field.
@@ -2104,71 +2160,7 @@ fn dupeImageAttachment(alloc: Allocator, src: ImageAttachment) !ImageAttachment 
     };
 }
 /// Deep-copies one history turn; caller owns the returned turn and frees with freeHistoryTurn.
-pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
-    switch (turn) {
-        .compacted_summary => |entry| {
-            const summary = try alloc.dupe(u8, entry.summary);
-            errdefer alloc.free(summary);
-            const root_user_messages = try core_types.dupeCompletedToolNames(
-                alloc,
-                entry.root_user_messages,
-            );
-            errdefer core_types.freeCompletedToolNames(alloc, root_user_messages);
-            const permission_feedback = try core_types.dupePermissionFeedback(
-                alloc,
-                entry.permission_feedback,
-            );
-            return .{ .compacted_summary = .{
-                .summary = summary,
-                .removed_turn_count = entry.removed_turn_count,
-                .compaction_count = entry.compaction_count,
-                .root_user_messages = root_user_messages,
-                .root_user_messages_complete = entry.root_user_messages_complete,
-                .permission_feedback = permission_feedback,
-                .permission_feedback_complete = entry.permission_feedback_complete,
-            } };
-        },
-        .assistant => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant_copy = try alloc.dupe(u8, entry.assistant);
-            errdefer alloc.free(assistant_copy);
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            return .{ .assistant = .{
-                .user = user,
-                .assistant = assistant_copy,
-                .execution = execution,
-            } };
-        },
-        .interrupted => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-            const tool_call = if (entry.tool_call) |call| try core_types.dupeToolCall(alloc, call) else null;
-            errdefer if (tool_call) |call| core_types.freeToolCall(alloc, call);
-            const completed_tool_names = try core_types.dupeCompletedToolNames(alloc, entry.completed_tool_names);
-            errdefer core_types.freeCompletedToolNames(alloc, completed_tool_names);
-            const cancelled_command = if (entry.cancelled_command) |presentation|
-                try core_types.dupeCancelledCommandPresentation(alloc, presentation)
-            else
-                null;
-            errdefer if (cancelled_command) |presentation| {
-                core_types.freeCancelledCommandPresentation(alloc, presentation);
-            };
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            return .{ .interrupted = .{
-                .user = user,
-                .assistant = assistant,
-                .tool_call = tool_call,
-                .completed_tool_names = completed_tool_names,
-                .execution = execution,
-                .cancelled_command = cancelled_command,
-                .terminal_reason = entry.terminal_reason,
-            } };
-        },
-    }
-}
+pub const dupeHistoryTurn = core_types.dupeHistoryTurn;
 pub fn appendAssistantTurnWithExecution(
     alloc: Allocator,
     current: []HistoryTurn,
@@ -2183,7 +2175,7 @@ pub fn appendAssistantTurnWithExecution(
     const next = try alloc.alloc(HistoryTurn, current.len + 1);
     errdefer alloc.free(next);
 
-    std.mem.copyForwards(HistoryTurn, next[0..current.len], current);
+    @memmove(next[0..current.len], current);
     next[current.len] = .{ .assistant = .{
         .user = .{ .text = user_copy, .images = &.{} },
         .assistant = assistant_copy,
@@ -2195,36 +2187,6 @@ pub fn appendAssistantTurnWithExecution(
 }
 
 /// Appends a finished turn to an owned prompt-context projection and reapplies its turn limit.
-pub fn appendHistoryTurnToOwnedContext(
-    alloc: Allocator,
-    current: []HistoryTurn,
-    turn: HistoryTurn,
-    max_history_turns: usize,
-) ![]HistoryTurn {
-    var list: std.ArrayList(HistoryTurn) = .empty;
-    errdefer {
-        for (list.items) |owned_turn| {
-            freeHistoryTurn(alloc, owned_turn);
-        }
-        list.deinit(alloc);
-    }
-
-    try list.ensureTotalCapacity(alloc, current.len + 1);
-    for (current) |owned_turn| {
-        list.appendAssumeCapacity(owned_turn);
-    }
-    if (current.len > 0) alloc.free(current);
-
-    const duplicate = try dupeHistoryTurn(alloc, turn);
-    var owns_duplicate = true;
-    errdefer if (owns_duplicate) freeHistoryTurn(alloc, duplicate);
-
-    try list.append(alloc, duplicate);
-    owns_duplicate = false;
-    _ = try compactHistory(&list, alloc, max_history_turns);
-    return try list.toOwnedSlice(alloc);
-}
-
 /// Builds one owned assistant history turn; caller frees with freeHistoryTurn.
 pub fn makeAssistantTurn(alloc: Allocator, user_text: []const u8, assistant_text: []const u8) !HistoryTurn {
     const user_copy = try alloc.dupe(u8, user_text);
@@ -2235,129 +2197,6 @@ pub fn makeAssistantTurn(alloc: Allocator, user_text: []const u8, assistant_text
         .user = .{ .text = user_copy, .images = &.{} },
         .assistant = assistant_copy,
     } };
-}
-
-test "unavailable profile usage keeps reconciled generation pending in host runtime" {
-    const alloc = std.testing.allocator;
-    const Checkpoint = struct {
-        calls: usize = 0,
-
-        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-        }
-    };
-
-    var checkpoint = Checkpoint{};
-    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
-    defer runtime.deinit(alloc);
-    try std.testing.expectEqual(
-        profile_usage_runtime.InitializeOutcome.unavailable,
-        try runtime.initializeProfileUsage(alloc, null),
-    );
-    runtime.attachProfileUsagePublisher(alloc);
-    runtime.usage.configureCheckpointSink(.{
-        .context = &checkpoint,
-        .allocator = alloc,
-        .persist = Checkpoint.persist,
-    });
-
-    const sequence = try runtime.usage.reserveInvocation();
-    try runtime.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    try runtime.usage.applyGeneration(alloc, .{
-        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        .created_at_ms = 1000,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-
-    var snapshot = try runtime.usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.pending, snapshot.billing);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
-    try std.testing.expectEqual(@as(u64, 0), snapshot.input_tokens);
-    try std.testing.expectEqual(@as(usize, 1), checkpoint.calls);
-}
-
-test "readable profile usage does not attach publishers or flush recovery" {
-    const alloc = std.testing.allocator;
-    const Checkpoint = struct {
-        calls: usize = 0,
-
-        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-        }
-    };
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-
-    var checkpoint = Checkpoint{};
-    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
-    defer runtime.deinit(alloc);
-    try std.testing.expectEqual(
-        profile_usage_runtime.InitializeOutcome.available,
-        try runtime.initializeProfileUsage(alloc, home),
-    );
-    runtime.usage.configureCheckpointSink(.{
-        .context = &checkpoint,
-        .allocator = alloc,
-        .persist = Checkpoint.persist,
-    });
-
-    const sequence = try runtime.usage.reserveInvocation();
-    try runtime.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    try runtime.usage.applyGeneration(alloc, .{
-        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        .created_at_ms = 1000,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-
-    const checkpoint_calls = checkpoint.calls;
-    try std.testing.expectEqual(
-        profile_usage_runtime.InitializeOutcome.available,
-        try runtime.ensureProfileUsageReadable(alloc, home),
-    );
-    var saved = try runtime.usage.snapshot(alloc);
-    defer saved.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), saved.publication_backlog.len);
-    try std.testing.expectEqual(checkpoint_calls, checkpoint.calls);
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.access(io_mod.getIo(), ".fx/usage.jsonl", .{}),
-    );
 }
 
 test "appendAssistantTurnWithExecution transfers memory and clears the source" {
@@ -2387,7 +2226,7 @@ test "appendAssistantTurnWithExecution transfers memory and clears the source" {
 }
 
 test "appendAssistantTurnWithExecution keeps source memory on allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
 
     for (0..3) |fail_index| {
         var execution = core_types.ExecutionMemory{
@@ -2427,44 +2266,20 @@ pub fn appendHistoryMessages(
     messages: *std.ArrayList(message.Message),
     history: []const HistoryTurn,
 ) !void {
-    _ = try appendHistoryMessagesImpl(alloc, messages, history, true);
+    try appendHistoryMessagesImpl(alloc, messages, history);
 }
 
 pub fn appendHistoryChatMessages(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
-) !void {
-    _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
-}
-
-/// Projects complete raw canonical turns for semantic compaction. Prior
-/// checkpoints are derived model context and never become semantic source for
-/// a later checkpoint.
-pub fn appendCompactionHistoryChatMessages(
-    alloc: Allocator,
-    messages: *std.ArrayList(core_types.ChatMessage),
-    history: []const HistoryTurn,
-) !void {
-    for (history, 0..) |turn, index| {
-        if (turn == .compacted_summary) continue;
-        _ = try appendHistoryChatMessagesImpl(
-            alloc,
-            messages,
-            history[index .. index + 1],
-            false,
-            .closed,
-        );
-    }
+) (Allocator.Error || error{InvalidReplayHandle})!void {
+    try appendHistoryChatMessagesImpl(alloc, messages, history, .closed);
 }
 
 fn isCurrentCompactionCheckpoint(turn: HistoryTurn) bool {
     return switch (turn) {
-        .compacted_summary => |entry| std.mem.startsWith(
-            u8,
-            entry.summary,
-            core_types.context_handoff_open,
-        ),
+        .compacted_summary => |entry| compactor.replacesPriorContext(entry.summary),
         else => false,
     };
 }
@@ -2535,11 +2350,10 @@ fn appendActiveContextHistoryChatMessagesWithTrailingProjection(
         return error.InvalidContextHistoryStart;
     }
     const retained_count = raw_before - checkpoint.removed_turn_count;
-    _ = try appendHistoryChatMessagesImpl(
+    try appendHistoryChatMessagesImpl(
         alloc,
         messages,
         history[context_history_start .. context_history_start + 1],
-        true,
         .closed,
     );
     if (retained_count > 0) {
@@ -2552,147 +2366,22 @@ fn appendActiveContextHistoryChatMessagesWithTrailingProjection(
         if (remaining != 0) return error.InvalidContextHistoryStart;
         for (history[retained_start..context_history_start], retained_start..) |turn, index| {
             if (turn == .compacted_summary) continue;
-            _ = try appendHistoryChatMessagesImpl(
+            try appendHistoryChatMessagesImpl(
                 alloc,
                 messages,
                 history[index .. index + 1],
-                false,
                 .closed,
             );
         }
     }
     if (context_history_start + 1 < history.len) {
-        _ = try appendHistoryChatMessagesImpl(
+        try appendHistoryChatMessagesImpl(
             alloc,
             messages,
             history[context_history_start + 1 ..],
-            false,
             interrupted_projection,
         );
     }
-}
-
-pub fn rawHistoryTurnCount(history: []const HistoryTurn) usize {
-    var count: usize = 0;
-    for (history) |turn| if (turn != .compacted_summary) {
-        count += 1;
-    };
-    return count;
-}
-
-pub fn retainedHistoryTurnCountForMessageTail(
-    alloc: Allocator,
-    history: []const HistoryTurn,
-    wanted_messages: usize,
-) !usize {
-    if (wanted_messages == 0) return 0;
-    var remaining = wanted_messages;
-    var retained_turns: usize = 0;
-    var index = history.len;
-    while (index > 0 and remaining > 0) {
-        index -= 1;
-        if (history[index] == .compacted_summary) continue;
-        var projected: std.ArrayList(core_types.ChatMessage) = .empty;
-        defer projected.deinit(alloc);
-        _ = try appendHistoryChatMessagesImpl(
-            alloc,
-            &projected,
-            history[index .. index + 1],
-            false,
-            .closed,
-        );
-        if (projected.items.len == 0) continue;
-        retained_turns += 1;
-        remaining -|= projected.items.len;
-    }
-    return retained_turns;
-}
-
-pub const RetainedHistoryTail = struct {
-    turn_count: usize,
-    message_count: usize,
-};
-
-pub fn retainedHistoryTailForMessageCount(
-    alloc: Allocator,
-    history: []const HistoryTurn,
-    wanted_messages: usize,
-) !RetainedHistoryTail {
-    const turn_count = try retainedHistoryTurnCountForMessageTail(
-        alloc,
-        history,
-        wanted_messages,
-    );
-    if (turn_count == 0) return .{ .turn_count = 0, .message_count = 0 };
-    if (turn_count == rawHistoryTurnCount(history)) {
-        return .{ .turn_count = 0, .message_count = 0 };
-    }
-
-    var retained_start = history.len;
-    var remaining = turn_count;
-    while (retained_start > 0 and remaining > 0) {
-        retained_start -= 1;
-        if (history[retained_start] != .compacted_summary) remaining -= 1;
-    }
-    if (remaining != 0) return error.InvalidContextHistoryStart;
-
-    var projected: std.ArrayList(core_types.ChatMessage) = .empty;
-    defer projected.deinit(alloc);
-    try appendCompactionHistoryChatMessages(
-        alloc,
-        &projected,
-        history[retained_start..],
-    );
-    return .{
-        .turn_count = turn_count,
-        .message_count = projected.items.len,
-    };
-}
-
-test "retained compaction tail expands requested messages to complete raw turns" {
-    const alloc = std.testing.allocator;
-    var calls = [_]core_types.ToolCall{.{
-        .id = @constCast("tail-call"),
-        .name = @constCast("terminal"),
-        .arguments_json = @constCast("{\"action\":\"exec\",\"command\":\"printf tail\"}"),
-    }};
-    var results = [_]core_types.PersistedToolResult{.{
-        .tool_call_id = @constCast("tail-call"),
-        .tool_name = @constCast("terminal"),
-        .status = .success,
-        .output = @constCast("tail result"),
-        .output_bytes = 11,
-        .stored_output_bytes = 11,
-    }};
-    var steps = [_]core_types.ToolExecutionStep{.{
-        .assistant = @constCast("running"),
-        .tool_calls = &calls,
-        .tool_results = &results,
-    }};
-    var history = [_]HistoryTurn{
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("older raw user") },
-            .assistant = @constCast("older raw assistant"),
-        } },
-        .{ .compacted_summary = .{
-            .summary = @constCast("older summary"),
-            .removed_turn_count = 1,
-            .compaction_count = 1,
-        } },
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("run the tail command") },
-            .assistant = @constCast("tail complete"),
-            .execution = .{ .tool_steps = &steps },
-        } },
-    };
-
-    const tail = try retainedHistoryTailForMessageCount(alloc, &history, 2);
-    try std.testing.expectEqual(@as(usize, 1), tail.turn_count);
-    try std.testing.expectEqual(@as(usize, 4), tail.message_count);
-
-    const only_tail = try retainedHistoryTailForMessageCount(alloc, history[1..], 2);
-    try std.testing.expectEqual(@as(usize, 0), only_tail.turn_count);
-    try std.testing.expectEqual(@as(usize, 0), only_tail.message_count);
 }
 
 test "active context projects checkpoint before retained raw tail" {
@@ -2754,163 +2443,10 @@ test "active context rejects corrupt retained-tail accounting" {
     );
 }
 
-test "compaction history keeps permission feedback non-authoritative" {
-    var feedback = [_][]u8{@constCast("allow this write")};
-    var calls = [_]core_types.ToolCall{.{
-        .id = "call",
-        .name = "write_file",
-        .arguments_json = "{}",
-    }};
-    var results = [_]core_types.PersistedToolResult{.{
-        .tool_call_id = @constCast("call"),
-        .tool_name = @constCast("write_file"),
-        .status = .failure,
-        .output = @constCast("denied"),
-        .output_bytes = 6,
-        .stored_output_bytes = 6,
-        .permission_feedback = &feedback,
-    }};
-    var steps = [_]core_types.ToolExecutionStep{.{
-        .tool_calls = &calls,
-        .tool_results = &results,
-    }};
-    const history = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("write it") },
-        .assistant = @constCast("requesting write"),
-        .execution = .{ .tool_steps = &steps },
-    } }};
-    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
-    defer messages.deinit(std.testing.allocator);
-    try appendCompactionHistoryChatMessages(
-        std.testing.allocator,
-        &messages,
-        &history,
-    );
-    var feedback_count: usize = 0;
-    for (messages.items) |entry| {
-        if (entry.permission_feedback) feedback_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), feedback_count);
-}
-
-pub const HistoryBudgetOptions = struct {
-    max_tokens: usize = 0,
-};
-
-pub fn appendHistoryMessagesBudgeted(
-    alloc: Allocator,
-    messages: *std.ArrayList(message.Message),
-    history: []const HistoryTurn,
-    opts: HistoryBudgetOptions,
-) !void {
-    const keep = try selectBudgetedHistoryTurns(alloc, history, opts) orelse
-        return appendHistoryMessages(alloc, messages, history);
-    defer alloc.free(keep);
-
-    const trimmed_context = try formatBudgetTrimmedHistoryContext(
-        alloc,
-        history,
-        keep,
-    );
-    var owns_trimmed_context = true;
-    errdefer if (owns_trimmed_context) alloc.free(trimmed_context);
-    try messages.append(
-        alloc,
-        message.Message.systemOwned(trimmed_context),
-    );
-    owns_trimmed_context = false;
-
-    var in_leading_summary_prefix = true;
-    for (history, 0..) |turn, idx| {
-        if (!keep[idx]) {
-            in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
-            continue;
-        }
-        in_leading_summary_prefix = try appendHistoryMessagesImpl(
-            alloc,
-            messages,
-            history[idx .. idx + 1],
-            in_leading_summary_prefix,
-        );
-    }
-}
-
-pub fn appendHistoryChatMessagesBudgeted(
-    alloc: Allocator,
-    messages: *std.ArrayList(core_types.ChatMessage),
-    history: []const HistoryTurn,
-    opts: HistoryBudgetOptions,
-) !void {
-    return appendHistoryChatMessagesBudgetedImpl(
-        alloc,
-        messages,
-        history,
-        opts,
-        .closed,
-    );
-}
-
-/// Projects a handoff turn without telling the model that the user aborted it.
-/// Stored execution evidence remains unchanged; only the trailing interruption
-/// closure is omitted because the current prompt already carries steering intent.
-pub fn appendSteeringContinuationHistoryChatMessagesBudgeted(
-    alloc: Allocator,
-    messages: *std.ArrayList(core_types.ChatMessage),
-    history: []const HistoryTurn,
-    opts: HistoryBudgetOptions,
-) !void {
-    return appendHistoryChatMessagesBudgetedImpl(
-        alloc,
-        messages,
-        history,
-        opts,
-        .steering_continuation,
-    );
-}
-
 const InterruptedChatProjection = enum {
     closed,
     steering_continuation,
 };
-
-fn appendHistoryChatMessagesBudgetedImpl(
-    alloc: Allocator,
-    messages: *std.ArrayList(core_types.ChatMessage),
-    history: []const HistoryTurn,
-    opts: HistoryBudgetOptions,
-    trailing_interrupted_projection: InterruptedChatProjection,
-) !void {
-    const keep = try selectBudgetedHistoryTurns(alloc, history, opts) orelse
-        return appendHistoryChatMessagesWithTrailingProjection(
-            alloc,
-            messages,
-            history,
-            trailing_interrupted_projection,
-        );
-    defer alloc.free(keep);
-
-    const trimmed_context = try formatBudgetTrimmedHistoryContext(alloc, history, keep);
-    errdefer alloc.free(trimmed_context);
-    try messages.append(alloc, .{ .role = .system, .content = trimmed_context });
-
-    var in_leading_summary_prefix = true;
-    for (history, 0..) |turn, idx| {
-        if (!keep[idx]) {
-            in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
-            continue;
-        }
-        in_leading_summary_prefix = try appendHistoryChatMessagesImpl(
-            alloc,
-            messages,
-            history[idx .. idx + 1],
-            in_leading_summary_prefix,
-            if (idx + 1 == history.len)
-                trailing_interrupted_projection
-            else
-                .closed,
-        );
-    }
-}
 
 fn appendHistoryChatMessagesWithTrailingProjection(
     alloc: Allocator,
@@ -2919,86 +2455,37 @@ fn appendHistoryChatMessagesWithTrailingProjection(
     trailing_interrupted_projection: InterruptedChatProjection,
 ) !void {
     if (history.len == 0 or trailing_interrupted_projection == .closed) {
-        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
+        try appendHistoryChatMessagesImpl(alloc, messages, history, .closed);
         return;
     }
 
-    var in_leading_summary_prefix = true;
     if (history.len > 1) {
-        in_leading_summary_prefix = try appendHistoryChatMessagesImpl(
+        try appendHistoryChatMessagesImpl(
             alloc,
             messages,
             history[0 .. history.len - 1],
-            true,
             .closed,
         );
     }
-    _ = try appendHistoryChatMessagesImpl(
+    try appendHistoryChatMessagesImpl(
         alloc,
         messages,
         history[history.len - 1 ..],
-        in_leading_summary_prefix,
         trailing_interrupted_projection,
     );
-}
-
-fn continuesLeadingSummaryPrefix(in_leading_summary_prefix: bool, turn: HistoryTurn) bool {
-    return in_leading_summary_prefix and turn == .compacted_summary;
-}
-
-fn selectBudgetedHistoryTurns(
-    alloc: Allocator,
-    history: []const HistoryTurn,
-    opts: HistoryBudgetOptions,
-) !?[]bool {
-    if (opts.max_tokens == 0 or history.len == 0) return null;
-
-    const keep = try alloc.alloc(bool, history.len);
-    errdefer alloc.free(keep);
-    @memset(keep, false);
-
-    var used_tokens: usize = 0;
-    var kept_count: usize = 0;
-    var i = history.len;
-    while (i > 0) {
-        i -= 1;
-        const cost = estimateHistoryTurnTokens(history[i]);
-        if (kept_count == 0 or used_tokens + cost <= opts.max_tokens) {
-            keep[i] = true;
-            used_tokens += cost;
-            kept_count += 1;
-        }
-    }
-
-    if (kept_count == history.len) {
-        alloc.free(keep);
-        return null;
-    }
-    return keep;
 }
 
 fn appendHistoryMessagesImpl(
     alloc: Allocator,
     messages: *std.ArrayList(message.Message),
     history: []const HistoryTurn,
-    starts_in_leading_summary_prefix: bool,
-) !bool {
-    var in_leading_summary_prefix = starts_in_leading_summary_prefix;
+) !void {
     for (history) |turn| {
-        in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
         switch (turn) {
             .compacted_summary => |entry| {
-                const summary_is_system = in_leading_summary_prefix and
-                    !isCurrentCompactionCheckpoint(turn);
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
                 errdefer alloc.free(text);
-                try messages.append(
-                    alloc,
-                    if (summary_is_system)
-                        message.Message.systemOwned(text)
-                    else
-                        message.Message.userOwned(text),
-                );
+                try messages.append(alloc, message.Message.userOwned(text));
             },
             .assistant => |entry| {
                 try messages.append(alloc, .{
@@ -3067,7 +2554,6 @@ fn appendHistoryMessagesImpl(
             },
         }
     }
-    return in_leading_summary_prefix;
 }
 
 fn appendExecutionMemoryMessages(
@@ -3145,16 +2631,16 @@ pub fn appendExecutionMemoryChatMessages(
                     try messages.append(alloc, .{ .role = .assistant, .content = prefix });
                 }
             }
-            if (steering.text.len > 0) {
-                try messages.append(alloc, .{ .role = .user, .content = steering.text });
-            }
+            try messages.append(alloc, restoredSteeringChatMessage(steering.text));
             steering_index += 1;
         }
-        if (step.tool_calls.len == 0) continue;
+        if (step.tool_calls.len == 0 and step.provider_replay == null and step.assistant == null) continue;
         try messages.append(alloc, .{
             .role = .assistant,
             .content = step.assistant,
             .tool_calls = step.tool_calls,
+            .provider_replay = step.provider_replay,
+            .standalone_response = step.tool_calls.len == 0,
         });
         for (step.tool_results) |result| {
             try messages.append(alloc, .{
@@ -3188,13 +2674,27 @@ pub fn appendExecutionMemoryChatMessages(
                 try messages.append(alloc, .{ .role = .assistant, .content = prefix });
             }
         }
-        if (steering.text.len == 0) continue;
-        try messages.append(alloc, .{ .role = .user, .content = steering.text });
+        try messages.append(alloc, restoredSteeringChatMessage(steering.text));
     }
+}
+
+/// Steering comes from whoever drives this session, so compaction keeps it as
+/// user text rather than a generated notice. Empty entries only mark a
+/// checkpoint boundary. Borrows `text`.
+fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
+    return .{
+        .role = .user,
+        .content = text,
+        .restored_steering = true,
+        .context_origin = if (text.len > 0) .user_turn else .ordinary,
+    };
 }
 
 fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {
     return .{
+        .review_feedback = result.review_feedback,
+        .tool_images = result.tool_images,
+        .tool_image_handle = result.tool_image_handle,
         .output_handle = result.output_handle,
         .preview = result.preview,
         .output_bytes = result.output_bytes,
@@ -3211,32 +2711,28 @@ fn appendHistoryChatMessagesImpl(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
-    starts_in_leading_summary_prefix: bool,
     interrupted_projection: InterruptedChatProjection,
-) !bool {
-    var in_leading_summary_prefix = starts_in_leading_summary_prefix;
+) !void {
     for (history) |turn| {
-        in_leading_summary_prefix = continuesLeadingSummaryPrefix(in_leading_summary_prefix, turn);
         switch (turn) {
             .compacted_summary => |entry| {
-                const summary_is_system = in_leading_summary_prefix and
-                    !isCurrentCompactionCheckpoint(turn);
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
                 errdefer alloc.free(text);
                 try messages.append(alloc, .{
-                    .role = if (summary_is_system) .system else .user,
+                    .role = .user,
                     .content = text,
+                    .context_origin = .handoff,
                 });
             },
             .assistant => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
+                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
-                if (entry.assistant.len > 0) {
-                    try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant });
+                if (entry.assistant.len > 0 or entry.provider_replay != null) {
+                    try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
             },
             .interrupted => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
+                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.tool_call) |tool_call| {
                     const assistant_content = try formatInterruptedAssistantToolContent(alloc, entry);
@@ -3250,6 +2746,11 @@ fn appendHistoryChatMessagesImpl(
                         .tool_call_id = tool_call.id,
                         .tool_name = tool_call.name,
                         .tool_result_status = .failure,
+                        .tool_result_memory = .{
+                            .output_bytes = tool_output.len,
+                            .stored_output_bytes = tool_output.len,
+                            .truncated = false,
+                        },
                     });
                 } else if (interrupted_projection == .steering_continuation) {
                     if (entry.assistant) |assistant| {
@@ -3268,7 +2769,6 @@ fn appendHistoryChatMessagesImpl(
             },
         }
     }
-    return in_leading_summary_prefix;
 }
 /// Infers a conversation language tag from text using core's script-counting heuristic.
 pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguage) ConversationLanguage {
@@ -3288,8 +2788,8 @@ pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguag
 }
 
 pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    if (try compactor.modelText(alloc, summary)) |text| return text;
+    return alloc.print(
         "{s}{s}\n\n{s}\n{s}",
         .{ compact_continuation_preamble, summary, compact_recent_messages_note, compact_direct_resume_instruction },
     );
@@ -3315,61 +2815,6 @@ pub fn formatExecutionFileContext(alloc: Allocator, files: []const core_types.Fi
     }
 
     return out.toOwnedSlice() catch return error.OutOfMemory;
-}
-
-pub fn formatExecutionReplayContext(
-    alloc: Allocator,
-    execution: core_types.ExecutionMemory,
-) !?[]u8 {
-    if (execution.isEmpty()) return null;
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    out.writer.writeAll("Previous tool execution:") catch return error.OutOfMemory;
-
-    for (execution.tool_steps) |step| {
-        if (step.assistant) |assistant| {
-            if (assistant.len > 0) {
-                out.writer.print("\n\nAssistant:\n{s}", .{assistant}) catch return error.OutOfMemory;
-            }
-        }
-        for (step.tool_results) |result| {
-            out.writer.print(
-                "\n\nTool {s} ({s}):\n{s}",
-                .{ result.tool_name, @tagName(result.status), result.output },
-            ) catch return error.OutOfMemory;
-            for (result.permission_feedback) |feedback| {
-                out.writer.print(
-                    "\n\nUser permission feedback:\n{s}",
-                    .{feedback},
-                ) catch return error.OutOfMemory;
-            }
-        }
-    }
-    if (execution.files.len > 0) {
-        const files = try formatExecutionFileContext(alloc, execution.files);
-        defer alloc.free(files);
-        out.writer.print("\n\n{s}", .{files}) catch return error.OutOfMemory;
-    }
-
-    return out.toOwnedSlice() catch return error.OutOfMemory;
-}
-
-test "turn summary alone does not create model execution replay context" {
-    const execution = ExecutionMemory{ .turn_summary = .{
-        .started_at_ms = 100,
-        .completed_at_ms = 250,
-        .thinking_duration_ms = 40,
-        .turn_duration_ms = 150,
-        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
-    } };
-
-    const context = try formatExecutionReplayContext(
-        std.testing.allocator,
-        execution,
-    );
-    defer if (context) |value| std.testing.allocator.free(value);
-    try std.testing.expect(context == null);
 }
 
 pub fn formatInterruptedHistoryContext(alloc: Allocator, entry: InterruptedHistoryTurn) ![]u8 {
@@ -3425,531 +2870,7 @@ fn formatInterruptedAssistantClosedContent(alloc: Allocator, entry: InterruptedH
 }
 
 fn formatInterruptedPartialAssistantClosedContent(alloc: Allocator, assistant: []const u8) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ assistant, interrupted_before_completion_output });
-}
-
-fn compactHistory(history: *std.ArrayList(HistoryTurn), alloc: Allocator, max_history_turns: usize) !bool {
-    if (max_history_turns == 0 or history.items.len <= max_history_turns) return false;
-
-    if (max_history_turns <= 1) {
-        while (history.items.len > max_history_turns) {
-            const oldest = history.orderedRemove(0);
-            freeHistoryTurn(alloc, oldest);
-        }
-        return true;
-    }
-
-    const preserve_recent_turns = preservedRecentTurnCount(max_history_turns);
-    const existing_summary_len: usize = if (history.items.len > 0 and history.items[0] == .compacted_summary) 1 else 0;
-    if (history.items.len <= existing_summary_len + preserve_recent_turns) return false;
-
-    const keep_from = history.items.len - preserve_recent_turns;
-    const removed = history.items[existing_summary_len..keep_from];
-    if (removed.len == 0) return false;
-
-    const existing_summary = if (existing_summary_len == 1) history.items[0].compacted_summary else null;
-    const next_summary = try buildCompactedSummaryTurn(alloc, existing_summary, removed);
-    errdefer freeHistoryTurn(alloc, .{ .compacted_summary = next_summary });
-
-    const preserved_len = history.items.len - keep_from;
-    const next_items = try alloc.alloc(HistoryTurn, preserved_len + 1);
-    const old_allocated = history.allocatedSlice();
-
-    next_items[0] = .{ .compacted_summary = next_summary };
-    if (preserved_len > 0) {
-        std.mem.copyForwards(HistoryTurn, next_items[1 .. 1 + preserved_len], history.items[keep_from..]);
-    }
-
-    var i: usize = 0;
-    while (i < keep_from) : (i += 1) {
-        freeHistoryTurn(alloc, history.items[i]);
-    }
-
-    alloc.free(old_allocated);
-    history.items = next_items;
-    history.capacity = next_items.len;
-    return true;
-}
-
-fn buildCompactedSummaryTurn(
-    alloc: Allocator,
-    existing: ?CompactedSummaryHistoryTurn,
-    removed: []const HistoryTurn,
-) !CompactedSummaryHistoryTurn {
-    return .{
-        .summary = try buildCompactedSummaryText(alloc, existing, removed),
-        .removed_turn_count = (if (existing) |entry| entry.removed_turn_count else 0) + removed.len,
-        .compaction_count = (if (existing) |entry| entry.compaction_count else 0) + 1,
-        .root_user_messages = &.{},
-        .root_user_messages_complete = false,
-        .permission_feedback = &.{},
-        .permission_feedback_complete = false,
-    };
-}
-
-test "history compaction discards root-user authority text" {
-    const alloc = std.testing.allocator;
-    const removed = [_]HistoryTurn{
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("first exact request") },
-            .assistant = @constCast("first response"),
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("second exact request") },
-        } },
-    };
-    const first = try buildCompactedSummaryTurn(alloc, null, &removed);
-    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
-    try std.testing.expectEqual(@as(usize, 0), first.root_user_messages.len);
-    try std.testing.expect(!first.root_user_messages_complete);
-
-    const later = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("third exact request") },
-        .assistant = @constCast("third response"),
-    } }};
-    const second = try buildCompactedSummaryTurn(alloc, first, &later);
-    defer freeHistoryTurn(alloc, .{ .compacted_summary = second });
-    try std.testing.expectEqual(@as(usize, 0), second.root_user_messages.len);
-    try std.testing.expect(!second.root_user_messages_complete);
-}
-
-test "repeated compaction keeps historical authority discarded" {
-    const alloc = std.testing.allocator;
-    const legacy: CompactedSummaryHistoryTurn = .{
-        .summary = @constCast("legacy summary without exact authority"),
-        .removed_turn_count = 4,
-        .compaction_count = 1,
-        .root_user_messages_complete = false,
-        .permission_feedback_complete = false,
-    };
-    const first_removed = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("newer exact request") },
-        .assistant = @constCast("response"),
-    } }};
-    const first = try buildCompactedSummaryTurn(alloc, legacy, &first_removed);
-    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
-    try std.testing.expect(!first.root_user_messages_complete);
-    try std.testing.expect(!first.permission_feedback_complete);
-    try std.testing.expectEqual(@as(usize, 0), first.root_user_messages.len);
-
-    const second_removed = [_]HistoryTurn{.{ .interrupted = .{
-        .user = .{ .text = @constCast("latest exact request") },
-    } }};
-    const second = try buildCompactedSummaryTurn(alloc, first, &second_removed);
-    defer freeHistoryTurn(alloc, .{ .compacted_summary = second });
-    try std.testing.expect(!second.root_user_messages_complete);
-    try std.testing.expect(!second.permission_feedback_complete);
-    try std.testing.expectEqual(@as(usize, 0), second.root_user_messages.len);
-}
-
-test "repeated compaction discards historical permission feedback" {
-    const alloc = std.testing.allocator;
-    var first_feedback = [_][]u8{@constCast("Do not write outside the workspace.")};
-    var first_results = [_]PersistedToolResult{.{
-        .tool_call_id = @constCast("first"),
-        .tool_name = @constCast("write_file"),
-        .status = .failure,
-        .output = @constCast("denied"),
-        .output_bytes = 6,
-        .stored_output_bytes = 6,
-        .permission_feedback = &first_feedback,
-    }};
-    var first_steps = [_]ToolExecutionStep{.{ .tool_results = &first_results }};
-    const first_removed = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("Prepare the report.") },
-        .assistant = @constCast("I need to write a file."),
-        .execution = .{ .tool_steps = &first_steps },
-    } }};
-    const first = try buildCompactedSummaryTurn(alloc, null, &first_removed);
-    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
-    try std.testing.expect(!first.permission_feedback_complete);
-    try std.testing.expectEqual(@as(usize, 0), first.permission_feedback.len);
-
-    var second_feedback = [_][]u8{@constCast("README changes require approval.")};
-    var second_results = [_]PersistedToolResult{.{
-        .tool_call_id = @constCast("second"),
-        .tool_name = @constCast("edit_file"),
-        .status = .failure,
-        .output = @constCast("denied"),
-        .output_bytes = 6,
-        .stored_output_bytes = 6,
-        .permission_feedback = &second_feedback,
-    }};
-    var second_steps = [_]ToolExecutionStep{.{ .tool_results = &second_results }};
-    const later = [_]HistoryTurn{.{ .interrupted = .{
-        .user = .{ .text = @constCast("Continue with the report.") },
-        .execution = .{ .tool_steps = &second_steps },
-    } }};
-    const repeated = try buildCompactedSummaryTurn(alloc, first, &later);
-    defer freeHistoryTurn(alloc, .{ .compacted_summary = repeated });
-    try std.testing.expect(!repeated.permission_feedback_complete);
-    try std.testing.expectEqual(@as(usize, 0), repeated.permission_feedback.len);
-}
-
-fn buildCompactedSummaryText(
-    alloc: Allocator,
-    existing: ?CompactedSummaryHistoryTurn,
-    removed: []const HistoryTurn,
-) ![]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(arena);
-
-    try lines.append(arena, "Conversation summary:");
-    try lines.append(arena, try std.fmt.allocPrint(arena, "- Earlier turns compacted: {d}", .{removed.len}));
-
-    if (existing) |entry| {
-        try lines.append(arena, "- Previously compacted context:");
-        var existing_lines = std.mem.splitScalar(u8, entry.summary, '\n');
-        while (existing_lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r\n");
-            if (trimmed.len == 0) continue;
-            try lines.append(arena, try std.fmt.allocPrint(arena, "  {s}", .{trimmed}));
-        }
-    }
-
-    try appendUserSummaryLines(arena, &lines, removed);
-    try appendAssistantSummaryLines(arena, &lines, removed);
-    try appendExecutionSummaryLines(arena, &lines, removed);
-    try appendInterruptedSummaryLines(arena, &lines, removed);
-
-    if (lines.items.len <= 2) {
-        try lines.append(arena, "- Earlier conversation context compacted.");
-    }
-
-    return compressSummaryLines(alloc, lines.items);
-}
-
-fn appendUserSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), removed: []const HistoryTurn) !void {
-    var added: usize = 0;
-    var saw_header = false;
-    for (removed) |turn| {
-        const user_text = switch (turn) {
-            .assistant => |entry| entry.user.text,
-            .interrupted => |entry| entry.user.text,
-            .compacted_summary => continue,
-        };
-
-        const summary = compactLineText(arena, user_text, compact_summary_max_line_chars - 4) catch continue;
-        if (summary.len == 0) continue;
-        if (!saw_header) {
-            try lines.append(arena, "- Recent user requests:");
-            saw_header = true;
-        }
-        try lines.append(arena, try std.fmt.allocPrint(arena, "  - {s}", .{summary}));
-        added += 1;
-        if (added >= 4) break;
-    }
-}
-
-fn appendAssistantSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), removed: []const HistoryTurn) !void {
-    var added: usize = 0;
-    var saw_header = false;
-    for (removed) |turn| {
-        const assistant_text = switch (turn) {
-            .assistant => |entry| entry.assistant,
-            .interrupted => |entry| entry.assistant orelse continue,
-            else => continue,
-        };
-
-        const summary = compactLineText(arena, assistant_text, compact_summary_max_line_chars - 4) catch continue;
-        if (summary.len == 0) continue;
-        if (!saw_header) {
-            try lines.append(arena, "- Assistant outcomes:");
-            saw_header = true;
-        }
-        try lines.append(arena, try std.fmt.allocPrint(arena, "  - {s}", .{summary}));
-        added += 1;
-        if (added >= 3) break;
-    }
-}
-
-fn appendExecutionSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), removed: []const HistoryTurn) !void {
-    var added: usize = 0;
-    var saw_header = false;
-    for (removed) |turn| {
-        const execution = switch (turn) {
-            .assistant => |entry| entry.execution,
-            .interrupted => |entry| entry.execution,
-            else => continue,
-        };
-
-        for (execution.tool_steps) |step| {
-            for (step.tool_results) |result| {
-                if (!saw_header) {
-                    try lines.append(arena, "- Tool execution evidence:");
-                    saw_header = true;
-                }
-                try lines.append(arena, try formatToolResultEvidenceLine(arena, result));
-                added += 1;
-                if (added >= 4) return;
-            }
-        }
-
-        for (execution.files) |file| {
-            if (!saw_header) {
-                try lines.append(arena, "- Tool execution evidence:");
-                saw_header = true;
-            }
-            const stale = if (file.stale) ", stale" else "";
-            try lines.append(arena, try std.fmt.allocPrint(arena, "  - file {s}: {s}{s}", .{ @tagName(file.action), file.path, stale }));
-            added += 1;
-            if (added >= 4) return;
-        }
-    }
-}
-
-fn formatBudgetTrimmedHistoryContext(alloc: Allocator, history: []const HistoryTurn, keep: []const bool) ![]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(arena);
-
-    var omitted: usize = 0;
-    for (keep) |kept| {
-        if (!kept) omitted += 1;
-    }
-    try lines.append(arena, try std.fmt.allocPrint(arena, "Context budget trimmed {d} older history turn(s). Recent turns are preserved verbatim.", .{omitted}));
-    try appendBudgetCompactedSummaryLines(arena, &lines, history, keep);
-    try lines.append(arena, "Preserved key evidence from trimmed turns:");
-
-    var added: usize = 0;
-    for (history, 0..) |turn, idx| {
-        if (keep[idx]) continue;
-        added += try appendBudgetEvidenceForTurn(arena, &lines, turn, 6 - @min(added, 6));
-        if (added >= 6) break;
-    }
-    if (added == 0) try lines.append(arena, "- No tool evidence was present in trimmed turns.");
-    return compressSummaryLines(alloc, lines.items);
-}
-
-fn appendBudgetCompactedSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), history: []const HistoryTurn, keep: []const bool) !void {
-    for (history, 0..) |turn, idx| {
-        if (keep[idx]) continue;
-        const entry = switch (turn) {
-            .compacted_summary => |value| value,
-            else => continue,
-        };
-
-        try lines.append(arena, "Preserved compacted summary from trimmed history:");
-        var added: usize = 0;
-        var summary_lines = std.mem.splitScalar(u8, entry.summary, '\n');
-        while (summary_lines.next()) |line| {
-            const summary = compactLineText(arena, line, compact_summary_max_line_chars - 4) catch continue;
-            if (summary.len == 0) continue;
-            try lines.append(arena, try std.fmt.allocPrint(arena, "- {s}", .{summary}));
-            added += 1;
-            if (added >= 6) break;
-        }
-        if (added == 0) try lines.append(arena, "- Compacted summary was present but empty.");
-        return;
-    }
-}
-
-fn appendBudgetEvidenceForTurn(arena: Allocator, lines: *std.ArrayList([]const u8), turn: HistoryTurn, remaining: usize) !usize {
-    if (remaining == 0) return 0;
-    const execution = switch (turn) {
-        .assistant => |entry| entry.execution,
-        .interrupted => |entry| entry.execution,
-        else => return 0,
-    };
-    var added: usize = 0;
-    for (execution.tool_steps) |step| {
-        for (step.tool_results) |result| {
-            try lines.append(arena, try formatToolResultEvidenceLine(arena, result));
-            added += 1;
-            if (added >= remaining) return added;
-        }
-    }
-    for (execution.files) |file| {
-        const stale = if (file.stale) ", stale" else "";
-        try lines.append(arena, try std.fmt.allocPrint(arena, "- file {s}: {s}{s}", .{ @tagName(file.action), file.path, stale }));
-        added += 1;
-        if (added >= remaining) return added;
-    }
-    return added;
-}
-
-fn formatToolResultEvidenceLine(arena: Allocator, result: core_types.PersistedToolResult) ![]const u8 {
-    if (result.output_handle) |handle| {
-        if (result.preview) |preview| {
-            const compact_preview = try compactLineText(arena, preview, 96);
-            return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes, handle={s}, preview={s})", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes, handle, compact_preview });
-        }
-        return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes, handle={s})", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes, handle });
-    }
-    return std.fmt.allocPrint(arena, "- {s} {s} ({d} stored bytes)", .{ result.tool_name, @tagName(result.status), result.stored_output_bytes });
-}
-
-fn estimateHistoryTurnTokens(turn: HistoryTurn) usize {
-    return switch (turn) {
-        .compacted_summary => |entry| estimateTextTokens(entry.summary),
-        .assistant => |entry| estimateTextTokens(entry.user.text) + estimateTextTokens(entry.assistant) + estimateExecutionTokens(entry.execution),
-        .interrupted => |entry| estimateTextTokens(entry.user.text) +
-            (if (entry.assistant) |assistant| estimateTextTokens(assistant) else 0) +
-            estimateExecutionTokens(entry.execution),
-    };
-}
-
-fn estimateExecutionTokens(execution: core_types.ExecutionMemory) usize {
-    var total: usize = 0;
-    for (execution.tool_steps) |step| {
-        if (step.assistant) |assistant| total += estimateTextTokens(assistant);
-        for (step.tool_calls) |call| {
-            total += estimateTextTokens(call.name) + estimateTextTokens(call.arguments_json);
-        }
-        for (step.tool_results) |result| {
-            if (result.preview) |preview| {
-                total += estimateTextTokens(preview);
-            } else {
-                total += estimateTextTokens(result.output);
-            }
-            if (result.output_handle) |handle| total += estimateTextTokens(handle);
-            for (result.permission_feedback) |feedback| {
-                total += estimateTextTokens(feedback);
-            }
-        }
-    }
-    for (execution.files) |file| {
-        total += estimateTextTokens(file.path) + estimateTextTokens(file.tool_name);
-    }
-    return total;
-}
-
-fn estimateTextTokens(text: []const u8) usize {
-    var count: usize = 0;
-    var span_len: usize = 0;
-    for (text) |byte| {
-        if (std.ascii.isWhitespace(byte)) {
-            if (span_len > 0) {
-                count += (span_len + 3) / 4;
-                span_len = 0;
-            }
-        } else {
-            span_len += 1;
-        }
-    }
-    if (span_len > 0) count += (span_len + 3) / 4;
-    return count;
-}
-
-fn appendInterruptedSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), removed: []const HistoryTurn) !void {
-    var added: usize = 0;
-    var saw_header = false;
-    for (removed) |turn| {
-        const entry = switch (turn) {
-            .interrupted => |value| value,
-            else => continue,
-        };
-
-        if (!saw_header) {
-            try lines.append(arena, "- Incomplete turns:");
-            saw_header = true;
-        }
-
-        const line = try std.fmt.allocPrint(
-            arena,
-            "  - {s}",
-            .{interruptedTurnNotice(entry).body},
-        );
-        try lines.append(arena, line);
-        added += 1;
-        if (added >= 3) break;
-    }
-}
-
-fn compressSummaryLines(alloc: Allocator, lines: []const []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    var seen: std.ArrayList([]const u8) = .empty;
-    defer seen.deinit(alloc);
-
-    var line_count: usize = 0;
-    var char_count: usize = 0;
-    var omitted: usize = 0;
-
-    for (lines) |line| {
-        const normalized = std.mem.trim(u8, line, " \t\r\n");
-        if (normalized.len == 0) continue;
-        if (containsLine(seen.items, normalized)) {
-            omitted += 1;
-            continue;
-        }
-
-        try seen.append(alloc, normalized);
-
-        const candidate_chars = normalized.len + @intFromBool(line_count > 0);
-        if (line_count >= compact_summary_max_lines or char_count + candidate_chars > compact_summary_max_chars) {
-            omitted += 1;
-            continue;
-        }
-
-        if (line_count > 0) try out.writer.writeByte('\n');
-        try out.writer.writeAll(normalized);
-        line_count += 1;
-        char_count += candidate_chars;
-    }
-
-    if (omitted > 0 and line_count < compact_summary_max_lines) {
-        const notice = try std.fmt.allocPrint(alloc, "- ... {d} additional line(s) omitted.", .{omitted});
-        defer alloc.free(notice);
-        const candidate_chars = notice.len + @intFromBool(line_count > 0);
-        if (char_count + candidate_chars <= compact_summary_max_chars) {
-            if (line_count > 0) try out.writer.writeByte('\n');
-            try out.writer.writeAll(notice);
-        }
-    }
-
-    return try out.toOwnedSlice();
-}
-
-fn containsLine(lines: []const []const u8, candidate: []const u8) bool {
-    for (lines) |line| {
-        if (std.mem.eql(u8, line, candidate)) return true;
-    }
-    return false;
-}
-
-fn preservedRecentTurnCount(max_history_turns: usize) usize {
-    if (max_history_turns <= 2) return 1;
-    return @min(max_history_turns - 1, 4);
-}
-
-fn compactLineText(arena: Allocator, text: []const u8, max_bytes: usize) ![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    defer out.deinit();
-
-    var wrote_space = false;
-    var i: usize = 0;
-    while (i < text.len) {
-        const byte = text[i];
-        const is_space = byte == ' ' or byte == '\n' or byte == '\r' or byte == '\t';
-        if (is_space) {
-            if (out.written().len > 0) wrote_space = true;
-            i += 1;
-            continue;
-        }
-
-        if (wrote_space and out.written().len < max_bytes) {
-            try out.writer.writeByte(' ');
-            wrote_space = false;
-        }
-        if (out.written().len >= max_bytes) break;
-        const next_i = text_utils.utf8ForwardBoundary(text, i + 1);
-        const codepoint_len = next_i - i;
-        if (codepoint_len > max_bytes - out.written().len) break;
-        try out.writer.writeAll(text[i..next_i]);
-        i = next_i;
-    }
-
-    const written = std.mem.trim(u8, out.written(), " \t\r\n");
-    return if (written.len == 0) arena.dupe(u8, "") else arena.dupe(u8, written);
+    return alloc.print("{s}\n\n{s}", .{ assistant, interrupted_before_completion_output });
 }
 
 test "resume-history-to-request conversion preserves user assistant ordering" {
@@ -3976,12 +2897,12 @@ test "resume-history-to-request conversion preserves user assistant ordering" {
 }
 test "appendHistoryMessages frees owned projection text when append fails" {
     const compact = [_]HistoryTurn{.{ .compacted_summary = .{ .summary = @constCast("summary"), .removed_turn_count = 1, .compaction_count = 1 } }};
-    var compact_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var compact_failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     var compact_messages: std.ArrayList(message.Message) = .empty;
     try std.testing.expectError(error.OutOfMemory, appendHistoryMessages(compact_failing.allocator(), &compact_messages, &compact));
 }
 test "dupeImageAttachment frees path when media_type allocation fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
         .path = @constCast("/tmp/a.png"),
         .media_type = @constCast("image/png"),
@@ -4019,8 +2940,8 @@ test "history projection keeps system role only for leading summaries" {
             .compaction_count = 1,
         } },
         .{ .assistant = .{
-            .user = .{ .text = @constCast("old request " ++ ("u" ** 800)) },
-            .assistant = @constCast("old answer " ++ ("a" ** 800)),
+            .user = .{ .text = @constCast("old request " ++ text_utils.repeat("u", 800)) },
+            .assistant = @constCast("old answer " ++ text_utils.repeat("a", 800)),
         } },
         .{ .compacted_summary = .{
             .summary = @constCast("nonleading summary marker"),
@@ -4047,49 +2968,11 @@ test "history projection keeps system role only for leading summaries" {
         try std.testing.expectEqualStrings(@tagName(projected.role), @tagName(chat.role));
         try std.testing.expectEqualStrings(projected.content.?.asText(), chat.content.?);
     }
-    try std.testing.expectEqual(.system, messages.items[0].role);
+    try std.testing.expectEqual(.user, messages.items[0].role);
     try std.testing.expectEqual(.user, messages.items[3].role);
     try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "nonleading summary marker") != null);
     try std.testing.expectEqual(.user, messages.items[6].role);
     try std.testing.expect(std.mem.find(u8, messages.items[6].content.?.asText(), "<turn_aborted>") != null);
-
-    var budgeted_messages: std.ArrayList(message.Message) = .empty;
-    defer deinitMessages(alloc, &budgeted_messages);
-    try appendHistoryMessagesBudgeted(alloc, &budgeted_messages, &history, .{ .max_tokens = 128 });
-
-    var budgeted_chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
-    defer budgeted_chat_messages.deinit(arena);
-    try appendHistoryChatMessagesBudgeted(arena, &budgeted_chat_messages, &history, .{ .max_tokens = 128 });
-
-    try std.testing.expectEqual(budgeted_messages.items.len, budgeted_chat_messages.items.len);
-    var saw_nonleading_summary = false;
-    var saw_interruption_marker = false;
-    var saw_non_system = false;
-    for (budgeted_messages.items, budgeted_chat_messages.items) |projected, chat| {
-        try std.testing.expectEqualStrings(@tagName(projected.role), @tagName(chat.role));
-        try std.testing.expectEqualStrings(projected.content.?.asText(), chat.content.?);
-        if (projected.role == .system) {
-            try std.testing.expect(!saw_non_system);
-        } else {
-            saw_non_system = true;
-        }
-        const text = projected.content.?.asText();
-        if (std.mem.find(u8, text, "nonleading summary marker") != null and
-            std.mem.startsWith(u8, text, compact_continuation_preamble))
-        {
-            try std.testing.expectEqual(.user, projected.role);
-            try std.testing.expect(!saw_nonleading_summary);
-            saw_nonleading_summary = true;
-        }
-        if (std.mem.find(u8, text, "<turn_aborted>") != null) {
-            try std.testing.expectEqual(.user, projected.role);
-            try std.testing.expect(!saw_interruption_marker);
-            saw_interruption_marker = true;
-        }
-    }
-    try std.testing.expectEqual(.system, budgeted_messages.items[0].role);
-    try std.testing.expect(saw_nonleading_summary);
-    try std.testing.expect(saw_interruption_marker);
 }
 
 test "resume history projects steering before the final assistant" {
@@ -4401,366 +3284,7 @@ test "resume projections group two tool results before their feedback" {
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[5].role);
 }
 
-test "execution replay context and token estimate include permission feedback" {
-    const alloc = std.testing.allocator;
-    var feedback = [_][]u8{@constCast("read it after writing")};
-    var with_feedback_results = [_]PersistedToolResult{.{
-        .tool_call_id = @constCast("call_feedback"),
-        .tool_name = @constCast("write_file"),
-        .status = .success,
-        .output = @constCast("wrote note.txt"),
-        .output_bytes = 15,
-        .stored_output_bytes = 15,
-        .permission_feedback = feedback[0..],
-    }};
-    var without_feedback_results = [_]PersistedToolResult{.{
-        .tool_call_id = @constCast("call_feedback"),
-        .tool_name = @constCast("write_file"),
-        .status = .success,
-        .output = @constCast("wrote note.txt"),
-        .output_bytes = 15,
-        .stored_output_bytes = 15,
-    }};
-    var with_feedback_steps = [_]ToolExecutionStep{.{ .tool_results = with_feedback_results[0..] }};
-    var without_feedback_steps = [_]ToolExecutionStep{.{ .tool_results = without_feedback_results[0..] }};
-    const with_feedback = ExecutionMemory{ .tool_steps = with_feedback_steps[0..] };
-    const without_feedback = ExecutionMemory{ .tool_steps = without_feedback_steps[0..] };
-
-    const context = (try formatExecutionReplayContext(alloc, with_feedback)).?;
-    defer alloc.free(context);
-    try std.testing.expect(std.mem.find(u8, context, "wrote note.txt") != null);
-    try std.testing.expect(std.mem.find(u8, context, "read it after writing") != null);
-    try std.testing.expect(estimateExecutionTokens(with_feedback) > estimateExecutionTokens(without_feedback));
-}
-
-test "budgeted resume projection preserves latest turn and summarizes trimmed handle evidence" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var large_calls = [_]ToolCall{.{
-        .id = "call_large",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"make lots of evidence\"}",
-    }};
-    var large_results = [_]PersistedToolResult{.{
-        .tool_call_id = @constCast("call_large"),
-        .tool_name = @constCast("run_command"),
-        .status = .success,
-        .output = @constCast("<tool_result_preview handle=\"result-call_large-abc.txt\">preview evidence</tool_result_preview>"),
-        .output_bytes = 80_000,
-        .stored_output_bytes = 80_000,
-        .truncated = true,
-        .provider_native = false,
-        .created_at_ms = 1,
-        .output_handle = @constCast("result-call_large-abc.txt"),
-        .preview = @constCast("preview evidence"),
-    }};
-    var large_steps = [_]ToolExecutionStep{.{
-        .tool_calls = large_calls[0..],
-        .tool_results = large_results[0..],
-    }};
-    const history = [_]HistoryTurn{
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("old large request") },
-            .assistant = @constCast("old large answer"),
-            .execution = .{ .tool_steps = large_steps[0..] },
-        } },
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("latest request that must survive") },
-            .assistant = @constCast("latest answer"),
-        } },
-    };
-
-    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
-    defer messages.deinit(arena);
-    try appendHistoryChatMessagesBudgeted(arena, &messages, &history, .{ .max_tokens = 12 });
-
-    try std.testing.expect(messages.items.len >= 3);
-    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "result-call_large-abc.txt") != null);
-    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "preview evidence") != null);
-    try std.testing.expectEqualStrings("latest request that must survive", messages.items[messages.items.len - 2].content.?);
-    try std.testing.expectEqualStrings("latest answer", messages.items[messages.items.len - 1].content.?);
-}
-
-test "budgeted resume projection preserves compacted summary when older handle evidence is trimmed" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var large_calls = [_]ToolCall{.{
-        .id = "call_large",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"make lots of evidence\"}",
-    }};
-    var large_results = [_]PersistedToolResult{.{
-        .tool_call_id = @constCast("call_large"),
-        .tool_name = @constCast("run_command"),
-        .status = .success,
-        .output = @constCast("<tool_result_preview handle=\"result-call_large-summary.txt\">summary preview evidence</tool_result_preview>"),
-        .output_bytes = 80_000,
-        .stored_output_bytes = 80_000,
-        .truncated = true,
-        .provider_native = false,
-        .created_at_ms = 1,
-        .output_handle = @constCast("result-call_large-summary.txt"),
-        .preview = @constCast("summary preview evidence"),
-    }};
-    var large_steps = [_]ToolExecutionStep{.{
-        .tool_calls = large_calls[0..],
-        .tool_results = large_results[0..],
-    }};
-    const history = [_]HistoryTurn{
-        .{ .compacted_summary = .{
-            .summary = @constCast("Conversation summary:\n- Prior compacted decision needle " ++ ("x" ** 240)),
-            .removed_turn_count = 6,
-            .compaction_count = 2,
-        } },
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("old large request") },
-            .assistant = @constCast("old large answer"),
-            .execution = .{ .tool_steps = large_steps[0..] },
-        } },
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("latest request that must survive") },
-            .assistant = @constCast("latest answer"),
-        } },
-    };
-
-    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
-    defer messages.deinit(arena);
-    try appendHistoryChatMessagesBudgeted(arena, &messages, &history, .{ .max_tokens = 12 });
-
-    try std.testing.expect(messages.items.len >= 3);
-    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "Prior compacted decision needle") != null);
-    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "result-call_large-summary.txt") != null);
-    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "summary preview evidence") != null);
-    try std.testing.expectEqualStrings("latest request that must survive", messages.items[messages.items.len - 2].content.?);
-    try std.testing.expectEqualStrings("latest answer", messages.items[messages.items.len - 1].content.?);
-}
-
-test "budgeted Message and Chat projections retain latest turn and identical trimmed evidence" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var trimmed_calls = [_]ToolCall{.{
-        .id = "call_trimmed",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"produce extensive evidence\"}",
-    }};
-    var trimmed_results = [_]PersistedToolResult{.{
-        .tool_call_id = @constCast("call_trimmed"),
-        .tool_name = @constCast("run_command"),
-        .status = .failure,
-        .output = @constCast("trimmed failure output"),
-        .output_bytes = 22,
-        .stored_output_bytes = 22,
-        .output_handle = @constCast("result-call_trimmed.txt"),
-        .preview = @constCast("trimmed failure preview"),
-    }};
-    var trimmed_files = [_]FileEvidence{.{
-        .path = @constCast("src/trimmed.zig"),
-        .tool_call_id = @constCast("call_trimmed"),
-        .tool_name = @constCast("run_command"),
-        .action = .write,
-        .status = .failure,
-        .stale = true,
-    }};
-    var trimmed_steps = [_]ToolExecutionStep{.{
-        .assistant = @constCast("collecting extensive trimmed evidence"),
-        .tool_calls = trimmed_calls[0..],
-        .tool_results = trimmed_results[0..],
-    }};
-    var retained_calls = [_]ToolCall{.{
-        .id = "call_retained",
-        .name = "read_file",
-        .arguments_json = "{\"path\":\"src/retained.zig\"}",
-    }};
-    var retained_results = [_]PersistedToolResult{.{
-        .tool_call_id = @constCast("call_retained"),
-        .tool_name = @constCast("read_file"),
-        .status = .failure,
-        .output = @constCast("retained failure"),
-        .output_bytes = 16,
-        .stored_output_bytes = 16,
-    }};
-    var retained_files = [_]FileEvidence{.{
-        .path = @constCast("src/retained.zig"),
-        .tool_call_id = @constCast("call_retained"),
-        .tool_name = @constCast("read_file"),
-        .action = .read,
-        .status = .failure,
-        .model_view_covers_full_file = true,
-    }};
-    var retained_steps = [_]ToolExecutionStep{.{
-        .assistant = @constCast("reading retained"),
-        .tool_calls = retained_calls[0..],
-        .tool_results = retained_results[0..],
-    }};
-    var background_images = [_]ImageAttachment{.{
-        .id = 7,
-        .path = @constCast("/tmp/background.png"),
-        .media_type = @constCast("image/png"),
-    }};
-    var interrupted_images = [_]ImageAttachment{.{
-        .id = 8,
-        .path = @constCast("/tmp/interrupted.jpg"),
-        .media_type = @constCast("image/jpeg"),
-    }};
-    var latest_images = [_]ImageAttachment{.{
-        .id = 9,
-        .path = @constCast("/tmp/latest.webp"),
-        .media_type = @constCast("image/webp"),
-    }};
-    const history = [_]HistoryTurn{
-        .{ .compacted_summary = .{
-            .summary = @constCast("prior compacted decision needle " ++ ("x" ** 320)),
-            .removed_turn_count = 5,
-            .compaction_count = 2,
-        } },
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("old request " ++ ("y" ** 240)) },
-            .assistant = @constCast("old answer " ++ ("z" ** 240)),
-            .execution = .{
-                .tool_steps = trimmed_steps[0..],
-                .files = trimmed_files[0..],
-            },
-        } },
-        .{ .assistant = .{
-            .user = .{
-                .text = @constCast("run retained"),
-                .images = background_images[0..],
-            },
-            .assistant = @constCast("server ready"),
-            .execution = .{
-                .tool_steps = retained_steps[0..],
-                .files = retained_files[0..],
-            },
-        } },
-        .{ .interrupted = .{
-            .user = .{
-                .text = @constCast("stop retained"),
-                .images = interrupted_images[0..],
-            },
-            .assistant = @constCast("partial retained"),
-            .tool_call = .{
-                .id = "call_interrupted",
-                .name = "browser_navigate",
-                .arguments_json = "{\"url\":\"http://localhost:3000\"}",
-            },
-        } },
-        .{ .assistant = .{
-            .user = .{
-                .text = @constCast("latest request"),
-                .images = latest_images[0..],
-            },
-            .assistant = @constCast("latest answer"),
-        } },
-    };
-
-    var messages: std.ArrayList(message.Message) = .empty;
-    defer deinitMessages(arena, &messages);
-    try appendHistoryMessagesBudgeted(
-        arena,
-        &messages,
-        &history,
-        .{ .max_tokens = 64 },
-    );
-    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
-    defer chat_messages.deinit(arena);
-    try appendHistoryChatMessagesBudgeted(
-        arena,
-        &chat_messages,
-        &history,
-        .{ .max_tokens = 64 },
-    );
-
-    try std.testing.expectEqual(messages.items.len, chat_messages.items.len);
-    var saw_interrupted = false;
-    var saw_failure_status = false;
-    var saw_file_evidence = false;
-    var saw_background_image = false;
-    var saw_interrupted_image = false;
-    var saw_latest_image = false;
-    for (messages.items, chat_messages.items) |projected, chat| {
-        try std.testing.expectEqualStrings(
-            @tagName(projected.role),
-            @tagName(chat.role),
-        );
-        try std.testing.expectEqual(projected.content == null, chat.content == null);
-        if (projected.content) |content| {
-            try std.testing.expectEqualStrings(content.asText(), chat.content.?);
-            saw_interrupted = saw_interrupted or
-                std.mem.find(u8, content.asText(), "<turn_aborted>") != null;
-            saw_file_evidence = saw_file_evidence or
-                std.mem.find(u8, content.asText(), "src/retained.zig") != null;
-        }
-        try std.testing.expectEqual(projected.images.len, chat.images.len);
-        for (projected.images, chat.images) |projected_image, chat_image| {
-            try std.testing.expectEqual(projected_image.id, chat_image.id);
-            try std.testing.expectEqualStrings(projected_image.path, chat_image.path);
-            try std.testing.expectEqualStrings(
-                projected_image.media_type,
-                chat_image.media_type,
-            );
-            saw_background_image = saw_background_image or
-                std.mem.eql(u8, projected_image.path, "/tmp/background.png");
-            saw_interrupted_image = saw_interrupted_image or
-                std.mem.eql(u8, projected_image.path, "/tmp/interrupted.jpg");
-            saw_latest_image = saw_latest_image or
-                std.mem.eql(u8, projected_image.path, "/tmp/latest.webp");
-        }
-        try std.testing.expectEqual(projected.tool_calls.len, chat.tool_calls.len);
-        for (projected.tool_calls, chat.tool_calls) |projected_call, chat_call| {
-            try std.testing.expectEqualStrings(projected_call.id, chat_call.id);
-            try std.testing.expectEqualStrings(projected_call.name, chat_call.name);
-            try std.testing.expectEqualStrings(
-                projected_call.arguments_json,
-                chat_call.arguments_json,
-            );
-        }
-        try std.testing.expectEqual(projected.tool_result_status, chat.tool_result_status);
-        saw_failure_status = saw_failure_status or
-            projected.tool_result_status == .failure;
-    }
-
-    const trimmed_context = messages.items[0].content.?.asText();
-    try std.testing.expect(std.mem.find(
-        u8,
-        trimmed_context,
-        "prior compacted decision needle",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        trimmed_context,
-        "result-call_trimmed.txt",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        trimmed_context,
-        "src/trimmed.zig",
-    ) != null);
-    try std.testing.expect(saw_interrupted);
-    try std.testing.expect(saw_failure_status);
-    try std.testing.expect(saw_file_evidence);
-    try std.testing.expect(saw_background_image);
-    try std.testing.expect(saw_interrupted_image);
-    try std.testing.expect(saw_latest_image);
-    try std.testing.expectEqualStrings(
-        "latest request",
-        messages.items[messages.items.len - 2].content.?.asText(),
-    );
-    try std.testing.expectEqualStrings(
-        "latest answer",
-        messages.items[messages.items.len - 1].content.?.asText(),
-    );
-}
-
-test "context compaction summary preserves large result handle without dropping canonical execution memory" {
+test "active context snapshot preserves large result handles exactly" {
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 2 };
     defer runtime.deinit(alloc);
@@ -4808,10 +3332,16 @@ test "context compaction summary preserves large result handle without dropping 
 
     const context = try runtime.snapshotContextHistory(alloc);
     defer freeHistoryTurnSlice(alloc, context);
-    try std.testing.expectEqual(@as(usize, 2), context.len);
-    try std.testing.expectEqual(HistoryTurn.compacted_summary, std.meta.activeTag(context[0]));
-    try std.testing.expect(std.mem.find(u8, context[0].compacted_summary.summary, "result-call_large-abc.txt") != null);
-    try std.testing.expect(std.mem.find(u8, context[0].compacted_summary.summary, "important preview") != null);
+    try std.testing.expectEqual(@as(usize, 3), context.len);
+    try std.testing.expectEqual(HistoryTurn.assistant, std.meta.activeTag(context[0]));
+    try std.testing.expectEqualStrings(
+        "result-call_large-abc.txt",
+        context[0].assistant.execution.tool_steps[0].tool_results[0].output_handle.?,
+    );
+    try std.testing.expectEqualStrings(
+        "important preview",
+        context[0].assistant.execution.tool_steps[0].tool_results[0].preview.?,
+    );
 }
 
 test "interrupted history projects marker and aborted tool result" {
@@ -4892,6 +3422,44 @@ test "interrupted history projects marker and aborted tool result" {
     }
 }
 
+test "interrupted tool diagnostics remain complete for compaction" {
+    const replay_handle = "cancelled-output.bin";
+    const oversized_handle = text_utils.repeat("h", 129);
+    const presentations = [_]?CancelledCommandPresentation{
+        null,
+        .{},
+        .{ .output_replay = .unavailable },
+        .{ .output_replay = .{ .available = .{ .handle = replay_handle, .framed_bytes = 42 } } },
+        .{ .output_replay = .{ .available = .{ .handle = oversized_handle, .framed_bytes = 42 } } },
+    };
+    for (presentations, 0..) |presentation, index| {
+        for ([_]InterruptedTerminalReason{ .cancelled, .failed }) |reason| {
+            for ([_]InterruptedChatProjection{ .closed, .steering_continuation }) |projection| {
+                var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena_state.deinit();
+                const alloc = arena_state.allocator();
+                const history = [_]HistoryTurn{.{ .interrupted = .{
+                    .user = .{ .text = @constCast("Stop the current tool.") },
+                    .tool_call = .{ .id = "cancelled-call", .name = "subagent", .arguments_json = "{}" },
+                    .cancelled_command = presentation,
+                    .terminal_reason = reason,
+                } }};
+                var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+                try appendHistoryChatMessagesImpl(alloc, &messages, &history, projection);
+                // Compaction saves this diagnostic as the tool's output; it must
+                // say the tool did not complete.
+                const result = messages.items[2];
+                try std.testing.expectEqual(.failure, result.tool_result_status.?);
+                try std.testing.expectEqualStrings("cancelled-call", result.tool_call_id.?);
+                try std.testing.expect(std.mem.startsWith(u8, result.content.?, aborted_tool_output));
+                try std.testing.expectEqual(@as(usize, if (index == 3) 1 else 0), std.mem.count(u8, result.content.?, replay_handle));
+                try std.testing.expect(std.mem.find(u8, result.content.?, oversized_handle) == null);
+                try std.testing.expectEqual(reason, history[0].interrupted.terminal_reason);
+            }
+        }
+    }
+}
+
 test "no-output interrupted history projects synthetic assistant before marker" {
     const alloc = std.testing.allocator;
     const history = [_]HistoryTurn{.{ .interrupted = .{
@@ -4948,11 +3516,11 @@ test "steering continuation omits only the trailing interrupted closure" {
     var messages: std.ArrayList(core_types.ChatMessage) = .empty;
     defer messages.deinit(arena);
 
-    try appendSteeringContinuationHistoryChatMessagesBudgeted(
+    try appendSteeringActiveContextHistoryChatMessages(
         arena,
         &messages,
         &history,
-        .{},
+        0,
     );
 
     try std.testing.expectEqual(@as(usize, 5), messages.items.len);
@@ -5121,8 +3689,140 @@ test "SessionRuntime.restore replaces history, updates language, and preserves e
     try std.testing.expect(runtime.agent.history.items[2].assistant.assistant.ptr != restore_history[2].assistant.assistant.ptr);
 }
 
+test "collectReferencedShellIds extracts raw and escaped envelopes from restored history" {
+    const alloc = std.testing.allocator;
+
+    var replay_turn = try makeAssistantTurn(alloc, "restart the server", "starting it");
+    replay_turn.assistant.provider_replay = .{
+        .source = .{ .provider = .gateway, .model = try alloc.dupe(u8, "test") },
+        .parts_json = try alloc.dupe(
+            u8,
+            "[{\"type\":\"tool_result\",\"content\":\"{\\\"session_id\\\":\\\"shell-3\\\",\\\"state\\\":\\\"running\\\"}\"}," ++
+                "{\"type\":\"tool_result\",\"content\":\"{\\\"session_id\\\":\\\"shell-3\\\"}\"}," ++
+                "{\"type\":\"tool_result\",\"content\":\"{\\\"session_id\\\":null}\"}]",
+        ),
+    };
+    const tool_turn: HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = try alloc.dupe(u8, "stop it") },
+        .tool_call = .{
+            .id = try alloc.dupe(u8, "call-1"),
+            .name = try alloc.dupe(u8, "shell"),
+            .arguments_json = try alloc.dupe(u8, "{\"action\":\"stop\",\"session_id\":\"shell-7\"}"),
+            .provider_result = try alloc.dupe(u8, "{\"session_id\":\"shell-X9ab_cd-12\",\"state\":\"running\"}"),
+        },
+    } };
+    const summary_turn: HistoryTurn = .{ .compacted_summary = .{
+        .summary = try alloc.dupe(u8, "prose mentioning shell-9 without an envelope"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } };
+    const history = [_]HistoryTurn{ replay_turn, tool_turn, summary_turn };
+    defer {
+        for (history) |turn| freeHistoryTurn(alloc, turn);
+    }
+
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, &history, &ids);
+
+    try std.testing.expectEqual(@as(usize, 3), ids.items.len);
+    try std.testing.expectEqualStrings("shell-3", ids.items[0]);
+    try std.testing.expectEqualStrings("shell-7", ids.items[1]);
+    try std.testing.expectEqualStrings("shell-X9ab_cd-12", ids.items[2]);
+}
+
+test "collectReferencedShellIds scans persisted tool step previews" {
+    const alloc = std.testing.allocator;
+    var turn = try makeAssistantTurn(alloc, "check the watcher", "still running");
+    defer freeHistoryTurn(alloc, turn);
+
+    const envelope = "{\"session_id\":\"shell-4\",\"state\":\"running\"}";
+    const results = try alloc.alloc(core_types.PersistedToolResult, 1);
+    results[0] = .{
+        .tool_call_id = try alloc.dupe(u8, "call-1"),
+        .tool_name = try alloc.dupe(u8, "shell"),
+        .status = .success,
+        .output = try alloc.dupe(u8, envelope),
+        .output_bytes = envelope.len,
+        .stored_output_bytes = envelope.len,
+        .preview = try alloc.dupe(u8, envelope),
+    };
+    const steps = try alloc.alloc(core_types.ToolExecutionStep, 1);
+    steps[0] = .{ .tool_results = results };
+    turn.assistant.execution = .{ .tool_steps = steps };
+
+    const history = [_]HistoryTurn{turn};
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, &history, &ids);
+
+    try std.testing.expectEqual(@as(usize, 1), ids.items.len);
+    try std.testing.expectEqualStrings("shell-4", ids.items[0]);
+}
+
+test "collectReferencedShellIds scans inline tool outputs without previews" {
+    const alloc = std.testing.allocator;
+    var turn = try makeAssistantTurn(alloc, "start the server", "running");
+    defer freeHistoryTurn(alloc, turn);
+
+    const envelope = "{\"session_id\":\"shell-11\",\"state\":\"running\"}";
+    const results = try alloc.alloc(core_types.PersistedToolResult, 1);
+    results[0] = .{
+        .tool_call_id = try alloc.dupe(u8, "call-1"),
+        .tool_name = try alloc.dupe(u8, "shell"),
+        .status = .success,
+        .output = try alloc.dupe(u8, envelope),
+        .output_bytes = envelope.len,
+        .stored_output_bytes = envelope.len,
+    };
+    const steps = try alloc.alloc(core_types.ToolExecutionStep, 1);
+    steps[0] = .{ .tool_results = results };
+    turn.assistant.execution = .{ .tool_steps = steps };
+
+    const history = [_]HistoryTurn{turn};
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, &history, &ids);
+
+    try std.testing.expectEqual(@as(usize, 1), ids.items.len);
+    try std.testing.expectEqualStrings("shell-11", ids.items[0]);
+}
+
+test "collectReferencedShellIds yields nothing for shell-free history" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{try makeAssistantTurn(alloc, "hello", "hi")};
+    defer {
+        for (history) |turn| freeHistoryTurn(alloc, turn);
+    }
+
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer ids.deinit(alloc);
+    try collectReferencedShellIds(alloc, &history, &ids);
+
+    try std.testing.expectEqual(@as(usize, 0), ids.items.len);
+}
+
+test "SessionRuntime restore and reset clear stale shell handle state" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 2 };
+    defer runtime.deinit(alloc);
+
+    runtime.has_stale_shell_handles = true;
+
+    const restore_history = [_]HistoryTurn{try makeAssistantTurn(alloc, "one", "reply one")};
+    defer {
+        for (restore_history) |turn| freeHistoryTurn(alloc, turn);
+    }
+    try runtime.restore(alloc, ConversationLanguage.literal("en"), &restore_history);
+    try std.testing.expect(!runtime.has_stale_shell_handles);
+
+    runtime.has_stale_shell_handles = true;
+    runtime.reset(alloc);
+    try std.testing.expect(!runtime.has_stale_shell_handles);
+}
+
 test "SessionRuntime.restore may retain earlier restored turns after later append failure" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 3 });
     const alloc = failing.allocator();
     var runtime: SessionRuntime = .{ .max_history_turns = 0 };
     defer runtime.deinit(alloc);
@@ -5207,36 +3907,19 @@ test "SessionRuntime appends every canonical history turn without compaction" {
     try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
 }
 
-test "compactLineText preserves complete UTF-8 codepoints at the byte cap" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const split = try compactLineText(arena, "ab★z", 3);
-    try std.testing.expectEqualStrings("ab", split);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(split));
-
-    const exact = try compactLineText(arena, "ab★z", 5);
-    try std.testing.expectEqualStrings("ab★", exact);
-
-    const collapsed = try compactLineText(arena, "  alpha\n\tbeta  ", 10);
-    try std.testing.expectEqualStrings("alpha beta", collapsed);
-}
-
-test "compacted Unicode history serializes system content as a string" {
+test "compacted Unicode history remains conversational context" {
     const alloc = std.testing.allocator;
-    var runtime: SessionRuntime = .{ .max_history_turns = 2 };
-    defer runtime.deinit(alloc);
-
-    try runtime.appendAssistantHistoryTurn(alloc, ("a" ** 155) ++ "★", "first reply");
-    try runtime.appendAssistantHistoryTurn(alloc, "second user", "second reply");
-    try runtime.appendAssistantHistoryTurn(alloc, "preserved user", "preserved reply");
-
-    const context = try runtime.snapshotContextHistory(alloc);
-    defer freeHistoryTurnSlice(alloc, context);
-    try std.testing.expectEqual(@as(usize, 2), context.len);
-    try std.testing.expect(context[0] == .compacted_summary);
-    try std.testing.expectEqualStrings("preserved user", context[1].assistant.user.text);
+    const context = [_]HistoryTurn{
+        .{ .compacted_summary = .{
+            .summary = @constCast(text_utils.repeat("a", 155) ++ "★"),
+            .removed_turn_count = 2,
+            .compaction_count = 1,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("preserved user") },
+            .assistant = @constCast("preserved reply"),
+        } },
+    };
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -5244,16 +3927,16 @@ test "compacted Unicode history serializes system content as a string" {
 
     var messages: std.ArrayList(core_types.ChatMessage) = .empty;
     defer messages.deinit(arena);
-    try appendHistoryChatMessages(arena, &messages, context);
+    try appendHistoryChatMessages(arena, &messages, &context);
     try messages.append(arena, .{ .role = .user, .content = "current user" });
 
-    try std.testing.expectEqual(core_types.ChatRole.system, messages.items[0].role);
+    try std.testing.expectEqual(core_types.ChatRole.user, messages.items[0].role);
     try std.testing.expect(messages.items[0].content != null);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(context[0].compacted_summary.summary));
-    try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
+    try std.testing.expect(std.unicode.utf8ValidateSlice(messages.items[0].content.?));
+    try std.testing.expectEqualStrings("preserved user", messages.items[1].content.?);
 }
 
-test "SessionRuntime preserves canonical turns and derives a bounded request window" {
+test "SessionRuntime context snapshot preserves the active history exactly" {
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 4 };
     defer runtime.deinit(alloc);
@@ -5271,14 +3954,13 @@ test "SessionRuntime preserves canonical turns and derives a bounded request win
 
     const context = try runtime.snapshotContextHistory(alloc);
     defer freeHistoryTurnSlice(alloc, context);
-    try std.testing.expectEqual(@as(usize, 4), context.len);
-    try std.testing.expect(context[0] == .compacted_summary);
-    try std.testing.expectEqual(@as(usize, 2), context[0].compacted_summary.removed_turn_count);
-    try std.testing.expectEqualStrings("three", context[1].assistant.user.text);
-    try std.testing.expectEqualStrings("five", context[3].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 5), context.len);
+    try std.testing.expectEqualStrings("one", context[0].assistant.user.text);
+    try std.testing.expectEqualStrings("three", context[2].assistant.user.text);
+    try std.testing.expectEqualStrings("five", context[4].assistant.user.text);
 }
 
-test "accepted semantic checkpoint is append-only and becomes the canonical model window" {
+test "accepted semantic checkpoint releases summarized model memory" {
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(alloc);
@@ -5291,20 +3973,19 @@ test "accepted semantic checkpoint is append-only and becomes the canonical mode
         .compaction_count = 1,
     } });
 
-    try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
-    try std.testing.expectEqual(@as(usize, 2), runtime.contextHistoryStart());
-    try std.testing.expectEqualStrings("first exact prompt", runtime.agent.history.items[0].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
+    try std.testing.expect(runtime.agent.history.items[0] == .compacted_summary);
 
     const compacted = try runtime.snapshotHistory(alloc);
     defer freeHistoryTurnSlice(alloc, compacted);
-    try std.testing.expectEqual(@as(usize, 3), compacted.len);
+    try std.testing.expectEqual(@as(usize, 1), compacted.len);
     var projected_messages: std.ArrayList(core_types.ChatMessage) = .empty;
     defer projected_messages.deinit(alloc);
     try appendActiveContextHistoryChatMessages(
         alloc,
         &projected_messages,
         compacted,
-        runtime.contextHistoryStart(),
+        0,
     );
     defer alloc.free(@constCast(projected_messages.items[0].content.?));
     try std.testing.expectEqual(core_types.ChatRole.user, projected_messages.items[0].role);
@@ -5312,9 +3993,9 @@ test "accepted semantic checkpoint is append-only and becomes the canonical mode
     try runtime.appendAssistantHistoryTurn(alloc, "post-checkpoint prompt", "post-checkpoint reply");
     const continued = try runtime.snapshotHistory(alloc);
     defer freeHistoryTurnSlice(alloc, continued);
-    try std.testing.expectEqual(@as(usize, 4), continued.len);
-    try std.testing.expect(continued[2] == .compacted_summary);
-    try std.testing.expectEqualStrings("post-checkpoint prompt", continued[3].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 2), continued.len);
+    try std.testing.expect(continued[0] == .compacted_summary);
+    try std.testing.expectEqualStrings("post-checkpoint prompt", continued[1].assistant.user.text);
 }
 
 test "restored history keeps an in-memory unversioned prefix boundary" {
@@ -5327,21 +4008,17 @@ test "restored history keeps an in-memory unversioned prefix boundary" {
 
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(alloc);
-    try runtime.restoreWithContextHistoryStart(
+    try runtime.restore(
         alloc,
         ConversationLanguage.literal("en"),
         &restored_history,
-        1,
     );
     try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
-    try std.testing.expectEqual(@as(usize, 1), runtime.contextHistoryStart());
 
     try runtime.appendAssistantHistoryTurn(alloc, "fresh", "fresh reply");
     try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
-    try std.testing.expectEqual(@as(usize, 1), runtime.contextHistoryStart());
     runtime.reset(alloc);
     try std.testing.expectEqual(@as(usize, 0), runtime.unversionedHistoryEnd());
-    try std.testing.expectEqual(@as(usize, 0), runtime.contextHistoryStart());
 }
 
 test "current checkpoint clears restored unversioned history provenance" {
@@ -5361,11 +4038,10 @@ test "current checkpoint clears restored unversioned history provenance" {
 
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(alloc);
-    try runtime.restoreWithContextHistoryStart(
+    try runtime.restore(
         alloc,
         ConversationLanguage.literal("en"),
-        &restored_history,
-        1,
+        restored_history[1..],
     );
     try std.testing.expectEqual(@as(usize, 0), runtime.unversionedHistoryEnd());
 
@@ -5387,56 +4063,22 @@ test "legacy checkpoint keeps restored provenance conservative" {
 
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(alloc);
-    try runtime.restoreWithContextHistoryStart(
+    try runtime.restore(
         alloc,
         ConversationLanguage.literal("en"),
         &restored_history,
-        1,
     );
     try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
 }
 
-test "compacted failed turn does not claim user interruption" {
-    const alloc = std.testing.allocator;
-    const history = [_]HistoryTurn{.{ .interrupted = .{
-        .user = .{ .text = @constCast("stream a response") },
-        .assistant = @constCast("partial response"),
-        .terminal_reason = .failed,
-    } }};
-
-    const summary = try buildCompactedSummaryText(alloc, null, &history);
-    defer alloc.free(summary);
-
-    try std.testing.expect(std.mem.find(u8, summary, "failed") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "user interrupted") == null);
-}
-
-test "compacted cancelled turn omits verbose interruption transcript" {
-    const alloc = std.testing.allocator;
-    var completed_tool_names = [_][]u8{@constCast("read_file")};
-    const history = [_]HistoryTurn{.{ .interrupted = .{
-        .user = .{ .text = @constCast("inspect the project") },
-        .completed_tool_names = completed_tool_names[0..],
-    } }};
-
-    const summary = try buildCompactedSummaryText(alloc, null, &history);
-    defer alloc.free(summary);
-
-    try std.testing.expect(std.mem.find(u8, summary, "cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "Interrupted by user after completing") == null);
-    try std.testing.expect(std.mem.find(u8, summary, "<turn_aborted>") == null);
-}
-
 test "SessionRuntime context snapshot allocation failure preserves canonical state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(alloc);
 
     try runtime.appendAssistantHistoryTurn(alloc, "first prompt", "first reply");
     try runtime.appendAssistantHistoryTurn(alloc, "second prompt", "second reply");
-    runtime.context_history_start = 1;
 
-    const context_history_start = runtime.contextHistoryStart();
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     try std.testing.expectError(
         error.OutOfMemory,
@@ -5444,7 +4086,6 @@ test "SessionRuntime context snapshot allocation failure preserves canonical sta
     );
 
     try std.testing.expectEqual(@as(usize, 2), runtime.historyLen());
-    try std.testing.expectEqual(context_history_start, runtime.contextHistoryStart());
     try std.testing.expectEqualStrings(
         "first prompt",
         runtime.agent.history.items[0].assistant.user.text,
@@ -5654,10 +4295,7 @@ fn checkPromptHistorySnapshotAllocationFailures(alloc: Allocator) !void {
             &canonical,
             context_history_start,
         );
-        return switch (err) {
-            error.WriteFailed => error.OutOfMemory,
-            else => err,
-        };
+        return err;
     };
     defer freeHistoryTurnSlice(alloc, prompt_history);
     try expectCanonicalHistoryFixtureUnchanged(
@@ -5668,7 +4306,7 @@ fn checkPromptHistorySnapshotAllocationFailures(alloc: Allocator) !void {
 
 test "prompt history snapshot failure preserves canonical ownership" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPromptHistorySnapshotAllocationFailures,
         .{},
     );
@@ -5681,11 +4319,10 @@ fn checkPromptHistoryMessageProjectionAllocationFailures(
     var messages: std.ArrayList(message.Message) = .empty;
     defer deinitMessages(alloc, &messages);
 
-    appendHistoryMessagesBudgeted(
+    appendHistoryMessages(
         alloc,
         &messages,
         prompt_history,
-        .{ .max_tokens = 1 },
     ) catch |err| {
         try std.testing.expectEqualStrings(
             "old user",
@@ -5699,10 +4336,7 @@ fn checkPromptHistoryMessageProjectionAllocationFailures(
             PersistedToolStatus.failure,
             prompt_history[1].assistant.execution.tool_steps[0].tool_results[0].status,
         );
-        return switch (err) {
-            error.WriteFailed => error.OutOfMemory,
-            else => err,
-        };
+        return err;
     };
 
     try std.testing.expect(messages.items.len >= 6);
@@ -5772,7 +4406,7 @@ test "prompt history cleanup is independent after snapshot creation" {
     defer freeHistoryTurnSlice(alloc, prompt_history);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkPromptHistoryMessageProjectionAllocationFailures,
         .{prompt_history},
     );
@@ -5794,12 +4428,11 @@ test "owned prompt history selection matches SessionRuntime context snapshot" {
     try runtime.appendAssistantHistoryTurn(alloc, "one", "reply one");
     try runtime.appendAssistantHistoryTurn(alloc, "two", "reply two");
     try runtime.appendAssistantHistoryTurn(alloc, "three", "reply three");
-    runtime.context_history_start = 1;
 
     const direct = try snapshotOwnedContextHistory(
         alloc,
         runtime.agent.history.items,
-        runtime.context_history_start,
+        0,
         runtime.max_history_turns,
     );
     defer freeHistoryTurnSlice(alloc, direct);
@@ -5813,14 +4446,9 @@ test "owned prompt history selection matches SessionRuntime context snapshot" {
             std.meta.activeTag(direct_turn),
         );
     }
-    try std.testing.expectEqualStrings(
-        through_runtime[0].compacted_summary.summary,
-        direct[0].compacted_summary.summary,
-    );
-    try std.testing.expectEqualStrings(
-        through_runtime[1].assistant.user.text,
-        direct[1].assistant.user.text,
-    );
+    try std.testing.expectEqual(@as(usize, 3), direct.len);
+    try std.testing.expectEqualStrings("one", direct[0].assistant.user.text);
+    try std.testing.expectEqualStrings("three", direct[2].assistant.user.text);
 }
 
 test "SessionRuntime context projection preserves nine typed canonical turns" {
@@ -5851,9 +4479,9 @@ test "SessionRuntime context projection preserves nine typed canonical turns" {
         .execution = .{ .tool_steps = steps[0..] },
     } });
     for (1..9) |index| {
-        const user = try std.fmt.allocPrint(alloc, "prompt {d}", .{index});
+        const user = try alloc.print("prompt {d}", .{index});
         defer alloc.free(user);
-        const assistant = try std.fmt.allocPrint(alloc, "reply {d}", .{index});
+        const assistant = try alloc.print("reply {d}", .{index});
         defer alloc.free(assistant);
         try runtime.appendAssistantHistoryTurn(alloc, user, assistant);
     }
@@ -5870,11 +4498,10 @@ test "SessionRuntime context projection preserves nine typed canonical turns" {
 
     const context = try runtime.snapshotContextHistory(alloc);
     defer freeHistoryTurnSlice(alloc, context);
-    try std.testing.expectEqual(@as(usize, 5), context.len);
-    try std.testing.expect(context[0] == .compacted_summary);
-    try std.testing.expectEqual(@as(usize, 5), context[0].compacted_summary.removed_turn_count);
-    try std.testing.expectEqualStrings("prompt 5", context[1].assistant.user.text);
-    try std.testing.expectEqualStrings("prompt 8", context[4].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 9), context.len);
+    try std.testing.expectEqualStrings("first prompt", context[0].assistant.user.text);
+    try std.testing.expectEqualStrings("prompt 5", context[5].assistant.user.text);
+    try std.testing.expectEqualStrings("prompt 8", context[8].assistant.user.text);
 
     try std.testing.expectEqual(@as(usize, 9), runtime.historyLen());
     try std.testing.expectEqualStrings(
@@ -5951,14 +4578,14 @@ fn checkWorkProvenanceOwnershipFailures(alloc: Allocator) !void {
 
 test "work provenance user ownership frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkWorkProvenanceOwnershipFailures,
         .{},
     );
 }
 
 test "SessionRuntime.snapshotHistory frees partial copies on allocation failure" {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(base);
 
@@ -5969,7 +4596,7 @@ test "SessionRuntime.snapshotHistory frees partial copies on allocation failure"
     try std.testing.expectError(error.OutOfMemory, runtime.snapshotHistory(failing.allocator()));
 }
 
-test "full image catalog retains history excluded from budgeted context" {
+test "active context and image catalog retain historical images" {
     const alloc = std.testing.allocator;
     var historical_images = [_]ImageAttachment{.{
         .id = 3,
@@ -5989,8 +4616,8 @@ test "full image catalog retains history excluded from budgeted context" {
 
     const budgeted = try snapshotOwnedContextHistory(alloc, &history, 0, 1);
     defer freeHistoryTurnSlice(alloc, budgeted);
-    try std.testing.expectEqual(@as(usize, 1), budgeted.len);
-    try std.testing.expectEqual(@as(usize, 0), budgeted[0].assistant.user.images.len);
+    try std.testing.expectEqual(@as(usize, 2), budgeted.len);
+    try std.testing.expectEqual(@as(usize, 1), budgeted[0].assistant.user.images.len);
 
     const catalog = try collect_image_catalog(alloc, &history, &.{});
     defer core_types.freeImageAttachmentSlice(alloc, catalog);
@@ -6022,90 +4649,6 @@ test "full image catalog merges canonical history and current images" {
     try std.testing.expectEqual(@as(usize, 8), catalog[1].id);
 }
 
-test "image catalog replacement preserves history and replaces current authority" {
-    const alloc = std.testing.allocator;
-    const catalog = [_]ImageAttachment{
-        .{ .id = 2, .path = @constCast("/tmp/history.png"), .media_type = @constCast("image/png") },
-        .{ .id = 8, .path = @constCast("/tmp/old-current.png"), .media_type = @constCast("image/png") },
-    };
-    const old_current = [_]ImageAttachment{
-        .{ .id = 8, .path = @constCast("/tmp/old-current.png"), .media_type = @constCast("image/png") },
-    };
-    const new_current = [_]ImageAttachment{
-        .{ .id = 9, .path = @constCast("/tmp/new-current.jpg"), .media_type = @constCast("image/jpeg") },
-    };
-
-    const replaced = try replace_image_catalog_current_images(
-        alloc,
-        &catalog,
-        &old_current,
-        &new_current,
-    );
-    defer core_types.freeImageAttachmentSlice(alloc, replaced);
-
-    try std.testing.expectEqual(@as(usize, 2), replaced.len);
-    try std.testing.expectEqual(@as(usize, 2), replaced[0].id);
-    try std.testing.expectEqual(@as(usize, 9), replaced[1].id);
-    try std.testing.expectEqualStrings("/tmp/new-current.jpg", replaced[1].path);
-}
-
-test "image catalog replacement rejects stale current authority" {
-    const catalog = [_]ImageAttachment{
-        .{ .id = 2, .path = @constCast("/tmp/history.png"), .media_type = @constCast("image/png") },
-    };
-    const stale_current = [_]ImageAttachment{
-        .{ .id = 8, .path = @constCast("/tmp/stale.png"), .media_type = @constCast("image/png") },
-    };
-
-    try std.testing.expectError(
-        error.StaleImageCatalog,
-        replace_image_catalog_current_images(
-            std.testing.allocator,
-            &catalog,
-            &stale_current,
-            &.{},
-        ),
-    );
-}
-
-test "image catalog replacement cleans up every allocation failure" {
-    const catalog = [_]ImageAttachment{
-        .{ .id = 2, .path = @constCast("/tmp/history.png"), .media_type = @constCast("image/png") },
-        .{ .id = 8, .path = @constCast("/tmp/old-current.png"), .media_type = @constCast("image/png") },
-    };
-    const old_current = [_]ImageAttachment{
-        .{ .id = 8, .path = @constCast("/tmp/old-current.png"), .media_type = @constCast("image/png") },
-    };
-    const new_current = [_]ImageAttachment{
-        .{ .id = 9, .path = @constCast("/tmp/new-current.jpg"), .media_type = @constCast("image/jpeg") },
-    };
-
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const replaced = try replace_image_catalog_current_images(
-        probe.allocator(),
-        &catalog,
-        &old_current,
-        &new_current,
-    );
-    core_types.freeImageAttachmentSlice(probe.allocator(), replaced);
-
-    for (0..probe.alloc_index) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
-            .{ .fail_index = fail_index },
-        );
-        try std.testing.expectError(
-            error.OutOfMemory,
-            replace_image_catalog_current_images(
-                failing.allocator(),
-                &catalog,
-                &old_current,
-                &new_current,
-            ),
-        );
-    }
-}
-
 fn checkImageCatalogHistoryMergeAllocationFailures(alloc: Allocator) !void {
     const catalog = [_]ImageAttachment{.{
         .id = 2,
@@ -6128,7 +4671,7 @@ fn checkImageCatalogHistoryMergeAllocationFailures(alloc: Allocator) !void {
 
 test "image catalog history merge cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkImageCatalogHistoryMergeAllocationFailures,
         .{},
     );
@@ -6183,12 +4726,12 @@ test "full image catalog cleans up every allocation failure" {
         .media_type = @constCast("image/jpeg"),
     }};
 
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const probed = try collect_image_catalog(probe.allocator(), &history, &current);
     core_types.freeImageAttachmentSlice(probe.allocator(), probed);
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         try std.testing.expectError(
@@ -6247,55 +4790,6 @@ test "SessionRuntime.lastAssistantReply and lastSummary return borrowed stored s
     try std.testing.expect(summary.ptr == runtime.agent.history.items[2].compacted_summary.summary.ptr);
 }
 
-test "SessionRuntime restores a durable context boundary without deleting canonical history" {
-    const alloc = std.testing.allocator;
-    var original: SessionRuntime = .{ .max_history_turns = 8 };
-    defer original.deinit(alloc);
-    try original.appendAssistantHistoryTurn(alloc, "one", "reply one");
-    try original.appendAssistantHistoryTurn(alloc, "two", "reply two");
-    try original.appendAssistantHistoryTurn(alloc, "three", "reply three");
-    original.context_history_start = 2;
-
-    const history = try original.snapshotHistory(alloc);
-    defer freeHistoryTurnSlice(alloc, history);
-
-    var restored: SessionRuntime = .{ .max_history_turns = 8 };
-    defer restored.deinit(alloc);
-    try restored.restoreWithContextHistoryStart(
-        alloc,
-        ConversationLanguage.literal("en"),
-        history,
-        original.contextHistoryStart(),
-    );
-
-    try std.testing.expectEqual(@as(usize, 3), restored.historyLen());
-    try std.testing.expectEqual(@as(usize, 2), restored.contextHistoryStart());
-    const context = try restored.snapshotContextHistory(alloc);
-    defer freeHistoryTurnSlice(alloc, context);
-    try std.testing.expectEqual(@as(usize, 2), context.len);
-    try std.testing.expect(context[0] == .compacted_summary);
-    try std.testing.expect(std.mem.find(
-        u8,
-        context[0].compacted_summary.summary,
-        "one",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        context[0].compacted_summary.summary,
-        "two",
-    ) != null);
-    try std.testing.expectEqualStrings("three", context[1].assistant.user.text);
-    try std.testing.expectError(
-        error.InvalidContextHistoryStart,
-        restored.restoreWithContextHistoryStart(
-            alloc,
-            ConversationLanguage.literal("en"),
-            history,
-            history.len + 1,
-        ),
-    );
-}
-
 test "SessionRuntime owns permission transitions and immutable snapshots" {
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
@@ -6327,7 +4821,6 @@ test "SessionRuntime owns permission transitions and immutable snapshots" {
         alloc,
         ConversationLanguage.literal("en"),
         &.{},
-        0,
         snapshot,
     );
     var restored_snapshot = try restored.snapshotPermissionState(alloc);
@@ -6336,36 +4829,6 @@ test "SessionRuntime owns permission transitions and immutable snapshots" {
         session_permission_state.StateDecision.deny,
         session_permission_state.decide(restored_snapshot, key),
     );
-}
-
-test "appendHistoryTurnToOwnedContext moves old ownership, duplicates new turn, and compacts" {
-    const alloc = std.testing.allocator;
-
-    var current = try alloc.alloc(HistoryTurn, 2);
-    current[0] = try makeAssistantTurn(alloc, "one", "reply one");
-    current[1] = try makeAssistantTurn(alloc, "two", "reply two");
-
-    var caller_turn = try makeAssistantTurn(alloc, "three", "reply three");
-    defer freeHistoryTurn(alloc, caller_turn);
-
-    const next = try appendHistoryTurnToOwnedContext(alloc, current, caller_turn, 2);
-    defer freeHistoryTurnSlice(alloc, next);
-
-    caller_turn.assistant.user.text[0] = '!';
-    try std.testing.expectEqual(@as(usize, 2), next.len);
-    try std.testing.expect(next[0] == .compacted_summary);
-    try std.testing.expectEqualStrings("three", next[1].assistant.user.text);
-    try std.testing.expectEqualStrings("reply three", next[1].assistant.assistant);
-}
-
-test "appendHistoryTurnToOwnedContext frees duplicate fields on allocation failure" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
-    const turn = HistoryTurn{ .assistant = .{
-        .user = .{ .text = @constCast("prompt") },
-        .assistant = @constCast("reply"),
-    } };
-
-    try std.testing.expectError(error.OutOfMemory, appendHistoryTurnToOwnedContext(failing.allocator(), &.{}, turn, 0));
 }
 
 test "SessionRuntime.appendHistoryMessages matches top-level projection and preserves ownership flags" {
@@ -6413,7 +4876,7 @@ test "SessionRuntime.appendHistoryMessages frees owned system text when append f
         .removed_turn_count = 1,
         .compaction_count = 1,
     } }};
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     var messages: std.ArrayList(message.Message) = .empty;
 
     try std.testing.expectError(error.OutOfMemory, SessionRuntime.appendHistoryMessages(failing.allocator(), &messages, &compact));
@@ -6436,4 +4899,24 @@ test "history context formatters return exact text" {
 fn deinitMessages(alloc: Allocator, messages: *std.ArrayList(message.Message)) void {
     for (messages.items) |*msg| msg.deinit(alloc);
     messages.deinit(alloc);
+}
+
+test "image catalog merges a retained recovery image and rejects changed identity" {
+    const alloc = std.testing.allocator;
+    var images = [_]ImageAttachment{.{
+        .id = 7,
+        .path = @constCast("/missing/original.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/session/images/saved.bin"),
+        .snapshot_sha256 = @constCast(text_utils.repeat("a", 64)),
+    }};
+    const turn: HistoryTurn = .{ .interrupted = .{ .user = .{ .text = @constCast("recover"), .images = &images } } };
+    const catalog = try collect_image_catalog(alloc, &.{turn}, &.{});
+    defer core_types.freeImageAttachmentSlice(alloc, catalog);
+    const merged = try merge_image_catalog_history_turn(alloc, catalog, turn);
+    defer core_types.freeImageAttachmentSlice(alloc, merged);
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expectEqual(@as(usize, 7), merged[0].id);
+    images[0].snapshot_sha256 = @constCast(text_utils.repeat("b", 64));
+    try std.testing.expectError(error.StaleImageCatalog, merge_image_catalog_history_turn(alloc, catalog, turn));
 }

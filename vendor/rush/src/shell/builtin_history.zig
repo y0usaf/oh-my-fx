@@ -323,7 +323,7 @@ fn createFcTempFile(shell: anytype, contents: []const u8) ![]const u8 {
     while (attempt < 100) : (attempt += 1) {
         const path = try std.fmt.allocPrint(allocator, "/tmp/rush-fc-{}-{}", .{ pid, attempt });
         errdefer allocator.free(path);
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
 
         const fd = shell.host.openZ(path_z, .{
@@ -364,7 +364,7 @@ fn deleteFcTempFile(shell: anytype, path: []const u8) void {
         else => @TypeOf(shell.host),
     };
     if (!@hasDecl(HostType, "deleteFileZ")) return;
-    const path_z = shell.scratchAllocator().dupeZ(u8, path) catch return;
+    const path_z = shell.scratchAllocator().dupeSentinel(u8, path, 0) catch return;
     defer shell.scratchAllocator().free(path_z);
     // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
     shell.host.deleteFileZ(path_z) catch {};
@@ -372,7 +372,7 @@ fn deleteFcTempFile(shell: anytype, path: []const u8) void {
 
 fn readFcTempFile(shell: anytype, path: []const u8) ![]const u8 {
     const allocator = shell.scratchAllocator();
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = try shell.host.openZ(path_z, .{ .access = .read_only });
     defer shell.host.close(fd) catch {};
@@ -391,9 +391,9 @@ fn runFcEditor(shell: anytype, editor: []const u8, path: []const u8) !result.Exi
     const allocator = shell.scratchAllocator();
     const editor_path_z = (try fcResolveEditorPathZ(shell, editor)) orelse return error.FileNotFound;
     defer allocator.free(editor_path_z);
-    const editor_arg_z = try allocator.dupeZ(u8, editor);
+    const editor_arg_z = try allocator.dupeSentinel(u8, editor, 0);
     defer allocator.free(editor_arg_z);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const argv = try allocator.allocSentinel(?[*:0]const u8, 2, null);
     defer allocator.free(argv);
@@ -427,7 +427,7 @@ fn fcEditorEnvp(shell: anytype) ![:null]const ?[*:0]const u8 {
 fn fcResolveEditorPathZ(shell: anytype, editor: []const u8) !?[:0]u8 {
     const allocator = shell.scratchAllocator();
     if (std.mem.indexOfScalar(u8, editor, '/') != null) {
-        const editor_z = try allocator.dupeZ(u8, editor);
+        const editor_z = try allocator.dupeSentinel(u8, editor, 0);
         errdefer allocator.free(editor_z);
         if (shell.host.isExecutableZ(editor_z)) return editor_z;
         allocator.free(editor_z);
@@ -444,7 +444,7 @@ fn fcResolveEditorPathZ(shell: anytype, editor: []const u8) !?[:0]u8 {
         else
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, editor });
         defer allocator.free(candidate_text);
-        const candidate = try allocator.dupeZ(u8, candidate_text);
+        const candidate = try allocator.dupeSentinel(u8, candidate_text, 0);
         errdefer allocator.free(candidate);
         if (shell.host.isExecutableZ(candidate)) return candidate;
         allocator.free(candidate);

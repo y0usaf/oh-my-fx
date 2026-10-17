@@ -1,5 +1,4 @@
 const std = @import("std");
-const std_builtin = @import("builtin");
 const builtin_gateway = @import("gateway.zig");
 const terminal_contracts = @import("../core/terminal/contracts.zig");
 const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
@@ -13,6 +12,7 @@ const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const types = @import("../core/shared/types.zig");
 const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
+const compactor = @import("../core/compactor/compactor.zig");
 const capability_retrieval = @import("../core/tooling/capability_retrieval.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
@@ -40,7 +40,7 @@ const glob_files_description =
 const grep_files_description =
     "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, known-path reads, and shell grep; do not repeat the same or equivalent search after a caller search only finds a definition.";
 const read_file_description =
-    "Read one UTF-8 text file with bounded line-numbered output and optional start_line/line_count range. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code. When NOT to use: list directories, search many files, read binary data, or bypass dedicated search tools.";
+    "Read one file with bounded line-numbered output and optional start_line/line_count range. UTF-8 text returns as numbered lines; image files (PNG, JPEG, GIF, WebP up to 3.9MB) attach to the result so you can see them. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code, or view an image file. When NOT to use: list directories, search many files, read non-image binary data, or bypass dedicated search tools.";
 const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: add a new file or intentionally replace an entire generated/small file. When NOT to use: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
@@ -50,7 +50,7 @@ const web_fetch_description =
 const web_search_description =
     "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 const shell_description =
-    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.";
+    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors, and quote words that begin with =.";
 
 const shell_executable_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
@@ -71,6 +71,7 @@ const shell_run_properties = [_]model_tool_schema.Property{
     .{ .name = "tty", .json_type = .boolean, .description = "Use a persistent TTY when interactive input or human attachment is required. Defaults to false." },
     .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_yield_time_ms }, .description = "Initial observation window. Defaults to 30000; use 0 to return the owned running handle immediately." },
     .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Set only when the user explicitly requests a finite deadline. Omit for commands intended to remain running, receive input, continue across turns, or be stopped later." },
+    .{ .name = "reload", .json_type = .boolean, .description = "Reload the user's startup files before this command, for example after installing a tool or editing a file they source. Edits to the startup files themselves are picked up automatically." },
 };
 
 const shell_interact_properties = [_]model_tool_schema.Property{
@@ -94,6 +95,7 @@ const shell_profile_run_properties = [_]model_tool_schema.Property{
     shell_run_properties[5],
     shell_run_properties[6],
     shell_run_properties[7],
+    shell_run_properties[8],
 };
 
 const shell_explicit_run_properties = [_]model_tool_schema.Property{
@@ -155,9 +157,9 @@ const shell_process_request_properties = [_]model_tool_schema.Property{.{
 }};
 
 const skill_description =
-    "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
+    "Load an installed skill or one required relative text resource completely. Copy the exact advertised location. Resolve paths mentioned in skill instructions from the selected skill directory, not the workspace. Read referenced text with the same location and its relative resource path. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: installing a missing skill.";
 const capability_search_description =
-    "Find relevant installed skills and configured MCP tools from one natural-language task. The runtime owns domain routing, ranking, catalog bounds, and terminal no-match handling. Set server only when an exact configured MCP alias is already known. Load one exact skill result with skill or select one exact MCP result with mcp_select_tool. Do not guess identities or repeat a no-match search.";
+    "Find installed skills and configured MCP tools for a described capability. Optionally restrict MCP results to one exact configured server. Results describe this query; no_match does not rule out another query. Use returned skill locations with skill. Matching MCP schemas are loaded automatically within the schema budget; call advertised tools directly or use mcp_select_tool for explicit selection. Do not guess identities.";
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_select_tool_description =
@@ -182,18 +184,22 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
 };
 
 const subagent_description =
-    "Delegate work and receive one terminal child result. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. Optional instructions replace only that child's system overlay; fx preserves its trusted base prompt. fx owns timing, worker identities, cancellation, permissions, persistence, and cleanup.";
+    "Delegate work and receive one terminal child result. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. A plain message to a working child queues feedback for its next safe boundary without cancelling its current tool. A delivery receipt is not the child's final result; that result arrives separately. Optional instructions replace only that child's system overlay between turns; fx preserves its trusted base prompt. Optional model and effort apply only when a child is created and are rejected for an existing child. fx owns timing, worker identities, cancellation, permissions, persistence, and cleanup.";
 
 const subagent_model_run_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
-    .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "One complete task for a temporary child. The child inherits the parent model and effort and accepts no follow-up." },
+    .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "One complete task for a temporary child. The child accepts no follow-up." },
+    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional model for this child, as a catalog model ID such as openai/gpt-5.6-terra. Unambiguous partial names resolve to catalog IDs; unknown or ambiguous names are rejected with candidate IDs. Inherits the parent's model when omitted." },
+    .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort for this child. Inherits the parent's effort when omitted." },
 };
 
 const subagent_model_message_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"message"} } },
     .{ .name = "agent", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_agent_name_bytes }, .description = "Stable lowercase name for one persistent conversation in this parent session. A new valid name creates it; later calls continue it." },
-    .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "Optional persistent instructions for this child. When present, replaces its child-specific system overlay before this message; when omitted, preserves the existing overlay. Cannot replace fx's trusted base prompt or widen authority." },
-    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Next message for that named agent. fx creates it on first use and continues it afterward." },
+    .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "Optional persistent instructions for this child. Replaces its child-specific system overlay before this message when idle; rejected while the child is working. Omit to preserve the overlay or send live feedback. Cannot replace fx's trusted base prompt or widen authority." },
+    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Message for that named agent: creates it on first use, continues an idle conversation, or queues feedback for a working child. Do not resend merely to poll for completion." },
+    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional model applied when this message creates the child, as a catalog model ID such as openai/gpt-5.6-terra. Unambiguous partial names resolve to catalog IDs; unknown or ambiguous names are rejected with candidate IDs. Inherits the parent's model when omitted. Rejected when the named child already exists." },
+    .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort applied when this message creates the child. Inherits the parent's effort when omitted. Rejected when the named child already exists." },
 };
 
 const subagent_model_action_schemas = [_]model_tool_schema.ObjectSchema{
@@ -213,7 +219,7 @@ const subagent_model_request_properties = [_]model_tool_schema.Property{.{
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
-    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. When to use: inspect more after a tool-result preview or command-output handle says retained output is available. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
 pub const glob_files = ToolSpec{
     .name = "glob_files",
@@ -503,6 +509,7 @@ pub fn shellProcessOnlySpec() ToolSpec {
 
 pub const capability_search = ToolSpec{
     .name = "capability_search",
+    .internal = true,
     .description = capability_search_description,
     .model_schema = .{
         .name = "capability_search",
@@ -516,7 +523,7 @@ pub const capability_search = ToolSpec{
             .additional_properties = false,
         },
     },
-    .executor_kind = .skill,
+    .executor_kind = .capability_search,
     .activity_kind = .read,
     .requires_approval = false,
     .action_label = "Searching capabilities",
@@ -540,12 +547,11 @@ pub const skill = ToolSpec{
         .description = skill_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "name", .json_type = .string, .description = "The name of the skill from the available skills list." },
                 .{ .name = "location", .json_type = .string, .description = "The exact advertised location of the selected skill." },
-                .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Defaults to SKILL.md." },
-                .{ .name = "offset", .json_type = .integer, .description = "Optional UTF-8 byte offset. Use the returned next_offset to continue." },
+                .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Omit or pass an empty string to read SKILL.md." },
             },
-            .required = &.{"name"},
+            .required = &.{"location"},
+            .additional_properties = false,
         },
     },
     .executor_kind = .skill,
@@ -558,6 +564,7 @@ pub const skill = ToolSpec{
     .presentation_fn = skill_impl.presentation,
     .permission_target_kind = .none,
     .decode = skill_impl.decode,
+    .prepare_skill_call_fn = skill_impl.prepare,
     .validate = skill_impl.validate,
     .call = skill_impl.call,
     .reads_only_fn = skill_impl.readsOnly,
@@ -627,6 +634,7 @@ pub const subagent = ToolSpec{
 
 pub const mcp_select_tool = ToolSpec{
     .name = "mcp_select_tool",
+    .internal = true,
     .description = mcp_select_tool_description,
     .model_schema = .{
         .name = "mcp_select_tool",
@@ -771,7 +779,7 @@ pub const vision = ToolSpec{
 };
 
 const read_tool_result_range_properties = [_]model_tool_schema.Property{
-    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output." },
+    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output, or a saved turn, tool call or earlier compaction ID like M12, T12 or L2." },
     .{ .name = "start_byte", .json_type = .integer, .description = "Optional 1-based byte offset. Defaults to 1." },
     .{ .name = "byte_count", .json_type = .integer, .description = "Optional positive byte count. Bounded by the tool." },
 };
@@ -781,9 +789,18 @@ const read_tool_result_query_properties = [_]model_tool_schema.Property{
     .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Non-empty literal line query." },
 };
 
+const read_tool_result_search_properties = [_]model_tool_schema.Property{.{
+    .name = "search",
+    .json_type = .array,
+    .bounds = &.{ .min_items = 1, .max_items = compactor.max_search_phrases },
+    .shape = &.{ .array_values = .{ .json_type = .string } },
+    .description = "One to three searches over turns, tool calls and earlier compactions saved by compaction. Words match in any order; rarer words and exact phrases rank higher.",
+}};
+
 const read_tool_result_input_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &read_tool_result_range_properties, .required = &.{"handle"}, .additional_properties = false },
     .{ .properties = &read_tool_result_query_properties, .required = &.{ "handle", "query" }, .additional_properties = false },
+    .{ .properties = &read_tool_result_search_properties, .required = &.{"search"}, .additional_properties = false },
 };
 
 const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
@@ -792,6 +809,7 @@ const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
 
 pub const read_tool_result = ToolSpec{
     .name = "read_tool_result",
+    .internal = true,
     .description = read_tool_result_description,
     .model_schema = .{
         .name = "read_tool_result",
@@ -801,7 +819,7 @@ pub const read_tool_result = ToolSpec{
                 .name = "request",
                 .json_type = .object,
                 .shape = &.{ .object = &read_tool_result_request_schema },
-                .description = "Choose one request: handle plus query, or handle plus an optional byte range.",
+                .description = "Choose one request: handle plus query, handle plus an optional byte range, or search.",
             }},
             .required = &.{"request"},
             .additional_properties = false,
@@ -930,7 +948,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "47e84930e1fdc99133e76843f795891b35592d32615cacb76a3dfc81e1b23b7a",
+        "ca8b5aa265c6318fbd0604879fb2626826d9fcb83fa5d335dc0371fec7286b3f",
         &actual_hex,
     );
 }
@@ -938,14 +956,14 @@ test "built-in model-facing tool contract stays byte exact" {
 test "registry classifies every built-in progress label" {
     inline for (all) |tool| {
         var started_buf: [96]u8 = undefined;
-        const started = try std.fmt.bufPrint(&started_buf, "{s} value", .{tool.action_label});
+        const started = try std.mem.print(&started_buf, "{s} value", .{tool.action_label});
         try std.testing.expectEqual(
             tool_dispatch.ProgressLabelKind.started,
             tool_dispatch.classifyProgressLabel(registry, started),
         );
 
         var completed_buf: [96]u8 = undefined;
-        const completed = try std.fmt.bufPrint(&completed_buf, "{s} value", .{tool.completed_action_label});
+        const completed = try std.mem.print(&completed_buf, "{s} value", .{tool.completed_action_label});
         try std.testing.expectEqual(
             tool_dispatch.ProgressLabelKind.completed,
             tool_dispatch.classifyProgressLabel(registry, completed),
@@ -957,22 +975,6 @@ fn schemaProperty(schema: model_tool_schema.ObjectSchema, name: []const u8) ?mod
         if (std.mem.eql(u8, property.name, name)) return property;
     }
     return null;
-}
-
-fn schemaEnumValues(property: model_tool_schema.Property) []const []const u8 {
-    const shape = property.shape orelse return &.{};
-    return switch (shape.*) {
-        .enum_values => |values| values,
-        else => &.{},
-    };
-}
-
-fn schemaObject(property: model_tool_schema.Property) ?*const model_tool_schema.ObjectSchema {
-    const shape = property.shape orelse return null;
-    return switch (shape.*) {
-        .object => |object| object,
-        else => null,
-    };
 }
 
 fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
@@ -1028,7 +1030,7 @@ test "shell advertises only run interact and stop" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(alloc, shell);
     defer alloc.free(schema_json);
     for ([_][]const u8{ "run", "interact", "stop" }) |action| {
-        const needle = try std.fmt.allocPrint(alloc, "\"{s}\"", .{action});
+        const needle = try alloc.print("\"{s}\"", .{action});
         defer alloc.free(needle);
         try std.testing.expect(std.mem.find(u8, schema_json, needle) != null);
     }
@@ -1357,13 +1359,14 @@ test "built-in skill owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("skill", skill.name);
-    try std.testing.expect(std.mem.find(u8, skill.description, "relative text resources in bounded chunks") != null);
+    try std.testing.expect(std.mem.find(u8, skill.description, "relative text resource completely") != null);
+    try std.testing.expect(std.mem.find(u8, skill.description, "selected skill directory") != null);
     try std.testing.expect(std.mem.find(u8, skill.description, "the task clearly matches one") != null);
     try std.testing.expect(std.mem.find(u8, skill.description, "installing a missing skill") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"location\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"resource\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\":{\"type\":\"integer\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\":{\"type\":\"integer\"") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"location\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\",\"location\"]") == null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, skill.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, skill.activity_kind);
@@ -1393,6 +1396,11 @@ test "built-in subagent owns product metadata schema and callbacks" {
         try std.testing.expect(std.mem.find(u8, schema_json, action) != null);
     }
     try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
+    // Creation-time routing overrides are advertised on both actions.
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"model\":") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"effort\":") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "Inherits the parent's model when omitted") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "Rejected when the named child already exists") != null);
     for ([_][]const u8{
         "\"command\":",
         "\"relationship\":",
@@ -1402,8 +1410,7 @@ test "built-in subagent owns product metadata schema and callbacks" {
         "\"cursor\":",
         "\"generation\":",
         "\"reopen\"",
-        "\"model\"",
-        "\"effort\"",
+        "\"provider\"",
         "\"send\"",
         "\"wait\"",
         "\"stop\"",
@@ -1462,7 +1469,7 @@ test "built-in capability_search owns unified bounded metadata schema and callba
 
     try std.testing.expectEqualStrings("capability_search", capability_search.name);
     try std.testing.expect(std.mem.find(u8, capability_search.description, "configured MCP tools") != null);
-    try std.testing.expect(std.mem.find(u8, capability_search.description, "runtime owns") != null);
+    try std.testing.expect(std.mem.find(u8, capability_search.description, "no_match does not rule out another query") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4096") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"server\":{\"type\":\"string\",\"minLength\":1") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"kind\"") == null);
@@ -1470,7 +1477,7 @@ test "built-in capability_search owns unified bounded metadata schema and callba
     try std.testing.expect(std.mem.find(u8, schema_json, "\"cursor\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
     try std.testing.expect(capability_search.model_visible);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, capability_search.executor_kind);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.capability_search, capability_search.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, capability_search.activity_kind);
     try std.testing.expect(!capability_search.requires_approval);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, capability_search.label_arg_kind);
@@ -1642,8 +1649,6 @@ test "built-in vision dispatch uses supplied runtime provider" {
 
     var fixture = Fixture{};
     const vision_registry = tool_dispatch.Registry{ .tools = &.{vision} };
-    var status_detail: ?[]u8 = null;
-    defer if (status_detail) |detail| std.testing.allocator.free(detail);
     var result = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = std.testing.allocator,
         .vision_provider = .{
@@ -1654,7 +1659,7 @@ test "built-in vision dispatch uses supplied runtime provider" {
         .id = "vision_1",
         .name = "vision",
         .arguments_json = "{\"image_ids\":[7,9],\"focus\":\"read status\"}",
-    }, &status_detail);
+    });
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.success, result.status);
@@ -1681,9 +1686,13 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
     try std.testing.expect(!input_schema.get("additionalProperties").?.bool);
     const request = input_schema.get("properties").?.object.get("request").?.object;
     const alternatives = request.get("oneOf").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), alternatives.len);
+    try std.testing.expectEqual(@as(usize, 3), alternatives.len);
     const range = alternatives[0].object;
     const query = alternatives[1].object;
+    const search = alternatives[2].object;
+    try std.testing.expectEqualStrings("search", search.get("required").?.array.items[0].string);
+    try std.testing.expectEqual(@as(i64, 3), search.get("properties").?.object.get("search").?.object.get("maxItems").?.integer);
+    try std.testing.expect(search.get("properties").?.object.get("handle") == null);
     try std.testing.expect(range.get("properties").?.object.get("query") == null);
     try std.testing.expect(query.get("properties").?.object.get("start_byte") == null);
     try std.testing.expect(query.get("properties").?.object.get("byte_count") == null);
@@ -1750,18 +1759,13 @@ test "built-in registry uses executable web_fetch implementation" {
     defer result.deinit(std.testing.allocator);
 
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => return error.TestUnexpectedResult,
         .failure => |body| body,
     };
     try std.testing.expect(std.mem.find(u8, body, "\"tool_name\":\"web_fetch\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "web_fetch failed") != null);
     try std.testing.expect(std.mem.find(u8, body, "UnsupportedScheme") != null);
-}
-
-fn expectRegisteredNames(names: []const []const u8) !void {
-    for (names) |name| {
-        try std.testing.expect(registry.lookup(name) != null);
-    }
 }
 
 test "built-in read-only tool set matches plan inspection tools" {

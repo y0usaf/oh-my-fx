@@ -39,28 +39,53 @@ pub const Observation = struct {
     }
 };
 
-pub fn refreshAll(ctx: Context) !void {
-    try syncOwned(ctx);
-    const items = try ctx.managed_runtime.list(ctx.alloc);
-    defer {
-        for (items) |*item| item.deinit(ctx.alloc);
-        ctx.alloc.free(items);
+/// Caller owns the copied metadata and screen. Reading this view does not
+/// acknowledge output or acquire a terminal write lease.
+pub const InputReview = struct {
+    session_id: []u8,
+    launch_command: []u8,
+    cwd: []u8,
+    screen: []u8,
+
+    pub fn deinit(self: *InputReview, alloc: Allocator) void {
+        alloc.free(self.session_id);
+        alloc.free(self.launch_command);
+        alloc.free(self.cwd);
+        alloc.free(self.screen);
+        self.* = undefined;
     }
-    for (items) |item| {
-        if (item.backend != .tty) continue;
-        refresh(ctx, item.execution_id, item.command) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            if (isDefinitiveLoss(err)) {
-                ctx.managed_runtime.observeTtyState(item.execution_id, .lost);
-            }
-            debug_trace.logf(
-                "terminal",
-                "managed TTY refresh skipped session={s} err={s}",
-                .{ item.execution_id, @errorName(err) },
-            );
-            continue;
-        };
-    }
+};
+
+pub fn inspectInput(ctx: Context, session_id: []const u8) !InputReview {
+    var authority = try reloadAuthority(ctx, session_id);
+    defer authority.deinit();
+    var inspected = try execute(ctx, .{ .inspect = .{
+        .session_id = session_id,
+        .authority = authority.view(),
+    } });
+    defer inspected.deinit(ctx.alloc);
+    const value = switch (inspected.view()) {
+        .failure => |failure| return mapTerminalFailure(failure.code),
+        .success => |success| switch (success) {
+            .inspect => |value| value,
+            else => return error.InvalidTerminalResult,
+        },
+    };
+    if (!std.mem.eql(u8, value.session.session_id, session_id) or
+        value.session.lifecycle != .running) return error.TerminalNotReady;
+    const command = value.command orelse return error.TerminalCommandUnavailable;
+    const owned_id = try ctx.alloc.dupe(u8, session_id);
+    errdefer ctx.alloc.free(owned_id);
+    const owned_command = try ctx.alloc.dupe(u8, command);
+    errdefer ctx.alloc.free(owned_command);
+    const owned_cwd = try ctx.alloc.dupe(u8, value.cwd);
+    errdefer ctx.alloc.free(owned_cwd);
+    return .{
+        .session_id = owned_id,
+        .launch_command = owned_command,
+        .cwd = owned_cwd,
+        .screen = try currentScreenText(ctx, session_id, authority.view()),
+    };
 }
 
 pub fn refresh(
@@ -198,7 +223,18 @@ pub fn observe(
     };
 }
 
-pub fn syncOwned(ctx: Context) !void {
+pub const SyncOutcome = enum {
+    /// The requested terminal is indexed, or this owner has no such terminal.
+    indexed,
+    /// The requested terminal ended with the fx process that started it.
+    ended_with_owner,
+};
+
+/// Indexes this owner's terminals that the managed runtime does not know yet,
+/// which happens after resume. Listing reconciles them first, so a terminal
+/// whose owning fx process is gone reads as lost. Such terminals are never
+/// reattached or indexed; `requested_session_id` reports whether it is one.
+pub fn syncOwned(ctx: Context, requested_session_id: []const u8) !SyncOutcome {
     var catalog_authority = try reloadOwnerCatalogAuthority(ctx);
     defer catalog_authority.deinit();
     var listed = try execute(ctx, .{ .list = .{
@@ -212,10 +248,19 @@ pub fn syncOwned(ctx: Context) !void {
             else => return error.InvalidTerminalResult,
         },
     };
+    var outcome: SyncOutcome = .indexed;
     for (sessions) |facts| {
         if (facts.lifecycle == .closed or
             ctx.managed_runtime.backendFor(facts.session_id) != null)
         {
+            continue;
+        }
+        // This process starts and indexes its own terminals, so an unknown
+        // lost terminal belonged to an fx process instance that has exited.
+        if (facts.lifecycle == .lost) {
+            if (std.mem.eql(u8, facts.session_id, requested_session_id)) {
+                outcome = .ended_with_owner;
+            }
             continue;
         }
         var authority = try reloadAuthority(ctx, facts.session_id);
@@ -260,6 +305,7 @@ pub fn syncOwned(ctx: Context) !void {
             prepared.reservation_id,
         );
     }
+    return outcome;
 }
 
 fn resolveCompletedStatus(

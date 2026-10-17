@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const contracts = @import("contracts.zig");
 const io_mod = @import("../shared/io.zig");
 
@@ -17,7 +18,6 @@ pub const AuthorityPreparation = struct {
     actor: contracts.ActorRole,
     controls: contracts.AllowedControls,
     lifetime: contracts.TerminalLifetime,
-    direct_human_model_read_only: bool = false,
 };
 
 /// Owns every string and the secret embedded in the returned persistence
@@ -100,8 +100,8 @@ fn construct_start_persistence(
     input: AuthorityPreparation,
     proof: contracts.HolderProof,
 ) !PreparedAuthority {
-    if (!std.fs.path.isAbsolute(input.workspace_root) or
-        !std.fs.path.isAbsolute(input.cwd))
+    if (!std.Io.Dir.path.isAbsolute(input.workspace_root) or
+        !std.Io.Dir.path.isAbsolute(input.cwd))
     {
         return error.InvalidPrincipal;
     }
@@ -121,7 +121,6 @@ fn construct_start_persistence(
             .generation = try contracts.AuthorityGeneration.init(1),
         },
         .proof = proof,
-        .direct_human_model_read_only = input.direct_human_model_read_only,
     };
     try borrowed.validate(.{
         .cwd = input.cwd,
@@ -139,7 +138,6 @@ fn construct_start_persistence(
                 .generation = borrowed.grant.generation,
             },
             .proof = borrowed.proof,
-            .direct_human_model_read_only = borrowed.direct_human_model_read_only,
         },
     };
 }
@@ -416,26 +414,6 @@ test "production preparation mints canonical generation one authority" {
     try persistence.proof.validate();
 }
 
-test "pure authority construction validates direct human policy" {
-    const proof = contracts.HolderProof{ .bytes = @splat(9) };
-    var input = test_preparation();
-    input.actor = .human;
-    input.direct_human_model_read_only = true;
-    var prepared = try construct_start_persistence(
-        std.testing.allocator,
-        input,
-        proof,
-    );
-    defer prepared.deinit();
-    try std.testing.expect(prepared.view().direct_human_model_read_only);
-
-    input.actor = .agent;
-    try std.testing.expectError(
-        error.InvalidStartPersistence,
-        construct_start_persistence(std.testing.allocator, input, proof),
-    );
-}
-
 fn check_preparation_allocation_failures(alloc: Allocator) !void {
     var prepared = try construct_start_persistence(
         alloc,
@@ -459,7 +437,7 @@ fn check_preparation_allocation_failures(alloc: Allocator) !void {
 
 test "authority preparation and owned claims cover allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_preparation_allocation_failures,
         .{},
     );

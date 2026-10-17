@@ -13,6 +13,7 @@ const composer_skill_binding = @import("composer_skill_binding.zig");
 const composer_text_replacement = @import("composer_text_replacement.zig");
 const composer_undo = @import("composer_undo.zig");
 const composer_history = @import("composer_history.zig");
+const composer_stash = @import("composer_stash.zig");
 const edit_history = @import("edit_history.zig");
 const editor_state = @import("editor_state.zig");
 const gesture_state = @import("gesture_state.zig");
@@ -48,17 +49,41 @@ pub const Runtime = struct {
     kill_ring: kill_ring.State = .{},
     edit_history: edit_history.State = .{},
     vertical_navigation: vertical_navigation.State = .{},
+    /// Set while the Ctrl+P model picker borrows the composer: first as the
+    /// catalog's query box, then for its inline effort and fast stages. Holds
+    /// the draft the composer is restored to when that flow ends.
+    model_picker_draft: ?composer_stash.State = null,
+
+    pub fn initInto(self: *Runtime) void {
+        const runtime_info = @typeInfo(Runtime).@"struct";
+        inline for (runtime_info.field_names, runtime_info.field_types, runtime_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "picker")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
+        }
+        self.picker.initInto();
+    }
 
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
-        self.usage_menu.close(alloc);
+        self.usage_menu.close();
         self.edit_state.deinit(alloc);
         self.picker.deinit(alloc);
         self.composer_history.deinit(alloc);
         self.entities.deinit(alloc);
         self.kill_ring.deinit(alloc);
         self.edit_history.deinit(alloc);
+        if (self.model_picker_draft) |*draft| draft.deinit(alloc);
+    }
+
+    pub fn composerStashView(self: *Runtime) composer_stash.State.ComposerView {
+        return .{
+            .edit = &self.edit_state,
+            .entities = &self.entities,
+            .edit_history = &self.edit_history,
+            .vertical_navigation = &self.vertical_navigation,
+            .composer_history = &self.composer_history,
+        };
     }
 
     pub fn inputResetState(self: *Runtime) input_reset.State {
@@ -186,4 +211,16 @@ test "runtime owns product input state without terminal mechanics" {
     try std.testing.expectEqualStrings("draft", runtime.edit_state.input.items);
     try std.testing.expect(!@hasField(Runtime, "terminal_action_decoder"));
     try std.testing.expect(!@hasField(Runtime, "terminal_cursor_probe"));
+}
+
+test "runtime initInto preserves defaults without copying file picker scratch buffers" {
+    var actual: Runtime = undefined;
+    @memset(std.mem.asBytes(&actual), 0xa5);
+    actual.initInto();
+
+    var expected: Runtime = .{};
+    @memset(expected.picker.file_completion.raw_query[0..], 0xa5);
+    @memset(expected.picker.file_completion.lookup_query[0..], 0xa5);
+
+    try std.testing.expectEqualDeep(expected, actual);
 }

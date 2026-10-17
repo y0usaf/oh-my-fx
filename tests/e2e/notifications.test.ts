@@ -146,7 +146,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/sound");
-      await session.waitForText("● Sound: on", TIMEOUT);
+      await session.waitForText("* sound: on", TIMEOUT);
       expect(await session.captureFullScrollback()).not.toContain(
         "saved to user settings",
       );
@@ -159,7 +159,7 @@ test.skipIf(!tmuxAvailable())(
       });
 
       await session.sendText("/sound off");
-      await session.waitForText("● Sound: off", TIMEOUT);
+      await session.waitForText("* sound: off", TIMEOUT);
       settings = JSON.parse(readFileSync(settingsPath, "utf8"));
       expect(settings.notifications).toEqual({
         turn_end: false,
@@ -169,7 +169,7 @@ test.skipIf(!tmuxAvailable())(
 
       await session.sendText("/sound on");
       await session.waitForPane(
-        (pane) => (pane.match(/● Sound: on/g)?.length ?? 0) >= 2,
+        (pane) => (pane.match(/\* sound: on/g)?.length ?? 0) >= 2,
         TIMEOUT,
       );
       settings = JSON.parse(readFileSync(settingsPath, "utf8"));

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
@@ -138,12 +139,15 @@ pub fn call(
         return semanticFailure(ctx.allocator, "No MCP runtime is available.");
     const call_feature = ctx.mcp_call_feature orelse
         return semanticFailure(ctx.allocator, "MCP resources and prompts are unavailable.");
-    const result = call_feature(runtime_context, ctx.allocator, erased.as(Input).request, .{
+    const feature = erased.as(Input).request;
+    const observed = if (ctx.observer) |observer| observer.beginMcp(.{ .call_id = ctx.tool_call_id, .server = feature.server_name, .tool = @tagName(feature.action), .transport = null }) else null;
+    const result = call_feature(runtime_context, ctx.allocator, feature, .{
         .cancel_flag = ctx.cancel_flag,
         .input_responder = ctx.mcp_input_responder,
         .output_limit_bytes = ctx.max_tool_result_bytes,
         .access = ctx.mcp_access,
     }) catch |err| {
+        if (observed) |call_| call_.end(if (err == error.Cancelled) .cancelled else .failure, @errorName(err));
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.McpInputRequired or
             err == error.UnsupportedMode or
@@ -157,6 +161,8 @@ pub fn call(
             err,
         ) };
     };
+    if (observed) |call_| call_.end(.success, null);
+    if (result.images.len > 0) return .{ .rich = .{ .text = result.model_output, .images = result.images } };
     return .{ .success = result.model_output };
 }
 
@@ -201,8 +207,9 @@ fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 }
 
 fn parseAction(value: []const u8) ?tool_mcp_runtime.FeatureAction {
-    inline for (std.meta.fields(tool_mcp_runtime.FeatureAction)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    const feature_action_info = @typeInfo(tool_mcp_runtime.FeatureAction).@"enum";
+    inline for (feature_action_info.field_names, feature_action_info.field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, value, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -324,7 +331,7 @@ test "MCP feature tool owned input releases every allocation failure" {
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
 
 test "MCP feature input-required remains a typed terminal result" {
@@ -357,6 +364,7 @@ test "MCP feature input-required remains a typed terminal result" {
     var result = try call(ctx, input);
     defer result.deinit(alloc);
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| try std.testing.expect(isInputRequiredFailure(body)),
         .success => return error.TestUnexpectedResult,
     }

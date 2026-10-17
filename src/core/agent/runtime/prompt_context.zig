@@ -1,142 +1,174 @@
 const std = @import("std");
-const model_capabilities = @import("../../config/model_capabilities.zig");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const token_estimate = @import("../../shared/token_estimate.zig");
 const types = @import("../../shared/types.zig");
-const session_runtime = @import("../../session/session.zig");
+const stream_provider = @import("../stream_provider.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
-const HistoryTurn = types.HistoryTurn;
 
-const compaction_high_water_numerator: usize = 4;
-const compaction_ratio_denominator: usize = 5;
-const compaction_target_denominator: usize = 10;
-const compaction_source_reduction_denominator: usize = 8;
-const compaction_generation_multiplier: usize = 4;
-
-pub const CompactionTrigger = enum {
-    automatic,
-    manual,
-};
-
-pub const CompactionDecision = enum {
-    no_op,
-    compact,
-};
-
-pub const CompactionPlanInput = struct {
-    trigger: CompactionTrigger,
-    capabilities: model_capabilities.Capabilities,
-    request_tokens: usize,
-    source_tokens: usize,
-    protected_tokens: usize = 0,
-};
-
-pub const CompactionPlan = struct {
-    decision: CompactionDecision,
-    usable_input_tokens: ?usize,
-    high_water_tokens: ?usize,
-    session_target_tokens: ?usize,
-    accepted_handoff_tokens: ?usize,
-    generation_tokens: ?usize,
-};
-
-pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
-    const usable = usableInputTokens(input.capabilities);
-    const high_water = if (usable) |tokens|
-        tokens * compaction_high_water_numerator / compaction_ratio_denominator
-    else
-        null;
-    const session_target = if (usable) |tokens|
-        tokens / compaction_target_denominator
-    else
-        null;
-    const should_compact = input.source_tokens > 0 and switch (input.trigger) {
-        .manual => true,
-        .automatic => if (high_water) |tokens| input.request_tokens >= tokens else false,
-    };
-    if (!should_compact) return .{
-        .decision = .no_op,
-        .usable_input_tokens = usable,
-        .high_water_tokens = high_water,
-        .session_target_tokens = session_target,
-        .accepted_handoff_tokens = null,
-        .generation_tokens = null,
-    };
-
-    const source_target = @max(
-        @as(usize, 1),
-        (input.source_tokens +| (compaction_source_reduction_denominator - 1)) /
-            compaction_source_reduction_denominator,
-    );
-    const total_target = if (session_target) |target|
-        @max(@as(usize, 1), target)
-    else
-        source_target;
-    if (input.protected_tokens >= total_target) return .{
-        .decision = .no_op,
-        .usable_input_tokens = usable,
-        .high_water_tokens = high_water,
-        .session_target_tokens = session_target,
-        .accepted_handoff_tokens = null,
-        .generation_tokens = null,
-    };
-    const accepted = total_target - input.protected_tokens;
-    const requested_generation = accepted *| compaction_generation_multiplier;
-    const generation = if (input.capabilities.max_output_tokens) |limit|
-        @min(requested_generation, @as(usize, @intCast(limit)))
-    else
-        requested_generation;
-    return .{
-        .decision = .compact,
-        .usable_input_tokens = usable,
-        .high_water_tokens = high_water,
-        .session_target_tokens = session_target,
-        .accepted_handoff_tokens = accepted,
-        .generation_tokens = generation,
-    };
-}
-
-pub const CompactionHandoffError = error{
-    EmptyCompactionHandoff,
-    InvalidCompactionHandoff,
-    CompactionHandoffTooLarge,
-};
-
-pub fn validateCompactionHandoff(
-    text: []const u8,
-    accepted_tokens: usize,
-) CompactionHandoffError!void {
-    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidCompactionHandoff;
-    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
-        return error.EmptyCompactionHandoff;
-    }
-    var estimator = token_estimate.StreamingEstimator{};
-    estimator.consume(text);
-    if (estimator.estimate() > accepted_tokens) {
-        return error.CompactionHandoffTooLarge;
-    }
-}
+const textTokens = token_estimate.textTokens;
 
 pub const RequestCost = struct {
     serialized_bytes: usize,
+    /// Uncalibrated serialization estimate; non-image usage may replace it.
+    text_tokens: usize,
+    /// Null means no image parts. Otherwise visual cost needs applicable usage.
+    image_identity: ?[32]u8 = null,
     estimated_input_tokens: usize,
 };
 
 pub const RequestTokenCalibration = struct {
-    serialized_bytes: usize,
+    request: RequestCost,
     exact_input_tokens: usize,
+
+    pub fn applies(self: RequestTokenCalibration, cost: RequestCost) bool {
+        return self.request.serialized_bytes != 0 and self.exact_input_tokens != 0 and
+            std.meta.eql(cost.image_identity, self.request.image_identity);
+    }
 };
 
-pub fn measureProviderRequest(body: []const u8) RequestCost {
+const ImagePartData = struct {
+    type: []const u8 = "",
+    data: ?[]const u8 = null,
+};
+
+/// Responses `input_image` parts carry the URL as a string; chat-completions
+/// `image_url` parts wrap it in an object.
+const ImageUrl = struct {
+    url: []const u8,
+
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ImageUrl {
+        if (try source.peekNextTokenType() == .string) {
+            return .{ .url = try std.json.innerParse([]const u8, alloc, source, options) };
+        }
+        const Wrapped = struct { url: []const u8 };
+        const wrapped = try std.json.innerParse(Wrapped, alloc, source, options);
+        return .{ .url = wrapped.url };
+    }
+};
+
+const ImagePart = struct {
+    type: []const u8 = "",
+    mediaType: ?[]const u8 = null,
+    detail: ?[]const u8 = null,
+    data: ?ImagePartData = null,
+    image_url: ?ImageUrl = null,
+};
+
+const MessageContent = struct {
+    parts: []const ImagePart = &.{},
+
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !MessageContent {
+        if (try source.peekNextTokenType() == .array_begin) {
+            return .{ .parts = try std.json.innerParse([]const ImagePart, alloc, source, options) };
+        }
+        try source.skipValue();
+        return .{};
+    }
+};
+
+const CostMessage = struct {
+    role: []const u8 = "",
+    type: []const u8 = "",
+    content: MessageContent = .{},
+    output: MessageContent = .{},
+};
+
+const CostRequest = struct {
+    prompt: ?[]const CostMessage = null,
+    input: ?[]const CostMessage = null,
+    messages: ?[]const CostMessage = null,
+};
+
+pub const MeasurementError = error{ OutOfMemory, InvalidRequestMeasurement };
+
+/// Borrows the prepared body and request; releases parsing scratch before returning.
+/// Image payloads are transport bytes, not text. Their initial token cost is unknown.
+pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: stream_provider.RequestData) MeasurementError!RequestCost {
+    const has_images = image_input: {
+        if (request.verified_images) |images| if (images.len != 0) break :image_input true;
+        for (request.messages) |message| {
+            if (message.images.len != 0) break :image_input true;
+            // Retained tool images serialize as follow-up user-message file
+            // parts, so they never appear in message.images. Count them as
+            // image input or their base64 payloads are priced as text.
+            if (message.tool_result_memory) |memory| if (memory.tool_images.len != 0) break :image_input true;
+        }
+        break :image_input false;
+    };
+    if (!has_images) {
+        const tokens = textTokens(body);
+        return .{ .serialized_bytes = body.len, .text_tokens = tokens, .estimated_input_tokens = tokens };
+    }
+
+    // Typed parsing borrows unescaped payload strings. Value parsing copies them.
+    const parsed = std.json.parseFromSlice(CostRequest, alloc, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidRequestMeasurement,
+    };
+    defer parsed.deinit();
+    const envelopes = @as(u8, @intFromBool(parsed.value.prompt != null)) +
+        @intFromBool(parsed.value.input != null) +
+        @intFromBool(parsed.value.messages != null);
+    if (envelopes > 1) return error.InvalidRequestMeasurement;
+    const messages = parsed.value.prompt orelse parsed.value.input orelse parsed.value.messages orelse {
+        // Unrecognized envelope: degrade to the conservative text estimate
+        // rather than fail the request over a shape this measurer does not know.
+        const tokens = textTokens(body);
+        return .{ .serialized_bytes = body.len, .text_tokens = tokens, .estimated_input_tokens = tokens };
+    };
     var estimator = token_estimate.StreamingEstimator{};
-    estimator.consume(body);
+    var identity = std.crypto.hash.sha2.Sha256.init(.{});
+    var cursor: usize = 0;
+    var found_image = false;
+    for (messages) |message| {
+        // Retained tool images never land in user-message content on
+        // input-style bodies: the responses protocol writes them as
+        // input_image parts inside function_call_output items, which carry no
+        // role. Scan both carriers.
+        const parts = if (std.mem.eql(u8, message.role, "user"))
+            message.content.parts
+        else if (parsed.value.input != null and std.mem.eql(u8, message.type, "function_call_output"))
+            message.output.parts
+        else
+            continue;
+        for (parts) |part| {
+            const payload = if (parsed.value.input != null and std.mem.eql(u8, part.type, "input_image"))
+                (part.image_url orelse return error.InvalidRequestMeasurement).url
+            else if (parsed.value.messages != null and std.mem.eql(u8, part.type, "image_url"))
+                (part.image_url orelse return error.InvalidRequestMeasurement).url
+            else if (parsed.value.prompt != null and std.mem.eql(u8, part.type, "file") and
+                std.mem.startsWith(u8, part.mediaType orelse "", "image/"))
+            payload: {
+                const data = part.data orelse return error.InvalidRequestMeasurement;
+                if (!std.mem.eql(u8, data.type, "data")) return error.InvalidRequestMeasurement;
+                break :payload data.data orelse return error.InvalidRequestMeasurement;
+            } else continue;
+            const address = @intFromPtr(payload.ptr);
+            if (address < @intFromPtr(body.ptr)) return error.InvalidRequestMeasurement;
+            const offset = address - @intFromPtr(body.ptr);
+            if (offset < cursor or offset > body.len or payload.len > body.len - offset) return error.InvalidRequestMeasurement;
+            estimator.consume(body[cursor..offset]);
+            cursor = offset + payload.len;
+            for ([_][]const u8{ part.type, part.mediaType orelse "", part.detail orelse "", payload }) |value| {
+                identity.update(std.mem.asBytes(&value.len));
+                identity.update(value);
+            }
+            found_image = true;
+        }
+    }
+    estimator.consume(body[cursor..]);
+    const tokens: usize = @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
     return .{
         .serialized_bytes = body.len,
-        .estimated_input_tokens = @intCast(@min(
-            estimator.estimate(),
-            std.math.maxInt(usize),
-        )),
+        .text_tokens = tokens,
+        .image_identity = if (found_image) identity.finalResult() else null,
+        .estimated_input_tokens = tokens,
     };
 }
 
@@ -144,21 +176,20 @@ pub fn calibrateProviderRequest(
     cost: RequestCost,
     calibration: RequestTokenCalibration,
 ) RequestCost {
-    if (calibration.serialized_bytes == 0 or calibration.exact_input_tokens == 0) {
-        return cost;
-    }
-    const calibrated_tokens = multiplyDivideCeilSaturating(
-        cost.serialized_bytes,
-        calibration.exact_input_tokens,
-        calibration.serialized_bytes,
-    );
-    return .{
-        .serialized_bytes = cost.serialized_bytes,
-        .estimated_input_tokens = @max(
-            cost.estimated_input_tokens,
-            calibrated_tokens,
-        ),
-    };
+    if (!calibration.applies(cost)) return cost;
+    const calibrated_tokens = if (cost.image_identity != null)
+        if (cost.text_tokens >= calibration.request.text_tokens)
+            calibration.exact_input_tokens +| (cost.text_tokens - calibration.request.text_tokens)
+        else
+            calibration.exact_input_tokens -| (calibration.request.text_tokens - cost.text_tokens)
+    else
+        multiplyDivideCeilSaturating(cost.serialized_bytes, calibration.exact_input_tokens, calibration.request.serialized_bytes);
+    var result = cost;
+    result.estimated_input_tokens = if (cost.image_identity != null)
+        @max(cost.text_tokens, calibrated_tokens)
+    else
+        @max(1, calibrated_tokens);
+    return result;
 }
 
 fn multiplyDivideCeilSaturating(
@@ -182,62 +213,42 @@ fn multiplyDivideCeilSaturating(
     return std.math.add(usize, whole, partial) catch std.math.maxInt(usize);
 }
 
-pub fn estimateCompactionSourceTokens(messages: []const ChatMessage) usize {
-    var estimator = token_estimate.StreamingEstimator{};
-    for (messages) |message| {
-        estimator.consume(@tagName(message.role));
-        if (message.content) |content| estimator.consume(content);
-        if (message.tool_call_id) |id| estimator.consume(id);
-        if (message.tool_name) |name| estimator.consume(name);
-        for (message.tool_calls) |call| {
-            estimator.consume(call.id);
-            estimator.consume(call.name);
-            estimator.consume(call.arguments_json);
-        }
-    }
-    return @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
-}
+pub const ProviderPrompt = struct {
+    instructions: std.ArrayList(ChatMessage),
+    messages: std.ArrayList(ChatMessage),
 
-pub fn usableInputTokens(
-    capabilities: model_capabilities.Capabilities,
-) ?usize {
-    const context_window = capabilities.context_window orelse return null;
-    const context_tokens: usize = @intCast(context_window);
-    if (capabilities.max_output_tokens) |output| {
-        const output_tokens: usize = @intCast(output);
-        if (output_tokens < context_tokens) return context_tokens - output_tokens;
+    pub fn deinit(self: *ProviderPrompt, alloc: Allocator) void {
+        self.instructions.deinit(alloc);
+        self.messages.deinit(alloc);
+        self.* = undefined;
     }
-    return context_tokens;
-}
+};
 
-pub fn buildGatewayMessages(
+pub fn buildProviderPrompt(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
     ephemeral_overlay: []const ChatMessage,
     durable_history: []const ChatMessage,
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
-) !std.ArrayList(ChatMessage) {
+) !ProviderPrompt {
+    var instructions: std.ArrayList(ChatMessage) = .empty;
+    errdefer instructions.deinit(alloc);
     var messages: std.ArrayList(ChatMessage) = .empty;
     errdefer messages.deinit(alloc);
 
-    try messages.appendSlice(alloc, stable_prefix);
-    try appendEphemeralOverlayMessages(alloc, &messages, ephemeral_overlay);
+    try instructions.appendSlice(alloc, stable_prefix);
+    try instructions.appendSlice(alloc, ephemeral_overlay);
     try messages.appendSlice(alloc, durable_history);
     try messages.append(alloc, current_user_message);
     try messages.appendSlice(alloc, within_turn_suffix);
-    return messages;
+    return .{
+        .instructions = instructions,
+        .messages = messages,
+    };
 }
 
-fn appendEphemeralOverlayMessages(alloc: Allocator, messages: *std.ArrayList(ChatMessage), ephemeral_overlay: []const ChatMessage) !void {
-    for (ephemeral_overlay) |overlay_message| {
-        var copy = overlay_message;
-        copy.cache_policy = .no_cache;
-        try messages.append(alloc, copy);
-    }
-}
-
-test "buildGatewayMessages orders transient overlay before history and current prompt" {
+test "buildProviderPrompt separates instructions from chronological messages" {
     const alloc = std.testing.allocator;
     const stable_prefix = [_]ChatMessage{
         .{ .role = .system, .content = "stable system prompt" },
@@ -255,21 +266,22 @@ test "buildGatewayMessages orders transient overlay before history and current p
         .{ .role = .assistant, .content = "within turn assistant" },
     };
 
-    var messages = try buildGatewayMessages(alloc, &stable_prefix, &overlay, &history, current, &suffix);
-    defer messages.deinit(alloc);
+    var prompt = try buildProviderPrompt(alloc, &stable_prefix, &overlay, &history, current, &suffix);
+    defer prompt.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 7), messages.items.len);
-    try std.testing.expectEqualStrings("stable system prompt", messages.items[0].content.?);
-    try std.testing.expectEqualStrings("stable project context", messages.items[1].content.?);
-    try std.testing.expectEqualStrings("volatile runtime overlay", messages.items[2].content.?);
-    try std.testing.expectEqualStrings("history user prompt", messages.items[3].content.?);
-    try std.testing.expectEqualStrings("history assistant answer", messages.items[4].content.?);
-    try std.testing.expectEqualStrings("current user prompt", messages.items[5].content.?);
-    try std.testing.expectEqualStrings("within turn assistant", messages.items[6].content.?);
-    try std.testing.expectEqual(types.ChatCachePolicy.no_cache, messages.items[2].cache_policy);
+    try std.testing.expectEqual(@as(usize, 3), prompt.instructions.items.len);
+    try std.testing.expectEqual(@as(usize, 4), prompt.messages.items.len);
+    try std.testing.expectEqualStrings("stable system prompt", prompt.instructions.items[0].content.?);
+    try std.testing.expectEqualStrings("stable project context", prompt.instructions.items[1].content.?);
+    try std.testing.expectEqualStrings("volatile runtime overlay", prompt.instructions.items[2].content.?);
+    try std.testing.expectEqualStrings("history user prompt", prompt.messages.items[0].content.?);
+    try std.testing.expectEqualStrings("history assistant answer", prompt.messages.items[1].content.?);
+    try std.testing.expectEqualStrings("current user prompt", prompt.messages.items[2].content.?);
+    try std.testing.expectEqualStrings("within turn assistant", prompt.messages.items[3].content.?);
 }
 
-test "buildGatewayMessages preserves one system prefix for projected session history" {
+test "buildProviderPrompt keeps compacted session context out of instructions" {
+    const session_runtime = @import("../../session/session.zig");
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -301,7 +313,7 @@ test "buildGatewayMessages preserves one system prefix for projected session his
         .status = .success,
         .model_view_covers_full_file = true,
     }};
-    const history = [_]HistoryTurn{
+    const history = [_]types.HistoryTurn{
         .{ .compacted_summary = .{
             .summary = @constCast("LEADING_SUMMARY_ONLY"),
             .removed_turn_count = 2,
@@ -338,7 +350,7 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     const overlay = [_]ChatMessage{.{ .role = .system, .content = "ephemeral overlay" }};
     const current = ChatMessage{ .role = .user, .content = "current portable prompt" };
     const suffix = [_]ChatMessage{.{ .role = .assistant, .content = "within-turn suffix" }};
-    var messages = try buildGatewayMessages(
+    var prompt = try buildProviderPrompt(
         arena,
         &stable_prefix,
         &overlay,
@@ -346,22 +358,18 @@ test "buildGatewayMessages preserves one system prefix for projected session his
         current,
         &suffix,
     );
-    defer messages.deinit(arena);
+    defer prompt.deinit(arena);
 
-    var saw_non_system = false;
     var leading_summary_count: usize = 0;
     var late_summary_count: usize = 0;
     var file_evidence_count: usize = 0;
     var interruption_count: usize = 0;
-    for (messages.items) |entry| {
-        if (entry.role == .system) {
-            try std.testing.expect(!saw_non_system);
-        } else {
-            saw_non_system = true;
-        }
+    for (prompt.instructions.items) |entry| try std.testing.expectEqual(types.ChatRole.system, entry.role);
+    for (prompt.messages.items) |entry| {
+        try std.testing.expect(entry.role != .system);
         const content = entry.content orelse continue;
         if (std.mem.find(u8, content, "LEADING_SUMMARY_ONLY") != null) {
-            try std.testing.expectEqual(types.ChatRole.system, entry.role);
+            try std.testing.expectEqual(types.ChatRole.user, entry.role);
             leading_summary_count += 1;
         }
         if (std.mem.find(u8, content, "LATE_SUMMARY_ONLY") != null) {
@@ -383,26 +391,46 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     try std.testing.expectEqual(@as(usize, 1), late_summary_count);
     try std.testing.expectEqual(@as(usize, 1), file_evidence_count);
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
-    try std.testing.expectEqualStrings("current portable prompt", messages.items[messages.items.len - 2].content.?);
-    try std.testing.expectEqualStrings("within-turn suffix", messages.items[messages.items.len - 1].content.?);
+    try std.testing.expectEqualStrings("current portable prompt", prompt.messages.items[prompt.messages.items.len - 2].content.?);
+    try std.testing.expectEqualStrings("within-turn suffix", prompt.messages.items[prompt.messages.items.len - 1].content.?);
 }
 
 test "provider request measurement includes serialized structure" {
-    const compact = measureProviderRequest("{\"prompt\":[{\"role\":\"user\",\"content\":\"same\"}]}");
-    const fragmented = measureProviderRequest(
+    const compact = try measureProviderRequest(std.testing.allocator, "{\"prompt\":[{\"role\":\"user\",\"content\":\"same\"}]}", measurement_test_request(false));
+    const fragmented = try measureProviderRequest(
+        std.testing.allocator,
         "{\"prompt\":[{\"role\":\"user\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"user\",\"content\":\"m\"},{\"role\":\"user\",\"content\":\"e\"}]}",
+        measurement_test_request(false),
     );
     try std.testing.expect(fragmented.serialized_bytes > compact.serialized_bytes);
     try std.testing.expect(fragmented.estimated_input_tokens > compact.estimated_input_tokens);
 }
 
+test "provider request image accounting excludes encoded payload length" {
+    const Case = struct { prefix: []const u8, suffix: []const u8 };
+    const cases = [_]Case{
+        .{ .prefix = "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,", .suffix = "\"}]}]}" },
+        .{ .prefix = "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\",\"data\":\"", .suffix = "\"}}]}]}" },
+    };
+    inline for (cases) |case| {
+        const small = try measureProviderRequest(std.testing.allocator, case.prefix ++ "AAAA" ++ case.suffix, measurement_test_request(true));
+        const large = try measureProviderRequest(std.testing.allocator, case.prefix ++ text_utils.repeat("AAAA", 1000) ++ case.suffix, measurement_test_request(true));
+        try std.testing.expect(large.serialized_bytes > small.serialized_bytes);
+        try std.testing.expectEqual(small.text_tokens, large.text_tokens);
+        try std.testing.expectEqual(small.estimated_input_tokens, large.estimated_input_tokens);
+        try std.testing.expect(small.image_identity != null);
+        try std.testing.expect(!std.meta.eql(small.image_identity, large.image_identity));
+    }
+}
+
 test "provider request measurement learns the prior exact token density" {
     const current = RequestCost{
         .serialized_bytes = 1_456_988,
+        .text_tokens = 365_113,
         .estimated_input_tokens = 365_113,
     };
     const calibrated = calibrateProviderRequest(current, .{
-        .serialized_bytes = 767_736,
+        .request = .{ .serialized_bytes = 767_736, .text_tokens = 192_000, .estimated_input_tokens = 192_000 },
         .exact_input_tokens = 398_710,
     });
 
@@ -410,87 +438,200 @@ test "provider request measurement learns the prior exact token density" {
     try std.testing.expect(calibrated.estimated_input_tokens >= current.estimated_input_tokens);
 }
 
-test "compaction v2 triggers automatic work at eighty percent and targets ten percent" {
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        std.meta.tags(CompactionDecision).len,
-    );
+test "provider usage corrects a serialized estimate downward" {
+    const cost = RequestCost{ .serialized_bytes = 34_210, .text_tokens = 8_892, .estimated_input_tokens = 8_892 };
+    const calibrated = calibrateProviderRequest(cost, .{ .request = cost, .exact_input_tokens = 6_030 });
+    try std.testing.expectEqual(@as(usize, 6_030), calibrated.estimated_input_tokens);
+    try std.testing.expectEqual(cost.text_tokens, calibrated.text_tokens);
+}
 
-    const capabilities = model_capabilities.Capabilities{
-        .context_window = 1_000,
-        .max_output_tokens = 200,
+fn measurement_test_request(with_images: bool) stream_provider.RequestData {
+    return .{
+        .model = "fixture/model",
+        .messages = if (with_images) &.{.{
+            .role = .user,
+            .images = &.{.{ .path = @constCast("fixture.png"), .media_type = @constCast("image/png") }},
+        }} else &.{},
+        .tool_choice = .none,
+        .provider_options = .{},
     };
-    const below = planCompaction(.{
-        .trigger = .automatic,
-        .capabilities = capabilities,
-        .request_tokens = 639,
-        .source_tokens = 640,
-    });
-    try std.testing.expectEqual(CompactionDecision.no_op, below.decision);
-
-    const at_boundary = planCompaction(.{
-        .trigger = .automatic,
-        .capabilities = capabilities,
-        .request_tokens = 640,
-        .source_tokens = 640,
-    });
-    try std.testing.expectEqual(CompactionDecision.compact, at_boundary.decision);
-    try std.testing.expectEqual(@as(?usize, 800), at_boundary.usable_input_tokens);
-    try std.testing.expectEqual(@as(?usize, 640), at_boundary.high_water_tokens);
-    try std.testing.expectEqual(@as(?usize, 80), at_boundary.session_target_tokens);
-    try std.testing.expectEqual(@as(?usize, 80), at_boundary.accepted_handoff_tokens);
-    try std.testing.expectEqual(@as(?usize, 200), at_boundary.generation_tokens);
-
-    const protected_prompt = planCompaction(.{
-        .trigger = .automatic,
-        .capabilities = capabilities,
-        .request_tokens = 640,
-        .source_tokens = 640,
-        .protected_tokens = 20,
-    });
-    try std.testing.expectEqual(@as(?usize, 60), protected_prompt.accepted_handoff_tokens);
-
-    const oversized_protected_prompt = planCompaction(.{
-        .trigger = .automatic,
-        .capabilities = capabilities,
-        .request_tokens = 640,
-        .source_tokens = 640,
-        .protected_tokens = 80,
-    });
-    try std.testing.expectEqual(CompactionDecision.no_op, oversized_protected_prompt.decision);
 }
 
-test "manual compaction shares the budget and stops after a smaller source" {
-    const plan = planCompaction(.{
-        .trigger = .manual,
-        .capabilities = .{
-            .context_window = 1_000,
-            .max_output_tokens = 200,
+test "provider request image accounting preserves text and tool payloads" {
+    const body =
+        \\{"input":[{"role":"user","content":[{"type":"input_text","text":"data:image/png;base64,AAAA"},{"image_url":"data:image/png;base64,BBBB","type":"input_image"}]},{"type":"function_call","arguments":"{\"image_url\":\"AAAA\"}"},{"type":"function_call_output","output":"data:image/png;base64,AAAA"}]}
+    ;
+    const measured = try measureProviderRequest(std.testing.allocator, body, measurement_test_request(true));
+    const without_image_payload =
+        \\{"input":[{"role":"user","content":[{"type":"input_text","text":"data:image/png;base64,AAAA"},{"image_url":"","type":"input_image"}]},{"type":"function_call","arguments":"{\"image_url\":\"AAAA\"}"},{"type":"function_call_output","output":"data:image/png;base64,AAAA"}]}
+    ;
+    try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
+
+    const file_text = "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"text/plain\",\"data\":{\"type\":\"data\",\"data\":\"AAAA\"}}]}]}";
+    const non_image = try measureProviderRequest(std.testing.allocator, file_text, measurement_test_request(true));
+    try std.testing.expectEqual(textTokens(file_text), non_image.text_tokens);
+    try std.testing.expectEqual(@as(?[32]u8, null), non_image.image_identity);
+}
+
+test "provider request measurement prices retained tool images as image input" {
+    const body =
+        \\{"prompt":[{"role":"tool","content":[{"type":"tool-result","toolCallId":"call_1","output":{"type":"content","value":[{"type":"text","text":"capture"}]}}]},{"role":"user","content":[{"type":"text","text":"Attached image(s) from the tool result."},{"type":"file","mediaType":"image/png","data":{"type":"data","data":"AAAABBBBCCCCDDDD"}}]}]}
+    ;
+    var request = measurement_test_request(false);
+    request.messages = &.{.{
+        .role = .tool,
+        .content = "capture",
+        .tool_result_memory = .{
+            .tool_images = &.{.{ .data = @constCast("AAAABBBBCCCCDDDD"), .mime_type = @constCast("image/png") }},
         },
-        .request_tokens = 100,
-        .source_tokens = 400,
-    });
-    try std.testing.expectEqual(CompactionDecision.compact, plan.decision);
-    try std.testing.expectEqual(@as(?usize, 80), plan.accepted_handoff_tokens);
-    try std.testing.expectEqual(@as(?usize, 200), plan.generation_tokens);
+    }};
+    const measured = try measureProviderRequest(std.testing.allocator, body, request);
+    try std.testing.expect(measured.image_identity != null);
+    const without_image_payload =
+        \\{"prompt":[{"role":"tool","content":[{"type":"tool-result","toolCallId":"call_1","output":{"type":"content","value":[{"type":"text","text":"capture"}]}}]},{"role":"user","content":[{"type":"text","text":"Attached image(s) from the tool result."},{"type":"file","mediaType":"image/png","data":{"type":"data","data":""}}]}]}
+    ;
+    try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
 
-    const empty = planCompaction(.{
-        .trigger = .manual,
-        .capabilities = .{ .context_window = 1_000 },
-        .request_tokens = 0,
-        .source_tokens = 0,
-    });
-    try std.testing.expectEqual(CompactionDecision.no_op, empty.decision);
+    // Tool images must not be priced as text: their encoded payload inflates
+    // the estimate by roughly bytes/4 phantom tokens.
+    const text_only = try measureProviderRequest(std.testing.allocator, body, measurement_test_request(false));
+    try std.testing.expect(text_only.estimated_input_tokens > measured.estimated_input_tokens);
 }
 
-test "handoff acceptance is structural and bounded" {
-    try std.testing.expectError(
-        error.EmptyCompactionHandoff,
-        validateCompactionHandoff(" \n\t", 10),
-    );
-    try std.testing.expectError(
-        error.CompactionHandoffTooLarge,
-        validateCompactionHandoff("one two three four five six seven eight nine ten eleven", 4),
-    );
-    try validateCompactionHandoff("# Objective\nContinue safely.", 16);
+test "provider request measurement excludes responses-protocol tool image payloads" {
+    // The responses protocol writes retained tool images as input_image parts
+    // inside function_call_output items, which carry no role.
+    const body =
+        \\{"input":[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"capture"},{"type":"input_image","image_url":"data:image/png;base64,AAAABBBBCCCCDDDD"}]},{"role":"user","content":[{"type":"input_text","text":"next"}]}]}
+    ;
+    var request = measurement_test_request(false);
+    request.messages = &.{.{
+        .role = .tool,
+        .content = "capture",
+        .tool_result_memory = .{
+            .tool_images = &.{.{ .data = @constCast("AAAABBBBCCCCDDDD"), .mime_type = @constCast("image/png") }},
+        },
+    }};
+    const measured = try measureProviderRequest(std.testing.allocator, body, request);
+    try std.testing.expect(measured.image_identity != null);
+    const without_image_payload =
+        \\{"input":[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"capture"},{"type":"input_image","image_url":""}]},{"role":"user","content":[{"type":"input_text","text":"next"}]}]}
+    ;
+    try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
+}
+
+test "provider request measurement excludes chat-completions image payloads" {
+    // Chat-completions bodies carry user images, including retained tool
+    // images, as image_url parts with data URLs.
+    const body =
+        \\{"model":"fixture/model","messages":[{"role":"tool","tool_call_id":"call_1","content":"capture"},{"role":"user","content":[{"type":"text","text":"The tool \"read_file\" returned 1 image(s)."},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAABBBBCCCCDDDD"}}]}]}
+    ;
+    var request = measurement_test_request(false);
+    request.messages = &.{.{
+        .role = .tool,
+        .content = "capture",
+        .tool_result_memory = .{
+            .tool_images = &.{.{ .data = @constCast("AAAABBBBCCCCDDDD"), .mime_type = @constCast("image/png") }},
+        },
+    }};
+    const measured = try measureProviderRequest(std.testing.allocator, body, request);
+    try std.testing.expect(measured.image_identity != null);
+    const without_image_payload =
+        \\{"model":"fixture/model","messages":[{"role":"tool","tool_call_id":"call_1","content":"capture"},{"role":"user","content":[{"type":"text","text":"The tool \"read_file\" returned 1 image(s)."},{"type":"image_url","image_url":{"url":""}}]}]}
+    ;
+    try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
+}
+
+test "provider request measurement degrades to text estimate on unknown envelopes" {
+    const body =
+        \\{"model":"fixture/model","contents":[{"role":"user","parts":[{"inline_data":{"data":"AAAA"}}]}]}
+    ;
+    const measured = try measureProviderRequest(std.testing.allocator, body, measurement_test_request(true));
+    try std.testing.expectEqual(textTokens(body), measured.estimated_input_tokens);
+    try std.testing.expectEqual(@as(?[32]u8, null), measured.image_identity);
+}
+
+test "provider request image calibration uses exact usage plus text growth without compounding" {
+    const first = RequestCost{ .serialized_bytes = 4_000_000, .text_tokens = 100, .image_identity = @as([32]u8, @splat(1)), .estimated_input_tokens = 100 };
+    var next = first;
+    next.text_tokens = 150;
+    next.estimated_input_tokens = 150;
+    next.serialized_bytes += 200;
+    const calibrated = calibrateProviderRequest(next, .{ .request = first, .exact_input_tokens = 1000 });
+    try std.testing.expectEqual(@as(usize, 1050), calibrated.estimated_input_tokens);
+    try std.testing.expectEqual(@as(usize, 150), calibrated.text_tokens);
+    var third = next;
+    third.text_tokens = 200;
+    third.estimated_input_tokens = 200;
+    const repeated = calibrateProviderRequest(third, .{ .request = calibrated, .exact_input_tokens = 1050 });
+    try std.testing.expectEqual(@as(usize, 1100), repeated.estimated_input_tokens);
+    try std.testing.expectEqual(@as(usize, 1000), calibrateProviderRequest(first, .{ .request = calibrated, .exact_input_tokens = 1050 }).estimated_input_tokens);
+
+    next.image_identity = @as([32]u8, @splat(2));
+    try std.testing.expectEqual(next, calibrateProviderRequest(next, .{ .request = first, .exact_input_tokens = 1000 }));
+    next.image_identity = null;
+    try std.testing.expectEqual(next, calibrateProviderRequest(next, .{ .request = first, .exact_input_tokens = 1000 }));
+    try std.testing.expectEqual(first, calibrateProviderRequest(first, .{ .request = next, .exact_input_tokens = 1000 }));
+    try std.testing.expectEqual(first, calibrateProviderRequest(first, .{ .request = first, .exact_input_tokens = 0 }));
+    try std.testing.expectEqual(@as(usize, 150), calibrateProviderRequest(calibrated, .{ .request = third, .exact_input_tokens = 1 }).estimated_input_tokens);
+    try std.testing.expectEqual(std.math.maxInt(usize), calibrateProviderRequest(calibrated, .{ .request = first, .exact_input_tokens = std.math.maxInt(usize) }).estimated_input_tokens);
+}
+
+test "provider request image accounting borrows large payloads and releases scratch" {
+    const alloc = std.testing.allocator;
+    const payload = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'A');
+    const body = try alloc.print("{{\"input\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,{s}\"}}]}}]}}", .{payload});
+    defer alloc.free(body);
+    var storage: [8192]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&storage);
+    var tracked = std.testing.FailingAllocator.init(scratch.allocator(), .{});
+    const cost = try measureProviderRequest(tracked.allocator(), body, measurement_test_request(true));
+    try std.testing.expect(cost.text_tokens < 100);
+    try std.testing.expectEqual(tracked.allocated_bytes, tracked.freed_bytes);
+}
+
+test "provider request image identity includes ordering media type and detail" {
+    const alloc = std.testing.allocator;
+    const first = "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AAAA\",\"detail\":\"auto\"}";
+    const second = "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,BBBB\"}";
+    const reference = try measureProviderRequest(alloc, "{\"input\":[{\"role\":\"user\",\"content\":[" ++ first ++ "," ++ second ++ "]}]}", measurement_test_request(true));
+    inline for (.{
+        "{\"input\":[{\"role\":\"user\",\"content\":[" ++ second ++ "," ++ first ++ "]}]}",
+        "{\"input\":[{\"role\":\"user\",\"content\":[" ++ first ++ "]}]}",
+        "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AAAA\",\"detail\":\"high\"}," ++ second ++ "]}]}",
+        "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/jpeg;base64,AAAA\",\"detail\":\"auto\"}," ++ second ++ "]}]}",
+    }) |body| {
+        const changed = try measureProviderRequest(alloc, body, measurement_test_request(true));
+        try std.testing.expect(!std.meta.eql(reference.image_identity, changed.image_identity));
+    }
+    var no_storage: [0]u8 = .{};
+    var scratch = std.heap.FixedBufferAllocator.init(&no_storage);
+    const text = try measureProviderRequest(scratch.allocator(), "{\"input\":[]}", measurement_test_request(false));
+    try std.testing.expectEqual(textTokens("{\"input\":[]}"), text.text_tokens);
+}
+
+test "provider request image accounting handles allocation and malformed input failures" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            _ = try measureProviderRequest(alloc, "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AAAA\"}]}]}", measurement_test_request(true));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
+    for ([_][]const u8{
+        "{",
+        "{\"input\":[],\"prompt\":[]}",
+        "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\"}]}]}",
+        "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"escaped\\nimage\"}]}]}",
+        // Prompt-shape file parts must carry the nested v4 data object; every
+        // other shape is rejected rather than mis-measured.
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":\"AAAA\"}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\"}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"url\",\"url\":\"https://x/y.png\"}}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\"}}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\",\"data\":\"escaped\\nimage\"}}]}]}",
+    }) |body| {
+        try std.testing.expectError(error.InvalidRequestMeasurement, measureProviderRequest(std.testing.allocator, body, measurement_test_request(true)));
+    }
 }

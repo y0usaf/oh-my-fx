@@ -1,10 +1,13 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const managed_execution = @import("../../execution/managed_execution.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
+const shared_theme = @import("../../shared/theme.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+const tool_args = @import("../../tooling/tool_args.zig");
 const tool_specs = @import("../../tooling/tool_specs.zig");
 const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
@@ -46,6 +49,9 @@ fn fallbackToolDisplay(
     registry: tool_dispatch.Registry,
     tool_name: []const u8,
 ) []const u8 {
+    // Provider-executed search backends are never registered locally; their
+    // stream names (exa_search, ...) are internal identifiers, not display copy.
+    if (tooling_presentation.isProviderSearchAlias(tool_name)) return "web search";
     const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
         "shell"
     else
@@ -118,6 +124,7 @@ pub const ProvisionalToolStatuses = struct {
         activity_kind: types.ToolActivityKind,
         action_label: []const u8,
         label_value: ?[]const u8,
+        arguments_json: ?[]const u8,
     ) !void {
         if (tool_id.len == 0) {
             debug_trace.logf(
@@ -129,19 +136,38 @@ pub const ProvisionalToolStatuses = struct {
         }
 
         var buf: [512]u8 = undefined;
-        const label = try formatProvisionalProgressLabel(&buf, action_label, label_value);
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const is_skill = std.mem.eql(u8, tool_name, "skill");
+        var observed_label = if (is_skill) null else label_value;
+        var observed_kind = activity_kind;
+        const resource_label: ?[]const u8 = if (is_skill) resource: {
+            const json = arguments_json orelse break :resource null;
+            const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch break :resource null;
+            const spec = hooks.tool_registry.lookup(tool_name) orelse break :resource null;
+            const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+            if (presentation.label_arg_kind != .resource) break :resource null;
+            const value = tool_dispatch.presentationLabelValue(presentation, args) orelse break :resource null;
+            const encoded = text_utils.encodeTerminalSafe(scratch.allocator(), value, buf.len) catch break :resource null;
+            if (encoded.truncated) break :resource null;
+            const formatted = formatProvisionalProgressLabel(&buf, presentation.action_label, encoded.bytes) catch break :resource null;
+            observed_label = value;
+            observed_kind = presentation.activity_kind;
+            break :resource formatted;
+        } else null;
+        const label = resource_label orelse try formatProvisionalProgressLabel(&buf, action_label, observed_label);
         const recorded = try self.recordTracked(
             alloc,
             tool_id,
             tool_name,
-            label_value,
+            observed_label,
         );
         hooks.push_tool_lifecycle(hooks.ctx, .{
             .provisional = .{
                 .id = .{ .turn_id = turn_id, .call_id = tool_id },
                 .presentation_group_id = self.presentation_group_id,
                 .tool_name = tool_name,
-                .activity_kind = activity_kind,
+                .activity_kind = observed_kind,
             },
         }) catch |err| {
             if (recorded) self.forget(alloc, tool_id);
@@ -163,10 +189,9 @@ pub const ProvisionalToolStatuses = struct {
         call: ToolCall,
     ) !void {
         const call_id = self.visibleId(call) orelse return;
-        const summary = try std.fmt.allocPrint(
-            arena,
-            "{s} failed: invalid JSON arguments",
-            .{fallbackToolDisplay(hooks.tool_registry, call.name)},
+        const summary = try arena.print(
+            "{s} failed: {s}",
+            .{ fallbackToolDisplay(hooks.tool_registry, call.name), if (call.argument_integrity == .non_object_json) "non-object arguments" else "invalid JSON arguments" },
         );
         try hooks.push_tool_lifecycle(hooks.ctx, .{
             .terminal = .{
@@ -427,7 +452,7 @@ pub const ProvisionalToolStatuses = struct {
                 detail,
                 diff.max_encoded_label_bytes,
             );
-            const summary = try std.fmt.allocPrint(arena, "Cancelled {s}", .{encoded.bytes});
+            const summary = try arena.print("Cancelled {s}", .{encoded.bytes});
             try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .cancelled, .summary = summary },
@@ -472,8 +497,7 @@ pub const ProvisionalToolStatuses = struct {
                 detail,
                 diff.max_encoded_label_bytes,
             );
-            const summary = try std.fmt.allocPrint(
-                arena,
+            const summary = try arena.print(
                 "Connection interrupted before {s} ran",
                 .{encoded.bytes},
             );
@@ -703,9 +727,9 @@ fn formatProvisionalProgressLabel(
     label_value: ?[]const u8,
 ) ![]const u8 {
     if (label_value) |value| {
-        return std.fmt.bufPrint(buf, "● {s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m", .{ action_label, value });
+        return std.mem.print(buf, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ action_label, shared_theme.current().tool_stdout_style, value });
     }
-    return std.fmt.bufPrint(buf, "● {s}\x1b[0m", .{action_label});
+    return std.mem.print(buf, "● {s}\x1b[0m", .{action_label});
 }
 
 pub fn fileMutationDisplayPath(
@@ -739,13 +763,13 @@ pub noinline fn startToolVisibleLifecycle(
     const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
     if (activity_kind == .ask) return false;
     const redacted_arguments = try text_utils.maskSecrets(arena, call.arguments_json);
-    const activity_line = try hooks.describe_tool_action(
+    const activity_line = if (call.argument_integrity == .valid) try hooks.describe_tool_action(
         hooks.ctx,
         arena,
         call,
         display_target,
         advertised_dynamic_tool_names,
-    );
+    ) else null;
     try hooks.push_tool_lifecycle(hooks.ctx, .{ .authoritative_started = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .presentation_group_id = presentation_group_id,
@@ -755,10 +779,12 @@ pub noinline fn startToolVisibleLifecycle(
         .arguments_json = redacted_arguments,
         .place_after_current_transcript = false,
     } });
-    try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
-        .id = .{ .turn_id = turn_id, .call_id = call.id },
-        .text = activity_line,
-    } });
+    if (activity_line) |line| {
+        try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+            .id = .{ .turn_id = turn_id, .call_id = call.id },
+            .text = line,
+        } });
+    }
     return true;
 }
 
@@ -809,34 +835,6 @@ fn finishDeferredToolStatus(
             .summary = line,
         },
     } });
-}
-
-pub fn finishDeniedToolStatusWithResultMemory(
-    hooks: *const AgentRuntimeDeps,
-    arena: Allocator,
-    turn_id: u64,
-    call: ToolCall,
-    status_started: bool,
-    display_target: ?[]const u8,
-    label: []const u8,
-    advertised_dynamic_tool_names: []const []const u8,
-    result: ToolExecutionResult,
-    safe_result: []const u8,
-    result_memory: types.ToolResultMemory,
-) !void {
-    return finishDeniedToolStatusInternal(
-        hooks,
-        arena,
-        turn_id,
-        call,
-        status_started,
-        display_target,
-        label,
-        advertised_dynamic_tool_names,
-        safe_result,
-        result_memory,
-        result.command_result_json,
-    );
 }
 
 fn finishDeniedToolStatusInternal(
@@ -958,6 +956,53 @@ fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
     return std.mem.eql(u8, action, "wait");
 }
 
+pub fn publishSubagentCompletionPreview(
+    hooks: *const AgentRuntimeDeps,
+    arena: Allocator,
+    turn_id: u64,
+    call: ToolCall,
+    result: ToolExecutionResult,
+    advertised_dynamic_tool_names: []const []const u8,
+) !bool {
+    if (!std.mem.eql(u8, call.name, "subagent")) return false;
+    const base_line = if (try tooling_presentation.subagentStatusLine(
+        arena,
+        call,
+        result.model_output,
+    )) |line|
+        try arena.print("● {s}", .{line})
+    else switch (result.status) {
+        .success => try hooks.describe_tool_action_completed(
+            hooks.ctx,
+            arena,
+            call,
+            null,
+            advertised_dynamic_tool_names,
+        ),
+        .failure => try hooks.describe_tool_action_denied(
+            hooks.ctx,
+            arena,
+            call,
+            null,
+            try tooling_presentation.subagentFailureLabel(
+                arena,
+                call,
+                result.model_output,
+            ),
+            advertised_dynamic_tool_names,
+        ),
+    };
+    const line = if (result.subagent_completion) |status|
+        renderedSubagentSummary(hooks, arena, base_line, status)
+    else
+        base_line;
+    try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+        .id = .{ .turn_id = turn_id, .call_id = call.id },
+        .text = line,
+    } });
+    return true;
+}
+
 pub fn finishExecutedToolStatus(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -982,7 +1027,9 @@ pub fn finishExecutedToolStatus(
     else
         null;
     const outcome_decision = command_decision orelse terminal_action_decision;
-    const base_line = if (outcome_decision) |decision| blk: {
+    const base_line = if (try tooling_presentation.subagentStatusLine(arena, call, result.model_output)) |line|
+        line
+    else if (outcome_decision) |decision| blk: {
         const base = try hooks.describe_tool_action_denied(
             hooks.ctx,
             arena,
@@ -992,7 +1039,7 @@ pub fn finishExecutedToolStatus(
             advertised_dynamic_tool_names,
         );
         break :blk if (decision.detail) |detail|
-            try std.fmt.allocPrint(arena, "{s}: {s}", .{ base, detail })
+            try arena.print("{s}: {s}", .{ base, detail })
         else
             base;
     } else switch (result.status) {
@@ -1012,16 +1059,18 @@ pub fn finishExecutedToolStatus(
                 arena,
                 call,
                 display_target,
-                "Failed",
+                try tooling_presentation.subagentFailureLabel(arena, call, safe_result),
                 advertised_dynamic_tool_names,
             );
             if (std.mem.eql(u8, call.name, "shell")) {
+                if (try tool_result_errors.isTerminalEndedFailure(arena, safe_result)) {
+                    break :blk try arena.print("{s} · ended when fx exited", .{base});
+                }
                 if (try tool_result_errors.inspectTerminalActionFieldCorrection(
                     arena,
                     safe_result,
                 )) |correction| {
-                    break :blk try std.fmt.allocPrint(
-                        arena,
+                    break :blk try arena.print(
                         "{s} · {d} invalid field{s}",
                         .{
                             base,
@@ -1039,13 +1088,15 @@ pub fn finishExecutedToolStatus(
                 advertised_dynamic_tool_names,
             )) orelse break :blk base;
             if (detail.len == 0) break :blk base;
-            break :blk try std.fmt.allocPrint(arena, "{s}: {s}", .{ base, detail });
+            break :blk try arena.print("{s}: {s}", .{ base, detail });
         },
     };
     const summary_line = if (result.web_fetch_completion) |completion|
         try formatWebFetchCompletion(arena, base_line, completion)
     else if (result.web_search_completion) |completion|
         try formatWebSearchCompletion(arena, base_line, completion)
+    else if (result.subagent_completion) |status|
+        renderedSubagentSummary(hooks, arena, base_line, status)
     else
         base_line;
     const line = if (diff_entry) |payload| blk: {
@@ -1152,11 +1203,11 @@ pub fn commandOutcomeDecision(
         else
             .{
                 .outcome = .failed,
-                .label = try std.fmt.allocPrint(arena, "Exited {d}", .{code}),
+                .label = try arena.print("Exited {d}", .{code}),
             },
         .signal => |signal| .{
             .outcome = .failed,
-            .label = try std.fmt.allocPrint(arena, "Signaled {d}", .{signal}),
+            .label = try arena.print("Signaled {d}", .{signal}),
         },
         .timed_out => .{ .outcome = .failed, .label = "Timed out" },
         .output_capture_failed => .{
@@ -1179,11 +1230,11 @@ pub fn terminalActionOutcomeDecision(
             .cancelled => .{ .outcome = .cancelled, .label = "Cancelled" },
             .exited => |code| .{
                 .outcome = if (code == 0) .completed else .failed,
-                .label = try std.fmt.allocPrint(arena, "Exited {d}", .{code}),
+                .label = try arena.print("Exited {d}", .{code}),
             },
             .signal => |signal| .{
                 .outcome = .failed,
-                .label = try std.fmt.allocPrint(arena, "Terminated by signal {d}", .{signal}),
+                .label = try arena.print("Terminated by signal {d}", .{signal}),
             },
         },
         .failed => |failed| if (failed == .cancelled)
@@ -1204,6 +1255,11 @@ fn failureStatusDetail(
     safe_result: []const u8,
     advertised_dynamic_tool_names: []const []const u8,
 ) !?[]const u8 {
+    switch (call.argument_integrity) {
+        .malformed_json => return "invalid JSON arguments",
+        .non_object_json => return "non-object arguments",
+        .valid => {},
+    }
     if (result.status_detail) |detail| {
         if (!std.mem.eql(u8, detail, "preflight failed")) return detail;
 
@@ -1218,13 +1274,16 @@ fn failureStatusDetail(
                     std.mem.findScalar(u8, actionable, '\n') == null and
                     std.mem.findScalar(u8, actionable, '\r') == null)
                 {
-                    return actionable;
+                    const masked = try text_utils.maskSecrets(arena, actionable);
+                    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, 256);
+                    return if (encoded.bytes.len == 0) detail else encoded.bytes;
                 }
             }
         }
 
         if (safe_result.len == 0) return detail;
-        const encoded = try text_utils.encodeTerminalSafe(arena, safe_result, 256);
+        const masked = try text_utils.maskSecrets(arena, safe_result);
+        const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, 256);
         return if (encoded.bytes.len == 0) detail else encoded.bytes;
     }
 
@@ -1234,7 +1293,8 @@ fn failureStatusDetail(
         return null;
     }
     const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
-    const encoded = try text_utils.encodeTerminalSafe(arena, detail, 256);
+    const masked_detail = try text_utils.maskSecrets(arena, detail);
+    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
 }
 
@@ -1308,24 +1368,13 @@ fn commandArtifactHandle(
         .string => |value| value,
         else => return null,
     };
-    const handle = std.fs.path.basename(output_file);
+    const handle = std.Io.Dir.path.basename(output_file);
     if (!std.mem.startsWith(u8, handle, "fx-command-") or
         !std.mem.endsWith(u8, handle, ".log") or
         std.mem.endsWith(u8, handle, ".stdout.log") or
         std.mem.endsWith(u8, handle, ".stderr.log")) return null;
     const owned: []const u8 = try arena.dupe(u8, handle);
     return owned;
-}
-
-pub fn malformedToolArgumentsResult(arena: Allocator, call: ToolCall) !ToolExecutionResult {
-    return .{
-        .status = .failure,
-        .model_output = try tool_result_errors.malformedToolArgumentsJson(
-            arena,
-            call.name,
-        ),
-        .status_detail = "invalid JSON arguments",
-    };
 }
 
 pub fn finishCommittedFileStatus(
@@ -1364,9 +1413,21 @@ pub fn finishCommittedFileStatus(
     });
 }
 
+fn renderedSubagentSummary(
+    hooks: *const AgentRuntimeDeps,
+    arena: Allocator,
+    base: []const u8,
+    status: types.SubagentStatus,
+) []const u8 {
+    const renderer = hooks.subagent_status_renderer orelse return base;
+    var buf: [256]u8 = undefined;
+    const status_line = renderer.render(&buf, status);
+    if (status_line.len == 0) return base;
+    return arena.print("{s}\n  {s}", .{ base, status_line }) catch base;
+}
+
 fn formatWebSearchCompletion(arena: Allocator, base: []const u8, completion: types.WebSearchCompletion) ![]const u8 {
-    return std.fmt.allocPrint(
-        arena,
+    return arena.print(
         "{s} \x1b[38;5;245m| {d} search{s} | {d}ms\x1b[0m",
         .{ base, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
     );
@@ -1379,8 +1440,7 @@ fn formatWebFetchCompletion(arena: Allocator, base: []const u8, completion: type
         .stored => " | artifact stored",
         .unavailable => " | artifact unavailable",
     };
-    return std.fmt.allocPrint(
-        arena,
+    return arena.print(
         "{s} \x1b[38;5;245m| {s} | {d} bytes | HTTP {d} | {d}ms | {s}{s}\x1b[0m",
         .{ base, completion.url(), completion.bytes, completion.status, completion.duration_ms, cache, artifact },
     );
@@ -1400,11 +1460,11 @@ pub fn formatToolStatusWithStats(
     const add_style = if (markers.added.len != 0) markers.added else accent;
     const rem_style = if (markers.removed.len != 0) markers.removed else accent;
     if (additions > 0 and deletions > 0) {
-        return std.fmt.allocPrint(arena, "{s} {s}+{d}{s} {s}/{s} {s}-{d}{s}", .{ base, add_style, additions, reset, dim, reset, rem_style, deletions, reset });
+        return arena.print("{s} {s}+{d}{s} {s}/{s} {s}-{d}{s}", .{ base, add_style, additions, reset, dim, reset, rem_style, deletions, reset });
     } else if (additions > 0) {
-        return std.fmt.allocPrint(arena, "{s} {s}+{d}{s}", .{ base, add_style, additions, reset });
+        return arena.print("{s} {s}+{d}{s}", .{ base, add_style, additions, reset });
     } else if (deletions > 0) {
-        return std.fmt.allocPrint(arena, "{s} {s}-{d}{s}", .{ base, rem_style, deletions, reset });
+        return arena.print("{s} {s}-{d}{s}", .{ base, rem_style, deletions, reset });
     }
     return base;
 }
@@ -1416,6 +1476,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.edit_file,
     test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
+    test_builtin_tools.skill,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_activity_tool = blk: {
@@ -1468,14 +1529,14 @@ const ProvisionalStatusTestCapture = struct {
     }
 
     fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(types.ChatMessage)) !void {}
-    fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8) !command_admission.PermissionOutcome {
+    fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
     fn describeToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "started {s}", .{call.name});
+        return arena.print("started {s}", .{call.name});
     }
     fn describeDeniedToolAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
     fn noopPermissionTarget(_: *anyopaque, arena: Allocator, _: ToolCall, _: []const []const u8) ![]const u8 {
         return arena.dupe(u8, "");
@@ -1495,7 +1556,7 @@ const ProvisionalStatusTestCapture = struct {
     fn noopPushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
     fn noopPushHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
     fn noopFormatToolExecutionError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
+        return arena.print("{s}", .{@errorName(err)});
     }
 
     fn captureToolLifecycle(raw: *anyopaque, event: types.ToolLifecycleEvent) !void {
@@ -1538,6 +1599,15 @@ test "formatToolStatusWithStats accents the +/- counts and falls back to neutral
     defer alloc.free(neutral);
     try std.testing.expect(std.mem.find(u8, neutral, "\x1b[38;5;252m+3") != null);
     try std.testing.expect(std.mem.find(u8, neutral, "\x1b[38;5;252m-1") != null);
+}
+
+test "fallback tool display never exposes provider search backend names" {
+    for ([_][]const u8{ "exa_search", "perplexity_search", "parallel_search" }) |name| {
+        try std.testing.expectEqualStrings("web search", fallbackToolDisplay(test_tool_registry, name));
+    }
+    try std.testing.expectEqualStrings("tool call", fallbackToolDisplay(test_tool_registry, "read_file"));
+    try std.testing.expectEqualStrings("tool call", fallbackToolDisplay(test_tool_registry, "run_command"));
+    try std.testing.expectEqualStrings("mcp_custom", fallbackToolDisplay(test_tool_registry, "mcp_custom"));
 }
 
 test "provisional lifecycle preflight distinguishes unknown eligible and ineligible tools" {
@@ -1699,8 +1769,8 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), "src/main.zig");
-    try statuses.publish(&hooks, alloc, 7, "list_1", "glob_files", activityKind(hooks.tool_registry, "glob_files"), eligibleActionLabel("glob_files"), null);
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), "src/main.zig", null);
+    try statuses.publish(&hooks, alloc, 7, "list_1", "glob_files", activityKind(hooks.tool_registry, "glob_files"), eligibleActionLabel("glob_files"), null, null);
 
     try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
     switch (capture.events.items[0]) {
@@ -1729,6 +1799,114 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
     }
 }
 
+test "provisional skill labels select complete resource arguments and ignore opaque hints" {
+    const cases = [_]struct {
+        arguments_json: ?[]const u8,
+        hint: ?[]const u8 = "skill:opaque/location",
+        resource: ?[]const u8 = null,
+    }{
+        .{ .arguments_json = "{\"location\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .resource = "references/types.md" },
+        .{ .arguments_json = "{\"resource\":\"references/types.md\",\"location\":\"skill:opaque/location\"}", .resource = "references/types.md" },
+        .{ .arguments_json = "{\"resource\":\"references/types.md\"}", .hint = null, .resource = "references/types.md" },
+        .{ .arguments_json = null },
+        .{ .arguments_json = "" },
+        .{ .arguments_json = "{\"resource\":\"partial" },
+        .{ .arguments_json = "[]" },
+        .{ .arguments_json = "null" },
+        .{ .arguments_json = "\"references/types.md\"" },
+        .{ .arguments_json = "{\"resource\":null}" },
+        .{ .arguments_json = "{\"resource\":42}" },
+        .{ .arguments_json = "{\"resource\":false}" },
+        .{ .arguments_json = "{\"resource\":[]}" },
+        .{ .arguments_json = "{\"resource\":{}}" },
+        .{ .arguments_json = "{\"resource\":\"\"}" },
+        .{ .arguments_json = "{\"resource\":\"SKILL.md\"}" },
+        .{ .arguments_json = "{\"resource\":\"SKILL.md\",\"offset\":1}" },
+        .{ .arguments_json = "{\"location\":\"skill:opaque/location\"}" },
+        .{ .arguments_json = "{\"name\":\"root-skill\"}" },
+        .{ .arguments_json = "{}" },
+    };
+    const alloc = std.testing.allocator;
+    for (cases) |case| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), case.hint, case.arguments_json);
+        try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+        try std.testing.expectEqual(types.ToolActivityKind.read, capture.events.items[0].provisional.activity_kind);
+        try std.testing.expectEqualStrings("skill_1", capture.events.items[1].progress.id.call_id);
+        var expected_buf: [512]u8 = undefined;
+        const expected = try formatProvisionalProgressLabel(&expected_buf, if (case.resource != null) "Reading skill resource" else "Loading skill", case.resource);
+        try std.testing.expectEqualStrings(expected, capture.events.items[1].progress.text);
+        if (case.resource) |resource| {
+            try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
+        } else {
+            try std.testing.expect(statuses.tracked.items[0].label_value == null);
+        }
+    }
+}
+
+test "provisional skill labels decode escaped UTF-8 and encode terminal controls before copying" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    {
+        const json = try alloc.dupe(u8, "{\"location\":\"skill:opaque/location\",\"resource\":\"r/\\u00e9\\u4e2d\\\"\\u001b[31m\\n\\r\\t\\u0000\\u0080.md\"}");
+        defer alloc.free(json);
+        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), "skill:opaque/location", json);
+    }
+    try std.testing.expectEqualStrings(
+        "● Reading skill resource\x1b[0m \x1b[38;5;245mr/é中\"\\x1b[31m\\x0a\\x0d\\x09\\x00\\u{0080}.md\x1b[0m",
+        capture.events.items[1].progress.text,
+    );
+    try std.testing.expectEqualStrings("r/é中\"\x1b[31m\n\r\t\x00\u{0080}.md", statuses.tracked.items[0].label_value.?);
+}
+
+test "provisional skill labels fall back when encoded resource exceeds the progress buffer" {
+    const alloc = std.testing.allocator;
+    const max_detail = 512 - "● Reading skill resource\x1b[0m \x1b[38;5;245m\x1b[0m".len;
+    for ([_]usize{ max_detail, max_detail + 1, 512, 513, 4096 }) |len| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        const resource = try alloc.alloc(u8, len);
+        defer alloc.free(resource);
+        @memset(resource, 'a');
+        const json = try alloc.print("{{\"resource\":\"{s}\"}}", .{resource});
+        defer alloc.free(json);
+        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), "skill:opaque/location", json);
+        const text = capture.events.items[1].progress.text;
+        if (len == max_detail) {
+            try std.testing.expectEqual(@as(usize, 512), text.len);
+            try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
+        } else {
+            try std.testing.expectEqualStrings("● Loading skill\x1b[0m", text);
+            try std.testing.expect(statuses.tracked.items[0].label_value == null);
+        }
+    }
+}
+
+test "provisional non-skill labels retain hints regardless of completed arguments" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "not JSON", "{\"path\":\"different.txt\",\"resource\":\"references/types.md\"}" }) |json| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", .read, eligibleActionLabel("read_file"), "original.txt", json);
+        try std.testing.expectEqualStrings("● Reading\x1b[0m \x1b[38;5;245moriginal.txt\x1b[0m", capture.events.items[1].progress.text);
+        try std.testing.expectEqualStrings("original.txt", statuses.tracked.items[0].label_value.?);
+    }
+}
+
 test "tracked provisional cancellation retains labels without exposing registered names" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -1740,10 +1918,13 @@ test "tracked provisional cancellation retains labels without exposing registere
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", null);
-    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", "src/main.zig");
-    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null);
-    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null);
+    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", null, null);
+    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", "src/main.zig", null);
+    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "search_1", "exa_search", .read, "Searching", null, null);
+    try statuses.publish(&hooks, alloc, 9, "search_2", "perplexity_search", .read, "Searching", null, null);
+    try statuses.publish(&hooks, alloc, 9, "search_3", "exa_search", .read, "Searching", "cmux theme docs", null);
     try statuses.finishTrackedCancelled(&hooks, alloc, arena, 9);
 
     var terminal_count: usize = 0;
@@ -1757,11 +1938,17 @@ test "tracked provisional cancellation retains labels without exposing registere
             try std.testing.expectEqualStrings("Cancelled tool call", event.terminal.outcome.summary);
         } else if (std.mem.eql(u8, event.terminal.id.call_id, "mcp_1")) {
             try std.testing.expectEqualStrings("Cancelled mcp_custom", event.terminal.outcome.summary);
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "search_1")) {
+            try std.testing.expectEqualStrings("Cancelled web search", event.terminal.outcome.summary);
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "search_2")) {
+            try std.testing.expectEqualStrings("Cancelled web search", event.terminal.outcome.summary);
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "search_3")) {
+            try std.testing.expectEqualStrings("Cancelled cmux theme docs", event.terminal.outcome.summary);
         } else {
             return error.TestUnexpectedToolCallId;
         }
     }
-    try std.testing.expectEqual(@as(usize, 3), terminal_count);
+    try std.testing.expectEqual(@as(usize, 6), terminal_count);
     try std.testing.expectEqual(@as(usize, 0), statuses.tracked.items.len);
 
     const event_count = capture.events.items.len;
@@ -1780,8 +1967,8 @@ test "unmatched recovery starts hide registered names but retain unknown identit
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null);
-    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null);
+    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null, null);
+    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null, null);
     try statuses.finishUnmatchedRecoveryStarts(&hooks, alloc, arena, 9, &.{});
 
     var terminal_count: usize = 0;
@@ -1819,7 +2006,7 @@ test "provisional lifecycle remains distinct from authoritative lifecycle" {
     defer statuses.deinit(alloc);
 
     const call = testToolCall("read_1", "read_file");
-    try statuses.publish(&hooks, alloc, 1, call.id, call.name, activityKind(hooks.tool_registry, call.name), eligibleActionLabel(call.name), null);
+    try statuses.publish(&hooks, alloc, 1, call.id, call.name, activityKind(hooks.tool_registry, call.name), eligibleActionLabel(call.name), null, null);
     try std.testing.expect(try startToolVisibleLifecycle(
         &hooks,
         arena,
@@ -1860,7 +2047,7 @@ test "provisional lifecycle rolls back a newly tracked id when provisional publi
 
     try std.testing.expectError(
         error.TestProvisionalPublicationFailure,
-        statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null),
+        statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null, null),
     );
     try std.testing.expect(!statuses.has("read_1"));
     try std.testing.expectEqual(@as(usize, 0), capture.events.items.len);
@@ -1874,7 +2061,7 @@ test "provisional lifecycle keeps a tracked id when progress publication fails" 
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null);
+    try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null, null);
     try std.testing.expect(statuses.has("read_1"));
     try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
     try std.testing.expect(capture.events.items[0] == .provisional);
@@ -1952,12 +2139,23 @@ test "provisional lifecycle terminal matching prefers final id then provisional 
         .arguments_json = "{",
     });
 
-    try std.testing.expectEqual(@as(usize, 3), capture.events.items.len);
+    _ = try statuses.record(alloc, "provider_search_invalid");
+    try statuses.finishMalformedProviderToolArguments(&hooks, arena, 1, &.{.{
+        .id = "provider_search_invalid",
+        .name = "exa_search",
+        .arguments_json = "{",
+        .argument_integrity = .malformed_json,
+        .provenance = .provider_executed,
+    }});
+
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
     for (capture.events.items) |event| {
         switch (event) {
             .terminal => |terminal| {
                 if (std.mem.eql(u8, terminal.id.call_id, "mcp_invalid")) {
                     try std.testing.expectEqualStrings("mcp_lookup failed: invalid JSON arguments", terminal.outcome.summary);
+                } else if (std.mem.eql(u8, terminal.id.call_id, "provider_search_invalid")) {
+                    try std.testing.expectEqualStrings("web search failed: invalid JSON arguments", terminal.outcome.summary);
                 } else {
                     try std.testing.expectEqualStrings("provisional_read", terminal.id.call_id);
                     try std.testing.expectEqualStrings("tool call failed: invalid JSON arguments", terminal.outcome.summary);
@@ -2016,6 +2214,91 @@ test "admitted provisional settlement consumes visible identity exactly once" {
     }
 }
 
+test "malformed final settlement retains diagnostics and consumes identity once" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |streamed| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        if (streamed) _ = try statuses.record(alloc, "streamed_id");
+        const call: ToolCall = .{
+            .id = "final_id",
+            .name = "shell",
+            .arguments_json = "{}",
+            .argument_integrity = .malformed_json,
+            .provisional_id = if (streamed) "streamed_id" else null,
+        };
+        const result: ToolExecutionResult = .{ .status = .failure, .model_output = "safe diagnostic" };
+        const memory: types.ToolResultMemory = .{ .output_bytes = 15, .stored_output_bytes = 15 };
+        capture.fail_terminal = true;
+        try std.testing.expectError(error.TestTerminalPublicationFailure, statuses.finishExecutedCall(
+            &hooks,
+            alloc,
+            arena,
+            1,
+            call,
+            false,
+            null,
+            result,
+            result.model_output,
+            memory,
+            null,
+            &.{},
+        ));
+        try std.testing.expect(!statuses.hasTerminal(call.id));
+        if (streamed) try std.testing.expect(statuses.has("streamed_id"));
+        capture.fail_terminal = false;
+        try std.testing.expect(try statuses.finishExecutedCall(
+            &hooks,
+            alloc,
+            arena,
+            1,
+            call,
+            false,
+            null,
+            result,
+            result.model_output,
+            memory,
+            null,
+            &.{},
+        ));
+        try std.testing.expect(!try statuses.finishExecutedCall(
+            &hooks,
+            alloc,
+            arena,
+            1,
+            call,
+            false,
+            null,
+            result,
+            result.model_output,
+            memory,
+            null,
+            &.{},
+        ));
+        try std.testing.expectEqual(@as(usize, 0), statuses.tracked.items.len);
+        var terminal_count: usize = 0;
+        for (capture.events.items) |event| switch (event) {
+            .terminal => |terminal| {
+                terminal_count += 1;
+                try std.testing.expectEqualStrings(if (streamed) "streamed_id" else "final_id", terminal.id.call_id);
+                try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+                try std.testing.expectEqualStrings("Failed shell: invalid JSON arguments", terminal.outcome.summary);
+                try std.testing.expectEqualStrings(result.model_output, terminal.result.?);
+                try std.testing.expectEqual(@as(usize, 15), terminal.result_memory.?.output_bytes);
+            },
+            .progress => return error.TestUnexpectedResult,
+            else => {},
+        };
+        try std.testing.expectEqual(@as(usize, 1), terminal_count);
+    }
+}
+
 test "failed admitted settlement keeps identity when terminal publication fails" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2043,13 +2326,29 @@ fn checkProvisionalLifecycleAllocationFailures(alloc: Allocator) !void {
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
 
-    try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null);
+    try statuses.publish(&hooks, alloc, 1, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null, null);
     try std.testing.expect(statuses.has("read_1"));
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try std.testing.expect(try statuses.finishExecutedCall(
+        &hooks,
+        alloc,
+        arena_state.allocator(),
+        1,
+        .{ .id = "read_1", .name = "read_file", .arguments_json = "{}", .argument_integrity = .malformed_json },
+        false,
+        null,
+        .{ .status = .failure, .model_output = "diagnostic" },
+        "diagnostic",
+        .{},
+        null,
+        &.{},
+    ));
 }
 
 test "provisional lifecycle cleans up every copied-id allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkProvisionalLifecycleAllocationFailures,
         .{},
     );
@@ -2105,6 +2404,105 @@ test "provider search completion keeps terminal result detail" {
     }
 }
 
+test "subagent completion preview updates progress without publishing a terminal" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const call = ToolCall{
+        .id = "child",
+        .name = "subagent",
+        .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}",
+    };
+
+    try std.testing.expect(try publishSubagentCompletionPreview(
+        &hooks,
+        arena,
+        3,
+        call,
+        .{ .model_output = "{\"ok\":true,\"pending\":true}" },
+        &.{},
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    switch (capture.events.items[0]) {
+        .progress => |progress| {
+            try std.testing.expectEqual(@as(u64, 3), progress.id.turn_id);
+            try std.testing.expectEqualStrings("child", progress.id.call_id);
+            try std.testing.expectEqualStrings("● Subagent still running · inspect auth", progress.text);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "subagent terminal summary preserves request row before child status" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    var hooks = capture.hooks();
+    var renderer_context: u8 = 0;
+    hooks.subagent_status_renderer = .{
+        .ctx = &renderer_context,
+        .render_fn = struct {
+            fn render(_: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
+                return std.mem.print(buf, "{s} · {s} · {d}k", .{ status.model, status.effort.displayLabel(), status.input_tokens / 1000 }) catch "";
+            }
+        }.render,
+    };
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        3,
+        .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        true,
+        null,
+        .{
+            .model_output = "{\"ok\":true,\"result\":\"done\"}",
+            .subagent_completion = .{
+                .model = "openai/gpt-5.5",
+                .effort = types.ReasoningEffort.literal("high"),
+                .input_tokens = 12_000,
+                .context_window = 100_000,
+            },
+        },
+        "{\"ok\":true,\"result\":\"done\"}",
+        .{},
+        null,
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    switch (capture.events.items[0]) {
+        .terminal => |terminal| try std.testing.expectEqualStrings("started subagent\n  openai/gpt-5.5 · high · 12k", terminal.outcome.summary),
+        else => return error.TestExpectedEqual,
+    }
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        3,
+        .{ .id = "child-fallback", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        true,
+        null,
+        .{ .model_output = "{\"ok\":true,\"result\":\"done\"}" },
+        "{\"ok\":true,\"result\":\"done\"}",
+        .{},
+        null,
+        &.{},
+    );
+    switch (capture.events.items[1]) {
+        .terminal => |terminal| try std.testing.expectEqualStrings("started subagent", terminal.outcome.summary),
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "file edit preflight failure reports the exact mismatch" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2150,7 +2548,7 @@ test "permission target preflight failure reports the actionable reason" {
     var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
     defer capture.deinit();
     const hooks = capture.hooks();
-    const failure = "Permission target resolution failed for grep_files: FileNotFound";
+    const failure = "Path not found: /tmp/missing";
 
     try finishExecutedToolStatus(
         &hooks,
@@ -2178,12 +2576,12 @@ test "permission target preflight failure reports the actionable reason" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed grep_files: Permission target resolution failed for grep_files: FileNotFound",
+        "Failed grep_files: Path not found: /tmp/missing",
         terminal.outcome.summary,
     );
 }
 
-test "dynamic MCP failure derives a bounded terminal-safe detail from the safe result" {
+test "dynamic MCP failure flattens a multi-line detail into a terminal-safe summary" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2192,7 +2590,7 @@ test "dynamic MCP failure derives a bounded terminal-safe detail from the safe r
     defer capture.deinit();
     const hooks = capture.hooks();
     const failure =
-        \\{"server":"plain","tool":"mcp_plain_getThreads","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"Invalid input: labels require at least one item\nretry rejected"}]}}
+        \\{"server":"plain","tool":"mcp_plain_getThreads","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"Invalid input:\u001b[31m labels require at least one item\nretry rejected\n"}]}}
     ;
     const advertised = [_][]const u8{"mcp_plain_getThreads"};
 
@@ -2217,7 +2615,48 @@ test "dynamic MCP failure derives a bounded terminal-safe detail from the safe r
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed mcp_plain_getThreads: Invalid input: labels require at least one item\\x0aretry rejected",
+        "Failed mcp_plain_getThreads: Invalid input:\\x1b[31m labels require at least one item retry rejected",
+        terminal.outcome.summary,
+    );
+    try std.testing.expect(std.mem.findScalar(u8, terminal.outcome.summary, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, terminal.outcome.summary, '\n') == null);
+}
+
+test "dynamic MCP failure flattens a pretty-printed JSON error body" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const failure =
+        \\{"server":"vercel","tool":"mcp_vercel_web_fetch_vercel_url","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"{\n  \"success\": false,\n  \"info\": \"Unable to create share\"\n}"}]}}
+    ;
+    const advertised = [_][]const u8{"mcp_vercel_web_fetch_vercel_url"};
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        7,
+        .{
+            .id = "vercel_failure",
+            .name = "mcp_vercel_web_fetch_vercel_url",
+            .arguments_json = "{}",
+        },
+        true,
+        null,
+        .{ .status = .failure, .model_output = failure },
+        failure,
+        .{ .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        null,
+        &advertised,
+    );
+
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+    try std.testing.expectEqualStrings(
+        "Failed mcp_vercel_web_fetch_vercel_url: { \"success\": false, \"info\": \"Unable to create share\" }",
         terminal.outcome.summary,
     );
 }
@@ -2239,7 +2678,7 @@ test "terminal path scope failure appends the exact status detail" {
             label: []const u8,
             _: []const []const u8,
         ) ![]const u8 {
-            return std.fmt.allocPrint(target, "{s} start", .{label});
+            return target.print("{s} start", .{label});
         }
     }.describe;
     const failure = "{\"failure\":{\"action\":\"start\",\"code\":\"path_outside_workspace\"}}";
@@ -2592,4 +3031,65 @@ test "cancelled shell wait names the observation instead of the process" {
         terminal.outcome.summary,
         "Stopped waiting for",
     ) != null);
+}
+
+// Secret-shaped test needles are written as concatenated fragments so
+// interactive tool-result masking never rewrites the literal in flight.
+test "failure status detail masks secret-shaped failure output" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "call_fail",
+        .name = "mcp__fixture__echo",
+        .arguments_json = "{}",
+    };
+    const result: ToolExecutionResult = .{
+        .model_output = "",
+        .status = .failure,
+        .status_detail = "preflight failed",
+    };
+    const failure_output = "MY_NOTE_" ++ "TOKEN=abcdefgh";
+    const detail = (try failureStatusDetail(arena, call, result, failure_output, &.{})).?;
+    try std.testing.expect(std.mem.find(u8, detail, "[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, detail, "abcdefgh") == null);
+}
+
+test "failure status detail masks the actionable edit failure reason" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "call_edit_fail",
+        .name = "edit_file",
+        .arguments_json = "{}",
+    };
+    const result: ToolExecutionResult = .{
+        .model_output = "",
+        .status = .failure,
+        .status_detail = "preflight failed",
+    };
+    const failure_output = "edit_file failed: MY_NOTE_" ++ "TOKEN=abcdefgh";
+    const detail = (try failureStatusDetail(arena, call, result, failure_output, &.{})).?;
+    try std.testing.expectEqualStrings("MY_NOTE_" ++ "TOKEN=[redacted]", detail);
+}
+
+test "failure status detail terminal-encodes the actionable edit failure reason" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "call_edit_fail",
+        .name = "edit_file",
+        .arguments_json = "{}",
+    };
+    const result: ToolExecutionResult = .{
+        .model_output = "",
+        .status = .failure,
+        .status_detail = "preflight failed",
+    };
+    const failure_output = "edit_file failed: reset terminal\x1b[2J";
+    const detail = (try failureStatusDetail(arena, call, result, failure_output, &.{})).?;
+    try std.testing.expect(std.mem.findScalar(u8, detail, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, detail, "\\x1b") != null);
 }

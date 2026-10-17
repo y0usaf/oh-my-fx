@@ -24,9 +24,9 @@ const promptHistoryStore = {
 const encoded = new TextEncoder();
 const fetch = async () => new Response(new ReadableStream({
   start(controller) {
-    controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"ok"}\n'));
-    controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"}}\n'));
-    controller.enqueue(encoded.encode("data: [DONE]\n"));
+    controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"ok"}\n\n'));
+    controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"}}\n\n'));
+    controller.enqueue(encoded.encode("data: [DONE]\n\n"));
     controller.close();
   },
 }), { status: 200, headers: { "content-type": "text/event-stream" } });
@@ -87,8 +87,11 @@ if (!second.events.some((event) => event.type === "history.restore" && event.cou
 }
 second.runtime.write("\x1b[A");
 await waitFor(second.terminal, () => grid(second.terminal).includes("/exit"), "restored Up-arrow slash command");
-second.runtime.write("\x10");
-await waitFor(second.terminal, () => grid(second.terminal).includes("remember this prompt"), "restored Ctrl-P prompt");
+// A recalled entry lands with the cursor at the end of the line: the next Up
+// moves to the draft start, and only the one after walks further back.
+second.runtime.write("\x1b[A");
+second.runtime.write("\x1b[A");
+await waitFor(second.terminal, () => grid(second.terminal).includes("remember this prompt"), "restored Up-arrow prompt");
 if (grid(second.terminal).includes("durable prompt history unavailable")) {
   throw new Error("terminal reported unavailable history despite a host provider");
 }

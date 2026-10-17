@@ -11,13 +11,27 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-fx is a coding agent harness and CLI written in Zig, optimized for research and embeddability as part of larger systems.
+# fx
 
-It focuses on minimalism and performance across the board, from system prompt design to its tools, feature set, and 7.8 MiB binary.
+fx is a minimal coding agent CLI that still comes with batteries included. It's one native binary written in Zig, so there is no runtime to install, and it runs the same on your laptop, in CI, or inside an agent sandbox. Its output is closer to a Unix shell than an IDE, because the conversation prints into your terminal's scrollback instead of filling the screen.
 
-For end users, its CLI output style and form factor aim to be closer to a Unix shell than a heavy "IDE in the terminal" TUI.
+fx is meant to be embedded and extended. Scripts call it with `fx ask`, editors connect over the Agent Client Protocol (ACP), and JavaScript apps run the same agent core through [libfx](sdk/README.md) with their own tools. Skills, MCP servers, and your project's `AGENTS.md` add to what the agent knows and can do.
 
-It's open source (Apache-2.0), model-agnostic, and suitable for both local and cloud inference.
+<p>
+  <a href="https://vercel.com/labs#labs-products"><img alt="Vercel Labs Product" src="https://img.shields.io/badge/LABS-PRODUCT-0a0a0a.svg?style=for-the-badge&amp;logo=Vercel&amp;labelColor=000000" height="28"></a>
+  <a href="https://github.com/vercel-labs/fx/releases/latest"><img alt="fx CLI release" src="https://img.shields.io/github/v/release/vercel-labs/fx.svg?style=for-the-badge&amp;labelColor=000000&amp;label=release" height="28"></a>
+  <a href="https://github.com/vercel-labs/fx/blob/main/LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/vercel-labs/fx.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
+</p>
+
+## Features
+
+- **Small and fast**: CI fails a pull request if any benchmarked command, such as `fx help` or `fx status --json`, takes longer than 2 ms on Linux ([benchmarks](benchmarks/)). Stable releases for Apple silicon must also fit under a fixed size limit.
+- **Built-in tools**: fx finds, reads, and edits files, runs shell commands, searches the web and reads URLs, and delegates work to subagents. A development server or file watcher can keep running while it works ([tools](https://fx.sh/docs/capabilities/tools)).
+- **Model choice**: sign in to Vercel AI Gateway, use a ChatGPT or Grok subscription, or connect an OpenAI-compatible Chat Completions endpoint such as Ollama or OpenRouter ([custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections)).
+- **Inline output**: you can scroll, search, and copy the conversation like any other command's output, and tmux bindings and copy mode keep working. Terminals that support the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) can also show when fx is busy or waiting for you.
+- **Your own shell**: commands run in your login shell, with your aliases, functions, and `PATH`. fx runs your startup files once and reuses the result until one of them changes, so a slow `.zshrc` doesn't slow down every command. Commands also receive `AI_AGENT=fx` in their environment, so development tools can detect fx.
+- **Permissions**: the default `auto` mode runs routine work, such as editing project files and running tests, without asking. Anything else goes first to a model that checks the exact action for prompt injection or malicious behavior, and fx holds the action if the check finds a problem. Switch to `ask` to approve each action yourself, or to `full-access` to turn the checks off ([permissions](https://fx.sh/docs/configure-fx/permissions)).
+- **Sessions**: fx saves your conversations under `~/.fx/sessions/`, and `fx -c` picks up where you left off in a project. When a conversation fills the model's context, fx compacts older turns but keeps their full text on disk, where the agent can look it up ([sessions](https://fx.sh/docs/using-fx/sessions)).
 
 ## Install
 
@@ -25,141 +39,122 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 curl -fsSL https://fx.sh/setup.sh | bash
 ```
 
-## Run fx
+fx runs on macOS and Linux, on x86_64 and arm64. The installer puts it in `~/.local/bin`. fx checks for updates in the background, and `fx upgrade` installs the latest release right away. [CHANGELOG.md](CHANGELOG.md) lists what changed in each release. You can also [try fx in your browser](https://fx.sh/try) without installing anything.
 
-Sign in with Vercel AI Gateway:
+## Quick start
+
+Sign in with one of these:
 
 ```bash
-fx login
+fx login          # Vercel AI Gateway
+fx login codex    # ChatGPT subscription
+fx login grok     # Grok subscription
+fx setup          # AI Gateway API key
 ```
 
-Or use an eligible ChatGPT subscription through OpenAI Codex OAuth:
+Then open a project and start fx:
 
 ```bash
-fx login codex
+cd your-project
 fx
 ```
 
-Or use an eligible Grok subscription through xAI OAuth:
+Type what you want done and press Enter. `/help` lists the slash commands. If something doesn't work, run `fx doctor` to check your setup.
 
-```bash
-fx login grok
-fx
-```
-
-`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, run `/provider` (alias `/setup`) to move between Gateway, Codex, and Grok: Enter on a subscription provider switches to it or starts its sign-in, and `vercel` opens further columns for the sign-in method, the API key to use, and the Vercel team. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing the provider again from `/provider` starts sign-in.
-
-The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
-
-The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
-
-To use an AI Gateway API key instead:
-
-```bash
-fx setup
-```
-
-Embedding hosts that inject provider authentication at the network boundary can set `FX_AUTH_MODE=host-managed`. In this mode, fx does not read, refresh, or write local model-provider credentials and does not add authentication-owned headers to Gateway, Codex, or Grok requests. The host must authenticate those forwarded requests.
-
-Run fx from a project:
-
-```bash
-cd your_project
-fx
-```
-
-The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands. While fx is working, Enter steers the active turn at its next safe model boundary. If a tool is running, fx waits for it to finish; press Escape to interrupt the active work and apply the update as soon as the turn settles.
-
-Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`, or set `"collapse_tool_calls": true` in `~/.fx/settings.json`, to show one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with Ctrl+O.
-
-The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "workspace": true
-  }
-}
-```
-
-List saved sessions with `fx sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
-
-```bash
-fx session resume last
-fx session resume --id <id>
-```
-
-Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
-
-Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
-
-Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.
-
-fx automatically summarizes a long session into a fresh context window when the active model request reaches 80% of its usable input capacity, then continues the same turn. Run `/compact` to create the same durable handoff immediately and wait for your next prompt.
-
-Use `fx ask` for a single request:
+To send one request without the interactive shell, use `fx ask`. Add `--json` when a script needs to read the result:
 
 ```bash
 fx ask "explain the changes in this repository"
+fx ask --json "summarize the failing tests" | jq -r .final_output
 ```
 
-With `--json`, `output` contains accumulated assistant Markdown across the request, while `final_output` contains only a completed final assistant response and is `""` for interrupted, failed, background, or otherwise absent final responses.
+## Embed and extend
 
-Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
-
-fx starts in `auto` permission mode. Routine understood development actions run directly. Each unresolved action receives one narrow review of the exact pending action for concrete security danger. Prepared file mutations and static tools are reviewed without task text; reviewed commands, dynamic tools, and delegated actions also receive bounded trusted root-request context. A clear result authorizes only that action. A caution or unavailable review holds the action and returns advice to the agent without opening a permission prompt or ending the turn. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
-
-JSON and quiet requests stay noninteractive by default. Add `--prompt-permissions` to allow configured approval prompts when stdin is a TTY. Automatic safety review never opens that prompt. Prompt text is written to stderr, so JSON stdout stays parseable and quiet stdout stays empty. Piped or redirected stdin remains noninteractive and fails instead of waiting for approval.
-
-Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
-
-## Embed fx
-
-fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.
-
-| Surface | Use |
+| Surface | Use it for |
 | --- | --- |
-| `fx acp` | Connect the native agent to editors and other Agent Client Protocol clients. |
-| `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
-| `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
+| <code>fx&nbsp;ask</code> | One request from a script or CI job. `--json` returns structured output, and `--resume` continues a saved session. |
+| <code>fx&nbsp;acp</code> | Editors and other [Agent Client Protocol](https://fx.sh/docs/using-fx/acp) clients, over stdio. |
+| [libfx](https://www.npmjs.com/package/libfx) | The agent core as a JavaScript library, built as a native Node.js addon and as WebAssembly. `createFxAgent()` runs an agent with your own tools, MCP clients, and skills, and `createFxTerminal()` embeds the fx terminal. |
 
-The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
+The [libfx README](sdk/README.md) and the [libfx docs](https://fx.sh/docs/lib) cover the API. The WebAssembly build is experimental.
 
-## Extend fx
+The CLI also picks up these extensions:
 
-In the interactive shell, bare `/mcp` opens an inline browser for servers, tools, resources, and prompts without adding anything to the transcript. Resource and prompt content enters the composer only after an explicit Insert action. Direct `/mcp SUBCOMMAND` forms remain available.
+- **Skills**: fx loads skills from `.fx/skills` and `~/.fx/skills`, and from the folders other agents use, such as `.claude/skills` and `.agents/skills`. The model sees each skill's name and description and reads the full instructions only when it needs them, so installed skills take little room in the context ([skills](https://fx.sh/docs/capabilities/skills)).
+- **MCP servers**: `/mcp add slack` sets up Slack, and `fx mcp` manages servers from your terminal. A server's tool schemas load when the model looks for them ([MCP](https://fx.sh/docs/capabilities/mcp)).
+- **Project instructions**: fx follows the `AGENTS.md` in your project, nested `AGENTS.md` files for the directories they cover, and `~/.fx/AGENTS.md` for your own instructions across projects ([project instructions](https://fx.sh/docs/configure-fx/project-instructions)).
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Run `fx mcp add NAME COMMAND [ARGS...]` for a local server or `fx mcp add --transport http NAME URL` for Streamable HTTP without opening the interactive shell; the equivalent `/mcp add` forms remain available inside fx. A workspace may also provide Claude-compatible `.mcp.json` with a top-level `mcpServers` object. Pending project servers stay disconnected on every surface until they are approved with `/mcp trust approve <server>` or `fx mcp trust approve <server>`. Interactive fx presents the trust prompt after startup. `fx ask` reports skipped pending servers on stderr, and ACP leaves them unavailable. Repository files cannot persist approval or expose environment-expanded values before approval. `/mcp trust reject <server>` rejects one and `/mcp trust reset` clears the workspace choices. Profile entries win same-name collisions. Profile `~/.fx/mcp.json` accepts `mcpServers` as an alias for `mcp`, while writes always use `mcp` and ambiguous server-like keys produce a visible warning. Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report invalid or suspicious trusted MCP profiles without starting their servers.
+## Examples
 
-The `subagent` tool has four operations: `run` delegates one temporary task, `message` creates or continues a named persistent agent, `wait` observes a child, and `stop` cancels its current work. A first message creates the named child immediately; optional instructions set or replace that child's system overlay while preserving fx's trusted base prompt. Child sessions remain private to their saved parent session.
+[`examples/`](examples) has small libfx apps you can run with an AI Gateway API key:
 
-Use `fx mcp list`, `fx mcp path`, and `fx mcp remove NAME` for noninteractive profile management. `fx mcp trust approve|reject NAME`, `fx mcp trust approve-all`, and `fx mcp trust reset` manage workspace-scoped project trust. `fx mcp auth NAME` and `fx mcp logout NAME` run the existing remote credential lifecycle without opening the TUI or contacting the Gateway.
-
-MCP servers have a 30-second startup timeout by default; set `startup_timeout_ms` on a server when its cold start needs a different bound. For direct `docker run` stdio entries, fx uses a private container ID file to remove the owned container after shutdown or startup failure. A configuration that already supplies `--cidfile` keeps ownership of its own cleanup policy.
+- [`node-chat`](examples/node-chat): a terminal chat with streamed replies.
+- [`browser-agent`](examples/browser-agent): the agent in WebAssembly behind a plain HTML form.
+- [`nextjs-agent`](examples/nextjs-agent): a Next.js App Router form with a streaming route handler.
+- [`nuxt-agent`](examples/nuxt-agent): the same idea in Nuxt, with a Nitro route.
 
 ## Documentation
 
-Read the [fx documentation](https://fx.sh/docs).
+The manual at [fx.sh/docs](https://fx.sh/docs) covers models, permissions, configuration, skills, MCP, sessions, and every CLI and slash command.
 
-## Build from source
+## For coding agents
 
-Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
+To learn fx, read the manual as Markdown. [fx.sh/llms.txt](https://fx.sh/llms.txt) indexes every page, [fx.sh/llms-full.txt](https://fx.sh/llms-full.txt) puts the whole manual in one file, and adding `.md` to any docs URL returns that page as Markdown. For the flags of the installed version, run `fx <command> --help`.
+
+To run fx from your own tools, use `fx ask`. It takes the prompt as arguments or on stdin, writes its result to stdout and progress and diagnostics to stderr, and exits with a nonzero status when the request fails. With `--json`, the final answer is in `final_output`.
+
+To inspect a user's setup, run `fx status --json` for configuration and runtime information, or `fx doctor --json` for local health checks. Neither changes the setup.
+
+`fx ask` uses the user's saved permission mode, which is `auto` unless they changed it. Pass `--full-access` only when the user asks for it, because it turns off fx's permission checks.
+
+To change fx itself, read [AGENTS.md](AGENTS.md) first, then build and verify the change as described in [Contributing](#contributing).
+
+## Feedback
+
+Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose). If something looks wrong in your terminal, `/trace` creates a private diagnostic report you can attach ([share feedback](https://fx.sh/docs/using-fx/share-feedback)).
+
+## Contributing
+
+You need [Zig 0.17.0](https://ziglang.org/download/) to build fx:
 
 ```bash
 git clone https://github.com/vercel-labs/fx.git
 cd fx
-zig build -Doptimize=ReleaseSafe
+zig build
 ./zig-out/bin/fx
 ```
 
-Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
+Test your changes with the freshly built `./zig-out/bin/fx`, because a bare `fx` may be an older copy on your `PATH`.
+
+`zig build test` runs the unit tests, which sit next to the code they cover. The end-to-end tests in [`tests/e2e/`](tests/e2e) drive the built binary through tmux and need [Bun](https://bun.sh).
+
+The source is laid out like this:
+
+```text
+fx/
+├── src/
+│   ├── main.zig     entry point that wires everything together
+│   ├── core/        agent loop, sessions, config, permissions, MCP, skills
+│   ├── builtins/    built-in tool specs, providers, and the system prompt
+│   ├── tools/       built-in tools: files, shell, web, skills, subagents
+│   ├── ui/          terminal rendering and input
+│   ├── gateway/     model provider transport
+│   ├── mcp/         MCP v2 engine, behind FX_MCP_ENGINE=v2
+│   └── acp/         Agent Client Protocol server
+├── sdk/             libfx, the JavaScript library
+├── tests/           end-to-end tests and model evals
+└── benchmarks/      startup, memory, and latency benchmarks
+```
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. It covers verification, CI, and PR labels. If a coding agent is helping you, point it at [For coding agents](#for-coding-agents).
+
+## Security
+
+Report vulnerabilities through the [contact page](https://fx.sh/contact) instead of a public issue.
 
 ## License
 
-[Apache-2.0](LICENSE)
-
-Third-party licenses and attributions are listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[Apache-2.0](LICENSE). Third-party licenses and attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Credits
 

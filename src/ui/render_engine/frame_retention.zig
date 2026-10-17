@@ -220,7 +220,6 @@ fn testPlan() paint_plan.PaintPlan {
         .footer_clean_allowed = true,
         .synchronized_update = false,
         .cursor_target = .{ .row = 3, .col = 1, .visible = true },
-        .footer_reservation_source = .footer_layout,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -311,6 +310,7 @@ test "validate retains the primary transcript after a normal-screen transition" 
         4,
         0,
         .{ .restore_normal_screen = .{ .mouse_tracking_active = true } },
+        .none,
     );
     defer movement.deinit(std.testing.allocator);
 

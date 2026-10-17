@@ -1,0 +1,26 @@
+[
+  {
+    "description": "a refused process removes the saved login whoever saved it",
+    "old": "    /\\ store' = IF store = tried[p] THEN 0 ELSE store",
+    "new": "    /\\ store' = 0",
+    "invariant": "NoNewerLoginErased"
+  },
+  {
+    "description": "a process takes a saved login it had or tried before",
+    "old": "    /\\ store # 0\n    /\\ store # tried[p]\n",
+    "new": "    /\\ store # 0\n",
+    "invariant": "NoLoginRetaken"
+  },
+  {
+    "description": "A sign-in isn't remembered as had, so its own refusal would leave it saved",
+    "old": "    /\\ tried' = [tried EXCEPT ![p] = next]",
+    "new": "    /\\ tried' = tried",
+    "invariant": "HeldIsTried"
+  },
+  {
+    "description": "A login taken isn't remembered as tried",
+    "old": "    /\\ tried' = [tried EXCEPT ![p] = store]",
+    "new": "    /\\ tried' = tried",
+    "invariant": "HeldIsTried"
+  }
+]

@@ -102,6 +102,7 @@ pub fn buildAndFlushFrame(
             plan.layout,
         ),
         options.terminal_transition,
+        terminal_diff.FrameReset.fromPlan(plan.reset_terminal, shell.history_reset_uses_ris),
     );
     defer movement.deinit(alloc);
 
@@ -481,7 +482,6 @@ fn testPlan() paint_plan.PaintPlan {
         .footer_clean_allowed = true,
         .synchronized_update = false,
         .cursor_target = .{ .row = 3, .col = 1, .visible = true },
-        .footer_reservation_source = .footer_layout,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -791,10 +791,10 @@ test "buildAndFlushFrame neutral presentation keeps repaint controls without sty
     });
 
     try std.testing.expect(result.is_committed());
-    try std.testing.expect(std.mem.indexOf(u8, sink.bytes.items, "\x1b[?2026h") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.bytes.items, "\x1b[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.bytes.items, "\x1b[31m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.bytes.items, "\x1b]8;") == null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b[?2026h") != null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b[") != null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b]8;") == null);
     try std.testing.expectEqual(@as(u21, 'B'), shell.shadow.cellAt(2, 1).?.codepoint);
     try std.testing.expect(shell.shadow.cellAt(2, 1).?.style.eql(.{}));
 }

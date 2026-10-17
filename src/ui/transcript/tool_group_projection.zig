@@ -1,9 +1,17 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const types = @import("../../core/shared/types.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
+const ui_render = @import("../render.zig");
+const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
+const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
+const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -14,7 +22,10 @@ pub const Projection = struct {
     owned_overrides: std.ArrayList(OwnedOverride) = .empty,
 
     pub fn deinit(self: *Projection, alloc: std.mem.Allocator) void {
-        for (self.owned_overrides.items) |owned| alloc.free(owned.bytes);
+        for (self.owned_overrides.items) |owned| {
+            alloc.free(owned.bytes);
+            alloc.free(owned.line_provenance);
+        }
         self.owned_overrides.deinit(alloc);
         self.entry_actions.deinit(alloc);
         self.* = undefined;
@@ -36,6 +47,13 @@ pub const Projection = struct {
             .kind = kind,
             .bytes = bytes,
         } };
+    }
+
+    fn setOwnedGroup(self: *Projection, alloc: std.mem.Allocator, index: usize, group: GroupBlock) !void {
+        errdefer alloc.free(group.lines);
+        try self.setOwnedOverride(alloc, index, .tool_status, group.bytes);
+        self.owned_overrides.items[self.owned_overrides.items.len - 1].line_provenance = group.lines;
+        self.entry_actions.items[index].override.line_provenance = group.lines;
     }
 
     fn appendOwnedOverride(
@@ -84,6 +102,7 @@ pub const Projection = struct {
                 retained_index += 1;
             } else {
                 alloc.free(owned.bytes);
+                alloc.free(owned.line_provenance);
             }
         }
         self.owned_overrides.items.len = retained_index;
@@ -95,6 +114,7 @@ pub const Projection = struct {
             self.owned_overrides.appendAssumeCapacity(.{
                 .entry_index = start_index + owned.entry_index,
                 .bytes = owned.bytes,
+                .line_provenance = owned.line_provenance,
             });
         }
         suffix.entry_actions.items.len = 0;
@@ -105,6 +125,7 @@ pub const Projection = struct {
 const OwnedOverride = struct {
     entry_index: usize,
     bytes: []u8,
+    line_provenance: []const transcript_blocks.LineProvenance = &.{},
 };
 
 pub const SummaryStyle = struct {
@@ -138,7 +159,6 @@ const Summary = struct {
     timed_out: usize = 0,
     denied: usize = 0,
     cancelled: usize = 0,
-    deferred: usize = 0,
     completion_unreported: usize = 0,
     not_executed: usize = 0,
 };
@@ -280,7 +300,7 @@ fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
             },
             .denied => summary.denied += 1,
             .cancelled => summary.cancelled += 1,
-            .deferred => summary.deferred += 1,
+            .deferred => {},
         }
     }
 }
@@ -341,16 +361,108 @@ fn normalizeStatusPhrase(
     return if (phrase.len == 0) null else phrase;
 }
 
+fn subagentStatusContinuation(
+    entry: TranscriptEntry,
+    detail: ?*const ToolDetailRecord,
+) ?[]const u8 {
+    const record = detail orelse return null;
+    if (record.activity_kind != .subagent) return null;
+    const text = switch (entry) {
+        .raw_bytes => |raw| raw.bytes,
+        else => return null,
+    };
+    const newline = std.mem.findScalar(u8, text, '\n') orelse return null;
+    const continuation = std.mem.trim(u8, text[newline + 1 ..], " \t\r\n");
+    return if (continuation.len == 0) null else continuation;
+}
+
 fn clipSummary(
     alloc: std.mem.Allocator,
     text: []const u8,
     cols: u16,
 ) ![]u8 {
-    if (display_width.visibleWidth(text) <= cols) return try alloc.dupe(u8, text);
+    if (display_width.visibleWidthIgnoringAnsi(text) <= cols) return try alloc.dupe(u8, text);
     if (cols == 0) return try alloc.dupe(u8, "");
     if (cols == 1) return try alloc.dupe(u8, "…");
-    const prefix = display_width.prefixByWidth(text, cols - 1);
-    return try std.fmt.allocPrint(alloc, "{s}…", .{prefix});
+    const prefix = display_width.prefixByWidthIgnoringAnsi(text, cols - 1);
+    const clipped = try alloc.print("{s}…", .{prefix});
+    // A cut inside a styled run can leave the final SGR open; close it so the
+    // accent cannot bleed into whatever the terminal paints next.
+    if (std.mem.find(u8, clipped, "\x1b") == null or std.mem.endsWith(u8, clipped, "\x1b[0m"))
+        return clipped;
+    defer alloc.free(clipped);
+    return try alloc.print("{s}\x1b[0m", .{clipped});
+}
+
+const StatToken = struct {
+    /// Index of the sign character.
+    start: usize,
+    added: bool,
+};
+
+/// Diff counts exist only on write_file/edit_file status lines; every other
+/// phrase can end in a coincidental " +N" / "-N" (for example `head -80`).
+fn entryShowsDiffStats(detail: ?*const ToolDetailRecord) bool {
+    const record = detail orelse return false;
+    return std.mem.eql(u8, record.tool_name, "write_file") or
+        std.mem.eql(u8, record.tool_name, "edit_file");
+}
+
+/// Matches a trailing " +N" or " -N" diff count in a plain status phrase.
+fn trailingStatToken(text: []const u8) ?StatToken {
+    var index = text.len;
+    while (index > 0 and std.ascii.isDigit(text[index - 1])) : (index -= 1) {}
+    if (index == text.len) return null;
+    if (index < 2) return null;
+    const sign = text[index - 1];
+    if (sign != '+' and sign != '-') return null;
+    if (text[index - 2] != ' ') return null;
+    return .{ .start = index - 1, .added = sign == '+' };
+}
+
+/// Re-applies the diff add/remove marker accents to the trailing "+N" / "-N"
+/// counts of a normalized tool status phrase. Normalization strips SGR so
+/// grouped lines stay uniform; the counts keep their green/red so file edits
+/// stay scannable inside collapsed and expanded groups. `ambient_style` is
+/// re-applied between the two counts so the " / " separator keeps the line's
+/// surrounding style. Returns `text` unchanged when no diff count suffix is
+/// present. Caller owns the returned slice.
+fn accentTrailingDiffStats(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    ambient_style: []const u8,
+) ![]u8 {
+    const added_style = ui_render.diff_added_marker_style;
+    const removed_style = ui_render.diff_removed_marker_style;
+    if (added_style.len == 0 and removed_style.len == 0) return try alloc.dupe(u8, text);
+    const reset = "\x1b[0m";
+
+    const last = trailingStatToken(text) orelse return try alloc.dupe(u8, text);
+    if (!last.added and last.start >= 2 and text[last.start - 2] == '/') {
+        const before_slash = std.mem.trimEnd(u8, text[0 .. last.start - 2], " ");
+        if (trailingStatToken(before_slash)) |first| {
+            if (first.added) {
+                return try alloc.print("{s}{s}{s}{s}{s} / {s}{s}{s}", .{
+                    before_slash[0..first.start],
+                    added_style,
+                    before_slash[first.start..],
+                    reset,
+                    ambient_style,
+                    removed_style,
+                    text[last.start..],
+                    reset,
+                });
+            }
+        }
+    }
+    const style = if (last.added) added_style else removed_style;
+    if (style.len == 0) return try alloc.dupe(u8, text);
+    return try alloc.print("{s}{s}{s}{s}", .{
+        text[0..last.start],
+        style,
+        text[last.start..],
+        reset,
+    });
 }
 
 fn applySummaryStyle(
@@ -385,12 +497,22 @@ fn applySummaryStyle(
     return try out.toOwnedSlice();
 }
 
+/// Compact group header: the summary clipped to one row and styled.
 fn formatGroupHeader(
     alloc: std.mem.Allocator,
     summary: Summary,
     cols: u16,
     style: SummaryStyle,
 ) ![]u8 {
+    const plain = try formatGroupSummary(alloc, summary);
+    defer alloc.free(plain);
+    const clipped = try clipSummary(alloc, plain, cols);
+    defer alloc.free(clipped);
+    return applySummaryStyle(alloc, clipped, style);
+}
+
+/// Unstyled, unclipped "● N tool calls · ..." summary row. Caller owns it.
+fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.print("● {d} tool call{s}", .{
@@ -421,18 +543,10 @@ fn formatGroupHeader(
     try appendSegment(&out.writer, summary.failed, "failed");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
-    try appendSegment(
-        &out.writer,
-        summary.deferred,
-        if (summary.deferred == 1) "command not run" else "commands not run",
-    );
-
-    const plain = try out.toOwnedSlice();
-    defer alloc.free(plain);
-    const clipped = try clipSummary(alloc, plain, cols);
-    defer alloc.free(clipped);
-    return applySummaryStyle(alloc, clipped, style);
+    return out.toOwnedSlice();
 }
+
+const GroupBlock = struct { bytes: []u8, lines: []const transcript_blocks.LineProvenance };
 
 fn formatGroupBlock(
     alloc: std.mem.Allocator,
@@ -446,10 +560,17 @@ fn formatGroupBlock(
     cols: u16,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
-) ![]u8 {
+) !GroupBlock {
     const header = try formatGroupHeader(alloc, summary, cols, style);
-    if (collapse_tool_calls) return header;
     defer alloc.free(header);
+    var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
+    errdefer lines.deinit(alloc);
+    try lines.append(alloc, .{ .entry = .{ .entry_id = entries[status_indices[0]].id(), .entry_class = .tool_status, .projection_part = .group_header } });
+    if (collapse_tool_calls) {
+        const bytes = try alloc.dupe(u8, header);
+        errdefer alloc.free(bytes);
+        return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
+    }
 
     var focused_in_group = false;
     var static_count: usize = 0;
@@ -466,7 +587,7 @@ fn formatGroupBlock(
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -489,14 +610,33 @@ fn formatGroupBlock(
             raw_phrase,
             detail,
         ) orelse raw_phrase;
+        const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, style.text_style) orelse phrase;
         static_index += 1;
-        const connector = if (!focused_in_group and static_index == static_count) "└" else "├";
-        const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
+        const last_static_row = !focused_in_group and static_index == static_count;
+        const connector = if (last_static_row) "└" else "├";
+        const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
         const clipped = try clipSummary(scratch, child, cols);
+        try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+        const accented = if (entryShowsDiffStats(detail))
+            try accentTrailingDiffStats(scratch, clipped, style.text_style)
+        else
+            clipped;
         try out.writer.writeByte('\n');
         if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
-        try out.writer.writeAll(clipped);
+        try out.writer.writeAll(accented);
         if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
+        if (subagentStatusContinuation(entry, detail)) |continuation| {
+            const continuation_row = try scratch.print(
+                "{s}{s}",
+                .{ if (last_static_row) "  " else "│ ", continuation },
+            );
+            const clipped_continuation = try clipSummary(scratch, continuation_row, cols);
+            try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+            try out.writer.writeByte('\n');
+            if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
+            try out.writer.writeAll(clipped_continuation);
+            if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
+        }
     }
 
     for (status_indices) |status_index| {
@@ -507,44 +647,197 @@ fn formatGroupBlock(
 
         const terminal = try transcript_blocks.renderEntryToBlock(scratch, entry, cols, styles);
         if (terminal.bytes.len > 0) {
+            try lines.append(alloc, .block_separator);
+            const count = std.mem.count(u8, std.mem.trimEnd(u8, terminal.bytes, "\n"), "\n") + 1;
+            try lines.appendNTimes(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_cancel } }, count);
             try out.writer.writeAll("\n\n");
             try out.writer.writeAll(terminal.bytes);
         }
         terminal.deinit(scratch);
     }
-    return out.toOwnedSlice();
+    const bytes = try out.toOwnedSlice();
+    errdefer alloc.free(bytes);
+    return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
 }
 
+/// The minimum tail length accepted as an identity match in
+/// reprojectTruncatedCommandPhrase. Genuinely truncated command phrases carry
+/// roughly 116 bytes of command prefix (the compact activity bound), so a long
+/// threshold cannot reject a real row; it exists to stop a short coincidental
+/// tail from rewriting an unrelated one.
+const min_reclip_tail_bytes = 16;
+
+/// Returns the longest suffix of `text` that is also a prefix of `base`, when
+/// it is long enough to prove the two share a command. O(n^2) over a frozen
+/// phrase of at most ~120 bytes; the loop count is bounded and tiny.
+fn commandTailMatch(text: []const u8, base: []const u8) ?[]const u8 {
+    var len: usize = @min(text.len, base.len);
+    while (len >= min_reclip_tail_bytes) : (len -= 1) {
+        const tail = text[text.len - len ..];
+        if (std.mem.startsWith(u8, base, tail)) return tail;
+    }
+    return null;
+}
+
+/// Substitutes the stored full command for a status phrase that was truncated
+/// to the compact activity bound at generation time. Records carry the full
+/// display whenever the command is known — captured runs, tty runs, and
+/// terminal-session actions — so the phrase can be reclipped to the live
+/// terminal width instead of keeping the frozen "..." marker.
+///
+/// The row's own leading label is preserved ("Running", "Ran", "Exited 1"):
+/// the stored action label is a start-time prediction that cannot know the
+/// settled outcome, and an active row must never be rewritten to the
+/// completed label. Identity is proven by the command itself — the frozen
+/// tail is a generation-time prefix of the stored display — which is a
+/// stronger guard than comparing the predicted label against the row.
 fn reprojectTruncatedCommandPhrase(
     scratch: std.mem.Allocator,
     phrase: []const u8,
     detail: ?*const ToolDetailRecord,
 ) !?[]const u8 {
     const record = detail orelse return null;
-    if (!record.isCapturedCommand() or record.outcome != .completed) return null;
     if (!std.mem.endsWith(u8, phrase, "...")) return null;
     const command = record.command_display orelse return null;
-    const action = record.command_action_label orelse return null;
-    return try std.fmt.allocPrint(scratch, "{s} {s}", .{ action, command });
+    if (command.len == 0) return null;
+    const body = phrase[0 .. phrase.len - "...".len];
+    const tail = commandTailMatch(body, command) orelse return null;
+    const label = body[0 .. body.len - tail.len];
+    if (label.len == 0 or label[label.len - 1] != ' ') return null;
+    return try scratch.print("{s}{s}", .{ label, command });
 }
 
+/// Shell-highlight the command portion of a command phrase ("Running <cmd>",
+/// "Ran <cmd>"). The leading action word and connector stay in the row's
+/// ambient style; only the command's syntax tokens pick up palette colors.
+/// `base_style` (the row's text style, when any) is re-established after every
+/// token close so untokenized text keeps the row's color.
+/// Multi-word status labels that can lead a command row when no label was
+/// recorded. Mirrors the terminal-outcome labels composed in
+/// tool_admission.permissionDeniedStatusLabel and the lifecycle rows.
+const known_multiword_labels = [_][]const u8{
+    "Denied by auto agent",
+    "Review evidence incomplete",
+    "Permission required",
+    "Safety caution",
+    "Review unavailable",
+    "Timed out",
+};
+
+fn knownLabelPrefix(phrase: []const u8) ?usize {
+    for (known_multiword_labels) |label| {
+        if (std.mem.startsWith(u8, phrase, label) and phrase.len > label.len and phrase[label.len] == ' ')
+            return label.len;
+    }
+    return null;
+}
+
+fn highlightCommandPhrase(
+    scratch: std.mem.Allocator,
+    phrase: []const u8,
+    detail: ?*const ToolDetailRecord,
+    base_style: []const u8,
+) !?[]const u8 {
+    const record = detail orelse return null;
+    if (record.activity_kind != .command) return null;
+    // Prefer the recorded action label so multi-word labels ("Timed out")
+    // split at the true boundary. Otherwise trust the stored command text:
+    // prose-prefixed rows ("Reading project instructions before continuing:
+    // <cmd>") end with it. Then known multi-word labels, then first space.
+    const label_end = if (record.command_action_label) |action|
+        if (std.mem.startsWith(u8, phrase, action) and phrase.len > action.len and phrase[action.len] == ' ')
+            action.len
+        else
+            null
+    else
+        null;
+    const display_end = if (record.command_display) |display| blk: {
+        if (display.len == 0 or phrase.len <= display.len + 1) break :blk null;
+        if (!std.mem.endsWith(u8, phrase, display)) break :blk null;
+        const split_at = phrase.len - display.len - 1;
+        break :blk if (phrase[split_at] == ' ') split_at else null;
+    } else null;
+    const split = label_end orelse display_end orelse knownLabelPrefix(phrase) orelse std.mem.findScalar(u8, phrase, ' ') orelse return null;
+    const command = phrase[split + 1 ..];
+    if (command.len == 0) return null;
+    const theme = shared_theme.current();
+    const profile = code_highlight_languages.resolve("sh") orelse return null;
+    const variant: code_highlight.Theme = if (theme.light) .light else .dark;
+    // Commands without tokens keep their exact plain bytes.
+    const plain = try code_highlight.highlight(scratch, command, profile, variant, null);
+    if (std.mem.eql(u8, plain, command)) return null;
+    const highlighted = try code_highlight.highlight(
+        scratch,
+        command,
+        profile,
+        variant,
+        if (base_style.len > 0) base_style else null,
+    );
+    return try scratch.print("{s} {s}", .{ phrase[0..split], highlighted });
+}
+
+/// One expanded child as complete logical rows. Expanded rows are never
+/// clipped; materializeExpandedOverride wraps them to the live width.
 fn formatExpandedChild(
     alloc: std.mem.Allocator,
     entry: TranscriptEntry,
     detail: ?*const ToolDetailRecord,
     connector: []const u8,
-    cols: u16,
 ) ![]u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
-    const phrase = switch (entry) {
+    const raw_phrase = switch (entry) {
         .raw_bytes => |raw| try normalizeStatusPhrase(scratch, raw.bytes),
         else => null,
     } orelse if (detail) |record| record.tool_name else "tool activity";
-    const child = try std.fmt.allocPrint(scratch, "{s} {s}", .{ connector, phrase });
-    const clipped = try clipSummary(scratch, child, cols);
-    return alloc.dupe(u8, clipped);
+    const phrase = try reprojectTruncatedCommandPhrase(
+        scratch,
+        raw_phrase,
+        detail,
+    ) orelse raw_phrase;
+    // Expanded rows carry no ambient text style, so tokens highlight over the
+    // terminal default foreground.
+    const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, "") orelse phrase;
+    const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
+    const accented = if (entryShowsDiffStats(detail))
+        try accentTrailingDiffStats(scratch, child, "")
+    else
+        child;
+    const continuation = subagentStatusContinuation(entry, detail) orelse return alloc.dupe(u8, accented);
+    return alloc.print("{s}\n{s}{s}", .{
+        accented,
+        if (std.mem.eql(u8, connector, "└")) "  " else "│ ",
+        continuation,
+    });
+}
+
+test "expanded subagent row preserves status continuation" {
+    const alloc = std.testing.allocator;
+    const entry = TranscriptEntry{ .raw_bytes = .{
+        .id = 7,
+        .bytes = "● reviewer working · inspect auth\n  gpt-5.5 · high · 12k/256k 4%\n",
+        .class = .tool_status,
+    } };
+    const detail = ToolDetailRecord{
+        .entry_id = 7,
+        .tool_name = @constCast("subagent"),
+        .activity_kind = .subagent,
+    };
+    const row = try formatExpandedChild(alloc, entry, &detail, "└");
+    defer alloc.free(row);
+
+    try std.testing.expectEqualStrings(
+        "└ reviewer working · inspect auth\n  gpt-5.5 · high · 12k/256k 4%",
+        row,
+    );
+
+    const middle_row = try formatExpandedChild(alloc, entry, &detail, "├");
+    defer alloc.free(middle_row);
+    try std.testing.expectEqualStrings(
+        "├ reviewer working · inspect auth\n│ gpt-5.5 · high · 12k/256k 4%",
+        middle_row,
+    );
 }
 
 fn installExpandedGroup(
@@ -555,11 +848,9 @@ fn installExpandedGroup(
     details: []const ToolDetailRecord,
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     summary: Summary,
-    cols: u16,
-    style: SummaryStyle,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !void {
-    const header = try formatGroupHeader(alloc, summary, cols, style);
+    const header = try formatGroupSummary(alloc, summary);
     defer alloc.free(header);
     for (status_indices, 0..) |status_index, child_index| {
         try build_checkpoint.tick(checkpoint);
@@ -567,10 +858,10 @@ fn installExpandedGroup(
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         const connector = if (child_index + 1 == status_indices.len) "└" else "├";
-        const child = try formatExpandedChild(alloc, entry, detail, connector, cols);
+        const child = try formatExpandedChild(alloc, entry, detail, connector);
         defer alloc.free(child);
         const bytes = if (child_index == 0)
-            try std.fmt.allocPrint(alloc, "{s}\n{s}", .{ header, child })
+            try alloc.print("{s}\n{s}", .{ header, child })
         else
             try alloc.dupe(u8, child);
         try projection.setOwnedOverride(alloc, status_index, .tool_status, bytes);
@@ -689,16 +980,20 @@ pub fn buildStyled(
     };
 }
 
+/// Full-transcript tool rows fitted to `cols`. Builds the same relationships
+/// the live full transcript caches and materializes them, so every
+/// full-transcript build shares one width policy.
 pub fn buildExpandedStyledInterruptible(
     alloc: std.mem.Allocator,
     entries: []const TranscriptEntry,
     details: []const ToolDetailRecord,
     cols: u16,
     style: SummaryStyle,
-    styles: transcript_blocks.Styles,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, style, styles, .expanded, null, checkpoint);
+    var relationships = try buildExpandedRelationshipsInterruptible(alloc, entries, details, checkpoint);
+    defer relationships.deinit(alloc);
+    return materializeExpandedRelationshipsRangeInterruptible(alloc, &relationships, 0, cols, style, checkpoint);
 }
 
 pub fn buildExpandedRelationshipsInterruptible(
@@ -756,6 +1051,9 @@ pub fn materializeExpandedRelationshipsRangeInterruptible(
     return projection;
 }
 
+/// Fits one expanded override to `cols` without hiding any of it. The full
+/// transcript exists to show everything, so rows word-wrap instead of
+/// clipping, and each wrapped row continues under its own tree rail.
 fn materializeExpandedOverride(
     alloc: std.mem.Allocator,
     bytes: []const u8,
@@ -769,17 +1067,29 @@ fn materializeExpandedOverride(
     while (lines.next()) |line| {
         if (!first) try out.writer.writeByte('\n');
         first = false;
-        const clipped = try clipSummary(alloc, line, cols);
-        defer alloc.free(clipped);
-        if (std.mem.startsWith(u8, line, "●")) {
-            const styled = try applySummaryStyle(alloc, clipped, style);
-            defer alloc.free(styled);
-            try out.writer.writeAll(styled);
-        } else {
-            try out.writer.writeAll(clipped);
-        }
+        const styled = if (std.mem.startsWith(u8, line, "●"))
+            try applySummaryStyle(alloc, line, style)
+        else
+            null;
+        defer if (styled) |value| alloc.free(value);
+        const wrapped = try transcript_blocks.wrapFullToolStatus(
+            alloc,
+            styled orelse line,
+            cols,
+            expandedContinuationPrefix(line),
+        );
+        defer alloc.free(wrapped);
+        try out.writer.writeAll(wrapped);
     }
     return out.toOwnedSlice();
+}
+
+/// Rows written by installExpandedGroup start with their tree glyph. A
+/// non-final child ("├") and its continuation ("│") keep the rail on wrapped
+/// rows; the header and the final child ("└") indent past their marker.
+fn expandedContinuationPrefix(row: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, row, "├") or std.mem.startsWith(u8, row, "│")) return "│ ";
+    return "  ";
 }
 
 pub fn buildStyledFocused(
@@ -896,6 +1206,7 @@ fn buildWithStyleAndStats(
 
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
+        if (mode == .compact and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, &detail_indices, entry_id, stats);
         if (statusNamesAsk(entry, detail)) continue;
@@ -933,8 +1244,6 @@ fn buildWithStyleAndStats(
                 details,
                 &detail_indices,
                 group.summary,
-                cols,
-                style,
                 checkpoint,
             );
         }
@@ -980,8 +1289,6 @@ fn buildWithStyleAndStats(
                 details,
                 &detail_indices,
                 summary,
-                cols,
-                style,
                 checkpoint,
             );
         }
@@ -991,7 +1298,11 @@ fn buildWithStyleAndStats(
     var index: usize = 0;
     while (index < entries.len) {
         try build_checkpoint.tick(checkpoint);
-        if (projection.entry_actions.items[index] != .keep) {
+        // Hidden entries keep their action, but grouping below skips them, so
+        // they must not anchor a group either.
+        if (projection.entry_actions.items[index] != .keep or
+            !transcript_blocks.isEntryVisibleInCompactPresentation(entries[index]))
+        {
             index += 1;
             continue;
         }
@@ -1029,7 +1340,7 @@ fn buildWithStyleAndStats(
                 style,
                 styles,
             );
-            try projection.setOwnedOverride(alloc, index, .tool_status, bytes);
+            try projection.setOwnedGroup(alloc, index, bytes);
             index += 1;
             continue;
         }
@@ -1047,6 +1358,7 @@ fn buildWithStyleAndStats(
 
         while (index < entries.len) : (index += 1) {
             try build_checkpoint.tick(checkpoint);
+            if (!transcript_blocks.isEntryVisibleInCompactPresentation(entries[index])) continue;
             if (presentation_group_indices[index] != null) break;
             if (toolStatusEntryId(entries[index])) |group_entry_id| {
                 const group_detail = detailForEntry(details, &detail_indices, group_entry_id, stats);
@@ -1076,7 +1388,7 @@ fn buildWithStyleAndStats(
             style,
             styles,
         );
-        try projection.setOwnedOverride(alloc, first_index, .tool_status, bytes);
+        try projection.setOwnedGroup(alloc, first_index, bytes);
     }
 
     return projection;
@@ -1151,12 +1463,40 @@ test "minimal tool group summary uses semantic category order and outcomes" {
         "● 3 tool calls · 1 read · 1 edit · 1 command · 1 failed\n" ++
             "├ Read runtime.zig\n" ++
             "├ Edited main.zig\n" ++
-            "└ Ran zig build",
+            "└ Ran \x1b[38;5;252mzig\x1b[39m build",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
     try std.testing.expectEqual(types.ToolActivityKind.read, details[0].activity_kind.?);
+}
+
+test "grouped subagent status keeps the vertical continuation for middle rows" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Subagent working · inspect auth\n  glm-5.3-flash · max\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Subagent working · inspect auth\n  glm-5.3-flash · max\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Subagent working · inspect auth\n  glm-5.3-flash · max\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Subagent working · inspect auth\n  glm-5.3-flash · max\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+        .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+        .{ .entry_id = 3, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+        .{ .entry_id = 4, .tool_name = @constCast("subagent"), .activity_kind = .subagent },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 4 tool calls · 4 subagent\n" ++
+            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
+            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
+            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
+            "└ Subagent working · inspect auth\n  glm-5.3-flash · max",
+        projection.entry_actions.items[0].override.bytes,
+    );
 }
 
 test "small minimal tool groups surface canonical action targets" {
@@ -1184,11 +1524,153 @@ test "small minimal tool groups surface canonical action targets" {
     );
 }
 
-test "minimal tool groups preserve denied and not-run action text" {
+test "accentTrailingDiffStats re-applies add and remove marker styles" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const added = try accentTrailingDiffStats(alloc, "Wrote note.txt +143", "");
+    defer alloc.free(added);
+    try std.testing.expectEqualStrings("Wrote note.txt [G]+143\x1b[0m", added);
+
+    const removed = try accentTrailingDiffStats(alloc, "Edited main.zig -27", "");
+    defer alloc.free(removed);
+    try std.testing.expectEqualStrings("Edited main.zig [R]-27\x1b[0m", removed);
+
+    const both = try accentTrailingDiffStats(alloc, "Edited main.zig +12 / -3", "[dim]");
+    defer alloc.free(both);
+    try std.testing.expectEqualStrings("Edited main.zig [G]+12\x1b[0m[dim] / [R]-3\x1b[0m", both);
+
+    const plain = try accentTrailingDiffStats(alloc, "Read runtime.zig", "");
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("Read runtime.zig", plain);
+
+    const not_a_stat = try accentTrailingDiffStats(alloc, "Wrote notes v2", "");
+    defer alloc.free(not_a_stat);
+    try std.testing.expectEqualStrings("Wrote notes v2", not_a_stat);
+
+    ui_render.diff_added_marker_style = "";
+    ui_render.diff_removed_marker_style = "";
+    const unstyled = try accentTrailingDiffStats(alloc, "Wrote note.txt +143", "");
+    defer alloc.free(unstyled);
+    try std.testing.expectEqualStrings("Wrote note.txt +143", unstyled);
+}
+
+test "collapsed tool group keeps diff count accents" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Edited\x1b[0m \x1b[38;5;245mmain.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 3 tool calls · 1 read · 1 write · 1 edit\n" ++
+            "├ Read runtime.zig\n" ++
+            "├ Wrote note.txt [G]+143\x1b[0m\n" ++
+            "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "grouped command lines shell-highlight verbs and numeric flags" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran\x1b[0m \x1b[38;5;245mcat log.txt | head -80\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+2\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mdetached.txt\x1b[0m \x1b[38;2;48;164;108m+7\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .outcome = .completed },
+        // entry 3 has no detail record; without a recorded file mutation the
+        // suffix cannot be trusted and stays plain.
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 3 tool calls · 1 write · 1 command\n" ++
+            "├ Ran \x1b[38;5;252mcat\x1b[39m log.txt \x1b[38;5;252m|\x1b[39m \x1b[38;5;252mhead\x1b[39m \x1b[38;5;250m-80\x1b[39m\n" ++
+            "├ Wrote note.txt [G]+2\x1b[0m\n" ++
+            "└ Wrote detached.txt +7",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "expanded tool group keeps diff count accents" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mnote.txt\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .outcome = .completed },
+    };
+
+    var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{
+        .marker_style = "<marker>",
+        .text_style = "<secondary>",
+        .reset_style = "<reset>",
+    }, null);
+    defer projection.deinit(alloc);
+    const expanded = projection.entry_actions.items[0].override.bytes;
+
+    try std.testing.expect(std.mem.find(u8, expanded, "\n└ Wrote note.txt [G]+143\x1b[0m") != null);
+}
+
+test "clipSummary clips styled text by visible width and closes open SGR" {
+    const alloc = std.testing.allocator;
+
+    const before_style = try clipSummary(alloc, "├ Wrote a/very/long/path/that/overflows.zig \x1b[32m+143\x1b[0m", 20);
+    defer alloc.free(before_style);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(before_style) <= 20);
+    try std.testing.expect(std.mem.find(u8, before_style, "\x1b") == null);
+
+    const inside_style = try clipSummary(alloc, "├ Wrote x \x1b[32m+143\x1b[0m", 13);
+    defer alloc.free(inside_style);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(inside_style) <= 13);
+    try std.testing.expect(std.mem.endsWith(u8, inside_style, "\x1b[0m"));
+}
+
+test "minimal tool groups keep instruction refresh neutral and denials visible" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "⊘ Denied by auto agent zig build\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Not run — project instructions changed: runtime.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Reading project instructions before continuing: runtime.zig\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("terminal"), .activity_kind = .command, .outcome = .denied },
@@ -1199,27 +1681,28 @@ test "minimal tool groups preserve denied and not-run action text" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 command · 1 denied · 1 command not run\n" ++
-            "├ Denied by auto agent zig build\n" ++
-            "└ Not run — project instructions changed: runtime.zig",
+        "● 2 tool calls · 1 read · 1 command · 1 denied\n" ++
+            "├ Denied by auto agent \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "└ Reading project instructions before continuing: runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
 }
 
-test "minimal tool group pluralizes context-withheld commands" {
+test "minimal tool group counts instruction refresh attempts without failure counts" {
     const alloc = std.testing.allocator;
-    const header = try formatGroupHeader(
-        alloc,
-        .{ .total = 3, .deferred = 3 },
-        120,
-        .{},
-    );
+    var summary = Summary{};
+    for (0..3) |_| {
+        observeTool(&summary, &.{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .outcome = .deferred,
+        });
+    }
+    const header = try formatGroupHeader(alloc, summary, 120, .{});
     defer alloc.free(header);
 
-    try std.testing.expectEqualStrings(
-        "● 3 tool calls · 3 commands not run",
-        header,
-    );
+    try std.testing.expectEqualStrings("● 3 tool calls · 3 commands", header);
 }
 
 test "focused tool remains counted but is omitted from stable child rows" {
@@ -1261,18 +1744,50 @@ test "minimal command details expose running completed and failed process states
 
     try std.testing.expectEqualStrings(
         "● 3 tool calls · 3 commands · 1 failed\n" ++
-            "├ Running rg snapshot\n" ++
-            "├ Ran zig build\n" ++
-            "└ Ran zig build test",
+            "├ Running \x1b[38;5;252mrg\x1b[39m snapshot\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "└ Ran \x1b[38;5;252mzig\x1b[39m build test",
         projection.entry_actions.items[0].override.bytes,
     );
 }
 
+test "completed command rows shell-highlight quoted strings without coloring the action" {
+    const alloc = std.testing.allocator;
+    const command = "printf 'hello world'";
+    const arguments_json = try alloc.print(
+        "{{\"command\":{f}}}",
+        .{std.json.fmt(command, .{})},
+    );
+    defer alloc.free(arguments_json);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran\x1b[0m \x1b[38;5;245mprintf 'hello world'\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .captured_command = true,
+        .activity_kind = .command,
+        .arguments_json = arguments_json,
+        .command_display = @constCast(command),
+        .command_action_label = @constCast("Ran"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+
+    var projection = try build(alloc, &entries, &details, 240);
+    defer projection.deinit(alloc);
+    const row = projection.entry_actions.items[0].override.bytes;
+
+    // The header, connector, and action label stay uncolored; the command
+    // verb and quoted string pick up the syntax palette and close again.
+    try std.testing.expect(std.mem.startsWith(u8, row, "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m "));
+    try std.testing.expect(std.mem.find(u8, row, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
+}
+
 test "minimal completed command rows reproject stored arguments at the current width" {
     const alloc = std.testing.allocator;
-    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
-    const arguments_json = try std.fmt.allocPrint(
-        alloc,
+    const command = "printf " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8);
+    const arguments_json = try alloc.print(
         "{{\"command\":{f}}}",
         .{std.json.fmt(command, .{})},
     );
@@ -1301,13 +1816,14 @@ test "minimal completed command rows reproject stored arguments at the current w
     var narrow = try build(alloc, &entries, &details, 80);
     defer narrow.deinit(alloc);
     const narrow_row = narrow.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…"));
+    // The row carries styling (the command verb token), so the clip closes it.
+    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…\x1b[0m"));
     try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
 
     var wide = try build(alloc, &entries, &details, 240);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran " ++ command,
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -1323,9 +1839,8 @@ test "minimal completed command rows reproject stored arguments at the current w
     defer legacy.deinit(alloc);
     try std.testing.expect(std.mem.endsWith(u8, legacy.entry_actions.items[0].override.bytes, "..."));
 
-    const relative_command = "cd ./packages/cli && " ++ ("printf relative-path " ** 6);
-    const relative_arguments_json = try std.fmt.allocPrint(
-        alloc,
+    const relative_command = "cd ./packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
+    const relative_arguments_json = try alloc.print(
         "{{\"command\":{f}}}",
         .{std.json.fmt(relative_command, .{})},
     );
@@ -1353,7 +1868,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran " ++ relative_command,
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path ",
         relative.entry_actions.items[0].override.bytes,
     );
 
@@ -1378,9 +1893,382 @@ test "minimal completed command rows reproject stored arguments at the current w
     var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
     defer compatibility.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Installed skill " ++ command,
+        "● 1 tool call · 1 command\n└ Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
         compatibility.entry_actions.items[0].override.bytes,
     );
+}
+
+test "completed session and tty command rows reproject stored commands at the current width" {
+    const alloc = std.testing.allocator;
+    const tty_command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
+    const observe_command = "npm run " ++ text_utils.repeat("dev-server-", 12);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mbun run pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeli...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+        .{ .raw_bytes = .{
+            .id = 2,
+            .bytes = "● Observed\x1b[0m \x1b[38;5;245mnpm run dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-server-dev-s...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    // tty runs and terminal-session observations are not captured commands;
+    // their full display arrives only through stored command metadata.
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = false,
+            .activity_kind = .command,
+            .command_display = @constCast(tty_command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("shell"),
+            .captured_command = false,
+            .activity_kind = .command,
+            .command_display = @constCast(observe_command),
+            .command_action_label = @constCast("Observed"),
+            .outcome = .completed,
+        },
+    };
+
+    var narrow = try build(alloc, &entries, &details, 80);
+    defer narrow.deinit(alloc);
+    const narrow_rows = narrow.entry_actions.items[0].override.bytes;
+    var narrow_lines = std.mem.splitScalar(u8, narrow_rows, '\n');
+    _ = narrow_lines.next(); // group header
+    const narrow_tty = narrow_lines.next().?;
+    const narrow_observe = narrow_lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…\x1b[0m"));
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_tty) <= 80);
+    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ Observed \x1b[38;5;252mnpm\x1b[39m run dev-server-"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…\x1b[0m"));
+    // Reprojection replaces the frozen ASCII marker before reclipping.
+    try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
+
+    var wide = try build(alloc, &entries, &details, 400);
+    defer wide.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 2 commands\n" ++
+            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
+            "└ Observed \x1b[38;5;252mnpm\x1b[39m run " ++ text_utils.repeat("dev-server-", 12),
+        wide.entry_actions.items[0].override.bytes,
+    );
+}
+
+/// Paints expanded rows through the terminal engine so tests assert what the
+/// full transcript shows. Each row must already fit `cols`.
+fn paintExpandedRowsForTest(alloc: std.mem.Allocator, bytes: []const u8, cols: u16) !vt_emulator.Grid {
+    var rows: u16 = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| : (rows += 1) {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+    }
+    var grid = try vt_emulator.Grid.init(alloc, cols, rows);
+    errdefer grid.deinit();
+    try grid.feed(bytes);
+    return grid;
+}
+
+/// Visible text of grid rows `first..last` with tree glyphs and spaces
+/// removed, so a wrapped row compares equal to its source wherever the wrap
+/// fell. The caller owns the result.
+fn paintedTreeTextForTest(
+    alloc: std.mem.Allocator,
+    grid: *const vt_emulator.Grid,
+    first: u16,
+    last: u16,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(alloc);
+    var row = first;
+    while (row <= last) : (row += 1) {
+        row_text.clearRetainingCapacity();
+        try grid.rowTextTrimmed(row, &row_text);
+        var text: []const u8 = row_text.items;
+        for ([_][]const u8{ "├", "└", "│" }) |glyph| {
+            if (std.mem.startsWith(u8, text, glyph)) {
+                text = text[glyph.len..];
+                break;
+            }
+        }
+        for (text) |byte| {
+            if (byte != ' ') try out.append(alloc, byte);
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn withoutSpacesForTest(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (text) |byte| {
+        if (byte != ' ') try out.append(alloc, byte);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn lastContentCellForTest(grid: *const vt_emulator.Grid, row: u16) vt_emulator.Cell {
+    var col = grid.cols;
+    while (col > 1) : (col -= 1) {
+        const cell = grid.cellAt(row, col).?;
+        if (cell.width > 0 and cell.codepoint != ' ') return cell;
+    }
+    return grid.cellAt(row, 1).?;
+}
+
+test "expanded rows wrap under their tree rail and keep command styling" {
+    const alloc = std.testing.allocator;
+    const first_command = "printf 'alpha beta gamma delta epsilon zeta eta theta'";
+    const last_command = "printf 'iota kappa lambda mu nu xi omicron pi rho'";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran\x1b[0m \x1b[38;5;245m" ++ first_command ++ "\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran\x1b[0m \x1b[38;5;245m" ++ last_command ++ "\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .command_display = @constCast(first_command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .command_display = @constCast(last_command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+        },
+    };
+    const cols: u16 = 24;
+
+    var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, cols, .{}, null);
+    defer projection.deinit(alloc);
+    const rows = try alloc.print("{s}\n{s}", .{
+        projection.entry_actions.items[0].override.bytes,
+        projection.entry_actions.items[1].override.bytes,
+    });
+    defer alloc.free(rows);
+    try std.testing.expect(std.mem.find(u8, rows, "…") == null);
+
+    var grid = try paintExpandedRowsForTest(alloc, rows, cols);
+    defer grid.deinit();
+    try std.testing.expectEqual(@as(u21, '●'), grid.cellAt(1, 1).?.codepoint);
+    // The header itself is wider than 24 columns and wraps before the first child.
+    var first_child_row: u16 = 2;
+    while (first_child_row <= grid.rows and grid.cellAt(first_child_row, 1).?.codepoint != '├') : (first_child_row += 1) {}
+    var last_child_row: u16 = first_child_row + 1;
+    while (last_child_row <= grid.rows and grid.cellAt(last_child_row, 1).?.codepoint != '└') : (last_child_row += 1) {}
+    try std.testing.expect(first_child_row > 2);
+    try std.testing.expect(last_child_row > first_child_row + 1 and last_child_row < grid.rows);
+
+    // A non-final child continues under an unstyled rail, and its quoted
+    // argument keeps the string color across every wrap.
+    var row: u16 = first_child_row + 1;
+    while (row < last_child_row) : (row += 1) {
+        const rail = grid.cellAt(row, 1).?;
+        try std.testing.expectEqual(@as(u21, '│'), rail.codepoint);
+        try std.testing.expect(rail.style.fg.eql(.default));
+        const before_wrap = lastContentCellForTest(&grid, row - 1);
+        try std.testing.expect(!before_wrap.style.fg.eql(.default));
+        try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(before_wrap.style.fg));
+    }
+    // The final child indents past its marker.
+    row = last_child_row + 1;
+    while (row <= grid.rows) : (row += 1) {
+        try std.testing.expectEqual(@as(u21, ' '), grid.cellAt(row, 1).?.codepoint);
+        try std.testing.expectEqual(@as(u21, ' '), grid.cellAt(row, 2).?.codepoint);
+        try std.testing.expect(grid.cellAt(row, 3).?.codepoint != ' ');
+    }
+
+    // Nothing is hidden: each child's rows hold its whole command.
+    const first_painted = try paintedTreeTextForTest(alloc, &grid, first_child_row, last_child_row - 1);
+    defer alloc.free(first_painted);
+    const first_expected = try withoutSpacesForTest(alloc, "Ran " ++ first_command);
+    defer alloc.free(first_expected);
+    try std.testing.expectEqualStrings(first_expected, first_painted);
+    const last_painted = try paintedTreeTextForTest(alloc, &grid, last_child_row, grid.rows);
+    defer alloc.free(last_painted);
+    const last_expected = try withoutSpacesForTest(alloc, "Ran " ++ last_command);
+    defer alloc.free(last_expected);
+    try std.testing.expectEqualStrings(last_expected, last_painted);
+}
+
+test "expanded group headers wrap instead of clipping" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran zig build\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
+        .{ .entry_id = 2, .tool_name = @constCast("shell"), .activity_kind = .command, .outcome = .failed },
+    };
+
+    var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 16, .{}, null);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    var grid = try paintExpandedRowsForTest(alloc, bytes, 16);
+    defer grid.deinit();
+
+    const header_end = blk: {
+        var row: u16 = 2;
+        while (row <= grid.rows) : (row += 1) {
+            if (grid.cellAt(row, 1).?.codepoint == '├') break :blk row - 1;
+        }
+        return error.TestExpectedFirstChildRow;
+    };
+    try std.testing.expect(header_end > 1);
+    const header_painted = try paintedTreeTextForTest(alloc, &grid, 1, header_end);
+    defer alloc.free(header_painted);
+    try std.testing.expect(std.mem.find(u8, header_painted, "failed") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "…") == null);
+}
+
+test "expanded group children reproject stored commands at the current width" {
+    const alloc = std.testing.allocator;
+    const command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mbun run pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeline-stage-pipeli...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    const details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .captured_command = false,
+        .activity_kind = .command,
+        .command_display = @constCast(command),
+        .command_action_label = @constCast("Ran"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+
+    var wide = try buildExpandedStyledInterruptible(alloc, &entries, &details, 400, .{}, null);
+    defer wide.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
+        wide.entry_actions.items[0].override.bytes,
+    );
+
+    // A narrower full transcript wraps the stored command instead of clipping
+    // it, and the frozen generation marker never returns.
+    var narrow = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{}, null);
+    defer narrow.deinit(alloc);
+    const narrow_rows = narrow.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, narrow_rows, "…") == null);
+    try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
+    var grid = try paintExpandedRowsForTest(alloc, narrow_rows, 80);
+    defer grid.deinit();
+    try std.testing.expect(grid.rows > 2);
+    const painted = try paintedTreeTextForTest(alloc, &grid, 2, grid.rows);
+    defer alloc.free(painted);
+    const expected = try withoutSpacesForTest(alloc, "Ran " ++ command);
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, painted);
+}
+
+test "command reprojection rejects a record carrying a different command" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{
+            .id = 1,
+            .bytes = "● Ran\x1b[0m \x1b[38;5;245mprintf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-...\x1b[0m\n",
+            .class = .tool_status,
+        } },
+    };
+    const details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("shell"),
+        .activity_kind = .command,
+        .command_display = @constCast("zig build test --release"),
+        .command_action_label = @constCast("Ran"),
+        .outcome = .completed,
+        .command_process_presentation = .{ .exit_code = 0 },
+    }};
+
+    var projection = try build(alloc, &entries, &details, 240);
+    defer projection.deinit(alloc);
+    // The frozen tail is no prefix of the stored command, so the row is left
+    // untouched rather than rewritten with unrelated content.
+    try std.testing.expect(std.mem.endsWith(u8, projection.entry_actions.items[0].override.bytes, "..."));
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "zig build") == null);
+}
+
+test "command reprojection keeps the row's own label across lifecycle states" {
+    const alloc = std.testing.allocator;
+    const command = "printf " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8);
+    const frozen_tail = "printf alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-";
+
+    const Case = struct {
+        label: []const u8,
+        outcome: ?types.ToolOutcomeKind,
+        stored_action: []const u8,
+    };
+    const cases = [_]Case{
+        // Active row: outcome not yet set, stored label is the start-time
+        // prediction. The live row must keep "Running", never flip to "Ran".
+        .{ .label = "Running", .outcome = null, .stored_action = "Ran" },
+        // Plain success: the historical happy path.
+        .{ .label = "Ran", .outcome = .completed, .stored_action = "Ran" },
+        // Nonzero exit: the tool completed but the settled label carries the
+        // exit code the start-time prediction could not know.
+        .{ .label = "Exited 1", .outcome = .completed, .stored_action = "Ran" },
+        // Failed tool outcome with a divergent settled label.
+        .{ .label = "Failed", .outcome = .failed, .stored_action = "Observed" },
+    };
+
+    for (cases, 0..) |case, index| {
+        const bytes = try alloc.print(
+            "● {s}\x1b[0m \x1b[38;5;245m{s}...\x1b[0m\n",
+            .{ case.label, frozen_tail },
+        );
+        defer alloc.free(bytes);
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = @intCast(index + 1), .bytes = bytes, .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{.{
+            .entry_id = @intCast(index + 1),
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .command_display = @constCast(command),
+            .command_action_label = @constCast(case.stored_action),
+            .outcome = case.outcome,
+        }};
+
+        var projection = try build(alloc, &entries, &details, 240);
+        defer projection.deinit(alloc);
+        const row = projection.entry_actions.items[0].override.bytes;
+
+        // The frozen marker is gone, the full command is present, and the
+        // row keeps its own label rather than the stored prediction.
+        try std.testing.expect(std.mem.find(u8, row, "...") == null);
+        try std.testing.expect(std.mem.find(u8, row, "alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta") != null);
+        const expected_prefix = try alloc.print("\n└ {s} ", .{case.label});
+        defer alloc.free(expected_prefix);
+        try std.testing.expect(std.mem.find(u8, row, expected_prefix) != null);
+    }
+}
+
+test "command tail match requires an identity-length prefix" {
+    try std.testing.expect(commandTailMatch("Ran zig build test --release", "zig build test --release --verbose") != null);
+    try std.testing.expect(commandTailMatch("Ran head -6; echo done", "git status") == null);
+    try std.testing.expect(commandTailMatch("Ran x", "x") == null);
+    try std.testing.expect(commandTailMatch("", "anything") == null);
 }
 
 test "minimal command timeout uses its typed cause in the row and group" {
@@ -1403,7 +2291,7 @@ test "minimal command timeout uses its typed cause in the row and group" {
 
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command · 1 timed out\n" ++
-            "└ Timed out sleep 5",
+            "└ Timed out \x1b[38;5;252msleep\x1b[39m 5",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1454,7 +2342,7 @@ test "tool-heavy groups render every canonical action" {
     try std.testing.expect(std.mem.find(u8, summary, "10 read") != null);
     try std.testing.expect(std.mem.find(u8, summary, "8 commands") != null);
     try std.testing.expect(std.mem.find(u8, summary, "1 failed") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "Ran rg snapshot") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "Ran \x1b[38;5;252mrg\x1b[39m snapshot") != null);
     try std.testing.expect(std.mem.find(u8, summary, "Editing runtime.zig") != null);
     try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, summary, "\n"));
     var lines = std.mem.splitScalar(u8, summary, '\n');
@@ -1486,7 +2374,7 @@ test "minimal tool group keeps cancellation in the header and child row" {
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command · 1 cancelled\n" ++
-            "└ Cancelled sleep 30\n\n" ++
+            "└ Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
             "■ Cancelled sleep 30 · What can fx do differently?",
         projection.entry_actions.items[0].override.bytes,
     );
@@ -1562,8 +2450,8 @@ test "cancelled actions remain inside the message-delimited block" {
     defer projection.deinit(alloc);
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled first") != null);
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled second") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled \x1b[38;5;252mfirst\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled \x1b[38;5;252msecond\x1b[39m") != null);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
     try std.testing.expect(projection.entry_actions.items[3] == .hide);
@@ -1649,8 +2537,8 @@ test "one presentation group keeps sibling tools in creation order across assist
 
     try std.testing.expectEqualStrings(
         "● 2 tool calls · 2 commands\n" ++
-            "├ Running first\n" ++
-            "└ Running second",
+            "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
+            "└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
@@ -1726,7 +2614,7 @@ test "legacy lifecycle records without group identity respect transcript boundar
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Running second",
+        "● 1 tool call · 1 command\n└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[2].override.bytes,
     );
 }
@@ -1763,15 +2651,15 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● 2 tool calls · 2 commands\n" ++
-            "├ Running first\n" ++
-            "└ Running second",
+            "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
+            "└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
 
 test "presentation grouping is atomic across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPresentationGroupingAllocationFailures,
         .{},
     );
@@ -1809,6 +2697,48 @@ test "entries hidden by compact presentation do not split tool groups" {
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expect(projection.entry_actions.items[2] == .keep);
     try std.testing.expect(projection.entry_actions.items[3] == .hide);
+}
+
+test "tool status hidden by a display clear does not start a compact group" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "welcome", .class = .welcome } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "command", .class = .tool_status, .inline_hidden = true } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "output", .class = .command_output, .inline_hidden = true } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "4s", .class = .turn_summary, .inline_hidden = true } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 2, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .keep);
+    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    try std.testing.expect(projection.entry_actions.items[3] == .keep);
+}
+
+test "visible tool status after a display clear keeps its compact group" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status, .inline_hidden = true } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "read", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .keep);
+    try std.testing.expect(projection.entry_actions.items[1] == .override);
+    const block = projection.entry_actions.items[1].override.bytes;
+    try std.testing.expect(std.mem.find(u8, block, "1 tool call") != null);
+    try std.testing.expect(std.mem.find(u8, block, "run_command") == null);
 }
 
 test "visible assistant messages split groups while silent entries do not" {
@@ -2005,7 +2935,7 @@ test "mixed group keeps the count header before every action" {
             "├ Read three.zig\n" ++
             "├ Read four.zig\n" ++
             "├ Read five.zig\n" ++
-            "└ Ran git -C /workspace status --short",
+            "└ Ran \x1b[38;5;252mgit\x1b[39m \x1b[38;5;250m-C\x1b[39m /workspace status \x1b[38;5;250m--short\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2049,7 +2979,7 @@ test "expanded tool title stays primary while the group summary stays secondary"
         .marker_style = "<marker>",
         .text_style = "<secondary>",
         .reset_style = "<reset>",
-    }, .{}, null);
+    }, null);
     defer projection.deinit(alloc);
     const expanded = projection.entry_actions.items[0].override.bytes;
 
@@ -2217,4 +3147,42 @@ test "many presentation groups perform a bounded number of indexed detail lookup
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expect(projection.entry_actions.items[tool_count - 1] == .override);
     try std.testing.expect(stats.detail_lookups <= tool_count * 4);
+}
+
+test "prose-prefixed command rows highlight only the trailing stored command" {
+    const alloc = std.testing.allocator;
+    const command = "cat AGENTS.md && printf done";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran echo ok\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Reading project instructions before continuing: cat AGENTS.md && printf done\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .captured_command = true,
+            .activity_kind = .command,
+            .command_display = @constCast("echo ok"),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .arguments_json = @constCast("{\"command\":\"cat AGENTS.md && printf done\"}"),
+            .command_display = @constCast(command),
+            .outcome = .deferred,
+        },
+    };
+
+    var projection = try build(alloc, &entries, &details, 200);
+    defer projection.deinit(alloc);
+    const rows = projection.entry_actions.items[0].override.bytes;
+
+    // The prose prefix stays plain in full; the trailing command highlights.
+    try std.testing.expect(std.mem.find(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252m&&\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252mprintf\x1b[39m") != null);
 }
