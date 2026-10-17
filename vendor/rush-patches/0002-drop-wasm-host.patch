@@ -1,0 +1,21 @@
+diff --git a/src/host.zig b/src/host.zig
+index 9d4a193..7911684 100644
+--- a/src/host.zig
++++ b/src/host.zig
+@@ -9,8 +9,6 @@ pub const RealHost = if (!zig_builtin.cpu.arch.isWasm())
+ else
+     struct {};
+ 
+-pub const WasmHost = @import("host/WasmHost.zig");
+-pub const WasmSession = @import("host/WasmSession.zig");
+ 
+ pub const Fd = enum(i32) {
+     stdin = 0,
+@@ -287,7 +285,3 @@ pub const WaitStatus = union(enum) {
+     }
+ };
+ 
+-test {
+-    _ = WasmHost;
+-    _ = WasmSession;
+-}
