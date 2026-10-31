@@ -679,7 +679,7 @@ function environmentDurability() {
 }
 
 async function chooseEnvironmentDurability(dir) {
-  const load = (asset) => import((asset.protocol === "" ? bundledAssetUrl(asset) : asset).href);
+  const load = (asset) => import(/* webpackIgnore: true */ /* turbopackIgnore: true */ (asset.protocol === "" ? bundledAssetUrl(asset) : asset).href);
   if (dir === null) {
     const { vercel } = await load(new URL("./durable/vercel.mjs", import.meta.url));
     return vercel();
